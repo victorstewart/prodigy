@@ -27,9 +27,17 @@ public:
   // The workload persists and applies this desired authority through its
   // domain owner before acknowledging readiness with an app-computed receipt.
   virtual bool statefulDataAuthority(const StatefulDataAuthority&) { return false; }
+  // Read-only challenge. Accepted asynchronous work publishes its descriptor
+  // through the same Hub/topic; false explicitly reports unsupported.
+  virtual bool prepareStatefulDataAuthority(const StatefulDataAuthorityPreparation&) { return false; }
   // Return true only after the native workload installed, activated, renewed, or
   // revoked the exact private session command.
   virtual bool cousinSessionCommand(const ProdigyCousinSessionLocalCommand&) { return false; }
+  // Reverse carrier frames are delivered only after Neuron matched the exact
+  // live v3 session and local container lease.  This callback has no listener
+  // or socket authority.
+  virtual void cousinCarrierFrame(const ProdigyCousinCarrierFrame&) {}
+  virtual bool nametagSourceBaseline(const ProdigyNametagSourceBaselineEnvelope&) { return false; }
   virtual void messageFromProdigy(Message *message) {}
 };
 
@@ -140,10 +148,21 @@ private:
   // length-prefixed String before decoding the typed payload.
   bool queueCousinSessionFrame(ContainerTopic topic, const String& payload)
   {
-    if (payload.size() > ProdigyCousinSessionMaximumBytes)
+    const bool carrier = topic == ContainerTopic::cousinCarrierFrame;
+    if (payload.size() > (carrier ? ProdigyCousinCarrierMaximumPayloadBytes + 128 : ProdigyCousinSessionMaximumBytes))
     {
       return false;
     }
+    // No container hop may turn the bounded carrier into an unbounded send
+    // backlog.  Reserve room for control/revoke frames; carrier data is much
+    // smaller and is rejected before it can crowd them out.
+    const uint32_t ceiling = ProdigyCousinSessionMaximumRecords * ProdigyCousinSessionMaximumBytes;
+    // Never build a carrier backlog on this control hop: a carrier is accepted
+    // only into an empty, idle buffer. Session/revoke control therefore wins
+    // every queued arbitration (at most one bounded carrier may already be in
+    // the kernel write in progress).
+    if ((carrier && (neuron.pendingSend || neuron.wBuffer.outstandingBytes() != 0)) ||
+        (!carrier && neuron.wBuffer.outstandingBytes() > ceiling - std::min<uint32_t>(uint32_t(payload.size()), ceiling))) return false;
 
     uint32_t frameOffset = neuron.wBuffer.size();
     Message::construct(neuron.wBuffer, topic, payload);
@@ -329,6 +348,7 @@ public:
 
   UnixStream neuron;
   ContainerParameters parameters;
+  StatefulDataAuthorityPreparation statefulPreparationRequest;
   Statistics statistics;
   ProdigyResumptionRegistry tlsResumptionRegistry;
 
@@ -603,6 +623,16 @@ public:
         queueCousinSessionFrame(ContainerTopic::cousinSessionRequest, serialized);
   }
 
+  bool sendCousinCarrierFrame(const ProdigyCousinCarrierFrame& frame)
+  {
+    if (!prodigyCousinCarrierFrameValid(frame)) return false;
+    String serialized = {}; auto copy = frame;
+    return BitseryEngine::serialize(serialized, copy) &&
+        serialized.size() <= ProdigyCousinCarrierMaximumPayloadBytes + 128 &&
+        queueCousinSessionFrame(ContainerTopic::cousinCarrierFrame, serialized);
+  }
+
+
   bool publishTaskResult(const String& result)
   {
     if (result.size() > prodigyTaskResultMaxBytes)
@@ -735,6 +765,26 @@ public:
     String encoded;
     return BitseryEngine::serialize(encoded, receipt) && encoded.size() <= 4096 &&
         queueCousinSessionFrame(ContainerTopic::statefulDataAuthority, encoded);
+  }
+
+  bool publishStatefulDataAuthorityPreparation(const StatefulDataAuthorityPreparation& preparation)
+  {
+    if (!preparation.response || !prodigyStatefulDataAuthorityPreparationValid(preparation) ||
+        !prodigyStatefulDataAuthorityPreparationContextEqual(preparation, statefulPreparationRequest)) return false;
+    String encoded;
+    return BitseryEngine::serialize(encoded, preparation) && encoded.size() <= 4096 &&
+        queueCousinSessionFrame(ContainerTopic::statefulDataAuthority, encoded);
+  }
+
+  bool publishNametagSourceBaselineReceipt(const ProdigyNametagSourceBaselineEnvelope& envelope)
+  {
+    if (!prodigyNametagSourceBaselineEnvelopeValid(envelope) ||
+        envelope.direction != ProdigyNametagSourceBaselineDirection::receipt ||
+        envelope.receipt.localContainerUUID != parameters.uuid ||
+        envelope.receipt.probeDeploymentID != parameters.deploymentID) return false;
+    String encoded = {};
+    return BitseryEngine::serialize(encoded, envelope) && encoded.size() <= 4096 &&
+        queuePackedFrame(ContainerTopic::nametagSourceBaseline, encoded);
   }
 
   void neuronHandler(Message *message)
@@ -940,10 +990,31 @@ public:
             (void)queueCousinSessionFrame(ContainerTopic::cousinSessionAck, encoded);
           break;
         }
+      case ContainerTopic::cousinCarrierFrame:
+        {
+          String serialized = {}; Message::extractToStringView(args, serialized);
+          ProdigyCousinCarrierFrame frame = {};
+          if (args == terminal && BitseryEngine::deserializeSafe(serialized, frame) &&
+              prodigyCousinCarrierFrameValid(frame)) target->cousinCarrierFrame(frame);
+          break;
+        }
       case ContainerTopic::statefulDataAuthority:
         {
           String encoded;
           Message::extractToStringView(args, encoded);
+          StatefulDataAuthorityPreparation preparation;
+          if (args == terminal && BitseryEngine::deserializeSafe(encoded, preparation) &&
+              prodigyStatefulDataAuthorityPreparationValid(preparation) && !preparation.response && preparation.memberRequestUUID != 0) {
+            if (preparation.deploymentID != parameters.deploymentID ||
+                preparation.shardGroup != parameters.statefulTopology.shardGroup) break;
+            statefulPreparationRequest = preparation;
+            if (!target->prepareStatefulDataAuthority(preparation)) {
+              preparation.response = true;
+              preparation.failure.assign("application does not support read-only stateful preparation"_ctv);
+              (void)publishStatefulDataAuthorityPreparation(preparation);
+            }
+            break;
+          }
           StatefulDataAuthorityReceipt command;
           if (args != terminal || !BitseryEngine::deserializeSafe(encoded, command) ||
               command.ready || !command.snapshotReceiptSHA256.empty() ||
@@ -960,6 +1031,21 @@ public:
           }
           break;
         }
+      case ContainerTopic::nametagSourceBaseline:
+        {
+          String encoded = {}; Message::extractToStringView(args, encoded);
+          ProdigyNametagSourceBaselineEnvelope envelope = {};
+          if (args == terminal && BitseryEngine::deserializeSafe(encoded, envelope) &&
+              prodigyNametagSourceBaselineEnvelopeValid(envelope) &&
+              (envelope.direction == ProdigyNametagSourceBaselineDirection::execute ||
+               envelope.direction == ProdigyNametagSourceBaselineDirection::query) &&
+              envelope.command.probeDeploymentID == parameters.deploymentID)
+            (void)target->nametagSourceBaseline(envelope);
+          break;
+        }
+      case ContainerTopic::nametagQualificationApplicationReceipt:
+      case ContainerTopic::nametagQualificationApplicationCommand:
+        break;
       case ContainerTopic::wormholesRefresh:
         {
           if (args >= terminal)

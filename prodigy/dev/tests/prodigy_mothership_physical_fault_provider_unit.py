@@ -68,14 +68,37 @@ raise SystemExit(8)
         return provider.execute(self.request, self.root, str(self.ip), require_root=False, boot_id=self.boot,
                                 now=self.clock.now, sleep=self.clock.sleep)
 
-    def test_execute_restores_route_and_writes_strict_receipt(self):
+    def apply(self):
+        return provider.apply(self.request, self.root, str(self.ip), require_root=False, boot_id=self.boot,
+                              now=self.clock.now)
+
+    def test_execute_compatibility_holds_window_and_restores(self):
         receipt = self.execute()
         self.assertTrue(receipt["restored"])
-        self.assertLess(receipt["installedAtMonotonicMs"], receipt["restoredAtMonotonicMs"])
+        self.assertGreaterEqual(receipt["restoredAtMonotonicMs"] - receipt["installedAtMonotonicMs"],
+                                self.request.durationMilliseconds)
+        self.assertEqual(json.loads(self.ip_state.read_text()), [])
+
+    def test_apply_is_nonblocking_and_deadline_query_auto_restores(self):
+        receipt = self.apply()
+        self.assertEqual(receipt["phase"], "applied")
+        self.assertTrue(receipt["authenticated"])
+        self.assertFalse(receipt["restored"])
+        self.assertEqual(receipt["gatewayEndpoint"], self.request.peerAddress)
+        self.assertEqual(receipt["flowTarget"], "peer-host")
+        self.assertEqual(receipt["flowIdentity"], "host:" + self.request.peerAddress)
+        self.assertNotEqual(json.loads(self.ip_state.read_text()), [])
+        self.assertEqual(provider.query(self.request, self.root, boot_id=self.boot,
+                                        now=self.clock.now)["phase"], "applied")
+        self.clock.value = receipt["autoRestoreDeadlineMonotonicMs"] + 1
+        restored = provider.query(self.request, self.root, boot_id=self.boot, require_root=False,
+                                  ip_binary=str(self.ip), now=self.clock.now)
+        self.assertTrue(restored["restored"])
+        self.assertLess(restored["installedAtMonotonicMs"], restored["restoredAtMonotonicMs"])
         self.assertEqual(json.loads(self.ip_state.read_text()), [])
         path = self.root / f"physical-fault-{self.request.operationID}.json"
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
-        self.assertEqual(provider.query(self.request, self.root, boot_id=self.boot), receipt)
+        self.assertEqual(provider.query(self.request, self.root, boot_id=self.boot), restored)
 
     def test_iproute_host_destination_rendering_is_canonicalized(self):
         metric = provider._route_metric(self.request.operationID)
@@ -94,29 +117,35 @@ raise SystemExit(8)
             "198.51.100.9/32", metric))
 
     def test_exact_retry_is_idempotent_and_retarget_rejected(self):
-        first = self.execute()
-        self.assertEqual(self.execute(), first)
+        first = self.apply()
+        self.assertEqual(self.apply(), first)
         changed = provider.Request(self.request.operationID, "source", GUEST, "198.51.100.10", 10)
         with self.assertRaisesRegex(provider.ProviderError, "does not exactly match"):
-            provider.execute(changed, self.root, str(self.ip), require_root=False, boot_id=self.boot,
-                             now=self.clock.now, sleep=self.clock.sleep)
+            provider.apply(changed, self.root, str(self.ip), require_root=False, boot_id=self.boot,
+                           now=self.clock.now)
+        changed_identity = provider.Request(self.request.operationID, "source", GUEST,
+                                            self.request.peerAddress, 10, self.request.peerAddress,
+                                            "peer-host", "masque:other-gateway")
+        with self.assertRaisesRegex(provider.ProviderError, "does not exactly match"):
+            provider.apply(changed_identity, self.root, str(self.ip), require_root=False,
+                           boot_id=self.boot, now=self.clock.now)
 
     def test_preexisting_route_and_boot_mismatch_fail_closed(self):
         self.ip_state.write_text(json.dumps([{"dst":"198.51.100.9/32", "type":"unicast", "protocol":"kernel"}]))
         with self.assertRaisesRegex(provider.ProviderError, "pre-existing"):
-            self.execute()
+            self.apply()
         # It is particularly important not to delete a matching-looking route
         # which was present before this request acquired install ownership.
         matching = [{"dst":"198.51.100.9/32", "type":"blackhole", "protocol":"186", "metric":"7"}]
         self.ip_state.write_text(json.dumps(matching))
         with self.assertRaisesRegex(provider.ProviderError, "pre-existing"):
-            self.execute()
+            self.apply()
         self.assertEqual(json.loads(self.ip_state.read_text()), matching)
         self.ip_state.write_text("[]")
-        self.execute()
+        self.apply()
         with self.assertRaisesRegex(provider.ProviderError, "different boot"):
-            provider.execute(self.request, self.root, str(self.ip), require_root=False,
-                             boot_id="11111111-1111-1111-1111-111111111111", now=self.clock.now, sleep=self.clock.sleep)
+            provider.apply(self.request, self.root, str(self.ip), require_root=False,
+                           boot_id="11111111-1111-1111-1111-111111111111", now=self.clock.now)
 
     def test_competing_route_after_precheck_is_never_removed(self):
         real_check = provider._ensure_no_route
@@ -130,7 +159,7 @@ raise SystemExit(8)
             return real_check(ip_binary, request)
         with mock.patch.object(provider, "_ensure_no_route", side_effect=race):
             with self.assertRaisesRegex(provider.ProviderError, "pre-existing"):
-                self.execute()
+                self.apply()
         self.assertEqual(checks, 2)
         self.assertEqual(json.loads(self.ip_state.read_text()), matching)
 
@@ -153,33 +182,33 @@ raise SystemExit(8)
         finally:
             os.close(directory_fd)
         with self.assertRaisesRegex(provider.ProviderError, "colliding active"):
-            self.execute()
+            self.apply()
 
     def test_state_root_and_lock_reject_symlinks_or_unsafe_files(self):
         unsafe = Path(self.temp.name) / "unsafe"
         unsafe.mkdir(mode=0o755)
         with self.assertRaisesRegex(provider.ProviderError, "permissions or ownership"):
-            provider.execute(self.request, unsafe, str(self.ip), require_root=False,
-                             boot_id=self.boot, now=self.clock.now, sleep=self.clock.sleep)
+            provider.apply(self.request, unsafe, str(self.ip), require_root=False,
+                           boot_id=self.boot, now=self.clock.now)
         lock = self.root / ".physical-fault.lock"
         lock.symlink_to(self.ip_state)
         with self.assertRaisesRegex(provider.ProviderError, "fault lock"):
-            self.execute()
+            self.apply()
 
     def test_fresh_state_directory_is_provisioned_only_below_a_safe_parent(self):
         fresh = Path(self.temp.name) / "fresh-state"
         self.assertFalse(fresh.exists())
-        receipt = provider.execute(self.request, fresh, str(self.ip), require_root=False,
-                                   boot_id=self.boot, now=self.clock.now, sleep=self.clock.sleep)
-        self.assertTrue(receipt["restored"])
+        receipt = provider.apply(self.request, fresh, str(self.ip), require_root=False,
+                                 boot_id=self.boot, now=self.clock.now)
+        self.assertEqual(receipt["phase"], "applied")
         self.assertEqual(stat.S_IMODE(fresh.stat().st_mode), 0o700)
 
         unsafe_parent = Path(self.temp.name) / "unsafe-parent"
         unsafe_parent.mkdir(mode=0o700)
         unsafe_parent.chmod(0o770)
         with self.assertRaisesRegex(provider.ProviderError, "state parent permissions"):
-            provider.execute(self.request, unsafe_parent / "state", str(self.ip), require_root=False,
-                             boot_id=self.boot, now=self.clock.now, sleep=self.clock.sleep)
+            provider.apply(self.request, unsafe_parent / "state", str(self.ip), require_root=False,
+                           boot_id=self.boot, now=self.clock.now)
 
     def test_root_mode_accepts_only_and_provisions_the_fixed_state_directory(self):
         fixed_parent = Path(self.temp.name) / "fixed-parent"
@@ -201,8 +230,11 @@ raise SystemExit(8)
         intent = {"schemaVersion": provider.SCHEMA_VERSION, "request": provider.asdict(self.request),
                   "operationID": self.request.operationID, "role": self.request.role,
                   "guestID": self.request.guestID, "peerAddress": self.request.peerAddress,
+                  "gatewayEndpoint": self.request.peerAddress,
+                  "flowTarget": "peer-host", "flowIdentity": "host:" + self.request.peerAddress,
                   "durationMilliseconds": self.request.durationMilliseconds, "bootID": self.boot,
                   "installedAtMonotonicMs": 100, "routeMetric": metric,
+                  "autoRestoreDeadlineMonotonicMs": 110, "authenticated": True,
                   "installIntent": True, "routeInstalled": False, "restored": False}
         directory_fd = provider._open_state_root(self.root, require_root=False)
         try:
@@ -213,8 +245,9 @@ raise SystemExit(8)
         competing = {"dst": self.request.prefix, "type": "blackhole", "protocol": "186", "metric": "7"}
         owned = {"dst": self.request.prefix, "type": "blackhole", "protocol": "186", "metric": str(metric)}
         self.ip_state.write_text(json.dumps([competing, owned]))
+        self.clock.value = 111
 
-        receipt = self.execute()
+        receipt = self.apply()
 
         self.assertTrue(receipt["restored"])
         self.assertEqual(json.loads(self.ip_state.read_text()), [competing])
@@ -231,13 +264,13 @@ raise SystemExit(8)
             return real_write(*args, **kwargs)
         with mock.patch.object(provider.signal, "pthread_sigmask", side_effect=record_mask), \
              mock.patch.object(provider, "_atomic_write", side_effect=checked_write):
-            self.execute()
+            self.apply()
         self.assertEqual(calls[0][0], signal.SIG_BLOCK)
         self.assertEqual(calls[0][1], {signal.SIGINT, signal.SIGTERM, signal.SIGHUP})
         self.assertEqual(calls[1][0], signal.SIG_UNBLOCK)
 
     def test_state_symlink_is_rejected_by_dirfd_open(self):
-        self.execute()
+        self.apply()
         path = self.root / f"physical-fault-{self.request.operationID}.json"
         path.unlink()
         path.symlink_to(self.ip_state)

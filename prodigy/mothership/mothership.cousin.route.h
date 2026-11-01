@@ -27,6 +27,7 @@ public:
   uint8_t destinationCIDR = 0;
   uint16_t destinationTCPPort = 0;
   uint16_t pathMTU = 0;
+  CousinRouteEndpointKind endpointKind = CousinRouteEndpointKind::externalWormhole;
   uint64_t generation = 0;
   int64_t issuedAtMs = 0;
   int64_t expiresAtMs = 0;
@@ -50,7 +51,7 @@ static inline bool mothershipParseCousinRouteIntentJSON(
     "sourcePermissionUUID", "destinationPermissionUUID", "slots",
     "destinationRoutablePrefixUUID", "destinationPublicAddress", "transportProtocol",
     "destinationCIDR", "destinationTCPPort", "pathMTU", "generation",
-    "issuedAtMs", "expiresAtMs", "state"
+    "issuedAtMs", "expiresAtMs", "state", "endpointKind"
   };
   uint32_t seen = 0;
   for (auto field : document.get_object())
@@ -65,7 +66,7 @@ static inline bool mothershipParseCousinRouteIntentJSON(
       if (field.value.get(value) != simdjson::SUCCESS) return reject();
       String text; text.setInvariant(value.data(), value.size());
       uint128_t parsed = 0;
-      if (!prodigyParseCanonicalHex128(text, parsed) || parsed == 0) return reject();
+      if (!(index == 7 && text.equals("0x0"_ctv)) && !prodigyParseCanonicalHex128(text, parsed)) return reject();
       uint128_t *targets[] = {&intent.routeUUID, &intent.operationUUID,
         &intent.logicalWorkloadUUID, &intent.logicalServiceUUID,
         &intent.sourcePermissionUUID, &intent.destinationPermissionUUID};
@@ -105,6 +106,12 @@ static inline bool mothershipParseCousinRouteIntentJSON(
       if (field.value.get(value) != simdjson::SUCCESS || value != "TCP") return reject();
       intent.transportProtocol = IPPROTO_TCP;
     }
+    else if (index == 17)
+    {
+      std::string_view value;
+      if (field.value.get(value) != simdjson::SUCCESS || value != "privateContainer") return reject();
+      intent.endpointKind = CousinRouteEndpointKind::privateContainer;
+    }
     else if (index == 16)
     {
       std::string_view value;
@@ -138,8 +145,11 @@ static inline bool mothershipParseCousinRouteIntentJSON(
       else return reject();
     }
   }
-  constexpr uint32_t all = (uint32_t(1) << std::size(names)) - 1;
-  if (seen != all || intent.expiresAtMs <= intent.issuedAtMs ||
+  constexpr uint32_t required = (uint32_t(1) << 17) - 1;
+  if ((seen & required) != required ||
+      (intent.endpointKind == CousinRouteEndpointKind::privateContainer ?
+       (intent.destinationRoutablePrefixUUID != 0 || intent.destinationCIDR != 128) :
+       intent.destinationRoutablePrefixUUID == 0) || intent.expiresAtMs <= intent.issuedAtMs ||
       intent.expiresAtMs - intent.issuedAtMs > cousinRouteMaximumLifetimeMs ||
       intent.destinationCIDR == 0 || intent.destinationCIDR > 128 ||
       intent.pathMTU < cousinRouteMinimumPathMTU || intent.pathMTU > cousinRouteMaximumPathMTU)

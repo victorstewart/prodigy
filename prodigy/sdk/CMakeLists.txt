@@ -53,11 +53,13 @@ set(
    _PRODIGY_SDK_C_INSTALL_DEPOFILES
    "${PRODIGY_SDK_DEPOFILES_DIR}/aegis.DepoFile"
    "${PRODIGY_SDK_DEPOFILES_DIR}/gxhash.DepoFile"
+   "${PRODIGY_SDK_DEPOFILES_DIR}/rust-toolchain.DepoFile"
 )
 set(
    _PRODIGY_SDK_CPP_INSTALL_DEPOFILES
    "${PRODIGY_SDK_DEPOFILES_DIR}/aegis.DepoFile"
    "${PRODIGY_SDK_DEPOFILES_DIR}/gxhash.DepoFile"
+   "${PRODIGY_SDK_DEPOFILES_DIR}/rust-toolchain.DepoFile"
    "${PRODIGY_SDK_DEPOFILES_DIR}/openssl.DepoFile"
 )
 
@@ -70,6 +72,7 @@ if (PRODIGY_SDK_USE_DEPOS_BASICS
       "${_PRODIGY_SDK_BASICS_DEPOFILE}"
       "${PRODIGY_SDK_DEPOFILES_DIR}/aegis.DepoFile"
       "${PRODIGY_SDK_DEPOFILES_DIR}/gxhash.DepoFile"
+      "${PRODIGY_SDK_DEPOFILES_DIR}/rust-toolchain.DepoFile"
       "${PRODIGY_SDK_DEPOFILES_DIR}/openssl.DepoFile"
    )
    depos_depend(FILES ${_PRODIGY_SDK_DEPOFILES})

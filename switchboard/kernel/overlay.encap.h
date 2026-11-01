@@ -1,6 +1,7 @@
 #pragma once
 
 #include <switchboard/kernel/csum.h>
+#include <switchboard/common/gateway.injection.h>
 #include <switchboard/kernel/overlay.routing.h>
 #include <switchboard/kernel/services.h>
 
@@ -110,7 +111,12 @@ __attribute__((__always_inline__)) static inline bool switchboardEncapSKBV6Inter
     bpf_memcpy(installed, wormhole, sizeof(*installed));
   }
 
-  if (route->use_gateway_mac != 0)
+  if (route->use_gateway_mac == SWITCHBOARD_OVERLAY_ROUTE_ACTION_LOCAL_CONTAINER_REDIRECT)
+  {
+    null_mac_addresses(eth);
+    return true;
+  }
+  if (route->use_gateway_mac == SWITCHBOARD_OVERLAY_ROUTE_ACTION_GATEWAY_MAC)
   {
     return from_us_to_gateway(eth);
   }
@@ -235,7 +241,12 @@ __attribute__((__always_inline__)) static inline bool switchboardEncapSKBV4Inter
   ipv4_csum_inline(iph, &csum);
   iph->check = (__u16)csum;
 
-  if (route->use_gateway_mac != 0)
+  if (route->use_gateway_mac == SWITCHBOARD_OVERLAY_ROUTE_ACTION_LOCAL_CONTAINER_REDIRECT)
+  {
+    null_mac_addresses(eth);
+    return true;
+  }
+  if (route->use_gateway_mac == SWITCHBOARD_OVERLAY_ROUTE_ACTION_GATEWAY_MAC)
   {
     return from_us_to_gateway(eth);
   }
@@ -278,6 +289,28 @@ __attribute__((__always_inline__)) static inline bool switchboardEncapWormholeSK
   return false;
 }
 
+// Every producer of an overlay packet uses this completion step.  A selected
+// local gateway is an injection boundary, not a next hop: do not let an
+// already-encapsulated frame fall through to a physical egress hook.
+__attribute__((__always_inline__)) static inline int switchboardCompleteMasqueGatewayInjection(
+    struct __sk_buff *skb, const struct switchboard_overlay_machine_route *route)
+{
+  if (route == NULL || route->use_gateway_mac != SWITCHBOARD_OVERLAY_ROUTE_ACTION_LOCAL_CONTAINER_REDIRECT)
+  {
+    return TC_ACT_OK;
+  }
+
+  const __u8 fragment = route->next_hop_mac[0];
+  if (switchboardMasqueGatewayRedirectPermitted(route->use_gateway_mac, fragment, true) == false ||
+      redirectContainerFragment(fragment, true) == false)
+  {
+    return TC_ACT_SHOT;
+  }
+
+  skb->mark = SWITCHBOARD_MASQUE_GATEWAY_INJECTION_SKB_MARK;
+  return TC_ACT_REDIRECT;
+}
+
 __attribute__((__always_inline__)) static inline bool switchboardMaybeRouteHostedIngressIPv4(struct __sk_buff *skb, struct ethhdr *eth, void *data_end, int *action)
 {
   if (action == NULL)
@@ -308,7 +341,7 @@ __attribute__((__always_inline__)) static inline bool switchboardMaybeRouteHoste
   __u16 inner_packet_len = (__u16)(skb->len - sizeof(struct ethhdr));
   if (switchboardEncapSKBV6(skb, inner_packet_len, IPPROTO_IPIP, route) || switchboardEncapSKBV4(skb, inner_packet_len, IPPROTO_IPIP, route))
   {
-    *action = TC_ACT_OK;
+    *action = switchboardCompleteMasqueGatewayInjection(skb, route);
     return true;
   }
 
@@ -346,7 +379,7 @@ __attribute__((__always_inline__)) static inline bool switchboardMaybeRouteHoste
   __u16 inner_packet_len = (__u16)(skb->len - sizeof(struct ethhdr));
   if (switchboardEncapSKBV6(skb, inner_packet_len, IPPROTO_IPV6, route) || switchboardEncapSKBV4(skb, inner_packet_len, IPPROTO_IPV6, route))
   {
-    *action = TC_ACT_OK;
+    *action = switchboardCompleteMasqueGatewayInjection(skb, route);
     return true;
   }
 

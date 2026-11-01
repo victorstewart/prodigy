@@ -450,6 +450,46 @@ static ProdigyPersistentBootState runtimePersistenceBootState(void)
   return boot;
 }
 
+static void testExplicitBrainSnapshotResetSkipsInvalidSnapshotDecode(TestSuite& suite)
+{
+  ScopedPersistentRoot root = {};
+  ProdigyPersistentStateStore store(root.path);
+  const ProdigyPersistentBootState boot = runtimePersistenceBootState();
+  String failure = {};
+  const bool savedBoot = store.saveBootState(boot, &failure);
+  store.close();
+
+  TidesDB raw(root.path);
+  const bool wroteCorruptSnapshot = raw.write("brain"_ctv, "snapshot"_ctv, "corrupt snapshot"_ctv, &failure);
+  raw.close();
+
+  persistentBootState = {};
+  persistedBrainSnapshot = {};
+  havePersistedBrainSnapshot = false;
+  effectiveBootstrapConfig = {};
+  const bool normalRejected = savedBoot && wroteCorruptSnapshot &&
+      !loadProdigyStartupState(""_ctv, false, failure, store) &&
+      failure.equals("invalid persistent brain snapshot"_ctv);
+
+  failure.clear();
+  const bool resetAccepted = loadProdigyStartupState(""_ctv, true, failure, store) &&
+      !havePersistedBrainSnapshot &&
+      persistentBootState.bootstrapSshUser.equals("bootstrap-user"_ctv);
+  String removeFailure = {};
+  const bool resetCleared = resetAccepted && store.removeBrainSnapshot(&removeFailure);
+  ProdigyPersistentBrainSnapshot absent = {};
+  String absentFailure = {};
+  const bool snapshotAbsent = resetCleared && !store.loadBrainSnapshot(absent, &absentFailure) &&
+      absentFailure.equals("record not found"_ctv);
+  suite.expect(normalRejected && resetAccepted && resetCleared && snapshotAbsent,
+               "runtime_explicit_snapshot_reset_skips_corrupt_snapshot_but_normal_startup_rejects");
+  store.close();
+  persistentBootState = {};
+  persistedBrainSnapshot = {};
+  havePersistedBrainSnapshot = false;
+  effectiveBootstrapConfig = {};
+}
+
 static void testPersistentWriterDetachesViewBackedSchemaFields(TestSuite& suite)
 {
   String backing = {};
@@ -502,6 +542,24 @@ static void testPersistentWriterDetachesViewBackedSchemaFields(TestSuite& suite)
     suite.expect(false, "runtime_persistence_writer_builds_pair_projection_view_fixture");
     return;
   }
+  auto privateProjection = localProjection;
+  privateProjection.protocolVersion = ProdigyLocalClusterPairControlProjection::privateDiscoveryVersion;
+  ProdigyPairPrivateDiscoveryStatus privateStatus = {};
+  privateStatus.pairUUID = privateProjection.credentials[0].pairUUID;
+  privateStatus.rootGeneration = privateProjection.credentials[0].rootGeneration;
+  privateStatus.peerClusterUUID = remoteProjection.localClusterUUID;
+  privateStatus.activationUUID = 0x7310;
+  privateStatus.phase = ProdigyPairPrivateDiscoveryPhase::prepared;
+  privateProjection.privateDiscoveryStatuses.push_back(privateStatus);
+  String privateBytes = {}; ProdigyLocalClusterPairControlProjection decodedPrivate = {};
+  suite.expect(prodigyLocalClusterPairControlProjectionValid(privateProjection, true) &&
+                   BitseryEngine::serialize(privateBytes, privateProjection) > 0 &&
+                   BitseryEngine::deserializeSafe(privateBytes, decodedPrivate) &&
+                   prodigyLocalClusterPairControlProjectionEqual(privateProjection, decodedPrivate),
+               "runtime_pair_private_projection_v3_round_trips_prepared_status");
+  if (!decodedPrivate.privateDiscoveryStatuses.empty()) decodedPrivate.privateDiscoveryStatuses[0].peerClusterUUID = 0x7fff;
+  suite.expect(!decodedPrivate.privateDiscoveryStatuses.empty() && !prodigyLocalClusterPairControlProjectionValid(decodedPrivate, true),
+               "runtime_pair_private_projection_rejects_unbound_peer");
   auto& credential = localProjection.credentials[0];
   String localClaimBacking(const_cast<uint8_t *>(credential.localClaim.data()), credential.localClaim.size(), Copy::yes,
                            credential.localClaim.size());
@@ -2592,6 +2650,7 @@ int main(void)
   testProductionPairProjectionWriterUsesColocatedNeuronAuthority(suite);
   testNeuronClusterPairControlProjectionDurabilityAndStreamFence(suite);
   testClusterPairRuntimeRequiresFreshDurableProjectionAfterRestart(suite);
+  testExplicitBrainSnapshotResetSkipsInvalidSnapshotDecode(suite);
   if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only != nullptr &&
       std::strcmp(only, "reentrant-update-persistence") == 0)
   {

@@ -1,5 +1,15 @@
 #pragma once
 
+#include <array>
+#include <cstring>
+#ifdef __linux__
+#include <fcntl.h>
+#include <sched.h>
+#include <unistd.h>
+#endif
+
+class IPAddress;
+
 enum class BGPState : uint8_t {
 
   idle = 0,
@@ -8,6 +18,140 @@ enum class BGPState : uint8_t {
   established,
   failed
 };
+
+constexpr static uint16_t BGP_AFI_IPV6 = 2;
+constexpr static uint8_t BGP_SAFI_UNICAST = 1;
+constexpr static uint32_t BGP_IPV6_UNICAST_IMPORT_MAX_NLRI = 128;
+// CONNECT-IP forwards the connector's inner packet once before delivery.
+constexpr static uint8_t BGP_PRIVATE_MASQUE_HOP_LIMIT = 2;
+#ifdef __linux__
+static inline bool bgpConfigurePrivateMasqueHopLimit(int fd)
+{
+  const int hopLimit = BGP_PRIVATE_MASQUE_HOP_LIMIT;
+  return fd >= 0 && setsockopt(fd, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &hopLimit, sizeof(hopLimit)) == 0;
+}
+#endif
+
+// This is a pure desired-state transition.  The owner of a BGP session uses
+// it to make announcement and withdrawal reconciliation idempotent without
+// letting a control-plane projection send on a socket itself.
+enum class BGPIPv6UnicastAdvertisementAction : uint8_t { none = 0, announce, withdraw };
+
+static inline bool bgpIPv6UnicastAdvertisementActionValid(BGPIPv6UnicastAdvertisementAction action)
+{
+  return action == BGPIPv6UnicastAdvertisementAction::none ||
+      action == BGPIPv6UnicastAdvertisementAction::announce ||
+      action == BGPIPv6UnicastAdvertisementAction::withdraw;
+}
+
+static inline BGPIPv6UnicastAdvertisementAction bgpIPv6UnicastAdvertisementTransition(
+    bool currentlyAdvertised, bool shouldAdvertise)
+{
+  if (currentlyAdvertised == shouldAdvertise) return BGPIPv6UnicastAdvertisementAction::none;
+  return shouldAdvertise ? BGPIPv6UnicastAdvertisementAction::announce :
+      BGPIPv6UnicastAdvertisementAction::withdraw;
+}
+
+struct BGPIPv6UnicastImport {
+  std::array<uint8_t, 16> prefix = {};
+  std::array<uint8_t, 16> nextHop = {};
+  uint8_t cidr = 0;
+  bool withdrawn = false;
+};
+
+using BGPIPv6UnicastImportObserver = void (*)(void *, const BGPIPv6UnicastImport&);
+// State changes are emitted by the hub, rather than inferred by an owner from
+// socket lifetime.  A route imported from a session must disappear as soon as
+// that session stops being established.
+using BGPSessionStateObserver = void (*)(void *, const IPAddress&, bool established);
+
+static inline bool bgpIPv6UnicastNextHopValid(const uint8_t *nextHop)
+{
+  if (nextHop == nullptr || nextHop[0] == 0xff || (nextHop[0] == 0xfe && (nextHop[1] & 0xc0u) == 0x80u)) return false;
+  uint8_t aggregate = 0;
+  for (uint32_t index = 0; index < 16; ++index) aggregate |= nextHop[index];
+  return aggregate != 0;
+}
+
+static inline bool bgpDecodeCanonicalIPv6NLRI(const uint8_t *&cursor, const uint8_t *tail,
+                                              BGPIPv6UnicastImport& imported)
+{
+  if (cursor == tail) return false;
+  imported.cidr = *cursor++;
+  if (imported.cidr > 128) return false;
+  const uint8_t bytes = uint8_t((imported.cidr + 7) / 8);
+  if (size_t(tail - cursor) < bytes) return false;
+  imported.prefix = {};
+  if (bytes != 0) std::memcpy(imported.prefix.data(), cursor, bytes);
+  if ((imported.cidr & 7u) != 0 && (imported.prefix[bytes - 1] & uint8_t((1u << (8u - (imported.cidr & 7u))) - 1u)) != 0) return false;
+  cursor += bytes;
+  return true;
+}
+
+// Parses only MP_REACH_NLRI and MP_UNREACH_NLRI IPv6-unicast attributes from
+// one BGP UPDATE body. It is deliberately observer-only: no kernel route or
+// peer state is changed. Results are emitted only after the entire UPDATE is
+// structurally valid, preventing partial imports from malformed messages.
+static inline bool bgpObserveIPv6UnicastUpdate(const uint8_t *body, size_t length,
+                                               BGPIPv6UnicastImportObserver observer, void *context)
+{
+  if (body == nullptr || observer == nullptr || length < 4) return false;
+  const uint8_t *cursor = body, *tail = body + length;
+  auto read16 = [&](uint16_t& value) -> bool {
+    if (size_t(tail - cursor) < 2) return false;
+    value = uint16_t(cursor[0]) << 8 | uint16_t(cursor[1]); cursor += 2; return true;
+  };
+  uint16_t withdrawnLength = 0, attributesLength = 0;
+  if (!read16(withdrawnLength) || size_t(tail - cursor) < withdrawnLength) return false;
+  // IPv6-only import sessions must not silently skip legacy IPv4 NLRI. A
+  // nonempty section would otherwise invalidate the whole-UPDATE fence.
+  if (withdrawnLength != 0) return false;
+  cursor += withdrawnLength; // legacy IPv4 withdrawn NLRI
+  if (!read16(attributesLength) || size_t(tail - cursor) < attributesLength) return false;
+  const uint8_t *attributesTail = cursor + attributesLength;
+  std::array<BGPIPv6UnicastImport, BGP_IPV6_UNICAST_IMPORT_MAX_NLRI> imports = {};
+  uint32_t count = 0;
+  auto append = [&](const BGPIPv6UnicastImport& imported) -> bool {
+    if (count >= imports.size()) return false;
+    imports[count++] = imported; return true;
+  };
+  while (cursor < attributesTail)
+  {
+    if (size_t(attributesTail - cursor) < 3) return false;
+    const uint8_t flags = *cursor++, type = *cursor++;
+    uint16_t attributeLength = *cursor++;
+    if (flags & 0x10u) { if (size_t(attributesTail - cursor) < 1) return false; attributeLength = uint16_t(attributeLength) << 8 | *cursor++; }
+    if (size_t(attributesTail - cursor) < attributeLength) return false;
+    const uint8_t *attributeTail = cursor + attributeLength;
+    if (type == 14 || type == 15)
+    {
+      if (size_t(attributeTail - cursor) < 3) return false;
+      const uint16_t afi = uint16_t(cursor[0]) << 8 | uint16_t(cursor[1]); cursor += 2;
+      const uint8_t safi = *cursor++;
+      if (afi == BGP_AFI_IPV6 && safi == BGP_SAFI_UNICAST)
+      {
+        BGPIPv6UnicastImport imported = {}; imported.withdrawn = type == 15;
+        if (type == 14)
+        {
+          if (cursor == attributeTail) return false;
+          const uint8_t nextHopLength = *cursor++;
+          if ((nextHopLength != 16 && nextHopLength != 32) || size_t(attributeTail - cursor) < size_t(nextHopLength) + 1) return false;
+          std::memcpy(imported.nextHop.data(), cursor, imported.nextHop.size());
+          if (!bgpIPv6UnicastNextHopValid(imported.nextHop.data())) return false;
+          cursor += nextHopLength;
+          if (*cursor++ != 0) return false;
+        }
+        while (cursor < attributeTail) { BGPIPv6UnicastImport next = imported; if (!bgpDecodeCanonicalIPv6NLRI(cursor, attributeTail, next) || !append(next)) return false; }
+      }
+    }
+    cursor = attributeTail;
+  }
+  // The legacy IPv4 NLRI tail follows the attribute block. Reject it rather
+  // than accepting a partially validated UPDATE on an IPv6 import session.
+  if (attributesTail != tail) return false;
+  for (uint32_t index = 0; index < count; ++index) observer(context, imports[index]);
+  return true;
+}
 
 // https://datatracker.ietf.org/doc/html/rfc4271
 #ifdef __linux__
@@ -30,6 +174,8 @@ constexpr static inline T reverseByteOrder(T value)
 
   return reversed;
 }
+
+class BGPPrivateListener;
 
 class BGPPeer : public StreamBase, public TCPSocket {
 private:
@@ -792,7 +938,8 @@ private:
 
   constexpr static uint8_t marker[16] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
-  uint16_t fillOpenMesage(Buffer& wBuffer, uint32_t bgpid, bool is6)
+public:
+  uint16_t fillOpenMesage(Buffer& wBuffer, uint32_t bgpid, bool is6, uint16_t localASN)
   {
     // if (is6)
     // {
@@ -826,7 +973,7 @@ private:
 
     wBuffer.append(uint8_t(0x01)); // Open
     wBuffer.append(uint8_t(0x04)); // BGP version 4
-    wBuffer.append(reverseByteOrder(uint16_t(35'870))); // our ASN
+    wBuffer.append(reverseByteOrder(localASN)); // our ASN
     wBuffer.append(reverseByteOrder(uint16_t(180))); // hold time
     wBuffer.append(bgpid);
 
@@ -935,7 +1082,7 @@ private:
     message.append(uint8_t(0x04));
     message.append(uint8_t(0x02)); // AS_SEQUENCE
     message.append(uint8_t(0x01)); // 1 ASN to follow
-    message.append(reverseByteOrder(uint16_t(35'870))); // our ASN
+    message.append(reverseByteOrder(localASN)); // our ASN
 
     if (prefix.network.is6)
     {
@@ -990,6 +1137,7 @@ private:
     memcpy(message.data() + sizeof(marker), &nlen, 2);
   }
 
+private:
   uint16_t fillWithdrawPrefixMessage(Buffer& wBuffer, const IPPrefix& prefix)
   {
     uint32_t header_offset = wBuffer.size();
@@ -1081,10 +1229,94 @@ public:
 
   uint32_t bgpid;
   uint16_t peerASN = 0;
+  uint16_t localASN = 35'870;
+  IPAddress peerAddress = {};
   BGPState state = BGPState::idle;
   uint32_t reconnectFailures = 0;
   bool is6;
   uint8_t hopLimit {0}; // 0 = use system default
+  // Imports remain disabled unless the explicit peer owner supplies an
+  // observer. Provider BGP sessions therefore preserve their advertise-only
+  // behavior by default.
+  BGPIPv6UnicastImportObserver ipv6UnicastImportObserver = nullptr;
+  void *ipv6UnicastImportContext = nullptr;
+  BGPSessionStateObserver sessionStateObserver = nullptr;
+  void *sessionStateContext = nullptr;
+
+  // Private cross-cluster peers live in the MASQUE gateway's network
+  // namespace.  Retaining that namespace descriptor makes reconnects create
+  // their sockets in the same namespace instead of silently falling back to
+  // host routing.  Provider peers leave this unset and preserve the historic
+  // path.
+  int transportNetworkNamespaceFD = -1;
+  String transportInterface = {};
+  IPAddress transportSourceAddress = {};
+  bool strictPrivateTransport = false;
+  // A peer accepted by a private listener is never eligible for the active
+  // reconnect path.  Its listener owns admission and re-arms accept after the
+  // child has fully closed.
+  BGPPrivateListener *passiveOwner = nullptr;
+
+  bool configurePrivateTransport(int networkNamespaceFD, const String& interface,
+                                 const IPAddress& sourceAddress)
+  {
+#ifdef __linux__
+    if (networkNamespaceFD < 0 || interface.size() == 0 || interface.size() >= IFNAMSIZ ||
+        !sourceAddress.is6 || sourceAddress.isNull()) return false;
+    const int retained = ::fcntl(networkNamespaceFD, F_DUPFD_CLOEXEC, 3);
+    if (retained < 0) return false;
+    if (transportNetworkNamespaceFD >= 0) ::close(transportNetworkNamespaceFD);
+    transportNetworkNamespaceFD = retained;
+    transportInterface.assign(interface);
+    transportSourceAddress = sourceAddress;
+    strictPrivateTransport = true;
+    return true;
+#else
+    (void)networkNamespaceFD; (void)interface; (void)sourceAddress;
+    return false;
+#endif
+  }
+
+  void setIPv6UnicastImportObserver(BGPIPv6UnicastImportObserver observer, void *context)
+  {
+    ipv6UnicastImportObserver = observer;
+    ipv6UnicastImportContext = context;
+  }
+
+  void setSessionStateObserver(BGPSessionStateObserver observer, void *context)
+  { sessionStateObserver = observer; sessionStateContext = context; }
+  void notifySessionState(bool established)
+  { if (sessionStateObserver) sessionStateObserver(sessionStateContext, peerAddress, established); }
+
+  void clearSessionBuffers(void)
+  {
+    rBuffer.clear();
+    wBuffer.clear();
+  }
+
+  void adoptAcceptedPrivateSocket(
+      int acceptedSlot, uint32_t localBGPID, uint16_t expectedPeerASN, uint16_t selectedLocalASN,
+      const IPAddress& localAddress, const IPAddress& expectedPeerAddress,
+      BGPIPv6UnicastImportObserver importObserver, void *importContext,
+      BGPSessionStateObserver stateObserver, void *stateContext,
+      BGPPrivateListener *owner)
+  {
+    domain = AF_INET6;
+    type = SOCK_STREAM;
+    protocol = IPPROTO_TCP;
+    bgpid = localBGPID;
+    peerASN = expectedPeerASN;
+    localASN = selectedLocalASN;
+    peerAddress = expectedPeerAddress;
+    is6 = true;
+    setSaddr(localAddress, 179);
+    setDaddr(expectedPeerAddress, 179);
+    fslot = acceptedSlot;
+    isFixedFile = true;
+    passiveOwner = owner;
+    setIPv6UnicastImportObserver(importObserver, importContext);
+    setSessionStateObserver(stateObserver, stateContext);
+  }
 
   // TCP-MD5 authentication (RFC 2385) support
   String md5Key; // stored in-memory only; do not log
@@ -1157,7 +1389,7 @@ public:
   {
     wBuffer.need(128);
 
-    uint32_t len = fillOpenMesage(wBuffer, bgpid, is6);
+    uint32_t len = fillOpenMesage(wBuffer, bgpid, is6, localASN);
 
     String message;
     message.setInvariant(wBuffer.pTail() - len, len);
@@ -1187,6 +1419,7 @@ public:
   void announcePrefix(const IPPrefix& prefix, const IPAddress& gateway, bool globally, uint32_t community = 0)
   {
     String& message = routes[prefix];
+    message.clear();
     message.reserve(128);
     fillAnnouncePrefixMessage(message, prefix, gateway, globally, community);
 
@@ -1228,9 +1461,15 @@ public:
     }
   }
 
-  void handleMessage(void)
+  static bool openASNMatches(const uint8_t *open, size_t length, uint16_t expectedASN)
   {
-    if (rBuffer.outstandingBytes() >= 18)
+    return open != nullptr && length >= 29 &&
+        (expectedASN == 0 || (uint16_t(open[20]) << 8 | uint16_t(open[21])) == expectedASN);
+  }
+
+  bool handleMessage(void)
+  {
+    while (rBuffer.outstandingBytes() >= 18)
     {
       // messages are not aligned, so we can't make any assumptions
 
@@ -1238,7 +1477,16 @@ public:
 
       uint16_t message_len = (uint16_t)(cursor[16] << 8 | cursor[17]);
 
-      if (rBuffer.outstandingBytes() >= message_len)
+      if (message_len < 19)
+      {
+        std::fprintf(stderr, "BGP message rejected: invalid length %hu\n", message_len);
+        state = BGPState::failed;
+        notifySessionState(false);
+        Ring::queueClose(this);
+        return false;
+      }
+
+      if (rBuffer.outstandingBytes() < message_len) return true;
       {
         String message;
         message.setInvariant(cursor, message_len);
@@ -1254,17 +1502,19 @@ public:
               if (message_len < 29)
               {
                 state = BGPState::failed;
+                notifySessionState(false);
                 Ring::queueClose(this);
-                break;
+                return false;
               }
               const uint8_t *open = message.data();
               const uint16_t openedASN = uint16_t(open[20]) << 8 | uint16_t(open[21]);
-              if (peerASN != 0 && openedASN != peerASN)
+              if (!openASNMatches(open, message_len, peerASN))
               {
-                basics_log("BGP OPEN rejected expected peer AS=%hu received AS=%hu\n", peerASN, openedASN);
+                std::fprintf(stderr, "BGP OPEN rejected expected peer AS=%hu received AS=%hu\n", peerASN, openedASN);
                 state = BGPState::failed;
+                notifySessionState(false);
                 Ring::queueClose(this);
-                break;
+                return false;
               }
               sendKeepalive();
               state = BGPState::openconfirm;
@@ -1273,15 +1523,22 @@ public:
             }
           case 2: // Update
             {
-              // we do not currently import or act on UPDATE messages on this session
+              if (ipv6UnicastImportObserver != nullptr && message_len >= 19)
+              {
+                // The observer sees only a wholly valid MP IPv6-unicast
+                // UPDATE and cannot install routes through this parser path.
+                (void)bgpObserveIPv6UnicastUpdate(message.data() + 19, message_len - 19,
+                                                   ipv6UnicastImportObserver, ipv6UnicastImportContext);
+              }
               break;
             }
           case 3: // Notification
             {
               // we might receive these if an error, they'll already be printed though
               state = BGPState::failed;
+              notifySessionState(false);
               Ring::queueClose(this);
-              break;
+              return false;
             }
           case 4: // Keepalive
             {
@@ -1290,6 +1547,7 @@ public:
                 state = BGPState::established;
                 reconnectFailures = 0;
                 basics_log("BGP peer session established\n");
+                notifySessionState(true);
                 pushRoutes();
               }
               else
@@ -1310,6 +1568,7 @@ public:
         rBuffer.consume(message_len, false);
       }
     }
+    return true;
   }
 
   void goIdle(void)
@@ -1323,10 +1582,71 @@ public:
     wBuffer.reserve(4_KB);
   }
 
+  ~BGPPeer()
+  {
+#ifdef __linux__
+    if (transportNetworkNamespaceFD >= 0) ::close(transportNetworkNamespaceFD);
+#endif
+    transportNetworkNamespaceFD = -1;
+  }
+
+  void createSocket(void) override
+  {
+#ifdef __linux__
+    if (strictPrivateTransport)
+    {
+      const int callerNamespace = ::open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
+      if (callerNamespace < 0 || transportNetworkNamespaceFD < 0 ||
+          ::setns(transportNetworkNamespaceFD, CLONE_NEWNET) != 0)
+      {
+        if (callerNamespace >= 0) ::close(callerNamespace);
+        fd = -1;
+        return;
+      }
+      TCPSocket::createSocket();
+      const bool restored = ::setns(callerNamespace, CLONE_NEWNET) == 0;
+      ::close(callerNamespace);
+      // Continuing the Neuron event loop in a container namespace could
+      // route unrelated control traffic through the tunnel.  Fail hard if
+      // the kernel cannot restore the caller namespace.
+      if (!restored) std::abort();
+      return;
+    }
+#endif
+    TCPSocket::createSocket();
+  }
+
   // Ensure MD5 is re-applied on socket recreation
   void configureSocket(void) override
   {
     TCPSocket::configureSocket();
+    if (strictPrivateTransport)
+    {
+#ifdef __linux__
+      const bool boundToTunnel = fd >= 0 &&
+          ::setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE,
+                       transportInterface.c_str(), socklen_t(transportInterface.size() + 1)) == 0;
+      sockaddr_in6 source = {};
+      source.sin6_family = AF_INET6;
+      std::memcpy(&source.sin6_addr, transportSourceAddress.v6, sizeof(source.sin6_addr));
+      const bool sourceBound = boundToTunnel &&
+          ::bind(fd, reinterpret_cast<const sockaddr *>(&source), sizeof(source)) == 0;
+      if (!sourceBound)
+      {
+        const int failure = errno;
+        if (fd >= 0) ::close(fd);
+        fd = -1;
+        std::fprintf(stderr,
+                     "private BGP socket tunnel bind failed interface=%s errno=%d\n",
+                     transportInterface.c_str(), failure);
+        return;
+      }
+#else
+      if (fd >= 0) ::close(fd);
+      fd = -1;
+      return;
+#endif
+    }
     applyMD5ToSocket();
     if (hopLimit > 0)
     {
@@ -1344,14 +1664,211 @@ public:
   }
 };
 
+// The private cross-cluster listener is deliberately separate from BGPPeer.
+// TCP-MD5 authenticates the SYN, so it must be configured on the listening
+// socket before bind/listen; applying it only to an accepted child is too late.
+class BGPPrivateListener final : public TCPSocket {
+public:
+  int transportNetworkNamespaceFD = -1;
+  String transportInterface = {};
+  IPAddress localAddress = {};
+  IPAddress peerAddress = {};
+  uint16_t peerASN = 0;
+  uint16_t localASN = 35'870;
+  uint32_t localBGPID = 0;
+  String md5Key = {};
+  BGPIPv6UnicastImportObserver ipv6UnicastImportObserver = nullptr;
+  void *ipv6UnicastImportContext = nullptr;
+  BGPSessionStateObserver sessionStateObserver = nullptr;
+  void *sessionStateContext = nullptr;
+  bytell_hash_map<IPPrefix, IPAddress> localPrefixes = {};
+  BGPPeer *acceptedPeer = nullptr;
+  bool acceptPending = false;
+  bool closing = false;
+
+private:
+  bool transportConfigured = false;
+
+  void createSocket(void) override
+  {
+#ifdef __linux__
+    transportConfigured = false;
+    const int callerNamespace = ::open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
+    if (callerNamespace < 0 || transportNetworkNamespaceFD < 0 ||
+        ::setns(transportNetworkNamespaceFD, CLONE_NEWNET) != 0)
+    {
+      if (callerNamespace >= 0) ::close(callerNamespace);
+      fd = -1;
+      return;
+    }
+    TCPSocket::createSocket();
+    const bool restored = ::setns(callerNamespace, CLONE_NEWNET) == 0;
+    ::close(callerNamespace);
+    // Continuing the event loop in the gateway namespace could redirect
+    // unrelated control traffic.  Restoration failure is unrecoverable.
+    if (!restored) std::abort();
+#else
+    fd = -1;
+#endif
+  }
+
+  void configureSocket(void) override
+  {
+    TCPSocket::configureSocket();
+#ifdef __linux__
+    if (fd < 0 || transportInterface.size() == 0 ||
+        transportInterface.size() >= IFNAMSIZ || !peerAddress.is6 ||
+        peerAddress.isNull() || md5Key.size() == 0 ||
+        md5Key.size() > TCP_MD5SIG_MAXKEYLEN)
+    {
+      if (fd >= 0) ::close(fd);
+      fd = -1;
+      return;
+    }
+
+    const int ipv6Only = 1;
+    bool configured =
+        bgpConfigurePrivateMasqueHopLimit(fd) &&
+        ::setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY,
+                     &ipv6Only, sizeof(ipv6Only)) == 0 &&
+        ::setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE,
+                     transportInterface.c_str(),
+                     socklen_t(transportInterface.size() + 1)) == 0;
+
+    struct tcp_md5sig option = {};
+    auto *peer = reinterpret_cast<struct sockaddr_in6 *>(&option.tcpm_addr);
+    peer->sin6_family = AF_INET6;
+    std::memcpy(&peer->sin6_addr, peerAddress.v6, sizeof(peer->sin6_addr));
+    option.tcpm_prefixlen = 128;
+    option.tcpm_keylen = uint32_t(md5Key.size());
+    std::memcpy(option.tcpm_key, md5Key.data(), option.tcpm_keylen);
+    configured = configured &&
+        ::setsockopt(fd, SOL_TCP, TCP_MD5SIG, &option, sizeof(option)) == 0;
+    std::memset(option.tcpm_key, 0, sizeof(option.tcpm_key));
+    if (!configured)
+    {
+      const int failure = errno;
+      ::close(fd);
+      fd = -1;
+      std::fprintf(stderr,
+                   "private BGP listener tunnel/authentication configuration failed interface=%s errno=%d\n",
+                   transportInterface.c_str(), failure);
+      return;
+    }
+    transportConfigured = true;
+#else
+    if (fd >= 0) ::close(fd);
+    fd = -1;
+#endif
+  }
+
+public:
+  bool start(int networkNamespaceFD, const String& interface,
+             const IPAddress& local, const IPAddress& peer,
+             const String& password)
+  {
+#ifdef __linux__
+    constexpr static uint16_t BGP_PORT = 179;
+    if (networkNamespaceFD < 0 || interface.size() == 0 ||
+        interface.size() >= IFNAMSIZ || !local.is6 || !peer.is6 ||
+        local.isNull() || peer.isNull() || local.equals(peer) ||
+        password.size() == 0 || password.size() > TCP_MD5SIG_MAXKEYLEN)
+      return false;
+    const int retained = ::fcntl(networkNamespaceFD, F_DUPFD_CLOEXEC, 3);
+    if (retained < 0) return false;
+    transportNetworkNamespaceFD = retained;
+    transportInterface.assign(interface);
+    localAddress = local;
+    peerAddress = peer;
+    md5Key = password;
+    domain = AF_INET6;
+    type = SOCK_STREAM;
+    protocol = IPPROTO_TCP;
+    createSocket();
+    if (fd < 0 || !transportConfigured) return false;
+    setSaddr(localAddress, BGP_PORT);
+    setDaddr(peerAddress, BGP_PORT);
+    setDatacenterCongestion();
+    if (::bind(fd, saddr<struct sockaddr>(), saddrLen) != 0 ||
+        ::listen(fd, SOMAXCONN) != 0)
+    {
+      const int failure = errno;
+      ::close(fd);
+      fd = -1;
+      std::fprintf(stderr,
+                   "private BGP listener bind/listen failed interface=%s errno=%d\n",
+                   transportInterface.c_str(), failure);
+      return false;
+    }
+    return true;
+#else
+    (void)networkNamespaceFD; (void)interface; (void)local; (void)peer;
+    (void)password;
+    return false;
+#endif
+  }
+
+  bool accepts(const struct sockaddr_storage& remote, socklen_t length) const
+  {
+    if (length < sizeof(struct sockaddr_in6) || remote.ss_family != AF_INET6)
+      return false;
+    const auto *address = reinterpret_cast<const struct sockaddr_in6 *>(&remote);
+    return std::memcmp(&address->sin6_addr, peerAddress.v6,
+                       sizeof(address->sin6_addr)) == 0;
+  }
+
+  void rememberLocalPrefix(const IPPrefix& prefix, const IPAddress& gateway)
+  { localPrefixes.insert_or_assign(prefix, gateway); }
+
+  void forgetPrefix(const IPPrefix& prefix) { localPrefixes.erase(prefix); }
+
+  ~BGPPrivateListener()
+  {
+#ifdef __linux__
+    if (transportNetworkNamespaceFD >= 0) ::close(transportNetworkNamespaceFD);
+#endif
+    transportNetworkNamespaceFD = -1;
+    if (md5Key.size() != 0) std::memset(md5Key.data(), 0, md5Key.size());
+  }
+};
+
 class BGPHub : public RingInterface {
 private:
 
   bytell_hash_set<BGPPeer *> peers;
+  bytell_hash_set<BGPPrivateListener *> privateListeners;
+  bytell_hash_set<BGPPrivateListener *> retiringPrivateListeners;
   bool shuttingDown = false;
   TimeoutPacket reconnectTimer = {};
   bool reconnectTimerQueued = false;
   bool reconnectTimerCancellationQueued = false;
+
+  void queuePrivateAccept(BGPPrivateListener *listener)
+  {
+    if (listener == nullptr || listener->closing || listener->acceptPending ||
+        listener->acceptedPeer != nullptr || !privateListeners.contains(listener) ||
+        Ring::socketIsClosing(listener)) return;
+    listener->acceptPending = true;
+    Ring::queueAccept(listener, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+  }
+
+  void retirePrivateListener(BGPPrivateListener *listener)
+  {
+    if (listener == nullptr || !privateListeners.contains(listener)) return;
+    listener->closing = true;
+    privateListeners.erase(listener);
+    retiringPrivateListeners.insert(listener);
+    if (listener->acceptedPeer != nullptr)
+    {
+      BGPPeer *peer = listener->acceptedPeer;
+      listener->acceptedPeer = nullptr;
+      peer->passiveOwner = nullptr;
+      if (peers.contains(peer)) peers.erase(peer);
+      peer->notifySessionState(false);
+      if (!Ring::socketIsClosing(peer)) Ring::queueClose(peer);
+    }
+    if (!Ring::socketIsClosing(listener)) Ring::queueClose(listener);
+  }
 
   void scheduleReconnect(BGPPeer *peer)
   {
@@ -1369,6 +1886,7 @@ private:
     reconnectTimer.setTimeoutMs(reconnectDelayMs(peer->reconnectFailures));
     reconnectTimerQueued = true;
     reconnectTimerCancellationQueued = false;
+    RingDispatcher::installMultiplexee(this, this);
     basics_log("BGP peer reconnect scheduled failures=%u delayMs=%u\n",
                unsigned(peer->reconnectFailures),
                unsigned(reconnectDelayMs(peer->reconnectFailures)));
@@ -1378,6 +1896,7 @@ private:
 public:
 
   uint32_t ourBGPID;
+  uint16_t ourASN = 35'870;
 
   constexpr static uint32_t reconnectDelayMs(uint32_t failures)
   {
@@ -1394,6 +1913,7 @@ public:
     BGPPeer *peer = new BGPPeer();
     peer->bgpid = ourBGPID;
     peer->peerASN = peerASN;
+    peer->peerAddress = peerAddress;
 
     if (peerAddress.is6)
     {
@@ -1425,6 +1945,7 @@ public:
     BGPPeer *peer = new BGPPeer();
     peer->bgpid = ourBGPID;
     peer->peerASN = peerASN;
+    peer->peerAddress = peerAddress;
 
     if (peerAddress.is6)
     {
@@ -1452,11 +1973,32 @@ public:
 
   void addPeer(uint16_t peerASN, const IPAddress& peerAddress, const IPAddress& srcAddress, const String& md5Password, uint8_t hopLimit)
   {
+    addPeer(peerASN, peerAddress, srcAddress, md5Password, hopLimit, nullptr, nullptr, nullptr, nullptr);
+  }
+
+  // Cross-cluster owners must explicitly opt into UPDATE observation. The
+  // established provider overload above deliberately remains advertise-only.
+  bool addPeer(uint16_t peerASN, const IPAddress& peerAddress, const IPAddress& srcAddress, const String& md5Password, uint8_t hopLimit,
+               BGPIPv6UnicastImportObserver importObserver, void *importContext,
+               BGPSessionStateObserver stateObserver = nullptr, void *stateContext = nullptr,
+               int networkNamespaceFD = -1, const String *boundInterface = nullptr)
+  {
     constexpr static uint16_t BGP_PORT = 179;
 
     BGPPeer *peer = new BGPPeer();
     peer->bgpid = ourBGPID;
     peer->peerASN = peerASN;
+    peer->peerAddress = peerAddress;
+
+    peer->localASN = ourASN;
+    const bool strictPrivateTransport = networkNamespaceFD >= 0 || boundInterface != nullptr;
+    if (strictPrivateTransport &&
+        (networkNamespaceFD < 0 || boundInterface == nullptr ||
+         !peer->configurePrivateTransport(networkNamespaceFD, *boundInterface, srcAddress)))
+    {
+      delete peer;
+      return false;
+    }
 
     if (peerAddress.is6)
     {
@@ -1471,20 +2013,76 @@ public:
       peer->setDaddr(peerAddress, BGP_PORT);
     }
 
-    peer->setSaddr(srcAddress);
+    if (!strictPrivateTransport) peer->setSaddr(srcAddress);
+    if (peer->fd < 0)
+    {
+      delete peer;
+      return false;
+    }
     peer->setDatacenterCongestion();
     peer->setMD5Password(md5Password);
     peer->setHopLimit(hopLimit);
+    peer->setIPv6UnicastImportObserver(importObserver, importContext);
+    peer->setSessionStateObserver(stateObserver, stateContext);
 
     peers.insert(peer);
 
     RingDispatcher::installMultiplexee(peer, this);
     Ring::installFDIntoFixedFileSlot(peer);
     Ring::queueConnect(peer);
+    return true;
+  }
+
+  // The MASQUE listener side owns the passive TCP/179 half of the private BGP
+  // session.  It binds only the exact inside address in the exact gateway
+  // namespace/TUN and authenticates the remote inside address at the SYN.
+  bool listenPrivatePeer(
+      uint16_t peerASN, const IPAddress& peerAddress,
+      const IPAddress& localAddress, const String& md5Password,
+      BGPIPv6UnicastImportObserver importObserver, void *importContext,
+      BGPSessionStateObserver stateObserver, void *stateContext,
+      int networkNamespaceFD, const String& boundInterface)
+  {
+    if (!peerAddress.is6 || !localAddress.is6 || peerASN == 0 ||
+        networkNamespaceFD < 0 || boundInterface.size() == 0) return false;
+    for (BGPPrivateListener *existing : privateListeners)
+      if (existing->peerAddress.equals(peerAddress)) return false;
+    for (BGPPeer *existing : peers)
+      if (existing->peerAddress.equals(peerAddress)) return false;
+
+    BGPPrivateListener *listener = new BGPPrivateListener();
+    listener->peerASN = peerASN;
+    listener->localBGPID = ourBGPID;
+    listener->localASN = ourASN;
+    listener->ipv6UnicastImportObserver = importObserver;
+    listener->ipv6UnicastImportContext = importContext;
+    listener->sessionStateObserver = stateObserver;
+    listener->sessionStateContext = stateContext;
+    if (!listener->start(networkNamespaceFD, boundInterface, localAddress,
+                         peerAddress, md5Password))
+    {
+      delete listener;
+      return false;
+    }
+
+    privateListeners.insert(listener);
+    RingDispatcher::installMultiplexee(listener, this);
+    Ring::installFDIntoFixedFileSlot(listener);
+    queuePrivateAccept(listener);
+    return true;
   }
 
   void withdrawPeer(const IPAddress& peerAddress)
   {
+    for (auto it = privateListeners.begin(); it != privateListeners.end(); ++it)
+    {
+      BGPPrivateListener *listener = *it;
+      if (listener->peerAddress.equals(peerAddress))
+      {
+        retirePrivateListener(listener);
+        break;
+      }
+    }
     for (auto it = peers.begin(); it != peers.end(); it++)
     {
       BGPPeer *peer = *it;
@@ -1503,6 +2101,8 @@ public:
 
   void withdrawPrefix(const IPPrefix& prefix)
   {
+    for (BGPPrivateListener *listener : privateListeners)
+      listener->forgetPrefix(prefix);
     for (BGPPeer *peer : peers)
     {
       if (prefix.network.is6 == peer->is6)
@@ -1525,6 +2125,8 @@ public:
 
   void announceLocalPrefix(const IPPrefix& prefix, const IPAddress& gateway)
   {
+    for (BGPPrivateListener *listener : privateListeners)
+      if (prefix.network.is6) listener->rememberLocalPrefix(prefix, gateway);
     for (BGPPeer *peer : peers)
     {
       if (prefix.network.is6 == peer->is6)
@@ -1546,7 +2148,57 @@ public:
     }
   }
 
-  void connectHandler(void *socket, int result)
+  void acceptHandler(void *socket, int fslot) override
+  {
+    BGPPrivateListener *listener = nullptr;
+    for (BGPPrivateListener *candidate : privateListeners)
+    {
+      if (static_cast<void *>(candidate) == socket) { listener = candidate; break; }
+    }
+    if (listener == nullptr)
+    {
+      // A close/withdraw can retire the listener while an accept completion is
+      // already in flight.  Such a child belongs to no current authority.
+      if (fslot >= 0) Ring::queueCloseRaw(fslot);
+      return;
+    }
+
+    listener->acceptPending = false;
+    if (fslot < 0)
+    {
+      queuePrivateAccept(listener);
+      return;
+    }
+
+    struct sockaddr_storage remote = {};
+    socklen_t remoteLength = 0;
+    const bool exactPeer = Ring::takeAcceptedPeerAddress(
+        fslot, remote, remoteLength) && listener->accepts(remote, remoteLength);
+    if (!exactPeer || listener->closing || listener->acceptedPeer != nullptr)
+    {
+      Ring::queueCloseRaw(fslot);
+      queuePrivateAccept(listener);
+      return;
+    }
+
+    BGPPeer *peer = new BGPPeer();
+    peer->adoptAcceptedPrivateSocket(
+        fslot, listener->localBGPID, listener->peerASN, listener->localASN,
+        listener->localAddress, listener->peerAddress,
+        listener->ipv6UnicastImportObserver,
+        listener->ipv6UnicastImportContext,
+        listener->sessionStateObserver, listener->sessionStateContext,
+        listener);
+    listener->acceptedPeer = peer;
+    peers.insert(peer);
+    RingDispatcher::installMultiplexee(peer, this);
+    for (const auto& [prefix, gateway] : listener->localPrefixes)
+      peer->announceLocalPrefix(prefix, gateway);
+    peer->sendOpen();
+    Ring::queueRecv(peer);
+  }
+
+  void connectHandler(void *socket, int result) override
   {
     BGPPeer *peer = static_cast<BGPPeer *>(socket);
 
@@ -1559,12 +2211,13 @@ public:
     else
     {
       peer->state = BGPState::failed;
+      if (peer->sessionStateObserver) peer->sessionStateObserver(peer->sessionStateContext, peer->peerAddress, false);
       basics_log("BGP peer TCP connect failed result=%d\n", result);
       Ring::queueClose(peer);
     }
   }
 
-  void recvHandler(void *socket, int result)
+  void recvHandler(void *socket, int result) override
   {
     BGPPeer *peer = static_cast<BGPPeer *>(socket);
     peer->pendingRecv = false;
@@ -1574,23 +2227,24 @@ public:
       if (result > 0)
       {
         peer->rBuffer.advance(result);
-        peer->handleMessage();
-        Ring::queueRecv(peer);
+        if (peer->handleMessage()) Ring::queueRecv(peer);
       }
       else if (result == 0)
       {
         peer->state = BGPState::failed;
+        if (peer->sessionStateObserver) peer->sessionStateObserver(peer->sessionStateContext, peer->peerAddress, false);
         Ring::queueClose(peer);
       }
       else if (result != -9)
       {
         peer->state = BGPState::failed;
+        if (peer->sessionStateObserver) peer->sessionStateObserver(peer->sessionStateContext, peer->peerAddress, false);
         Ring::queueClose(peer);
       }
     }
   }
 
-  void sendHandler(void *socket, int result)
+  void sendHandler(void *socket, int result) override
   {
     BGPPeer *peer = static_cast<BGPPeer *>(socket);
 
@@ -1613,6 +2267,7 @@ public:
       {
         peer->wBuffer.noteSendCompleted();
         peer->state = BGPState::failed;
+        if (peer->sessionStateObserver) peer->sessionStateObserver(peer->sessionStateContext, peer->peerAddress, false);
         Ring::queueClose(peer);
       }
       else
@@ -1637,16 +2292,65 @@ public:
     }
   }
 
-  void closeHandler(void *socket)
+  void closeHandler(void *socket) override
   {
+    for (auto it = retiringPrivateListeners.begin();
+         it != retiringPrivateListeners.end(); ++it)
+    {
+      BGPPrivateListener *listener = *it;
+      if (static_cast<void *>(listener) != socket) continue;
+      retiringPrivateListeners.erase(it);
+      RingDispatcher::eraseMultiplexee(listener);
+      delete listener;
+      if (shuttingDown && peers.empty() && privateListeners.empty() &&
+          retiringPrivateListeners.empty() && !reconnectTimerQueued) hasShutdownBGP();
+      return;
+    }
+
+    for (auto it = privateListeners.begin(); it != privateListeners.end(); ++it)
+    {
+      BGPPrivateListener *listener = *it;
+      if (static_cast<void *>(listener) != socket) continue;
+      privateListeners.erase(it);
+      listener->closing = true;
+      if (listener->acceptedPeer != nullptr)
+      {
+        BGPPeer *accepted = listener->acceptedPeer;
+        listener->acceptedPeer = nullptr;
+        accepted->passiveOwner = nullptr;
+        if (peers.contains(accepted)) peers.erase(accepted);
+        accepted->notifySessionState(false);
+        if (!Ring::socketIsClosing(accepted)) Ring::queueClose(accepted);
+      }
+      RingDispatcher::eraseMultiplexee(listener);
+      delete listener;
+      if (shuttingDown && peers.empty() && privateListeners.empty() &&
+          retiringPrivateListeners.empty() && !reconnectTimerQueued) hasShutdownBGP();
+      return;
+    }
+
     BGPPeer *peer = static_cast<BGPPeer *>(socket);
 
     if (peers.contains(peer)) // otherwise being withdrawn
     {
-      if (shuttingDown)
+      if (peer->passiveOwner != nullptr)
+      {
+        BGPPrivateListener *listener = peer->passiveOwner;
+        peer->passiveOwner = nullptr;
+        if (listener->acceptedPeer == peer) listener->acceptedPeer = nullptr;
+        peers.erase(peer);
+        peer->notifySessionState(false);
+        RingDispatcher::eraseMultiplexee(peer);
+        delete peer;
+        queuePrivateAccept(listener);
+      }
+      else if (shuttingDown)
       {
         peers.erase(peer);
-        if (peers.size() == 0)
+        RingDispatcher::eraseMultiplexee(peer);
+        delete peer;
+        if (peers.empty() && privateListeners.empty() &&
+            retiringPrivateListeners.empty() && !reconnectTimerQueued)
         {
           hasShutdownBGP();
         }
@@ -1654,6 +2358,7 @@ public:
       else
       {
         peer->state = BGPState::failed;
+        if (peer->sessionStateObserver) peer->sessionStateObserver(peer->sessionStateContext, peer->peerAddress, false);
         scheduleReconnect(peer);
       }
     }
@@ -1673,8 +2378,11 @@ public:
 
     reconnectTimerQueued = false;
     reconnectTimerCancellationQueued = false;
+    RingDispatcher::eraseMultiplexee(this);
     if (result == -ECANCELED || shuttingDown)
     {
+      if (shuttingDown && peers.empty() && privateListeners.empty() &&
+          retiringPrivateListeners.empty()) hasShutdownBGP();
       return;
     }
 
@@ -1683,6 +2391,8 @@ public:
       if (peer->state == BGPState::failed)
       {
         basics_log("BGP peer reconnect attempt failures=%u\n", unsigned(peer->reconnectFailures));
+        // The closed TCP session may have left a partial frame or unsent data.
+        peer->clearSessionBuffers();
         peer->recreateSocket();
         Ring::installFDIntoFixedFileSlot(peer);
         Ring::queueConnect(peer);
@@ -1699,6 +2409,9 @@ public:
       reconnectTimerCancellationQueued = true;
       Ring::queueCancelTimeout(&reconnectTimer);
     }
+
+    while (!privateListeners.empty())
+      retirePrivateListener(*privateListeners.begin());
 
     for (BGPPeer *peer : peers)
     {

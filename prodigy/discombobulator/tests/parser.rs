@@ -152,6 +152,15 @@ fn output_kind_validation_requires_execute_for_runnables_and_rejects_it_for_base
     assert!(
         format!("{tunnel_error:#}").contains("mothership tunnel provider builds require EXECUTE")
     );
+    let masque_error = resolve_build_spec(
+        &app_spec,
+        OutputKind::CrossClusterMasqueGateway,
+        &BTreeMap::new(),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{masque_error:#}").contains("cross-cluster MASQUE gateway builds require EXECUTE")
+    );
 
     let base_spec = parse_build_spec(
         r#"

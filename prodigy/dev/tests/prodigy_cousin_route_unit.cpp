@@ -4,11 +4,15 @@
 #include <string>
 
 #include <prodigy/cousin.route.h>
+#include <prodigy/cross.cluster.mesh.route.h>
+#include <prodigy/cross.cluster.path.fault.h>
+#include <prodigy/neuron/private.tunnel.bgp.runtime.h>
 #include <prodigy/cousin.discovery.h>
 #include <prodigy/mothership/mothership.cluster.registry.h>
 #include <prodigy/mothership/mothership.cousin.route.h>
 #include <prodigy/mothership/mothership.pair.control.boundary.h>
 #include <prodigy/mothership/mothership.cousin.permission.h>
+#include <prodigy/mothership/mothership.nametag.all.masters.h>
 
 class TestSuite {
 public:
@@ -58,6 +62,57 @@ static ProdigyLocalCousinServicePermission validLocalCousinPermission(bool accep
   permission.acceptedAuthorityGeneration = accepted ? 7 : 0;
   permission.state = ProdigyLocalCousinServicePermissionState::active;
   return permission;
+}
+
+// Frozen pre-v3 codec, independent of the production version switch.
+struct LegacyPermissionWire { ProdigyLocalCousinServicePermission value; };
+template <typename S> static void serialize(S&& s, LegacyPermissionWire& wire)
+{
+  auto& p = wire.value;
+  s.value4b(p.protocolVersion); s.value16b(p.permissionUUID); s.value16b(p.pairUUID);
+  s.value16b(p.logicalWorkloadUUID); s.value16b(p.logicalServiceUUID); s.value16b(p.localClusterUUID); s.value16b(p.peerClusterUUID);
+  s.value1b(p.localHalf); s.value2b(p.localApplicationID); s.value2b(p.peerApplicationID);
+  s.value8b(p.localCousinServicePrefix); s.value8b(p.peerCousinServicePrefix); s.object(p.slots); s.value8b(p.localDeploymentID);
+  s.text1b(p.canonicalPlanSHA256, 64); s.text1b(p.artifactSHA256, 64); s.value8b(p.artifactBytes);
+  s.value8b(p.generation); s.value8b(p.acceptedAuthorityGeneration); s.value1b(p.state);
+  if (p.protocolVersion == 2) { s.value4b(p.baselineLogicalCores); s.value4b(p.baselineMemoryMB); s.value4b(p.baselineStorageMB); }
+}
+
+static ProdigyLocalCousinServicePermission purposePermission(ProdigyCousinServicePurpose purpose, bool accepted = true,
+    uint16_t destinationApp = 10, uint16_t group = 0, uint16_t groups = 1)
+{
+  auto p = validLocalCousinPermission(accepted);
+  p.protocolVersion = 3; p.purpose = purpose;
+  p.localApplicationID = purpose == ProdigyCousinServicePurpose::clientAuthority ? 6 : 2;
+  p.peerApplicationID = purpose == ProdigyCousinServicePurpose::clientAuthority ? destinationApp : 2;
+  p.localCousinServicePrefix = purpose == ProdigyCousinServicePurpose::clientAuthority ? MeshServices::generateStatefulService(6, 1) :
+      purpose == ProdigyCousinServicePurpose::sibling ? MeshRegistry::Pulse::siblings : MeshRegistry::Pulse::seeding;
+  p.peerCousinServicePrefix = purpose == ProdigyCousinServicePurpose::clientAuthority ? prodigyCousinClientAuthorityPrefix(destinationApp) : p.localCousinServicePrefix;
+  p.localDeploymentID = uint64_t(p.localApplicationID) << 48 | 1;
+  p.peerDeploymentID = uint64_t(p.peerApplicationID) << 48 | 2;
+  p.peerCanonicalPlanSHA256 = digest('c'); p.peerArtifactSHA256 = digest('d'); p.peerArtifactBytes = 4096;
+  p.destinationShardGroup = group; p.destinationShardGroups = groups;
+  p.authorizedService = MeshServices::constrainPrefixToGroup(p.peerCousinServicePrefix, group);
+  p.slots = {};
+  for (uint16_t slot = 0; slot < CousinRouteSlotBitmap::slotCount; ++slot)
+    if (statefulServiceGroupOwnerForSlot(slot, groups) == group) { p.slots.insert(slot); break; }
+  if (accepted) { p.baselineLogicalCores = 2; p.baselineMemoryMB = 1024; p.baselineStorageMB = 4096; }
+  return p;
+}
+
+static std::string purposePermissionJSON(ProdigyLocalCousinServicePermission p)
+{
+  uint16_t slot = 0; prodigyCousinServicePermissionSingleSlot(p, slot);
+  return std::string("{\"permissionUUID\":\"0x0601\",\"pairUUID\":\"0x0300\",\"logicalWorkloadUUID\":\"0x0301\",\"logicalServiceUUID\":\"0x0302\",\"localClusterUUID\":\"0x0401\",\"peerClusterUUID\":\"0x0402\",\"localHalf\":\"source\",\"localApplicationID\":") +
+      std::to_string(p.localApplicationID) + ",\"peerApplicationID\":" + std::to_string(p.peerApplicationID) +
+      ",\"localCousinServicePrefix\":" + std::to_string(p.localCousinServicePrefix) + ",\"peerCousinServicePrefix\":" + std::to_string(p.peerCousinServicePrefix) +
+      ",\"slots\":[" + std::to_string(slot) + "],\"localDeploymentID\":" + std::to_string(p.localDeploymentID) +
+      ",\"canonicalPlanSHA256\":\"" + p.canonicalPlanSHA256.c_str() + "\",\"artifactSHA256\":\"" + p.artifactSHA256.c_str() +
+      "\",\"artifactBytes\":" + std::to_string(p.artifactBytes) + ",\"protocolVersion\":3,\"purpose\":\"" + prodigyCousinServicePurposeName(p.purpose) +
+      "\",\"peerDeploymentID\":" + std::to_string(p.peerDeploymentID) + ",\"peerCanonicalPlanSHA256\":\"" + p.peerCanonicalPlanSHA256.c_str() +
+      "\",\"peerArtifactSHA256\":\"" + p.peerArtifactSHA256.c_str() + "\",\"peerArtifactBytes\":" + std::to_string(p.peerArtifactBytes) +
+      ",\"authorizedService\":" + std::to_string(p.authorizedService) + ",\"transportSourcePolicy\":\"exact\",\"destinationShardGroup\":" +
+      std::to_string(p.destinationShardGroup) + ",\"destinationShardGroups\":" + std::to_string(p.destinationShardGroups) + "}";
 }
 
 static bool parseLocalCousinPermissionJSON(const String& json,
@@ -259,6 +314,358 @@ static MothershipPairControlServiceTransit validPairControlServiceTransit(
 int main(void)
 {
   TestSuite suite;
+#ifdef __linux__
+  if (std::getenv("PRODIGY_TEST_PRIVATE_BGP_HOP_LIMIT_ONLY") != nullptr)
+  {
+    int fd = ::socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    int hopLimit = 0; socklen_t length = sizeof(hopLimit);
+    const bool configured = fd >= 0 && bgpConfigurePrivateMasqueHopLimit(fd) &&
+        ::getsockopt(fd, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &hopLimit, &length) == 0;
+    suite.require(configured && hopLimit == 2 && BGP_PRIVATE_MASQUE_HOP_LIMIT == 2,
+        "private_bgp_hop_limit_survives_one_connect_ip_forward");
+    if (fd >= 0) ::close(fd);
+    return suite.failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+#endif
+  static_assert(MeshRegistry::Pulse::seeding == MeshServices::generateStatefulService(2, 4));
+  static_assert(MeshRegistry::Radar::seeding == MeshServices::generateStatefulService(5, 4));
+  static_assert(MeshRegistry::Pulse::seeders == MeshRegistry::Pulse::seeding);
+  for (uint16_t app : {2, 5}) {
+    const uint64_t canonical = app == 2 ? MeshRegistry::Pulse::seeding : MeshRegistry::Radar::seeding;
+    const uint64_t legacy = app == 2 ? MeshRegistry::Pulse::legacySeedingSlot3 : MeshRegistry::Radar::legacySeedingSlot3;
+    const String name = app == 2 ? String("MeshRegistry::Pulse::seeding"_ctv) : String("MeshRegistry::Radar::seeding"_ctv);
+    const auto mapping = MeshRegistry::serviceMappings.find(name);
+    StatefulDeploymentPlan plan = {}; plan.seedingPrefix = prodigyRuntimeStatefulServicePrefix(app, 4);
+    const auto roles = StatefulMeshRoles::forShardGroup(plan, app, 0);
+    suite.require(mapping != MeshRegistry::serviceMappings.end() && mapping->second == canonical &&
+        roles.seeding == MeshServices::constrainPrefixToGroup(canonical, 0) && canonical != legacy,
+        "graph_symbolic_seeding_mapping_matches_canonical_plan_role_not_legacy_slot3");
+  }
+  for (uint32_t version : {1u, 2u}) {
+    auto old = validLocalCousinPermission(); old.protocolVersion = version;
+    if (version == 2) { old.baselineLogicalCores = 2; old.baselineMemoryMB = 1024; old.baselineStorageMB = 4096; }
+    LegacyPermissionWire frozen = {old}; String expected = {}, actual = {};
+    ProdigyLocalCousinServicePermission decoded = {};
+    suite.require(BitseryEngine::serialize(expected, frozen) && BitseryEngine::serialize(actual, old) && actual == expected &&
+        BitseryEngine::deserializeSafe(expected, decoded) && prodigyLocalCousinServicePermissionEqual(old, decoded),
+        version == 1 ? "permission_v1_frozen_wire_bytes_unchanged" : "permission_v2_frozen_wire_bytes_unchanged");
+    old.transportSourcePolicy = ProdigyCousinTransportSourcePolicy::authenticatedNAT;
+    suite.require(!prodigyLocalCousinServicePermissionValid(old), "legacy_permission_never_authorizes_nat");
+  }
+  for (auto purpose : {ProdigyCousinServicePurpose::clientAuthority, ProdigyCousinServicePurpose::sibling, ProdigyCousinServicePurpose::seeding}) {
+    auto source = purposePermission(purpose);
+    auto destination = source; destination.localHalf = CousinRouteHalf::destination; ++destination.permissionUUID;
+    std::swap(destination.localClusterUUID, destination.peerClusterUUID);
+    std::swap(destination.localApplicationID, destination.peerApplicationID);
+    std::swap(destination.localCousinServicePrefix, destination.peerCousinServicePrefix);
+    std::swap(destination.localDeploymentID, destination.peerDeploymentID);
+    std::swap(destination.canonicalPlanSHA256, destination.peerCanonicalPlanSHA256);
+    std::swap(destination.artifactSHA256, destination.peerArtifactSHA256);
+    std::swap(destination.artifactBytes, destination.peerArtifactBytes);
+    auto counterpart = validCousinCounterpart(); counterpart.permission = destination;
+    counterpart.shardGroup = 0; counterpart.shardGroups = 1; counterpart.service = source.authorizedService;
+    counterpart.ownedSlots = source.slots;
+    suite.require(prodigyLocalCousinServicePermissionValid(source) && prodigyLocalCousinServicePermissionValid(destination) &&
+        prodigyCousinCounterpartMatchesPermission(counterpart, source, 0), "v3_exact_purpose_peer_deployment_discovery");
+    if (purpose == ProdigyCousinServicePurpose::seeding) {
+      auto privatePeer = counterpart; privatePeer.routablePrefixUUID = 0; privatePeer.wormholeRevision.clear();
+      privatePeer.publicTCPPort = privatePeer.servicePort;
+      CousinRouteRecord privateRoute = {}; privateRoute.version = 3;
+      privateRoute.endpointKind = CousinRouteEndpointKind::privateContainer; privateRoute.destinationCIDR = 128;
+      privateRoute.destinationPublicAddress = privatePeer.publicAddress; privateRoute.destinationTCPPort = privatePeer.publicTCPPort;
+      MothershipNametagAllMastersSeedPlacement row = {}; row.applicationID = destination.localApplicationID;
+      row.storeKind = DeploymentIdentityStoreKind::kv; row.shardGroup = privatePeer.shardGroup;
+      row.sourceClusterUUID = destination.localClusterUUID; row.sourceDeploymentID = destination.localDeploymentID;
+      row.sourceContainerUUID = privatePeer.containerUUID;
+      ProdigyStatefulStoreSeedAuthority authority = {}; authority.sourceClusterUUID = row.sourceClusterUUID;
+      authority.sourceDeploymentID = row.sourceDeploymentID; authority.sourceContainerUUID = row.sourceContainerUUID;
+      authority.applicationID = row.applicationID; authority.storeKind = row.storeKind;
+      authority.shardGroup = row.shardGroup; authority.nShardGroups = privatePeer.shardGroups;
+      DeploymentIdentityReport report = {}; report.version = 4; report.found = report.live = report.isStateful = true;
+      // An initial source has no remote seed receipt and need not be converged.
+      report.statefulRuntimeCohortConverged = false; report.clusterUUID = row.sourceClusterUUID;
+      report.deploymentID = row.sourceDeploymentID; report.applicationID = row.applicationID;
+      report.nShardGroups = authority.nShardGroups; report.nHealthy = report.nDeployed = report.nTarget = 3;
+      DeploymentIdentityStatefulMember member = {}; member.containerUUID = member.replicaUUID = row.sourceContainerUUID;
+      member.clusterUUID = row.sourceClusterUUID; member.machineUUID = privatePeer.nodeUUID;
+      member.shardGroup = row.shardGroup; member.storeKind = row.storeKind; member.allMasters = true;
+      report.statefulRuntimeCohort.push_back(member);
+      auto sibling = member; ++sibling.containerUUID; ++sibling.replicaUUID; report.statefulRuntimeCohort.push_back(sibling);
+      ++sibling.containerUUID; ++sibling.replicaUUID; report.statefulRuntimeCohort.push_back(sibling);
+      auto matches = [&] { return mothershipNametagPrivateSeedCounterpartMatches(row, authority, privateRoute,
+          source, destination, 0, report, privatePeer); };
+      suite.require(matches(), "private_seed_route_accepts_exact_live_source_counterpart");
+      ++privatePeer.containerUUID; suite.require(!matches(), "private_seed_route_rejects_other_container"); --privatePeer.containerUUID;
+      ++report.statefulRuntimeCohort[0].machineUUID; suite.require(!matches(), "private_seed_route_rejects_other_machine"); --report.statefulRuntimeCohort[0].machineUUID;
+      privateRoute.destinationPublicAddress = IPAddress("fd42:4242:4242:2::45", true);
+      suite.require(!matches(), "private_seed_route_rejects_other_address");
+      privateRoute.destinationPublicAddress = privatePeer.publicAddress; ++privateRoute.destinationTCPPort;
+      suite.require(!matches(), "private_seed_route_rejects_other_port"); --privateRoute.destinationTCPPort;
+      report.live = false; suite.require(!matches(), "private_seed_route_rejects_stale_report"); report.live = true;
+      ++authority.sourceContainerUUID; suite.require(!matches(), "private_seed_route_rejects_other_cut_source"); --authority.sourceContainerUUID;
+      ++privatePeer.permission.permissionUUID; suite.require(!matches(), "private_seed_route_rejects_other_permission"); --privatePeer.permission.permissionUUID;
+      privateRoute.destinationRoutablePrefixUUID = 1; suite.require(!matches(), "private_seed_route_rejects_prefix_claim");
+    }
+    auto wrong = source; wrong.peerCanonicalPlanSHA256[0] = 'e';
+    suite.require(!prodigyCousinCounterpartMatchesPermission(counterpart, wrong, 0), "v3_rejects_peer_plan_substitution");
+    wrong = source; ++wrong.peerDeploymentID;
+    suite.require(!prodigyCousinCounterpartMatchesPermission(counterpart, wrong, 0), "v3_rejects_peer_deployment_substitution");
+    wrong = source; wrong.slots.insert(1);
+    suite.require(!prodigyLocalCousinServicePermissionValid(wrong), "v3_nonlegacy_rejects_extra_logical_group");
+    counterpart.shardGroups = 2;
+    suite.require(!prodigyCousinCounterpartValid(counterpart), "v3_nonlegacy_rejects_multigroup_destination");
+    auto ingress = purposePermission(purpose, false); auto json = purposePermissionJSON(ingress);
+    ProdigyLocalCousinServicePermission parsed = {}; String failure = {}, bytes = {};
+    suite.require(parseLocalCousinPermissionJSON(String(json.c_str()), parsed, failure) &&
+        prodigyLocalCousinServicePermissionIdentityScopeMatches(ingress, parsed) &&
+        prodigyLocalCousinServicePermissionRequestAccepted(parsed, source), "v3_strict_parser_accepts_exact_owner_baseline_enrichment");
+    auto malformed = json; malformed.replace(malformed.find("\"exact\""), 7, "\"anything\"");
+    suite.require(!parseLocalCousinPermissionJSON(String(malformed.c_str()), parsed, failure), "v3_parser_rejects_unknown_transport_policy");
+    malformed = json; malformed.erase(malformed.find(",\"transportSourcePolicy\"")); malformed += "}";
+    suite.require(!parseLocalCousinPermissionJSON(String(malformed.c_str()), parsed, failure), "v3_parser_rejects_partial_extension");
+    malformed = json; malformed.insert(malformed.size() - 1, ",\"purpose\":\"sibling\"");
+    suite.require(!parseLocalCousinPermissionJSON(String(malformed.c_str()), parsed, failure), "v3_parser_rejects_duplicate_purpose");
+    suite.require(BitseryEngine::serialize(bytes, source) && BitseryEngine::deserializeSafe(bytes, parsed) &&
+        prodigyLocalCousinServicePermissionEqual(source, parsed), "v3_permission_wire_roundtrip_binds_full_scope");
+    DeploymentPlan plan = {}; plan.config.applicationID = source.localApplicationID; plan.config.versionID = 1;
+    plan.config.containerBlobSHA256 = source.artifactSHA256; plan.config.containerBlobBytes = source.artifactBytes;
+    plan.isStateful = purpose != ProdigyCousinServicePurpose::clientAuthority;
+    plan.config.type = plan.isStateful ? ApplicationType::stateful : ApplicationType::stateless;
+    Whitehole declaration = {}; plan.whiteholes.push_back(declaration);
+    plan.stateful.neverShard = true;
+    plan.stateful.clientPrefix = MeshRegistry::Pulse::clients;
+    plan.stateful.siblingPrefix = MeshRegistry::Pulse::siblings; plan.stateful.seedingPrefix = MeshRegistry::Pulse::seeding;
+    plan.subscriptions.emplace_back(MeshRegistry::Truth::clients, ContainerState::healthy, ContainerState::destroying, SubscriptionNature::all);
+    suite.require(prodigyCousinPermissionPlanServiceMatches(source, plan), "v3_live_plan_declares_exact_purpose_service");
+    plan.whiteholes.clear();
+    suite.require(prodigyCousinPermissionPlanServiceMatches(source, plan),
+        "private_purpose_plan_requires_no_public_source_allocation");
+    plan.useHostNetworkNamespace = true;
+    suite.require(!prodigyCousinPermissionPlanServiceMatches(source, plan),
+        "private_purpose_plan_never_admits_host_namespace");
+    plan.useHostNetworkNamespace = false;
+    plan.whiteholes.push_back(declaration);
+    StatefulTopology catchup = {}; catchup.servingMode = StatefulTopologyServingMode::catchupOnly;
+    suite.require(prodigyCousinSourceContainerStateEligible(source, ContainerState::scheduled, true, catchup),
+        "purpose_source_can_start_before_healthy_when_runtime_ready");
+    suite.require(!prodigyCousinSourceContainerStateEligible(source, ContainerState::scheduled, false, catchup),
+        "graph_seed_requires_runtime_ready_even_before_healthy");
+    catchup.servingMode = StatefulTopologyServingMode::serve;
+    suite.require(prodigyCousinSourceContainerStateEligible(source, ContainerState::scheduled, true, catchup) ==
+        (purpose == ProdigyCousinServicePurpose::clientAuthority),
+        "prehealthy_writer_cannot_bypass_graph_source_gate");
+    if (purpose == ProdigyCousinServicePurpose::clientAuthority) {
+      suite.require(prodigyCousinSourceContainerStateEligible(source, ContainerState::crashedRestarting, true, catchup),
+          "client_authority_runtime_ready_restart_is_eligible");
+      suite.require(!prodigyCousinSourceContainerStateEligible(source, ContainerState::destroying, true, catchup),
+          "client_authority_destroying_is_ineligible");
+      auto invalidSource = source; invalidSource.localHalf = CousinRouteHalf::destination;
+      suite.require(!prodigyCousinSourceContainerStateEligible(invalidSource, ContainerState::scheduled, true, catchup),
+          "client_authority_destination_cannot_bootstrap_as_source");
+      invalidSource = source; invalidSource.protocolVersion = 1;
+      suite.require(!prodigyCousinSourceContainerStateEligible(invalidSource, ContainerState::scheduled, true, catchup),
+          "legacy_client_authority_cannot_bootstrap_as_source");
+      plan.subscriptions.clear();
+      suite.require(!prodigyCousinPermissionPlanServiceMatches(source, plan), "client_authority_requires_exact_truth_subscription");
+      plan.subscriptions.emplace_back(MeshRegistry::Hot::clients, ContainerState::healthy, ContainerState::destroying, SubscriptionNature::all);
+      suite.require(!prodigyCousinPermissionPlanServiceMatches(source, plan), "client_authority_rejects_other_database_subscription");
+    } else {
+      plan.stateful.neverShard = false;
+      suite.require(!prodigyCousinPermissionPlanServiceMatches(source, plan), "graph_permission_requires_one_group_plan");
+    }
+    plan.whiteholes.push_back(declaration);
+    suite.require(!prodigyCousinAutomaticWhiteholePlanValid(plan.whiteholes), "automatic_permission_rejects_ambiguous_source_bindings");
+  }
+  for (uint16_t app : {2, 3, 4, 5, 10}) {
+    const bool sharded = app == 3 || app == 4;
+    for (uint16_t group : {uint16_t(0), uint16_t(sharded ? 2 : 0)}) {
+      const uint16_t groups = sharded ? 4 : 1;
+      auto source = purposePermission(ProdigyCousinServicePurpose::clientAuthority, true, app, group, groups);
+      auto destination = source; destination.localHalf = CousinRouteHalf::destination; ++destination.permissionUUID;
+      std::swap(destination.localClusterUUID, destination.peerClusterUUID);
+      std::swap(destination.localApplicationID, destination.peerApplicationID);
+      std::swap(destination.localCousinServicePrefix, destination.peerCousinServicePrefix);
+      std::swap(destination.localDeploymentID, destination.peerDeploymentID);
+      std::swap(destination.canonicalPlanSHA256, destination.peerCanonicalPlanSHA256);
+      std::swap(destination.artifactSHA256, destination.peerArtifactSHA256);
+      std::swap(destination.artifactBytes, destination.peerArtifactBytes);
+      uint16_t slot = 0;
+      suite.require(prodigyCousinServicePermissionSingleSlot(source, slot) &&
+          prodigyLocalCousinServicePermissionValid(source) && prodigyLocalCousinServicePermissionValid(destination),
+          "client_authority_all_five_databases_bind_one_exact_shard_and_owned_slot");
+      auto counterpart = validCousinCounterpart(); counterpart.permission = destination;
+      counterpart.shardGroup = group; counterpart.shardGroups = groups; counterpart.service = source.authorizedService;
+      counterpart.ownedSlots = source.slots;
+      suite.require(prodigyCousinCounterpartMatchesPermission(counterpart, source, slot),
+          "client_authority_discovery_accepts_exact_retained_or_nonzero_sharded_topology");
+      auto changed = counterpart; ++changed.shardGroups;
+      suite.require(!prodigyCousinCounterpartValid(changed), "client_authority_discovery_rejects_changed_group_count");
+      auto wrong = source; ++wrong.destinationShardGroup;
+      suite.require(!prodigyLocalCousinServicePermissionValid(wrong), "client_authority_rejects_group_service_mismatch");
+      wrong = source; wrong.peerCousinServicePrefix = MeshRegistry::Truth::siblings;
+      wrong.authorizedService = MeshServices::constrainPrefixToGroup(wrong.peerCousinServicePrefix, group);
+      suite.require(!prodigyLocalCousinServicePermissionValid(wrong), "client_authority_rejects_wrong_database_role_prefix");
+      wrong = source; wrong.peerApplicationID = 11; wrong.peerDeploymentID = uint64_t(11) << 48 | 2;
+      suite.require(!prodigyLocalCousinServicePermissionValid(wrong), "client_authority_rejects_wrong_peer_application");
+      wrong = source; wrong.localApplicationID = 7; wrong.localDeploymentID = uint64_t(7) << 48 | 1;
+      wrong.localCousinServicePrefix = MeshServices::generateStatefulService(7, 1);
+      suite.require(!prodigyLocalCousinServicePermissionValid(wrong), "client_authority_source_is_only_app6_authentication_prefix");
+      auto ingress = purposePermission(ProdigyCousinServicePurpose::clientAuthority, false, app, group, groups);
+      auto json = purposePermissionJSON(ingress); ProdigyLocalCousinServicePermission parsed = {}; String failure = {}, bytes = {};
+      suite.require(parseLocalCousinPermissionJSON(String(json.c_str()), parsed, failure) &&
+          prodigyLocalCousinServicePermissionIdentityScopeMatches(ingress, parsed) &&
+          BitseryEngine::serialize(bytes, source) && BitseryEngine::deserializeSafe(bytes, parsed) &&
+          prodigyLocalCousinServicePermissionEqual(source, parsed), "client_authority_parser_and_wire_bind_exact_destination_topology");
+      auto malformed = json; malformed.insert(malformed.size() - 1, ",\"destinationShardGroup\":0");
+      suite.require(!parseLocalCousinPermissionJSON(String(malformed.c_str()), parsed, failure),
+          "client_authority_parser_rejects_duplicate_topology_field");
+      DeploymentPlan plan = {}; plan.config.applicationID = 6; plan.config.versionID = 1;
+      plan.config.type = ApplicationType::stateless; plan.config.containerBlobSHA256 = source.artifactSHA256;
+      plan.config.containerBlobBytes = source.artifactBytes; plan.whiteholes.push_back(Whitehole{});
+      plan.subscriptions.emplace_back(source.peerCousinServicePrefix, ContainerState::healthy, ContainerState::destroying, SubscriptionNature::all);
+      suite.require(prodigyCousinPermissionPlanServiceMatches(source, plan), "app6_plan_requires_selected_database_clients_prefix");
+      auto exactOnly = plan; exactOnly.subscriptions.front().service = source.authorizedService;
+      suite.require(!prodigyCousinPermissionPlanServiceMatches(source, exactOnly), "full_app6_plan_requires_prefix_not_ad_hoc_exact_service");
+      ContainerPlan materialized = {}; materialized.config = plan.config; materialized.state = ContainerState::healthy;
+      materialized.runtimeReady = true; materialized.whiteholes = plan.whiteholes;
+      materialized.subscriptions.emplace(source.peerCousinServicePrefix, plan.subscriptions.front());
+      const uint64_t sourceService = MeshServices::constrainPrefixToGroup(source.localCousinServicePrefix, 0);
+      suite.require(prodigyCousinPermissionContainerPlanMatches(source, materialized, sourceService),
+          "materialized_app6_plan_accepts_exact_declared_database_prefix");
+      materialized.state = ContainerState::scheduled;
+      suite.require(!prodigyCousinPermissionContainerPlanMatches(source, materialized, sourceService),
+          "scheduled_client_requires_subscription_active_before_healthy");
+      materialized.subscriptions.at(source.peerCousinServicePrefix).startAt = ContainerState::scheduled;
+      suite.require(prodigyCousinPermissionContainerPlanMatches(source, materialized, sourceService),
+          "scheduled_client_accepts_exact_active_subscription");
+      materialized.runtimeReady = false;
+      suite.require(!prodigyCousinPermissionContainerPlanMatches(source, materialized, sourceService),
+          "scheduled_client_requires_runtime_ready");
+      materialized.runtimeReady = true; materialized.state = ContainerState::healthy;
+      materialized.whiteholes.clear();
+      suite.require(prodigyCousinPermissionContainerPlanMatches(source, materialized, sourceService),
+          "private_materialized_app6_uses_exact_subscription_without_public_source_allocation");
+      materialized.subscriptions.clear(); auto exact = plan.subscriptions.front(); exact.service = source.authorizedService;
+      materialized.subscriptions.emplace(exact.service, exact);
+      suite.require(prodigyCousinPermissionContainerPlanMatches(source, materialized, sourceService),
+          "materialized_app6_plan_accepts_only_selected_exact_shard_under_prefix");
+      materialized.subscriptions.clear(); exact.service = MeshServices::constrainPrefixToGroup(source.peerCousinServicePrefix, group + 1);
+      materialized.subscriptions.emplace(exact.service, exact);
+      suite.require(!prodigyCousinPermissionContainerPlanMatches(source, materialized, sourceService),
+          "materialized_app6_plan_rejects_other_shard_under_same_prefix");
+      if (app == 10) {
+        auto probe = source; probe.localApplicationID = 11;
+        probe.localDeploymentID = uint64_t(11) << 48 | 1;
+        probe.localCousinServicePrefix = MeshServices::generateStatefulService(11, 1);
+        suite.require(prodigyLocalCousinServicePermissionValid(probe), "probe_client_authority_identity_is_valid");
+        auto wrongProbe = probe; wrongProbe.localCousinServicePrefix = MeshServices::generateStatefulService(6, 1);
+        suite.require(!prodigyLocalCousinServicePermissionValid(wrongProbe), "probe_rejects_other_source_identity");
+        auto probePlan = plan; probePlan.config.applicationID = 11; probePlan.whiteholes.clear();
+        Whitehole quic = {}; quic.transport = ExternalAddressTransport::quic;
+        for (uint32_t i = 0; i < 16; ++i) probePlan.whiteholes.push_back(quic);
+        suite.require(prodigyCousinPermissionPlanServiceMatches(probe, probePlan),
+            "probe_plan_accepts_private_client_authority_with_quic_whiteholes");
+        ContainerPlan probeContainer = {}; probeContainer.config = probePlan.config;
+        probeContainer.state = ContainerState::scheduled; probeContainer.runtimeReady = true;
+        probeContainer.whiteholes = probePlan.whiteholes;
+        auto scheduledSubscription = probePlan.subscriptions.front(); scheduledSubscription.startAt = ContainerState::scheduled;
+        probeContainer.subscriptions.emplace(scheduledSubscription.service, scheduledSubscription);
+        const uint64_t probeService = MeshServices::constrainPrefixToGroup(probe.localCousinServicePrefix, 0);
+        suite.require(prodigyCousinPermissionContainerPlanMatches(probe, probeContainer, probeService, true),
+            "probe_private_session_accepts_sixteen_quic_whiteholes");
+        suite.require(!prodigyCousinPermissionContainerPlanMatches(probe, probeContainer, probeService),
+            "probe_public_session_rejects_quic_whiteholes");
+        probeContainer.config.applicationID = 6;
+        suite.require(!prodigyCousinPermissionContainerPlanMatches(probe, probeContainer, probeService, true),
+            "probe_private_session_rejects_wrong_application_identity");
+      }
+      DeploymentPlan peer = {}; peer.config.applicationID = app; peer.config.versionID = 2; peer.config.type = ApplicationType::stateful;
+      peer.config.containerBlobSHA256 = destination.artifactSHA256; peer.config.containerBlobBytes = destination.artifactBytes;
+      peer.isStateful = true; peer.stateful.neverShard = !sharded; peer.stateful.clientPrefix = destination.localCousinServicePrefix;
+      suite.require(prodigyCousinPermissionPlanServiceMatches(destination, peer), "destination_plan_matches_exact_database_client_role_and_group");
+      ContainerPlan peerPlan = {}; peerPlan.config = peer.config; peerPlan.isStateful = true; peerPlan.state = ContainerState::healthy;
+      peerPlan.runtimeReady = true; peerPlan.shardGroup = group; peerPlan.nShardGroups = groups;
+      peerPlan.statefulMeshRoles = StatefulMeshRoles::forShardGroup(peer.stateful, app, group);
+      peerPlan.statefulTopology.servingMode = StatefulTopologyServingMode::serve;
+      suite.require(prodigyCousinPermissionContainerPlanMatches(destination, peerPlan, source.authorizedService),
+          "destination_materialized_plan_matches_exact_authoritative_shard");
+      peerPlan.nShardGroups += 65536;
+      suite.require(!prodigyCousinPermissionContainerPlanMatches(destination, peerPlan, source.authorizedService),
+          "destination_topology_validation_never_truncates_group_count");
+      peerPlan.nShardGroups = groups; peerPlan.statefulTopology.servingMode = StatefulTopologyServingMode::catchupOnly;
+      suite.require(!prodigyCousinPermissionContainerPlanMatches(destination, peerPlan, source.authorizedService),
+          "destination_client_authority_rejects_nonwriter_catchup_only");
+      if (!sharded) {
+        wrong = source; wrong.destinationShardGroups = 2;
+        suite.require(!prodigyLocalCousinServicePermissionValid(wrong), "retained_databases_reject_multiple_groups");
+      }
+    }
+  }
+  for (uint16_t app : {3, 4}) {
+    auto permission = purposePermission(ProdigyCousinServicePurpose::sibling);
+    permission.purpose = ProdigyCousinServicePurpose::statefulCousin;
+    permission.localApplicationID = permission.peerApplicationID = app;
+    permission.localDeploymentID = uint64_t(app) << 48 | 1;
+    permission.peerDeploymentID = uint64_t(app) << 48 | 2;
+    permission.localCousinServicePrefix = permission.peerCousinServicePrefix =
+        app == 3 ? MeshServices::generateStatefulService(3, 3) : MeshServices::generateStatefulService(4, 3);
+    permission.authorizedService = MeshServices::constrainPrefixToGroup(permission.peerCousinServicePrefix, 0);
+    permission.destinationShardGroup = permission.destinationShardGroups = 0;
+    suite.require(prodigyLocalCousinServicePermissionValid(permission), "private_kv_permission_preserves_purpose_scope");
+    DeploymentPlan plan = {};
+    plan.config.applicationID = app; plan.config.versionID = 1; plan.config.type = ApplicationType::stateful;
+    plan.config.containerBlobSHA256 = permission.artifactSHA256; plan.config.containerBlobBytes = permission.artifactBytes;
+    plan.isStateful = true; plan.stateful.cousinPrefix = permission.localCousinServicePrefix;
+    for (auto half : {CousinRouteHalf::source, CousinRouteHalf::destination}) {
+      permission.localHalf = half;
+      suite.require(prodigyCousinPermissionPlanServiceMatches(permission, plan),
+          "private_kv_plan_accepts_both_halves_without_public_allocations");
+      plan.useHostNetworkNamespace = true;
+      suite.require(!prodigyCousinPermissionPlanServiceMatches(permission, plan), "private_kv_plan_rejects_host_namespace");
+      plan.useHostNetworkNamespace = false;
+      ++plan.stateful.cousinPrefix;
+      suite.require(!prodigyCousinPermissionPlanServiceMatches(permission, plan), "private_kv_plan_rejects_wrong_cousin_service");
+      --plan.stateful.cousinPrefix;
+    }
+  }
+  for (auto purpose : {ProdigyCousinServicePurpose::sibling, ProdigyCousinServicePurpose::seeding}) {
+    for (uint16_t app : {2, 5}) {
+      auto graph = purposePermission(purpose);
+      graph.localApplicationID = graph.peerApplicationID = app;
+      graph.localDeploymentID = uint64_t(app) << 48 | 1; graph.peerDeploymentID = uint64_t(app) << 48 | 2;
+      graph.localCousinServicePrefix = graph.peerCousinServicePrefix = purpose == ProdigyCousinServicePurpose::sibling ?
+          (app == 2 ? MeshRegistry::Pulse::siblings : MeshRegistry::Radar::siblings) :
+          (app == 2 ? MeshRegistry::Pulse::seeding : MeshRegistry::Radar::seeding);
+      graph.authorizedService = MeshServices::constrainPrefixToGroup(graph.peerCousinServicePrefix, 0);
+      suite.require(prodigyLocalCousinServicePermissionValid(graph), "graph_sibling_and_seeding_are_exact_one_group_nonclient_roles");
+      auto wrong = graph; wrong.localCousinServicePrefix = wrong.peerCousinServicePrefix = prodigyCousinClientAuthorityPrefix(app);
+      wrong.authorizedService = MeshServices::constrainPrefixToGroup(wrong.peerCousinServicePrefix, 0);
+      suite.require(!prodigyLocalCousinServicePermissionValid(wrong), "graph_nonclient_purpose_cannot_authorize_clients");
+      wrong = graph; wrong.purpose = purpose == ProdigyCousinServicePurpose::sibling ? ProdigyCousinServicePurpose::seeding : ProdigyCousinServicePurpose::sibling;
+      suite.require(!prodigyLocalCousinServicePermissionValid(wrong), "graph_purpose_cannot_authorize_another_nonclient_role");
+      wrong = graph; wrong.destinationShardGroups = 2;
+      suite.require(!prodigyLocalCousinServicePermissionValid(wrong), "graph_nonclient_purposes_remain_one_group_only");
+      if (purpose == ProdigyCousinServicePurpose::seeding) {
+        wrong = graph; wrong.localCousinServicePrefix = wrong.peerCousinServicePrefix =
+            app == 2 ? MeshRegistry::Pulse::legacySeedingSlot3 : MeshRegistry::Radar::legacySeedingSlot3;
+        wrong.authorizedService = MeshServices::constrainPrefixToGroup(wrong.peerCousinServicePrefix, 0);
+        suite.require(!prodigyLocalCousinServicePermissionValid(wrong), "graph_seeding_permission_rejects_legacy_slot3_identity");
+      }
+    }
+  }
+  for (uint16_t app : {3, 4}) for (uint16_t group = 0; group < 3; ++group) {
+    auto seed = purposePermission(ProdigyCousinServicePurpose::seeding, true, app, group, 3);
+    seed.localApplicationID = seed.peerApplicationID = app;
+    seed.localDeploymentID = (uint64_t(app) << 48) | 1; seed.peerDeploymentID = (uint64_t(app) << 48) | 2;
+    seed.localCousinServicePrefix = seed.peerCousinServicePrefix = app == 3 ? MeshRegistry::Hot::seeding : MeshRegistry::Cold::seeding;
+    seed.authorizedService = MeshServices::constrainPrefixToGroup(seed.peerCousinServicePrefix, group);
+    suite.require(prodigyLocalCousinServicePermissionValid(seed) &&
+        prodigyCousinServicePermissionGroupValid(seed, group, 3), "kv_seed_permission_binds_exact_shard_group");
+    suite.require(!prodigyCousinServicePermissionGroupValid(seed, (group + 1) % 3, 3), "kv_seed_permission_rejects_other_group");
+    auto wrong = seed; wrong.peerApplicationID = app == 3 ? 4 : 3;
+    wrong.peerDeploymentID = (uint64_t(wrong.peerApplicationID) << 48) | 2;
+    suite.require(!prodigyLocalCousinServicePermissionValid(wrong), "kv_seed_permission_rejects_other_application");
+  }
   ProdigyLocalCousinServicePermission permission = validLocalCousinPermission();
   suite.require(prodigyLocalCousinServicePermissionValid(permission),
                 "local_cousin_permission_accepts_asymmetric_application_mapping");
@@ -300,8 +707,31 @@ int main(void)
                     !prodigyLocalCousinServicePermissionRequestAccepted(requestedPermission, invalidV2Receipt),
                 "local_cousin_permission_receipt_rejects_malformed_v1_or_invalid_v2_record");
   ProdigyCousinDiscoverySnapshot discovery = validCousinDiscoverySnapshot();
+  ProdigyClusterPairEnrollmentResponse capability = {};
+  capability.protocolVersion = ProdigyClusterPairEnrollmentResponse::capabilityVersion;
+  capability.privateDiscoverySupported = true;
+  String capabilityBytes = {}; ProdigyClusterPairEnrollmentResponse decodedCapability = {};
+  suite.require(BitseryEngine::serialize(capabilityBytes, capability) &&
+                BitseryEngine::deserializeSafe(capabilityBytes, decodedCapability) &&
+                decodedCapability.protocolVersion == ProdigyClusterPairEnrollmentResponse::capabilityVersion &&
+                decodedCapability.privateDiscoverySupported, "pair_enrollment_capability_v2_roundtrip");
+  capability.protocolVersion = ProdigyClusterPairEnrollmentResponse::version;
+  capability.privateDiscoverySupported = false;
+  capabilityBytes.clear(); decodedCapability = {};
+  suite.require(BitseryEngine::serialize(capabilityBytes, capability) &&
+                BitseryEngine::deserializeSafe(capabilityBytes, decodedCapability) &&
+                !decodedCapability.privateDiscoverySupported, "pair_enrollment_capability_legacy_defaults_false");
   suite.require(prodigyCousinDiscoverySnapshotValid(discovery),
                 "cousin_discovery_accepts_exact_destination_counterpart_slots");
+  auto privateDiscovery = discovery;
+  privateDiscovery.records[0].routablePrefixUUID = 0;
+  privateDiscovery.records[0].wormholeRevision.clear();
+  privateDiscovery.records[0].publicTCPPort = privateDiscovery.records[0].servicePort;
+  suite.require(!prodigyCousinDiscoverySnapshotValid(privateDiscovery), "legacy_discovery_rejects_private_endpoint");
+  privateDiscovery.protocolVersion = ProdigyCousinDiscoverySnapshot::privateContainerVersion;
+  suite.require(prodigyCousinDiscoverySnapshotValid(privateDiscovery), "private_discovery_requires_v2");
+  privateDiscovery.records[0].publicTCPPort++;
+  suite.require(!prodigyCousinDiscoverySnapshotValid(privateDiscovery), "private_discovery_requires_service_port");
   suite.require(prodigyCousinCounterpartMatchesPermission(discovery.records[0], permission, 3),
                 "cousin_discovery_matches_asymmetric_source_permission_at_owned_slot");
   auto malformedCounterpart = discovery.records[0];
@@ -468,6 +898,524 @@ int main(void)
 
   CousinRouteRecord route = validRoute();
   suite.require(cousinRouteStructurallyValid(route), "route_structural_validation_accepts_unequal_application_mapping");
+
+  CrossClusterMasqueGatewayAuthority gateway = {};
+  gateway.pairUUID = route.pairUUID;
+  gateway.pairOperationUUID = 0x2201;
+  gateway.localClusterUUID = route.sourceClusterUUID;
+  gateway.peerClusterUUID = route.destinationClusterUUID;
+  gateway.localMachineUUID = 0x2202;
+  gateway.peerMachineUUID = 0x2203;
+  gateway.localDatacenterFragment = 1;
+  gateway.peerDatacenterFragment = 2;
+  gateway.localSitePrefix = prodigyContainerDatacenterSitePrefix(1);
+  gateway.peerSitePrefix = prodigyContainerDatacenterSitePrefix(2);
+  gateway.artifactSHA256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_ctv;
+  gateway.localIdentitySHA256 = gateway.artifactSHA256;
+  gateway.peerIdentitySHA256 = gateway.artifactSHA256;
+  gateway.peerTrustSHA256 = gateway.artifactSHA256;
+  gateway.artifactBytes = 1;
+  gateway.listenerPublicUDPEndpoint = IPAddress("2001:db8::1", true);
+  gateway.listenerPublicUDPPort = 443;
+  gateway.tunnelSlot = 0;
+  gateway.privateTunnelInterface = "mtbgp0"_ctv;
+  gateway.privateTunnelLocalIPv6 = IPAddress("fd5a:4d53::1", true);
+  gateway.privateTunnelPeerIPv6 = IPAddress("fd5a:4d53::2", true);
+  gateway.privateLocalASN = 64512; gateway.privatePeerASN = 64513;
+  gateway.privateLocalBGPID = 1; gateway.privatePeerBGPID = 2;
+  String privateSessionKey = {};
+  privateSessionKey.assign("0123456789abcdef0123456789abcdef"_ctv);
+  suite.require(prodigyComputeSHA256Hex(privateSessionKey, gateway.privateSessionCredentialSHA256),
+                "private_tunnel_bgp_fixture_hashes_delivered_vault_secret");
+  gateway.localRole = CrossClusterMasqueGatewayRole::listener;
+  gateway.generation = 13;
+  gateway.pairAuthorityGeneration = 7;
+  gateway.keyGeneration = route.keyEpoch;
+  Vector<Wormhole> gatewayWormholes = {};
+  suite.require(prodigyCrossClusterMasqueGatewayWormholes(gateway, gatewayWormholes) &&
+                    gatewayWormholes.size() == 1 &&
+                    gatewayWormholes[0].externalAddress.is6 &&
+                    std::memcmp(gatewayWormholes[0].externalAddress.v6, gateway.listenerPublicUDPEndpoint.v6, 16) == 0 &&
+                    gatewayWormholes[0].externalPort == 443 && gatewayWormholes[0].containerPort == 443 &&
+                    gatewayWormholes[0].layer4 == IPPROTO_UDP && !gatewayWormholes[0].isQuic &&
+                    prodigyCrossClusterMasqueGatewayWormholesMatch(gateway, gatewayWormholes),
+                "masque_listener_publishes_exact_single_tuple_routed_udp_endpoint");
+  auto alteredGatewayWormholes = gatewayWormholes;
+  alteredGatewayWormholes[0].containerPort++;
+  suite.require(!prodigyCrossClusterMasqueGatewayWormholesMatch(gateway, alteredGatewayWormholes),
+                "masque_listener_rejects_wrong_target_port");
+  alteredGatewayWormholes = gatewayWormholes;
+  alteredGatewayWormholes[0].externalAddress = IPAddress("2001:db8::2", true);
+  suite.require(!prodigyCrossClusterMasqueGatewayWormholesMatch(gateway, alteredGatewayWormholes),
+                "masque_listener_rejects_wrong_public_authority");
+  alteredGatewayWormholes = gatewayWormholes;
+  alteredGatewayWormholes[0].externalPort++;
+  suite.require(!prodigyCrossClusterMasqueGatewayWormholesMatch(gateway, alteredGatewayWormholes),
+                "masque_listener_rejects_wrong_public_port");
+  alteredGatewayWormholes = gatewayWormholes;
+  alteredGatewayWormholes[0].isQuic = true;
+  suite.require(!prodigyCrossClusterMasqueGatewayWormholesMatch(gateway, alteredGatewayWormholes),
+                "masque_listener_rejects_cid_routing");
+  alteredGatewayWormholes = gatewayWormholes;
+  alteredGatewayWormholes.push_back(gatewayWormholes[0]);
+  suite.require(!prodigyCrossClusterMasqueGatewayWormholesMatch(gateway, alteredGatewayWormholes),
+                "masque_listener_rejects_multiple_targets");
+  auto connectorGateway = gateway;
+  connectorGateway.localRole = CrossClusterMasqueGatewayRole::connector;
+  suite.require(prodigyCrossClusterMasqueGatewayWormholes(connectorGateway, gatewayWormholes) &&
+                    gatewayWormholes.empty() && prodigyCrossClusterMasqueGatewayWormholesMatch(connectorGateway, gatewayWormholes),
+                "masque_connector_does_not_publish_listener");
+  auto ipv4Gateway = gateway;
+  ipv4Gateway.listenerPublicUDPEndpoint = IPAddress("198.51.100.20", false);
+  suite.require(prodigyCrossClusterMasqueGatewayWormholes(ipv4Gateway, gatewayWormholes) &&
+                    gatewayWormholes.size() == 1 && !gatewayWormholes[0].externalAddress.is6 &&
+                    gatewayWormholes[0].externalAddress.v4 == ipv4Gateway.listenerPublicUDPEndpoint.v4 &&
+                    prodigyCrossClusterMasqueGatewayWormholesMatch(ipv4Gateway, gatewayWormholes),
+                "masque_listener_publishes_ipv4_authority");
+  Vector<Whitehole> gatewaySources = {};
+  suite.require(prodigyCrossClusterMasqueGatewayWhiteholesValid(gateway, gatewaySources) &&
+                    !prodigyCrossClusterMasqueGatewayWhiteholesValid(connectorGateway, gatewaySources),
+                "masque_listener_needs_no_source_and_connector_requires_one");
+  Whitehole source = {};
+  source.transport = ExternalAddressTransport::quic;
+  source.family = ExternalAddressFamily::ipv6;
+  source.source = ExternalAddressSource::hostPublicAddress;
+  source.hasAddress = true;
+  source.address = IPAddress("2001:db8::99", true);
+  source.sourcePort = 49152;
+  source.bindingNonce = 1;
+  gatewaySources.push_back(source);
+  suite.require(prodigyCrossClusterMasqueGatewayWhiteholesValid(connectorGateway, gatewaySources) &&
+                    !prodigyCrossClusterMasqueGatewayWhiteholesValid(gateway, gatewaySources),
+                "masque_connector_accepts_resolved_host_source_and_listener_rejects_it");
+  gatewaySources[0].family = ExternalAddressFamily::ipv4;
+  gatewaySources[0].address = IPAddress("198.51.100.99", false);
+  suite.require(!prodigyCrossClusterMasqueGatewayWhiteholesValid(connectorGateway, gatewaySources),
+                "masque_connector_rejects_source_family_mismatch");
+  auto ipv4Connector = ipv4Gateway;
+  ipv4Connector.localRole = CrossClusterMasqueGatewayRole::connector;
+  suite.require(prodigyCrossClusterMasqueGatewayWhiteholesValid(ipv4Connector, gatewaySources),
+                "masque_connector_accepts_resolved_ipv4_source");
+  gatewaySources[0].hasAddress = false;
+  suite.require(!prodigyCrossClusterMasqueGatewayWhiteholesValid(ipv4Connector, gatewaySources),
+                "masque_connector_rejects_unresolved_source");
+  gatewaySources[0].hasAddress = true;
+  gatewaySources[0].source = ExternalAddressSource::registeredRoutablePrefix;
+  suite.require(!prodigyCrossClusterMasqueGatewayWhiteholesValid(ipv4Connector, gatewaySources),
+                "masque_connector_rejects_non_host_source");
+  gatewaySources[0].source = ExternalAddressSource::hostPublicAddress;
+  gatewaySources[0].transport = ExternalAddressTransport::tcp;
+  suite.require(!prodigyCrossClusterMasqueGatewayWhiteholesValid(ipv4Connector, gatewaySources),
+                "masque_connector_rejects_non_quic_source");
+  auto invalidGateway = gateway;
+  invalidGateway.listenerPublicUDPPort = 0;
+  suite.require(!prodigyCrossClusterMasqueGatewayWormholes(invalidGateway, gatewayWormholes) && gatewayWormholes.empty(),
+                "masque_listener_rejects_invalid_authority");
+  invalidGateway = gateway;
+  invalidGateway.state = CrossClusterMasqueGatewayState::withdrawn;
+  suite.require(!prodigyCrossClusterMasqueGatewayWormholes(invalidGateway, gatewayWormholes) && gatewayWormholes.empty(),
+                "masque_listener_withdrawal_has_no_publication");
+
+  ProdigyCrossClusterMeshRoute mesh = {};
+  suite.require(prodigyBuildCrossClusterMeshRoute(gateway, mesh) &&
+                    prodigyCrossClusterMeshRouteValid(mesh),
+                "cross_cluster_mesh_projection_accepts_current_gateway_authority");
+
+  ProdigyCrossClusterMasqueGatewayReadiness gatewayReadiness = {};
+  gatewayReadiness.pairUUID = gateway.pairUUID;
+  gatewayReadiness.localClusterUUID = gateway.localClusterUUID;
+  gatewayReadiness.localMachineUUID = gateway.localMachineUUID;
+  gatewayReadiness.keyEpoch = gateway.keyGeneration;
+  gatewayReadiness.authorityGeneration = gateway.pairAuthorityGeneration;
+  gatewayReadiness.gatewayGeneration = gateway.generation;
+  gatewayReadiness.authenticatedMasqueQUICReady = true;
+  ProdigyCrossClusterSiteBGPRoutePlan bgpPlan = {};
+  suite.require(prodigyBuildCrossClusterSiteBGPRoutePlan(gateway, &gatewayReadiness, false, bgpPlan) &&
+                    bgpPlan.localSitePrefix.equals(gateway.localSitePrefix) &&
+                    bgpPlan.localSitePrefix.cidr == 96 &&
+                    bgpPlan.action == BGPIPv6UnicastAdvertisementAction::announce,
+                "cross_cluster_bgp_announces_only_ready_local_site_96");
+  suite.require(prodigyBuildCrossClusterSiteBGPRoutePlan(gateway, &gatewayReadiness, true, bgpPlan) &&
+                    bgpPlan.action == BGPIPv6UnicastAdvertisementAction::none,
+                "cross_cluster_bgp_ready_site_reconciliation_is_idempotent");
+  gatewayReadiness.authenticatedMasqueQUICReady = false;
+  suite.require(prodigyBuildCrossClusterSiteBGPRoutePlan(gateway, &gatewayReadiness, true, bgpPlan) &&
+                    bgpPlan.action == BGPIPv6UnicastAdvertisementAction::withdraw,
+                "cross_cluster_bgp_withdraws_site_96_on_gateway_readiness_loss");
+  gatewayReadiness.authenticatedMasqueQUICReady = true;
+  ++gatewayReadiness.gatewayGeneration;
+  suite.require(prodigyBuildCrossClusterSiteBGPRoutePlan(gateway, &gatewayReadiness, true, bgpPlan) &&
+                    bgpPlan.action == BGPIPv6UnicastAdvertisementAction::withdraw,
+                "cross_cluster_bgp_rejects_stale_gateway_readiness");
+  gatewayReadiness.gatewayGeneration = gateway.generation;
+  auto withdrawnForBGP = gateway;
+  withdrawnForBGP.state = CrossClusterMasqueGatewayState::withdrawn;
+  suite.require(prodigyBuildCrossClusterSiteBGPRoutePlan(withdrawnForBGP, &gatewayReadiness, true, bgpPlan) &&
+                    bgpPlan.action == BGPIPv6UnicastAdvertisementAction::withdraw,
+                "cross_cluster_bgp_withdraws_site_96_on_authority_withdrawal");
+
+  ProdigyCrossClusterPrivateTunnelBGPDesiredState privateBGP = {};
+  privateBGP.pairUUID = gateway.pairUUID;
+  privateBGP.pairOperationUUID = gateway.pairOperationUUID;
+  privateBGP.localMachineUUID = gateway.localMachineUUID;
+  privateBGP.peerMachineUUID = gateway.peerMachineUUID;
+  privateBGP.keyEpoch = gateway.keyGeneration;
+  privateBGP.authorityGeneration = gateway.pairAuthorityGeneration;
+  privateBGP.gatewayGeneration = gateway.generation;
+  privateBGP.gatewaySlot = gateway.gatewaySlot;
+  privateBGP.localSitePrefix = gateway.localSitePrefix;
+  privateBGP.peerSitePrefix = gateway.peerSitePrefix;
+  privateBGP.tunnelInterface = gateway.privateTunnelInterface;
+  privateBGP.localGatewayInjectionIPv6 = IPAddress("fd00:1:2:3::fc", true);
+  privateBGP.localGatewaySourceIPv6 = IPAddress("fd00:1:2:3::", true);
+  privateBGP.localGatewayInjectionFragment = prodigyCrossClusterMasqueGatewayRuntimeFragmentFirst;
+  privateBGP.localInsideIPv6 = gateway.privateTunnelLocalIPv6;
+  privateBGP.peerInsideIPv6 = gateway.privateTunnelPeerIPv6;
+  privateBGP.localASN = gateway.privateLocalASN;
+  privateBGP.peerASN = gateway.privatePeerASN;
+  privateBGP.localBGPID = gateway.privateLocalBGPID;
+  privateBGP.sessionKey = privateSessionKey;
+  privateBGP.masqueReady = true;
+  BGPPeer openBuilder;
+  Buffer localOpen, peerOpen, providerOpen;
+  localOpen.need(128); peerOpen.need(128); providerOpen.need(128);
+  openBuilder.fillOpenMesage(localOpen, gateway.privateLocalBGPID, true, gateway.privateLocalASN);
+  openBuilder.fillOpenMesage(peerOpen, gateway.privatePeerBGPID, true, gateway.privatePeerASN);
+  openBuilder.fillOpenMesage(providerOpen, gateway.privateLocalBGPID, true, openBuilder.localASN);
+  suite.require(BGPPeer::openASNMatches(localOpen.data(), localOpen.size(), gateway.privateLocalASN) &&
+                    BGPPeer::openASNMatches(peerOpen.data(), peerOpen.size(), gateway.privatePeerASN) &&
+                    !BGPPeer::openASNMatches(localOpen.data(), localOpen.size(), gateway.privatePeerASN) &&
+                    !BGPPeer::openASNMatches(peerOpen.data(), peerOpen.size(), gateway.privateLocalASN) &&
+                    BGPPeer::openASNMatches(providerOpen.data(), providerOpen.size(), 35'870),
+                "private_bgp_reciprocal_open_uses_local_asn_and_provider_default");
+  String localUpdate = {}, peerUpdate = {}, providerUpdate = {};
+  openBuilder.localASN = gateway.privateLocalASN;
+  openBuilder.fillAnnouncePrefixMessage(localUpdate, gateway.localSitePrefix, gateway.privateTunnelLocalIPv6, false);
+  openBuilder.localASN = gateway.privatePeerASN;
+  openBuilder.fillAnnouncePrefixMessage(peerUpdate, gateway.peerSitePrefix, gateway.privateTunnelPeerIPv6, false);
+  openBuilder.localASN = 35'870;
+  openBuilder.fillAnnouncePrefixMessage(providerUpdate, gateway.localSitePrefix, gateway.privateTunnelLocalIPv6, false);
+  auto emittedPathASN = [](const String& update, uint16_t expected) {
+    return update.size() >= 34 && update.data()[27] == 0x40 && update.data()[28] == 0x02 &&
+        update.data()[29] == 0x04 && update.data()[30] == 0x02 && update.data()[31] == 0x01 &&
+        (uint16_t(update.data()[32]) << 8 | uint16_t(update.data()[33])) == expected;
+  };
+  suite.require(emittedPathASN(localUpdate, gateway.privateLocalASN) &&
+                    emittedPathASN(peerUpdate, gateway.privatePeerASN) &&
+                    emittedPathASN(providerUpdate, 35'870),
+                "private_bgp_updates_advertise_exact_local_asn_and_provider_default");
+  auto wrongLocalASN = privateBGP;
+  wrongLocalASN.localASN = gateway.privatePeerASN;
+  suite.require(!prodigyCrossClusterPrivateTunnelBGPMatchesAuthority(gateway, &gatewayReadiness, wrongLocalASN),
+                "private_bgp_rejects_wrong_local_asn");
+  suite.require(prodigyCrossClusterPrivateTunnelBGPMatchesAuthority(gateway, &gatewayReadiness, privateBGP),
+                "private_tunnel_bgp_binds_exact_authority_and_masque_readiness");
+  suite.require(prodigyCrossClusterPrivateTunnelBGPImportAllowed(privateBGP, privateBGP.peerInsideIPv6,
+                                                                  gateway.peerSitePrefix, false),
+                "private_tunnel_bgp_imports_only_enrolled_peer_96");
+  auto wrongPrivatePrefix = privateBGP;
+  wrongPrivatePrefix.peerSitePrefix = gateway.localSitePrefix;
+  suite.require(!prodigyCrossClusterPrivateTunnelBGPDesiredStateValid(wrongPrivatePrefix) &&
+                    !prodigyCrossClusterPrivateTunnelBGPImportAllowed(privateBGP, privateBGP.peerInsideIPv6,
+                                                                       gateway.localSitePrefix, false),
+                "private_tunnel_bgp_rejects_wrong_prefix_tag");
+  auto wrongPrivatePeer = privateBGP;
+  wrongPrivatePeer.peerInsideIPv6 = IPAddress("fd5a:4d53::3", true);
+  suite.require(!prodigyCrossClusterPrivateTunnelBGPImportAllowed(privateBGP, wrongPrivatePeer.peerInsideIPv6,
+                                                                   gateway.peerSitePrefix, false),
+                "private_tunnel_bgp_rejects_wrong_peer");
+  auto stalePrivateGeneration = privateBGP;
+  ++stalePrivateGeneration.gatewayGeneration;
+  suite.require(!prodigyCrossClusterPrivateTunnelBGPMatchesAuthority(gateway, &gatewayReadiness,
+                                                                      stalePrivateGeneration),
+                "private_tunnel_bgp_rejects_stale_gateway_generation");
+  auto wrongPrivateOperation = privateBGP;
+  ++wrongPrivateOperation.pairOperationUUID;
+  suite.require(!prodigyCrossClusterPrivateTunnelBGPMatchesAuthority(gateway, &gatewayReadiness,
+                                                                      wrongPrivateOperation),
+                "private_tunnel_bgp_rejects_wrong_pair_operation");
+  ProdigyCrossClusterPrivateTunnelBGPPath privatePath = {};
+  privatePath.state = privateBGP;
+  privatePath.localPrefixAnnounced = true;
+  privatePath.sessionEstablished = true;
+  privatePath.peerPrefixImported = true;
+  SwitchboardOverlayMachineRoute privateFallback = {};
+  suite.require(prodigyBuildCrossClusterPrivateTunnelSwitchboardFallback(gateway, privatePath, privateFallback) &&
+                    privateFallback.machineFragment == switchboardMakeOverlayDatacenterRouteKey(gateway.peerDatacenterFragment) &&
+                    privateFallback.nextHop.equals(privateBGP.localGatewayInjectionIPv6) &&
+                    privateFallback.sourceAddress.equals(privateBGP.localGatewaySourceIPv6) &&
+                    privateFallback.localContainerRedirectFragment == prodigyCrossClusterMasqueGatewayRuntimeFragmentFirst &&
+                    !privateFallback.nextHop.equals(privateBGP.peerInsideIPv6) &&
+                    !privateFallback.sourceAddress.equals(privateBGP.localInsideIPv6),
+                "private_tunnel_bgp_programs_peer_96_fallback_to_local_gateway_veth_not_private_bgp_tuple");
+  Vector<ProdigyCrossClusterPrivateTunnelBGPPath> privatePaths = {};
+  privatePaths.push_back(privatePath);
+  auto secondPrivatePath = privatePath; secondPrivatePath.state.pairUUID += 1; secondPrivatePath.state.gatewaySlot = 1;
+  auto thirdPrivatePath = privatePath; thirdPrivatePath.state.pairUUID += 2; thirdPrivatePath.state.gatewaySlot = 2;
+  privatePaths.push_back(secondPrivatePath); privatePaths.push_back(thirdPrivatePath);
+  ProdigyCrossClusterPrivateTunnelBGPPath selectedPrivatePath = {};
+  suite.require(prodigySelectCrossClusterPrivateTunnelBGPPath(privatePaths, 2, selectedPrivatePath) &&
+                    selectedPrivatePath.state.peerSitePrefix.equals(gateway.peerSitePrefix),
+                "private_tunnel_bgp_supports_three_authorized_ecmp_paths");
+  auto duplicatePairPaths = privatePaths;
+  duplicatePairPaths[1].state.pairUUID = duplicatePairPaths[0].state.pairUUID;
+  suite.require(!prodigySelectCrossClusterPrivateTunnelBGPPath(duplicatePairPaths, 2, selectedPrivatePath),
+                "private_tunnel_bgp_rejects_duplicate_pair_candidate");
+  privatePaths[1].sessionEstablished = false;
+  privatePaths[2].peerPrefixImported = false;
+  suite.require(prodigySelectCrossClusterPrivateTunnelBGPPath(privatePaths, 2, selectedPrivatePath) &&
+                    selectedPrivatePath.state.localInsideIPv6.equals(privateBGP.localInsideIPv6),
+                "private_tunnel_bgp_fails_over_when_two_paths_withdraw");
+  privatePath.peerPrefixImported = false;
+  suite.require(!prodigyBuildCrossClusterPrivateTunnelSwitchboardFallback(gateway, privatePath, privateFallback),
+                "private_tunnel_bgp_withdraws_switchboard_fallback_on_nlri_loss");
+  privatePath.peerPrefixImported = true;
+  ProdigyCrossClusterPrivateBGPReadiness privateReadiness = {};
+  suite.require(prodigyObserveCrossClusterPrivateBGPReadiness(
+                    gateway, &privatePath, true, privateReadiness) &&
+                    prodigyCrossClusterPrivateBGPReady(privateReadiness) &&
+                    prodigyCrossClusterPrivateBGPReadinessMatchesAuthority(privateReadiness, gateway),
+                "private_tunnel_bgp_observation_binds_announcement_import_and_installed_peer_96");
+  suite.require(prodigyObserveCrossClusterPrivateBGPReadiness(
+                    gateway, &privatePath, false, privateReadiness) &&
+                    !prodigyCrossClusterPrivateBGPReady(privateReadiness),
+                "private_tunnel_bgp_observation_rejects_unprogrammed_switchboard_fallback");
+  suite.require(prodigyObserveCrossClusterPrivateBGPReadiness(
+                    gateway, &privatePath, true, privateReadiness),
+                "private_tunnel_bgp_restores_fixture_readiness_for_path_fault_contract");
+  ProdigyCrossClusterPathFaultRequest pathFault = {};
+  pathFault.operationUUID = 0x2401; pathFault.authority = gateway;
+  pathFault.scope = prodigyCrossClusterPathFaultScope(gateway);
+  prodigyCrossClusterPathFaultFlowIdentity(pathFault.scope, pathFault.flowIdentity);
+  suite.require(prodigyCrossClusterPathFaultRequestValid(pathFault),
+                "cross_cluster_path_fault_derives_canonical_scope_flow_identity");
+  auto leasedPathFault = pathFault;
+  leasedPathFault.protocolVersion = ProdigyCrossClusterPathFaultRequest::leaseVersion;
+  leasedPathFault.expiresAtMilliseconds = 123456;
+  ProdigyCrossClusterPathFaultControl faultControl = {}, decodedFaultControl = {};
+  faultControl.action = ProdigyCrossClusterPathFaultGatewayAction::pause;
+  faultControl.request = leasedPathFault;
+  String faultControlWire = {};
+  suite.require(prodigyCrossClusterPathFaultControlValid(faultControl) &&
+                BitseryEngine::serialize(faultControlWire, faultControl) &&
+                BitseryEngine::deserializeSafe(faultControlWire, decodedFaultControl) &&
+                prodigyCrossClusterPathFaultControlValid(decodedFaultControl) &&
+                prodigyCrossClusterPathFaultRequestEqual(decodedFaultControl.request, leasedPathFault),
+                "cross_cluster_path_fault_control_roundtrip_preserves_exact_lease");
+  decodedFaultControl.accepted = true;
+  suite.require(!prodigyCrossClusterPathFaultControlValid(decodedFaultControl),
+                "cross_cluster_path_fault_request_cannot_claim_acknowledgement");
+  decodedFaultControl.response = true;
+  suite.require(prodigyCrossClusterPathFaultControlValid(decodedFaultControl),
+                "cross_cluster_path_fault_acknowledgement_requires_response_direction");
+  auto resumeRequest = faultControl;
+  resumeRequest.action = ProdigyCrossClusterPathFaultGatewayAction::resume;
+  auto resumeResponse = resumeRequest; resumeResponse.response = true;
+  suite.require(!prodigyCrossClusterPathFaultRetryRejectedObservation(resumeRequest, false, resumeResponse) &&
+                prodigyCrossClusterPathFaultRetryRejectedObservation(resumeRequest, true, resumeResponse),
+                "cross_cluster_path_fault_retries_completed_negative_but_preserves_pending");
+  auto mismatchedResume = resumeResponse; ++mismatchedResume.request.operationUUID;
+  suite.require(!prodigyCrossClusterPathFaultRetryRejectedObservation(resumeRequest, true, mismatchedResume),
+                "cross_cluster_path_fault_retry_rejects_different_lease");
+  resumeResponse.accepted = resumeResponse.sessionReady = resumeResponse.bgpReady = true;
+  suite.require(!prodigyCrossClusterPathFaultRetryRejectedObservation(resumeRequest, true, resumeResponse),
+                "cross_cluster_path_fault_retains_positive_autorestoration_observation");
+  auto pauseRequest = faultControl, pauseResponse = faultControl; pauseResponse.response = true;
+  suite.require(!prodigyCrossClusterPathFaultRetryRejectedObservation(pauseRequest, true, pauseResponse),
+                "cross_cluster_path_fault_retry_never_replays_pause");
+  ProdigyCrossClusterPathFaultGatewayControlPayload leaseCommand = {}, leaseResponse = {};
+  String leaseFrame = {};
+  suite.require(prodigyCrossClusterPathFaultGatewayLeasePayload(leasedPathFault,
+                    ProdigyCrossClusterPathFaultGatewayAction::pause, leaseCommand) &&
+                prodigyEncodeCrossClusterPathFaultGatewayControlFrame(leaseCommand, leaseFrame) &&
+                leaseFrame.size() == 108 &&
+                prodigyDecodeCrossClusterPathFaultGatewayControlFrame(
+                    reinterpret_cast<const uint8_t *>(leaseFrame.data()), uint32_t(leaseFrame.size()), leaseResponse),
+                "cross_cluster_path_fault_fixed_lease_roundtrip");
+  leaseResponse.fromGateway = true; leaseResponse.accepted = true;
+  suite.require(prodigyCrossClusterPathFaultGatewayLeaseResponseMatches(leaseCommand, leaseResponse),
+                "cross_cluster_path_fault_fixed_lease_response_matches");
+  ++leaseResponse.gatewayGeneration;
+  suite.require(!prodigyCrossClusterPathFaultGatewayLeaseResponseMatches(leaseCommand, leaseResponse),
+                "cross_cluster_path_fault_fixed_lease_rejects_replaced_gateway");
+  ProdigyCrossClusterPathFaultGatewayLifecycleRecord lifecycle = {};
+  lifecycle.request = pathFault;
+  lifecycle.admittedPlan.kind = SystemContainerKind::crossClusterMasqueGateway;
+  lifecycle.admittedPlan.artifact.sha256 = gateway.artifactSHA256;
+  lifecycle.admittedPlan.artifact.bytes = gateway.artifactBytes;
+  lifecycle.admittedPlan.gatewayPairUUID = gateway.pairUUID;
+  lifecycle.admittedPlan.gatewayLocalClusterUUID = gateway.localClusterUUID;
+  lifecycle.admittedPlan.gatewayLocalMachineUUID = gateway.localMachineUUID;
+  lifecycle.admittedPlan.gatewayKeyEpoch = gateway.keyGeneration;
+  lifecycle.admittedPlan.gatewayAuthorityGeneration = gateway.pairAuthorityGeneration;
+  lifecycle.admittedPlan.gatewayGeneration = gateway.generation;
+  lifecycle.admittedPlan.gatewayTunnelInterface = gateway.privateTunnelInterface;
+  lifecycle.admittedPlan.egress.peerIsIPv6 = true; lifecycle.admittedPlan.egress.protocol = IPPROTO_UDP;
+  lifecycle.admittedPlan.egress.port = gateway.listenerPublicUDPPort;
+  std::memcpy(lifecycle.admittedPlan.egress.address6, gateway.listenerPublicUDPEndpoint.v6, sizeof(lifecycle.admittedPlan.egress.address6));
+  lifecycle.admittedPlan.egress.allowIngressFromPeer = true;
+  ClusterMachine::renderIPAddressLiteral(gateway.listenerPublicUDPEndpoint, lifecycle.admittedPlan.gatewayEndpoint);
+  lifecycle.admittedPlan.gatewayLocalIdentity = gateway.localIdentitySHA256;
+  lifecycle.admittedPlan.gatewayPeerIdentity = gateway.peerIdentitySHA256;
+  lifecycle.admittedPlan.gatewayPeerTrust = gateway.peerTrustSHA256;
+  lifecycle.retiringContainerUUID = 0x2410;
+  lifecycle.admittedLaunchGeneration = 9;
+  suite.require(prodigyCrossClusterPathFaultGatewayLifecycleRecordValid(lifecycle),
+                "cross_cluster_path_fault_write_ahead_lifecycle_binds_exact_admitted_gateway_plan");
+  auto driftedLifecycle = lifecycle;
+  driftedLifecycle.admittedPlan.artifact.sha256 =
+      "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"_ctv;
+  suite.require(!prodigyCrossClusterPathFaultGatewayLifecycleRecordValid(driftedLifecycle),
+                "cross_cluster_path_fault_write_ahead_lifecycle_rejects_artifact_drift");
+  driftedLifecycle = lifecycle;
+  ++driftedLifecycle.admittedPlan.gatewayGeneration;
+  suite.require(!prodigyCrossClusterPathFaultGatewayLifecycleRecordValid(driftedLifecycle),
+                "cross_cluster_path_fault_write_ahead_lifecycle_rejects_generation_drift");
+  ProdigyCrossClusterPathFaultGatewayControlPayload gatewayControlPayload = {};
+  gatewayControlPayload.action = ProdigyCrossClusterPathFaultGatewayAction::pause;
+  gatewayControlPayload.request = pathFault;
+  String gatewayControlFrame = {};
+  ProdigyCrossClusterPathFaultGatewayControlPayload decodedGatewayControl = {};
+  suite.require(prodigyEncodeCrossClusterPathFaultGatewayControlFrame(gatewayControlPayload, gatewayControlFrame) &&
+                    prodigyDecodeCrossClusterPathFaultGatewayControlFrame(
+                        reinterpret_cast<const uint8_t *>(gatewayControlFrame.data()), uint32_t(gatewayControlFrame.size()),
+                        decodedGatewayControl) && !decodedGatewayControl.fromGateway &&
+                    decodedGatewayControl.action == ProdigyCrossClusterPathFaultGatewayAction::pause,
+                "cross_cluster_path_fault_gateway_control_uses_one_exact_bidirectional_payload");
+  gatewayControlPayload.fromGateway = true; gatewayControlPayload.accepted = true;
+  gatewayControlPayload.authenticatedReady = false;
+  suite.require(prodigyEncodeCrossClusterPathFaultGatewayControlFrame(gatewayControlPayload, gatewayControlFrame) &&
+                    prodigyDecodeCrossClusterPathFaultGatewayControlFrame(
+                        reinterpret_cast<const uint8_t *>(gatewayControlFrame.data()), uint32_t(gatewayControlFrame.size()),
+                        decodedGatewayControl),
+                "cross_cluster_path_fault_gateway_control_accepts_authenticated_down_receipt");
+  gatewayControlPayload.fromGateway = false; gatewayControlPayload.accepted = true;
+  suite.require(!prodigyEncodeCrossClusterPathFaultGatewayControlFrame(gatewayControlPayload, gatewayControlFrame),
+                "cross_cluster_path_fault_gateway_control_rejects_command_state_claim");
+  suite.require(prodigyCrossClusterPathFaultControlAuthenticated(pathFault, gateway.localIdentitySHA256) &&
+                    !prodigyCrossClusterPathFaultControlAuthenticated(pathFault,
+                        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"_ctv),
+                "cross_cluster_path_fault_control_requires_pinned_authenticated_identity");
+  ProdigyCrossClusterPathFaultInMemorySessionControl pathFaultControl = {};
+  bool fakeMasqueReady = true;
+  suite.require(pathFaultControl.pause(pathFault) && pathFaultControl.pause(pathFault) &&
+                    pathFaultControl.query(pathFault, fakeMasqueReady) && !fakeMasqueReady &&
+                    pathFaultControl.resume(pathFault) && pathFaultControl.resume(pathFault) &&
+                    pathFaultControl.query(pathFault, fakeMasqueReady) &&
+                    fakeMasqueReady,
+                "cross_cluster_path_fault_in_memory_session_control_is_exact_and_idempotent");
+  auto driftedPathFault = pathFault;
+  ++driftedPathFault.scope.gatewayGeneration;
+  suite.require(!pathFaultControl.pause(driftedPathFault),
+                "cross_cluster_path_fault_in_memory_session_control_rejects_scope_generation_drift");
+  driftedPathFault = pathFault;
+  ++driftedPathFault.authority.peerMachineUUID;
+  suite.require(!pathFaultControl.query(driftedPathFault, fakeMasqueReady),
+                "cross_cluster_path_fault_in_memory_session_control_rejects_peer_drift");
+  auto survivingGateway = gateway; ++survivingGateway.pairUUID;
+  Vector<CrossClusterMasqueGatewayAuthority> admittedPathAuthorities = {};
+  admittedPathAuthorities.push_back(gateway); admittedPathAuthorities.push_back(survivingGateway);
+  ProdigyCrossClusterPathFaultSurvivorReceipt survivor = {};
+  survivor.scope = prodigyCrossClusterPathFaultScope(survivingGateway);
+  survivor.masque = gatewayReadiness; survivor.masque.pairUUID = survivingGateway.pairUUID;
+  survivor.privateBGP = privateReadiness; survivor.privateBGP.scope.pairUUID = survivingGateway.pairUUID;
+  ProdigyCrossClusterPathFaultReceipt pathFaultReceipt = {};
+  pathFaultReceipt.request = pathFault;
+  pathFaultReceipt.selectedMasqueSessionDown = true;
+  pathFaultReceipt.selectedPrivateBGPDown = true;
+  pathFaultReceipt.selectedRouteWithdrawn = true;
+  pathFaultReceipt.selectedMasque = gatewayReadiness;
+  pathFaultReceipt.selectedMasque.authenticatedMasqueQUICReady = false;
+  pathFaultReceipt.selectedPrivateBGP = privateReadiness;
+  pathFaultReceipt.selectedPrivateBGP.sessionEstablished = false;
+  pathFaultReceipt.selectedPrivateBGP.peerSitePrefixImported = false;
+  pathFaultReceipt.selectedPrivateBGP.switchboardFallbackInstalled = false;
+  pathFaultReceipt.surviving.push_back(survivor);
+  suite.require(prodigyCrossClusterPathFaultReceiptValid(pathFault, pathFaultReceipt,
+                                                          admittedPathAuthorities),
+                "cross_cluster_path_fault_active_receipt_proves_exact_down_path_and_ready_survivor");
+  pathFaultReceipt.phase = ProdigyCrossClusterPathFaultPhase::restored;
+  pathFaultReceipt.selectedMasqueSessionDown = false;
+  pathFaultReceipt.selectedPrivateBGPDown = false;
+  pathFaultReceipt.selectedRouteWithdrawn = false;
+  pathFaultReceipt.selectedMasque = gatewayReadiness;
+  pathFaultReceipt.selectedPrivateBGP = privateReadiness;
+  suite.require(prodigyCrossClusterPathFaultReceiptValid(pathFault, pathFaultReceipt,
+                                                          admittedPathAuthorities),
+                "cross_cluster_path_fault_restored_receipt_requires_masque_and_exact_peer_96_bgp");
+  auto retargetedPathFault = pathFault;
+  ++retargetedPathFault.authority.peerMachineUUID;
+  suite.require(!prodigyCrossClusterPathFaultReceiptValid(retargetedPathFault, pathFaultReceipt,
+                                                           admittedPathAuthorities),
+                "cross_cluster_path_fault_rejects_retargeted_authority_receipt");
+  NeuronPrivateTunnelBGPRuntime privateRuntime = {};
+  suite.require(!privateRuntime.reconcile(gateway, &gatewayReadiness, &privateBGP, -1) &&
+                    privateRuntime.desiredPaths().empty(),
+                "private_tunnel_bgp_requires_delivered_vault_secret_before_runtime_creation");
+  ProdigyPairPrivateBGPSecretDeliveryResponse deliveredSecret = {};
+  deliveredSecret.accepted = true; deliveredSecret.scope.pairUUID = gateway.pairUUID;
+  deliveredSecret.scope.operationUUID = gateway.pairOperationUUID;
+  deliveredSecret.scope.keyEpoch = gateway.keyGeneration; deliveredSecret.scope.tunnelSlot = gateway.tunnelSlot;
+  deliveredSecret.scope.clusterUUID = gateway.localClusterUUID; deliveredSecret.scope.machineUUID = gateway.localMachineUUID;
+  deliveredSecret.scope.authorityGeneration = gateway.pairAuthorityGeneration;
+  deliveredSecret.scope.gatewayGeneration = gateway.generation; deliveredSecret.credential = privateSessionKey;
+  suite.require(privateRuntime.installDeliveredSecret(deliveredSecret),
+                "private_tunnel_bgp_admits_exact_delivered_vault_secret");
+  gatewayReadiness.authenticatedMasqueQUICReady = false;
+  suite.require(!privateRuntime.reconcile(gateway, &gatewayReadiness, &privateBGP, -1) &&
+                    privateRuntime.desiredPaths().empty(),
+                "private_tunnel_bgp_withdraws_on_readiness_loss");
+  gatewayReadiness.authenticatedMasqueQUICReady = true;
+
+  ProdigyCrossClusterAuthenticatedOverlayUnderlay underlay = {};
+  underlay.pairUUID = mesh.pairUUID;
+  underlay.localMachineUUID = mesh.localMachineUUID;
+  underlay.peerMachineUUID = mesh.peerMachineUUID;
+  underlay.keyEpoch = mesh.keyEpoch;
+  underlay.authorityGeneration = mesh.authorityGeneration;
+  underlay.gatewayGeneration = mesh.gatewayGeneration;
+  underlay.nextHop = IPAddress("2001:db8:feed::2", true);
+  underlay.sourceAddress = IPAddress("2001:db8:feed::1", true);
+  SwitchboardOverlayMachineRoute remoteMachineRoute = {};
+  suite.require(prodigyBuildCrossClusterOverlayMachineRoute(mesh, underlay, 0x112233u, remoteMachineRoute) &&
+                    remoteMachineRoute.machineFragment == switchboardMakeOverlayMachineIdentity(2, 0x112233u),
+                "cross_cluster_mesh_projection_builds_datacenter_fenced_remote_machine_route");
+  const uint32_t remoteMachineIdentity = switchboardMakeOverlayMachineIdentity(2, 0x445566u);
+  SwitchboardOverlayMachineRoute selectedRoute = {};
+  suite.require(prodigySelectCrossClusterOverlayRoute(remoteMachineIdentity, nullptr, mesh, underlay, selectedRoute) &&
+                    selectedRoute.machineFragment == switchboardMakeOverlayDatacenterRouteKey(2) &&
+                    selectedRoute.nextHop.equals(underlay.nextHop),
+                "cross_cluster_mesh_projection_uses_authenticated_peer_site_as_remote_96_fallback");
+  SwitchboardOverlayMachineRoute exactRoute = remoteMachineRoute;
+  exactRoute.machineFragment = remoteMachineIdentity;
+  exactRoute.nextHop = IPAddress("2001:db8:face::2", true);
+  suite.require(prodigySelectCrossClusterOverlayRoute(remoteMachineIdentity, &exactRoute, mesh, underlay, selectedRoute) &&
+                    selectedRoute.nextHop.equals(exactRoute.nextHop),
+                "cross_cluster_mesh_projection_prefers_exact_dc_machine_route_over_site_fallback");
+  suite.require(!prodigySelectCrossClusterOverlayRoute(0, nullptr, mesh, underlay, selectedRoute) &&
+                    !prodigySelectCrossClusterOverlayRoute(switchboardMakeOverlayMachineIdentity(3, 1), nullptr, mesh, underlay, selectedRoute),
+                "cross_cluster_mesh_projection_rejects_default_88_and_unenrolled_datacenter");
+
+  auto withdrawnGateway = gateway;
+  withdrawnGateway.state = CrossClusterMasqueGatewayState::withdrawn;
+  ProdigyCrossClusterMeshRoute staleMesh = {};
+  suite.require(!prodigyBuildCrossClusterMeshRoute(withdrawnGateway, staleMesh),
+                "cross_cluster_mesh_projection_rejects_withdrawn_gateway");
+  underlay.nextHop = underlay.sourceAddress;
+  suite.require(!prodigyBuildCrossClusterOverlayMachineRoute(mesh, underlay, 0x112233u, remoteMachineRoute),
+                "cross_cluster_mesh_projection_refuses_underlay_loop");
+  underlay.nextHop = IPAddress("2001:db8:feed::2", true);
+  underlay.authorityGeneration++;
+  suite.require(!prodigyBuildCrossClusterOverlayMachineRoute(mesh, underlay, 0x112233u, remoteMachineRoute),
+                "cross_cluster_mesh_projection_rejects_stale_underlay_authority");
+  underlay.authorityGeneration = mesh.authorityGeneration;
+  underlay.gatewayGeneration++;
+  suite.require(!prodigyBuildCrossClusterOverlayMachineRoute(mesh, underlay, 0x112233u, remoteMachineRoute),
+                "cross_cluster_mesh_projection_rejects_stale_gateway_generation");
+  underlay.gatewayGeneration = mesh.gatewayGeneration;
+  mesh.peerDatacenterFragment = 1;
+  suite.require(!prodigyBuildCrossClusterOverlayMachineRoute(mesh, underlay, 0x112233u, remoteMachineRoute),
+                "cross_cluster_mesh_projection_rejects_datacenter_collision");
   String routeDigest = {};
   suite.require(cousinRouteAuthorizationDigest(route, routeDigest), "route_digest_constructs");
   suite.require(routeDigest.size() == 64, "route_digest_is_sha256");
@@ -554,6 +1502,22 @@ int main(void)
   suite.require(slotCoverageIsExact(allSlots, 7), "all_slots_assign_once_with_seven_groups");
 
   CousinRouteRecord prefixMismatch = route;
+  CousinRouteRecord privateRoute = route;
+  privateRoute.version = 3;
+  privateRoute.endpointKind = CousinRouteEndpointKind::privateContainer;
+  privateRoute.destinationRoutablePrefixUUID = 0;
+  privateRoute.destinationCIDR = 128;
+  String privateBytes = {};
+  CousinRouteRecord decodedPrivate = {};
+  suite.require(cousinRouteStructurallyValid(privateRoute) &&
+                BitseryEngine::serialize(privateBytes, privateRoute) &&
+                BitseryEngine::deserializeSafe(privateBytes, decodedPrivate) &&
+                cousinRouteExactMatches(privateRoute, decodedPrivate), "private_route_v3_roundtrip");
+  decodedPrivate.destinationRoutablePrefixUUID = 1;
+  suite.require(!cousinRouteStructurallyValid(decodedPrivate), "private_route_rejects_external_prefix");
+  decodedPrivate = privateRoute;
+  decodedPrivate.endpointKind = CousinRouteEndpointKind::externalWormhole;
+  suite.require(!cousinRouteStructurallyValid(decodedPrivate), "private_route_requires_explicit_endpoint_kind");
   prefixMismatch.sourceApplicationID = 8;
   suite.require(!cousinRouteStructurallyValid(prefixMismatch), "source_prefix_must_encode_source_application");
   CousinRouteRecord missingPermission = route;
@@ -1211,7 +2175,7 @@ int main(void)
       String bytes = currentBytes.substr(0, cut, Copy::yes);
       suite.require(!BitseryEngine::deserializeSafe(bytes, truncated), "pair_control_service_set_rejects_truncated_wire");
     }
-    currentBytes[0] = 5;
+    currentBytes[0] = 255;
     MothershipClusterPairEnrollmentIntent unsupported = {};
     suite.require(!BitseryEngine::deserializeSafe(currentBytes, unsupported) || !mothershipClusterPairEnrollmentIntentValid(unsupported),
                   "pair_control_service_set_rejects_unknown_wire_version");

@@ -1342,18 +1342,32 @@ static inline void prodigyBuildBundleInstallCommand(const String& bundlePath, co
   prodigyAppendShellSingleQuoted(command, bundleSHA256Path);
   command.append(" "_ctv);
   prodigyAppendShellSingleQuoted(command, tempBundleSHA256Path);
+  // An unexpected machine reset can follow publication of the live root.
+  // Make the extracted files and their directory entries durable
+  // before publishing the replacement, then make every namespace transition
+  // durable before the caller can exec it.
+  command.append("; sync -f "_ctv);
+  prodigyAppendShellSingleQuoted(command, paths.installRootTemp);
   command.append("; if [ -e "_ctv);
   prodigyAppendShellSingleQuoted(command, paths.installRoot);
   command.append(" ]; then mv "_ctv);
   prodigyAppendShellSingleQuoted(command, paths.installRoot);
   command.append(" "_ctv);
   prodigyAppendShellSingleQuoted(command, paths.installRootPrevious);
+  command.append("; sync -f "_ctv);
+  String installParent = {};
+  prodigyDirname(paths.installRoot, installParent);
+  prodigyAppendShellSingleQuoted(command, installParent);
   command.append("; fi; mv "_ctv);
   prodigyAppendShellSingleQuoted(command, paths.installRootTemp);
   command.append(" "_ctv);
   prodigyAppendShellSingleQuoted(command, paths.installRoot);
+  command.append("; sync -f "_ctv);
+  prodigyAppendShellSingleQuoted(command, installParent);
   command.append("; rm -rf "_ctv);
   prodigyAppendShellSingleQuoted(command, paths.installRootPrevious);
+  command.append("; sync -f "_ctv);
+  prodigyAppendShellSingleQuoted(command, installParent);
 
 }
 

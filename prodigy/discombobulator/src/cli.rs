@@ -67,6 +67,7 @@ pub enum OutputKindArg {
     App,
     Base,
     MothershipTunnelProvider,
+    CrossClusterMasqueGateway,
 }
 
 #[derive(Args)]

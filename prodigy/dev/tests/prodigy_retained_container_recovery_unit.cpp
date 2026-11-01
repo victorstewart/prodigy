@@ -124,6 +124,121 @@ static void expectCompactStartupCPURecovery()
   assert(prodigyBuildRetainedContainerBootstrap(plan,decoded,machineFragment,datacenterFragment,observedCreatedAtMs,bootstrap,&failure));
 }
 
+static void expectGraphReplicaRecovery()
+{
+  for (uint16_t app : {uint16_t(2), uint16_t(5)}) {
+    DeploymentPlan plan = deployment(true);
+    plan.config.applicationID = app; plan.stateful.allMasters = false;
+    plan.stateful.seedingAlways = true;
+    plan.stateful.clientPrefix = 0;
+    plan.stateful.siblingPrefix = prodigyRuntimeStatefulServicePrefix(app, 2);
+    plan.stateful.cousinPrefix = prodigyRuntimeStatefulServicePrefix(app, 3);
+    plan.stateful.seedingPrefix = prodigyRuntimeStatefulServicePrefix(app, 4);
+    plan.stateful.shardingPrefix = prodigyRuntimeStatefulServicePrefix(app, 5);
+    plan.whiteholes.emplace_back();
+    assert(prodigyGraphDeploymentPlanCanonical(plan, true));
+    auto parameters = parametersFor(plan);
+    parameters.advertisesOnPorts.erase(0);
+    parameters.statefulTopology.servingMode = StatefulTopologyServingMode::catchupOnly;
+    Whitehole egress = plan.whiteholes[0]; egress.hasAddress = true;
+    egress.address = IPAddress("2001:db8::7", true); egress.sourcePort = 12009; egress.bindingNonce = 91;
+    parameters.whiteholes.push_back(egress);
+    NeuronContainerBootstrap bootstrap; String failure;
+    auto recover = [&](const ContainerParameters& candidate) {
+      return prodigyBuildRetainedContainerBootstrap(plan, candidate, machineFragment, datacenterFragment,
+          observedCreatedAtMs, bootstrap, &failure);
+    };
+    assert(recover(parameters));
+    assert(bootstrap.plan.shardGroup == 0 && bootstrap.plan.nShardGroups == 1 &&
+        bootstrap.plan.statefulMeshRoles.client == 0 && bootstrap.plan.advertisements.size() == 2 &&
+        bootstrap.plan.whiteholes[0].bindingNonce == egress.bindingNonce &&
+        bootstrap.plan.statefulTopology.servingMode == StatefulTopologyServingMode::catchupOnly);
+    String encoded; BitseryEngine::serialize(encoded, parameters); ContainerParameters readback;
+    assert(BitseryEngine::deserializeSafe(encoded, readback) && recover(readback));
+    auto bad = parameters; bad.statefulTopology.shardGroup = 1; assert(!recover(bad));
+    bad = parameters; bad.statefulTopology.servingMode = StatefulTopologyServingMode::serve; assert(!recover(bad));
+    bad = parameters; ++bad.statefulTopology.topologyEpoch; assert(!recover(bad));
+    bad = parameters; bad.statefulMeshRoles.client = prodigyRuntimeStatefulServicePrefix(app, 1); assert(!recover(bad));
+    bad = parameters; bad.advertisesOnPorts[prodigyRuntimeStatefulServicePrefix(app, 1)] = 12003; assert(!recover(bad));
+    bad = parameters; bad.whiteholes[0].bindingNonce = 0; assert(!recover(bad));
+    assert(!prodigyGraphTopologyCanonical(plan, parameters.statefulTopology, 2));
+    plan.config.applicationID = 10;
+    assert(!prodigyGraphDeploymentPlanCanonical(plan, true));
+  }
+}
+
+static void expectGraphAllMastersRecovery()
+{
+  for (uint16_t app : {uint16_t(2), uint16_t(5)}) {
+    DeploymentPlan plan = deployment(true);
+    plan.config.applicationID = app;
+    plan.stateful.allMasters = true;
+    plan.stateful.seedingAlways = false;
+    plan.stateful.clientPrefix = prodigyRuntimeStatefulServicePrefix(app, 1);
+    plan.stateful.siblingPrefix = prodigyRuntimeStatefulServicePrefix(app, 2);
+    plan.stateful.cousinPrefix = prodigyRuntimeStatefulServicePrefix(app, 3);
+    plan.stateful.seedingPrefix = prodigyRuntimeStatefulServicePrefix(app, 4);
+    plan.stateful.shardingPrefix = prodigyRuntimeStatefulServicePrefix(app, 5);
+    assert(prodigyGraphDeploymentPlanCanonical(plan, false));
+    assert(!prodigyGraphDeploymentPlanCanonical(plan, true));
+    auto parameters = parametersFor(plan);
+    NeuronContainerBootstrap bootstrap; String failure;
+    assert(prodigyBuildRetainedContainerBootstrap(plan, parameters, machineFragment, datacenterFragment,
+        observedCreatedAtMs, bootstrap, &failure));
+    const auto generated = StatefulMeshRoles::forShardGroup(plan.stateful, app, 0);
+    assert(bootstrap.plan.statefulMeshRoles.client == generated.client);
+    assert(bootstrap.plan.statefulMeshRoles.seeding == generated.seeding);
+    assert(bootstrap.plan.statefulMeshRoles.cousin == 0 && bootstrap.plan.statefulMeshRoles.sharding == 0);
+    assert(bootstrap.plan.nShardGroups == 1 && bootstrap.plan.shardGroup == 0);
+    assert(bootstrap.plan.whiteholes.empty());
+    auto badPlan = plan; badPlan.stateful.clientPrefix = 0;
+    assert(!prodigyGraphDeploymentPlanCanonical(badPlan, false));
+    badPlan = plan; ++badPlan.stateful.siblingPrefix;
+    assert(!prodigyGraphDeploymentPlanCanonical(badPlan, false));
+    badPlan = plan; ++badPlan.stateful.seedingPrefix;
+    assert(!prodigyGraphDeploymentPlanCanonical(badPlan, false));
+    badPlan = plan; badPlan.stateful.seedingAlways = true;
+    assert(!prodigyGraphDeploymentPlanCanonical(badPlan, false));
+    badPlan = plan; badPlan.whiteholes.emplace_back();
+    assert(!prodigyGraphDeploymentPlanCanonical(badPlan, false));
+    auto badParameters = parameters; badParameters.statefulTopology.shardGroup = 1;
+    assert(!prodigyBuildRetainedContainerBootstrap(plan, badParameters, machineFragment, datacenterFragment,
+        observedCreatedAtMs, bootstrap, &failure));
+    badParameters = parameters; badParameters.statefulTopology.servingMode = StatefulTopologyServingMode::catchupOnly;
+    assert(!prodigyBuildRetainedContainerBootstrap(plan, badParameters, machineFragment, datacenterFragment,
+        observedCreatedAtMs, bootstrap, &failure));
+    assert(!prodigyGraphTopologyCanonical(plan, parameters.statefulTopology, 2));
+  }
+}
+
+static void expectLegacyGraphWriterEgressRecovery()
+{
+  for (uint16_t app : {uint16_t(2), uint16_t(5)}) {
+    DeploymentPlan plan = deployment(true);
+    plan.config.applicationID = app; plan.stateful.allMasters = false; plan.stateful.seedingAlways = true;
+    plan.stateful.clientPrefix = prodigyRuntimeStatefulServicePrefix(app, 1);
+    plan.stateful.siblingPrefix = prodigyRuntimeStatefulServicePrefix(app, 2);
+    plan.stateful.cousinPrefix = prodigyRuntimeStatefulServicePrefix(app, 3);
+    plan.stateful.seedingPrefix = prodigyRuntimeStatefulServicePrefix(app, 4);
+    plan.stateful.shardingPrefix = prodigyRuntimeStatefulServicePrefix(app, 5);
+    plan.whiteholes.emplace_back();
+    assert(prodigyGraphDeploymentPlanCanonical(plan, false));
+    auto parameters = parametersFor(plan);
+    Whitehole egress = plan.whiteholes[0]; egress.hasAddress = true;
+    egress.address = IPAddress("2001:db8::8", true); egress.sourcePort = 12010; egress.bindingNonce = 92;
+    parameters.whiteholes.push_back(egress);
+    NeuronContainerBootstrap bootstrap; String failure;
+    assert(prodigyBuildRetainedContainerBootstrap(plan, parameters, machineFragment, datacenterFragment,
+        observedCreatedAtMs, bootstrap, &failure));
+    auto bad = parameters; bad.whiteholes.clear();
+    assert(!prodigyBuildRetainedContainerBootstrap(plan, bad, machineFragment, datacenterFragment,
+        observedCreatedAtMs, bootstrap, &failure));
+    bad = parameters; bad.whiteholes[0].bindingNonce = 0;
+    assert(!prodigyBuildRetainedContainerBootstrap(plan, bad, machineFragment, datacenterFragment,
+        observedCreatedAtMs, bootstrap, &failure));
+  }
+}
+
 static void expectColdInventoryRejectsRetainedUnownedProcesses()
 {
   const auto scratch = std::filesystem::current_path() / ".run";
@@ -166,6 +281,9 @@ static void expectColdInventoryRejectsRetainedUnownedProcesses()
 
 int main()
 {
+  expectGraphReplicaRecovery();
+  expectGraphAllMastersRecovery();
+  expectLegacyGraphWriterEgressRecovery();
   expectColdInventoryRejectsRetainedUnownedProcesses();
   expectCompactStartupCPURecovery();
   expectReplicaAndShardableRecovery();

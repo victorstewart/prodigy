@@ -1,7 +1,7 @@
 #pragma once
 
 #include <cstdint>
-#include <networking/includes.h>
+#include <basics/includes.h>
 #include <openssl/evp.h>
 
 static inline void prodigyAppendHexByte(String& digest, uint8_t value)

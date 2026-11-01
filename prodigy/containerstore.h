@@ -341,7 +341,7 @@ private:
     return true;
   }
 
-  static bool storeSystemBlobWithKey(const String& sha256, uint64_t bytes, const String& blob, String *failureReport, const String *storeRoot)
+  static bool storeSystemBlobWithKey(SystemContainerKind kind, const String& sha256, uint64_t bytes, const String& blob, String *failureReport, const String *storeRoot)
   {
     String root = storeRoot ? *storeRoot : String("/containers/system-store"_ctv);
     std::error_code createError = {};
@@ -357,7 +357,7 @@ private:
       return false;
     }
 
-    String path = pathForSystemArtifactWithinRoot(root, sha256);
+    String path = pathForSystemArtifactWithinRoot(root, kind, sha256);
     String parent = {};
     prodigyDirname(path, parent);
     createError.clear();
@@ -434,7 +434,7 @@ private:
     return false;
   }
 
-  static String pathForSystemArtifactWithinRoot(const String& storeRoot, const String& sha256)
+  static String pathForSystemArtifactWithinRoot(const String& storeRoot, SystemContainerKind kind, const String& sha256)
   {
     String path = {};
     path.assign(storeRoot);
@@ -442,7 +442,12 @@ private:
     {
       path.append('/');
     }
-    path.append("mothership-tunnel-provider/"_ctv);
+    switch (kind)
+    {
+      case SystemContainerKind::mothershipTunnelProvider: path.append("mothership-tunnel-provider/"_ctv); break;
+      case SystemContainerKind::crossClusterMasqueGateway: path.append("cross-cluster-masque-gateway/"_ctv); break;
+      default: return {};
+    }
     path.append(sha256);
     path.append(".blob"_ctv);
     return path;
@@ -469,12 +474,28 @@ private:
     return true;
   }
 
-  static bool validateSystemArtifactContract(const String& blob, String *failureReport = nullptr)
+  static bool validateSystemArtifactKind(SystemContainerKind kind, String *failureReport = nullptr)
   {
-    String headerText = prodigyDiscombobulatorMothershipTunnelProviderBlobHeaderText();
+    if (kind == SystemContainerKind::mothershipTunnelProvider || kind == SystemContainerKind::crossClusterMasqueGateway)
+    {
+      return true;
+    }
+    if (failureReport) failureReport->assign("unsupported system container artifact kind"_ctv);
+    return false;
+  }
+
+  static bool validateSystemArtifactContract(SystemContainerKind kind, const String& blob, String *failureReport = nullptr)
+  {
+    if (validateSystemArtifactKind(kind, failureReport) == false) return false;
+    String headerText = kind == SystemContainerKind::mothershipTunnelProvider ?
+        prodigyDiscombobulatorMothershipTunnelProviderBlobHeaderText() :
+        prodigyDiscombobulatorCrossClusterMasqueGatewayBlobHeaderText();
     String header = {};
     header.assign(blob.substr(0, headerText.size(), Copy::yes));
-    if (prodigyValidateDiscombobulatorMothershipTunnelProviderBlobHeaderText(header, failureReport) == false)
+    const bool valid = kind == SystemContainerKind::mothershipTunnelProvider ?
+        prodigyValidateDiscombobulatorMothershipTunnelProviderBlobHeaderText(header, failureReport) :
+        prodigyValidateDiscombobulatorCrossClusterMasqueGatewayBlobHeaderText(header, failureReport);
+    if (valid == false)
     {
       return false;
     }
@@ -797,14 +818,19 @@ public:
     return containsAtPath(deploymentID, pathForContainerImage(deploymentID));
   }
 
-  static String systemPathForArtifact(const String& sha256, const String *storeRoot = nullptr)
+  static String systemPathForArtifact(SystemContainerKind kind, const String& sha256, const String *storeRoot = nullptr)
   {
-    return pathForSystemArtifactWithinRoot(storeRoot ? *storeRoot : String("/containers/system-store"_ctv), sha256);
+    return pathForSystemArtifactWithinRoot(storeRoot ? *storeRoot : String("/containers/system-store"_ctv), kind, sha256);
   }
 
-  static bool systemStore(const String& sha256, uint64_t bytes, const String& blob, String *failureReport = nullptr, const String *storeRoot = nullptr)
+  static String systemPathForArtifact(const String& sha256, const String *storeRoot = nullptr)
   {
-    if (validateSystemArtifactKey(sha256, bytes, failureReport) == false || validateSystemArtifactContract(blob, failureReport) == false)
+    return systemPathForArtifact(SystemContainerKind::mothershipTunnelProvider, sha256, storeRoot);
+  }
+
+  static bool systemStore(SystemContainerKind kind, const String& sha256, uint64_t bytes, const String& blob, String *failureReport = nullptr, const String *storeRoot = nullptr)
+  {
+    if (validateSystemArtifactKey(sha256, bytes, failureReport) == false || validateSystemArtifactContract(kind, blob, failureReport) == false)
     {
       return false;
     }
@@ -830,32 +856,43 @@ public:
       return false;
     }
 
-    return storeSystemBlobWithKey(sha256, bytes, blob, failureReport, storeRoot);
+    return storeSystemBlobWithKey(kind, sha256, bytes, blob, failureReport, storeRoot);
   }
 
-  static bool systemStore(const String& blob, String& sha256, uint64_t& bytes, String *failureReport = nullptr, const String *storeRoot = nullptr)
+  static bool systemStore(const String& sha256, uint64_t bytes, const String& blob, String *failureReport = nullptr, const String *storeRoot = nullptr)
+  {
+    return systemStore(SystemContainerKind::mothershipTunnelProvider, sha256, bytes, blob, failureReport, storeRoot);
+  }
+
+  static bool systemStore(SystemContainerKind kind, const String& blob, String& sha256, uint64_t& bytes, String *failureReport = nullptr, const String *storeRoot = nullptr)
   {
     sha256.clear();
     bytes = 0;
-    if (validateSystemArtifactContract(blob, failureReport) == false || prodigyComputeSHA256Hex(blob, sha256, failureReport) == false)
+    if (validateSystemArtifactContract(kind, blob, failureReport) == false || prodigyComputeSHA256Hex(blob, sha256, failureReport) == false)
     {
       return false;
     }
 
     bytes = blob.size();
-    return storeSystemBlobWithKey(sha256, bytes, blob, failureReport, storeRoot);
+    return storeSystemBlobWithKey(kind, sha256, bytes, blob, failureReport, storeRoot);
   }
 
-  static bool systemVerify(const String& sha256, uint64_t bytes, String *actualDigest = nullptr, uint64_t *actualBytes = nullptr, String *failureReport = nullptr, const String *storeRoot = nullptr)
+  static bool systemStore(const String& blob, String& sha256, uint64_t& bytes, String *failureReport = nullptr, const String *storeRoot = nullptr)
   {
-    String path = pathForSystemArtifactWithinRoot(storeRoot ? *storeRoot : String("/containers/system-store"_ctv), sha256);
+    return systemStore(SystemContainerKind::mothershipTunnelProvider, blob, sha256, bytes, failureReport, storeRoot);
+  }
+
+  static bool systemVerify(SystemContainerKind kind, const String& sha256, uint64_t bytes, String *actualDigest = nullptr, uint64_t *actualBytes = nullptr, String *failureReport = nullptr, const String *storeRoot = nullptr)
+  {
+    String path = pathForSystemArtifactWithinRoot(storeRoot ? *storeRoot : String("/containers/system-store"_ctv), kind, sha256);
     if (validateSystemArtifactKey(sha256, bytes, failureReport) == false ||
+        validateSystemArtifactKind(kind, failureReport) == false ||
         verifyStoredBlobAtPath(path, sha256, bytes, actualDigest, actualBytes, failureReport) == false)
     {
       return false;
     }
 
-    String headerText = prodigyDiscombobulatorMothershipTunnelProviderBlobHeaderText();
+    String headerText = kind == SystemContainerKind::mothershipTunnelProvider ? prodigyDiscombobulatorMothershipTunnelProviderBlobHeaderText() : prodigyDiscombobulatorCrossClusterMasqueGatewayBlobHeaderText();
     if (bytes <= headerText.size())
     {
       if (failureReport)
@@ -866,18 +903,25 @@ public:
     }
     String header = {};
     Filesystem::openReadAtClose(-1, path, header, headerText.size());
-    return prodigyValidateDiscombobulatorMothershipTunnelProviderBlobHeaderText(header, failureReport);
+    return kind == SystemContainerKind::mothershipTunnelProvider ?
+        prodigyValidateDiscombobulatorMothershipTunnelProviderBlobHeaderText(header, failureReport) :
+        prodigyValidateDiscombobulatorCrossClusterMasqueGatewayBlobHeaderText(header, failureReport);
   }
 
-  static bool systemLoadVerified(const String& sha256, uint64_t bytes, String& blob, String *failureReport = nullptr, const String *storeRoot = nullptr)
+  static bool systemVerify(const String& sha256, uint64_t bytes, String *actualDigest = nullptr, uint64_t *actualBytes = nullptr, String *failureReport = nullptr, const String *storeRoot = nullptr)
+  {
+    return systemVerify(SystemContainerKind::mothershipTunnelProvider, sha256, bytes, actualDigest, actualBytes, failureReport, storeRoot);
+  }
+
+  static bool systemLoadVerified(SystemContainerKind kind, const String& sha256, uint64_t bytes, String& blob, String *failureReport = nullptr, const String *storeRoot = nullptr)
   {
     String root = storeRoot ? *storeRoot : String("/containers/system-store"_ctv);
     blob.clear();
-    if (systemVerify(sha256, bytes, nullptr, nullptr, failureReport, &root) == false)
+    if (systemVerify(kind, sha256, bytes, nullptr, nullptr, failureReport, &root) == false)
     {
       return false;
     }
-    Filesystem::openReadAtClose(-1, pathForSystemArtifactWithinRoot(root, sha256), blob);
+    Filesystem::openReadAtClose(-1, pathForSystemArtifactWithinRoot(root, kind, sha256), blob);
     if (blob.size() != bytes)
     {
       if (failureReport)
@@ -887,6 +931,11 @@ public:
       return false;
     }
     return true;
+  }
+
+  static bool systemLoadVerified(const String& sha256, uint64_t bytes, String& blob, String *failureReport = nullptr, const String *storeRoot = nullptr)
+  {
+    return systemLoadVerified(SystemContainerKind::mothershipTunnelProvider, sha256, bytes, blob, failureReport, storeRoot);
   }
 
   static void destroy(uint64_t deploymentID)

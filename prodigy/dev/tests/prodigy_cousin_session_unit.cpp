@@ -1,153 +1,20 @@
 #include <prodigy/cousin.session.client.h>
 #include <prodigy/ingress.validation.h>
+#include "owned_ipv6_fixture.h"
 #include <cstdio>
 #include <cerrno>
 #include <netinet/tcp.h>
 #include <unistd.h>
 
 static unsigned failures = 0;
+static IPAddress localTestAddress = {};
 static void expect(bool value, const char *name)
 {
   std::printf("%s: %s\n", value ? "PASS" : "FAIL", name);
   if (!value) ++failures;
 }
 
-static ProdigyCousinDiscoveryPublication buildDiscoveryPublication(uint128_t nodeUUID,
-                                                                  uint128_t sourceClusterUUID,
-                                                                  uint128_t peerClusterUUID,
-                                                                  uint128_t pairUUID,
-                                                                  uint64_t rootGeneration,
-                                                                  uint64_t keyEpoch,
-                                                                  uint64_t projectionGeneration)
-{
-  ProdigyCousinDiscoveryPublication publication = {};
-  publication.nodeUUID = nodeUUID;
-  publication.projectionGeneration = projectionGeneration;
-  auto& snapshot = publication.snapshot;
-  snapshot.pairUUID = pairUUID;
-  snapshot.sourceClusterUUID = sourceClusterUUID;
-  snapshot.peerClusterUUID = peerClusterUUID;
-  snapshot.rootGeneration = rootGeneration;
-  snapshot.keyEpoch = keyEpoch;
-  snapshot.authorityGeneration = projectionGeneration;
-  ProdigyCousinCounterpart counterpart = {};
-  counterpart.permission.permissionUUID = 0x7e01;
-  counterpart.permission.pairUUID = pairUUID;
-  counterpart.permission.logicalWorkloadUUID = 0x7e02;
-  counterpart.permission.logicalServiceUUID = 0x7e03;
-  counterpart.permission.localClusterUUID = sourceClusterUUID;
-  counterpart.permission.peerClusterUUID = peerClusterUUID;
-  counterpart.permission.localHalf = CousinRouteHalf::destination;
-  counterpart.permission.localApplicationID = 7;
-  counterpart.permission.peerApplicationID = 19;
-  counterpart.permission.localCousinServicePrefix = MeshServices::generateStatefulService(7, 3);
-  counterpart.permission.peerCousinServicePrefix = MeshServices::generateStatefulService(19, 3);
-  counterpart.permission.slots.insert(3);
-  counterpart.permission.localDeploymentID = 0x7000000000001;
-  for (uint32_t index = 0; index < 64; ++index) {
-    counterpart.permission.canonicalPlanSHA256.append('a'); counterpart.permission.artifactSHA256.append('b');
-  }
-  counterpart.permission.artifactBytes = 1;
-  counterpart.permission.generation = 1;
-  counterpart.permission.acceptedAuthorityGeneration = projectionGeneration;
-  counterpart.permission.state = ProdigyLocalCousinServicePermissionState::active;
-  counterpart.containerUUID = 0x7e04;
-  counterpart.nodeUUID = nodeUUID;
-  counterpart.containerID = 9;
-  counterpart.shardGroups = 2;
-  counterpart.shardGroup = statefulServiceGroupOwnerForSlot(3, counterpart.shardGroups);
-  counterpart.service = MeshServices::constrainPrefixToGroup(counterpart.permission.localCousinServicePrefix,
-                                                               counterpart.shardGroup);
-  counterpart.servicePort = 9443;
-  for (uint16_t slot = 0; slot < nStatefulServiceGroupSlots; ++slot)
-    if (counterpart.permission.slots.contains(slot) &&
-        statefulServiceGroupOwnerForSlot(slot, counterpart.shardGroups) == counterpart.shardGroup)
-      counterpart.ownedSlots.insert(slot);
-  counterpart.routablePrefixUUID = 0x7e05;
-  counterpart.publicAddress = IPAddress("fd00:ffff:1234::7", true);
-  counterpart.publicTCPPort = 8443;
-  for (uint32_t index = 0; index < 64; ++index) counterpart.wormholeRevision.append('c');
-  snapshot.records.push_back(std::move(counterpart));
-  return publication;
-}
-
-static ProdigyCousinSessionControl buildSessionControl(const ProdigyCousinCounterpart& destination,
-                                                       uint64_t rootGeneration, uint64_t keyEpoch,
-                                                       uint128_t sessionUUID = 0x7f01, uint128_t requestUUID = 0x7f02)
-{
-  ProdigyCousinSessionControl control = {};
-  control.kind = ProdigyCousinSessionControlKind::propose;
-  auto& session = control.session;
-  session.sessionUUID = sessionUUID; session.requestUUID = requestUUID;
-  session.rootGeneration = rootGeneration; session.keyEpoch = keyEpoch; session.slot = 3;
-  session.destination = destination;
-  session.sourcePermission = destination.permission;
-  session.sourcePermission.permissionUUID = 0x7f03;
-  session.sourcePermission.localHalf = CousinRouteHalf::source;
-  std::swap(session.sourcePermission.localClusterUUID, session.sourcePermission.peerClusterUUID);
-  std::swap(session.sourcePermission.localApplicationID, session.sourcePermission.peerApplicationID);
-  std::swap(session.sourcePermission.localCousinServicePrefix, session.sourcePermission.peerCousinServicePrefix);
-  session.sourcePermission.localDeploymentID = uint64_t(session.sourcePermission.localApplicationID) << 48 | 1;
-  session.sourceContainerUUID = 0x7f04; session.sourceNodeUUID = uint128_t(0x111); session.sourceContainerID = 0x01020304;
-  session.sourceShardGroups = 2; session.sourceShardGroup = statefulServiceGroupOwnerForSlot(3, 2);
-  session.sourceService = MeshServices::constrainPrefixToGroup(session.sourcePermission.localCousinServicePrefix,
-                                                                 session.sourceShardGroup);
-  session.sourceBindingNonce = 1; session.sourceAddress = IPAddress("fd00:ffff:1234::1", true); session.sourceTCPPort = 40001;
-  return control;
-}
-
-static CousinRouteRecord buildRouteForSession(const ProdigyCousinSessionRecord& session)
-{
-  CousinRouteRecord route = {};
-  route.routeUUID = 0x7f10; route.operationUUID = 0x7f11;
-  route.pairUUID = session.sourcePermission.pairUUID;
-  route.logicalWorkloadUUID = session.sourcePermission.logicalWorkloadUUID;
-  route.logicalServiceUUID = session.sourcePermission.logicalServiceUUID;
-  route.sourceClusterUUID = session.sourcePermission.localClusterUUID;
-  route.sourceApplicationID = session.sourcePermission.localApplicationID;
-  route.sourceCousinServicePrefix = session.sourcePermission.localCousinServicePrefix;
-  route.destinationClusterUUID = session.destination.permission.localClusterUUID;
-  route.destinationApplicationID = session.destination.permission.localApplicationID;
-  route.destinationCousinServicePrefix = session.destination.permission.localCousinServicePrefix;
-  route.slots.insert(session.slot);
-  route.destinationRoutablePrefixUUID = session.destination.routablePrefixUUID;
-  route.destinationPublicAddress = session.destination.publicAddress;
-  route.destinationTCPPort = session.destination.publicTCPPort;
-  route.sourcePermissionUUID = session.sourcePermission.permissionUUID;
-  route.destinationPermissionUUID = session.destination.permission.permissionUUID;
-  route.transportProtocol = IPPROTO_TCP;
-  route.destinationCIDR = 128;
-  route.pathMTU = cousinRouteMinimumPathMTU;
-  route.generation = 3; route.issuedAtMs = 1000; route.expiresAtMs = 60000;
-  route.keyEpoch = session.keyEpoch; route.rootGeneration = session.rootGeneration;
-  route.state = CousinRouteState::active;
-  return route;
-}
-
-
-static ProdigyCousinSessionLocalCommand fixture(CousinRouteHalf half, uint128_t sessionUUID = 0x7f01,
-                                                uint128_t requestUUID = 0x7f02)
-{
-  auto publication = buildDiscoveryPublication(0x222, 0x300, 0x200, 0x100, 7, 9, 11);
-  auto session = buildSessionControl(publication.snapshot.records[0], 7, 9, sessionUUID, requestUUID).session;
-  session.destination.publicAddress = IPAddress("fd00:ffff:1234::2", true);
-  session.destination.publicTCPPort = 49192;
-  const CousinRouteRecord route = buildRouteForSession(session);
-  if (!prodigyCousinSessionRouteBindingForRoute(route, session.route)) session.protocolVersion = 0;
-  ProdigyCousinSessionLocalCommand command = {};
-  command.session = session; command.requestUUID = session.requestUUID; command.localHalf = half;
-  command.kind = half == CousinRouteHalf::source ? ProdigyCousinSessionLocalKind::activate : ProdigyCousinSessionLocalKind::install;
-  command.validForMs = ProdigyCousinSessionLeaseMs;
-  ClusterPairRoot root = {};
-  root.pairUUID = 0x100; root.firstClusterUUID = 0x200; root.secondClusterUUID = 0x300; root.rootGeneration = 7;
-  for (unsigned i = 0; i < root.root.size(); ++i) root.root[i] = uint8_t(i + 1);
-  ClusterPairKeyContext context = {}; ClusterPairDerivedKey key = {};
-  expect(prodigyCousinSessionKeyContext(session, context) && clusterPairDeriveKey(root, context, key) && key.size == 32,
-         "native_session_derives_purpose_scoped_32_byte_key");
-  std::memcpy(command.psk.data(), key.bytes.data(), 32);
-  prodigyCousinSessionDigest(session, command.canonicalContext);
-  return command;
-}
+#include "cousin_session_fixture.h"
 
 static bool pump(ProdigyCousinSessionStream& from, ProdigyCousinSessionStream& to)
 {
@@ -165,6 +32,267 @@ static bool pump(ProdigyCousinSessionStream& from, ProdigyCousinSessionStream& t
 
 int main()
 {
+  if (!prodigyTestOwnedULA(localTestAddress)) {
+    std::fprintf(stderr, "SKIP: session socket fixture requires an already assigned non-loopback IPv6 ULA\n");
+    return 77;
+  }
+  {
+    // Capacity required by the fixed three-site cohort: ordinary sessions,
+    // retained source pulls, and two remote App6 instances at each peer.
+    auto first = fixture(CousinRouteHalf::destination, 0x8100, 0x9100);
+    ProdigyCousinSessionClient owner(first.session.destination.containerUUID);
+    bool admitted = true;
+    for (uint32_t index = 0; index < 148; ++index) {
+      auto command = fixture(CousinRouteHalf::destination, 0x8100 + index, 0x9100 + index);
+      admitted = owner.applyCommand(command) && admitted;
+    }
+    expect(admitted, "three_site_source_cohort_fits_bounded_session_owner");
+  }
+  {
+    ProdigyCousinAdmissionAck ack = {};
+    ack.leaseGeneration = 1; ack.sessionUUID = 17; ack.containerID = 18;
+    expect(!prodigyCousinAdmissionAckValid(ack), "legacy_admission_ack_rejects_empty_revision");
+    ack.protocolVersion = ProdigyCousinAdmissionAck::privateContainerVersion;
+    expect(prodigyCousinAdmissionAckValid(ack), "private_admission_ack_accepts_empty_revision");
+    ack.wormholeRevision = String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    expect(!prodigyCousinAdmissionAckValid(ack), "private_admission_ack_rejects_wormhole_revision");
+    ack.protocolVersion = ProdigyCousinAdmissionAck::version;
+    expect(prodigyCousinAdmissionAckValid(ack), "legacy_admission_ack_preserves_revision");
+  }
+  for (auto purpose : {ProdigyCousinServicePurpose::seeding, ProdigyCousinServicePurpose::clientAuthority}) {
+    auto session = purposeFixture(CousinRouteHalf::source, purpose).session;
+    session.protocolVersion = ProdigyCousinSessionPrivateContainerProtocolVersion;
+    session.sourceCarrier.clusterUUID = session.sourcePermission.localClusterUUID;
+    session.sourceCarrier.nodeUUID = session.sourceNodeUUID;
+    session.sourceCarrier.address = localTestAddress; session.sourceCarrier.port = 315;
+    session.destinationCarrier.clusterUUID = session.destination.permission.localClusterUUID;
+    session.destinationCarrier.nodeUUID = session.destination.nodeUUID;
+    session.destinationCarrier.address = IPAddress("2001:db8:1::9", true); session.destinationCarrier.port = 315;
+    session.destination.routablePrefixUUID = 0;
+    session.destination.wormholeRevision.clear();
+    session.destination.publicTCPPort = session.destination.servicePort;
+    CousinRouteRecord route = buildRouteForSession(session);
+    route.version = 3; route.endpointKind = CousinRouteEndpointKind::privateContainer;
+    route.destinationRoutablePrefixUUID = 0; route.destinationCIDR = 128;
+    expect(prodigyCousinSessionRouteBindingForRoute(route, session.route) &&
+           prodigyCousinSessionRecordValid(session), "private_seed_session_binds_private_route");
+    auto changed = session;
+    changed.transport = ProdigyCousinSessionTransport::reverseCarrier;
+    expect(!prodigyCousinSessionRecordValid(changed), "private_session_never_uses_control_carrier_for_payload");
+    changed = session;
+    changed.destination.publicTCPPort++;
+    expect(!prodigyCousinSessionRecordValid(changed), "private_seed_session_rejects_changed_destination_port");
+    changed = session;
+    changed.protocolVersion = ProdigyCousinSessionProtocolVersion;
+    expect(!prodigyCousinSessionRecordValid(changed), "legacy_session_rejects_private_route");
+  }
+  {
+    ProdigyCousinCarrierFrame frame = {};
+    frame.kind = ProdigyCousinCarrierKind::data; frame.sessionUUID = 0x9001;
+    frame.leaseGeneration = 3; frame.sequence = 7; frame.credits = 1;
+    frame.payload.assign("bounded reverse carrier"_ctv);
+    String encoded = {}; ProdigyCousinCarrierFrame decoded = {};
+    expect(prodigyCousinCarrierFrameValid(frame) && BitseryEngine::serialize(encoded, frame) &&
+        BitseryEngine::deserializeSafe(encoded, decoded) && prodigyCousinCarrierFrameValid(decoded),
+        "reverse_carrier_schema_accepts_bounded_data_frame");
+    frame.payload.reserve(ProdigyCousinCarrierMaximumPayloadBytes + 1);
+    for (uint32_t i = 0; i <= ProdigyCousinCarrierMaximumPayloadBytes; ++i) frame.payload.append('x');
+    expect(!prodigyCousinCarrierFrameValid(frame), "reverse_carrier_schema_rejects_oversize_payload");
+    frame.payload.clear(); frame.kind = ProdigyCousinCarrierKind::fin; frame.credits = 1;
+    expect(!prodigyCousinCarrierFrameValid(frame), "reverse_carrier_schema_rejects_terminal_credit");
+  }
+  {
+    auto command = purposeFixture(CousinRouteHalf::source, ProdigyCousinServicePurpose::clientAuthority,
+                                  false, 3, 1, 4, 0x9002);
+    auto& session = command.session;
+    session.protocolVersion = ProdigyCousinSessionProtocolVersion;
+    session.transport = ProdigyCousinSessionTransport::reverseCarrier;
+    session.sourceCarrier.clusterUUID = session.sourcePermission.localClusterUUID;
+    session.sourceCarrier.nodeUUID = session.sourceNodeUUID; session.sourceCarrier.address = localTestAddress;
+    session.sourceCarrier.port = 315;
+    session.destinationCarrier.clusterUUID = session.destination.permission.localClusterUUID;
+    session.destinationCarrier.nodeUUID = session.destination.nodeUUID;
+    session.destinationCarrier.address = IPAddress("2001:db8:1::9", true); session.destinationCarrier.port = 315;
+    session.carrierConnectionID = 0x9004;
+    String digest = {}, changed = {}; ClusterPairKeyContext before = {}, after = {};
+    expect(prodigyCousinReverseCarrierSessionValid(session) && prodigyCousinSessionDigest(session, digest) &&
+        prodigyCousinSessionKeyContext(session, before), "reverse_carrier_requires_app6_hot_lan_to_global_binding");
+    ++session.carrierConnectionID;
+    expect(prodigyCousinSessionDigest(session, changed) && digest == changed,
+        "reverse_carrier_local_connection_counter_does_not_enter_shared_kdf_identity");
+    ++session.destinationCarrier.port;
+    expect(prodigyCousinSessionDigest(session, changed) && digest != changed &&
+        prodigyCousinSessionKeyContext(session, after) && before.channelIdentity != after.channelIdentity,
+        "reverse_carrier_pair_endpoint_change_rekeys_session_context");
+    std::swap(session.sourceCarrier.address, session.destinationCarrier.address);
+    expect(prodigyCousinReverseCarrierSessionValid(session),
+        "reverse_carrier_accepts_lan_pair_control_initiator_in_either_logical_data_direction");
+    // The preceding swap puts the global address on sourceCarrier.  Remove
+    // that endpoint too: reverse carrier requires exactly one global peer.
+    session.sourceCarrier.address = localTestAddress;
+    session.destinationCarrier.address = localTestAddress;
+    expect(!prodigyCousinReverseCarrierSessionValid(session),
+        "reverse_carrier_rejects_pair_control_without_one_global_peer_endpoint");
+    auto truth = purposeFixture(CousinRouteHalf::source, ProdigyCousinServicePurpose::clientAuthority,
+                                false, 10, 0, 1, 0x9003).session;
+    truth.protocolVersion = ProdigyCousinSessionProtocolVersion;
+    truth.transport = ProdigyCousinSessionTransport::reverseCarrier;
+    truth.sourceCarrier.clusterUUID = truth.sourcePermission.localClusterUUID;
+    truth.sourceCarrier.nodeUUID = truth.sourceNodeUUID; truth.sourceCarrier.address = localTestAddress; truth.sourceCarrier.port = 315;
+    truth.destinationCarrier.clusterUUID = truth.destination.permission.localClusterUUID;
+    truth.destinationCarrier.nodeUUID = truth.destination.nodeUUID;
+    truth.destinationCarrier.address = IPAddress("2001:db8:1::10", true); truth.destinationCarrier.port = 315;
+    truth.carrierConnectionID = 0x9005;
+    expect(prodigyCousinReverseCarrierSessionValid(truth),
+        "reverse_carrier_allows_singleton_truth_writer_only_at_group_zero");
+    truth.destination.shardGroups = 2;
+    expect(!prodigyCousinReverseCarrierSessionValid(truth),
+        "reverse_carrier_rejects_sharded_truth_writer");
+  }
+  {
+    auto initial = purposeFixture(CousinRouteHalf::source, ProdigyCousinServicePurpose::clientAuthority);
+    ProdigyCousinSessionClient owner(initial.session.sourceContainerUUID);
+    expect(owner.applyCommand(initial), "one_app6_whitehole_installs_exact_truth_service");
+    auto duplicate = purposeFixture(CousinRouteHalf::source, ProdigyCousinServicePurpose::clientAuthority, false, 10, 0, 1, 0x8101, 0x9911);
+    expect(prodigyCousinSessionLocalCommandValid(duplicate) && !owner.applyCommand(duplicate),
+        "second_permission_uuid_cannot_duplicate_same_remote_database_service_lease");
+    for (uint16_t app : {2, 3, 4, 5}) {
+      auto other = purposeFixture(CousinRouteHalf::source, ProdigyCousinServicePurpose::clientAuthority, false, app, 0, 1, 0x8201 + app * 2);
+      expect(owner.applyCommand(other), "one_app6_whitehole_allows_distinct_exact_database_service_leases");
+    }
+  }
+  for (uint16_t app : {2, 3, 4, 5, 10}) {
+    const bool sharded = app == 3 || app == 4;
+    for (uint16_t group : {uint16_t(0), uint16_t(sharded ? 2 : 0)}) {
+      const uint16_t groups = sharded ? 4 : 1;
+      auto source = purposeFixture(CousinRouteHalf::source, ProdigyCousinServicePurpose::clientAuthority, false, app, group, groups);
+      auto destination = purposeFixture(CousinRouteHalf::destination, ProdigyCousinServicePurpose::clientAuthority, false, app, group, groups);
+      expect(prodigyCousinSessionLocalCommandValid(source) && prodigyCousinSessionLocalCommandValid(destination) && source.psk == destination.psk &&
+          source.session.sourceShardGroup == 0 && source.session.sourceShardGroups == 1 &&
+          source.session.destination.shardGroup == group && source.session.destination.shardGroups == groups,
+          "client_authority_sessions_cover_all_databases_and_exact_nonzero_hot_cold_shards");
+      auto route = buildRouteForSession(source.session);
+      expect(prodigyCousinAutomaticSessionDesired(source.session.sourcePermission, route, true, 1, 2000),
+          "automatic_client_authority_session_uses_permission_owned_nonzero_logical_slot");
+      String bytes = {}; ProdigyCousinSessionLocalCommand decoded = {};
+      expect(BitseryEngine::serialize(bytes, source) && BitseryEngine::deserializeSafe(bytes, decoded) &&
+          prodigyCousinSessionLocalCommandValid(decoded) && decoded.canonicalContext == source.canonicalContext &&
+          decoded.session.sourcePermission.destinationShardGroup == group && decoded.session.sourcePermission.destinationShardGroups == groups,
+          "client_authority_command_wire_preserves_exact_database_topology_and_context");
+      auto wrong = source.session; ++wrong.destination.permission.destinationShardGroups;
+      expect(!prodigyCousinSessionRecordValid(wrong), "client_authority_session_rejects_peer_topology_substitution");
+      wrong = source.session; wrong.destination.service = MeshServices::constrainPrefixToGroup(wrong.destination.permission.localCousinServicePrefix, group + 1);
+      expect(!prodigyCousinSessionRecordValid(wrong), "client_authority_session_rejects_other_remote_shard_service");
+      wrong = source.session; wrong.sourceShardGroup = 1; wrong.sourceShardGroups = 2;
+      expect(!prodigyCousinSessionRecordValid(wrong), "client_authority_app6_source_remains_group_zero_of_one");
+      auto withdrawn = route; withdrawn.state = CousinRouteState::withdrawn; withdrawn.withdrawalGeneration = withdrawn.generation; withdrawn.withdrawnAtMs = 2000;
+      expect(!prodigyCousinSessionCurrentForRoute(source.session, withdrawn, 2000), "each_database_client_session_fails_closed_on_route_withdrawal");
+    }
+  }
+  for (auto purpose : {ProdigyCousinServicePurpose::clientAuthority, ProdigyCousinServicePurpose::sibling, ProdigyCousinServicePurpose::seeding}) {
+    auto source = purposeFixture(CousinRouteHalf::source, purpose);
+    auto destination = purposeFixture(CousinRouteHalf::destination, purpose);
+    auto route = buildRouteForSession(source.session);
+    expect(prodigyCousinSessionLocalCommandValid(source) && prodigyCousinSessionLocalCommandValid(destination) && source.psk == destination.psk,
+        "nonlegacy_purpose_has_exact_authenticated_source_and_destination_commands");
+    expect(prodigyCousinAutomaticSessionDesired(source.session.sourcePermission, route, true, 1, 2000) &&
+        !prodigyCousinAutomaticSessionDesired(source.session.sourcePermission, route, false, 1, 2000) &&
+        !prodigyCousinAutomaticSessionDesired(source.session.sourcePermission, route, true, 0, 2000) &&
+        !prodigyCousinAutomaticSessionDesired(source.session.sourcePermission, route, true, 2, 2000),
+        "automatic_session_requires_exact_live_plan_service_and_unique_usable_whitehole");
+    auto withdrawn = route; withdrawn.state = CousinRouteState::withdrawn; withdrawn.withdrawalGeneration = withdrawn.generation; withdrawn.withdrawnAtMs = 2000;
+    expect(!prodigyCousinAutomaticSessionDesired(source.session.sourcePermission, withdrawn, true, 1, 2000) &&
+        !prodigyCousinSessionCurrentForRoute(source.session, withdrawn, 2000), "withdrawal_clears_desired_and_current_nonlegacy_session");
+    auto revoked = source.session.sourcePermission; revoked.state = ProdigyLocalCousinServicePermissionState::revoked; revoked.generation = 2;
+    expect(!prodigyCousinAutomaticSessionDesired(revoked, route, true, 1, 2000), "permission_revoke_clears_automatic_desire");
+    auto wrong = source.session; wrong.destination.permission.peerArtifactBytes++;
+    expect(!prodigyCousinSessionRecordValid(wrong), "session_rejects_peer_artifact_identity_substitution");
+    wrong = source.session; wrong.sourceShardGroups = 2;
+    expect(!prodigyCousinSessionRecordValid(wrong), "nonlegacy_session_rejects_multiple_source_groups");
+    ProdigyCousinSessionClient owner(source.session.sourceContainerUUID);
+    expect(owner.applyCommand(source), "automatic_source_uses_existing_local_lease_owner");
+    auto renew = source; renew.kind = ProdigyCousinSessionLocalKind::renew; renew.leaseGeneration = 2; renew.psk[31] ^= 1;
+    expect(!owner.applyCommand(renew), "nonlegacy_renew_authenticates_final_psk_byte");
+  }
+  {
+    auto source = purposeFixture(CousinRouteHalf::source, ProdigyCousinServicePurpose::clientAuthority, true);
+    auto destination = purposeFixture(CousinRouteHalf::destination, ProdigyCousinServicePurpose::clientAuthority, true);
+    String immutableBefore = {}, immutableAfter = {}, encoded = {}; prodigyCousinSessionDigest(source.session, immutableBefore);
+    expect(prodigyCousinSessionLocalCommandValid(source) && prodigyCousinSessionLocalCommandValid(destination) &&
+        source.psk == destination.psk && source.canonicalContext == destination.canonicalContext,
+        "nat_two_tuple_projection_preserves_immutable_session_and_full_psk_context");
+    ProdigyCousinSessionLocalCommand decoded = {};
+    expect(BitseryEngine::serialize(encoded, destination) && BitseryEngine::deserializeSafe(encoded, decoded) &&
+        prodigyCousinSessionLocalCommandValid(decoded) && decoded.authenticatedSourceAddress.equals(destination.authenticatedSourceAddress),
+        "nat_v2_destination_projection_roundtrip");
+    sockaddr_storage observed = {}; auto& peer = reinterpret_cast<sockaddr_in6&>(observed);
+    peer.sin6_family = AF_INET6; peer.sin6_port = htons(source.session.sourceTCPPort);
+    std::memcpy(&peer.sin6_addr, destination.authenticatedSourceAddress.v6, 16);
+    expect(prodigyCousinSessionObservedSourceMatches(observed, sizeof(peer), source.session, destination.authenticatedSourceAddress) &&
+        !prodigyCousinSessionObservedSourceMatches(observed, sizeof(peer), source.session), "nat_requires_exact_authenticated_external_address_not_wildcard");
+    ++peer.sin6_port;
+    expect(!prodigyCousinSessionObservedSourceMatches(observed, sizeof(peer), source.session, destination.authenticatedSourceAddress),
+        "nat_source_port_translation_fails_closed");
+    --peer.sin6_port; peer.sin6_addr.s6_addr[15] ^= 1;
+    expect(!prodigyCousinSessionObservedSourceMatches(observed, sizeof(peer), source.session, destination.authenticatedSourceAddress),
+        "nat_external_address_substitution_fails_closed");
+    auto noEvidence = destination; noEvidence.protocolVersion = 1; noEvidence.authenticatedSourceAddress = {};
+    expect(!prodigyCousinSessionLocalCommandValid(noEvidence), "nat_destination_cannot_install_without_observed_socket_evidence");
+    ProdigyCousinSessionReceipt receipt = {};
+    receipt.protocolVersion = 2; receipt.projectionGeneration = 1; receipt.connectionID = 1; receipt.sequence = 1;
+    receipt.remoteEndpoint.clusterUUID = source.session.sourcePermission.localClusterUUID;
+    receipt.remoteEndpoint.nodeUUID = source.session.sourceNodeUUID; receipt.remoteEndpoint.address = source.session.sourceAddress; receipt.remoteEndpoint.port = 15315;
+    receipt.localEndpoint.clusterUUID = destination.session.destination.permission.localClusterUUID;
+    receipt.localEndpoint.nodeUUID = destination.session.destination.nodeUUID; receipt.localEndpoint.address = destination.session.destination.publicAddress; receipt.localEndpoint.port = 15315;
+    receipt.control.session = source.session; receipt.authenticatedSourceAddress = destination.authenticatedSourceAddress;
+    ProdigyCousinSessionReceipt decodedReceipt = {}; encoded.clear();
+    expect(prodigyCousinSessionReceiptValid(receipt) && BitseryEngine::serialize(encoded, receipt) &&
+        BitseryEngine::deserializeSafe(encoded, decodedReceipt) && prodigyCousinSessionReceiptValid(decodedReceipt),
+        "nat_v2_local_receipt_binds_exact_initiator_carrier_and_observed_ipv6");
+    auto missing = receipt; missing.protocolVersion = 1; missing.authenticatedSourceAddress = {};
+    expect(!prodigyCousinSessionReceiptValid(missing), "nat_propose_requires_local_authenticated_socket_observation");
+    auto wrongNode = receipt; ++wrongNode.remoteEndpoint.nodeUUID;
+    expect(!prodigyCousinSessionReceiptValid(wrongNode), "nat_receipt_requires_source_container_node_as_authenticated_initiator");
+    ProdigyCousinAdmissionCommand admission = {}; admission.protocolVersion = 2; admission.session = source.session;
+    admission.validForMs = ProdigyCousinSessionLeaseMs; admission.authenticatedSourceAddress = destination.authenticatedSourceAddress;
+    expect(prodigyCousinAdmissionCommandValid(admission), "nat_kernel_command_uses_exact_destination_only_source_projection");
+    admission.authenticatedSourceAddress = {};
+    expect(!prodigyCousinAdmissionCommandValid(admission), "nat_kernel_command_rejects_missing_source_projection");
+    auto ipv4 = source.session; ipv4.sourceAddress = IPAddress("192.0.2.1", false);
+    expect(!prodigyCousinSessionRecordValid(ipv4), "nat_policy_never_admits_ipv4");
+    auto localDestination = source.session; localDestination.destination.publicAddress = IPAddress("fd00:ffff:1234::2", true);
+    expect(!prodigyCousinSessionRecordValid(localDestination), "nat_requires_global_ipv6_destination");
+    ProdigyCousinSessionClient owner(destination.session.destination.containerUUID);
+    expect(owner.applyCommand(destination), "nat_destination_installs_existing_private_lease");
+    auto renew = destination; renew.kind = ProdigyCousinSessionLocalKind::renew; renew.leaseGeneration = 2;
+    renew.authenticatedSourceAddress = IPAddress("2001:db8:ffff::9", true);
+    expect(!owner.applyCommand(renew), "nat_renew_cannot_change_authenticated_carrier_address");
+    prodigyCousinSessionDigest(destination.session, immutableAfter);
+    expect(immutableBefore == immutableAfter, "observed_nat_projection_never_restamps_session_kdf");
+    for (bool wrongLastByte : {false, true}) {
+      auto serverCommand = destination;
+      if (wrongLastByte) serverCommand.psk[31] ^= 1;
+      ProdigyCousinSessionClient clientOwner(source.session.sourceContainerUUID), serverOwner(destination.session.destination.containerUUID);
+      ProdigyCousinSessionStream client, server;
+      client.rBuffer.reserve(8192); client.wBuffer.reserve(8192); server.rBuffer.reserve(8192); server.wBuffer.reserve(8192);
+      int pair[2] = {-1, -1};
+      bool prepared = clientOwner.applyCommand(source) && serverOwner.applyCommand(serverCommand) &&
+          socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, pair) == 0 &&
+          clientOwner.prepareOutbound(source.session.sessionUUID, client);
+      if (prepared) { ::close(client.fd); client.fd = pair[0]; pair[0] = -1; server.fd = pair[1]; pair[1] = -1; }
+      peer.sin6_port = htons(source.session.sourceTCPPort); std::memcpy(&peer.sin6_addr, destination.authenticatedSourceAddress.v6, 16);
+      prepared = prepared && serverOwner.prepareInbound(server, observed, sizeof(peer));
+      bool progressed = prepared;
+      for (unsigned i = 0; progressed && i < 10000 && (!client.isTransportNegotiated() || !server.isTransportNegotiated()); ++i)
+        progressed = pump(client, server) && pump(server, client);
+      const bool negotiated = progressed && client.isTransportNegotiated() && server.isTransportNegotiated();
+      expect(prepared && (wrongLastByte ? !negotiated && server.rBuffer.size() == 0 : negotiated), wrongLastByte ?
+          "nat_handshake_rejects_wrong_final_psk_byte_before_payload" : "nat_two_tuple_candidates_still_require_complete_fresh_aegis_handshake");
+      if (client.fd >= 0) { ::close(client.fd); client.fd = -1; }
+      if (server.fd >= 0) { ::close(server.fd); server.fd = -1; }
+      for (int fd : pair) if (fd >= 0) ::close(fd);
+    }
+  }
   auto source = fixture(CousinRouteHalf::source), destination = fixture(CousinRouteHalf::destination);
   const CousinRouteRecord liveRoute = buildRouteForSession(source.session);
   expect(prodigyCousinSessionCurrentForRoute(source.session, liveRoute, 2000),
@@ -281,6 +409,7 @@ int main()
   bool ok = listener >= 0 && setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) == 0 &&
       bind(listener, reinterpret_cast<sockaddr *>(&address), sizeof(address)) == 0 && listen(listener, 2) == 0;
   ProdigyCousinSessionStream client, server;
+  expect(!client.observeNegotiatedGuard().valid(), "unnegotiated_stream_has_no_guard_observation");
   client.rBuffer.reserve(8192); server.rBuffer.reserve(8192);
   client.wBuffer.reserve(8192); server.wBuffer.reserve(8192);
   ok = ok && clientOwner.prepareOutbound(source.session.sessionUUID, client);
@@ -301,6 +430,12 @@ int main()
   expect(ok && client.isTransportNegotiated() && server.isTransportNegotiated() &&
          client.tlsPeerUUID == source.session.destination.containerUUID && server.tlsPeerUUID == source.session.sourceContainerUUID,
          "native_session_fresh_authenticated_x25519_aegis_handshake");
+  const auto guardObservation = client.observeNegotiatedGuard();
+  expect(guardObservation.valid() && guardObservation.current(), "negotiated_guard_observation_is_current");
+  auto witnessedRenewal = source; witnessedRenewal.kind = ProdigyCousinSessionLocalKind::renew;
+  witnessedRenewal.leaseGeneration = 3;
+  expect(clientOwner.applyCommand(witnessedRenewal) && guardObservation.current(),
+         "negotiated_guard_survives_exact_monotonic_renewal");
   const String payload = "offline COUSIN payload"_ctv;
   if (ok) client.wBuffer.append(payload);
   for (unsigned i = 0; ok && i < 10000 && server.rBuffer.size() < payload.size(); ++i)
@@ -310,9 +445,20 @@ int main()
   ProdigyCousinSessionStream repeated;
   expect(!clientOwner.prepareOutbound(source.session.sessionUUID, repeated), "session_cannot_open_second_connection");
   auto revoke = source; revoke.kind = ProdigyCousinSessionLocalKind::revoke; revoke.psk.fill(0); revoke.canonicalContext.clear();
+  expect(!clientOwner.applyCommand(revoke) && client.isTransportNegotiated(), "stale_revoke_cannot_close_renewed_generation");
+  expect(guardObservation.current(), "stale_revoke_preserves_observed_guard");
+  revoke.leaseGeneration = 3;
   expect(clientOwner.applyCommand(revoke) && !client.isTransportNegotiated() && !client.prepareTransportTLSSend() &&
          !client.decryptTransportTLS(0) && client.nBytesToSend() == 0 && client.pBytesToSend() == nullptr,
          "revocation_closes_send_receive_and_queued_ciphertext");
+  expect(guardObservation.valid() && !guardObservation.current(), "exact_observed_guard_withdrawn_after_revoke");
+  expect(!clientOwner.applyCommand(source), "retired_session_rejects_replayed_generation_one_activate");
+  {
+    ProdigyCousinSessionClient reorderedOwner(source.session.sourceContainerUUID);
+    auto terminal = source; terminal.kind = ProdigyCousinSessionLocalKind::revoke; terminal.psk.fill(0); terminal.canonicalContext.clear();
+    expect(reorderedOwner.applyCommand(terminal) && !reorderedOwner.applyCommand(source),
+        "revoke_before_activate_tombstone_rejects_delayed_initial_command");
+  }
   ProdigyCousinSessionStream unowned, fixed;
   fixed.isFixedFile = true; fixed.fd = 42;
   expect(!unowned.abortOwnedSocket() && !fixed.abortOwnedSocket() && fixed.fd == 42,

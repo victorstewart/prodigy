@@ -68,6 +68,7 @@ public:
   uint16_t port;
   uint8_t proto;
   bool isQuic;
+  bool gatewayListener = false;
 
   bytell_hash_set<switchboard_runtime::Wormhole *> wormholes;
   bool hasQuicCidKeyState = false;
@@ -543,6 +544,9 @@ private:
   BPFProgram *bpf_router = nullptr;
   BPFProgram *host_ingress = nullptr;
   BPFProgram *host_egress = nullptr;
+  // A usable private BGP fallback needs the boundary routing maps even when
+  // this machine has no public portals or other boundary consumers.
+  bool privateBGPBoundaryConsumer = false;
   // An optional Ethernet veth delivers decrypted web-tunnel packets.  It
   // deliberately reuses the boundary programs, rather than loading another
   // object with a divergent copy of the routing maps.
@@ -552,6 +556,15 @@ private:
   uint32_t additionalIngressIfidx = 0;
   uint32_t additionalIngressXDPProgramID = 0;
   uint32_t additionalIngressTCXProgramID = 0;
+  // A root-selected physical overlay NIC carries IP-in-IP before the host
+  // router decapsulates it. It shares the primary programs and maps; only
+  // its two TCX links are distinct.
+  EthDevice *privateOverlayEth = nullptr;
+  int privateOverlayIngressTCXLink = -1;
+  int privateOverlayEgressTCXLink = -1;
+  uint32_t privateOverlayIfidx = 0;
+  uint32_t privateOverlayIngressProgramID = 0;
+  uint32_t privateOverlayEgressProgramID = 0;
   // An ordinary Prodigy exec can leave the prior process's additional XDP
   // attachment alive while this Switchboard replaces the primary attachment.
   // Keep an exact, pre-replacement primary-program witness for the normal
@@ -2354,7 +2367,7 @@ private:
     // A configured secondary ingress is itself a boundary-router consumer.
     // Resetting portals must not leave it attached to an old program/map set
     // while a subsequent wormhole recreates only the primary router.
-    if (additionalIngressEth != nullptr || !portals.empty())
+    if (privateBGPBoundaryConsumer || additionalIngressEth != nullptr || !portals.empty())
     {
       return;
     }
@@ -2523,11 +2536,13 @@ public:
   ~Switchboard()
   {
     detachAdditionalIngress();
+    closePrivateOverlayHostRouting();
     ringPreparationLifetime.reset();
     ringPreparationQuiescing = true;
     ringWaiters.clear();
     if (QuicCidReconcileWake *wake = std::exchange(quicCidReconcileWake, nullptr)) wake->cancel();
     ringPreparation.reset();
+    privateBGPBoundaryConsumer = false;
     resetState();
   }
 
@@ -2573,6 +2588,63 @@ public:
     additionalIngressXDPProgramID = 0;
     additionalIngressTCXProgramID = 0;
     additionalIngressEth = nullptr;
+  }
+
+  // Both newly created links and exact pre-existing links are owned by this
+  // Switchboard after configuration. A different pre-existing program is
+  // rejected before its link FD can become part of this runtime state.
+  void closePrivateOverlayHostRouting(void)
+  {
+    if (privateOverlayIngressTCXLink >= 0) ::close(privateOverlayIngressTCXLink);
+    if (privateOverlayEgressTCXLink >= 0) ::close(privateOverlayEgressTCXLink);
+    privateOverlayIngressTCXLink = -1; privateOverlayEgressTCXLink = -1;
+    privateOverlayIfidx = 0; privateOverlayIngressProgramID = 0; privateOverlayEgressProgramID = 0; privateOverlayEth = nullptr;
+  }
+
+  bool configurePrivateOverlayHostRouting(EthDevice& overlay, BPFProgram *ingressProgram, BPFProgram *egressProgram, String *failureReport = nullptr)
+  {
+    if (overlay.ifidx == 0 || ingressProgram == nullptr || egressProgram == nullptr) { if (failureReport) failureReport->assign("private overlay host routing programs unavailable"_ctv); return false; }
+    const uint32_t ingressID = kernelProgramID(ingressProgram), egressID = kernelProgramID(egressProgram);
+    if (ingressID == 0 || egressID == 0) { if (failureReport) failureReport->assign("private overlay host routing program identity unavailable"_ctv); return false; }
+    if (privateOverlayEth && (privateOverlayEth != &overlay || privateOverlayIfidx != overlay.ifidx)) { if (failureReport) failureReport->assign("private overlay host routing interface changed during runtime"_ctv); return false; }
+    privateOverlayEth = &overlay; privateOverlayIfidx = overlay.ifidx;
+    auto ensure = [&](BPFProgram *program, uint32_t programID, enum bpf_attach_type type,
+                      int& owned, uint32_t& attached, bool *created) -> bool {
+      if (owned >= 0) return attached == programID;
+      if (created) *created = false;
+      BPFProgram::TCXIdentity existing = {};
+      if (BPFProgram::openTCXIdentity(overlay.ifidx, type, 0, existing)) {
+        if (existing.programID != programID) { BPFProgram::closeTCXIdentity(existing); return false; }
+        owned = existing.linkFD;
+        existing.linkFD = -1;
+        BPFProgram::closeTCXIdentity(existing);
+        attached = programID;
+        return true;
+      }
+      __u32 queriedProgramID = 0;
+      struct bpf_prog_query_opts query = {};
+      query.sz = sizeof(query);
+      query.prog_ids = &queriedProgramID;
+      query.prog_cnt = 1;
+      if (bpf_prog_query_opts(overlay.ifidx, type, &query) != 0 || query.prog_cnt != 0) return false;
+      owned = bpf_link_create(program->prog_fd, overlay.ifidx, type, nullptr);
+      if (owned < 0) return false;
+      attached = programID;
+      if (created) *created = true;
+      return true;
+    };
+    bool ingressCreated = false;
+    if (!ensure(ingressProgram, ingressID, BPF_TCX_INGRESS, privateOverlayIngressTCXLink, privateOverlayIngressProgramID, &ingressCreated)) { if (failureReport) failureReport->snprintf<"private overlay ingress TCX attach failed ifidx={itoa} errno={itoa}"_ctv>(overlay.ifidx, uint32_t(errno)); return false; }
+    if (!ensure(egressProgram, egressID, BPF_TCX_EGRESS, privateOverlayEgressTCXLink, privateOverlayEgressProgramID, nullptr)) {
+      if (privateOverlayIngressTCXLink >= 0) {
+        if (ingressCreated) (void)bpf_link_detach(privateOverlayIngressTCXLink);
+        ::close(privateOverlayIngressTCXLink);
+        privateOverlayIngressTCXLink = -1;
+        privateOverlayIngressProgramID = 0;
+      }
+      if (failureReport) failureReport->snprintf<"private overlay egress TCX attach failed ifidx={itoa} errno={itoa}"_ctv>(overlay.ifidx, uint32_t(errno)); return false;
+    }
+    return true;
   }
 
   static uint32_t kernelProgramID(BPFProgram *program)
@@ -2960,6 +3032,14 @@ public:
     return bpf_router;
   }
 
+  bool setPrivateBGPBoundaryConsumer(bool required)
+  {
+    privateBGPBoundaryConsumer = required;
+    if (required) return ensureBoundaryRouterConfigured();
+    maybeDetachBoundaryRouter();
+    return true;
+  }
+
   void setLocalContainerSubnet(const struct local_container_subnet6& newSubnet)
   {
     if (std::memcmp(&subnet, &newSubnet, sizeof(subnet)) == 0) return;
@@ -3099,7 +3179,8 @@ public:
     maybeDetachBoundaryRouter();
   }
 
-  bool openWormhole(uint32_t containerID, const Wormhole& requestedWormhole, uint8_t admissionProfile)
+  bool openWormhole(uint32_t containerID, const Wormhole& requestedWormhole, uint8_t admissionProfile,
+                    bool gatewayListener = false)
   {
     if (!switchboardWormholeAdmissionProfileValid(admissionProfile) ||
         (admissionProfile == SWITCHBOARD_WORMHOLE_ADMISSION_PAIR_GRANT &&
@@ -3155,6 +3236,12 @@ public:
     query.proto = requestedWormhole.layer4;
     query.isQuic = requestedWormhole.isQuic;
 
+    // The host endpoint is exclusive even across QUIC routing modes. A
+    // gateway can never join a fleet portal or acquire a second target.
+    for (const SwitchboardPortal *existing : portals)
+      if (existing != nullptr && existing->address.equals(query.address) &&
+          existing->port == query.port && existing->proto == query.proto &&
+          (gatewayListener || existing->gatewayListener)) return false;
     if (auto it = portals.find(&query); it != portals.end())
     {
       portal = *it;
@@ -3182,7 +3269,7 @@ public:
         }
       }
 
-      if (prefixAnnounced == false)
+      if (prefixAnnounced == false && !gatewayListener)
       {
         basics_log("Switchboard openWormhole prefix-not-announced containerID=%u port=%u proto=%u announcing=%u\n",
                    containerID,
@@ -3197,6 +3284,7 @@ public:
       portal->port = requestedWormhole.externalPort;
       portal->proto = requestedWormhole.layer4;
       portal->isQuic = requestedWormhole.isQuic;
+      portal->gatewayListener = gatewayListener;
       portal->slot = portalSlots.back();
       portalSlots.pop_back();
       applyPortalQuicCidStateFromWormhole(portal, requestedWormhole);
@@ -3357,12 +3445,23 @@ public:
   }
 
   SwitchboardWormholeOperationStatus openWormholes(uint32_t containerID,
-                                                   const SwitchboardWormholeDesiredState& desired)
+                                                   const SwitchboardWormholeDesiredState& desired,
+                                                   bool gatewayListener = false)
   {
     appendAttachLogf("Switchboard openWormholes begin ifidx=%u containerID=%u requested=%u protected=%u announcing=%u dpfx=%u",
                      eth.ifidx, containerID, unsigned(desired.wormholes.size()),
                      unsigned(desired.pairAdmissionTCPPorts.size()), unsigned(announcingPrefixes.size()),
                      unsigned(subnet.dpfx));
+    if (gatewayListener && (desired.wormholes.size() != 1 ||
+        !desired.pairAdmissionTCPPorts.empty() || desired.wormholes[0].layer4 != IPPROTO_UDP ||
+        desired.wormholes[0].isQuic || desired.wormholes[0].externalAddress.isNull() ||
+        desired.wormholes[0].externalPort == 0 ||
+        desired.wormholes[0].externalPort != desired.wormholes[0].containerPort))
+      return SwitchboardWormholeOperationStatus::rejected;
+    if (auto existing = wormholesByContainer.find(containerID); existing != wormholesByContainer.end())
+      for (const auto *wormhole : existing->second)
+        if (wormhole != nullptr && wormhole->portal->gatewayListener != gatewayListener)
+          return SwitchboardWormholeOperationStatus::rejected;
     if (containerID == 0 || !prodigyWormholeDesiredStateValid(desired) ||
         !wormholeAdmissionProfilesCompatible(containerID, desired) ||
         !retainedProtectedWormholesRemainProtected(containerID, desired))
@@ -3389,6 +3488,14 @@ public:
       std::sort(previous.pairAdmissionTCPPorts.begin(), previous.pairAdmissionTCPPorts.end());
     }
     if (!prodigyWormholeDesiredStateValid(previous)) return SwitchboardWormholeOperationStatus::rejected;
+    // A changed listener must be withdrawn by the authority owner before a
+    // replacement; rollback must never revive a superseded endpoint.
+    if (gatewayListener && !previous.wormholes.empty())
+    {
+      String oldBytes = {};
+      if (!prodigyEncodeWormholeDesiredState(previous, oldBytes) || oldBytes != desiredBytes)
+        return SwitchboardWormholeOperationStatus::rejected;
+    }
     String previousRevision = {};
     if (auto applied = wormholeRevisionByContainer.find(containerID); applied != wormholeRevisionByContainer.end())
       previousRevision = applied->second;
@@ -3403,7 +3510,7 @@ public:
     auto openFrom = [&](const SwitchboardWormholeDesiredState& state, const Wormhole& wormhole) -> bool {
       const uint8_t profile = prodigyWormholeRequiresPairAdmission(state, wormhole.containerPort, wormhole.layer4)
           ? SWITCHBOARD_WORMHOLE_ADMISSION_PAIR_GRANT : SWITCHBOARD_WORMHOLE_ADMISSION_NONE;
-      return openWormhole(containerID, wormhole, profile);
+      return openWormhole(containerID, wormhole, profile, gatewayListener);
     };
 
     const SwitchboardWormholeOperationStatus status = switchboardReplaceWormholesTransaction(

@@ -132,6 +132,20 @@ static inline void prodigyCollectMachineOverlayRouteAddresses(const Machine& mac
   appendAddress(machine.privateAddress);
   appendAddress(machine.publicAddress);
   appendAddress(machine.sshAddress);
+
+  // Container and machine-overlay addresses are destinations carried by the
+  // overlay, never usable as its outer transport endpoints. Hardware inventory
+  // can include the host's own overlay interface alongside its real NICs.
+  Vector<ClusterMachinePeerAddress> underlay = {};
+  for (const ClusterMachinePeerAddress& candidate : candidates)
+  {
+    IPAddress address = {};
+    if (ClusterMachine::parseIPAddressLiteral(candidate.address, address) && address.is6 &&
+        std::memcmp(address.v6, container_network_subnet6.value, sizeof(container_network_subnet6.value)) == 0)
+      continue;
+    underlay.push_back(candidate);
+  }
+  candidates = std::move(underlay);
 }
 
 static inline bool prodigyMachinePeerAddressMatches(const Machine& machine, const IPAddress& address, const String *addressText = nullptr)

@@ -5,6 +5,31 @@
 #include <switchboard/kernel/container.egress.policy.h>
 #include <switchboard/kernel/portal.routing.h>
 
+__attribute__((__always_inline__)) static inline bool containerMasqueGatewayRemoteTransitIPv6(
+    struct ipv6hdr *ip6h, void *data_end)
+{
+  if (ip6h == NULL || (void *)(ip6h + 1) > data_end || ip6h->nexthdr != IPPROTO_TCP ||
+      (void *)((struct tcphdr *)(ip6h + 1) + 1) > data_end)
+  {
+    return false;
+  }
+
+  __u32 zeroidx = 0, sourceMachine = 0;
+  struct container_network_policy *policy = bpf_map_lookup_elem(&ct_net_policy, &zeroidx);
+  struct local_container_subnet6 *localSubnet = bpf_map_lookup_elem(&lc_subnet, &zeroidx);
+  if (policy == NULL || localSubnet == NULL ||
+      switchboardExtractOverlayMachineIdentityFromIPv6(ip6h->saddr.s6_addr, &sourceMachine) == false)
+  {
+    return false;
+  }
+
+  // Do not use an exact machine route here: only the selected source-site
+  // fallback proves that this gateway owns the remote-site tunnel boundary.
+  struct switchboard_overlay_machine_route *sourceSiteRoute = lookupOverlaySiteRoute(sourceMachine);
+  return switchboardMasqueGatewayRemoteTransitPermitted(containerNetworkMode(), localSubnet,
+      policy->containerFragment, ip6h->saddr.s6_addr, ip6h->daddr.s6_addr, true, sourceSiteRoute);
+}
+
 // This program is attached as BPF_NETKIT_PEER using the host-side primary
 // ifindex. Upstream netkit resolves that attach type to the peer endpoint, and
 // netkit_xmit() runs the program attached to the transmitting endpoint. That
@@ -122,6 +147,7 @@ int ct_egress(struct __sk_buff *skb)
     }
   }
 
+  bool masqueGatewayTransit = false;
   if (networkMode == CONTAINER_NETWORK_DESTINATION_ALLOWLIST && wormholeReply == SWITCHBOARD_WORMHOLE_REPLY_NONE)
   {
     __u8 proto = 0;
@@ -146,9 +172,39 @@ int ct_egress(struct __sk_buff *skb)
       }
       goto forward_to_host;
     }
-    return NETKIT_DROP;
+    if (protocol == BE_ETH_P_IPV6)
+    {
+      struct ipv6hdr *ip6h = (struct ipv6hdr *)l3_data;
+      struct switchboard_l4_ports l4 = {};
+      if (containerMasqueGatewayRemoteTransitIPv6(ip6h, data_end))
+      {
+        masqueGatewayTransit = true;
+      }
+      else
+      {
+        if ((void *)(ip6h + 1) > data_end || ip6h->nexthdr != IPPROTO_UDP ||
+            switchboard_parse_l4_ports((void *)(ip6h + 1), data_end, ip6h->nexthdr,
+                                      l3Offset + sizeof(struct ipv6hdr), &l4) == false ||
+            containerEgressAllow6(ip6h->daddr.s6_addr, ip6h->nexthdr, l4.dest) == false)
+        {
+          return NETKIT_DROP;
+        }
+        goto forward_to_host;
+      }
+    }
+    if (!masqueGatewayTransit) return NETKIT_DROP;
   }
-  if (networkMode == CONTAINER_NETWORK_DECLARED_ONLY && wormholeReply == SWITCHBOARD_WORMHOLE_REPLY_NONE)
+  bool privateSiteFlow = false;
+  if (protocol == BE_ETH_P_IPV6)
+  {
+    struct ipv6hdr *ip6h = (struct ipv6hdr *)l3_data;
+    if ((void *)(ip6h + 1) > data_end) return NETKIT_DROP;
+    privateSiteFlow = switchboardCrossSiteContainerFlow(ip6h->saddr.s6_addr, ip6h->daddr.s6_addr);
+  }
+  // Public application ingress may use unrestricted policy, but its private
+  // cross-site sockets still require an exact authenticated session lease.
+  if ((networkMode == CONTAINER_NETWORK_DECLARED_ONLY || privateSiteFlow) &&
+      wormholeReply == SWITCHBOARD_WORMHOLE_REPLY_NONE && !masqueGatewayTransit)
   {
     if (protocol == BE_ETH_P_IP)
     {
@@ -343,16 +399,23 @@ int ct_egress(struct __sk_buff *skb)
         return redirectContainerFragment(containerID.value[4], false) ? NETKIT_REDIRECT : NETKIT_DROP;
       }
 
-      __u32 machineFragment = ((__u32)containerID.value[1] << 16) |
+      __u32 machineFragment = switchboardMakeOverlayMachineIdentity(containerID.value[0], ((__u32)containerID.value[1] << 16) |
                               ((__u32)containerID.value[2] << 8) |
-                              (__u32)containerID.value[3];
+                              (__u32)containerID.value[3]);
       struct switchboard_overlay_machine_route *route = lookupOverlayMachineRouteByFragment(machineFragment);
       if (skb->len <= sizeof(struct ethhdr) || skb->len - sizeof(struct ethhdr) > 0xffffu)
       {
         return NETKIT_DROP;
       }
+      // This branch bypasses normal outbound routing, which learns the reverse
+      // whitehole flow before forwarding. Preserve that reply authorization
+      // before encapsulation changes the packet headers.
+      if (route == NULL || switchboardMaybeLearnWhiteholeIPv6(eth, data_end) != TC_ACT_OK)
+      {
+        return NETKIT_DROP;
+      }
       __u16 innerBytes = (__u16)(skb->len - sizeof(struct ethhdr));
-      if (route == NULL || switchboardEncapWormholeSKB(skb,
+      if (switchboardEncapWormholeSKB(skb,
                                                        innerBytes,
                                                        IPPROTO_IPV6,
                                                        route,
@@ -360,7 +423,9 @@ int ct_egress(struct __sk_buff *skb)
       {
         return NETKIT_DROP;
       }
-      return NETKIT_PASS;
+      int injectionAction = switchboardCompleteMasqueGatewayInjection(skb, route);
+      if (injectionAction == TC_ACT_REDIRECT) return NETKIT_REDIRECT;
+      return injectionAction == TC_ACT_OK ? NETKIT_PASS : NETKIT_DROP;
     }
   }
 
@@ -383,10 +448,8 @@ forward_to_host: ;
   eth->h_proto = protocol;
 
   int outbound_action = switchboardRouteOutboundEthFrame(skb, eth, data_end);
-  if (outbound_action != TC_ACT_OK)
-  {
-    return NETKIT_DROP;
-  }
+  if (outbound_action == TC_ACT_REDIRECT) return NETKIT_REDIRECT;
+  if (outbound_action != TC_ACT_OK) return NETKIT_DROP;
 
   // L3 netkit packets carry only a synthetic Ethernet placeholder, so a
   // direct bpf_redirect() to a MAC device is rejected by skb_do_redirect().

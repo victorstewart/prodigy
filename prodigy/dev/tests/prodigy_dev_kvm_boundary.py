@@ -29,6 +29,7 @@ MARKER_CONTENT = "prodigy-disposable-linux-v1"
 COLD_REBOOT_HISTORY_LIMIT = 16
 COLD_REBOOT_MAX_DELAY_MS = 24 * 60 * 60 * 1000
 COLD_REBOOT_RELEASE_GRACE_MS = 30 * 1000
+QEMU_EXEC_IDENTITY_OBSERVATION_SECONDS = 1.0
 
 
 class BoundaryError(RuntimeError):
@@ -243,6 +244,128 @@ def qmp_quit(socket_path: str) -> None:
         client.sendall(b'{"execute":"quit"}' + bytes((13, 10)))
 
 
+def persistent_guest_args(record: dict[str, object]) -> tuple[argparse.Namespace, str]:
+    verification = record["boundaryVerification"]
+    required = {"knownHosts", "sshPrivateKey", "sshUser", "sshPort", "bootTimeout", "guestUUID", "machineID", "hostMachineID"}
+    require(isinstance(verification, dict) and required <= verification.keys(), "persistent guest verification state is incomplete")
+    require(isinstance(verification["sshPort"], int) and isinstance(verification["bootTimeout"], int) and
+            isinstance(verification["guestUUID"], str) and isinstance(verification["machineID"], str) and
+            isinstance(verification["hostMachineID"], str) and
+            all(isinstance(verification[key], str) for key in ("knownHosts", "sshPrivateKey", "sshUser")),
+            "persistent guest verification state is malformed")
+    ssh = verification.get("sshCommand", "ssh"); evidence_dir = verification.get("evidenceDir", ".")
+    require(isinstance(ssh, str) and ssh and isinstance(evidence_dir, str) and evidence_dir,
+            "persistent guest verification executor state is malformed")
+    return argparse.Namespace(known_hosts=Path(verification["knownHosts"]), ssh_private_key=Path(verification["sshPrivateKey"]),
+                              ssh_user=verification["sshUser"], ssh_port=verification["sshPort"],
+                              boot_timeout=verification["bootTimeout"], guest_uuid=uuid.UUID(verification["guestUUID"]),
+                              expected_machine_id=verification["machineID"], ssh=ssh,
+                              evidence_dir=Path(evidence_dir)), verification["hostMachineID"]
+
+
+def cluster_lan_mac_from_persistent_network(record: dict[str, object]) -> str:
+    """Return the one LAN MAC admitted by the sealed QEMU network command."""
+    network = record.get("network")
+    command = record.get("qemuCommand")
+    require(isinstance(network, dict) and isinstance(command, list), "persistent LAN network state is invalid")
+    validate_persistent_network(command, network)
+    devices = network.get("devices")
+    netdevs = network.get("netdevs")
+    require(isinstance(devices, list) and isinstance(netdevs, list) and
+            all(isinstance(value, str) for value in devices + netdevs),
+            "persistent LAN network state is invalid")
+    lan_devices = [value for value in devices
+                   if re.fullmatch(r"virtio-net-pci,netdev=clusterlan,mac=(02(?::[0-9a-f]{2}){5})", value)]
+    require(len(lan_devices) == 1 and sum("id=clusterlan" in value.split(",") for value in netdevs) == 1,
+            "persistent QEMU network has no exact cluster LAN device")
+    return lan_devices[0].rsplit("=", 1)[1]
+
+
+def derive_cluster_lan_ipv6(task_id: str, lan_mac: str, guest_uuid: str) -> tuple[ipaddress.IPv6Network, ipaddress.IPv6Address]:
+    """Derive one task-private RFC4193 /64 and per-guest IID without host state."""
+    require(re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", task_id) is not None, "task ID is invalid")
+    require(re.fullmatch(r"02(?::[0-9a-f]{2}){5}", lan_mac) is not None, "cluster LAN MAC is invalid")
+    try:
+        parsed_uuid = uuid.UUID(guest_uuid)
+    except ValueError as error:
+        raise BoundaryError("guest UUID is invalid") from error
+    require(str(parsed_uuid) == guest_uuid, "guest UUID is invalid")
+    subnet_digest = hashlib.sha256(b"prodigy-cluster-lan-subnet-v1\0" + task_id.encode()).digest()
+    network = ipaddress.IPv6Network((int.from_bytes(b"\xfd" + subnet_digest[:5] + b"\0" * 10, "big"), 64))
+    iid = bytearray(hashlib.sha256(b"prodigy-cluster-lan-iid-v1\0" +
+                                   bytes.fromhex(lan_mac.replace(":", "")) + parsed_uuid.bytes).digest()[-8:])
+    iid[0] = (iid[0] & 0xfd) | 0x02  # locally administered, never multicast
+    return network, ipaddress.IPv6Address(int(network.network_address) | int.from_bytes(iid, "big"))
+
+
+def configure_cluster_lan_ipv6(record: dict[str, object], task_id: str) -> dict[str, str]:
+    """Configure only the sealed guest's lan0 through its existing SSH boundary."""
+    pid = record.get("qemuPID")
+    starttime = record.get("qemuStarttime")
+    command = record.get("qemuCommand")
+    require(isinstance(pid, int) and isinstance(starttime, str) and isinstance(command, list) and
+            command_matches(pid, starttime, command), "exact QEMU process identity mismatch")
+    args, _host_machine_id = persistent_guest_args(record)
+    verify_persistent_guest(record, pid, starttime)
+    lan_mac = cluster_lan_mac_from_persistent_network(record)
+    network, address = derive_cluster_lan_ipv6(task_id, lan_mac, str(args.guest_uuid))
+    cidr = f"{address}/64"
+    dropin = "/etc/systemd/network/10-cloud-init-lan0.network.d/50-prodigy-cluster-lan-ipv6.conf"
+    content = "[Network]\nAddress=" + cidr + "\nIPv6AcceptRA=no\n"
+    encoded = base64.b64encode(content.encode()).decode()
+    # This is a fixed owner command: all variable fields are validated above and
+    # shell-quoted; callers cannot select a guest command, file, or interface.
+    script = (
+        "test \"$(cat " + MARKER + ")\" = " + shlex.quote(MARKER_CONTENT) + "\n"
+        "test \"$(cat /sys/class/net/lan0/address)\" = " + shlex.quote(lan_mac) + "\n"
+        "test -f /etc/systemd/network/10-cloud-init-lan0.network\n"
+        "dropin=" + shlex.quote(dropin) + "\n"
+        "content=$(printf %s " + shlex.quote(encoded) + " | base64 -d)\n"
+        "if test ! -f \"$dropin\" || test \"$(cat \"$dropin\")\" != \"$content\"; then\n"
+        "  install -d -o root -g root -m 0755 /etc/systemd/network/10-cloud-init-lan0.network.d\n"
+        "  tmp=$(mktemp /etc/systemd/network/10-cloud-init-lan0.network.d/.50-prodigy-cluster-lan-ipv6.conf.XXXXXX)\n"
+        "  trap 'rm -f \"$tmp\"' EXIT\n"
+        "  printf '%s' \"$content\" >\"$tmp\"\n"
+        "  chown root:root \"$tmp\"; chmod 0644 \"$tmp\"; mv -f \"$tmp\" \"$dropin\"\n"
+        "  trap - EXIT\n"
+        "fi\n"
+        "networkctl reload\nnetworkctl reconfigure lan0\n"
+        "ip -j -6 address show dev lan0 | python3 -c " + shlex.quote(
+            "import ipaddress,json,sys; expected=ipaddress.IPv6Interface(sys.argv[1]); "
+            "found=[ipaddress.IPv6Interface(x['local']+'/'+str(x['prefixlen'])) for x in json.load(sys.stdin)[0]['addr_info'] "
+            "if x.get('family') == 'inet6']; assert found.count(expected) == 1") + " " + shlex.quote(cidr) + "\n")
+    result = guest_run(args, script, 30)
+    require(result.returncode == 0, "guest failed exact cluster LAN IPv6 configuration")
+    return {"interface": "lan0", "mac": lan_mac, "subnet": str(network), "address": cidr, "dropIn": dropin}
+
+
+def query_guest_linux_identity(record: dict[str, object]) -> dict[str, object]:
+    """Observe one live guest through its saved, pinned SSH boundary."""
+    pid = record.get("qemuPID")
+    starttime = record.get("qemuStarttime")
+    command = record.get("qemuCommand")
+    require(isinstance(pid, int) and isinstance(starttime, str) and isinstance(command, list) and
+            command_matches(pid, starttime, command), "exact QEMU process identity mismatch")
+    args, _host_machine_id = persistent_guest_args(record)
+    verify_persistent_guest(record, pid, starttime)
+    script = (
+        "test \"$(cat " + MARKER + ")\" = " + shlex.quote(MARKER_CONTENT) + "\n"
+        "machine=$(tr -d '\\n' </etc/machine-id)\n"
+        "boot=$(tr -d '\\n' </proc/sys/kernel/random/boot_id)\n"
+        "printf '%s\\n%s\\n' \"$machine\" \"$boot\"\n")
+    result = guest_run(args, script, 30)
+    values = result.stdout.splitlines()
+    require(result.returncode == 0 and len(values) == 2,
+            "guest Linux identity observation failed")
+    machine_id, boot_id = values
+    require(re.fullmatch(r"[0-9a-f]{32}", machine_id) is not None and
+            machine_id == args.expected_machine_id and
+            re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", boot_id) is not None,
+            "guest Linux identity observation is invalid")
+    return {"machineID": machine_id, "bootID": boot_id,
+            "qemuPID": pid, "qemuStarttime": starttime}
+
+
 def stop_persistent_qemu(record: dict[str, object], purpose: str) -> None:
     """Stop only the exact sealed QEMU process, with bounded signal fallback."""
     pid = int(record["qemuPID"])
@@ -278,6 +401,21 @@ def qemu_pidfile(command: list[str]) -> Path:
     return Path(command[index + 1])
 
 
+def observe_spawned_qemu_identity(process: subprocess.Popen[str], command: list[str]) -> str:
+    """Wait briefly for exec and /proc to expose the exact child we just spawned."""
+    deadline = time.monotonic() + QEMU_EXEC_IDENTITY_OBSERVATION_SECONDS
+    while True:
+        if process.poll() is not None:
+            raise BoundaryError(f"replacement QEMU exited during exec observation with status {process.returncode}")
+        starttime = proc_starttime(process.pid)
+        if starttime is not None and command_matches(process.pid, starttime, command):
+            return starttime
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(.02)
+    raise BoundaryError("replacement QEMU identity mismatch after bounded exec observation")
+
+
 def verify_persistent_guest(record: dict[str, object], pid: int, starttime: str) -> None:
     verification = record["boundaryVerification"]
     required = {"knownHosts", "sshPrivateKey", "sshUser", "sshPort", "bootTimeout", "guestUUID", "machineID", "hostMachineID"}
@@ -287,9 +425,6 @@ def verify_persistent_guest(record: dict[str, object], pid: int, starttime: str)
             isinstance(verification["hostMachineID"], str) and
             all(isinstance(verification[key], str) for key in ("knownHosts", "sshPrivateKey", "sshUser")),
             "persistent guest verification state is malformed")
-    # Early persistent-boundary records predate these two presentation/executor
-    # fields.  Mothership's launch contract used argparse's SSH default; retain
-    # that replay while recording explicit values for every new boundary.
     ssh = verification.get("sshCommand", "ssh")
     evidence_dir = verification.get("evidenceDir", ".")
     require(isinstance(ssh, str) and ssh and isinstance(evidence_dir, str) and evidence_dir,
@@ -311,6 +446,61 @@ def canonical_cold_reboot_id(value: object, label: str) -> str:
     require(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{32}", value) is not None,
             f"{label} must be canonical 32-hex")
     return value
+
+
+def canonical_guest_uuid(value: object, label: str) -> str:
+    require(isinstance(value, str), f"{label} must be a canonical UUID")
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError as error:
+        raise BoundaryError(f"{label} must be a canonical UUID") from error
+    require(str(parsed) == value, f"{label} must be a canonical UUID")
+    return value
+
+
+def canonical_sha256(value: object, label: str) -> str:
+    require(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None,
+            f"{label} must be canonical lowercase SHA-256")
+    return value
+
+
+def current_host_machine_id() -> str:
+    value = Path("/etc/machine-id").read_text().strip()
+    require(re.fullmatch(r"[0-9a-f]{32}", value) is not None, "host machine identity is invalid")
+    return value
+
+
+def validate_stopped_recovery_boundary(record: dict[str, object], expected_guest_uuid: str) -> None:
+    """Require a stopped record to remain the exact sealed disk/network boundary."""
+    require(record.get("guestUUID") == expected_guest_uuid, "persistent guest UUID differs from recovery request")
+    verification = record["boundaryVerification"]
+    require(isinstance(verification, dict) and verification.get("guestUUID") == expected_guest_uuid,
+            "persistent guest verification UUID differs from recovery request")
+    host_machine_id = verification.get("hostMachineID")
+    require(isinstance(host_machine_id, str) and re.fullmatch(r"[0-9a-f]{32}", host_machine_id) is not None and
+            host_machine_id == current_host_machine_id(), "host machine identity differs from persistent boundary")
+    overlay = safe_path(Path(str(record["overlay"])), "persistent overlay")
+    vars_copy = safe_path(Path(str(record["ovmfVars"])), "persistent OVMF vars")
+    qmp_socket = Path(str(record["qmpSocket"]))
+    require(qmp_socket.is_absolute() and not qmp_socket.is_symlink() and qmp_socket.parent.resolve(strict=True).is_dir() and
+            (not qmp_socket.exists() or qmp_socket.is_socket()),
+            "persistent QMP socket path is unsafe")
+    command = record["qemuCommand"]
+    def option_value(option: str) -> str | None:
+        if not isinstance(command, list) or command.count(option) != 1:
+            return None
+        index = command.index(option)
+        return command[index + 1] if index + 1 < len(command) and isinstance(command[index + 1], str) else None
+    pidfile = qemu_pidfile(command)
+    require(option_value("-pidfile") == str(pidfile) and pidfile.is_absolute() and not pidfile.is_symlink() and
+            pidfile.parent.resolve(strict=True).is_dir() and (not pidfile.exists() or pidfile.is_file()),
+            "persistent QEMU pidfile path is unsafe")
+    require(option_value("-accel") == "kvm" and option_value("-uuid") == expected_guest_uuid and
+            f"file={overlay},if=virtio,format=qcow2,cache=none" in command and
+            f"if=pflash,format=raw,file={vars_copy}" in command and
+            option_value("-qmp") == f"unix:{qmp_socket},server=on,wait=off",
+            "persistent QEMU disk or identity command is unsafe")
+    validate_persistent_network(command, record["network"])
 
 
 def completed_cold_reboot(receipt: dict[str, object], operation_id: str,
@@ -398,6 +588,7 @@ def resume_cold_reboot(record: dict[str, object], state_path: Path, operation_id
     if command_matches(pid, record["qemuStarttime"], command):
         stop_persistent_qemu(record, "cold reboot")
     replacement_pid = None
+    replacement_process = None
     pidfile = qemu_pidfile(command)
     if pidfile.is_file():
         try: candidate = int(pidfile.read_text().strip())
@@ -408,7 +599,8 @@ def resume_cold_reboot(record: dict[str, object], state_path: Path, operation_id
         process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                    start_new_session=True)
         replacement_pid = process.pid
-    starttime = proc_starttime(replacement_pid)
+        replacement_process = process
+    starttime = observe_spawned_qemu_identity(replacement_process, command) if replacement_process else proc_starttime(replacement_pid)
     require(starttime is not None and command_matches(replacement_pid, starttime, command), "replacement QEMU identity mismatch")
     verify_persistent_guest(record, replacement_pid, starttime)
     completed_at = max(time.monotonic_ns() // 1_000_000, int(prior["startedAtMonotonicMs"]) + 1)
@@ -537,6 +729,59 @@ def preserve_cold_reboot_after_session_loss() -> None:
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
 
+def recover_stopped_boundary(record: dict[str, object], state_path: Path, operation_id: str,
+                             expected_guest_uuid: str, expected_state_sha256: str,
+                             observed_state_sha256: str) -> dict[str, object]:
+    """Recover one OOM-stopped exact boundary through the existing reboot owner."""
+    current = record.get("lastColdReboot")
+    completed = completed_cold_reboot_for(record, operation_id)
+    receipt = current if isinstance(current, dict) and current.get("operationID") == operation_id else completed
+    if receipt is None:
+        require(observed_state_sha256 == expected_state_sha256,
+                "persistent state SHA-256 differs from recovery request")
+        validate_stopped_recovery_boundary(record, expected_guest_uuid)
+        pid = int(record["qemuPID"]); starttime = str(record["qemuStarttime"])
+        require(proc_starttime(pid) is None, "recorded QEMU PID is still live or has been reused")
+        if current is not None:
+            require(isinstance(current, dict) and current.get("completed") is True,
+                    "another unfinished reboot operation already owns this boundary")
+            archive_completed_cold_reboot(record)
+        receipt = {"operationID": operation_id, "beforePID": pid, "beforeStarttime": starttime,
+                   "startedAtMonotonicMs": time.monotonic_ns() // 1_000_000, "completed": False,
+                   "recoveryProtocol": "prodigy-kvm-stopped-recovery-v1",
+                   "recoveryExpectedGuestUUID": expected_guest_uuid,
+                   "recoveryExpectedStateSHA256": expected_state_sha256,
+                   "recoveryPriorIdentity": {"pid": pid, "starttime": starttime}}
+        record["lastColdReboot"] = receipt
+        write_persistent_state(state_path, record)
+    else:
+        validate_stopped_recovery_boundary(record, expected_guest_uuid)
+        require(receipt.get("recoveryProtocol") == "prodigy-kvm-stopped-recovery-v1" and
+                receipt.get("recoveryExpectedGuestUUID") == expected_guest_uuid and
+                receipt.get("recoveryExpectedStateSHA256") == expected_state_sha256,
+                "stopped recovery inputs differ from durable operation")
+        prior = receipt.get("recoveryPriorIdentity")
+        require(isinstance(prior, dict) and prior.get("pid") == receipt.get("beforePID") and
+                prior.get("starttime") == receipt.get("beforeStarttime"),
+                "stopped recovery prior identity is malformed")
+        if receipt.get("completed") is True:
+            require(receipt.get("afterPID") == record.get("qemuPID") and
+                    receipt.get("afterStarttime") == record.get("qemuStarttime") and
+                    command_matches(int(receipt["afterPID"]), str(receipt["afterStarttime"]), record["qemuCommand"]),
+                    "completed stopped recovery no longer owns its exact QEMU process")
+            verify_persistent_guest(record, int(receipt["afterPID"]), str(receipt["afterStarttime"]))
+            return receipt
+        require(proc_starttime(int(prior["pid"])) is None, "stopped recovery prior PID was reused")
+
+    recovered = resume_cold_reboot(record, state_path, operation_id)
+    require(recovered.get("afterPID") == record.get("qemuPID") and
+            recovered.get("afterStarttime") == record.get("qemuStarttime") and
+            command_matches(int(recovered["afterPID"]), str(recovered["afterStarttime"]), record["qemuCommand"]),
+            "stopped recovery no longer owns its exact QEMU process")
+    verify_persistent_guest(record, int(recovered["afterPID"]), str(recovered["afterStarttime"]))
+    return recovered
+
+
 def _lifecycle_main(argv: Sequence[str]) -> int:
     operation, state_path, task_id, remainder = lifecycle_arguments(argv)
     if operation == "launch":
@@ -570,8 +815,15 @@ def _lifecycle_main(argv: Sequence[str]) -> int:
         finally: qemu_log.close()
         return 0
     operation_id = cohort_id = None
+    expected_guest_uuid = expected_state_sha256 = None
     not_before_unix_ms: int | None = None
-    if operation in ("cold-reboot", "arm-cold-reboot", "release-cold-reboot"):
+    if operation == "recover-stopped":
+        require(len(remainder) == 6 and remainder[0::2] == ["--operation-uuid", "--expected-guest-uuid", "--expected-state-sha256"],
+                "recover-stopped requires canonical operation, guest UUID, and state SHA-256 arguments")
+        operation_id = canonical_cold_reboot_id(remainder[1], "recovery operation UUID")
+        expected_guest_uuid = canonical_guest_uuid(remainder[3], "expected guest UUID")
+        expected_state_sha256 = canonical_sha256(remainder[5], "expected state SHA-256")
+    elif operation in ("cold-reboot", "arm-cold-reboot", "release-cold-reboot"):
         require(len(remainder) in (2, 4, 6) and len(remainder) % 2 == 0,
                 f"{operation} requires canonical operation arguments")
         options = dict(zip(remainder[::2], remainder[1::2]))
@@ -594,16 +846,18 @@ def _lifecycle_main(argv: Sequence[str]) -> int:
                 require(set(options) == {"--operation-id", "--cohort-id"},
                         "release-cold-reboot requires operation ID and cohort ID")
         preserve_cold_reboot_after_session_loss()
-    elif operation in ("query", "reconcile-executor"):
+    elif operation in ("query", "query-guest-identity", "reconcile-executor"):
         if operation == "reconcile-executor":
             require(not remainder or (len(remainder) == 4 and remainder[0::2] == ["--operation-id", "--cohort-id"]),
                     "reconcile-executor accepts one exact operation ID and cohort ID pair")
             if remainder:
                 operation_id = canonical_cold_reboot_id(remainder[1], "operation ID")
                 cohort_id = canonical_cold_reboot_id(remainder[3], "cohort ID")
-        else:
+        elif operation == "query":
             require(not remainder or (len(remainder) == 4 and remainder[0::2] == ["--operation-id", "--cohort-id"]),
                     "query accepts one exact operation ID and cohort ID pair")
+        else:
+            require(not remainder, "query-guest-identity does not accept extra arguments")
         if operation == "query" and remainder:
             operation_id = canonical_cold_reboot_id(remainder[1], "operation ID")
             cohort_id = canonical_cold_reboot_id(remainder[3], "cohort ID")
@@ -611,9 +865,18 @@ def _lifecycle_main(argv: Sequence[str]) -> int:
         require(not remainder, f"{operation} does not accept extra arguments")
     if operation == "remove" and not state_path.exists():
         return 0
+    observed_state_sha256 = digest(state_path) if operation == "recover-stopped" else ""
     record = load_persistent_state(state_path, task_id); pid = int(record["qemuPID"]); command = record["qemuCommand"]
+    if operation == "configure-cluster-lan-ipv6":
+        print(json.dumps(configure_cluster_lan_ipv6(record, task_id), sort_keys=True)); return 0
+    if operation == "recover-stopped":
+        assert operation_id is not None and expected_guest_uuid is not None and expected_state_sha256 is not None
+        print(json.dumps(recover_stopped_boundary(record, state_path, operation_id, expected_guest_uuid,
+                                                  expected_state_sha256, observed_state_sha256), sort_keys=True)); return 0
     if operation == "reconcile-executor":
         print(json.dumps(reconcile_executor_upgrade(record, state_path, operation_id, cohort_id), sort_keys=True)); return 0
+    if operation == "query-guest-identity":
+        print(json.dumps(query_guest_linux_identity(record), sort_keys=True)); return 0
     if operation == "query":
         require(command_matches(pid, record["qemuStarttime"], command), "exact QEMU process identity mismatch")
         if operation_id is not None:
@@ -893,6 +1156,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 if __name__ == "__main__":
     try:
         operation = sys.argv[1] if len(sys.argv) > 1 else ""
-        raise SystemExit(lifecycle_main(sys.argv[1:]) if operation in ("launch", "query", "reconcile-executor", "cold-reboot", "arm-cold-reboot", "release-cold-reboot", "remove") else main())
+        raise SystemExit(lifecycle_main(sys.argv[1:]) if operation in ("launch", "query", "query-guest-identity", "reconcile-executor", "cold-reboot", "arm-cold-reboot", "release-cold-reboot", "recover-stopped", "configure-cluster-lan-ipv6", "remove") else main())
     except (BoundaryError, subprocess.CalledProcessError, OSError, json.JSONDecodeError) as error:
         print(f"FAIL: {error}", file=sys.stderr); raise SystemExit(1)

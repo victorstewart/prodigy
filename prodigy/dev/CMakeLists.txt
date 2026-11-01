@@ -161,6 +161,7 @@ set(PRODIGY_DEPOFILES
    "${PRODIGY_DEPOFILES_DIR}/cares.DepoFile"
    "${PRODIGY_DEPOFILES_DIR}/cppsort.DepoFile"
    "${PRODIGY_DEPOFILES_DIR}/gxhash.DepoFile"
+   "${PRODIGY_DEPOFILES_DIR}/rust-toolchain.DepoFile"
    "${PRODIGY_DEPOFILES_DIR}/itoa.DepoFile"
    "${PRODIGY_DEPOFILES_DIR}/libbpf.DepoFile"
    "${PRODIGY_DEPOFILES_DIR}/libcap.DepoFile"
@@ -175,6 +176,7 @@ set(PRODIGY_DEPOFILES
    "${PRODIGY_DEPOFILES_DIR}/openssl.DepoFile"
    "${PRODIGY_DEPOFILES_DIR}/picotls.DepoFile"
    "${PRODIGY_DEPOFILES_DIR}/picoquic.DepoFile"
+   "${PRODIGY_DEPOFILES_DIR}/masque-tunnel.DepoFile"
    "${PRODIGY_DEPOFILES_DIR}/simdjson.DepoFile"
    "${PRODIGY_DEPOFILES_DIR}/snappy.DepoFile"
    "${PRODIGY_DEPOFILES_DIR}/static_type_info.DepoFile"
@@ -186,6 +188,48 @@ set(PRODIGY_DEPOFILES
 
 depos_depend(FILES ${PRODIGY_DEPOFILES})
 _depos_ensure_registry_ready()
+
+# Depos currently imports library targets only.  This executable is staged by
+# the masque-tunnel package and exposed here as an explicit path/IMPORTED
+# executable, rather than being represented as a Depos library target.
+_depos_resolve_runtime(_prodigy_depos_executable PRODIGY_DEPOS_ROOT _prodigy_depos_local_mode _prodigy_depos_namespace)
+depos_default_variant(PRODIGY_DEPOS_VARIANT)
+_depos_internal_namespace(_prodigy_depos_store_namespace ${_prodigy_depos_local_mode})
+# Depos exports no executable target.  Its generated manifest is the
+# materialized package metadata, so use its exact package version rather than
+# duplicating the DepoFile VERSION here.
+set(_prodigy_masque_tunnel_depofile "${PRODIGY_DEPOFILES_DIR}/masque-tunnel.DepoFile")
+file(STRINGS "${_prodigy_masque_tunnel_depofile}" _prodigy_masque_tunnel_version_lines REGEX "^VERSION[ \t]+[^ \t\r\n]+$")
+list(LENGTH _prodigy_masque_tunnel_version_lines _prodigy_masque_tunnel_version_count)
+if (NOT _prodigy_masque_tunnel_version_count EQUAL 1)
+   message(FATAL_ERROR "${_prodigy_masque_tunnel_depofile} must declare exactly one VERSION.")
+endif()
+list(GET _prodigy_masque_tunnel_version_lines 0 _prodigy_masque_tunnel_version_line)
+string(REGEX REPLACE "^VERSION[ \t]+([^ \t\r\n]+)$" "\\1" _prodigy_masque_tunnel_version "${_prodigy_masque_tunnel_version_line}")
+file(STRINGS "${DEPOS_MANIFEST_FILE}" _prodigy_masque_tunnel_manifest_lines
+   REGEX "^depos_require\\(masque_tunnel NAMESPACE ${_prodigy_depos_store_namespace} VERSION [^ )]+\\)$")
+list(LENGTH _prodigy_masque_tunnel_manifest_lines _prodigy_masque_tunnel_manifest_count)
+if (NOT _prodigy_masque_tunnel_manifest_count EQUAL 1)
+   message(FATAL_ERROR "${DEPOS_MANIFEST_FILE} must materialize exactly one masque_tunnel request for namespace ${_prodigy_depos_store_namespace}.")
+endif()
+list(GET _prodigy_masque_tunnel_manifest_lines 0 _prodigy_masque_tunnel_manifest_line)
+string(REGEX REPLACE "^depos_require\\(masque_tunnel NAMESPACE ${_prodigy_depos_store_namespace} VERSION ([^ )]+)\\)$" "\\1"
+   _prodigy_masque_tunnel_materialized_version "${_prodigy_masque_tunnel_manifest_line}")
+if (NOT _prodigy_masque_tunnel_materialized_version STREQUAL _prodigy_masque_tunnel_version)
+   message(FATAL_ERROR "${DEPOS_MANIFEST_FILE} materialized masque_tunnel ${_prodigy_masque_tunnel_materialized_version}, expected ${_prodigy_masque_tunnel_version} from ${_prodigy_masque_tunnel_depofile}.")
+endif()
+
+# This path is determined by the same materialized package metadata that
+# depos_depend produced.
+# Do not retain a cache entry: an earlier package version must not survive a
+# later configure and silently select an obsolete gateway binary.
+unset(PRODIGY_MASQUE_TUNNEL_BINARY CACHE)
+set(PRODIGY_MASQUE_TUNNEL_BINARY
+   "${PRODIGY_DEPOS_ROOT}/store/${PRODIGY_DEPOS_VARIANT}/masque_tunnel/${_prodigy_depos_store_namespace}/${_prodigy_masque_tunnel_version}/bin/masque-tunnel")
+if (NOT TARGET prodigy::masque_tunnel)
+   add_executable(prodigy::masque_tunnel IMPORTED GLOBAL)
+   set_target_properties(prodigy::masque_tunnel PROPERTIES IMPORTED_LOCATION "${PRODIGY_MASQUE_TUNNEL_BINARY}")
+endif()
 
 set(PRODIGY_SDK_ENABLE_TESTS OFF CACHE BOOL "Disable standalone SDK tests when embedding the SDK into the Prodigy dev build" FORCE)
 add_subdirectory("${PRODIGY_ROOT}/prodigy/sdk" "${CMAKE_BINARY_DIR}/sdk")
@@ -442,6 +486,25 @@ set(PRODIGY_PINGPONG_ISOLATION_DISCOMBOBUFILE "${CMAKE_BINARY_DIR}/prodigy-pingp
 set(PRODIGY_PINGPONG_ISOLATION_CONTAINER_ARTIFACT "${CMAKE_BINARY_DIR}/prodigy-pingpong-isolation.${PRODIGY_RESOLVED_TARGET_ARCH}.container.zst")
 set(PRODIGY_MOTHERSHIP_TUNNEL_PROVIDER_DISCOMBOBUFILE "${CMAKE_BINARY_DIR}/prodigy-mothership-tunnel-provider.DiscombobuFile")
 set(PRODIGY_MOTHERSHIP_TUNNEL_PROVIDER_ARTIFACT "${CMAKE_BINARY_DIR}/prodigy-mothership-tunnel-provider.${PRODIGY_RESOLVED_TARGET_ARCH}.container.zst")
+set(PRODIGY_CROSS_CLUSTER_MASQUE_GATEWAY_DISCOMBOBUFILE "${CMAKE_BINARY_DIR}/prodigy-cross-cluster-masque-gateway.DiscombobuFile")
+set(PRODIGY_CROSS_CLUSTER_MASQUE_GATEWAY_ARTIFACT "${CMAKE_BINARY_DIR}/prodigy-cross-cluster-masque-gateway.${PRODIGY_RESOLVED_TARGET_ARCH}.container.zst")
+set(PRODIGY_MASQUE_GATEWAY_RUNTIME_BASE "" CACHE STRING "Pinned Discombobulator FROM source for a non-x86_64 MASQUE gateway runtime")
+if (PRODIGY_RESOLVED_TARGET_ARCH STREQUAL "x86_64")
+   set(PRODIGY_MASQUE_GATEWAY_RUNTIME_BASE "remote dockerhub library/archlinux@sha256:5b0bb8064e4fcb1b2092fdee45e959c3c2d18dc7fb986a046aaddaae4d731993 for x86_64")
+elseif (PRODIGY_MASQUE_GATEWAY_RUNTIME_BASE STREQUAL "")
+   message(FATAL_ERROR "Cross-cluster MASQUE gateway requires an explicit digest-pinned PRODIGY_MASQUE_GATEWAY_RUNTIME_BASE for ${PRODIGY_RESOLVED_TARGET_ARCH}.")
+else()
+   string(REGEX MATCH "^remote[ \t]+dockerhub[ \t]+[^ \t@]+@sha256:([0-9a-f]+)[ \t]+for[ \t]+${PRODIGY_RESOLVED_TARGET_ARCH}$"
+      _prodigy_masque_gateway_runtime_base_match "${PRODIGY_MASQUE_GATEWAY_RUNTIME_BASE}")
+   if (_prodigy_masque_gateway_runtime_base_match STREQUAL "")
+      message(FATAL_ERROR "PRODIGY_MASQUE_GATEWAY_RUNTIME_BASE must be exactly a dockerhub repository@sha256 digest pinned for ${PRODIGY_RESOLVED_TARGET_ARCH}.")
+   endif()
+   set(_prodigy_masque_gateway_runtime_digest "${CMAKE_MATCH_1}")
+   string(LENGTH "${_prodigy_masque_gateway_runtime_digest}" _prodigy_masque_gateway_runtime_digest_length)
+   if (NOT _prodigy_masque_gateway_runtime_digest_length EQUAL 64)
+      message(FATAL_ERROR "PRODIGY_MASQUE_GATEWAY_RUNTIME_BASE must contain a 64-character lowercase sha256 digest.")
+   endif()
+endif()
 set(PRODIGY_PINGPONG_UNREADY_DISCOMBOBUFILE "${CMAKE_BINARY_DIR}/prodigy-pingpong-unready.DiscombobuFile")
 set(PRODIGY_PINGPONG_UNREADY_CONTAINER_ARTIFACT "${CMAKE_BINARY_DIR}/prodigy-pingpong-unready.${PRODIGY_RESOLVED_TARGET_ARCH}.container.zst")
 set(PRODIGY_G6_BYO_PROBE_DISCOMBOBUFILE "${CMAKE_BINARY_DIR}/prodigy-g6-byo-probe.DiscombobuFile")
@@ -477,6 +540,11 @@ configure_file(
 configure_file(
    "${CMAKE_CURRENT_SOURCE_DIR}/tests/mothership_tunnel_provider.DiscombobuFile.in"
    "${PRODIGY_MOTHERSHIP_TUNNEL_PROVIDER_DISCOMBOBUFILE}"
+   @ONLY
+)
+configure_file(
+   "${CMAKE_CURRENT_SOURCE_DIR}/tests/cross_cluster_masque_gateway.DiscombobuFile.in"
+   "${PRODIGY_CROSS_CLUSTER_MASQUE_GATEWAY_DISCOMBOBUFILE}"
    @ONLY
 )
 set(PRODIGY_PINGPONG_PROBE_BINARY prodigy_pingpong_container_unready)
@@ -654,9 +722,11 @@ add_executable(prodigy_brain_async_authority_unit ${CMAKE_CURRENT_SOURCE_DIR}/te
 add_executable(prodigy_brain_retirement_authority_ack_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_brain_retirement_authority_ack_unit.cpp)
 add_executable(prodigy_runtime_persistence_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_runtime_persistence_unit.cpp ${PRODIGY_IAAS_RUNTIME_PROVIDER_SOURCES} ${PRODIGY_MOTHERSHIP_TUNNEL_GATEWAY_SOURCE})
 add_executable(prodigy_runtime_environment_bgp_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_runtime_environment_bgp_unit.cpp ${PRODIGY_IAAS_RUNTIME_PROVIDER_SOURCES})
+add_executable(prodigy_pair_private_bgp_secret_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_pair_private_bgp_secret_unit.cpp)
 add_executable(prodigy_transport_tls_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_transport_tls_unit.cpp)
 add_executable(prodigy_transport_bulk_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_transport_bulk_unit.cpp)
 add_executable(prodigy_artifact_io_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_artifact_io_unit.cpp)
+add_executable(prodigy_cross_cluster_masque_gateway_contract_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_cross_cluster_masque_gateway_contract_unit.cpp)
 add_executable(prodigy_mothership_artifact_responsiveness_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_artifact_responsiveness_unit.cpp)
 add_executable(prodigy_cluster_topology_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_cluster_topology_unit.cpp)
 add_executable(prodigy_neuron_hub_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_neuron_hub_unit.cpp)
@@ -741,6 +811,7 @@ add_executable(prodigy_mothership_cluster_remove_unit ${CMAKE_CURRENT_SOURCE_DIR
 add_executable(prodigy_mothership_cluster_create_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_cluster_create_unit.cpp)
 add_executable(prodigy_mothership_production_pair_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_production_pair_unit.cpp)
 add_executable(prodigy_mothership_physical_fault_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_physical_fault_unit.cpp)
+add_executable(prodigy_mothership_nametag_qualification_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_nametag_qualification_unit.cpp)
 add_executable(prodigy_mothership_g6_registry_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_g6_registry_unit.cpp)
 add_executable(prodigy_mothership_addmachines_progress_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_addmachines_progress_unit.cpp)
 add_executable(prodigy_mothership_unix_connect_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_unix_connect_unit.cpp ${PRODIGY_VIRTUAL_DATACENTER_PROVIDER_HEADER} ${PRODIGY_MOTHERSHIP_TUNNEL_GATEWAY_SOURCE} ${PRODIGY_IAAS_RUNTIME_PROVIDER_SOURCES})
@@ -780,10 +851,12 @@ set(PRODIGY_ALL_BUILD_TARGETS
    prodigy_brain_async_authority_unit
    prodigy_brain_retirement_authority_ack_unit
    prodigy_runtime_environment_bgp_unit
+   prodigy_pair_private_bgp_secret_unit
    prodigy_runtime_persistence_unit
    prodigy_transport_tls_unit
    prodigy_transport_bulk_unit
    prodigy_artifact_io_unit
+   prodigy_cross_cluster_masque_gateway_contract_unit
    prodigy_mothership_artifact_responsiveness_unit
    prodigy_cluster_topology_unit
    prodigy_neuron_hub_unit
@@ -857,6 +930,7 @@ set(PRODIGY_ALL_BUILD_TARGETS
    prodigy_mothership_cluster_create_unit
    prodigy_mothership_production_pair_unit
    prodigy_mothership_physical_fault_unit
+   prodigy_mothership_nametag_qualification_unit
    prodigy_mothership_g6_registry_unit
    prodigy_mothership_addmachines_progress_unit
    prodigy_mothership_unix_connect_unit
@@ -953,7 +1027,13 @@ endforeach()
 
 # The authenticated stream owns this pinned handshake implementation; Cargo
 # only builds the static backend, while the existing C++ owner runs all I/O.
-find_program(PRODIGY_NOISE_CARGO_EXECUTABLE cargo REQUIRED)
+set(PRODIGY_RUST_TOOLCHAIN_BIN
+   "${PRODIGY_DEPOS_ROOT}/store/${PRODIGY_DEPOS_VARIANT}/rust_toolchain/${_prodigy_depos_store_namespace}/1.97.1/bin")
+set(PRODIGY_NOISE_CARGO_EXECUTABLE "${PRODIGY_RUST_TOOLCHAIN_BIN}/cargo")
+set(PRODIGY_NOISE_RUSTC_EXECUTABLE "${PRODIGY_RUST_TOOLCHAIN_BIN}/rustc")
+if (NOT EXISTS "${PRODIGY_NOISE_CARGO_EXECUTABLE}" OR NOT EXISTS "${PRODIGY_NOISE_RUSTC_EXECUTABLE}")
+   message(FATAL_ERROR "Pinned Depos Rust toolchain is missing from ${PRODIGY_RUST_TOOLCHAIN_BIN}")
+endif()
 set(PRODIGY_NOISE_MANIFEST "${PRODIGY_ROOT}/prodigy/crypto/noise/Cargo.toml")
 set(PRODIGY_NOISE_TARGET_DIR "${CMAKE_BINARY_DIR}/noise-target")
 set(PRODIGY_NOISE_ARCHIVE "${PRODIGY_NOISE_TARGET_DIR}/release/libprodigy_noise.a")
@@ -963,8 +1043,10 @@ file(GLOB_RECURSE PRODIGY_NOISE_SOURCES CONFIGURE_DEPENDS
 add_custom_command(
    OUTPUT "${PRODIGY_NOISE_ARCHIVE}"
    COMMAND ${CMAKE_COMMAND} -E env "CARGO_TARGET_DIR=${PRODIGY_NOISE_TARGET_DIR}"
+           "RUSTC=${PRODIGY_NOISE_RUSTC_EXECUTABLE}"
            "${PRODIGY_NOISE_CARGO_EXECUTABLE}" build --locked --release --manifest-path "${PRODIGY_NOISE_MANIFEST}"
    DEPENDS ${PRODIGY_NOISE_SOURCES} "${PRODIGY_ROOT}/prodigy/crypto/noise/Cargo.lock"
+           "${PRODIGY_NOISE_CARGO_EXECUTABLE}" "${PRODIGY_NOISE_RUSTC_EXECUTABLE}"
    VERBATIM)
 add_custom_target(prodigy_noise_backend DEPENDS "${PRODIGY_NOISE_ARCHIVE}")
 add_library(prodigy_noise STATIC IMPORTED GLOBAL)
@@ -1044,11 +1126,13 @@ target_compile_definitions(prodigy_brain_replication_credentials_unit PUBLIC
    PRODIGY_DEBUG=1
    PRODIGY_TEST_APP_ARTIFACT="${PRODIGY_PINGPONG_CONTAINER_ARTIFACT}"
    PRODIGY_TEST_MOTHERSHIP_TUNNEL_PROVIDER_ARTIFACT="${PRODIGY_MOTHERSHIP_TUNNEL_PROVIDER_ARTIFACT}"
+   PRODIGY_TEST_CROSS_CLUSTER_MASQUE_GATEWAY_ARTIFACT="${PRODIGY_CROSS_CLUSTER_MASQUE_GATEWAY_ARTIFACT}"
+   PRODIGY_TEST_CLUSTER_BOUNDARY_CHECKER="${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_test_cluster.sh"
    PRODIGY_TEST_UPGRADE_BUNDLE="${PRODIGY_BUNDLE_OUTPUT}"
 )
 target_compile_definitions(prodigy_pairing_parser_adversarial_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_container_overlay_sync_unit PUBLIC PRODIGY_DEBUG=1 PRODIGY_TEST_BINARY_DIR="${CMAKE_BINARY_DIR}")
-target_compile_definitions(prodigy_switchboard_whitehole_unit PUBLIC PRODIGY_TEST_BINARY_DIR="${CMAKE_BINARY_DIR}")
+target_compile_definitions(prodigy_switchboard_whitehole_unit PUBLIC PRODIGY_TEST_BINARY_DIR="${CMAKE_BINARY_DIR}" PRIVATE BASICS_DEBUG=1)
 if (PRODIGY_ENABLE_FUZZ_TESTS)
    target_compile_definitions(prodigy_pairing_parser_fuzz PUBLIC PRODIGY_DEBUG=1)
    target_compile_definitions(prodigy_mothership_topic_fuzz PUBLIC PRODIGY_DEBUG=1)
@@ -1101,6 +1185,7 @@ target_compile_options(prodigy_runtime_persistence_unit PUBLIC -O2)
 target_compile_options(prodigy_transport_tls_unit PUBLIC -O2)
 target_compile_options(prodigy_transport_bulk_unit PUBLIC -O2)
 target_compile_options(prodigy_artifact_io_unit PUBLIC -O2)
+target_compile_options(prodigy_cross_cluster_masque_gateway_contract_unit PUBLIC -O2)
 target_compile_options(prodigy_mothership_artifact_responsiveness_unit PUBLIC -O2)
 target_compile_options(prodigy_cluster_topology_unit PUBLIC -O2)
 target_compile_options(prodigy_neuron_hub_unit PUBLIC -O2)
@@ -1158,6 +1243,7 @@ target_compile_options(prodigy_mothership_cluster_remove_unit PUBLIC -O2)
 target_compile_options(prodigy_mothership_cluster_create_unit PUBLIC -O2)
 target_compile_options(prodigy_mothership_production_pair_unit PRIVATE -O2 -UNDEBUG)
 target_compile_options(prodigy_mothership_physical_fault_unit PUBLIC -O2)
+target_compile_options(prodigy_mothership_nametag_qualification_unit PUBLIC -O2 -UNDEBUG)
 target_compile_options(prodigy_mothership_g6_registry_unit PRIVATE -O2 -UNDEBUG)
 target_compile_options(prodigy_mothership_addmachines_progress_unit PUBLIC -O2)
 target_compile_options(prodigy_mothership_unix_connect_unit PUBLIC -O2)
@@ -1269,6 +1355,10 @@ add_dependencies(prodigy_container_overlay_sync_unit
    container_ingress_router
    host_ingress_router)
 
+# The overlay route unit exercises the userspace route-key contract; compile
+# the matching egress BPF lookup whenever that focused target is built.
+add_dependencies(prodigy_switchboard_overlay_route_unit host_egress_router)
+
 add_dependencies(prodigy_switchboard_whitehole_unit
    balancer_router
    container_egress_router
@@ -1308,6 +1398,10 @@ add_custom_command(
    COMMAND "${CMAKE_COMMAND}" -E env
            CARGO_TARGET_DIR=${DISCOMBOBULATOR_CARGO_TARGET_DIR}
            cargo run --quiet --manifest-path "${DISCOMBOBULATOR_MANIFEST}" --
+           remote add dockerhub docker.io
+   COMMAND "${CMAKE_COMMAND}" -E env
+           CARGO_TARGET_DIR=${DISCOMBOBULATOR_CARGO_TARGET_DIR}
+           cargo run --quiet --manifest-path "${DISCOMBOBULATOR_MANIFEST}" --
            build
            --file "${PRODIGY_DNS_RESOLVER_DISCOMBOBUFILE}"
            --context "resolver=$<TARGET_FILE_DIR:prodigy_dns_resolver>"
@@ -1320,6 +1414,7 @@ add_custom_command(
            "${DISCOMBOBULATOR_CARGO_LOCK}"
            ${DISCOMBOBULATOR_SOURCE_FILES}
    COMMENT "Building Prodigy DNS resolver app container"
+   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
    VERBATIM
 )
 add_custom_target(prodigy_dns_resolver_container DEPENDS "${PRODIGY_DNS_RESOLVER_CONTAINER_ARTIFACT}")
@@ -1439,6 +1534,32 @@ add_custom_command(
 add_custom_target(prodigy_mothership_tunnel_provider_artifact DEPENDS "${PRODIGY_MOTHERSHIP_TUNNEL_PROVIDER_ARTIFACT}")
 
 add_custom_command(
+   OUTPUT "${PRODIGY_CROSS_CLUSTER_MASQUE_GATEWAY_ARTIFACT}"
+   COMMAND "${CMAKE_COMMAND}" -E env
+           CARGO_TARGET_DIR=${DISCOMBOBULATOR_CARGO_TARGET_DIR}
+           cargo run --quiet --manifest-path "${DISCOMBOBULATOR_MANIFEST}" --
+           remote add dockerhub docker.io
+   COMMAND "${CMAKE_COMMAND}" -E env
+           CARGO_TARGET_DIR=${DISCOMBOBULATOR_CARGO_TARGET_DIR}
+           cargo run --quiet --manifest-path "${DISCOMBOBULATOR_MANIFEST}" --
+           build
+           --file "${PRODIGY_CROSS_CLUSTER_MASQUE_GATEWAY_DISCOMBOBUFILE}"
+           --context "gateway=$<TARGET_FILE_DIR:prodigy::masque_tunnel>"
+           --output "${PRODIGY_CROSS_CLUSTER_MASQUE_GATEWAY_ARTIFACT}"
+           --kind cross-cluster-masque-gateway
+   DEPENDS "${PRODIGY_MASQUE_TUNNEL_BINARY}"
+           "${CMAKE_CURRENT_SOURCE_DIR}/tests/cross_cluster_masque_gateway.DiscombobuFile.in"
+           "${PRODIGY_CROSS_CLUSTER_MASQUE_GATEWAY_DISCOMBOBUFILE}"
+           "${DISCOMBOBULATOR_MANIFEST}"
+           "${DISCOMBOBULATOR_CARGO_LOCK}"
+           ${DISCOMBOBULATOR_SOURCE_FILES}
+   COMMENT "Building Prodigy cross-cluster MASQUE gateway system container"
+   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+   VERBATIM
+)
+add_custom_target(prodigy_cross_cluster_masque_gateway_artifact DEPENDS "${PRODIGY_CROSS_CLUSTER_MASQUE_GATEWAY_ARTIFACT}")
+
+add_custom_command(
    OUTPUT "${PRODIGY_PINGPONG_UNREADY_CONTAINER_ARTIFACT}"
    COMMAND "${CMAKE_COMMAND}" -E env
            CARGO_TARGET_DIR=${DISCOMBOBULATOR_CARGO_TARGET_DIR}
@@ -1556,6 +1677,7 @@ add_dependencies(prodigy_pingpong_unready_container_artifact prodigy_bundle)
 add_dependencies(prodigy_brain_replication_credentials_unit
    prodigy_bundle
    prodigy_mothership_tunnel_provider_artifact
+   prodigy_cross_cluster_masque_gateway_artifact
    prodigy_pingpong_container_artifact)
 foreach(_prodigy_artifact_test IN ITEMS
    prodigy_artifact_io_unit
@@ -2082,6 +2204,7 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
 
    add_test(NAME prodigy_transport_bulk_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_transport_bulk_unit)
    add_test(NAME prodigy_artifact_io_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_artifact_io_unit)
+   add_test(NAME prodigy_cross_cluster_masque_gateway_contract_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_cross_cluster_masque_gateway_contract_unit)
    add_test(NAME prodigy_mothership_artifact_responsiveness_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_artifact_responsiveness_unit)
 
    add_test(
@@ -2148,6 +2271,10 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_host_ingress_overlay_contract.cmake
    )
    add_test(
+      NAME prodigy_masque_gateway_injection_contract
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_masque_gateway_injection_contract.cmake
+   )
+   add_test(
       NAME prodigy_container_overlay_sync_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_container_overlay_sync_unit
    )
@@ -2189,7 +2316,12 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    )
    add_test(
       NAME prodigy_dependency_materialization_contract
-      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_dependency_materialization_contract.cmake
+      COMMAND ${CMAKE_COMMAND}
+              -DPRODIGY_ROOT=${PRODIGY_ROOT}
+              -DPRODIGY_DEPOS_MANIFEST_FILE=${DEPOS_MANIFEST_FILE}
+              -DPRODIGY_DEPOS_MANIFEST_NAMESPACE=${_prodigy_depos_store_namespace}
+              -DPRODIGY_MASQUE_TUNNEL_VERSION=${_prodigy_masque_tunnel_version}
+              -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_dependency_materialization_contract.cmake
    )
    add_test(
       NAME prodigy_container_cgroup_bounds_contract
@@ -2246,6 +2378,11 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=machine-schema-persistence ${CMAKE_BINARY_DIR}/prodigy_brain_replication_credentials_unit)
    add_test(NAME prodigy_routable_fleet_mothership_authorization
       COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=routable-fleet-mothership ${CMAKE_BINARY_DIR}/prodigy_brain_replication_credentials_unit)
+   add_test(NAME prodigy_cross_cluster_masque_gateway_lifecycle
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=cross-cluster-masque-gateway-lifecycle ${CMAKE_BINARY_DIR}/prodigy_brain_replication_credentials_unit)
+   add_test(NAME prodigy_cross_cluster_masque_gateway_reconcile
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=cross-cluster-masque-gateway-reconcile ${CMAKE_BINARY_DIR}/prodigy_brain_replication_credentials_unit)
+   set_tests_properties(prodigy_cross_cluster_masque_gateway_reconcile PROPERTIES LABELS "guest;integration")
    add_test(
       NAME prodigy_async_persistence_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_async_persistence_unit
@@ -2670,6 +2807,12 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    add_test(NAME prodigy_cousin_lifecycle_observe_unit
       COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_cousin_lifecycle_observe_unit.py)
    set_tests_properties(prodigy_cousin_lifecycle_observe_unit PROPERTIES TIMEOUT 15)
+   add_test(NAME prodigy_nametag_three_cluster_qualification_unit
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_nametag_three_cluster_qualification_unit.sh)
+   set_tests_properties(prodigy_nametag_three_cluster_qualification_unit PROPERTIES TIMEOUT 60)
+   add_test(NAME prodigy_nametag_three_cluster_manifest_materialize_unit
+      COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_nametag_three_cluster_manifest_materialize_unit.py)
+   set_tests_properties(prodigy_nametag_three_cluster_manifest_materialize_unit PROPERTIES TIMEOUT 15)
    add_test(NAME prodigy_g6_preflight_unit
       COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_g6_preflight_unit.py)
    set_tests_properties(prodigy_g6_preflight_unit PROPERTIES TIMEOUT 15)
@@ -2681,6 +2824,7 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    set_tests_properties(prodigy_pair_control_session_unit PROPERTIES TIMEOUT 15 SKIP_RETURN_CODE 77 ENVIRONMENT "PRODIGY_TEST_ONLY=cousin-session")
    add_test(NAME prodigy_noise_backend_unit
       COMMAND ${CMAKE_COMMAND} -E env "CARGO_TARGET_DIR=${PRODIGY_NOISE_TARGET_DIR}"
+              "RUSTC=${PRODIGY_NOISE_RUSTC_EXECUTABLE}"
               "${PRODIGY_NOISE_CARGO_EXECUTABLE}" test --locked --offline --release --manifest-path "${PRODIGY_NOISE_MANIFEST}")
    set_tests_properties(prodigy_noise_backend_unit PROPERTIES TIMEOUT 180)
 
@@ -2713,6 +2857,11 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    add_test(
       NAME prodigy_mothership_physical_fault_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_physical_fault_unit
+   )
+
+   add_test(
+      NAME prodigy_mothership_nametag_qualification_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_nametag_qualification_unit
    )
 
    add_test(

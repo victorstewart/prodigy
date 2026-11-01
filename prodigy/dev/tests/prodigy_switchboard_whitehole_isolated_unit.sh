@@ -5,9 +5,10 @@ unit="${1:-}"
 
 if [[ -z "${unit}" || ! -x "${unit}" ]]
 then
-   echo "usage: $0 /path/to/prodigy_switchboard_whitehole_unit" >&2
+   echo "usage: $0 /path/to/prodigy_switchboard_whitehole_unit [unit arguments...]" >&2
    exit 2
 fi
+shift
 
 if [[ "${EUID}" -ne 0 ]]
 then
@@ -43,7 +44,7 @@ then
       PRODIGY_SWITCHBOARD_WHITEHOLE_UNIT_PARENT_NETNS="$(readlink /proc/self/ns/net)" \
       PRODIGY_SWITCHBOARD_WHITEHOLE_UNIT_PARENT_MNTNS="$(readlink /proc/self/ns/mnt)" \
       PRODIGY_SWITCHBOARD_WHITEHOLE_UNIT_PARENT_BPFFS="$(findmnt -n -o MAJ:MIN --target /sys/fs/bpf)" \
-      unshare --mount --net --propagation private -- bash "$0" "${unit}"
+      unshare --mount --net --propagation private -- bash "$0" "${unit}" "$@"
 fi
 
 if [[ "$(readlink /proc/self/ns/net)" == "${PRODIGY_SWITCHBOARD_WHITEHOLE_UNIT_PARENT_NETNS:-}" ||
@@ -81,4 +82,4 @@ ip addr add 198.18.0.1/24 dev pwhsyn0
 ip link set pwhsyn0 up
 ip link set pwhsink0 up
 
-"${unit}"
+"${unit}" "$@"

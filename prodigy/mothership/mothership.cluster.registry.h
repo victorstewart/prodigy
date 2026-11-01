@@ -21,7 +21,20 @@
 #include <prodigy/mothership/mothership.virtual.datacenter.h>
 #include <prodigy/mothership/mothership.pair.control.boundary.h>
 #include <prodigy/mothership/mothership.production.pair.h>
+#include <prodigy/mothership/mothership.nametag.all.masters.h>
 #include <prodigy/mothership/mothership.physical.fault.h>
+#include <prodigy/mothership/mothership.nametag.qualification.h>
+#include <prodigy/pair.private.bgp.secret.h>
+#include <prodigy/cross.cluster.path.fault.h>
+#include <prodigy/retained.container.recovery.h>
+
+// Provider BGP is a public-origin plane.  ULA prefixes are reserved for
+// authenticated private BGP carried inside MASQUE and must never be persisted
+// or admitted as provider origins.
+static inline bool mothershipProviderBGPOriginPrefixAllowed(const IPPrefix& prefix)
+{
+  return prefix.network.is6 == false || (prefix.network.v6[0] & 0xfeu) != 0xfcu;
+}
 
 // Local endpoint qualification is an operation of the test provider, not a
 // migration receipt. In particular, selecting the target does not authorize
@@ -192,6 +205,106 @@ static void serialize(S&& serializer, MothershipTestPairBoundaryRecord& record)
   if (record.version >= 5) serializer.object(record.cousinTransport);
 }
 
+// Keep the V2 wire shape explicit instead of attempting to decode it through
+// the evolving runtime cluster codec. In particular, V2's tunnel egress
+// policy predated the versioned IPv6-capable policy used today.
+class MothershipProdigyClusterRecordV2EgressPolicy {
+public:
+  uint32_t address4 = 0;
+  uint16_t port = 0;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipProdigyClusterRecordV2EgressPolicy& policy)
+{
+  serializer.value4b(policy.address4);
+  serializer.value2b(policy.port);
+}
+
+class MothershipProdigyClusterRecordV2TunnelProvider {
+public:
+  String artifactSHA256;
+  uint64_t artifactBytes = 0;
+  String dialEndpoint;
+  MothershipProdigyClusterRecordV2EgressPolicy egress;
+  MothershipTunnelGatewayClientAuth clientAuth;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipProdigyClusterRecordV2TunnelProvider& provider)
+{
+  serializer.text1b(provider.artifactSHA256, 64);
+  serializer.value8b(provider.artifactBytes);
+  serializer.text1b(provider.dialEndpoint, UINT32_MAX);
+  serializer.object(provider.egress);
+  serializer.object(provider.clientAuth);
+}
+
+class MothershipProdigyClusterRecordV2Connectivity {
+public:
+  MothershipConnectivityKind kind = MothershipConnectivityKind::ssh;
+  MothershipProdigyClusterRecordV2TunnelProvider tunnelProvider;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipProdigyClusterRecordV2Connectivity& connectivity)
+{
+  serializer.value1b(connectivity.kind);
+  serializer.object(connectivity.tunnelProvider);
+}
+
+class MothershipProdigyClusterRecordV2 {
+public:
+  MothershipProdigyCluster cluster;
+  MothershipProdigyClusterRecordV2Connectivity connectivity;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipProdigyClusterRecordV2& record)
+{
+  MothershipProdigyCluster& cluster = record.cluster;
+  serializer.text1b(cluster.name, UINT32_MAX);
+  serializer.value16b(cluster.clusterUUID);
+  serializer.value1b(cluster.deploymentMode);
+  serializer.value1b(cluster.includeLocalMachine);
+  serializer.value1b(cluster.provider);
+  serializer.value1b(cluster.architecture);
+  serializer.text1b(cluster.providerScope, UINT32_MAX);
+  serializer.text1b(cluster.providerCredentialName, UINT32_MAX);
+  serializer.value1b(cluster.propagateProviderCredentialToProdigy);
+  serializer.value1b(cluster.dnsProvider);
+  serializer.text1b(cluster.dnsProviderCredentialName, UINT32_MAX);
+  serializer.object(cluster.acme);
+  serializer.object(cluster.aws);
+  serializer.object(cluster.gcp);
+  serializer.object(cluster.azure);
+  serializer.container(cluster.controls, UINT32_MAX);
+  serializer.object(record.connectivity);
+  serializer.value1b(cluster.datacenterFragment);
+  serializer.value4b(cluster.autoscaleIntervalSeconds);
+  serializer.value4b(cluster.nBrains);
+  serializer.container(cluster.machineSchemas, UINT32_MAX);
+  serializer.container(cluster.machines, UINT32_MAX);
+  serializer.object(cluster.topology);
+  serializer.text1b(cluster.bootstrapSshUser, UINT32_MAX);
+  serializer.object(cluster.bootstrapSshKeyPackage);
+  serializer.object(cluster.bootstrapSshHostKeyPackage);
+  serializer.text1b(cluster.bootstrapSshPrivateKeyPath, UINT32_MAX);
+  serializer.text1b(cluster.remoteProdigyPath, UINT32_MAX);
+  serializer.value2b(cluster.sharedCPUOvercommitPermille);
+  serializer.object(cluster.machineReservedResources);
+  serializer.value1b(cluster.osUpdatesEnabled);
+  serializer.container(cluster.osUpdatePolicies, UINT32_MAX);
+  serializer.value4b(cluster.maxOSDrains);
+  serializer.value4b(cluster.machineUpdateCadenceMins);
+  serializer.object(cluster.bgp);
+  serializer.object(cluster.test);
+  serializer.value1b(cluster.desiredEnvironment);
+  serializer.value1b(cluster.environmentConfigured);
+  serializer.value8b(cluster.lastRefreshMs);
+  serializer.text1b(cluster.lastRefreshFailure, UINT32_MAX);
+}
+
 class MothershipProdigyClusterRecordV3 {
 public:
 
@@ -352,6 +465,136 @@ public:
   Vector<MothershipUpgradeRejectedObservation> rejectedObservations = {};
 };
 
+// The unready-VM repair uses the cluster report to prove which registered peer
+// needs its sealed reboot and the admission report to bind current authority,
+// artifact, topology, inventory, and capacity.  The reboot necessarily
+// advances that peer's transport generation, so the completed report is checked
+// against those immutable fields instead of the pre-reboot semantic digest.  A
+// normal fresh admission is still required before any deployment can consume
+// the completed report.
+static inline bool mothershipLocalVMUnreadyUpgradeReportValid(
+    const MothershipUpgradeAdmissionReport& report,
+    const MothershipUpgradeAdmissionRecord& admission,
+    const MothershipProdigyCluster& cluster, uint128_t machineUUID,
+    bool completed, uint64_t minimumReceiptVersion, String *failure = nullptr)
+{
+  auto fail = [&](const char *message) {
+    if (failure != nullptr) failure->assign(message);
+    return false;
+  };
+  auto failPeer = [&](const char *field, uint128_t peerUUID) {
+    if (failure != nullptr)
+    {
+      String fieldName(field), peer = {};
+      peer.assignItoh(peerUUID);
+      failure->snprintf<"unready local VM recovery peer proof field={} peer={}"_ctv>(fieldName, peer);
+    }
+    return false;
+  };
+  auto failAuthority = [&](const char *field) {
+    if (failure != nullptr)
+    {
+      String fieldName(field);
+      failure->snprintf<"unready local VM recovery authority proof field={}"_ctv>(fieldName);
+    }
+    return false;
+  };
+  String operationID = {};
+  operationID.assignItoh(admission.operationID);
+  if (report.version != 4) return failAuthority("version");
+  if (report.clusterUUID != cluster.clusterUUID) return failAuthority("cluster");
+  if (report.operationID != operationID) return failAuthority("operation");
+  if (report.targetBundleSHA256 != admission.targetBundleSHA256) return failAuthority("target-bundle");
+  if (report.targetContractSHA256 != admission.targetContractSHA256) return failAuthority("target-contract");
+  if (report.authorityGeneration != admission.authorityGeneration) return failAuthority("generation");
+  if (report.masterUUID != admission.masterUUID) return failAuthority("master-uuid");
+  if (report.masterBootNs != admission.masterBootNs) return failAuthority("master-boot");
+  if (!report.master) return failAuthority("master-role");
+  if (!report.authorityQuorumHealthy) return failAuthority("quorum");
+  if (!report.authorityAcknowledged) return failAuthority("authority-acknowledgement");
+  if (!report.recoveryWitnessAcknowledged) return failAuthority("recovery-witness");
+  if (!report.currentUpdaterSupportsSerialFollowers) return failAuthority("serial-followers");
+  if (!report.commissionedPeerTransportVerified) return failAuthority("peer-transport");
+  if (report.masterApprovedBundleSHA256 != admission.sourceBundleSHA256)
+    return failAuthority("approved-source-bundle");
+  if (!report.stagingCapacityResponsesComplete) return failAuthority("staging-responses");
+  if (!report.stagingCapacityComplete) return failAuthority("staging-capacity");
+  if (report.commissionedBrainCount != 3) return failAuthority("brain-count");
+  if (report.peers.size() != 3) return failAuthority("peer-count");
+  if (report.observationComplete != completed) return failAuthority("observation-complete");
+  if (completed)
+  {
+    if (report.observationReceiptVersion <= minimumReceiptVersion)
+      return failAuthority("receipt-version");
+    if (report.healthyCommissionedBrainCount != 3) return failAuthority("healthy-count");
+    if (!report.fleetInventoriesFresh) return failAuthority("fleet-inventories");
+    if (!report.fleetBundleDigestsFresh) return failAuthority("fleet-bundle-digests");
+  }
+  else if (report.healthyCommissionedBrainCount != 2)
+    return failAuthority("healthy-count");
+  uint32_t targetMatches = 0;
+  for (uint32_t index = 0; index < report.peers.size(); ++index)
+  {
+    const auto& peer = report.peers[index];
+    const bool masterSelf = peer.machineUUID == report.masterUUID;
+    const char *invalidField = nullptr;
+    if (peer.brainUUID != peer.machineUUID) invalidField = "brain-machine";
+    else if (peer.authorityGeneration != admission.authorityGeneration) invalidField = "authority-generation";
+    else if (masterSelf &&
+             (peer.masterUUID != 0 || peer.masterBootNs != 0 || peer.requesterTransportGeneration != 0))
+      invalidField = "master-self-echo";
+    else if (!masterSelf &&
+             (peer.masterUUID != admission.masterUUID || peer.masterBootNs != admission.masterBootNs))
+      invalidField = "follower-master-echo";
+    else if (!peer.codeSupportsSerialFollowers) invalidField = "serial-followers";
+    else if (!peer.localInstalledBundleVerified) invalidField = "installed-bundle-attestation";
+    else if (!peer.authorityAcknowledged) invalidField = "authority-acknowledgement";
+    else if (!peer.recoveryWitnessAcknowledged) invalidField = "recovery-witness";
+    else if (peer.operationID != report.operationID) invalidField = "operation";
+    else if (peer.targetBundleSHA256 != report.targetBundleSHA256) invalidField = "target-bundle";
+    else if (peer.targetContractSHA256 != report.targetContractSHA256) invalidField = "target-contract";
+    else if (peer.requiredStagingBytes != report.requiredStagingBytes) invalidField = "staging-bytes";
+    else if (!peer.stagingCapacityProbeComplete) invalidField = "staging-probe";
+    else if (!peer.stagingCapacityVerified) invalidField = "staging-capacity";
+    else if (peer.installedBundleSHA256 != admission.sourceBundleSHA256) invalidField = "source-bundle";
+    if (invalidField != nullptr) return failPeer(invalidField, peer.machineUUID);
+    uint32_t topologyMatches = 0;
+    for (const auto& machine : cluster.topology.machines)
+      if (machine.uuid == peer.machineUUID && machine.isBrain) ++topologyMatches;
+    for (uint32_t prior = 0; prior < index; ++prior)
+      if (report.peers[prior].machineUUID == peer.machineUUID) ++topologyMatches;
+    if (topologyMatches != 1)
+      return failPeer("topology", peer.machineUUID);
+    if (peer.machineUUID == machineUUID)
+    {
+      ++targetMatches;
+      if (peer.stateUploadFresh != completed)
+        return fail("unready local VM recovery target upload state is not the required transition");
+    }
+    else if (!peer.stateUploadFresh)
+      return fail("unready local VM recovery has another stale peer upload");
+  }
+  if (targetMatches != 1)
+    return fail("unready local VM recovery target is absent from the authenticated peer proof");
+  return true;
+}
+
+// The cluster report separately proves that the exact target Brain is
+// currently missing readiness.  Its authenticated state upload can briefly
+// complete while the failing control carrier reconnects, so the adjacent
+// admission snapshot may be either phase.  Accept only a wholly valid phase:
+// two healthy peers with the target upload absent, or all three healthy with
+// every inventory and bundle digest fresh.  A partial hybrid remains closed.
+static inline bool mothershipLocalVMUnreadyUpgradePreRecoveryReportValid(
+    const MothershipUpgradeAdmissionReport& report,
+    const MothershipUpgradeAdmissionRecord& admission,
+    const MothershipProdigyCluster& cluster, uint128_t machineUUID,
+    String *failure = nullptr)
+{
+  return mothershipLocalVMUnreadyUpgradeReportValid(
+      report, admission, cluster, machineUUID, report.observationComplete, 0, failure);
+}
+
 template <typename S>
 static void serialize(S&& serializer, MothershipUpgradeAdmissionRecord& record)
 {
@@ -383,7 +626,7 @@ static void serialize(S&& serializer, MothershipUpgradeAdmissionRecord& record)
 // retry-safe while each Brain remains the sole runtime authority owner.
 class MothershipClusterPairEnrollmentIntent {
 public:
-  static constexpr uint32_t version = 4;
+  static constexpr uint32_t version = 6;
   uint32_t protocolVersion = version;
   uint128_t pairUUID = 0;
   uint128_t operationUUID = 0;
@@ -413,6 +656,10 @@ public:
   MothershipPairControlBoundaryDescriptor testControlBoundary;
   // At most one exact application tuple per direction, owned by this pair.
   Vector<MothershipPairControlServiceTransit> testControlServiceTransits;
+  // Ciphertext/tag/nonce only. The AES key is re-derived from `root`, which is
+  // the pre-existing private enrollment master key; this never enters a Brain
+  // authority projection or a public registry record.
+  Vector<MothershipPairPrivateBGPVault::Record> privateBGPSecrets;
 
   ~MothershipClusterPairEnrollmentIntent()
   {
@@ -505,6 +752,17 @@ static void serialize(S&& serializer, MothershipClusterPairEnrollmentIntent& int
     serializer.container(intent.testControlServiceTransits, MothershipPairControlMaximumServiceTransits,
         [](auto& nested, auto& transit) { nested.object(transit); });
   }
+  if (intent.protocolVersion == 5)
+  {
+    // Consume legacy encrypted BGP-only records, but deliberately do not
+    // promote them: v5 has no authenticated gateway TLS bundle to deliver.
+    Vector<MothershipPairPrivateBGPVault::LegacyRecord> legacyPrivateBGPSecrets;
+    serializer.container(legacyPrivateBGPSecrets, 3, [](auto& nested, auto& record) { nested.object(record); });
+    intent.privateBGPSecrets.clear();
+  }
+  else if (intent.protocolVersion >= 6)
+    serializer.container(intent.privateBGPSecrets, 3, [](auto& nested, auto& record) { nested.object(record); });
+  else intent.privateBGPSecrets.clear();
 }
 
 class MothershipLocalMembershipCleanupMachine {
@@ -580,15 +838,82 @@ static inline bool mothershipLocalMembershipCleanupIntentEqual(
 static inline bool mothershipApplicationPlacementRequired(uint16_t applicationID)
 { return applicationID == 2 || applicationID == 5 || applicationID == 10; }
 
+class MothershipGraphReplicaPlacement {
+public:
+  uint128_t clusterUUID = 0;
+  uint64_t deploymentID = 0;
+  uint64_t membershipGeneration = 0;
+  uint64_t topologyVersion = 0;
+  String topologySHA256;
+  String canonicalPlanSHA256;
+  String artifactSHA256;
+  uint64_t artifactBytes = 0;
+  String observationReceiptSHA256;
+};
+
+// This is an observation bundle, not a second route registry.  The route
+// records and their half receipts remain owned by the existing COUSIN columns;
+// graph admission only names the two exact retained graph services it needs.
+class MothershipGraphReplicaRouteBinding {
+public:
+  ProdigyCousinServicePurpose purpose = ProdigyCousinServicePurpose::sibling;
+  CousinRouteRecord route;
+  CousinRouteApplyReceipt ownerReceipt;
+  CousinRouteApplyReceipt replicaReceipt;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipGraphReplicaPlacement& member)
+{
+  serializer.value16b(member.clusterUUID); serializer.value8b(member.deploymentID);
+  serializer.value8b(member.membershipGeneration); serializer.value8b(member.topologyVersion);
+  serializer.text1b(member.topologySHA256, 64); serializer.text1b(member.canonicalPlanSHA256, 64);
+  serializer.text1b(member.artifactSHA256, 64); serializer.value8b(member.artifactBytes);
+  serializer.text1b(member.observationReceiptSHA256, 64);
+}
+
+static inline bool mothershipGraphReplicaPlacementSame(
+    MothershipGraphReplicaPlacement left, MothershipGraphReplicaPlacement right)
+{
+  String a, b;
+  BitseryEngine::serialize(a, left); BitseryEngine::serialize(b, right);
+  return a == b;
+}
+
+class MothershipGraphReplicaRetirement {
+public:
+  MothershipGraphReplicaPlacement member;
+  uint64_t startedGeneration = 0;
+  uint64_t completedGeneration = 0;
+  String cleanupReceiptSHA256;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipGraphReplicaRetirement& retirement)
+{
+  serializer.object(retirement.member);
+  serializer.value8b(retirement.startedGeneration); serializer.value8b(retirement.completedGeneration);
+  serializer.text1b(retirement.cleanupReceiptSHA256, 64);
+}
+
 class MothershipApplicationPlacement {
 public:
   enum class Policy : uint8_t { hardSingleton = 1, retainedSource = 2 };
-  uint32_t version = 1;
+  uint32_t version = 3;
   uint16_t applicationID = 10;
   uint128_t ownerClusterUUID = 0;
   uint64_t generation = 1;
   String observationReceiptSHA256;
   Policy policy = Policy::hardSingleton;
+  Vector<MothershipGraphReplicaPlacement> graphReplicas;
+  Vector<MothershipGraphReplicaRetirement> graphReplicaRetirements;
+  uint128_t truthRetirementOwnerClusterUUID = 0;
+  uint64_t truthRetirementExpectedGeneration = 0;
+  uint64_t truthRetirementStartedGeneration = 0;
+  uint64_t truthRetirementCompletedGeneration = 0;
+  String truthRetirementClusterName;
+  String truthRetirementInventorySHA256;
+  String truthRetirementCleanupSHA256;
 };
 
 template <typename S>
@@ -600,12 +925,110 @@ static void serialize(S&& serializer, MothershipApplicationPlacement& placement)
   serializer.value8b(placement.generation);
   serializer.text1b(placement.observationReceiptSHA256, 64);
   serializer.value1b(placement.policy);
+  // Version one is the existing retained-owner/singleton record, byte for byte.
+  if (placement.version >= 2) serializer.container(placement.graphReplicas, 256);
+  if (placement.version >= 3) serializer.container(placement.graphReplicaRetirements, 256);
+  if (placement.version >= 4) {
+    serializer.value16b(placement.truthRetirementOwnerClusterUUID);
+    serializer.value8b(placement.truthRetirementExpectedGeneration);
+    serializer.value8b(placement.truthRetirementStartedGeneration);
+    serializer.value8b(placement.truthRetirementCompletedGeneration);
+    serializer.text1b(placement.truthRetirementClusterName, UINT32_MAX);
+    serializer.text1b(placement.truthRetirementInventorySHA256, 64);
+    serializer.text1b(placement.truthRetirementCleanupSHA256, 64);
+  }
+}
+
+class MothershipTruthLifecycleLock {
+  int fd = -1;
+public:
+  MothershipTruthLifecycleLock() = default;
+  MothershipTruthLifecycleLock(const MothershipTruthLifecycleLock&) = delete;
+  MothershipTruthLifecycleLock& operator=(const MothershipTruthLifecycleLock&) = delete;
+  ~MothershipTruthLifecycleLock() { if (fd >= 0) ::close(fd); }
+  bool acquire(const String& registryPath, String *failure = nullptr)
+  {
+    if (fd >= 0 || registryPath.empty()) {
+      if (failure) failure->assign("Truth lifecycle lock unavailable"_ctv);
+      return false;
+    }
+    String path = registryPath; path.append(".truth-lifecycle.lock"_ctv);
+    fd = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0 || ::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+      if (fd >= 0) { ::close(fd); fd = -1; }
+      if (failure) failure->assign("Truth lifecycle lock unavailable"_ctv);
+      return false;
+    }
+    if (failure) failure->clear();
+    return true;
+  }
+};
+
+class MothershipTruthRetirementMachineIdentity {
+public:
+  uint128_t uuid = 0;
+  String cloudID;
+  bool isBrain = false;
+};
+template <typename S>
+static void serialize(S&& serializer, MothershipTruthRetirementMachineIdentity& machine)
+{
+  serializer.value16b(machine.uuid);
+  serializer.text1b(machine.cloudID, UINT32_MAX);
+  serializer.value1b(machine.isBrain);
+}
+class MothershipTruthRetirementInventory {
+public:
+  uint128_t clusterUUID = 0;
+  String clusterName;
+  String providerScope;
+  String providerCredentialName;
+  Vector<MothershipTruthRetirementMachineIdentity> machines;
+};
+template <typename S>
+static void serialize(S&& serializer, MothershipTruthRetirementInventory& inventory)
+{
+  serializer.value16b(inventory.clusterUUID);
+  serializer.text1b(inventory.clusterName, UINT32_MAX);
+  serializer.text1b(inventory.providerScope, UINT32_MAX);
+  serializer.text1b(inventory.providerCredentialName, UINT32_MAX);
+  serializer.container(inventory.machines, 65536);
+}
+static inline bool mothershipTruthRetirementInventoryDigest(const MothershipProdigyCluster& cluster, String& digest)
+{
+  digest.clear();
+  if (cluster.clusterUUID == 0 || cluster.name.empty() || cluster.providerCredentialName.empty() ||
+      cluster.deploymentMode != MothershipClusterDeploymentMode::remote ||
+      cluster.provider != MothershipClusterProvider::vultr || cluster.includeLocalMachine ||
+      cluster.nBrains == 0 || cluster.topology.machines.empty() || cluster.topology.machines.size() > 65536) return false;
+  MothershipTruthRetirementInventory inventory;
+  inventory.clusterUUID = cluster.clusterUUID; inventory.clusterName = cluster.name;
+  inventory.providerScope = cluster.providerScope; inventory.providerCredentialName = cluster.providerCredentialName;
+  uint32_t brains = 0;
+  for (const auto& machine : cluster.topology.machines) {
+    if (machine.source != ClusterMachineSource::created || machine.backing != ClusterMachineBacking::cloud ||
+        machine.kind != MachineConfig::MachineKind::vm || machine.uuid == 0 || machine.cloud.cloudID.empty()) return false;
+    if (machine.isBrain) ++brains;
+    MothershipTruthRetirementMachineIdentity identity;
+    identity.uuid = machine.uuid; identity.cloudID = machine.cloud.cloudID; identity.isBrain = machine.isBrain;
+    for (const auto& prior : inventory.machines)
+      if (prior.uuid == identity.uuid || prior.cloudID == identity.cloudID) return false;
+    inventory.machines.push_back(std::move(identity));
+  }
+  if (brains != cluster.nBrains) return false;
+  std::sort(inventory.machines.begin(), inventory.machines.end(),
+      [](const auto& a, const auto& b) { return a.uuid < b.uuid; });
+  String bytes; BitseryEngine::serialize(bytes, inventory);
+  return prodigyComputeSHA256Hex(bytes, digest);
 }
 
 class MothershipClusterRegistry {
 private:
 
   TidesDB db;
+  // The Vault owns clear pair BGP material.  Public TidesDB records remain
+  // authority descriptors containing its SHA-256 reference only.
+  MothershipPairPrivateBGPVault privateBGPVault;
 
   constexpr static auto clustersColumnFamily = "clusters"_ctv;
   constexpr static auto clustersByUUIDColumnFamily = "clusters_by_uuid"_ctv;
@@ -614,7 +1037,12 @@ private:
   constexpr static auto cousinRoutesColumnFamily = "cousin_routes"_ctv;
   constexpr static auto cousinRouteReceiptsColumnFamily = "cousin_route_receipts"_ctv;
   constexpr static auto clusterPairEnrollmentsColumnFamily = "cluster_pair_enrollments"_ctv;
+  constexpr static auto crossClusterMasqueGatewaysColumnFamily = "cross_cluster_masque_gateways"_ctv;
+  constexpr static auto crossClusterPathFaultLifecyclesColumnFamily = "cross_cluster_path_fault_lifecycles"_ctv;
+  constexpr static auto crossClusterPathFaultLifecycleHistoryColumnFamily = "cross_cluster_path_fault_lifecycle_history"_ctv;
   constexpr static auto productionPairsColumnFamily = "production_pairs"_ctv;
+  constexpr static auto nametagStatefulPreparationsColumnFamily = "nametag_stateful_preparations"_ctv;
+  constexpr static auto nametagAllMastersColumnFamily = "nametag_all_masters"_ctv;
   constexpr static auto applicationPlacementsColumnFamily = "application_placements"_ctv;
   constexpr static auto physicalTransitBoundariesColumnFamily = "physical_transit_boundaries"_ctv;
   constexpr static auto physicalNetworkFaultsColumnFamily = "physical_network_faults"_ctv;
@@ -622,6 +1050,11 @@ private:
   constexpr static auto localVMFaultsColumnFamily = "local_vm_faults"_ctv;
   constexpr static auto localAuthorityRecoveryCohortsColumnFamily = "local_authority_recovery_cohorts"_ctv;
   constexpr static auto localMembershipCleanupColumnFamily = "local_membership_cleanup"_ctv;
+  constexpr static auto nametagQualificationReceiptsColumnFamily = "nametag_qualification_receipts"_ctv;
+  constexpr static auto nametagQualificationIntentsColumnFamily = "nametag_qualification_intents"_ctv;
+  constexpr static auto nametagQualificationExecutionsColumnFamily = "nametag_qualification_executions"_ctv;
+  constexpr static auto nametagSourceBaselineRecordsColumnFamily = "nametag_source_baseline_records"_ctv;
+  constexpr static auto nametagSourceBaselineIntentsColumnFamily = "nametag_source_baseline_intents"_ctv;
   constexpr static auto clusterRecordV2Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=2\n\n"_ctv;
   constexpr static auto clusterRecordV3Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=3\n\n"_ctv;
   constexpr static auto clusterRecordV4Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=4\n\n"_ctv;
@@ -707,6 +1140,76 @@ private:
       return false;
     }
     return true;
+  }
+
+  static bool nametagQualificationAdapterFrozen(const MothershipNametagQualificationAdapter& adapter)
+  {
+    if (adapter.operation == nullptr || adapter.rowID == nullptr) return false;
+    const auto *frozen = mothershipNametagQualificationAdapter(adapter.operation);
+    return frozen != nullptr && frozen->row == adapter.row && frozen->direction == adapter.direction &&
+        std::strcmp(frozen->rowID, adapter.rowID) == 0 &&
+        frozen->deadlineSeconds == adapter.deadlineSeconds && frozen->convergenceSeconds == adapter.convergenceSeconds;
+  }
+
+  static bool nametagQualificationKey(const MothershipNametagQualificationAdapter& adapter,
+                                      uint128_t runUUID, String& key)
+  {
+    if (!nametagQualificationAdapterFrozen(adapter) || runUUID == 0) return false;
+    key.assign(adapter.operation);
+    key.append('/');
+    String run = {};
+    run.assignItoh(runUUID);
+    key.append(run);
+    return true;
+  }
+
+  static bool nametagSourceBaselineKey(uint128_t operationUUID, String& key)
+  { if (operationUUID == 0) return false; key.assignItoh(operationUUID); return true; }
+
+  static bool nametagQualificationAllMastersMatches(
+      const MothershipNametagQualificationIntent& intent,
+      const MothershipNametagAllMastersRecord& allMasters)
+  {
+    if (!mothershipNametagQualificationIntentValid(intent) ||
+        !mothershipNametagAllMastersRecordValid(allMasters) ||
+        intent.allMastersOperationUUID != allMasters.intent.operationUUID ||
+        intent.probeTargets.size() != allMasters.intent.sites.size()) return false;
+    // The all-masters record fixes the canonical EWR/ORD/LAN order. A
+    // qualification intent cannot reinterpret those sites by reordering its
+    // three probe targets.
+    for (uint32_t site = 0; site < intent.probeTargets.size(); ++site)
+      if (intent.probeTargets[site].clusterUUID != allMasters.intent.sites[site].clusterUUID) return false;
+    return true;
+  }
+
+  static bool nametagQualificationReceiptMatchesIntent(
+      const MothershipNametagQualificationReceipt& receipt,
+      const MothershipNametagQualificationIntent& intent)
+  {
+    if (!mothershipNametagQualificationReceiptValid(receipt) ||
+        !mothershipNametagQualificationIntentValid(intent) ||
+        receipt.runUUID != intent.runUUID || receipt.row != intent.row ||
+        receipt.direction != intent.direction || !receipt.rowID.equal(intent.rowID) ||
+        receipt.allMastersOperationUUID != intent.allMastersOperationUUID ||
+        receipt.startedAtMilliseconds != intent.startedAtMilliseconds ||
+        receipt.deadlineAtMilliseconds != intent.deadlineAtMilliseconds ||
+        receipt.convergenceDeadlineAtMilliseconds != intent.convergenceDeadlineAtMilliseconds ||
+        receipt.applicationReceipts.size() != intent.probeTargets.size()) return false;
+    for (uint32_t site = 0; site < intent.probeTargets.size(); ++site) {
+      const auto& application = receipt.applicationReceipts[site];
+      const auto& target = intent.probeTargets[site];
+      if (application.localClusterUUID != target.clusterUUID ||
+          application.deploymentID != target.probeDeploymentID) return false;
+    }
+    return true;
+  }
+
+  static bool nametagQualificationIntentExact(const MothershipNametagQualificationIntent& left,
+                                              const MothershipNametagQualificationIntent& right)
+  {
+    String leftEncoded = {}, rightEncoded = {}; auto leftCopy = left; auto rightCopy = right;
+    return BitseryEngine::serialize(leftEncoded, leftCopy) && BitseryEngine::serialize(rightEncoded, rightCopy) &&
+        leftEncoded.equal(rightEncoded);
   }
 
   static bool cousinRouteReceiptKey(uint128_t routeUUID, CousinRouteHalf half, String& key)
@@ -867,7 +1370,8 @@ private:
       for (uint32_t index = 0; index < record.bgpAuthorizedOriginPrefixes.size(); ++index)
       {
         const IPPrefix& prefix = record.bgpAuthorizedOriginPrefixes[index];
-        if (prefix.cidr > (prefix.network.is6 ? 128 : 32) || !prefix.equals(prefix.canonicalized())) return false;
+        if (prefix.cidr > (prefix.network.is6 ? 128 : 32) || !prefix.equals(prefix.canonicalized()) ||
+            !mothershipProviderBGPOriginPrefixAllowed(prefix)) return false;
         for (uint32_t other = 0; other < index; ++other)
           if (prefix.equals(record.bgpAuthorizedOriginPrefixes[other])) return false;
       }
@@ -905,7 +1409,8 @@ private:
       for (uint32_t index = 0; index < record.bgpAuthorizedOriginPrefixes.size(); ++index)
       {
         const IPPrefix& prefix = record.bgpAuthorizedOriginPrefixes[index];
-        if (prefix.cidr > (prefix.network.is6 ? 128 : 32) || !prefix.equals(prefix.canonicalized())) return false;
+        if (prefix.cidr > (prefix.network.is6 ? 128 : 32) || !prefix.equals(prefix.canonicalized()) ||
+            !mothershipProviderBGPOriginPrefixAllowed(prefix)) return false;
         for (uint32_t other = 0; other < index; ++other)
           if (prefix.equals(record.bgpAuthorizedOriginPrefixes[other])) return false;
       }
@@ -1014,9 +1519,24 @@ private:
     {
       String payload = {};
       payload.assign(serialized.substr(clusterRecordV2Header.size(), serialized.size() - clusterRecordV2Header.size(), Copy::yes));
-      // V2 serialized the unchanged cluster object directly, so all adopted rack
-      // identifiers retain the legacy zero/default semantics after decoding.
-      if (BitseryEngine::deserializeSafe(payload, cluster) == false) return false;
+      MothershipProdigyClusterRecordV2 record = {};
+      if (BitseryEngine::deserializeSafe(payload, record) == false) return false;
+      // V2 predates adopted machine identity tails. A successful historic
+      // decode therefore retains the default zero rack/UUID semantics.
+      cluster = std::move(record.cluster);
+      cluster.mothershipConnectivity.kind = record.connectivity.kind;
+      cluster.mothershipConnectivity.tunnelProvider.artifactSha256 =
+          std::move(record.connectivity.tunnelProvider.artifactSHA256);
+      cluster.mothershipConnectivity.tunnelProvider.artifactBytes =
+          record.connectivity.tunnelProvider.artifactBytes;
+      cluster.mothershipConnectivity.tunnelProvider.dialEndpoint =
+          std::move(record.connectivity.tunnelProvider.dialEndpoint);
+      cluster.mothershipConnectivity.tunnelProvider.egress.address4 =
+          record.connectivity.tunnelProvider.egress.address4;
+      cluster.mothershipConnectivity.tunnelProvider.egress.port =
+          record.connectivity.tunnelProvider.egress.port;
+      cluster.mothershipConnectivity.tunnelProvider.clientAuth =
+          std::move(record.connectivity.tunnelProvider.clientAuth);
       cluster.providerManagedBGP = false;
       return true;
     }
@@ -1110,13 +1630,12 @@ private:
     key.assignItoh(clusterUUID);
   }
 
-  bool allocateTestDatacenterFragment(MothershipProdigyCluster& cluster, bool preserveExisting, String *failure = nullptr)
+  // The datacenter fragment is part of every container-network IPv6 address.
+  // Keep its lease in the cluster record rather than introducing a second
+  // registry: one TidesDB record set is the authority for test, local, and
+  // remote clusters alike.
+  bool allocateDatacenterFragment(MothershipProdigyCluster& cluster, bool preserveExisting, String *failure = nullptr)
   {
-    if (mothershipClusterUsesVirtualDatacenter(cluster) == false)
-    {
-      return true;
-    }
-
     bool used[256] = {};
     Vector<String> serializedClusters = {};
     if (db.listValues(clustersColumnFamily, serializedClusters, failure) == false)
@@ -1129,31 +1648,31 @@ private:
       MothershipProdigyCluster existing = {};
       if (deserializeClusterValue(reinterpret_cast<const uint8_t *>(serialized.data()), serialized.size(), existing) == false)
       {
-        if (failure) failure->assign("cluster record decode failed while allocating test datacenter fragment"_ctv);
+        if (failure) failure->assign("cluster record decode failed while allocating datacenter fragment"_ctv);
         return false;
-      }
-      if (mothershipClusterUsesVirtualDatacenter(existing) == false)
-      {
-        continue;
       }
       if (existing.clusterUUID == cluster.clusterUUID) continue;
-      const String& existingRoot = existing.test.workspaceRoot;
-      const String& requestedRoot = cluster.test.workspaceRoot;
-      const auto containsWorkspace = [](const String& parent, const String& child) {
-        return child.size() > parent.size() && child[parent.size()] == '/' &&
-               std::memcmp(parent.data(), child.data(), parent.size()) == 0;
-      };
-      if (existingRoot == requestedRoot || containsWorkspace(existingRoot, requestedRoot) ||
-          containsWorkspace(requestedRoot, existingRoot))
-      {
-        if (failure) failure->assign("test workspace overlaps another cluster"_ctv);
-        return false;
-      }
       used[existing.datacenterFragment] = true;
-      if (cluster.test.enableFakeIpv4Boundary || existing.test.enableFakeIpv4Boundary)
+      if (mothershipClusterUsesVirtualDatacenter(cluster) &&
+          mothershipClusterUsesVirtualDatacenter(existing))
       {
-        if (failure) failure->assign("test fake IPv4 boundary is single-tenant until its public boundary domain is virtualized"_ctv);
-        return false;
+        const String& existingRoot = existing.test.workspaceRoot;
+        const String& requestedRoot = cluster.test.workspaceRoot;
+        const auto containsWorkspace = [](const String& parent, const String& child) {
+          return child.size() > parent.size() && child[parent.size()] == '/' &&
+                 std::memcmp(parent.data(), child.data(), parent.size()) == 0;
+        };
+        if (existingRoot == requestedRoot || containsWorkspace(existingRoot, requestedRoot) ||
+            containsWorkspace(requestedRoot, existingRoot))
+        {
+          if (failure) failure->assign("test workspace overlaps another cluster"_ctv);
+          return false;
+        }
+        if (cluster.test.enableFakeIpv4Boundary || existing.test.enableFakeIpv4Boundary)
+        {
+          if (failure) failure->assign("test fake IPv4 boundary is single-tenant until its public boundary domain is virtualized"_ctv);
+          return false;
+        }
       }
     }
 
@@ -1161,7 +1680,23 @@ private:
     {
       if (cluster.datacenterFragment == 0 || used[cluster.datacenterFragment])
       {
-        if (failure) failure->assign("existing test datacenter fragment is invalid or conflicts"_ctv);
+        if (failure) failure->assign("existing cluster datacenter fragment is invalid or conflicts"_ctv);
+        return false;
+      }
+      if (failure) failure->clear();
+      return true;
+    }
+
+    // The serialized field predates an explicit "unset" marker and defaults
+    // to one. Treat a colliding one as that legacy/default request so new
+    // callers remain source- and wire-compatible; any other colliding value
+    // is an explicit lease request and must fail closed.
+    if (cluster.datacenterFragment != 0 &&
+        !(cluster.datacenterFragment == 1 && used[cluster.datacenterFragment]))
+    {
+      if (used[cluster.datacenterFragment])
+      {
+        if (failure) failure->assign("cluster datacenter fragment already leased"_ctv);
         return false;
       }
       if (failure) failure->clear();
@@ -1178,7 +1713,7 @@ private:
       }
     }
 
-    if (failure) failure->assign("test datacenter fragment capacity exhausted"_ctv);
+    if (failure) failure->assign("datacenter fragment capacity exhausted"_ctv);
     return false;
   }
 
@@ -3298,7 +3833,7 @@ public:
       return reject("paired destination workload is not the declared healthy stateless fixture"_ctv);
     StatelessDeploymentAdmissionReceipt receipt = {};
     if (!BitseryEngine::deserializeSafe(record.targetAdmissionReceipt, receipt) ||
-        !testPairTargetAdmissionMatches(record, receipt) || deploymentReport.version != 1 ||
+        !testPairTargetAdmissionMatches(record, receipt) || !prodigyDeploymentIdentityReportVersionSupported(deploymentReport.version) ||
         !deploymentReport.found || !deploymentReport.live ||
         deploymentReport.clusterUUID == 0 || deploymentReport.clusterUUID != receipt.admission.clusterUUID ||
         deploymentReport.applicationID != ApplicationConfig::extractApplicationID(record.targetDeploymentID) ||
@@ -3328,7 +3863,7 @@ public:
           transport.nDeployed != transport.nTarget || transport.nHealthy != transport.nTarget)
         return reject("paired destination COUSIN transport workload is not wholly healthy"_ctv);
       const DeploymentIdentityReport& identity = *cousinTransportReport;
-      if (identity.version != 1 || !identity.found || !identity.live ||
+      if (!prodigyDeploymentIdentityReportVersionSupported(identity.version) || !identity.found || !identity.live ||
           identity.clusterUUID != receipt.admission.clusterUUID ||
           identity.applicationID != permission.localApplicationID || identity.versionID != transportVersionID ||
           identity.deploymentID != permission.localDeploymentID || identity.state != DeploymentState::running ||
@@ -4051,14 +4586,84 @@ public:
     String encoded, key;
     key.assignItoa(applicationID);
     if (!db.read(applicationPlacementsColumnFamily, key, encoded, failure)) return false;
-    if (!BitseryEngine::deserializeSafe(encoded, placement) || placement.version != 1 ||
+    if (!BitseryEngine::deserializeSafe(encoded, placement) || placement.version < 1 || placement.version > 4 ||
         placement.applicationID != applicationID || !mothershipApplicationPlacementRequired(applicationID) ||
         placement.ownerClusterUUID == 0 || placement.generation == 0 ||
         placement.policy != (applicationID == 10 ? MothershipApplicationPlacement::Policy::hardSingleton : MothershipApplicationPlacement::Policy::retainedSource) ||
         !prodigyIsSHA256HexDigest(placement.observationReceiptSHA256)) {
       placement = {};
-      if (failure) failure->assign("Truth singleton placement is corrupt"_ctv);
+      if (failure) failure->assign("retained application placement is corrupt"_ctv);
       return false;
+    }
+    if (placement.version == 4 &&
+        (applicationID != 10 || placement.truthRetirementOwnerClusterUUID == 0 ||
+         placement.truthRetirementExpectedGeneration == 0 ||
+         placement.truthRetirementExpectedGeneration == UINT64_MAX ||
+         placement.truthRetirementStartedGeneration != placement.truthRetirementExpectedGeneration + 1 ||
+         placement.truthRetirementClusterName.empty() ||
+         !prodigyIsSHA256HexDigest(placement.truthRetirementInventorySHA256) ||
+         (placement.truthRetirementCompletedGeneration == 0 ?
+             (!placement.truthRetirementCleanupSHA256.empty() ||
+              placement.ownerClusterUUID != placement.truthRetirementOwnerClusterUUID ||
+              placement.generation != placement.truthRetirementStartedGeneration) :
+             (placement.truthRetirementStartedGeneration == UINT64_MAX ||
+              placement.truthRetirementCompletedGeneration != placement.truthRetirementStartedGeneration + 1 ||
+              !prodigyIsSHA256HexDigest(placement.truthRetirementCleanupSHA256) ||
+              placement.generation < placement.truthRetirementCompletedGeneration ||
+              (placement.ownerClusterUUID == placement.truthRetirementOwnerClusterUUID &&
+               placement.generation != placement.truthRetirementCompletedGeneration) ||
+              (placement.ownerClusterUUID != placement.truthRetirementOwnerClusterUUID &&
+               (placement.truthRetirementCompletedGeneration == UINT64_MAX ||
+                placement.generation != placement.truthRetirementCompletedGeneration + 1)))))) {
+      placement = {};
+      if (failure) failure->assign("Truth retirement placement is corrupt"_ctv);
+      return false;
+    }
+    uint128_t previous = 0;
+    bytell_hash_set<uint64_t> generations;
+    for (const auto& member : placement.graphReplicas) {
+      if (placement.version < 2 || applicationID == 10 || member.clusterUUID <= previous ||
+          member.clusterUUID == placement.ownerClusterUUID ||
+          uint16_t(member.deploymentID >> 48) != applicationID || member.membershipGeneration <= 1 ||
+          member.membershipGeneration > placement.generation || !generations.insert(member.membershipGeneration).second ||
+          member.topologyVersion == 0 || !prodigyIsSHA256HexDigest(member.topologySHA256) ||
+          !prodigyIsSHA256HexDigest(member.canonicalPlanSHA256) || !prodigyIsSHA256HexDigest(member.artifactSHA256) ||
+          member.artifactBytes == 0 || !prodigyIsSHA256HexDigest(member.observationReceiptSHA256)) {
+        placement = {};
+        if (failure) failure->assign("graph replica placement is corrupt"_ctv);
+        return false;
+      }
+      previous = member.clusterUUID;
+    }
+    previous = 0;
+    for (const auto& retirement : placement.graphReplicaRetirements) {
+      const auto& member = retirement.member;
+      if (placement.version != 3 || applicationID == 10 || member.clusterUUID <= previous ||
+          member.clusterUUID == placement.ownerClusterUUID || uint16_t(member.deploymentID >> 48) != applicationID ||
+          member.membershipGeneration <= 1 || retirement.startedGeneration <= member.membershipGeneration ||
+          retirement.startedGeneration > placement.generation ||
+          !generations.insert(retirement.startedGeneration).second || member.topologyVersion == 0 ||
+          (retirement.completedGeneration != 0 && !generations.insert(member.membershipGeneration).second) ||
+          !prodigyIsSHA256HexDigest(member.topologySHA256) || !prodigyIsSHA256HexDigest(member.canonicalPlanSHA256) ||
+          !prodigyIsSHA256HexDigest(member.artifactSHA256) || member.artifactBytes == 0 ||
+          !prodigyIsSHA256HexDigest(member.observationReceiptSHA256) ||
+          (retirement.completedGeneration == 0 ? !retirement.cleanupReceiptSHA256.empty() :
+              (retirement.completedGeneration <= retirement.startedGeneration || retirement.completedGeneration > placement.generation ||
+               !generations.insert(retirement.completedGeneration).second || !prodigyIsSHA256HexDigest(retirement.cleanupReceiptSHA256)))) {
+        placement = {};
+        if (failure) failure->assign("graph replica retirement is corrupt"_ctv);
+        return false;
+      }
+      const auto active = std::find_if(placement.graphReplicas.begin(), placement.graphReplicas.end(),
+          [&](const auto& candidate) { return candidate.clusterUUID == member.clusterUUID; });
+      if ((retirement.completedGeneration == 0 && (active == placement.graphReplicas.end() ||
+              !mothershipGraphReplicaPlacementSame(*active, member))) ||
+          (retirement.completedGeneration != 0 && active != placement.graphReplicas.end())) {
+        placement = {};
+        if (failure) failure->assign("graph replica retirement conflicts with active membership"_ctv);
+        return false;
+      }
+      previous = member.clusterUUID;
     }
     return true;
   }
@@ -4076,6 +4681,47 @@ public:
     if (!lockG6Operations(lock, failure)) return false;
     String readFailure;
     if (loadApplicationPlacement(applicationID, placement, &readFailure)) {
+      if (applicationID == 10 && placement.version == 4) {
+        if (placement.truthRetirementCompletedGeneration == 0) {
+          if (failure) failure->assign("Truth owner retirement is pending"_ctv);
+          return false;
+        }
+        if (placement.ownerClusterUUID == placement.truthRetirementOwnerClusterUUID) {
+          if (clusterUUID == placement.ownerClusterUUID || placement.generation == UINT64_MAX ||
+              observationReceiptSHA256 == placement.observationReceiptSHA256) {
+            if (failure) failure->assign("retired Truth owner cannot be readmitted"_ctv);
+            return false;
+          }
+          String oldValue, oldName, oldUUIDKey, lookupFailure;
+          oldUUIDKey.assignItoh(placement.truthRetirementOwnerClusterUUID);
+          if (db.read(clustersColumnFamily, placement.truthRetirementClusterName, oldValue, &lookupFailure)) {
+            MothershipProdigyCluster named;
+            if (!deserializeClusterValue(reinterpret_cast<const uint8_t *>(oldValue.data()), oldValue.size(), named) ||
+                named.clusterUUID == placement.truthRetirementOwnerClusterUUID) {
+              if (failure) failure->assign("retired Truth cluster record remains or is corrupt"_ctv);
+              return false;
+            }
+          } else if (lookupFailure != "record not found"_ctv) {
+            if (failure) *failure = lookupFailure;
+            return false;
+          }
+          if (db.read(clustersByUUIDColumnFamily, oldUUIDKey, oldName, &lookupFailure) ||
+              lookupFailure != "record not found"_ctv) {
+            if (failure) failure->assign("retired Truth cluster index remains"_ctv);
+            return false;
+          }
+          String identity, candidateName; identity.assignItoh(clusterUUID);
+          MothershipProdigyCluster candidate;
+          if (!db.read(clustersByUUIDColumnFamily, identity, candidateName, failure) ||
+              !getCluster(candidateName, candidate, failure) || candidate.clusterUUID != clusterUUID ||
+              candidate.name != candidateName) return false;
+          placement.ownerClusterUUID = clusterUUID;
+          placement.observationReceiptSHA256 = observationReceiptSHA256;
+          ++placement.generation;
+          String key, bytes; key.assignItoa(applicationID); BitseryEngine::serialize(bytes, placement);
+          return db.write(applicationPlacementsColumnFamily, key, bytes, failure);
+        }
+      }
       if (placement.ownerClusterUUID != clusterUUID) {
         if (failure) failure->assign("Truth may be admitted only on its durable owner cluster"_ctv);
         return false;
@@ -4098,13 +4744,324 @@ public:
   bool loadTruthPlacement(MothershipApplicationPlacement& placement, String *failure = nullptr)
   { return loadApplicationPlacement(10, placement, failure); }
 
+  bool beginTruthOwnerRetirement(const MothershipProdigyCluster& cluster,
+      MothershipApplicationPlacement& out, String *failure = nullptr)
+  {
+    out = {};
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure)) return false;
+    MothershipApplicationPlacement placement; String readFailure;
+    if (!loadTruthPlacement(placement, &readFailure)) {
+      if (readFailure == "record not found"_ctv) { if (failure) failure->clear(); return true; }
+      if (failure) *failure = readFailure;
+      return false;
+    }
+    if (placement.ownerClusterUUID != cluster.clusterUUID) { if (failure) failure->clear(); return true; }
+    String digest, storedDigest, identity, registeredName; identity.assignItoh(cluster.clusterUUID);
+    MothershipProdigyCluster stored;
+    if (!mothershipTruthRetirementInventoryDigest(cluster, digest) ||
+        !db.read(clustersByUUIDColumnFamily, identity, registeredName, failure) || registeredName != cluster.name ||
+        !getCluster(registeredName, stored, failure) || stored.clusterUUID != cluster.clusterUUID ||
+        !mothershipTruthRetirementInventoryDigest(stored, storedDigest) || digest != storedDigest) {
+      if (failure) failure->assign("Truth retirement requires exact registered created-Vultr inventory"_ctv);
+      return false;
+    }
+    if (placement.version == 4 && placement.truthRetirementOwnerClusterUUID == cluster.clusterUUID) {
+      if (placement.truthRetirementInventorySHA256 != digest) {
+        if (failure) failure->assign("Truth retirement inventory changed"_ctv);
+        return false;
+      }
+      out = placement; if (failure) failure->clear(); return true;
+    }
+    if (placement.generation >= UINT64_MAX - 2) {
+      if (failure) failure->assign("Truth retirement generation exhausted"_ctv);
+      return false;
+    }
+    placement.version = 4;
+    placement.truthRetirementOwnerClusterUUID = cluster.clusterUUID;
+    placement.truthRetirementExpectedGeneration = placement.generation;
+    placement.truthRetirementStartedGeneration = ++placement.generation;
+    placement.truthRetirementCompletedGeneration = 0;
+    placement.truthRetirementClusterName = cluster.name;
+    placement.truthRetirementInventorySHA256 = digest;
+    placement.truthRetirementCleanupSHA256.clear();
+    String key, bytes; key.assignItoa(10); BitseryEngine::serialize(bytes, placement);
+    if (!db.write(applicationPlacementsColumnFamily, key, bytes, failure)) return false;
+    out = placement; if (failure) failure->clear(); return true;
+  }
+
+  bool completeTruthOwnerRetirement(const MothershipProdigyCluster& cluster,
+      const MothershipApplicationPlacement& expected, const String& verifiedCleanupReceipt,
+      String *failure = nullptr)
+  {
+    if (!prodigyIsSHA256HexDigest(verifiedCleanupReceipt)) {
+      if (failure) failure->assign("Truth retirement cleanup receipt is invalid"_ctv);
+      return false;
+    }
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure)) return false;
+    MothershipApplicationPlacement current;
+    String digest;
+    if (!loadTruthPlacement(current, failure) || current.version != 4 || expected.version != 4 ||
+        current.ownerClusterUUID != cluster.clusterUUID || expected.ownerClusterUUID != cluster.clusterUUID ||
+        current.truthRetirementOwnerClusterUUID != cluster.clusterUUID ||
+        expected.truthRetirementOwnerClusterUUID != cluster.clusterUUID ||
+        expected.truthRetirementExpectedGeneration != current.truthRetirementExpectedGeneration ||
+        expected.truthRetirementStartedGeneration != current.truthRetirementStartedGeneration ||
+        expected.truthRetirementClusterName != current.truthRetirementClusterName ||
+        expected.truthRetirementInventorySHA256 != current.truthRetirementInventorySHA256 ||
+        expected.observationReceiptSHA256 != current.observationReceiptSHA256 ||
+        expected.applicationID != 10 || expected.policy != MothershipApplicationPlacement::Policy::hardSingleton ||
+        !((expected.generation == current.truthRetirementStartedGeneration &&
+           expected.truthRetirementCompletedGeneration == 0 && expected.truthRetirementCleanupSHA256.empty()) ||
+          (current.truthRetirementCompletedGeneration != 0 &&
+           expected.generation == current.truthRetirementCompletedGeneration &&
+           expected.truthRetirementCompletedGeneration == current.truthRetirementCompletedGeneration &&
+           expected.truthRetirementCleanupSHA256 == current.truthRetirementCleanupSHA256)) ||
+        !mothershipTruthRetirementInventoryDigest(cluster, digest) ||
+        digest != current.truthRetirementInventorySHA256) {
+      if (failure) failure->assign("Truth retirement identity or generation mismatch"_ctv);
+      return false;
+    }
+    if (current.truthRetirementCompletedGeneration != 0) {
+      String identity, registeredName, readFailure; identity.assignItoh(cluster.clusterUUID);
+      if (db.read(clustersByUUIDColumnFamily, identity, registeredName, &readFailure)) {
+        MothershipProdigyCluster registered; String registeredDigest;
+        if (registeredName != cluster.name || !getCluster(registeredName, registered, failure) ||
+            registered.clusterUUID != cluster.clusterUUID ||
+            !mothershipTruthRetirementInventoryDigest(registered, registeredDigest) || registeredDigest != digest) {
+          if (failure) failure->assign("Truth retirement registered inventory changed"_ctv);
+          return false;
+        }
+      } else if (readFailure != "record not found"_ctv) {
+        if (failure) *failure = readFailure;
+        return false;
+      } else {
+        MothershipProdigyCluster named;
+        if (getCluster(current.truthRetirementClusterName, named, &readFailure)) {
+          if (named.clusterUUID == cluster.clusterUUID) {
+            if (failure) failure->assign("Truth retirement cluster index missing"_ctv);
+            return false;
+          }
+        } else if (readFailure != "record not found"_ctv) {
+          if (failure) *failure = readFailure;
+          return false;
+        }
+      }
+      const bool same = current.truthRetirementCleanupSHA256 == verifiedCleanupReceipt;
+      if (failure) { if (same) failure->clear(); else failure->assign("Truth retirement cleanup receipt conflicts"_ctv); }
+      return same;
+    }
+    String identity, registeredName; identity.assignItoh(cluster.clusterUUID);
+    MothershipProdigyCluster stored; String storedDigest;
+    if (!db.read(clustersByUUIDColumnFamily, identity, registeredName, failure) || registeredName != cluster.name ||
+        !getCluster(registeredName, stored, failure) || stored.clusterUUID != cluster.clusterUUID ||
+        !mothershipTruthRetirementInventoryDigest(stored, storedDigest) || storedDigest != digest) {
+      if (failure) failure->assign("Truth retirement registered inventory changed"_ctv);
+      return false;
+    }
+    current.truthRetirementCompletedGeneration = ++current.generation;
+    current.truthRetirementCleanupSHA256 = verifiedCleanupReceipt;
+    String key, bytes; key.assignItoa(10); BitseryEngine::serialize(bytes, current);
+    return db.write(applicationPlacementsColumnFamily, key, bytes, failure);
+  }
+
   bool admitApplicationPlacement(const DeploymentPlan& plan, uint128_t clusterUUID, const String& receipt,
       MothershipApplicationPlacement& placement, bool& resumed, String *failure = nullptr)
   {
     // Application identity, not a caller's stateless/stateful declaration,
     // selects the retained-placement policy on every admission transport.
     if (!mothershipApplicationPlacementRequired(plan.config.applicationID)) { placement = {}; resumed = false; return true; }
+    const bool graph = plan.config.applicationID == 2 || plan.config.applicationID == 5;
+    if (graph && !prodigyGraphDeploymentPlanCanonical(plan, false)) {
+      if (failure) failure->assign("graph owner admission requires a canonical one-group writer; replicas require authenticated membership"_ctv);
+      return false;
+    }
+    // Every current Radar/Pulse member is a local writer.  It has no durable
+    // retained-source owner, so never create or consult the singleton placement
+    // record that only protects Truth and the legacy graph recovery profile.
+    if (graph && plan.stateful.allMasters) { placement = {}; resumed = false; return true; }
     return admitApplicationPlacement(plan.config.applicationID, clusterUUID, receipt, placement, resumed, failure);
+  }
+
+  // Find the only two COUSIN paths through which a graph replica subscribes to
+  // its retained owner. Their purpose-specific permissions are authenticated live by
+  // Mothership immediately before it calls admission; this durable half makes
+  // route loss or a stale generation fail closed during both new and resumed
+  // admission without creating graph-local route state.
+  bool loadGraphReplicaRouteBindings(uint16_t applicationID, uint128_t ownerClusterUUID,
+      uint128_t replicaClusterUUID, int64_t nowMs, Vector<MothershipGraphReplicaRouteBinding>& bindings,
+      String *failure = nullptr)
+  {
+    bindings.clear();
+    if ((applicationID != 2 && applicationID != 5) || ownerClusterUUID == 0 || replicaClusterUUID == 0 ||
+        ownerClusterUUID == replicaClusterUUID || nowMs <= 0) {
+      if (failure) failure->assign("graph replica route binding requires distinct Radar/Pulse owner and replica clusters"_ctv);
+      return false;
+    }
+    Vector<String> encodedRoutes;
+    if (!db.listValues(cousinRoutesColumnFamily, encodedRoutes, failure)) return false;
+    for (const auto purpose : {ProdigyCousinServicePurpose::sibling, ProdigyCousinServicePurpose::seeding}) {
+      const uint64_t service = prodigyRuntimeStatefulServicePrefix(applicationID,
+          purpose == ProdigyCousinServicePurpose::sibling ? 2 : 4);
+      MothershipGraphReplicaRouteBinding binding = {};
+      bool found = false;
+      for (const auto& encoded : encodedRoutes) {
+        CousinRouteRecord route = {};
+        if (!BitseryEngine::deserializeSafe(encoded, route) || !cousinRouteStructurallyValid(route)) {
+          if (failure) failure->assign("graph replica route registry contains a corrupt record"_ctv);
+          return false;
+        }
+        // The route has its own bitmap; inspect it directly rather than
+        // borrowing the similarly-shaped permission validator.
+        uint32_t routeSlots = 0; uint16_t routeSlot = 0;
+        for (uint16_t candidate = 0; candidate < CousinRouteSlotBitmap::slotCount; ++candidate)
+          if (route.slots.contains(candidate)) { ++routeSlots; routeSlot = candidate; }
+        if (!cousinRouteUsableAt(route, nowMs) || route.state != CousinRouteState::active ||
+            route.sourceClusterUUID != replicaClusterUUID || route.destinationClusterUUID != ownerClusterUUID ||
+            route.sourceApplicationID != applicationID || route.destinationApplicationID != applicationID ||
+            route.sourceCousinServicePrefix != service || route.destinationCousinServicePrefix != service ||
+            routeSlots != 1 || routeSlot != 0) continue;
+        if (found) {
+          if (failure) failure->assign("graph replica route binding is ambiguous for a required service"_ctv);
+          return false;
+        }
+        CousinRouteApplyReceipt ownerReceipt = {}, replicaReceipt = {};
+        String receiptFailure;
+        if (!loadCurrentCousinRouteApplyReceipt(route.routeUUID, CousinRouteHalf::source, replicaReceipt, &receiptFailure) ||
+            !loadCurrentCousinRouteApplyReceipt(route.routeUUID, CousinRouteHalf::destination, ownerReceipt, &receiptFailure)) {
+          if (failure) failure->assign("graph replica route lacks an exact current owner/replica receipt"_ctv);
+          return false;
+        }
+        binding.purpose = purpose; binding.route = std::move(route);
+        binding.ownerReceipt = std::move(ownerReceipt); binding.replicaReceipt = std::move(replicaReceipt);
+        found = true;
+      }
+      if (!found) {
+        if (failure) failure->assign("graph replica admission requires active sibling and seeding COUSIN routes"_ctv);
+        return false;
+      }
+      bindings.push_back(std::move(binding));
+    }
+    if (failure) failure->clear();
+    return true;
+  }
+
+  // Only the authenticated Mothership admission path supplies this observation.
+  // A replica never reassigns the writer; membership changes are CAS-bound to
+  // the retained placement and exact registered target topology. A deployment
+  // identity is immutable for this phase, including across process restarts.
+  bool admitGraphReplicaPlacement(const DeploymentPlan& plan, uint128_t clusterUUID,
+      uint128_t expectedOwnerClusterUUID, uint64_t expectedGeneration,
+      uint64_t topologyVersion, const String& topologySHA256, const String& receipt,
+      MothershipApplicationPlacement& placement, bool& resumed, String *failure = nullptr)
+  {
+    placement = {}; resumed = false;
+    auto reject = [&](const char *reason) { if (failure) failure->assign(reason); return false; };
+    if (!prodigyGraphDeploymentPlanCanonical(plan, true) || clusterUUID == 0 ||
+        clusterUUID == expectedOwnerClusterUUID || expectedGeneration == 0 ||
+        !prodigyIsSHA256HexDigest(receipt) || !prodigyIsSHA256HexDigest(topologySHA256) ||
+        topologyVersion == 0 || !prodigyIsSHA256HexDigest(plan.config.containerBlobSHA256) ||
+        plan.config.containerBlobBytes == 0)
+      return reject("graph replica admission requires an exact non-writer plan and authenticated membership");
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure) || !loadApplicationPlacement(plan.config.applicationID, placement, failure)) return false;
+    if (placement.ownerClusterUUID != expectedOwnerClusterUUID || placement.generation != expectedGeneration)
+      return reject("graph replica admission has stale owner or membership generation");
+    Vector<MothershipGraphReplicaRouteBinding> routeBindings;
+    if (!loadGraphReplicaRouteBindings(plan.config.applicationID, expectedOwnerClusterUUID, clusterUUID,
+            Time::now<TimeResolution::ms>(), routeBindings, failure)) return false;
+    for (const auto& retirement : placement.graphReplicaRetirements)
+      if (retirement.member.clusterUUID == clusterUUID)
+        return reject("graph replica cluster membership is retiring or terminally retired");
+    MothershipProdigyCluster target, owner;
+    String identity; identity.assignItoh(clusterUUID);
+    if (!getClusterByIdentity(identity, target, failure)) return false;
+    identity.assignItoh(expectedOwnerClusterUUID);
+    if (!getClusterByIdentity(identity, owner, failure)) return false;
+    String bytes, registeredDigest;
+    BitseryEngine::serialize(bytes, target.topology);
+    if (target.topology.version != topologyVersion || target.topology.machines.empty() ||
+        !prodigyComputeSHA256Hex(bytes, registeredDigest) || registeredDigest != topologySHA256)
+      return reject("graph replica admission has stale registered cluster membership");
+    auto copy = plan;
+    String planBytes, planDigest;
+    BitseryEngine::serialize(planBytes, copy);
+    if (!prodigyComputeSHA256Hex(planBytes, planDigest)) return false;
+    for (const auto& member : placement.graphReplicas) if (member.clusterUUID == clusterUUID) {
+      if (member.deploymentID != plan.config.deploymentID() || member.canonicalPlanSHA256 != planDigest ||
+          member.artifactSHA256 != plan.config.containerBlobSHA256 || member.artifactBytes != plan.config.containerBlobBytes ||
+          member.topologyVersion != topologyVersion || member.topologySHA256 != topologySHA256)
+        return reject("graph replica admission conflicts with its durable plan or cluster membership");
+      resumed = true;
+      return true;
+    }
+    if (placement.graphReplicas.size() >= 256 || placement.generation == UINT64_MAX)
+      return reject("graph replica membership capacity or generation exhausted");
+    MothershipGraphReplicaPlacement member;
+    member.clusterUUID = clusterUUID; member.deploymentID = plan.config.deploymentID();
+    member.membershipGeneration = ++placement.generation; member.topologyVersion = topologyVersion;
+    member.topologySHA256 = topologySHA256; member.canonicalPlanSHA256 = planDigest;
+    member.artifactSHA256 = plan.config.containerBlobSHA256; member.artifactBytes = plan.config.containerBlobBytes;
+    member.observationReceiptSHA256 = receipt;
+    placement.version = 3; placement.graphReplicas.push_back(std::move(member));
+    std::sort(placement.graphReplicas.begin(), placement.graphReplicas.end(),
+        [](const auto& a, const auto& b) { return a.clusterUUID < b.clusterUUID; });
+    String key; key.assignItoa(plan.config.applicationID);
+    BitseryEngine::serialize(bytes, placement);
+    return db.write(applicationPlacementsColumnFamily, key, bytes, failure);
+  }
+
+  // The existing cluster-removal owner checkpoints this fence before runtime
+  // teardown, then completes it only after that owner proves cleanup. The
+  // immutable admitted member scopes both phases; neither phase moves a writer.
+  bool retireGraphReplicaPlacement(uint16_t applicationID, const MothershipGraphReplicaPlacement& expectedMember,
+      uint128_t expectedOwnerClusterUUID, uint64_t expectedGeneration, bool complete,
+      const String& cleanupReceiptSHA256, MothershipApplicationPlacement& placement, bool& resumed,
+      String *failure = nullptr)
+  {
+    placement = {}; resumed = false;
+    auto reject = [&](const char *reason) { if (failure) failure->assign(reason); return false; };
+    if ((applicationID != 2 && applicationID != 5) || expectedMember.clusterUUID == 0 ||
+        expectedMember.clusterUUID == expectedOwnerClusterUUID ||
+        uint16_t(expectedMember.deploymentID >> 48) != applicationID || expectedGeneration == 0 ||
+        (complete ? !prodigyIsSHA256HexDigest(cleanupReceiptSHA256) : !cleanupReceiptSHA256.empty()))
+      return reject("graph replica retirement requires its exact admitted member and cleanup phase");
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure) || !loadApplicationPlacement(applicationID, placement, failure)) return false;
+    if (placement.ownerClusterUUID != expectedOwnerClusterUUID || placement.generation != expectedGeneration)
+      return reject("graph replica retirement has stale owner or membership generation");
+    auto retirement = std::find_if(placement.graphReplicaRetirements.begin(), placement.graphReplicaRetirements.end(),
+        [&](const auto& candidate) { return candidate.member.clusterUUID == expectedMember.clusterUUID; });
+    if (retirement != placement.graphReplicaRetirements.end()) {
+      if (!mothershipGraphReplicaPlacementSame(retirement->member, expectedMember))
+        return reject("graph replica retirement conflicts with its admitted member");
+      if (!complete || retirement->completedGeneration != 0) {
+        if (complete && retirement->cleanupReceiptSHA256 != cleanupReceiptSHA256)
+          return reject("graph replica retirement cleanup receipt conflicts");
+        resumed = true; return true;
+      }
+    } else if (complete) return reject("graph replica retirement was not durably fenced before cleanup");
+    auto active = std::find_if(placement.graphReplicas.begin(), placement.graphReplicas.end(),
+        [&](const auto& candidate) { return candidate.clusterUUID == expectedMember.clusterUUID; });
+    if (active == placement.graphReplicas.end() || !mothershipGraphReplicaPlacementSame(*active, expectedMember))
+      return reject("graph replica retirement does not match active membership");
+    if (placement.generation == UINT64_MAX || (!complete && placement.graphReplicaRetirements.size() >= 256))
+      return reject("graph replica retirement capacity or generation exhausted");
+    if (complete) {
+      retirement->completedGeneration = ++placement.generation;
+      retirement->cleanupReceiptSHA256 = cleanupReceiptSHA256;
+      placement.graphReplicas.erase(active);
+    } else {
+      MothershipGraphReplicaRetirement pending;
+      pending.member = expectedMember; pending.startedGeneration = ++placement.generation;
+      placement.graphReplicaRetirements.push_back(std::move(pending));
+      std::sort(placement.graphReplicaRetirements.begin(), placement.graphReplicaRetirements.end(),
+          [](const auto& a, const auto& b) { return a.member.clusterUUID < b.member.clusterUUID; });
+    }
+    placement.version = 3;
+    String key, bytes; key.assignItoa(applicationID); BitseryEngine::serialize(bytes, placement);
+    return db.write(applicationPlacementsColumnFamily, key, bytes, failure);
   }
 
   bool admitTruthPlacement(uint128_t clusterUUID, const String& receipt,
@@ -4132,6 +5089,1099 @@ public:
     }
     if (failure) failure->clear();
     return true;
+  }
+
+  bool persistNametagStatefulPreparation(const MothershipNametagStatefulPreparationRecord& proposed,
+                                         MothershipNametagStatefulPreparationRecord& recorded,
+                                         bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    if (!mothershipNametagStatefulPreparationRecordValid(proposed)) {
+      if (failure) failure->assign("Nametag stateful preparation record is invalid"_ctv);
+      return false;
+    }
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure)) return false;
+    String key, encoded, readFailure; key.assignItoh(proposed.intent.operationUUID);
+    if (db.read(nametagStatefulPreparationsColumnFamily, key, encoded, &readFailure)) {
+      if (!BitseryEngine::deserializeSafe(encoded, recorded) ||
+          !mothershipNametagStatefulPreparationRecordValid(recorded) ||
+          recorded.intent.operationUUID != proposed.intent.operationUUID ||
+          recorded.requestSHA256 != proposed.requestSHA256) {
+        recorded = {};
+        if (failure) failure->assign("Nametag stateful preparation conflicts with its durable request"_ctv);
+        return false;
+      }
+      resumed = true;
+      if (failure) failure->clear();
+      return true;
+    }
+    if (!readFailure.equal("record not found"_ctv)) { if (failure) *failure = readFailure; return false; }
+    recorded = proposed;
+    MothershipNametagStatefulPreparationRecord copy = recorded;
+    BitseryEngine::serialize(encoded, copy);
+    if (!db.write(nametagStatefulPreparationsColumnFamily, key, encoded, failure)) { recorded = {}; return false; }
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool loadNametagStatefulPreparation(uint128_t operationUUID, MothershipNametagStatefulPreparationRecord& record,
+                                      String *failure = nullptr)
+  {
+    record = {}; String key, encoded; key.assignItoh(operationUUID);
+    if (operationUUID == 0 || !db.read(nametagStatefulPreparationsColumnFamily, key, encoded, failure)) return false;
+    if (!BitseryEngine::deserializeSafe(encoded, record) || !mothershipNametagStatefulPreparationRecordValid(record) ||
+        record.intent.operationUUID != operationUUID) {
+      record = {}; if (failure) failure->assign("Nametag stateful preparation record is corrupt or unsupported"_ctv); return false;
+    }
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool loadNametagExpiredCutRecoveryPreparation(uint128_t predecessorOperationUUID,
+      MothershipNametagAllMastersIntent& intent, bool& found, String *failure = nullptr) {
+    intent = {}; found = false; String key, op, bytes, readFailure;
+    key.assign("expired-cut-successor:"_ctv); op.assignItoh(predecessorOperationUUID); key.append(op);
+    if (!predecessorOperationUUID) return false;
+    if (!db.read(nametagAllMastersColumnFamily, key, bytes, &readFailure)) {
+      if (readFailure.equal("record not found"_ctv)) { if (failure) failure->clear(); return true; }
+      if (failure) *failure = readFailure; return false;
+    }
+    if (!BitseryEngine::deserializeSafe(bytes, intent) || !mothershipNametagAllMastersIntentValid(intent) ||
+        !intent.isExpiredCutRecovery() || intent.predecessorOperationUUID != predecessorOperationUUID) {
+      if (failure) failure->assign("expired-cut recovery preparation is corrupt"_ctv); return false;
+    }
+    found = true; if (failure) failure->clear(); return true;
+  }
+
+  bool validateNametagExpiredCutRecovery(const MothershipNametagAllMastersIntent& intent,
+      MothershipNametagAllMastersRecord& prior, MothershipNametagInitialSeedRecord& bootstrap,
+      String *failure = nullptr) {
+    String bytes, digest; MothershipNametagSourceBaselineRecord baseline; bool found = false;
+    const auto matchesDigest = [&](auto& value, const String& expected) {
+      bytes.clear(); digest.clear();
+      return BitseryEngine::serialize(bytes, value) && prodigyComputeSHA256Hex(bytes, digest, failure) && digest == expected;
+    };
+    if (!loadNametagAllMasters(intent.predecessorOperationUUID, prior, failure) ||
+        !loadNametagInitialSeed(intent.predecessorOperationUUID, bootstrap, failure) ||
+        !mothershipNametagExpiredCutRecoveryMatches(intent, prior, bootstrap, Time::now<TimeResolution::ms>()) ||
+        !matchesDigest(prior, intent.predecessorRecordSHA256) || !matchesDigest(bootstrap, intent.initialSeedRecordSHA256) ||
+        !loadNametagSourceBaseline(prior.intent.sourceBaselineOperationUUID, baseline, found, failure) || !found ||
+        !matchesDigest(baseline, intent.predecessorBaselineSHA256)) {
+      if (failure && failure->empty()) failure->assign("expired-cut recovery does not match its immutable expired predecessor and completed bootstrap"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  // Claim the single exact recovery before normal source deployment. A crash
+  // before its run row exists can only resume this immutable preparation.
+  bool persistNametagExpiredCutRecoveryPreparation(const MothershipNametagAllMastersIntent& intent,
+      bool& resumed, String *failure = nullptr) {
+    resumed = false; G6OperationLock lock;
+    MothershipNametagAllMastersRecord prior; MothershipNametagInitialSeedRecord bootstrap;
+    if (!lockG6Operations(lock, failure) || !validateNametagExpiredCutRecovery(intent, prior, bootstrap, failure)) return false;
+    MothershipNametagAllMastersIntent existing; bool found = false;
+    if (!loadNametagExpiredCutRecoveryPreparation(intent.predecessorOperationUUID, existing, found, failure)) return false;
+    String bytes, previous; auto copy = intent;
+    if (!BitseryEngine::serialize(bytes, copy)) return false;
+    if (found) {
+      resumed = BitseryEngine::serialize(previous, existing) && previous == bytes;
+      if (!resumed && failure) failure->assign("expired-cut predecessor already has a different immutable successor"_ctv);
+      return resumed;
+    }
+    String runKey, runBytes, readFailure; runKey.assignItoh(intent.operationUUID);
+    if (db.read(nametagAllMastersColumnFamily, runKey, runBytes, &readFailure) || !readFailure.equal("record not found"_ctv)) {
+      if (failure) failure->assign("expired-cut recovery requires an unused management operation UUID"_ctv); return false;
+    }
+    String key, op; key.assign("expired-cut-successor:"_ctv); op.assignItoh(intent.predecessorOperationUUID); key.append(op);
+    return db.write(nametagAllMastersColumnFamily, key, bytes, failure);
+  }
+
+  bool persistNametagAllMasters(const MothershipNametagAllMastersRecord& proposed,
+                                MothershipNametagAllMastersRecord& recorded, bool& resumed,
+                                String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    if (!mothershipNametagAllMastersRecordValid(proposed)) {
+      if (failure) failure->assign("Nametag all-masters record is invalid"_ctv);
+      return false;
+    }
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure)) return false;
+    if (proposed.intent.isExpiredCutRecovery()) {
+      MothershipNametagAllMastersRecord prior; MothershipNametagInitialSeedRecord bootstrap;
+      MothershipNametagAllMastersIntent claim; bool found = false; String a, b; auto intent = proposed.intent;
+      if (!validateNametagExpiredCutRecovery(intent, prior, bootstrap, failure) ||
+          !loadNametagExpiredCutRecoveryPreparation(intent.predecessorOperationUUID, claim, found, failure) || !found ||
+          !BitseryEngine::serialize(a, intent) || !BitseryEngine::serialize(b, claim) || a != b) return false;
+      MothershipNametagSourceBaselineRecord baseline, oldBaseline; bool baselineFound = false, oldFound = false;
+      const auto& source = intent.sites[0];
+      if (!loadNametagSourceBaseline(intent.sourceBaselineOperationUUID, baseline, baselineFound, failure) || !baselineFound ||
+          !loadNametagSourceBaseline(prior.intent.sourceBaselineOperationUUID, oldBaseline, oldFound, failure) || !oldFound ||
+          baseline.command.ewrClusterUUID != source.clusterUUID || baseline.command.hotDeploymentID != source.hotDeploymentID ||
+          baseline.command.coldDeploymentID != source.coldDeploymentID || baseline.command.pulseDeploymentID != source.pulseDeploymentID ||
+          baseline.command.radarDeploymentID != source.radarDeploymentID || baseline.command.truthDeploymentID != source.truthDeploymentID ||
+          baseline.command.probeDeploymentID != oldBaseline.command.probeDeploymentID) return false;
+      for (size_t i = 0; i < proposed.sourceCuts.size(); ++i) {
+        const auto& cut = proposed.sourceCuts[i];
+        for (const auto& old : prior.sourceCuts) if (cut.request.requestUUID == old.request.requestUUID) return false;
+        for (size_t j = 0; j < i; ++j) if (cut.request.requestUUID == proposed.sourceCuts[j].request.requestUUID) return false;
+      }
+    }
+    String key = {}, encoded = {}, readFailure = {}; key.assignItoh(proposed.intent.operationUUID);
+    if (db.read(nametagAllMastersColumnFamily, key, encoded, &readFailure)) {
+      if (!BitseryEngine::deserializeSafe(encoded, recorded) || !mothershipNametagAllMastersRecordValid(recorded) ||
+          recorded.intent.operationUUID != proposed.intent.operationUUID) {
+        recorded = {}; if (failure) failure->assign("Nametag all-masters intent conflicts with its durable request"_ctv); return false;
+      }
+      // The EWR receipt baseline and per-target progress are immutable once
+      // admitted. A restart may observe a newer live report, but must resume
+      // the persisted baseline rather than silently replacing it.
+      String existingIntent = {}, requestedIntent = {};
+      auto existingIntentCopy = recorded.intent; auto requestedIntentCopy = proposed.intent;
+      resumed = recorded.requestSHA256 == proposed.requestSHA256 &&
+          BitseryEngine::serialize(existingIntent, existingIntentCopy) &&
+          BitseryEngine::serialize(requestedIntent, requestedIntentCopy) && existingIntent == requestedIntent;
+      if (!resumed && failure) failure->assign("Nametag all-masters request conflicts with immutable durable baseline"_ctv);
+      return resumed;
+    }
+    if (!readFailure.equal("record not found"_ctv)) { if (failure) *failure = readFailure; return false; }
+    recorded = proposed; auto copy = recorded; BitseryEngine::serialize(encoded, copy);
+    if (!db.write(nametagAllMastersColumnFamily, key, encoded, failure)) { recorded = {}; return false; }
+    if (failure) failure->clear(); return true;
+  }
+
+  // Persist the exact bounded qualification marker before delivering the
+  // marked authority. Retries must preserve the original challenge and cut.
+  bool recordNametagAllMastersSeedFault(uint128_t operationUUID, uint32_t index,
+      const ProdigyNametagQualificationSeedFault& request,
+      MothershipNametagAllMastersRecord& recorded, String *failure = nullptr)
+  {
+    recorded = {}; G6OperationLock lock;
+    if (!operationUUID || request.response || request.stage != ProdigyNametagQualificationSeedFaultStage::arm ||
+        !prodigyNametagQualificationSeedFaultValid(request) || !lockG6Operations(lock, failure)) return false;
+    String key, encoded; key.assignItoh(operationUUID);
+    if (!db.read(nametagAllMastersColumnFamily, key, encoded, failure) ||
+        !BitseryEngine::deserializeSafe(encoded, recorded) || !mothershipNametagAllMastersRecordValid(recorded) ||
+        recorded.protocolVersion < MothershipNametagAllMastersRecord::sourceCutVersion ||
+        recorded.intent.operationUUID != operationUUID || index >= recorded.seedPlacements.size()) return false;
+    auto& row = recorded.seedPlacements[index];
+    const auto cut = std::find_if(recorded.sourceCuts.begin(), recorded.sourceCuts.end(), [&](const auto& value) {
+      return value.request.applicationID == row.applicationID && value.request.shardGroup == row.shardGroup;
+    });
+    if (cut == recorded.sourceCuts.end() || cut->released || !cut->proof.ready ||
+        cut->request.retainUntilMilliseconds <= Time::now<TimeResolution::ms>()) return false;
+    if (request.authority.operationUUID != mothershipNametagSeedOperationUUID(recorded)) return false;
+    const bool alreadyMarked = row.qualificationChallengeUUID != 0;
+    if (!alreadyMarked && (row.deliveryDispatched || row.deliveryApplied || row.catchupObserved ||
+        request.deadlineAtMilliseconds <= Time::now<TimeResolution::ms>())) return false;
+    if (row.qualificationChallengeUUID &&
+        (row.qualificationRunUUID != request.runUUID || row.qualificationChallengeUUID != request.challengeUUID ||
+         row.qualificationExecutionGeneration != request.executionGeneration ||
+         row.qualificationDeadlineAtMilliseconds != request.deadlineAtMilliseconds)) return false;
+    row.qualificationRunUUID = request.runUUID; row.qualificationChallengeUUID = request.challengeUUID;
+    row.qualificationExecutionGeneration = request.executionGeneration;
+    row.qualificationDeadlineAtMilliseconds = request.deadlineAtMilliseconds;
+    if (recorded.protocolVersion < MothershipNametagAllMastersRecord::qualificationSeedFaultVersion)
+      for (auto& placement : recorded.seedPlacements) placement.deliveryDispatched = placement.deliveryApplied;
+    recorded.protocolVersion = MothershipNametagAllMastersRecord::qualificationSeedFaultVersion;
+    ProdigyStatefulStoreSeedAuthority expected = {}; String a, b; auto observed = request.authority;
+    if (!mothershipNametagSourceCutAuthority(recorded, row, expected) ||
+        !BitseryEngine::serialize(a, expected) || !BitseryEngine::serialize(b, observed) || a != b ||
+        !mothershipNametagAllMastersRecordValid(recorded)) return false;
+    if (alreadyMarked) { if (failure) failure->clear(); return true; }
+    auto copy = recorded; encoded.clear();
+    if (!BitseryEngine::serialize(encoded, copy) || !db.write(nametagAllMastersColumnFamily, key, encoded, failure)) return false;
+    if (failure) failure->clear(); return true;
+  }
+
+  // Update one source-cut checkpoint in the existing operation row. The
+  // dispatch marker precedes the network request, so an interrupted first
+  // challenge with an unknown outcome is never silently reissued.
+  bool updateNametagAllMastersSourceCut(uint128_t operationUUID, uint32_t index,
+      bool markDispatch, const ProdigyStatefulStoreSourceCut *reply,
+      MothershipNametagAllMastersRecord& recorded, String *failure = nullptr)
+  {
+    recorded = {}; G6OperationLock lock;
+    if (operationUUID == 0 || !lockG6Operations(lock, failure)) return false;
+    String key, encoded; key.assignItoh(operationUUID);
+    if (!db.read(nametagAllMastersColumnFamily, key, encoded, failure) ||
+        !BitseryEngine::deserializeSafe(encoded, recorded) || !mothershipNametagAllMastersRecordValid(recorded) ||
+        recorded.protocolVersion < MothershipNametagAllMastersRecord::sourceCutVersion ||
+        recorded.intent.operationUUID != operationUUID || index >= recorded.sourceCuts.size()) return false;
+    auto& cut = recorded.sourceCuts[index];
+    MothershipNametagAllMastersIntent recovery; bool recoveryClaimed = false;
+    if (!loadNametagExpiredCutRecoveryPreparation(operationUUID, recovery, recoveryClaimed, failure) || recoveryClaimed) return false;
+    if (markDispatch) {
+      if (reply || cut.dispatched || cut.request.memberRequestUUID != 0) return false;
+      cut.dispatched = true;
+    } else {
+      if (!reply || !cut.dispatched || !prodigyStatefulStoreSourceCutValid(*reply) || !reply->response ||
+          reply->memberRequestUUID == 0) return false;
+      if (reply->action == ProdigyStatefulStoreSourceCutAction::prepare) {
+        auto expected = cut.request;
+        if (expected.memberRequestUUID == 0) expected.memberRequestUUID = reply->memberRequestUUID;
+        if (!prodigyStatefulStoreSourceCutResponseMatches(expected, *reply) || !reply->failure.empty() ||
+            (cut.request.memberRequestUUID != 0 && cut.request.memberRequestUUID != reply->memberRequestUUID)) return false;
+        cut.request.memberRequestUUID = reply->memberRequestUUID;
+        if (reply->ready) {
+          if (cut.proof.ready) {
+            String before, after; auto a = cut.proof; auto b = *reply;
+            if (!BitseryEngine::serialize(before, a) || !BitseryEngine::serialize(after, b) || before != after) return false;
+          } else cut.proof = *reply;
+        }
+      } else if (reply->action == ProdigyStatefulStoreSourceCutAction::release) {
+        auto expected = cut.request; expected.action = ProdigyStatefulStoreSourceCutAction::release;
+        expected.cutUUID = cut.proof.cutUUID; expected.cutGeneration = cut.proof.cutGeneration;
+        if (recorded.phase != MothershipNametagAllMastersRecord::Phase::remoteSeeded || !cut.proof.ready ||
+            !reply->released || !prodigyStatefulStoreSourceCutResponseMatches(expected, *reply)) return false;
+        cut.released = true;
+      } else return false;
+    }
+    if (!mothershipNametagAllMastersRecordValid(recorded)) return false;
+    auto copy = recorded; encoded.clear();
+    return BitseryEngine::serialize(encoded, copy) && db.write(nametagAllMastersColumnFamily, key, encoded, failure);
+  }
+
+  bool installNametagAllMastersSourceCutPlacements(uint128_t operationUUID,
+      const Vector<DeploymentIdentityReport>& pulse, const Vector<DeploymentIdentityReport>& hot,
+      const Vector<DeploymentIdentityReport>& cold, const Vector<DeploymentIdentityReport>& radar,
+      const String& fixture, MothershipNametagAllMastersRecord& recorded, String *failure = nullptr)
+  {
+    recorded = {}; G6OperationLock lock;
+    if (!operationUUID || !lockG6Operations(lock, failure)) return false;
+    String key, encoded; key.assignItoh(operationUUID);
+    if (!db.read(nametagAllMastersColumnFamily, key, encoded, failure) ||
+        !BitseryEngine::deserializeSafe(encoded, recorded) || !mothershipNametagAllMastersRecordValid(recorded) ||
+        recorded.intent.operationUUID != operationUUID || recorded.protocolVersion < MothershipNametagAllMastersRecord::sourceCutVersion) return false;
+    if (recorded.phase != MothershipNametagAllMastersRecord::Phase::sourceCutsPreparing) return true;
+    MothershipNametagAllMastersIntent recovery; bool recoveryClaimed = false;
+    if (!loadNametagExpiredCutRecoveryPreparation(operationUUID, recovery, recoveryClaimed, failure) || recoveryClaimed) return false;
+    if (!mothershipNametagSourceCutPlacementsSynthesize(recorded, pulse, hot, cold, radar, fixture) ||
+        !mothershipNametagAllMastersRecordValid(recorded)) return false;
+    auto copy = recorded; encoded.clear();
+    return BitseryEngine::serialize(encoded, copy) && db.write(nametagAllMastersColumnFamily, key, encoded, failure);
+  }
+
+  // Claim the immutable row before sending its authority. This serializes
+  // delivery with qualification-marker installation across Mothership retries.
+  bool claimNametagAllMastersSeedDelivery(uint128_t operationUUID, uint32_t index,
+      MothershipNametagAllMastersRecord& recorded, String *failure = nullptr)
+  {
+    recorded = {}; G6OperationLock lock;
+    if (!operationUUID || !lockG6Operations(lock, failure)) return false;
+    String key, encoded; key.assignItoh(operationUUID);
+    if (!db.read(nametagAllMastersColumnFamily, key, encoded, failure) ||
+        !BitseryEngine::deserializeSafe(encoded, recorded) || !mothershipNametagAllMastersRecordValid(recorded) ||
+        recorded.intent.operationUUID != operationUUID || index >= recorded.seedPlacements.size()) return false;
+    if (recorded.protocolVersion < MothershipNametagAllMastersRecord::sourceCutVersion) return true;
+    if (recorded.protocolVersion < MothershipNametagAllMastersRecord::qualificationSeedFaultVersion) {
+      for (auto& placement : recorded.seedPlacements) placement.deliveryDispatched = placement.deliveryApplied;
+      recorded.protocolVersion = MothershipNametagAllMastersRecord::qualificationSeedFaultVersion;
+    }
+    auto& row = recorded.seedPlacements[index];
+    if (row.deliveryDispatched) return true;
+    row.deliveryDispatched = true;
+    if (!mothershipNametagAllMastersRecordValid(recorded)) return false;
+    auto copy = recorded; encoded.clear();
+    return BitseryEngine::serialize(encoded, copy) && db.write(nametagAllMastersColumnFamily, key, encoded, failure);
+  }
+
+  bool markNametagAllMastersSeedDelivered(uint128_t operationUUID,
+      const MothershipNametagAllMastersSeedPlacement& expected,
+      MothershipNametagAllMastersRecord& recorded, String *failure = nullptr)
+  {
+    recorded = {}; G6OperationLock lock;
+    if (operationUUID == 0 || !lockG6Operations(lock, failure)) return false;
+    String key = {}, encoded = {}; key.assignItoh(operationUUID);
+    if (!db.read(nametagAllMastersColumnFamily, key, encoded, failure) ||
+        !BitseryEngine::deserializeSafe(encoded, recorded) || !mothershipNametagAllMastersRecordValid(recorded) ||
+        recorded.intent.operationUUID != operationUUID) {
+      recorded = {}; if (failure && failure->empty()) failure->assign("Nametag all-masters delivery has no durable baseline"_ctv); return false;
+    }
+    auto found = std::find_if(recorded.seedPlacements.begin(), recorded.seedPlacements.end(), [&](const auto& row) {
+      return row.site == expected.site && row.applicationID == expected.applicationID && row.shardGroup == expected.shardGroup &&
+          row.targetClusterUUID == expected.targetClusterUUID && row.targetDeploymentID == expected.targetDeploymentID &&
+          row.targetContainerUUID == expected.targetContainerUUID;
+    });
+    if (found == recorded.seedPlacements.end() || found->sourceClusterUUID != expected.sourceClusterUUID ||
+        found->sourceDeploymentID != expected.sourceDeploymentID || found->sourceContainerUUID != expected.sourceContainerUUID ||
+        found->fixtureSHA256 != expected.fixtureSHA256 || found->expectedCatchupWatermarkSHA256 != expected.expectedCatchupWatermarkSHA256 ||
+        found->sourceContentWatermarkSHA256 != expected.sourceContentWatermarkSHA256 ||
+        found->sourceCatchupWatermarkSHA256 != expected.sourceCatchupWatermarkSHA256 || found->seedGeneration != expected.seedGeneration ||
+        found->qualificationRunUUID != expected.qualificationRunUUID ||
+        found->qualificationChallengeUUID != expected.qualificationChallengeUUID ||
+        found->qualificationExecutionGeneration != expected.qualificationExecutionGeneration ||
+        found->qualificationDeadlineAtMilliseconds != expected.qualificationDeadlineAtMilliseconds) {
+      recorded = {}; if (failure) failure->assign("Nametag all-masters delivery target does not match its durable EWR baseline"_ctv); return false;
+    }
+    if (!found->deliveryApplied) {
+      found->deliveryApplied = true;
+      recorded.phase = MothershipNametagAllMastersRecord::Phase::remoteSeeding;
+      if (!mothershipNametagAllMastersRecordValid(recorded)) {
+        recorded = {}; if (failure) failure->assign("Nametag all-masters delivery would violate durable lifecycle"_ctv); return false;
+      }
+      auto copy = recorded; BitseryEngine::serialize(encoded, copy);
+      if (!db.write(nametagAllMastersColumnFamily, key, encoded, failure)) { recorded = {}; return false; }
+    }
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool recordNametagAllMastersSeedObservations(uint128_t operationUUID,
+      const Vector<DeploymentIdentityReport>& pulse, const Vector<DeploymentIdentityReport>& hot,
+      const Vector<DeploymentIdentityReport>& cold, const Vector<DeploymentIdentityReport>& radar,
+      MothershipNametagAllMastersRecord& recorded, String *failure = nullptr)
+  {
+    recorded = {}; G6OperationLock lock;
+    if (operationUUID == 0 || !lockG6Operations(lock, failure)) return false;
+    String key = {}, encoded = {}; key.assignItoh(operationUUID);
+    if (!db.read(nametagAllMastersColumnFamily, key, encoded, failure) ||
+        !BitseryEngine::deserializeSafe(encoded, recorded) || !mothershipNametagAllMastersRecordValid(recorded) ||
+        recorded.intent.operationUUID != operationUUID) {
+      recorded = {}; if (failure && failure->empty()) failure->assign("Nametag all-masters observation has no durable baseline"_ctv); return false;
+    }
+    bool changed = false, complete = true;
+    for (auto& row : recorded.seedPlacements) {
+      bool observed = false;
+      ProdigyStatefulStoreReceipt nativeProof = {};
+      if (recorded.protocolVersion >= MothershipNametagAllMastersRecord::sourceCutVersion) {
+        const Vector<DeploymentIdentityReport> *reports = row.applicationID == MeshRegistry::Pulse::applicationID ? &pulse :
+            (row.applicationID == MeshRegistry::Hot::applicationID ? &hot :
+             (row.applicationID == MeshRegistry::Cold::applicationID ? &cold : &radar));
+        ProdigyStatefulStoreSeedAuthority authority = {};
+        if (row.site < reports->size() && (*reports)[row.site].version >= 5 &&
+            mothershipNametagSourceCutAuthority(recorded, row, authority)) {
+          const auto& report = (*reports)[row.site];
+          for (const auto& member : report.statefulRuntimeCohort)
+            if (member.containerUUID == row.targetContainerUUID && member.shardGroup == row.shardGroup &&
+                report.clusterUUID == row.targetClusterUUID && report.deploymentID == row.targetDeploymentID &&
+                prodigyStatefulStoreReceiptMatchesSourceCutAuthority(member.nativeSourceCutReceipt, authority)) {
+              nativeProof = member.nativeSourceCutReceipt; observed = true; break;
+            }
+        }
+      } else observed = mothershipNametagAllMastersSeedPlacementObserved(row, pulse, hot, cold, radar);
+      if (observed && !row.deliveryApplied) {
+        recorded = {}; if (failure) failure->assign("Nametag all-masters receipt arrived before its durable delivery record"_ctv); return false;
+      }
+      if (observed && !row.catchupObserved) {
+        row.catchupObserved = true;
+        if (recorded.protocolVersion >= MothershipNametagAllMastersRecord::sourceCutVersion) row.nativeSourceCutReceipt = nativeProof;
+        changed = true;
+      }
+      complete = complete && row.catchupObserved;
+    }
+    if (complete && recorded.phase != MothershipNametagAllMastersRecord::Phase::remoteSeeded) {
+      recorded.phase = MothershipNametagAllMastersRecord::Phase::remoteSeeded; changed = true;
+    }
+    if (changed) {
+      if (!mothershipNametagAllMastersRecordValid(recorded)) {
+        recorded = {}; if (failure) failure->assign("Nametag all-masters receipt would violate durable lifecycle"_ctv); return false;
+      }
+      auto copy = recorded; BitseryEngine::serialize(encoded, copy);
+      if (!db.write(nametagAllMastersColumnFamily, key, encoded, failure)) { recorded = {}; return false; }
+    }
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool loadNametagInitialSeed(uint128_t operationUUID, MothershipNametagInitialSeedRecord& record, String *failure = nullptr) {
+    record = {}; if (!operationUUID) return false;
+    String key, op, bytes; key.assign("initial-seed-bootstrap:"_ctv); op.assignItoh(operationUUID); key.append(op);
+    if (!db.read(nametagAllMastersColumnFamily, key, bytes, failure) || !BitseryEngine::deserializeSafe(bytes, record) ||
+        record.operationUUID != operationUUID || !mothershipNametagInitialSeedRecordValid(record)) { record = {}; return false; }
+    if (failure) failure->clear(); return true;
+  }
+
+  bool persistNametagInitialSeed(const MothershipNametagInitialSeedRecord& proposed, bool& resumed, String *failure = nullptr) {
+    resumed = false; G6OperationLock lock; if (!lockG6Operations(lock, failure) || !mothershipNametagInitialSeedRecordValid(proposed) ||
+        proposed.dispatchMask || proposed.completedMask) return false;
+    MothershipNametagSourceBaselineRecord baseline = {}; bool found = false;
+    MothershipNametagAllMastersIntent intent = {}; String bytes, digest;
+    if (!BitseryEngine::deserializeSafe(proposed.intentBytes, intent) ||
+        !loadNametagSourceBaseline(proposed.baselineOperationUUID, baseline, found, failure) || !found ||
+        !prodigyNametagSourceBaselineReceiptValid(baseline.receipt) ||
+        baseline.receipt.ewrClusterUUID != intent.sites[0].clusterUUID ||
+        baseline.command.ewrClusterUUID != intent.sites[0].clusterUUID || baseline.command.pulseDeploymentID != intent.sites[0].pulseDeploymentID ||
+        baseline.command.hotDeploymentID != intent.sites[0].hotDeploymentID || baseline.command.coldDeploymentID != intent.sites[0].coldDeploymentID ||
+        baseline.command.radarDeploymentID != intent.sites[0].radarDeploymentID || baseline.command.truthDeploymentID != intent.sites[0].truthDeploymentID ||
+        !BitseryEngine::serialize(bytes, baseline.receipt) || !prodigyComputeSHA256Hex(bytes, digest, failure) || digest != proposed.baselineReceiptSHA256) return false;
+    String key, op, encoded, existing, readFailure; key.assign("initial-seed-bootstrap:"_ctv); op.assignItoh(proposed.operationUUID); key.append(op);
+    auto copy = proposed; if (!BitseryEngine::serialize(encoded, copy)) return false;
+    if (db.read(nametagAllMastersColumnFamily, key, existing, &readFailure)) {
+      MothershipNametagInitialSeedRecord current = {};
+      if (!BitseryEngine::deserializeSafe(existing, current) || !mothershipNametagInitialSeedRecordValid(current)) return false;
+      current.dispatchMask = current.completedMask = 0; String initial;
+      if (!BitseryEngine::serialize(initial, current) || initial != encoded) return false;
+      resumed = true; if (failure) failure->clear(); return true;
+    }
+    if (!readFailure.equal("record not found"_ctv) || !db.write(nametagAllMastersColumnFamily, key, encoded, failure)) return false;
+    if (failure) failure->clear(); return true;
+  }
+
+  bool updateNametagInitialSeedProgress(uint128_t operationUUID, uint32_t index, bool completed, String *failure = nullptr) {
+    G6OperationLock lock; if (index >= 8 || !lockG6Operations(lock, failure)) return false;
+    MothershipNametagInitialSeedRecord record = {};
+    if (!loadNametagInitialSeed(operationUUID, record, failure)) return false;
+    const uint8_t bit = uint8_t(1u << index);
+    if (completed) { if (!(record.dispatchMask & bit)) return false; record.completedMask |= bit; }
+    else record.dispatchMask |= bit;
+    String key, op, bytes; key.assign("initial-seed-bootstrap:"_ctv); op.assignItoh(operationUUID); key.append(op);
+    if (!mothershipNametagInitialSeedRecordValid(record) || !BitseryEngine::serialize(bytes, record) ||
+        !db.write(nametagAllMastersColumnFamily, key, bytes, failure)) return false;
+    if (failure) failure->clear(); return true;
+  }
+
+  bool loadNametagAllMasters(uint128_t operationUUID, MothershipNametagAllMastersRecord& record,
+                             String *failure = nullptr)
+  {
+    record = {};
+    if (operationUUID == 0) {
+      if (failure) failure->assign("Nametag all-masters operation UUID is required"_ctv);
+      return false;
+    }
+    String key = {}, encoded = {}; key.assignItoh(operationUUID);
+    if (!db.read(nametagAllMastersColumnFamily, key, encoded, failure)) return false;
+    if (!BitseryEngine::deserializeSafe(encoded, record) ||
+        !mothershipNametagAllMastersRecordValid(record) ||
+        record.intent.operationUUID != operationUUID) {
+      record = {};
+      if (failure) failure->assign("Nametag all-masters record is corrupt or unsupported"_ctv);
+      return false;
+    }
+    if (failure) failure->clear();
+    return true;
+  }
+
+  // Resolve a bounded, hash-linked chain into a transient current-cohort view.
+  // The original all-masters bytes remain the authority for the baseline;
+  // completed successor receipts supply only their actual replacement cohort.
+  bool loadNametagSeedSuccessorPrior(uint128_t rootOperation, const String& rootSHA256,
+      uint128_t predecessorSuccessor, const String& predecessorSHA256,
+      MothershipNametagAllMastersRecord& current, String *failure = nullptr, uint32_t *lineageDepth = nullptr) {
+    if (lineageDepth) *lineageDepth = 0;
+    current = {}; String key, bytes, digest; key.assignItoh(rootOperation);
+    if (!db.read(nametagAllMastersColumnFamily, key, bytes, failure) ||
+        !BitseryEngine::deserializeSafe(bytes, current) || !mothershipNametagAllMastersRecordValid(current) ||
+        current.intent.operationUUID != rootOperation || current.phase != MothershipNametagAllMastersRecord::Phase::remoteSeeded ||
+        !prodigyComputeSHA256Hex(bytes, digest, failure) || digest != rootSHA256 ||
+        (predecessorSuccessor ? !prodigyIsSHA256HexDigest(predecessorSHA256) : !predecessorSHA256.empty())) return false;
+    Vector<MothershipNametagSeedSuccessor> chain; auto operation = predecessorSuccessor; auto expected = predecessorSHA256;
+    while (operation) {
+      if (chain.size() >= 8 || std::any_of(chain.begin(), chain.end(), [&](const auto& link) { return link.operationUUID == operation; })) return false;
+      key.assign("seed-successor:"_ctv); String op; op.assignItoh(operation); key.append(op);
+      MothershipNametagSeedSuccessor link = {};
+      if (!db.read(nametagAllMastersColumnFamily, key, bytes, failure) ||
+          !BitseryEngine::deserializeSafe(bytes, link) || link.operationUUID != operation ||
+          link.predecessorOperationUUID != rootOperation || link.predecessorSHA256 != rootSHA256 ||
+          link.stage != MothershipNametagSeedSuccessorStage::complete ||
+          !prodigyComputeSHA256Hex(bytes, digest, failure) || digest != expected) return false;
+      operation = link.predecessorSuccessorUUID; expected = link.predecessorSuccessorSHA256;
+      chain.push_back(std::move(link));
+    }
+    if (!expected.empty()) return false;
+    if (lineageDepth) *lineageDepth = uint32_t(chain.size());
+    Vector<uint128_t> historicalContainers;
+    for (const auto& row : current.seedPlacements) historicalContainers.push_back(row.targetContainerUUID);
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+      for (const auto& target : it->targets)
+        if (std::find(historicalContainers.begin(), historicalContainers.end(), target.containerUUID) != historicalContainers.end()) return false;
+      if (!mothershipNametagSeedSuccessorProject(*it, current)) return false;
+      for (const auto& target : it->targets) historicalContainers.push_back(target.containerUUID);
+    }
+    if (failure) failure->clear(); return true;
+  }
+
+  // An unfinished head deliberately blocks later qualification rows. A caller
+  // resuming that operation uses its explicit predecessor view instead.
+  bool loadNametagAllMastersCurrentView(uint128_t rootOperation, MothershipNametagAllMastersRecord& current,
+      uint128_t& latestSuccessor, String& latestSHA256, String *failure = nullptr) {
+    latestSuccessor = 0; latestSHA256.clear();
+    if (!loadNametagAllMasters(rootOperation, current, failure)) return false;
+    String rootBytes, rootDigest; auto original = current;
+    if (!BitseryEngine::serialize(rootBytes, original) || !prodigyComputeSHA256Hex(rootBytes, rootDigest, failure)) return false;
+    String key, op, bytes, readFailure; key.assign("seed-successor-head:"_ctv); op.assignItoh(rootOperation); key.append(op);
+    if (!db.read(nametagAllMastersColumnFamily, key, bytes, &readFailure)) {
+      if (!readFailure.equal("record not found"_ctv)) { if (failure) *failure = readFailure; return false; }
+      if (failure) failure->clear(); return true;
+    }
+    MothershipNametagSeedSuccessorPlacementIntent head = {};
+    if (!BitseryEngine::deserializeSafe(bytes, head) || head.predecessorOperationUUID != rootOperation ||
+        head.predecessorSHA256 != rootDigest || !head.operationUUID) return false;
+    key.assign("seed-successor:"_ctv); op.assignItoh(head.operationUUID); key.append(op);
+    if (!db.read(nametagAllMastersColumnFamily, key, bytes, failure) || !prodigyComputeSHA256Hex(bytes, latestSHA256, failure)) return false;
+    latestSuccessor = head.operationUUID;
+    return loadNametagSeedSuccessorPrior(rootOperation, rootDigest, latestSuccessor, latestSHA256, current, failure);
+  }
+
+  // Store successors in the existing all-masters registry while preserving the
+  // predecessor bytes and all 48 native receipts unchanged.
+  // Persist the exact disposable-site plan before any cancellation is sent.
+  bool persistNametagSeedSuccessorPlacementIntent(const MothershipNametagSeedSuccessorPlacementIntent& proposed,
+      bool& resumed, String *failure = nullptr) {
+    resumed = false; G6OperationLock lock; if (!lockG6Operations(lock, failure)) return false;
+    String priorKey, priorBytes, digest; priorKey.assignItoh(proposed.predecessorOperationUUID);
+    MothershipNametagAllMastersRecord prior = {}; uint32_t lineageDepth = 0;
+    if (!loadNametagSeedSuccessorPrior(proposed.predecessorOperationUUID, proposed.predecessorSHA256,
+            proposed.predecessorSuccessorUUID, proposed.predecessorSuccessorSHA256, prior, failure, &lineageDepth) ||
+        lineageDepth >= 8 ||
+        !mothershipNametagSeedSuccessorPlacementIntentValid(proposed, prior)) return false;
+    const MothershipNametagQualificationAdapter *adapter = nullptr;
+    for (const auto& candidate : mothershipNametagQualificationAdapters)
+      if (uint8_t(candidate.row) == proposed.qualificationRow &&
+          candidate.direction == MothershipNametagQualificationDirection::injection) adapter = &candidate;
+    MothershipNametagQualificationIntent qualification = {}; bool found = false;
+    if (!adapter || !loadNametagQualificationIntent(*adapter, proposed.qualificationRunUUID, qualification, found, failure) || !found ||
+        qualification.allMastersOperationUUID != proposed.predecessorOperationUUID ||
+        qualification.executionGeneration != proposed.executionGeneration) return false;
+    String key, op, encoded, existing, readFailure; key.assign("seed-successor-placement:"_ctv);
+    op.assignItoh(proposed.operationUUID); key.append(op); auto copy = proposed;
+    if (!BitseryEngine::serialize(encoded, copy)) return false;
+    if (proposed.cancellationDispatchedMask || proposed.cancellationCompletedMask || !proposed.cancellationReceipts.empty() || !proposed.routePlan.empty()) return false;
+    // An expired run cannot begin another replacement, but an exact retry may
+    // repair the gap between a durable head claim and its operation record.
+    if (qualification.deadlineAtMilliseconds <= Time::now<TimeResolution::ms>()) {
+      String headKey, headOp, headBytes; headKey.assign("seed-successor-head:"_ctv);
+      headOp.assignItoh(proposed.predecessorOperationUUID); headKey.append(headOp);
+      if (!db.read(nametagAllMastersColumnFamily, headKey, headBytes, failure) || headBytes != encoded) return false;
+    }
+    if (db.read(nametagAllMastersColumnFamily, key, existing, &readFailure)) {
+      MothershipNametagSeedSuccessorPlacementIntent current = {};
+      if (!BitseryEngine::deserializeSafe(existing, current) || !mothershipNametagSeedSuccessorPlacementIntentValid(current, prior)) return false;
+      current.cancellationDispatchedMask = current.cancellationCompletedMask = 0; current.cancellationReceipts.clear();
+      current.routePlan.clear();
+      String initial; if (!BitseryEngine::serialize(initial, current) || initial != encoded) return false;
+      if (!claimNametagSeedSuccessorHead(proposed, encoded, failure)) return false;
+      resumed = true; if (failure) failure->clear(); return true;
+    }
+    if (!readFailure.equal("record not found"_ctv) || !claimNametagSeedSuccessorHead(proposed, encoded, failure) || !db.write(nametagAllMastersColumnFamily, key, encoded, failure)) return false;
+    if (failure) failure->clear(); return true;
+  }
+
+  bool loadNametagSeedSuccessorPlacementIntent(uint128_t operationUUID,
+      MothershipNametagSeedSuccessorPlacementIntent& recorded, String *failure = nullptr) {
+    recorded = {}; String key, op, bytes, priorKey, priorBytes, digest;
+    key.assign("seed-successor-placement:"_ctv); op.assignItoh(operationUUID); key.append(op);
+    if (!db.read(nametagAllMastersColumnFamily, key, bytes, failure) ||
+        !BitseryEngine::deserializeSafe(bytes, recorded) || recorded.operationUUID != operationUUID) return false;
+    MothershipNametagAllMastersRecord prior = {}; priorKey.assignItoh(recorded.predecessorOperationUUID);
+    if (!loadNametagSeedSuccessorPrior(recorded.predecessorOperationUUID, recorded.predecessorSHA256,
+            recorded.predecessorSuccessorUUID, recorded.predecessorSuccessorSHA256, prior, failure) ||
+        !mothershipNametagSeedSuccessorPlacementIntentValid(recorded, prior)) { recorded = {}; return false; }
+    if (failure) failure->clear(); return true;
+  }
+
+  // This is a candidate scan, not a deployment identity assertion: the
+  // caller must authenticate both permission bodies against their Brains.
+  bool listNametagSeedSuccessorRouteCandidates(uint128_t site, const Vector<uint16_t>& applications,
+      int64_t nowMs, Vector<CousinRouteRecord>& routes, String *failure = nullptr) {
+    routes.clear(); if (!site || applications.empty() || nowMs <= 0) return false;
+    CousinRouteLock lock; if (!lockCousinRoutes(lock, failure)) return false;
+    Vector<String> entries; if (!db.listValues(cousinRoutesColumnFamily, entries, failure)) return false;
+    for (const auto& bytes : entries) {
+      CousinRouteRecord route = {};
+      if (!BitseryEngine::deserializeSafe(bytes, route) || !cousinRouteStructurallyValid(route)) return false;
+      if (cousinRouteTerminal(route) || (route.sourceClusterUUID != site && route.destinationClusterUUID != site) ||
+          std::find(applications.begin(), applications.end(), route.sourceApplicationID) == applications.end()) continue;
+      // Historical routes can remain until expiry after their deployment is
+      // replaced. Only the authenticated permission bodies identify the DID;
+      // the caller checks admission and both receipts after that exact filter.
+      if (!cousinRouteCurrentContract(route)) return false;
+      routes.push_back(std::move(route));
+    }
+    if (failure) failure->clear(); return true;
+  }
+
+  // Persist the complete immutable plan before a permission commit. Exact
+  // retries are harmless; a different plan for the same placement is refused.
+  bool installNametagSeedSuccessorRoutePlan(uint128_t operationUUID,
+      const Vector<MothershipNametagSeedSuccessorRoutePlan>& plan, String *failure = nullptr) {
+    CousinRouteLock routesLock; G6OperationLock lock;
+    if (plan.empty() || !lockCousinRoutes(routesLock, failure) || !lockG6Operations(lock, failure)) return false;
+    String key, op, bytes; key.assign("seed-successor-placement:"_ctv); op.assignItoh(operationUUID); key.append(op);
+    MothershipNametagSeedSuccessorPlacementIntent current = {};
+    if (!db.read(nametagAllMastersColumnFamily, key, bytes, failure) || !BitseryEngine::deserializeSafe(bytes, current) ||
+        current.operationUUID != operationUUID || current.protocolVersion != current.version) return false;
+    MothershipNametagAllMastersRecord prior = {};
+    if (!loadNametagSeedSuccessorPrior(current.predecessorOperationUUID, current.predecessorSHA256,
+        current.predecessorSuccessorUUID, current.predecessorSuccessorSHA256, prior, failure) ||
+        !mothershipNametagSeedSuccessorPlacementIntentValid(current, prior)) return false;
+    if (!current.routePlan.empty()) {
+      auto requested = current; requested.routePlan = plan; String desired;
+      return BitseryEngine::serialize(desired, requested) && desired == bytes;
+    }
+    if (current.cancellationDispatchedMask || current.cancellationCompletedMask ||
+        std::any_of(plan.begin(), plan.end(), [](const auto& entry) { return entry.routeReady; })) return false;
+    for (const auto& entry : plan) {
+      CousinRouteRecord route = {}; CousinRouteApplyReceipt a = {}, b = {};
+      if (!loadCousinRoute(entry.previousRoute.routeUUID, route, failure) || !cousinRouteExactMatches(route, entry.previousRoute) ||
+          !loadCousinRouteApplyReceipt(route.routeUUID, CousinRouteHalf::source, a, failure) ||
+          !loadCousinRouteApplyReceipt(route.routeUUID, CousinRouteHalf::destination, b, failure) ||
+          !cousinRouteApplyReceiptExactMatches(a, entry.previousSourceReceipt) ||
+          !cousinRouteApplyReceiptExactMatches(b, entry.previousDestinationReceipt) ||
+          !cousinRouteReceiptsAcknowledgedAt(route, a, b, Time::now<TimeResolution::ms>())) return false;
+    }
+    current.routePlan = plan;
+    if (!mothershipNametagSeedSuccessorPlacementIntentValid(current, prior) || !BitseryEngine::serialize(bytes, current) ||
+        !db.write(nametagAllMastersColumnFamily, key, bytes, failure)) return false;
+    if (failure) failure->clear(); return true;
+  }
+
+  // Called only after the caller has authenticated discovery under the exact
+  // committed permissions. All entries become ready in one durable update.
+  bool finalizeNametagSeedSuccessorRoutes(uint128_t operationUUID,
+      const Vector<MothershipNametagSeedSuccessorRoutePlan>& ready, String *failure = nullptr) {
+    G6OperationLock lock; if (!lockG6Operations(lock, failure)) return false;
+    String key, op, bytes; key.assign("seed-successor-placement:"_ctv); op.assignItoh(operationUUID); key.append(op);
+    MothershipNametagSeedSuccessorPlacementIntent current = {};
+    if (!db.read(nametagAllMastersColumnFamily, key, bytes, failure) || !BitseryEngine::deserializeSafe(bytes, current) ||
+        current.operationUUID != operationUUID || current.protocolVersion != current.version || current.cancellationCompletedMask != 0x0f || current.routePlan.empty() ||
+        current.routePlan.size() != ready.size()) return false;
+    MothershipNametagAllMastersRecord prior = {};
+    if (!loadNametagSeedSuccessorPrior(current.predecessorOperationUUID, current.predecessorSHA256,
+        current.predecessorSuccessorUUID, current.predecessorSuccessorSHA256, prior, failure) ||
+        !mothershipNametagSeedSuccessorPlacementIntentValid(current, prior)) return false;
+    auto requested = current; requested.routePlan = ready;
+    if (!mothershipNametagSeedSuccessorPlacementIntentValid(requested, prior) ||
+        std::any_of(ready.begin(), ready.end(), [](const auto& entry) { return !entry.routeReady; })) return false;
+    if (std::all_of(current.routePlan.begin(), current.routePlan.end(), [](const auto& entry) { return entry.routeReady; })) {
+      String desired; return BitseryEngine::serialize(desired, requested) && desired == bytes;
+    }
+    if (std::any_of(current.routePlan.begin(), current.routePlan.end(), [](const auto& entry) { return entry.routeReady; })) return false;
+    auto normalized = requested;
+    for (size_t i = 0; i < normalized.routePlan.size(); ++i) {
+      auto& value = normalized.routePlan[i]; const auto& old = current.routePlan[i];
+      value.routeReady = false; value.sourceContainerUUID = value.sourceMachineUUID = 0;
+      value.desiredRoute.destinationPublicAddress = old.desiredRoute.destinationPublicAddress;
+      value.desiredRoute.destinationTCPPort = old.desiredRoute.destinationTCPPort;
+    }
+    String priorBytes;
+    if (!BitseryEngine::serialize(priorBytes, normalized) || priorBytes != bytes ||
+        !BitseryEngine::serialize(bytes, requested) || !db.write(nametagAllMastersColumnFamily, key, bytes, failure)) return false;
+    if (failure) failure->clear(); return true;
+  }
+
+  // The caller must pass a response received from the authenticated current
+  // Brain control connection. A dispatch is journaled before sending it.
+  bool updateNametagSeedSuccessorCancellation(uint128_t operationUUID, uint32_t index,
+      bool markDispatch, const CancelDeploymentResponse *response, String *failure = nullptr) {
+    G6OperationLock lock; if (!lockG6Operations(lock, failure) || index >= 4) return false;
+    String key, op, bytes, priorKey, priorBytes, digest;
+    key.assign("seed-successor-placement:"_ctv); op.assignItoh(operationUUID); key.append(op);
+    MothershipNametagSeedSuccessorPlacementIntent current = {};
+    if (!db.read(nametagAllMastersColumnFamily, key, bytes, failure) ||
+        !BitseryEngine::deserializeSafe(bytes, current) || current.operationUUID != operationUUID) return false;
+    MothershipNametagAllMastersRecord prior = {}; priorKey.assignItoh(current.predecessorOperationUUID);
+    if (!loadNametagSeedSuccessorPrior(current.predecessorOperationUUID, current.predecessorSHA256,
+            current.predecessorSuccessorUUID, current.predecessorSuccessorSHA256, prior, failure) ||
+        !mothershipNametagSeedSuccessorPlacementIntentValid(current, prior)) return false;
+    const uint8_t bit = uint8_t(1u << index); const auto& plan = current.plans[index];
+    if (markDispatch) {
+      if (response || (current.cancellationDispatchedMask & bit)) return false;
+      current.cancellationDispatchedMask |= bit;
+    } else {
+      if (!(current.cancellationDispatchedMask & bit) || !response || !response->success ||
+          response->result != CancelDeploymentResult::completed || response->phase != CancelDeploymentPhase::completed ||
+          !response->durableGeneration || !prodigyCanonicalOperationUUID(response->operationID) ||
+          response->applicationID != plan.applicationID || response->cancelledDeploymentID != plan.previousDeploymentID ||
+          response->successorDeploymentID != plan.successorDeploymentID ||
+          response->activeVersionID != (plan.previousDeploymentID & ((uint64_t(1) << 48) - 1)) ||
+          response->successorVersionID != (plan.successorDeploymentID & ((uint64_t(1) << 48) - 1))) return false;
+      uint128_t parsed = 0;
+      for (uint32_t i = 0; i < response->operationID.size(); ++i) {
+        const char c = response->operationID[i]; if (c == '-') continue;
+        parsed = (parsed << 4) | uint128_t(c <= '9' ? c - '0' : c - 'a' + 10);
+      }
+      if (parsed != plan.cancellationOperationUUID) return false;
+      if (current.cancellationCompletedMask & bit) {
+        const auto saved = std::find_if(current.cancellationReceipts.begin(), current.cancellationReceipts.end(), [&](const auto& receipt) {
+          return receipt.operationID == response->operationID;
+        });
+        if (saved == current.cancellationReceipts.end()) return false;
+        auto oldReceipt = *saved, newReceipt = *response; String oldBytes, newBytes;
+        if (!BitseryEngine::serialize(oldBytes, oldReceipt) || !BitseryEngine::serialize(newBytes, newReceipt) || oldBytes != newBytes) return false;
+        if (failure) failure->clear(); return true;
+      }
+      current.cancellationCompletedMask |= bit;
+      current.cancellationReceipts.push_back(*response);
+    }
+    if (!mothershipNametagSeedSuccessorPlacementIntentValid(current, prior)) return false;
+    String updated; if (!BitseryEngine::serialize(updated, current) ||
+        !db.write(nametagAllMastersColumnFamily, key, updated, failure)) return false;
+    if (failure) failure->clear(); return true;
+  }
+
+  bool persistNametagSeedSuccessor(const MothershipNametagSeedSuccessor& proposed,
+      const Vector<DeploymentIdentityReport>& reports, MothershipNametagSeedSuccessor& recorded,
+      bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false; G6OperationLock lock;
+    if (!lockG6Operations(lock, failure)) return false;
+    String priorKey, priorBytes, digest; priorKey.assignItoh(proposed.predecessorOperationUUID);
+    MothershipNametagAllMastersRecord prior = {};
+    if (!loadNametagSeedSuccessorPrior(proposed.predecessorOperationUUID, proposed.predecessorSHA256,
+            proposed.predecessorSuccessorUUID, proposed.predecessorSuccessorSHA256, prior, failure) ||
+        proposed.stage != MothershipNametagSeedSuccessorStage::prepared ||
+        proposed.sourceReboot.dispatched || proposed.destinationReboot.dispatched ||
+        !mothershipNametagSeedSuccessorValid(proposed, prior, reports)) return false;
+    const auto row = static_cast<MothershipNametagQualificationRow>(proposed.qualificationRow);
+    if (row != MothershipNametagQualificationRow::brainHardRebootCatchup &&
+        row != MothershipNametagQualificationRow::seedInterruptionResume) return false;
+    const MothershipNametagQualificationAdapter *adapter = nullptr;
+    for (const auto& candidate : mothershipNametagQualificationAdapters)
+      if (candidate.row == row && candidate.direction == MothershipNametagQualificationDirection::injection) adapter = &candidate;
+    MothershipNametagQualificationIntent qualification = {}; bool found = false;
+    if (!adapter || !loadNametagQualificationIntent(*adapter, proposed.qualificationRunUUID, qualification, found, failure) || !found ||
+        qualification.allMastersOperationUUID != proposed.predecessorOperationUUID ||
+        qualification.executionGeneration != proposed.executionGeneration) return false;
+    String placementKey, placementOp, placementBytes; placementKey.assign("seed-successor-placement:"_ctv);
+    placementOp.assignItoh(proposed.operationUUID); placementKey.append(placementOp);
+    MothershipNametagSeedSuccessorPlacementIntent placement = {};
+    if (!db.read(nametagAllMastersColumnFamily, placementKey, placementBytes, failure) ||
+        !BitseryEngine::deserializeSafe(placementBytes, placement) ||
+        !mothershipNametagSeedSuccessorPlacementIntentValid(placement, prior) ||
+        placement.operationUUID != proposed.operationUUID || placement.predecessorOperationUUID != proposed.predecessorOperationUUID ||
+        placement.qualificationRunUUID != proposed.qualificationRunUUID || placement.qualificationRow != proposed.qualificationRow ||
+        placement.executionGeneration != proposed.executionGeneration || placement.site != proposed.site ||
+        placement.predecessorSHA256 != proposed.predecessorSHA256 ||
+        placement.predecessorSuccessorUUID != proposed.predecessorSuccessorUUID ||
+        placement.predecessorSuccessorSHA256 != proposed.predecessorSuccessorSHA256 || placement.cancellationCompletedMask != 0x0f) return false;
+    String key = {}, op = {}, bytes = {}, existing = {}, readFailure = {};
+    key.assign("seed-successor:"_ctv); op.assignItoh(proposed.operationUUID); key.append(op);
+    auto copy = proposed;
+    if (!BitseryEngine::serialize(bytes, copy)) return false;
+    if (db.read(nametagAllMastersColumnFamily, key, existing, &readFailure)) {
+      if (!BitseryEngine::deserializeSafe(existing, recorded) || !mothershipNametagSeedSuccessorValid(recorded, prior, reports)) return false;
+      auto initial = recorded; initial.stage = MothershipNametagSeedSuccessorStage::prepared; initial.heldReceipt = {}; initial.releaseReceipt = {}; initial.releaseDispatched = false;
+      initial.sourceCutReleaseDispatchedMask = 0; initial.sourceCutReleaseReceipts.clear();
+      for (auto& target : initial.targets) { target.authority = {.protocolVersion = 0};
+        target.deliveryDispatched = target.deliveryApplied = false; target.nativeReceipt = {.protocolVersion = 0}; }
+      // A fence can be populated after admission once the current Brain and
+      // its authenticated boot identity are observed. Preserve that progress
+      // while comparing a retry with the original unpopulated proposal.
+      if (!proposed.sourceReboot.dispatchUUID) initial.sourceReboot = {};
+      else { initial.sourceReboot.dispatched = initial.sourceReboot.providerAccepted = initial.sourceReboot.observed = false; initial.sourceReboot.afterBootID.clear(); }
+      if (!proposed.destinationReboot.dispatchUUID) initial.destinationReboot = {};
+      else { initial.destinationReboot.dispatched = initial.destinationReboot.providerAccepted = initial.destinationReboot.observed = false; initial.destinationReboot.afterBootID.clear(); }
+      for (auto& cut : initial.sourceCuts) { cut.dispatched = cut.released = false; cut.request.memberRequestUUID = 0; cut.proof = {}; }
+      String initialBytes; if (!BitseryEngine::serialize(initialBytes, initial) || initialBytes != bytes) return false;
+      resumed = true; if (failure) failure->clear(); return true;
+    }
+    const auto now = Time::now<TimeResolution::ms>();
+    if (qualification.deadlineAtMilliseconds <= now) return false;
+    for (const auto& target : proposed.targets) {
+      const auto& old = prior.seedPlacements[target.predecessorIndex];
+      if (std::find(placement.predecessorIndices.begin(), placement.predecessorIndices.end(), target.predecessorIndex) == placement.predecessorIndices.end() ||
+          std::none_of(placement.plans.begin(), placement.plans.end(), [&](const auto& plan) {
+            return plan.applicationID == old.applicationID && plan.previousDeploymentID == old.targetDeploymentID &&
+                plan.successorDeploymentID == target.targetDeploymentID;
+          })) return false;
+      const auto cut = std::find_if(proposed.sourceCuts.begin(), proposed.sourceCuts.end(), [&](const auto& c) {
+        return c.request.applicationID == old.applicationID && c.request.shardGroup == old.shardGroup;
+      });
+      CousinRouteRecord route = {}; CousinRouteApplyReceipt left = {}, right = {};
+      if (cut == proposed.sourceCuts.end() || cut->request.retainUntilMilliseconds <= now ||
+          !loadUsableCousinRoute(target.routeUUID, now, route, failure) ||
+          !loadCurrentCousinRouteApplyReceipt(target.routeUUID, CousinRouteHalf::source, left, failure) ||
+          !loadCurrentCousinRouteApplyReceipt(target.routeUUID, CousinRouteHalf::destination, right, failure) ||
+          route.sourceClusterUUID != old.targetClusterUUID || route.destinationClusterUUID != old.sourceClusterUUID ||
+          route.sourceApplicationID != old.applicationID || route.destinationApplicationID != old.applicationID ||
+          route.sourceCousinServicePrefix != prodigyRuntimeStatefulServicePrefix(old.applicationID, 4) ||
+          route.destinationCousinServicePrefix != prodigyRuntimeStatefulServicePrefix(old.applicationID, 4) ||
+          route.expiresAtMs < cut->request.retainUntilMilliseconds ||
+          std::none_of(prior.intent.directGatewayAuthorities.begin(), prior.intent.directGatewayAuthorities.end(), [&](const auto& gateway) {
+            return gateway.pairUUID == route.pairUUID && gateway.localClusterUUID == old.targetClusterUUID &&
+                gateway.peerClusterUUID == old.sourceClusterUUID && gateway.state == CrossClusterMasqueGatewayState::active;
+          })) return false;
+    }
+    for (const auto& target : proposed.targets)
+      if (target.authority.protocolVersion || target.deliveryDispatched || target.deliveryApplied || target.nativeReceipt.protocolVersion) return false;
+    for (const auto& cut : proposed.sourceCuts)
+      if (cut.dispatched || cut.released || cut.request.memberRequestUUID || cut.proof.response) return false;
+    if (!readFailure.equal("record not found"_ctv) || !db.write(nametagAllMastersColumnFamily, key, bytes, failure)) return false;
+    recorded = proposed; if (failure) failure->clear(); return true;
+  }
+
+  bool updateNametagSeedSuccessorCut(uint128_t operationUUID, uint32_t index, bool markDispatch,
+      const ProdigyStatefulStoreSourceCut *reply, const Vector<DeploymentIdentityReport>& reports,
+      MothershipNametagSeedSuccessor& recorded, String *failure = nullptr)
+  {
+    G6OperationLock lock; if (!lockG6Operations(lock, failure) ||
+        !loadNametagSeedSuccessor(operationUUID, reports, recorded, failure) ||
+        recorded.stage != MothershipNametagSeedSuccessorStage::prepared || index >= recorded.sourceCuts.size()) return false;
+    auto& cut = recorded.sourceCuts[index];
+    if (markDispatch) {
+      if (reply || cut.dispatched || cut.request.memberRequestUUID) return false;
+      cut.dispatched = true;
+    } else {
+      if (!reply || !cut.dispatched || !reply->response || !reply->memberRequestUUID || !reply->failure.empty() ||
+          reply->action != ProdigyStatefulStoreSourceCutAction::prepare) return false;
+      auto expected = cut.request;
+      if (!expected.memberRequestUUID) expected.memberRequestUUID = reply->memberRequestUUID;
+      if (!prodigyStatefulStoreSourceCutResponseMatches(expected, *reply)) return false;
+      cut.request.memberRequestUUID = reply->memberRequestUUID;
+      if (reply->ready) {
+        if (cut.proof.ready) {
+          String a, b; auto before = cut.proof, after = *reply;
+          if (!BitseryEngine::serialize(a, before) || !BitseryEngine::serialize(b, after) || a != b) return false;
+        } else cut.proof = *reply;
+      }
+    }
+    String priorKey, priorBytes, key, op, encoded; priorKey.assignItoh(recorded.predecessorOperationUUID);
+    MothershipNametagAllMastersRecord prior = {};
+    if (!loadNametagSeedSuccessorPrior(recorded.predecessorOperationUUID, recorded.predecessorSHA256,
+            recorded.predecessorSuccessorUUID, recorded.predecessorSuccessorSHA256, prior, failure) ||
+        !mothershipNametagSeedSuccessorValid(recorded, prior, reports)) return false;
+    key.assign("seed-successor:"_ctv); op.assignItoh(operationUUID); key.append(op);
+    auto copy = recorded;
+    return BitseryEngine::serialize(encoded, copy) && db.write(nametagAllMastersColumnFamily, key, encoded, failure);
+  }
+
+  bool recordNametagSeedSuccessorHeld(uint128_t operationUUID, const ProdigyNametagQualificationSeedFault& receipt,
+      const Vector<DeploymentIdentityReport>& reports, MothershipNametagSeedSuccessor& recorded, String *failure = nullptr)
+  {
+    G6OperationLock lock; if (!lockG6Operations(lock, failure) ||
+        !loadNametagSeedSuccessor(operationUUID, reports, recorded, failure) || !receipt.held) return false;
+    if (recorded.stage != MothershipNametagSeedSuccessorStage::prepared) {
+      String a, b; auto prior = recorded.heldReceipt, observed = receipt;
+      return BitseryEngine::serialize(a, prior) && BitseryEngine::serialize(b, observed) && a == b;
+    }
+    if (receipt.deadlineAtMilliseconds <= Time::now<TimeResolution::ms>()) return false;
+    recorded.heldReceipt = receipt; recorded.stage = MothershipNametagSeedSuccessorStage::held;
+    return writeNametagSeedSuccessorChecked(recorded, reports, failure);
+  }
+
+  // The caller supplies the authenticated boot observation from the existing
+  // machine owner. The durable dispatch bit is written before reboot is sent.
+  bool updateNametagSeedSuccessorReboot(uint128_t operationUUID, bool source,
+      const MothershipNametagSeedRebootFence& requested, const Vector<DeploymentIdentityReport>& reports,
+      MothershipNametagSeedSuccessor& recorded, String *failure = nullptr)
+  {
+    G6OperationLock lock; if (!lockG6Operations(lock, failure) ||
+        !loadNametagSeedSuccessor(operationUUID, reports, recorded, failure) ||
+        recorded.qualificationRow != uint8_t(ProdigyNametagQualificationRow::brainHardRebootCatchup) ||
+        recorded.stage < MothershipNametagSeedSuccessorStage::held ||
+        recorded.stage > MothershipNametagSeedSuccessorStage::rebootObserved ||
+        !requested.clusterUUID || !requested.machineUUID || !requested.dispatchUUID || requested.beforeBootID.empty()) return false;
+    MothershipProdigyCluster cluster = {}; String clusterIdentity = {}; clusterIdentity.assignItoh(requested.clusterUUID);
+    if (!getClusterByIdentity(clusterIdentity, cluster, failure) || cluster.deploymentMode != MothershipClusterDeploymentMode::remote ||
+        cluster.provider != MothershipClusterProvider::vultr ||
+        std::count_if(cluster.topology.machines.begin(), cluster.topology.machines.end(), [&](const auto& machine) {
+          return machine.uuid == requested.machineUUID && machine.isBrain && machine.source == ClusterMachineSource::created && machine.hasCloud;
+        }) != 1) return false;
+    auto& fence = source ? recorded.sourceReboot : recorded.destinationReboot;
+    if (!fence.dispatchUUID) {
+      if (requested.dispatched || requested.providerAccepted || requested.observed || !requested.afterBootID.empty()) return false;
+      fence = requested;
+    } else {
+      if (fence.clusterUUID != requested.clusterUUID || fence.machineUUID != requested.machineUUID ||
+          fence.dispatchUUID != requested.dispatchUUID || fence.beforeBootID != requested.beforeBootID ||
+          (fence.dispatched && !requested.dispatched) || (fence.providerAccepted && !requested.providerAccepted) || (fence.observed && !requested.observed) ||
+          (fence.observed && fence.afterBootID != requested.afterBootID) ||
+          (!fence.dispatched && requested.observed)) return false;
+      fence = requested;
+    }
+    if (recorded.sourceReboot.observed && recorded.destinationReboot.observed)
+      recorded.stage = MothershipNametagSeedSuccessorStage::rebootObserved;
+    else if (recorded.sourceReboot.dispatched && recorded.destinationReboot.dispatched)
+      recorded.stage = MothershipNametagSeedSuccessorStage::rebootDispatched;
+    return writeNametagSeedSuccessorChecked(recorded, reports, failure);
+  }
+
+  bool installNametagSeedSuccessorAuthority(uint128_t operationUUID, uint32_t index,
+      const ProdigyStatefulStoreSeedAuthority& authority, const Vector<DeploymentIdentityReport>& reports,
+      MothershipNametagSeedSuccessor& recorded, String *failure = nullptr) {
+    G6OperationLock lock; if (!lockG6Operations(lock, failure) ||
+        !loadNametagSeedSuccessor(operationUUID, reports, recorded, failure) || index >= recorded.targets.size()) return false;
+    auto& target = recorded.targets[index];
+    if (target.authority.protocolVersion) {
+      auto a = target.authority, b = authority; String x, y;
+      return BitseryEngine::serialize(x, a) && BitseryEngine::serialize(y, b) && x == y;
+    }
+    if (recorded.stage != MothershipNametagSeedSuccessorStage::prepared || target.deliveryDispatched) return false;
+    target.authority = authority;
+    return writeNametagSeedSuccessorChecked(recorded, reports, failure);
+  }
+
+  // The exact authority is frozen before dispatch; markDispatch=false records
+  // the authenticated delivery acknowledgment, never merely a queued send.
+  bool updateNametagSeedSuccessorDelivery(uint128_t operationUUID, uint32_t index, bool markDispatch,
+      const Vector<DeploymentIdentityReport>& reports, MothershipNametagSeedSuccessor& recorded, String *failure = nullptr) {
+    G6OperationLock lock; if (!lockG6Operations(lock, failure) ||
+        !loadNametagSeedSuccessor(operationUUID, reports, recorded, failure) || index >= recorded.targets.size()) return false;
+    auto& target = recorded.targets[index];
+    if (!target.authority.protocolVersion || (!markDispatch && !target.deliveryDispatched)) return false;
+    if (markDispatch ? target.deliveryDispatched : target.deliveryApplied) return true;
+    if (recorded.stage == MothershipNametagSeedSuccessorStage::complete) return false;
+    if (markDispatch) target.deliveryDispatched = true; else target.deliveryApplied = true;
+    return writeNametagSeedSuccessorChecked(recorded, reports, failure);
+  }
+
+  bool recordNametagSeedSuccessorNative(uint128_t operationUUID, const Vector<DeploymentIdentityReport>& reports,
+      MothershipNametagSeedSuccessor& recorded, String *failure = nullptr) {
+    G6OperationLock lock; if (!lockG6Operations(lock, failure) ||
+        !loadNametagSeedSuccessor(operationUUID, reports, recorded, failure)) return false;
+    if (recorded.stage == MothershipNametagSeedSuccessorStage::complete) return true;
+    bool changed = false;
+    for (auto& target : recorded.targets) {
+      if (!target.deliveryApplied || target.nativeReceipt.protocolVersion) continue;
+      for (const auto& report : reports) {
+        if (!report.found || !report.live || report.version < 5 || report.deploymentID != target.targetDeploymentID ||
+            report.clusterUUID != target.authority.targetClusterUUID || report.applicationID != target.authority.applicationID) continue;
+        for (const auto& member : report.statefulRuntimeCohort) {
+          const auto& receipt = member.nativeSourceCutReceipt;
+          if (member.containerUUID == target.containerUUID && member.machineUUID == target.machineUUID &&
+              receipt.state == ProdigyStatefulStoreReceiptState::active &&
+              prodigyStatefulStoreReceiptMatchesSourceCutAuthority(receipt, target.authority)) {
+            target.nativeReceipt = receipt; changed = true; break;
+          }
+        }
+      }
+    }
+    return !changed || writeNametagSeedSuccessorChecked(recorded, reports, failure);
+  }
+
+  bool updateNametagSeedSuccessorRelease(uint128_t operationUUID, bool markDispatch,
+      const ProdigyNametagQualificationSeedFault *response, const Vector<DeploymentIdentityReport>& reports,
+      MothershipNametagSeedSuccessor& recorded, String *failure = nullptr) {
+    G6OperationLock lock; if (!lockG6Operations(lock, failure) ||
+        !loadNametagSeedSuccessor(operationUUID, reports, recorded, failure) ||
+        recorded.stage < MothershipNametagSeedSuccessorStage::held ||
+        (recorded.qualificationRow == uint8_t(ProdigyNametagQualificationRow::brainHardRebootCatchup) &&
+         recorded.stage < MothershipNametagSeedSuccessorStage::rebootObserved)) return false;
+    if (markDispatch) {
+      if (response) return false;
+      if (recorded.releaseDispatched) return true;
+      recorded.releaseDispatched = true;
+    } else {
+      if (!recorded.releaseDispatched || !response) return false;
+      if (recorded.stage >= MothershipNametagSeedSuccessorStage::resumed) {
+        auto a = recorded.releaseReceipt, b = *response; String x, y;
+        return BitseryEngine::serialize(x, a) && BitseryEngine::serialize(y, b) && x == y;
+      }
+      recorded.releaseReceipt = *response; recorded.stage = MothershipNametagSeedSuccessorStage::resumed;
+    }
+    return writeNametagSeedSuccessorChecked(recorded, reports, failure);
+  }
+
+  bool updateNametagSeedSuccessorCutRelease(uint128_t operationUUID, uint32_t index, bool markDispatch,
+      const ProdigyStatefulStoreSourceCut *response, const Vector<DeploymentIdentityReport>& reports,
+      MothershipNametagSeedSuccessor& recorded, String *failure = nullptr) {
+    G6OperationLock lock; if (!lockG6Operations(lock, failure) ||
+        !loadNametagSeedSuccessor(operationUUID, reports, recorded, failure) || index >= recorded.sourceCuts.size() ||
+        recorded.stage < MothershipNametagSeedSuccessorStage::resumed || !mothershipNametagSeedSuccessorNativeComplete(recorded)) return false;
+    auto& cut = recorded.sourceCuts[index]; const auto bit = uint8_t(1u << index);
+    if (markDispatch) {
+      if (response) return false;
+      if (recorded.sourceCutReleaseDispatchedMask & bit) return true;
+      recorded.sourceCutReleaseDispatchedMask |= bit;
+    } else {
+      if (!response || !(recorded.sourceCutReleaseDispatchedMask & bit)) return false;
+      if (cut.released) {
+        const auto old = std::find_if(recorded.sourceCutReleaseReceipts.begin(), recorded.sourceCutReleaseReceipts.end(),
+            [&](const auto& r) { return r.requestUUID == cut.request.requestUUID; });
+        if (old == recorded.sourceCutReleaseReceipts.end()) return false;
+        auto a = *old, b = *response; String x, y;
+        return BitseryEngine::serialize(x, a) && BitseryEngine::serialize(y, b) && x == y;
+      }
+      cut.released = true; recorded.sourceCutReleaseReceipts.push_back(*response);
+      if (std::all_of(recorded.sourceCuts.begin(), recorded.sourceCuts.end(), [](const auto& c) { return c.released; }))
+        recorded.stage = MothershipNametagSeedSuccessorStage::complete;
+    }
+    return writeNametagSeedSuccessorChecked(recorded, reports, failure);
+  }
+
+private:
+  // The single head contains the entire initial placement intent. Writing it
+  // before the operation record makes a crash between writes repairable only
+  // by an exact retry, while preventing another branch from being admitted.
+  bool claimNametagSeedSuccessorHead(const MothershipNametagSeedSuccessorPlacementIntent& proposed,
+      const String& initialBytes, String *failure) {
+    String key, op, existing, readFailure; key.assign("seed-successor-head:"_ctv);
+    op.assignItoh(proposed.predecessorOperationUUID); key.append(op);
+    if (db.read(nametagAllMastersColumnFamily, key, existing, &readFailure)) {
+      MothershipNametagSeedSuccessorPlacementIntent head = {};
+      if (!BitseryEngine::deserializeSafe(existing, head) || head.predecessorOperationUUID != proposed.predecessorOperationUUID ||
+          head.predecessorSHA256 != proposed.predecessorSHA256) return false;
+      if (head.operationUUID == proposed.operationUUID) return existing == initialBytes;
+      if (head.operationUUID != proposed.predecessorSuccessorUUID) return false;
+      String previousKey, previousBytes, digest; previousKey.assign("seed-successor:"_ctv);
+      op.assignItoh(head.operationUUID); previousKey.append(op);
+      MothershipNametagSeedSuccessor previous = {};
+      if (!db.read(nametagAllMastersColumnFamily, previousKey, previousBytes, failure) ||
+          !BitseryEngine::deserializeSafe(previousBytes, previous) || previous.operationUUID != head.operationUUID ||
+          previous.stage != MothershipNametagSeedSuccessorStage::complete ||
+          !prodigyComputeSHA256Hex(previousBytes, digest, failure) || digest != proposed.predecessorSuccessorSHA256) return false;
+    } else if (!readFailure.equal("record not found"_ctv) || proposed.predecessorSuccessorUUID) return false;
+    return db.write(nametagAllMastersColumnFamily, key, initialBytes, failure);
+  }
+
+  bool writeNametagSeedSuccessorChecked(const MothershipNametagSeedSuccessor& requested,
+      const Vector<DeploymentIdentityReport>& reports, String *failure = nullptr)
+  {
+    String priorKey, priorBytes, digest, key, op, encoded; priorKey.assignItoh(requested.predecessorOperationUUID);
+    MothershipNametagAllMastersRecord prior = {};
+    if (!loadNametagSeedSuccessorPrior(requested.predecessorOperationUUID, requested.predecessorSHA256,
+            requested.predecessorSuccessorUUID, requested.predecessorSuccessorSHA256, prior, failure) ||
+        !mothershipNametagSeedSuccessorValid(requested, prior, reports)) return false;
+    key.assign("seed-successor:"_ctv); op.assignItoh(requested.operationUUID); key.append(op);
+    auto copy = requested; if (!BitseryEngine::serialize(encoded, copy)) return false;
+    String oldBytes; MothershipNametagSeedSuccessor old = {};
+    if (!db.read(nametagAllMastersColumnFamily, key, oldBytes, failure) || !BitseryEngine::deserializeSafe(oldBytes, old)) return false;
+    if (old.stage == MothershipNametagSeedSuccessorStage::complete) return oldBytes == encoded;
+    String headKey, headBytes; headKey.assign("seed-successor-head:"_ctv); op.assignItoh(requested.predecessorOperationUUID); headKey.append(op);
+    MothershipNametagSeedSuccessorPlacementIntent head = {};
+    if (!db.read(nametagAllMastersColumnFamily, headKey, headBytes, failure) ||
+        !BitseryEngine::deserializeSafe(headBytes, head) || head.operationUUID != requested.operationUUID) return false;
+    return db.write(nametagAllMastersColumnFamily, key, encoded, failure);
+  }
+
+public:
+  // Recover immutable completion before consulting deadlines or live members.
+  // This closes the gap between the final source-cut ACK and the execution ref.
+  bool loadCompletedNametagSeedSuccessor(uint128_t operationUUID,
+      MothershipNametagSeedSuccessor& recorded, String& digest, bool& found, String *failure = nullptr)
+  {
+    recorded = {}; digest.clear(); found = false;
+    if (!operationUUID) return false;
+    String key, op, bytes, readFailure; key.assign("seed-successor:"_ctv); op.assignItoh(operationUUID); key.append(op);
+    if (!db.read(nametagAllMastersColumnFamily, key, bytes, &readFailure)) {
+      if (readFailure.equal("record not found"_ctv)) { if (failure) failure->clear(); return true; }
+      if (failure) *failure = readFailure; return false;
+    }
+    if (!BitseryEngine::deserializeSafe(bytes, recorded) || recorded.protocolVersion != recorded.version ||
+        recorded.operationUUID != operationUUID || recorded.stage < MothershipNametagSeedSuccessorStage::prepared ||
+        recorded.stage > MothershipNametagSeedSuccessorStage::complete) return false;
+    // An unfinished record is not admitted by this completion-only lookup.
+    // The ordinary resume owner must validate it with current live reports.
+    if (recorded.stage != MothershipNametagSeedSuccessorStage::complete) { recorded = {}; if (failure) failure->clear(); return true; }
+    MothershipNametagAllMastersRecord prior; Vector<DeploymentIdentityReport> none;
+    if (!loadNametagSeedSuccessorPrior(recorded.predecessorOperationUUID, recorded.predecessorSHA256,
+            recorded.predecessorSuccessorUUID, recorded.predecessorSuccessorSHA256, prior, failure) ||
+        !mothershipNametagSeedSuccessorValid(recorded, prior, none, false)) return false;
+    MothershipNametagAllMastersRecord projected;
+    if (!prodigyComputeSHA256Hex(bytes, digest, failure) ||
+        !loadNametagSeedSuccessorPrior(recorded.predecessorOperationUUID, recorded.predecessorSHA256,
+            operationUUID, digest, projected, failure)) return false;
+    found = true; if (failure) failure->clear(); return true;
+  }
+
+  bool loadNametagSeedSuccessor(uint128_t operationUUID, const Vector<DeploymentIdentityReport>& reports,
+      MothershipNametagSeedSuccessor& recorded, String *failure = nullptr)
+  {
+    recorded = {}; if (!operationUUID) return false;
+    String key = {}, op = {}, encoded = {}; key.assign("seed-successor:"_ctv);
+    op.assignItoh(operationUUID); key.append(op);
+    if (!db.read(nametagAllMastersColumnFamily, key, encoded, failure) ||
+        !BitseryEngine::deserializeSafe(encoded, recorded) || recorded.protocolVersion != MothershipNametagSeedSuccessor::version ||
+        recorded.operationUUID != operationUUID) { recorded = {}; return false; }
+    String priorKey = {}, priorBytes = {}, digest = {}; priorKey.assignItoh(recorded.predecessorOperationUUID);
+    MothershipNametagAllMastersRecord prior = {};
+    if (!loadNametagSeedSuccessorPrior(recorded.predecessorOperationUUID, recorded.predecessorSHA256,
+            recorded.predecessorSuccessorUUID, recorded.predecessorSuccessorSHA256, prior, failure) ||
+        !mothershipNametagSeedSuccessorValid(recorded, prior, reports)) { recorded = {}; return false; }
+    if (failure) failure->clear(); return true;
   }
 
   bool admitProductionPair(const MothershipProductionPairIntent& intent, int64_t nowMs,
@@ -4221,8 +6271,8 @@ public:
         (intent.protocolVersion != MothershipProductionPairIntent::statefulVersion ||
          intent.stateful.previousOperationUUID != latestStateful.intent.operationUUID ||
          intent.stateful.previousAuthorityEpoch != (priorAborted ? latestStateful.intent.stateful.sourceRetainedEpoch : latestStateful.intent.stateful.targetOwnershipEpoch) ||
-         intent.route.sourceClusterUUID != (priorAborted ? latestStateful.intent.route.sourceClusterUUID : latestStateful.intent.route.destinationClusterUUID) ||
-         intent.route.destinationClusterUUID != (priorAborted ? latestStateful.intent.route.destinationClusterUUID : latestStateful.intent.route.sourceClusterUUID) ||
+         intent.sourceWorkload.clusterUUID != (priorAborted ? latestStateful.intent.sourceWorkload.clusterUUID : latestStateful.intent.targetWorkload.clusterUUID) ||
+         intent.targetWorkload.clusterUUID != (priorAborted ? latestStateful.intent.targetWorkload.clusterUUID : latestStateful.intent.sourceWorkload.clusterUUID) ||
          intent.stateful.datasetUUID != latestStateful.intent.stateful.datasetUUID ||
          intent.stateful.contractSHA256 != latestStateful.intent.stateful.contractSHA256 ||
          intent.stateful.shardManifestSHA256 != latestStateful.intent.stateful.shardManifestSHA256 ||
@@ -4889,6 +6939,1310 @@ public:
     return db.write(physicalNetworkFaultsColumnFamily, key, encoded, failure);
   }
 
+  // Recover an incomplete immutable tuple before any caller can mint a new
+  // generation. A completed row is loaded separately through its receipt.
+  bool loadNametagQualificationExecution(const MothershipNametagQualificationAdapter& adapter,
+                                         const MothershipNametagQualificationIntent& intent,
+                                         MothershipNametagQualificationExecutionRecord& recorded,
+                                         bool& found, String *failure = nullptr)
+  {
+    recorded = {}; found = false;
+    if (!nametagQualificationAdapterFrozen(adapter) || !mothershipNametagQualificationIntentValid(intent) ||
+        intent.row != adapter.row || intent.direction != adapter.direction) {
+      if (failure) failure->assign("qualification execution identity is invalid"_ctv); return false;
+    }
+    String key = {}, encoded = {}, readFailure = {};
+    if (!nametagQualificationKey(adapter, intent.runUUID, key)) {
+      if (failure) failure->assign("qualification execution run identity is invalid"_ctv); return false;
+    }
+    if (!db.read(nametagQualificationExecutionsColumnFamily, key, encoded, &readFailure)) {
+      if (readFailure.equal("record not found"_ctv)) { if (failure) failure->clear(); return true; }
+      if (failure) *failure = readFailure; return false;
+    }
+    if (!BitseryEngine::deserializeSafe(encoded, recorded) ||
+        !mothershipNametagQualificationExecutionRecordValid(recorded) ||
+        !nametagQualificationIntentExact(recorded.intent, intent) ||
+        !nametagQualificationSeedReferencesValid(recorded, failure)) {
+      recorded = {}; if (failure && failure->empty()) failure->assign("qualification execution is corrupt or mismatched"_ctv); return false;
+    }
+    found = true; if (failure) failure->clear(); return true;
+  }
+
+  // Seed execution stores references to the existing immutable successor
+  // records. Resolve those records here rather than trusting a caller's digest
+  // or duplicating their native evidence in a second journal.
+  bool nametagQualificationSeedReferencesValid(
+      const MothershipNametagQualificationExecutionRecord& execution, String *failure = nullptr)
+  {
+    if (execution.protocolVersion != execution.seedVersion) return true;
+    auto reject = [&](const char* reason) { if (failure) failure->assign(reason); return false; };
+    if (!mothershipNametagQualificationExecutionRecordValid(execution)) return reject("seed execution is invalid");
+    auto injection = execution.intent;
+    if (execution.intent.direction == MothershipNametagQualificationDirection::observation) {
+      const auto *adapter = mothershipNametagQualificationAdapterForTuple(execution.intent.row,
+          MothershipNametagQualificationDirection::injection, execution.intent.rowID,
+          execution.intent.deadlineSeconds, execution.intent.convergenceSeconds);
+      bool found = false;
+      MothershipNametagQualificationReceipt receipt;
+      String digest;
+      if (!adapter || !loadNametagQualificationIntent(*adapter, execution.intent.priorInjectionRunUUID,
+            injection, found, failure) || !found ||
+          !loadNametagQualificationReceipt(*adapter, execution.intent.priorInjectionRunUUID, receipt, found, failure) || !found ||
+          !mothershipNametagQualificationReceiptDigest(receipt, digest) ||
+          digest != execution.intent.priorInjectionReceiptDigest ||
+          injection.allMastersOperationUUID != execution.intent.allMastersOperationUUID ||
+          injection.seedInputSHA256 != execution.intent.seedInputSHA256 ||
+          injection.seedSuccessorOperationUUIDs != execution.intent.seedSuccessorOperationUUIDs ||
+          injection.seedChallengeUUIDs != execution.intent.seedChallengeUUIDs) return reject("seed observation does not match its durable injection");
+    }
+    MothershipNametagAllMastersRecord original, current;
+    if (!loadNametagAllMasters(execution.intent.allMastersOperationUUID, original, failure)) return false;
+    String originalBytes, originalDigest; auto copy = original;
+    if (!BitseryEngine::serialize(originalBytes, copy) ||
+        !prodigyComputeSHA256Hex(originalBytes, originalDigest, failure)) return false;
+    for (uint32_t i = 0; i < execution.seedSuccessors.size(); ++i) {
+      const auto& ref = execution.seedSuccessors[i];
+      String key, operation, bytes, digest; key.assign("seed-successor:"_ctv);
+      operation.assignItoh(ref.operationUUID); key.append(operation);
+      MothershipNametagSeedSuccessor successor;
+      if (!db.read(nametagAllMastersColumnFamily, key, bytes, failure)) return false;
+      if (!prodigyComputeSHA256Hex(bytes, digest, failure) || digest != ref.sha256)
+        return reject("seed successor reference hash mismatch");
+      if (!BitseryEngine::deserializeSafe(bytes, successor)) return reject("seed successor cannot be decoded");
+      if (successor.operationUUID != ref.operationUUID ||
+          successor.predecessorOperationUUID != execution.intent.allMastersOperationUUID ||
+          successor.predecessorSHA256 != originalDigest) return reject("seed successor root identity mismatch");
+      if (successor.qualificationRunUUID != injection.runUUID ||
+          successor.executionGeneration != injection.executionGeneration ||
+          successor.qualificationRow != uint8_t(execution.intent.row) || successor.site != 1)
+        return reject("seed successor qualification identity mismatch");
+      if (successor.stage != MothershipNametagSeedSuccessorStage::complete ||
+          successor.heldReceipt.challengeUUID != execution.intent.seedChallengeUUIDs[i] ||
+          successor.kind != (execution.intent.row == MothershipNametagQualificationRow::seedInterruptionResume && i == 0 ?
+              MothershipNametagSeedSuccessorKind::replica : MothershipNametagSeedSuccessorKind::site))
+        return reject("seed successor stage, challenge or kind mismatch");
+      if (i && (successor.predecessorSuccessorUUID != execution.seedSuccessors[i - 1].operationUUID ||
+                successor.predecessorSuccessorSHA256 != execution.seedSuccessors[i - 1].sha256))
+        return reject("seed successor predecessor link mismatch");
+      if (!loadNametagSeedSuccessorPrior(execution.intent.allMastersOperationUUID, originalDigest,
+              ref.operationUUID, ref.sha256, current, failure))
+        return reject("seed successor chain failed validation");
+    }
+    if (!execution.seedControlWitnessDigest.empty() || !execution.seedFinalReadbacks.empty()) {
+      if (execution.seedSuccessors.size() != execution.intent.seedSuccessorOperationUUIDs.size()) return reject("seed successor set incomplete");
+      MothershipNametagSourceBaselineRecord baseline; bool found = false;
+      if (!loadNametagSourceBaseline(original.intent.sourceBaselineOperationUUID, baseline, found, failure) || !found ||
+          !prodigyNametagSourceBaselineReceiptValid(baseline.receipt) ||
+          execution.seedBaselineOperationUUID != original.intent.sourceBaselineOperationUUID ||
+          execution.seedBaselineFixtureSHA256 != baseline.receipt.fixtureManifestSHA256 ||
+          execution.seedBaselineReadbackSHA256 != baseline.receipt.canonicalReadbackDigest) return reject("seed source baseline mismatch or missing");
+      for (uint32_t site = 0; site < 3; ++site) {
+        const auto& observed = current.intent.sites[site];
+        const std::array<uint64_t, 5> expected = {observed.hotDeploymentID, observed.coldDeploymentID,
+            observed.radarDeploymentID, observed.pulseDeploymentID, current.intent.sites[0].truthDeploymentID};
+        if (execution.seedStoreDeploymentIDs[site] != expected) return reject("seed projected store deployment mismatch");
+      }
+    }
+    return true;
+  }
+
+  // Creation happens before any externally-visible qualification command.  A
+  // missing record is therefore safe to create; a malformed or conflicting
+  // one is never treated as a fresh run.
+  bool persistNametagQualificationExecutionPrepared(const MothershipNametagQualificationAdapter& adapter,
+                                                     const MothershipNametagQualificationIntent& intent,
+                                                     MothershipNametagQualificationExecutionRecord& recorded,
+                                                     bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    if (!mothershipNametagQualificationIntentValid(intent)) {
+      if (failure) failure->assign("qualification execution has invalid immutable intent"_ctv); return false;
+    }
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure)) return false;
+    bool found = false;
+    if (!loadNametagQualificationExecution(adapter, intent, recorded, found, failure)) return false;
+    if (found) {
+      resumed = recorded.phase == MothershipNametagQualificationExecutionPhase::prepared;
+      if (!resumed && failure) failure->assign("qualification execution is already beyond prepared"_ctv);
+      return resumed;
+    }
+    String key = {}, durableEncoded = {}, encoded = {};
+    if (!nametagQualificationKey(adapter, intent.runUUID, key) ||
+        !db.read(nametagQualificationIntentsColumnFamily, key, durableEncoded, failure)) {
+      if (failure && failure->empty()) failure->assign("qualification execution has no durable v4 intent"_ctv);
+      return false;
+    }
+    MothershipNametagQualificationIntent durable = {};
+    if (!BitseryEngine::deserializeSafe(durableEncoded, durable) ||
+        !mothershipNametagQualificationIntentValid(durable) || !nametagQualificationIntentExact(durable, intent)) {
+      if (failure) failure->assign("qualification execution intent conflicts with durable v4 intent"_ctv); return false;
+    }
+    recorded.intent = intent;
+    if (intent.protocolVersion == intent.seedVersion) recorded.protocolVersion = recorded.seedVersion;
+    auto copy = recorded; BitseryEngine::serialize(encoded, copy);
+    return db.write(nametagQualificationExecutionsColumnFamily, key, encoded, failure);
+  }
+
+  bool updateNametagQualificationSeedExecution(
+      const MothershipNametagQualificationAdapter& adapter,
+      const MothershipNametagQualificationExecutionRecord& proposed,
+      MothershipNametagQualificationExecutionRecord& recorded, String *failure = nullptr)
+  {
+    G6OperationLock lock; if (!lockG6Operations(lock, failure)) return false;
+    bool found = false;
+    if (proposed.protocolVersion != proposed.seedVersion ||
+        !mothershipNametagQualificationExecutionRecordValid(proposed) ||
+        !loadNametagQualificationExecution(adapter, proposed.intent, recorded, found, failure) || !found ||
+        recorded.protocolVersion != recorded.seedVersion ||
+        proposed.seedSuccessors.size() < recorded.seedSuccessors.size() ||
+        proposed.seedFinalReadbacks.size() < recorded.seedFinalReadbacks.size() ||
+        !nametagQualificationSeedReferencesValid(proposed, failure)) return false;
+    for (uint32_t i = 0; i < recorded.seedSuccessors.size(); ++i)
+      if (proposed.seedSuccessors[i].operationUUID != recorded.seedSuccessors[i].operationUUID ||
+          proposed.seedSuccessors[i].sha256 != recorded.seedSuccessors[i].sha256) return false;
+    for (uint32_t i = 0; i < recorded.seedFinalReadbacks.size(); ++i) {
+      auto before = recorded.seedFinalReadbacks[i], after = proposed.seedFinalReadbacks[i]; String a, b;
+      if (!BitseryEngine::serialize(a, before) || !BitseryEngine::serialize(b, after) || a != b) return false;
+    }
+    if (!recorded.seedControlWitnessDigest.empty() &&
+        (recorded.seedControlWitnessDigest != proposed.seedControlWitnessDigest ||
+         recorded.seedBaselineOperationUUID != proposed.seedBaselineOperationUUID ||
+         recorded.seedBaselineFixtureSHA256 != proposed.seedBaselineFixtureSHA256 ||
+         recorded.seedBaselineReadbackSHA256 != proposed.seedBaselineReadbackSHA256 ||
+         recorded.seedStoreDeploymentIDs != proposed.seedStoreDeploymentIDs)) return false;
+    const bool samePhase = proposed.phase == recorded.phase;
+    const bool converged = recorded.phase == MothershipNametagQualificationExecutionPhase::prepared &&
+        proposed.phase == MothershipNametagQualificationExecutionPhase::converging &&
+        mothershipNametagQualificationSeedExecutionComplete(proposed);
+    if (!samePhase && !converged) return false;
+    auto copy = proposed; String encoded, key;
+    if (!nametagQualificationKey(adapter, proposed.intent.runUUID, key) ||
+        !BitseryEngine::serialize(encoded, copy)) return false;
+    if (recorded.phase == MothershipNametagQualificationExecutionPhase::verified) {
+      auto old = recorded; String previous;
+      return BitseryEngine::serialize(previous, old) && previous == encoded;
+    }
+    if (!db.write(nametagQualificationExecutionsColumnFamily, key, encoded, failure)) return false;
+    recorded = proposed; return true;
+  }
+
+  // Row 17 records its write and the two exact process incarnations in the
+  // existing operation record; no driver marker is accepted as registry proof.
+  bool recordNametagQualificationRestart(const MothershipNametagQualificationAdapter& adapter,
+      const MothershipNametagQualificationIntent& intent, uint128_t nonce,
+      const MothershipNametagQualificationExecutionRecord::RestartProcess& process,
+      const ProdigyNametagQualificationApplicationReceipt *localReceipt,
+      MothershipNametagQualificationExecutionRecord& recorded, String *failure = nullptr)
+  {
+    G6OperationLock lock; if (!lockG6Operations(lock, failure)) return false;
+    bool found = false;
+    if (!loadNametagQualificationExecution(adapter, intent, recorded, found, failure) || !found ||
+        recorded.phase != MothershipNametagQualificationExecutionPhase::prepared || !nonce) return false;
+    if (localReceipt) {
+      if (recorded.protocolVersion == MothershipNametagQualificationExecutionRecord::restartVersion) return false;
+      recorded.protocolVersion = MothershipNametagQualificationExecutionRecord::restartVersion;
+      recorded.restartNonce = nonce; recorded.restartBefore = process; recorded.restartLocalWorkReceipt = *localReceipt;
+    } else {
+      if (recorded.protocolVersion != MothershipNametagQualificationExecutionRecord::restartVersion ||
+          recorded.restartNonce != nonce || recorded.restartAfter.pid) return false;
+      recorded.restartAfter = process;
+    }
+    String key = {}, encoded = {}; auto copy = recorded;
+    return mothershipNametagQualificationExecutionRecordValid(recorded) && nametagQualificationKey(adapter, intent.runUUID, key) &&
+        BitseryEngine::serialize(encoded, copy) && db.write(nametagQualificationExecutionsColumnFamily, key, encoded, failure);
+  }
+
+  bool advanceNametagQualificationExecution(const MothershipNametagQualificationAdapter& adapter,
+                                            const MothershipNametagQualificationIntent& intent,
+                                            MothershipNametagQualificationExecutionPhase expected,
+                                            MothershipNametagQualificationExecutionPhase next,
+                                            MothershipNametagQualificationExecutionRecord& recorded,
+                                            bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure)) return false;
+    bool found = false;
+    if (!loadNametagQualificationExecution(adapter, intent, recorded, found, failure) || !found) {
+      if (found == false && failure && failure->empty()) failure->assign("qualification execution phase is absent"_ctv);
+      return false;
+    }
+    if (recorded.phase == next) { resumed = true; if (failure) failure->clear(); return true; }
+    if (prodigyNametagQualificationPathRow(uint8_t(intent.row)) &&
+        intent.direction == MothershipNametagQualificationDirection::injection &&
+        next != MothershipNametagQualificationExecutionPhase::failed &&
+        !mothershipNametagQualificationPathExecutionComplete(recorded)) {
+      if (failure) failure->assign("qualification path lacks the complete durable fault and application witnesses"_ctv);
+      return false;
+    }
+    if (prodigyNametagQualificationPathRow(uint8_t(intent.row)) &&
+        intent.direction == MothershipNametagQualificationDirection::injection &&
+        next == MothershipNametagQualificationExecutionPhase::failed &&
+        std::any_of(recorded.pathFaults.begin(), recorded.pathFaults.end(), [](const auto& fault) {
+          return !fault.restored.response;
+        })) return false;
+    if (intent.row == MothershipNametagQualificationRow::truthClaimPartition &&
+        intent.direction == MothershipNametagQualificationDirection::injection &&
+        ((next != MothershipNametagQualificationExecutionPhase::failed && !mothershipNametagQualificationClaimExecutionComplete(recorded)) ||
+         (next == MothershipNametagQualificationExecutionPhase::failed &&
+          std::any_of(recorded.pathFaults.begin(), recorded.pathFaults.end(), [](const auto& f) { return !f.restored.response; })))) return false;
+    if (intent.row == MothershipNametagQualificationRow::graphKvReplayReorder &&
+        intent.direction == MothershipNametagQualificationDirection::injection &&
+        next != MothershipNametagQualificationExecutionPhase::failed &&
+        !mothershipNametagQualificationReplayExecutionComplete(recorded)) {
+      if (failure) failure->assign("qualification replay lacks durable native and independent readback witnesses"_ctv);
+      return false;
+    }
+    if (intent.row == MothershipNametagQualificationRow::localWriterIsolation &&
+        intent.direction == MothershipNametagQualificationDirection::injection) {
+      const auto& w = recorded.writerIsolation;
+      if (recorded.protocolVersion != MothershipNametagQualificationExecutionRecord::writerIsolationVersion ||
+          (next == MothershipNametagQualificationExecutionPhase::faultApplied &&
+           (!w.arm.ready || !w.localArm.runUUID || !w.isolated.ready || !w.isolated.isolated)) ||
+          (next == MothershipNametagQualificationExecutionPhase::workloadIssued &&
+           (!w.localWork.runUUID || !w.queried.ready || !w.queried.isolated)) ||
+          (next == MothershipNametagQualificationExecutionPhase::faultRestored && !w.released.ready)) {
+        if (failure) failure->assign("writer isolation lacks the exact durable phase witness"_ctv);
+        return false;
+      }
+    }
+    if (intent.row == MothershipNametagQualificationRow::mothershipRestartResume &&
+        intent.direction == MothershipNametagQualificationDirection::injection &&
+        (recorded.protocolVersion != MothershipNametagQualificationExecutionRecord::restartVersion || !recorded.restartAfter.pid)) {
+      if (failure) failure->assign("qualification restart lacks a durable new process incarnation"_ctv); return false;
+    }
+    if (intent.protocolVersion == MothershipNametagQualificationIntent::cousinRecoveryVersion &&
+        recorded.protocolVersion < MothershipNametagQualificationExecutionRecord::cousinRecoveryVersion) {
+      if (failure) failure->assign("cousin recovery requires durable pre-fault bindings"_ctv); return false;
+    }
+    if (intent.protocolVersion == MothershipNametagQualificationIntent::cousinRecoveryVersion &&
+        !recorded.cousinRecoveryAborting &&
+        recorded.protocolVersion == MothershipNametagQualificationExecutionRecord::cousinTransportVersion) {
+      const bool complete = recorded.cousinNativeWitnesses.size() == intent.cousinRecoveries.size() &&
+          std::all_of(recorded.cousinNativeWitnesses.begin(), recorded.cousinNativeWitnesses.end(), [&](const auto& w) {
+            return expected == MothershipNametagQualificationExecutionPhase::prepared ? w.arm.ready :
+                expected == MothershipNametagQualificationExecutionPhase::faultApplied ? w.fault.ready :
+                expected == MothershipNametagQualificationExecutionPhase::faultRestored ? w.final.ready : true;
+          });
+      if (!complete) { if (failure) failure->assign("qualification cousin phase lacks native transport proof"_ctv); return false; }
+      if (expected == MothershipNametagQualificationExecutionPhase::faultApplied && !recorded.cousinLocalWorkReceipt.runUUID) {
+        if (failure) failure->assign("qualification cousin phase lacks EWR local-work proof"_ctv); return false;
+      }
+    }
+    if (intent.protocolVersion == MothershipNametagQualificationIntent::cousinRecoveryVersion &&
+        !recorded.cousinRecoveryAborting &&
+        recorded.protocolVersion != MothershipNametagQualificationExecutionRecord::cousinTransportVersion) {
+      if (failure) failure->assign("qualification cousin phase lacks native transport proof"_ctv); return false;
+    }
+    if (recorded.phase != expected || !mothershipNametagQualificationExecutionPhaseTransitionValid(expected, next, intent)) {
+      if (failure) failure->assign("qualification execution phase transition is unsafe"_ctv); return false;
+    }
+    recorded.phase = next; String key = {}, encoded = {}; auto copy = recorded;
+    if (!nametagQualificationKey(adapter, intent.runUUID, key) || !BitseryEngine::serialize(encoded, copy)) return false;
+    return db.write(nametagQualificationExecutionsColumnFamily, key, encoded, failure);
+  }
+
+  bool recordNametagQualificationCousinLocalWork(
+      const MothershipNametagQualificationAdapter& adapter, const MothershipNametagQualificationIntent& intent,
+      const ProdigyNametagQualificationApplicationReceipt& receipt,
+      MothershipNametagQualificationExecutionRecord& recorded, String *failure = nullptr)
+  {
+    G6OperationLock lock; if (!lockG6Operations(lock, failure)) return false;
+    bool found = false;
+    if (!loadNametagQualificationExecution(adapter, intent, recorded, found, failure) || !found ||
+        recorded.protocolVersion != MothershipNametagQualificationExecutionRecord::cousinTransportVersion ||
+        recorded.phase != MothershipNametagQualificationExecutionPhase::faultApplied || recorded.cousinRecoveryAborting) return false;
+    if (recorded.cousinLocalWorkReceipt.runUUID) {
+      auto left = recorded.cousinLocalWorkReceipt, right = receipt; String a = {}, b = {};
+      return BitseryEngine::serialize(a, left) && BitseryEngine::serialize(b, right) && a == b;
+    }
+    recorded.cousinLocalWorkReceipt = receipt;
+    if (!mothershipNametagQualificationExecutionRecordValid(recorded)) return false;
+    String key = {}, encoded = {}; auto copy = recorded;
+    return nametagQualificationKey(adapter, intent.runUUID, key) && BitseryEngine::serialize(encoded, copy) &&
+        db.write(nametagQualificationExecutionsColumnFamily, key, encoded, failure);
+  }
+
+  bool recordNametagQualificationWriterIsolationLocalWork(
+      const MothershipNametagQualificationAdapter& adapter, const MothershipNametagQualificationIntent& intent,
+      const ProdigyNametagQualificationApplicationReceipt& receipt,
+      MothershipNametagQualificationExecutionRecord& recorded, String *failure = nullptr)
+  {
+    G6OperationLock lock; if (!lockG6Operations(lock, failure)) return false;
+    bool found = false;
+    if (!loadNametagQualificationExecution(adapter, intent, recorded, found, failure) || !found ||
+        recorded.protocolVersion != MothershipNametagQualificationExecutionRecord::writerIsolationVersion ||
+        !prodigyNametagQualificationApplicationReceiptValid(receipt) ||
+        receipt.protocolVersion != ProdigyNametagQualificationApplicationReceipt::writerStageVersion ||
+        receipt.runUUID != intent.runUUID || receipt.executionGeneration != intent.executionGeneration ||
+        receipt.row != uint8_t(intent.row) || receipt.direction != uint8_t(intent.direction) || receipt.rowID != intent.rowID ||
+        receipt.localClusterUUID != recorded.writerIsolation.challenge.clusterUUID ||
+        receipt.writerChallengeUUID != recorded.writerIsolation.challenge.challengeUUID) return false;
+    auto& w = recorded.writerIsolation;
+    auto *slot = receipt.writerStage == ProdigyNametagQualificationWriterStage::arm ? &w.localArm : &w.localWork;
+    if ((receipt.writerStage == ProdigyNametagQualificationWriterStage::arm &&
+         (recorded.phase != MothershipNametagQualificationExecutionPhase::prepared || !w.arm.ready)) ||
+        (receipt.writerStage == ProdigyNametagQualificationWriterStage::survivorWrites &&
+         (recorded.phase != MothershipNametagQualificationExecutionPhase::faultApplied || !w.isolated.ready)) ||
+        (receipt.writerStage != ProdigyNametagQualificationWriterStage::arm &&
+         receipt.writerStage != ProdigyNametagQualificationWriterStage::survivorWrites)) return false;
+    if (slot->runUUID) { auto left = *slot, right = receipt; String a = {}, b = {};
+      return BitseryEngine::serialize(a, left) && BitseryEngine::serialize(b, right) && a == b; }
+    *slot = receipt;
+    String key = {}, encoded = {}; auto copy = recorded;
+    return mothershipNametagQualificationExecutionRecordValid(recorded) &&
+        nametagQualificationKey(adapter, intent.runUUID, key) && BitseryEngine::serialize(encoded, copy) &&
+        db.write(nametagQualificationExecutionsColumnFamily, key, encoded, failure);
+  }
+
+  bool recordNametagQualificationWriterIsolationWitness(
+      const MothershipNametagQualificationAdapter& adapter, const MothershipNametagQualificationIntent& intent,
+      const ProdigyNametagQualificationWriterIsolation& value,
+      MothershipNametagQualificationExecutionRecord& recorded, String *failure = nullptr)
+  {
+    G6OperationLock lock; if (!lockG6Operations(lock, failure)) return false;
+    bool found = false;
+    if (!loadNametagQualificationExecution(adapter, intent, recorded, found, failure) || !found ||
+        intent.row != MothershipNametagQualificationRow::localWriterIsolation ||
+        intent.direction != MothershipNametagQualificationDirection::injection) return false;
+    auto& w = recorded.writerIsolation;
+    auto identical = [](auto left, auto right) {
+      String a = {}, b = {}; return BitseryEngine::serialize(a, left) && BitseryEngine::serialize(b, right) && a == b;
+    };
+    if (!value.response) {
+      if (recorded.phase != MothershipNametagQualificationExecutionPhase::prepared ||
+          value.stage != ProdigyNametagQualificationWriterIsolationStage::arm) return false;
+      if (w.challenge.challengeUUID) return identical(w.challenge, value);
+      w.challenge = value;
+    } else {
+      if (!value.ready || !w.challenge.challengeUUID) return false;
+      auto *slot = value.stage == ProdigyNametagQualificationWriterIsolationStage::arm ? &w.arm :
+          value.stage == ProdigyNametagQualificationWriterIsolationStage::isolate ? &w.isolated :
+          value.stage == ProdigyNametagQualificationWriterIsolationStage::query ? &w.queried : &w.released;
+      if (slot->response) return identical(*slot, value);
+      if ((value.stage == ProdigyNametagQualificationWriterIsolationStage::arm &&
+           recorded.phase != MothershipNametagQualificationExecutionPhase::prepared) ||
+          (value.stage == ProdigyNametagQualificationWriterIsolationStage::isolate &&
+           (recorded.phase != MothershipNametagQualificationExecutionPhase::prepared || !w.localArm.runUUID)) ||
+          (value.stage == ProdigyNametagQualificationWriterIsolationStage::query &&
+           recorded.phase != MothershipNametagQualificationExecutionPhase::faultApplied) ||
+          (value.stage == ProdigyNametagQualificationWriterIsolationStage::release &&
+           recorded.phase != MothershipNametagQualificationExecutionPhase::workloadIssued && !w.aborting)) return false;
+      *slot = value;
+    }
+    recorded.protocolVersion = MothershipNametagQualificationExecutionRecord::writerIsolationVersion;
+    String key = {}, encoded = {}; auto copy = recorded;
+    return mothershipNametagQualificationExecutionRecordValid(recorded) &&
+        nametagQualificationKey(adapter, intent.runUUID, key) && BitseryEngine::serialize(encoded, copy) &&
+        db.write(nametagQualificationExecutionsColumnFamily, key, encoded, failure);
+  }
+
+  bool recordNametagQualificationClaimReceipt(const MothershipNametagQualificationAdapter& adapter,
+      const MothershipNametagQualificationIntent& intent, const ProdigyNametagQualificationApplicationReceipt& receipt,
+      MothershipNametagQualificationExecutionRecord& recorded, String *failure = nullptr)
+  {
+    G6OperationLock lock; if (!lockG6Operations(lock, failure)) return false;
+    bool found = false;
+    if (!loadNametagQualificationExecution(adapter, intent, recorded, found, failure) || !found ||
+        intent.row != MothershipNametagQualificationRow::truthClaimPartition ||
+        intent.direction != MothershipNametagQualificationDirection::injection || recorded.pathAborting ||
+        (recorded.protocolVersion != MothershipNametagQualificationExecutionRecord::version &&
+         recorded.protocolVersion != MothershipNametagQualificationExecutionRecord::claimVersion)) return false;
+    for (const auto& previous : recorded.claimReceipts)
+      if (previous.localClusterUUID == receipt.localClusterUUID && previous.claimStage == receipt.claimStage) {
+        auto a = previous, b = receipt; String left = {}, right = {};
+        return BitseryEngine::serialize(left, a) && BitseryEngine::serialize(right, b) && left == right;
+      }
+    const auto stage = receipt.claimStage;
+    if (recorded.phase != MothershipNametagQualificationExecutionPhase::prepared ||
+        !mothershipNametagQualificationClaimStageMayRecord(recorded, stage)) return false;
+    recorded.claimReceipts.push_back(receipt);
+    if (stage == ProdigyNametagQualificationClaimStage::contend) {
+      size_t count = 0; for (const auto& r : recorded.claimReceipts) if (r.claimStage == stage) ++count;
+      if (count == 3) {
+        for (size_t claim = 0; claim < 3; ++claim) {
+          size_t winners = 0; uint128_t site = 0;
+          for (const auto& r : recorded.claimReceipts) if (r.claimStage == stage && r.claimResults[claim].accepted) {
+            if (!r.claimResults[claim].observed || r.localClusterUUID == intent.probeTargets[1].clusterUUID) return false;
+            ++winners; site = r.localClusterUUID;
+          }
+          if (winners != 1) return false;
+          recorded.claimWinnerSites[claim] = site;
+        }
+      }
+    }
+    recorded.protocolVersion = MothershipNametagQualificationExecutionRecord::claimVersion;
+    String key = {}, encoded = {}; auto copy = recorded;
+    return mothershipNametagQualificationExecutionRecordValid(recorded) &&
+        nametagQualificationKey(adapter, intent.runUUID, key) && BitseryEngine::serialize(encoded, copy) &&
+        db.write(nametagQualificationExecutionsColumnFamily, key, encoded, failure);
+  }
+
+  // Persist the complete selected batch before sending any pause. Replays may
+  // only reuse the exact retained requests, including their original deadline.
+  bool recordNametagQualificationPathBatch(const MothershipNametagQualificationAdapter& adapter,
+      const MothershipNametagQualificationIntent& intent, uint8_t batch,
+      const Vector<MothershipNametagQualificationExecutionRecord::PathFaultWitness>& proposed,
+      MothershipNametagQualificationExecutionRecord& recorded, String *failure = nullptr)
+  {
+    G6OperationLock lock; if (!lockG6Operations(lock, failure)) return false;
+    bool found = false; MothershipNametagAllMastersRecord allMasters = {};
+    if (!loadNametagQualificationExecution(adapter, intent, recorded, found, failure) || !found ||
+        intent.direction != MothershipNametagQualificationDirection::injection ||
+        !(prodigyNametagQualificationPathRow(uint8_t(intent.row)) ||
+          intent.row == MothershipNametagQualificationRow::truthClaimPartition) ||
+        !loadNametagAllMasters(intent.allMastersOperationUUID, allMasters, failure) ||
+        !mothershipNametagAllMastersRecordValid(allMasters) || allMasters.intent.sites.size() != 3) return false;
+    const auto ewr = allMasters.intent.sites[0].clusterUUID, ord = allMasters.intent.sites[1].clusterUUID;
+    const bool row11 = intent.row == MothershipNametagQualificationRow::masqueSessionLossBgpRecovery;
+    if (batch > (row11 ? 1 : 0)) return false;
+    auto selected = [&](const CrossClusterMasqueGatewayAuthority& a) {
+      if (intent.row == MothershipNametagQualificationRow::ewrOrdPathLoss)
+        return a.localClusterUUID == ewr && a.peerClusterUUID == ord;
+      return a.localClusterUUID == ord && (!row11 || batch == 1 ||
+          (a.peerClusterUUID == ewr && a.tunnelSlot == 0));
+    };
+    Vector<CrossClusterMasqueGatewayAuthority> expected = {};
+    for (const auto& authority : allMasters.intent.directGatewayAuthorities)
+      if (selected(authority)) expected.push_back(authority);
+    const size_t count = intent.row == MothershipNametagQualificationRow::ewrOrdPathLoss ? 3 :
+        (row11 && batch == 0 ? 1 : 6);
+    if (expected.size() != count || proposed.size() != count) return false;
+    auto identical = [](auto left, auto right) {
+      String a = {}, b = {}; return BitseryEngine::serialize(a, left) && BitseryEngine::serialize(b, right) && a == b;
+    };
+    Vector<MothershipNametagQualificationExecutionRecord::PathFaultWitness> existing = {};
+    for (const auto& witness : recorded.pathFaults) if (witness.batch == batch) existing.push_back(witness);
+    if (!existing.empty()) {
+      if (existing.size() != proposed.size()) return false;
+      for (size_t i = 0; i < existing.size(); ++i)
+        if (!identical(existing[i].request, proposed[i].request)) return false;
+      return true;
+    }
+    if (recorded.pathAborting || recorded.phase != MothershipNametagQualificationExecutionPhase::prepared ||
+        (batch == 1 && (recorded.pathFaults.size() != 1 || !recorded.pathFaults[0].restored.response))) return false;
+    if (intent.row == MothershipNametagQualificationRow::truthClaimPartition) {
+      size_t armed = 0; for (const auto& r : recorded.claimReceipts)
+        if (r.claimStage == ProdigyNametagQualificationClaimStage::arm) ++armed;
+      if (recorded.protocolVersion != MothershipNametagQualificationExecutionRecord::claimVersion || armed != 3) return false;
+    }
+    uint64_t expiry = 0;
+    for (const auto& witness : proposed) {
+      if (witness.batch != batch || witness.paused.response || witness.restored.response ||
+          witness.request.request.protocolVersion != ProdigyCrossClusterPathFaultRequest::leaseVersion ||
+          (expiry && expiry != witness.request.request.expiresAtMilliseconds)) return false;
+      expiry = witness.request.request.expiresAtMilliseconds;
+      size_t matches = 0;
+      for (const auto& authority : expected) if (identical(authority, witness.request.request.authority)) ++matches;
+      if (matches != 1) return false;
+      recorded.pathFaults.push_back(witness);
+    }
+    const auto now = Time::now<TimeResolution::ms>();
+    if (now <= 0 || expiry <= uint64_t(now) || expiry - uint64_t(now) > 60000) return false;
+    recorded.protocolVersion = intent.row == MothershipNametagQualificationRow::truthClaimPartition ?
+        MothershipNametagQualificationExecutionRecord::claimVersion : MothershipNametagQualificationExecutionRecord::pathVersion;
+    String key = {}, encoded = {}; auto copy = recorded;
+    return mothershipNametagQualificationExecutionRecordValid(recorded) &&
+        nametagQualificationKey(adapter, intent.runUUID, key) && BitseryEngine::serialize(encoded, copy) &&
+        db.write(nametagQualificationExecutionsColumnFamily, key, encoded, failure);
+  }
+
+  bool recordNametagQualificationPathObservation(const MothershipNametagQualificationAdapter& adapter,
+      const MothershipNametagQualificationIntent& intent, uint8_t batch,
+      const ProdigyCrossClusterPathFaultControl& observation,
+      MothershipNametagQualificationExecutionRecord& recorded, String *failure = nullptr)
+  {
+    G6OperationLock lock; if (!lockG6Operations(lock, failure)) return false;
+    bool found = false;
+    if (!loadNametagQualificationExecution(adapter, intent, recorded, found, failure) || !found ||
+        (recorded.protocolVersion != MothershipNametagQualificationExecutionRecord::pathVersion &&
+         recorded.protocolVersion != MothershipNametagQualificationExecutionRecord::claimVersion) ||
+        !observation.response || !observation.accepted || !prodigyCrossClusterPathFaultControlValid(observation) ||
+        (observation.action != ProdigyCrossClusterPathFaultGatewayAction::pause &&
+         observation.action != ProdigyCrossClusterPathFaultGatewayAction::resume)) return false;
+    for (auto& witness : recorded.pathFaults) {
+      if (witness.batch != batch ||
+          !prodigyCrossClusterPathFaultRequestEqual(witness.request.request, observation.request)) continue;
+      auto& slot = observation.action == ProdigyCrossClusterPathFaultGatewayAction::pause ? witness.paused : witness.restored;
+      if (slot.response) {
+        auto a = slot, b = observation; String left = {}, right = {};
+        return BitseryEngine::serialize(left, a) && BitseryEngine::serialize(right, b) && left == right;
+      }
+      slot = observation;
+      String key = {}, encoded = {}; auto copy = recorded;
+      return mothershipNametagQualificationExecutionRecordValid(recorded) &&
+          nametagQualificationKey(adapter, intent.runUUID, key) && BitseryEngine::serialize(encoded, copy) &&
+          db.write(nametagQualificationExecutionsColumnFamily, key, encoded, failure);
+    }
+    return false;
+  }
+
+  bool recordNametagQualificationPathReceipt(const MothershipNametagQualificationAdapter& adapter,
+      const MothershipNametagQualificationIntent& intent,
+      const ProdigyNametagQualificationApplicationReceipt& receipt,
+      MothershipNametagQualificationExecutionRecord& recorded, String *failure = nullptr)
+  {
+    G6OperationLock lock; if (!lockG6Operations(lock, failure)) return false;
+    bool found = false;
+    if (!loadNametagQualificationExecution(adapter, intent, recorded, found, failure) || !found ||
+        recorded.protocolVersion != MothershipNametagQualificationExecutionRecord::pathVersion || recorded.pathAborting) return false;
+    for (const auto& previous : recorded.pathWorkReceipts) {
+      if (previous.localClusterUUID != receipt.localClusterUUID || previous.pathBatch != receipt.pathBatch ||
+          previous.pathStage != receipt.pathStage) continue;
+      auto a = previous, b = receipt; String left = {}, right = {};
+      return BitseryEngine::serialize(left, a) && BitseryEngine::serialize(right, b) && left == right;
+    }
+    if (!mothershipNametagQualificationPathStageMayRecord(recorded, receipt.pathBatch, receipt.pathStage)) return false;
+    bool haveFault = false;
+    for (const auto& witness : recorded.pathFaults) if (witness.batch == receipt.pathBatch) {
+      haveFault = true;
+      if (!witness.paused.response ||
+          (receipt.pathStage == ProdigyNametagQualificationPathStage::final ? !witness.restored.response : witness.restored.response)) return false;
+    }
+    if (!haveFault) return false;
+    recorded.pathWorkReceipts.push_back(receipt);
+    String key = {}, encoded = {}; auto copy = recorded;
+    return mothershipNametagQualificationExecutionRecordValid(recorded) &&
+        nametagQualificationKey(adapter, intent.runUUID, key) && BitseryEngine::serialize(encoded, copy) &&
+        db.write(nametagQualificationExecutionsColumnFamily, key, encoded, failure);
+  }
+
+  bool recordNametagQualificationPathSurvivors(const MothershipNametagQualificationAdapter& adapter,
+      const MothershipNametagQualificationIntent& intent, bool during,
+      const MothershipNametagQualificationExecutionRecord::PathSurvivorStage& proposed,
+      MothershipNametagQualificationExecutionRecord& recorded, String *failure = nullptr)
+  {
+    G6OperationLock lock; if (!lockG6Operations(lock, failure)) return false;
+    bool found = false; MothershipNametagAllMastersRecord allMasters = {};
+    if (!loadNametagQualificationExecution(adapter, intent, recorded, found, failure) || !found ||
+        recorded.protocolVersion != MothershipNametagQualificationExecutionRecord::pathVersion || recorded.pathAborting ||
+        intent.row != MothershipNametagQualificationRow::ewrOrdPathLoss || proposed.receipts.size() != 12 ||
+        !loadNametagAllMasters(intent.allMastersOperationUUID, allMasters, failure) ||
+        !mothershipNametagAllMastersRecordValid(allMasters) || allMasters.intent.sites.size() != 3 ||
+        recorded.pathFaults.size() != 3 || proposed.observedAtMilliseconds < intent.startedAtMilliseconds ||
+        proposed.observedAtMilliseconds >= int64_t(recorded.pathFaults[0].request.request.expiresAtMilliseconds)) return false;
+    auto& slot = during ? recorded.pathSurvivorsDuring : recorded.pathSurvivorsBefore;
+    if (slot.observedAtMilliseconds) {
+      auto a = slot, b = proposed; String left = {}, right = {};
+      return BitseryEngine::serialize(left, a) && BitseryEngine::serialize(right, b) && left == right;
+    }
+    if (during && (!recorded.pathSurvivorsBefore.observedAtMilliseconds ||
+        proposed.observedAtMilliseconds < recorded.pathSurvivorsBefore.observedAtMilliseconds)) return false;
+    for (const auto& fault : recorded.pathFaults)
+      if (fault.restored.response || (during ? !fault.paused.response : fault.paused.response)) return false;
+    const auto lan = allMasters.intent.sites[2].clusterUUID; size_t count = 0;
+    for (const auto& authority : allMasters.intent.directGatewayAuthorities) {
+      if (authority.localClusterUUID != lan && authority.peerClusterUUID != lan) continue;
+      const auto scope = prodigyCrossClusterPathFaultScope(authority); size_t matches = 0;
+      for (const auto& survivor : proposed.receipts)
+        if (prodigyCrossClusterPathFaultScopeEqual(scope, survivor.scope) &&
+            prodigyCrossClusterMasqueGatewayReady(authority, &survivor.masque) &&
+            prodigyCrossClusterPrivateBGPReadinessMatchesAuthority(survivor.privateBGP, authority) &&
+            prodigyCrossClusterPrivateBGPReady(survivor.privateBGP)) ++matches;
+      if (matches != 1) return false;
+      ++count;
+    }
+    if (count != 12) return false;
+    slot = proposed;
+    String key = {}, encoded = {}; auto copy = recorded;
+    return mothershipNametagQualificationExecutionRecordValid(recorded) &&
+        nametagQualificationKey(adapter, intent.runUUID, key) && BitseryEngine::serialize(encoded, copy) &&
+        db.write(nametagQualificationExecutionsColumnFamily, key, encoded, failure);
+  }
+
+  bool markNametagQualificationPathRestoring(const MothershipNametagQualificationAdapter& adapter,
+      const MothershipNametagQualificationIntent& intent, uint8_t batch,
+      MothershipNametagQualificationExecutionRecord& recorded, String *failure = nullptr)
+  {
+    G6OperationLock lock; if (!lockG6Operations(lock, failure)) return false;
+    bool found = false;
+    if (!loadNametagQualificationExecution(adapter, intent, recorded, found, failure) || !found ||
+        (recorded.protocolVersion != MothershipNametagQualificationExecutionRecord::pathVersion &&
+         recorded.protocolVersion != MothershipNametagQualificationExecutionRecord::claimVersion) || recorded.pathAborting ||
+        batch > (intent.row == MothershipNametagQualificationRow::masqueSessionLossBgpRecovery ? 1 : 0)) return false;
+    const uint8_t flag = uint8_t(1) << batch;
+    if (recorded.pathRestoringBatches & flag) return true;
+    if (!mothershipNametagQualificationPathMayBeginRestore(recorded, batch)) return false;
+    recorded.pathRestoringBatches |= flag;
+    String key = {}, encoded = {}; auto copy = recorded;
+    return mothershipNametagQualificationExecutionRecordValid(recorded) &&
+        nametagQualificationKey(adapter, intent.runUUID, key) && BitseryEngine::serialize(encoded, copy) &&
+        db.write(nametagQualificationExecutionsColumnFamily, key, encoded, failure);
+  }
+
+  bool markNametagQualificationPathAbort(const MothershipNametagQualificationAdapter& adapter,
+      const MothershipNametagQualificationIntent& intent,
+      MothershipNametagQualificationExecutionRecord& recorded, String *failure = nullptr)
+  {
+    G6OperationLock lock; if (!lockG6Operations(lock, failure)) return false;
+    bool found = false;
+    if (!loadNametagQualificationExecution(adapter, intent, recorded, found, failure) || !found ||
+        (recorded.protocolVersion != MothershipNametagQualificationExecutionRecord::pathVersion &&
+         recorded.protocolVersion != MothershipNametagQualificationExecutionRecord::claimVersion) ||
+        recorded.phase == MothershipNametagQualificationExecutionPhase::verified) return false;
+    if (recorded.pathAborting) return true;
+    recorded.pathAborting = true;
+    String key = {}, encoded = {}; auto copy = recorded;
+    return mothershipNametagQualificationExecutionRecordValid(recorded) &&
+        nametagQualificationKey(adapter, intent.runUUID, key) && BitseryEngine::serialize(encoded, copy) &&
+        db.write(nametagQualificationExecutionsColumnFamily, key, encoded, failure);
+  }
+
+  bool markNametagQualificationWriterIsolationAbort(const MothershipNametagQualificationAdapter& adapter,
+      const MothershipNametagQualificationIntent& intent, bool complete,
+      MothershipNametagQualificationExecutionRecord& recorded, String *failure = nullptr)
+  {
+    G6OperationLock lock; if (!lockG6Operations(lock, failure)) return false;
+    bool found = false;
+    if (!loadNametagQualificationExecution(adapter, intent, recorded, found, failure) || !found ||
+        recorded.protocolVersion != MothershipNametagQualificationExecutionRecord::writerIsolationVersion ||
+        recorded.phase == MothershipNametagQualificationExecutionPhase::verified) return false;
+    auto& w = recorded.writerIsolation; w.aborting = true;
+    if (complete) {
+      if (w.arm.ready && !w.released.ready) return false;
+      recorded.phase = MothershipNametagQualificationExecutionPhase::failed;
+    }
+    String key = {}, encoded = {}; auto copy = recorded;
+    return mothershipNametagQualificationExecutionRecordValid(recorded) &&
+        nametagQualificationKey(adapter, intent.runUUID, key) && BitseryEngine::serialize(encoded, copy) &&
+        db.write(nametagQualificationExecutionsColumnFamily, key, encoded, failure);
+  }
+
+  bool markNametagQualificationReplayAbort(const MothershipNametagQualificationAdapter& adapter,
+      const MothershipNametagQualificationIntent& intent, MothershipNametagQualificationExecutionRecord& recorded,
+      String *failure = nullptr) {
+    G6OperationLock lock; if (!lockG6Operations(lock, failure)) return false;
+    bool found = false;
+    if (!loadNametagQualificationExecution(adapter, intent, recorded, found, failure) || !found ||
+        recorded.protocolVersion != MothershipNametagQualificationExecutionRecord::replayVersion ||
+        recorded.phase == MothershipNametagQualificationExecutionPhase::verified) return false;
+    if (recorded.replayAborting) return true;
+    recorded.replayAborting = true; auto copy = recorded; String key = {}, encoded = {};
+    return mothershipNametagQualificationExecutionRecordValid(recorded) &&
+        nametagQualificationKey(adapter, intent.runUUID, key) && BitseryEngine::serialize(encoded, copy) &&
+        db.write(nametagQualificationExecutionsColumnFamily, key, encoded, failure);
+  }
+
+  bool recordNametagQualificationReplayReadback(
+      const MothershipNametagQualificationAdapter& adapter, const MothershipNametagQualificationIntent& intent,
+      const ProdigyNametagQualificationApplicationReceipt& receipt,
+      MothershipNametagQualificationExecutionRecord& recorded, String *failure = nullptr)
+  {
+    G6OperationLock lock; if (!lockG6Operations(lock, failure)) return false;
+    bool found = false;
+    if (!loadNametagQualificationExecution(adapter, intent, recorded, found, failure) || !found ||
+        recorded.protocolVersion != MothershipNametagQualificationExecutionRecord::replayVersion ||
+        recorded.phase == MothershipNametagQualificationExecutionPhase::verified ||
+        recorded.phase == MothershipNametagQualificationExecutionPhase::failed ||
+        !prodigyNametagQualificationApplicationReceiptValid(receipt) ||
+        receipt.protocolVersion != ProdigyNametagQualificationApplicationReceipt::replayStageVersion) return false;
+    auto identical = [](auto left, auto right) {
+      String a = {}, b = {}; return BitseryEngine::serialize(a, left) && BitseryEngine::serialize(b, right) && a == b;
+    };
+    if (receipt.replayStage == ProdigyNametagQualificationReplayWorkStage::workload) {
+      if (recorded.replayLocalWork.runUUID) return identical(recorded.replayLocalWork, receipt);
+      recorded.replayLocalWork = receipt;
+    } else if (receipt.replayStage == ProdigyNametagQualificationReplayWorkStage::final) {
+      if (!recorded.replayLocalWork.runUUID) return false;
+      for (const auto& prior : recorded.replayFinalReadbacks)
+        if (prior.localClusterUUID == receipt.localClusterUUID) return identical(prior, receipt);
+      if (recorded.replayFinalReadbacks.size() >= 3) return false;
+      recorded.replayFinalReadbacks.push_back(receipt);
+    } else return false;
+    String key = {}, encoded = {}; auto copy = recorded;
+    return mothershipNametagQualificationExecutionRecordValid(recorded) &&
+        nametagQualificationKey(adapter, intent.runUUID, key) && BitseryEngine::serialize(encoded, copy) &&
+        db.write(nametagQualificationExecutionsColumnFamily, key, encoded, failure);
+  }
+
+  bool recordNametagQualificationReplayWitness(
+      const MothershipNametagQualificationAdapter& adapter, const MothershipNametagQualificationIntent& intent,
+      size_t index, const ProdigyNametagQualificationReplay& value,
+      MothershipNametagQualificationExecutionRecord& recorded, String *failure = nullptr)
+  {
+    G6OperationLock lock; if (!lockG6Operations(lock, failure)) return false;
+    bool found = false;
+    if (!loadNametagQualificationExecution(adapter, intent, recorded, found, failure) || !found ||
+        intent.row != MothershipNametagQualificationRow::graphKvReplayReorder ||
+        intent.direction != MothershipNametagQualificationDirection::injection || index >= 2 ||
+        index > recorded.replayWitnesses.size() || recorded.phase == MothershipNametagQualificationExecutionPhase::verified ||
+        recorded.phase == MothershipNametagQualificationExecutionPhase::failed ||
+        (recorded.replayAborting && value.stage != ProdigyNametagQualificationReplayStage::release) ||
+        !prodigyNametagQualificationReplayValid(value)) return false;
+    auto identical = [](auto left, auto right) {
+      String a = {}, b = {}; return BitseryEngine::serialize(a, left) && BitseryEngine::serialize(b, right) && a == b;
+    };
+    if (index == recorded.replayWitnesses.size()) {
+      if (value.response || value.targetSide || value.stage != ProdigyNametagQualificationReplayStage::arm ||
+          value.store != (index == 0 ? ProdigyNametagQualificationReplayStore::kv : ProdigyNametagQualificationReplayStore::graph)) return false;
+      recorded.replayWitnesses.emplace_back().sourceChallenge = value;
+    } else {
+      auto& w = recorded.replayWitnesses[index];
+      if (!value.response) {
+        if (value.stage != ProdigyNametagQualificationReplayStage::arm &&
+            !(value.targetSide && value.stage == ProdigyNametagQualificationReplayStage::prearm)) return false;
+        auto& slot = !value.targetSide ? w.sourceChallenge :
+            value.stage == ProdigyNametagQualificationReplayStage::prearm ? w.targetPrearmChallenge : w.targetChallenge;
+        if (slot.challengeUUID) return identical(slot, value);
+        if (!value.targetSide || (value.stage == ProdigyNametagQualificationReplayStage::arm &&
+            (!w.targetPrearm.ready || !w.sourceCapture.ready))) return false;
+        slot = value;
+      } else {
+        if (!value.ready) return false;
+        auto releasePrearm = w.targetPrearmChallenge; releasePrearm.stage = ProdigyNametagQualificationReplayStage::release;
+        const bool matchesPrearmRelease = value.targetSide && value.stage == ProdigyNametagQualificationReplayStage::release &&
+            prodigyNametagQualificationReplayResponseMatches(releasePrearm, value);
+        auto& challenge = !value.targetSide ? w.sourceChallenge :
+            (value.stage == ProdigyNametagQualificationReplayStage::prearm || matchesPrearmRelease) ?
+            w.targetPrearmChallenge : w.targetChallenge;
+        if (!challenge.challengeUUID) return false;
+        auto request = challenge; request.stage = value.stage;
+        if (!prodigyNametagQualificationReplayResponseMatches(request, value)) return false;
+        auto *slot = value.stage == ProdigyNametagQualificationReplayStage::prearm ? &w.targetPrearm :
+            value.stage == ProdigyNametagQualificationReplayStage::arm ?
+            (value.targetSide ? &w.targetArm : &w.sourceArm) :
+            value.stage == ProdigyNametagQualificationReplayStage::replay ?
+            (value.targetSide ? &w.targetReplay : &w.sourceReplay) :
+            value.stage == ProdigyNametagQualificationReplayStage::query ?
+            (value.targetSide ? &w.targetQuery : (w.sourceReplay.ready ? &w.sourceQuery : &w.sourceCapture)) :
+            (value.targetSide ? &w.targetRelease : &w.sourceRelease);
+        if (slot->response) return identical(*slot, value);
+        if (value.stage != ProdigyNametagQualificationReplayStage::prearm &&
+            value.stage != ProdigyNametagQualificationReplayStage::arm &&
+            value.stage != ProdigyNametagQualificationReplayStage::release &&
+            !(value.targetSide ? w.targetArm.ready : (value.stage == ProdigyNametagQualificationReplayStage::query && !w.sourceReplay.ready ? w.sourceArm.ready : w.sourceCapture.ready))) return false;
+        if (value.stage == ProdigyNametagQualificationReplayStage::query && value.targetSide && !w.targetReplay.ready) return false;
+        if (value.stage == ProdigyNametagQualificationReplayStage::replay && !value.targetSide && !w.targetReplay.ready) return false;
+        *slot = value;
+        if (value.stage == ProdigyNametagQualificationReplayStage::query && recorded.replayWitnesses.size() == 2 &&
+            std::all_of(recorded.replayWitnesses.begin(), recorded.replayWitnesses.end(), [](const auto& item) {
+              return item.sourceQuery.ready && item.targetQuery.ready;
+            }) && !recorded.replayQueriesCompletedAtMilliseconds)
+          recorded.replayQueriesCompletedAtMilliseconds = Time::now<TimeResolution::ms>();
+      }
+    }
+    recorded.protocolVersion = MothershipNametagQualificationExecutionRecord::replayVersion;
+    String key = {}, encoded = {}; auto copy = recorded;
+    return mothershipNametagQualificationExecutionRecordValid(recorded) &&
+        nametagQualificationKey(adapter, intent.runUUID, key) && BitseryEngine::serialize(encoded, copy) &&
+        db.write(nametagQualificationExecutionsColumnFamily, key, encoded, failure);
+  }
+
+  bool recordNametagQualificationCousinNativeWitness(
+      const MothershipNametagQualificationAdapter& adapter, const MothershipNametagQualificationIntent& intent,
+      size_t index, const ProdigyNametagQualificationCousinTransport& value,
+      MothershipNametagQualificationExecutionRecord& recorded, String *failure = nullptr)
+  {
+    G6OperationLock lock; if (!lockG6Operations(lock, failure)) return false;
+    bool found = false;
+    if (!loadNametagQualificationExecution(adapter, intent, recorded, found, failure) || !found ||
+        recorded.cousinRecoveryAborting || index >= intent.cousinRecoveries.size() ||
+        recorded.protocolVersion < MothershipNametagQualificationExecutionRecord::cousinRecoveryVersion) return false;
+    if (!value.response) {
+      if (recorded.phase != MothershipNametagQualificationExecutionPhase::prepared || index > recorded.cousinNativeWitnesses.size()) return false;
+      if (index == recorded.cousinNativeWitnesses.size()) {
+        MothershipNametagQualificationExecutionRecord::CousinNativeWitness witness = {}; witness.challenge = value;
+        recorded.cousinNativeWitnesses.push_back(std::move(witness));
+      } else {
+        auto left = recorded.cousinNativeWitnesses[index].challenge, right = value; String a = {}, b = {};
+        return BitseryEngine::serialize(a, left) && BitseryEngine::serialize(b, right) && a == b;
+      }
+    } else {
+      if (index >= recorded.cousinNativeWitnesses.size() || !value.ready) return false;
+      auto& witness = recorded.cousinNativeWitnesses[index];
+      auto *slot = value.stage == ProdigyNametagQualificationCousinStage::arm ? &witness.arm :
+          value.stage == ProdigyNametagQualificationCousinStage::faultObserved ? &witness.fault : &witness.final;
+      if ((value.stage == ProdigyNametagQualificationCousinStage::arm && recorded.phase != MothershipNametagQualificationExecutionPhase::prepared) ||
+          (value.stage == ProdigyNametagQualificationCousinStage::faultObserved && recorded.phase != MothershipNametagQualificationExecutionPhase::faultApplied) ||
+          (value.stage == ProdigyNametagQualificationCousinStage::final && recorded.phase != MothershipNametagQualificationExecutionPhase::faultRestored)) return false;
+      if (slot->response) { auto left = *slot, right = value; String a = {}, b = {};
+        return BitseryEngine::serialize(a, left) && BitseryEngine::serialize(b, right) && a == b; }
+      *slot = value;
+    }
+    recorded.protocolVersion = MothershipNametagQualificationExecutionRecord::cousinTransportVersion;
+    if (!mothershipNametagQualificationExecutionRecordValid(recorded)) return false;
+    String key = {}, encoded = {}; auto copy = recorded;
+    return nametagQualificationKey(adapter, intent.runUUID, key) && BitseryEngine::serialize(encoded, copy) &&
+        db.write(nametagQualificationExecutionsColumnFamily, key, encoded, failure);
+  }
+
+  bool markNametagQualificationCousinRecoveryAborting(
+      const MothershipNametagQualificationAdapter& adapter, const MothershipNametagQualificationIntent& intent,
+      MothershipNametagQualificationExecutionRecord& recorded, String *failure = nullptr)
+  {
+    G6OperationLock lock; if (!lockG6Operations(lock, failure)) return false;
+    bool found = false;
+    if (!loadNametagQualificationExecution(adapter, intent, recorded, found, failure) || !found ||
+        recorded.protocolVersion < MothershipNametagQualificationExecutionRecord::cousinRecoveryVersion ||
+        mothershipNametagQualificationExecutionPhaseTerminal(recorded.phase, intent)) return false;
+    if (recorded.cousinRecoveryAborting) return true;
+    recorded.cousinRecoveryAborting = true;
+    String key = {}, encoded = {}; auto copy = recorded;
+    return nametagQualificationKey(adapter, intent.runUUID, key) && BitseryEngine::serialize(encoded, copy) &&
+        db.write(nametagQualificationExecutionsColumnFamily, key, encoded, failure);
+  }
+
+  bool finishNametagQualificationCousinRecoveryAbort(
+      const MothershipNametagQualificationAdapter& adapter, const MothershipNametagQualificationIntent& intent,
+      MothershipNametagQualificationExecutionRecord& recorded, String *failure = nullptr)
+  {
+    CousinRouteLock routeLock; G6OperationLock operationLock;
+    if (!lockCousinRoutes(routeLock, failure) || !lockG6Operations(operationLock, failure)) return false;
+    bool found = false;
+    if (!loadNametagQualificationExecution(adapter, intent, recorded, found, failure) || !found ||
+        !recorded.cousinRecoveryAborting || recorded.protocolVersion < MothershipNametagQualificationExecutionRecord::cousinRecoveryVersion)
+      return false;
+    if (recorded.phase == MothershipNametagQualificationExecutionPhase::failed) return true;
+    for (size_t i = 0; i < recorded.cousinRecoveryBindings.size(); ++i) {
+      const auto& binding = recorded.cousinRecoveryBindings[i]; const auto& reference = intent.cousinRecoveries[i];
+      CousinRouteRecord original = {}, successor = {};
+      if (!loadCousinRoute(binding.route.routeUUID, original, failure)) return false;
+      if (cousinRouteExactMatches(original, binding.route)) continue;
+      CousinRouteApplyReceipt first = {}, second = {}, withdrawnSource = {}, withdrawnDestination = {};
+      if (!loadCousinRouteApplyReceipt(original.routeUUID, CousinRouteHalf::source, withdrawnSource, failure) ||
+          !loadCousinRouteApplyReceipt(original.routeUUID, CousinRouteHalf::destination, withdrawnDestination, failure) ||
+          !cousinRouteApplyReceiptMatchesCurrentRoute(withdrawnSource, original) ||
+          !cousinRouteApplyReceiptMatchesCurrentRoute(withdrawnDestination, original) ||
+          !loadCousinRoute(reference.successorRouteUUID, successor, failure)) return false;
+      auto expectedWithdrawal = binding.route;
+      if (expectedWithdrawal.generation == UINT64_MAX) return false;
+      expectedWithdrawal.operationUUID = reference.withdrawOperationUUID; expectedWithdrawal.generation++;
+      expectedWithdrawal.state = CousinRouteState::withdrawn;
+      expectedWithdrawal.withdrawalGeneration = expectedWithdrawal.generation;
+      expectedWithdrawal.withdrawnAtMs = intent.startedAtMilliseconds;
+      auto expected = binding.route; expected.routeUUID = reference.successorRouteUUID;
+      expected.operationUUID = reference.successorRouteOperationUUID; expected.sourcePermissionUUID = successor.sourcePermissionUUID;
+      expected.generation = 1; expected.state = CousinRouteState::active;
+      expected.withdrawalGeneration = 0; expected.withdrawnAtMs = 0; expected.priorOperationUUIDs.clear();
+      if (!cousinRouteExactMatches(original, expectedWithdrawal) ||
+          !cousinRouteExactMatches(successor, expected) ||
+          successor.operationUUID != reference.successorRouteOperationUUID ||
+          successor.state != CousinRouteState::active ||
+          (successor.sourcePermissionUUID != binding.sourcePermission.permissionUUID &&
+           successor.sourcePermissionUUID != reference.successorPermissionUUID) ||
+          !loadCousinRouteApplyReceipt(successor.routeUUID, CousinRouteHalf::source, first, failure) ||
+          !loadCousinRouteApplyReceipt(successor.routeUUID, CousinRouteHalf::destination, second, failure) ||
+          !cousinRouteApplyReceiptMatchesCurrentRoute(first, successor) ||
+          !cousinRouteApplyReceiptMatchesCurrentRoute(second, successor)) {
+        if (failure && failure->empty()) failure->assign("qualification abort awaits exact restored route receipts"_ctv); return false;
+      }
+    }
+    recorded.phase = MothershipNametagQualificationExecutionPhase::failed;
+    String key = {}, encoded = {}; auto copy = recorded;
+    return nametagQualificationKey(adapter, intent.runUUID, key) && BitseryEngine::serialize(encoded, copy) &&
+        db.write(nametagQualificationExecutionsColumnFamily, key, encoded, failure);
+  }
+
+  // Persist the exact pre-fault records before any cousin route mutation. A
+  // retry may only reuse the same bytes, including both acknowledged halves.
+  bool recordNametagQualificationCousinRecoveryBindings(
+      const MothershipNametagQualificationAdapter& adapter,
+      const MothershipNametagQualificationIntent& intent,
+      const Vector<MothershipNametagQualificationExecutionRecord::CousinRecoveryBinding>& bindings,
+      MothershipNametagQualificationExecutionRecord& recorded, bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    if (!mothershipNametagQualificationIntentValid(intent) ||
+        intent.protocolVersion != MothershipNametagQualificationIntent::cousinRecoveryVersion ||
+        bindings.size() != intent.cousinRecoveries.size()) {
+      if (failure) failure->assign("cousin recovery bindings do not match the immutable intent"_ctv); return false;
+    }
+    for (uint32_t i = 0; i < bindings.size(); ++i)
+      if (!mothershipNametagQualificationCousinRecoveryBindingValid(intent, i, bindings[i])) {
+        if (failure) failure->assign("invalid exact cousin recovery binding"_ctv); return false;
+      }
+    CousinRouteLock routeLock; G6OperationLock operationLock;
+    if (!lockCousinRoutes(routeLock, failure) || !lockG6Operations(operationLock, failure)) return false;
+    bool found = false;
+    if (!loadNametagQualificationExecution(adapter, intent, recorded, found, failure) || !found) return false;
+    if (!recorded.cousinRecoveryBindings.empty()) {
+      String before = {}, after = {}; auto a = recorded; auto b = recorded;
+      b.cousinRecoveryBindings = bindings;
+      resumed = BitseryEngine::serialize(before, a) && BitseryEngine::serialize(after, b) && before == after;
+      if (!resumed && failure) failure->assign("cousin recovery binding conflicts with its durable snapshot"_ctv);
+      if (resumed && failure) failure->clear();
+      return resumed;
+    }
+    if (recorded.phase != MothershipNametagQualificationExecutionPhase::prepared) {
+      if (failure) failure->assign("cousin recovery binding must precede the fault"_ctv); return false;
+    }
+    MothershipNametagAllMastersRecord allMasters = {};
+    if (!loadNametagAllMasters(intent.allMastersOperationUUID, allMasters, failure)) return false;
+    for (const auto& binding : bindings) {
+      if (std::any_of(allMasters.intent.seedRoutes.begin(), allMasters.intent.seedRoutes.end(),
+          [&](const auto& seed) { return seed.routeUUID == binding.route.routeUUID; })) {
+        if (failure) failure->assign("qualification may not replace a retained seed route"_ctv); return false;
+      }
+      CousinRouteRecord current = {}; CousinRouteApplyReceipt source = {}, destination = {};
+      if (!loadCousinRoute(binding.route.routeUUID, current, failure) ||
+          !cousinRouteAllowsNewAdmissionAt(current, Time::now<TimeResolution::ms>()) ||
+          !cousinRouteExactMatches(current, binding.route) ||
+          current.priorOperationUUIDs != binding.route.priorOperationUUIDs ||
+          !loadCousinRouteApplyReceipt(current.routeUUID, CousinRouteHalf::source, source, failure) ||
+          !loadCousinRouteApplyReceipt(current.routeUUID, CousinRouteHalf::destination, destination, failure) ||
+          !cousinRouteApplyReceiptExactMatches(source, binding.sourceReceipt) ||
+          !cousinRouteApplyReceiptExactMatches(destination, binding.destinationReceipt)) {
+        if (failure && failure->empty()) failure->assign("cousin recovery route changed before durable binding"_ctv); return false;
+      }
+    }
+    if (intent.row == MothershipNametagQualificationRow::permissionRevokeReinstall) {
+      // A permission cannot be revoked while any of its routes remains live.
+      // Do not admit a fault that would knowingly strand an unrelated route.
+      Vector<String> routeValues = {};
+      if (!db.listValues(cousinRoutesColumnFamily, routeValues, failure)) return false;
+      for (const auto& binding : bindings) {
+        for (const auto& other : bindings)
+          if (other.route.routeUUID != binding.route.routeUUID &&
+              other.sourcePermission.permissionUUID == binding.sourcePermission.permissionUUID) {
+            if (failure) failure->assign("qualification routes must have independent source permissions"_ctv); return false;
+          }
+        for (const auto& encodedRoute : routeValues) {
+          CousinRouteRecord current = {};
+          if (!BitseryEngine::deserializeSafe(encodedRoute, current) || !cousinRouteStructurallyValid(current)) {
+            if (failure) failure->assign("qualification found a corrupt cousin route"_ctv); return false;
+          }
+          if (current.routeUUID != binding.route.routeUUID && !cousinRouteTerminal(current) &&
+              (current.sourcePermissionUUID == binding.sourcePermission.permissionUUID ||
+               current.destinationPermissionUUID == binding.sourcePermission.permissionUUID)) {
+            if (failure) failure->assign("qualification source permission has another nonterminal route"_ctv); return false;
+          }
+        }
+      }
+    }
+    recorded.protocolVersion = MothershipNametagQualificationExecutionRecord::cousinRecoveryVersion;
+    recorded.cousinRecoveryBindings = bindings;
+    if (!mothershipNametagQualificationExecutionRecordValid(recorded)) return false;
+    String key = {}, encoded = {}; auto copy = recorded;
+    if (!nametagQualificationKey(adapter, intent.runUUID, key) || !BitseryEngine::serialize(encoded, copy) ||
+        !db.write(nametagQualificationExecutionsColumnFamily, key, encoded, failure)) return false;
+    if (failure) failure->clear(); return true;
+  }
+
+  bool recordNametagQualificationSecondTruthWriterAdmission(
+      const MothershipNametagQualificationAdapter& adapter,
+      const MothershipNametagQualificationIntent& intent,
+      const MothershipNametagQualificationExecutionRecord::SecondTruthWriterAdmissionReceipt& receipt,
+      MothershipNametagQualificationExecutionRecord& recorded, bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    if (!mothershipNametagQualificationSecondTruthWriterAdmissionMatchesIntent(intent, receipt)) {
+      if (failure) failure->assign("second Truth-writer admission receipt is invalid"_ctv);
+      return false;
+    }
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure)) return false;
+    bool found = false;
+    if (!loadNametagQualificationExecution(adapter, intent, recorded, found, failure) || !found) {
+      if (!found && failure && failure->empty()) failure->assign("qualification execution phase is absent"_ctv);
+      return false;
+    }
+    const auto& existing = recorded.secondTruthWriterAdmission;
+    const bool empty = existing.sourceClusterUUID == 0 && existing.candidateClusterUUID == 0 &&
+        existing.retainedOwnerClusterUUID == 0 && existing.retainedPlacementGeneration == 0 &&
+        existing.candidatePlanSHA256.empty() && !existing.fenced;
+    if (!empty) {
+      resumed = existing.sourceClusterUUID == receipt.sourceClusterUUID &&
+          existing.candidateClusterUUID == receipt.candidateClusterUUID &&
+          existing.retainedOwnerClusterUUID == receipt.retainedOwnerClusterUUID &&
+          existing.retainedPlacementGeneration == receipt.retainedPlacementGeneration &&
+          existing.candidatePlanSHA256 == receipt.candidatePlanSHA256 && existing.fenced == receipt.fenced;
+      if (!resumed && failure) failure->assign("second Truth-writer admission receipt conflicts with durable receipt"_ctv);
+      if (resumed && failure) failure->clear();
+      return resumed;
+    }
+    recorded.secondTruthWriterAdmission = receipt;
+    // v1 execution records predate this receipt tail.  Promote only after a
+    // fully validated immutable row-sixteen receipt is ready to persist.
+    recorded.protocolVersion = MothershipNametagQualificationExecutionRecord::version;
+    String key = {}, encoded = {}; auto copy = recorded;
+    if (!nametagQualificationKey(adapter, intent.runUUID, key) || !BitseryEngine::serialize(encoded, copy)) return false;
+    return db.write(nametagQualificationExecutionsColumnFamily, key, encoded, failure);
+  }
+
+  bool loadNametagQualificationIntent(const MothershipNametagQualificationAdapter& adapter,
+                                      uint128_t runUUID,
+                                      MothershipNametagQualificationIntent& recorded,
+                                      bool& found, String *failure = nullptr)
+  {
+    recorded = {}; found = false;
+    if (!nametagQualificationAdapterFrozen(adapter) || runUUID == 0)
+    { if (failure) failure->assign("qualification intent identity is invalid"_ctv); return false; }
+    String key = {}, encoded = {}, readFailure = {};
+    if (!nametagQualificationKey(adapter, runUUID, key))
+    { if (failure) failure->assign("qualification intent run identity is invalid"_ctv); return false; }
+    if (!db.read(nametagQualificationIntentsColumnFamily, key, encoded, &readFailure))
+    {
+      if (readFailure.equal("record not found"_ctv)) { if (failure) failure->clear(); return true; }
+      if (failure) *failure = readFailure;
+      return false;
+    }
+    if (!BitseryEngine::deserializeSafe(encoded, recorded) || !mothershipNametagQualificationIntentValid(recorded) ||
+        recorded.runUUID != runUUID || recorded.row != adapter.row || recorded.direction != adapter.direction ||
+        !recorded.rowID.equal(String(adapter.rowID)) ||
+        mothershipNametagQualificationAdapterForTuple(recorded.row, recorded.direction, recorded.rowID,
+            recorded.deadlineSeconds, recorded.convergenceSeconds) != &adapter)
+    { recorded = {}; if (failure) failure->assign("qualification intent is corrupt or mismatched"_ctv); return false; }
+    MothershipNametagAllMastersRecord allMasters = {};
+    if (!loadNametagAllMasters(recorded.allMastersOperationUUID, allMasters, failure) ||
+        !nametagQualificationAllMastersMatches(recorded, allMasters))
+    {
+      recorded = {};
+      if (failure && failure->empty()) failure->assign("qualification intent does not match durable three-site authority"_ctv);
+      return false;
+    }
+    found = true;
+    if (failure) failure->clear();
+    return true;
+  }
+
+  // Rebuild the seed receipt from its durable execution and immutable successor
+  // chain; the receipt's own digest only authenticates its bytes, not their origin.
+  bool nametagQualificationSeedReceiptMatchesExecution(
+      const MothershipNametagQualificationAdapter& adapter,
+      const MothershipNametagQualificationIntent& intent,
+      const MothershipNametagQualificationReceipt& receipt, String *failure = nullptr)
+  {
+    if (intent.protocolVersion != MothershipNametagQualificationIntent::seedVersion ||
+        !prodigyNametagQualificationSeedReadbackRow(uint8_t(intent.row))) return true;
+    MothershipNametagQualificationExecutionRecord execution; bool found = false;
+    if (!loadNametagQualificationExecution(adapter, intent, execution, found, failure) || !found ||
+        !mothershipNametagQualificationSeedExecutionComplete(execution) ||
+        (execution.phase != MothershipNametagQualificationExecutionPhase::converging &&
+         execution.phase != MothershipNametagQualificationExecutionPhase::verified)) {
+      if (failure && failure->empty()) failure->assign("seed receipt lacks a complete durable execution"_ctv);
+      return false;
+    }
+    String prefix; prefix.assign("nametag-qualification-v4:"_ctv); prefix.append(intent.rowID); prefix.append(":"_ctv);
+    const auto& witness = receipt.canonicalConvergenceWitness;
+    const size_t offset = prefix.size() + 64;
+    if (witness.size() <= offset + 1 || std::memcmp(witness.data(), prefix.data(), prefix.size()) != 0 ||
+        witness.data()[offset] != ':') return false;
+    String topology; topology.append(witness.data() + offset + 1, witness.size() - offset - 1);
+    auto requested = receipt; String expected;
+    if (!BitseryEngine::serialize(expected, requested)) return false;
+    // A receipt can be written before the normal converging -> verified journal
+    // transition, so verify both valid encodings against the same durable proof.
+    for (auto phase : {MothershipNametagQualificationExecutionPhase::converging,
+                       MothershipNametagQualificationExecutionPhase::verified}) {
+      if (phase == MothershipNametagQualificationExecutionPhase::verified && execution.phase != phase) continue;
+      auto proof = execution; proof.phase = phase;
+      MothershipNametagQualificationReceipt rebuilt; String actual;
+      if (mothershipNametagQualificationBuildReceipt(intent, receipt.applicationReceipts, topology,
+            receipt.observedAtMilliseconds, rebuilt, nullptr, &proof) &&
+          BitseryEngine::serialize(actual, rebuilt) && actual == expected) return true;
+    }
+    if (failure) failure->assign("seed receipt does not commit to its durable execution"_ctv);
+    return false;
+  }
+
+  bool loadNametagQualificationReceipt(const MothershipNametagQualificationAdapter& adapter,
+                                        uint128_t runUUID,
+                                        MothershipNametagQualificationReceipt& recorded,
+                                        bool& found, String *failure = nullptr)
+  {
+    recorded = {}; found = false;
+    if (!nametagQualificationAdapterFrozen(adapter) || runUUID == 0)
+    { if (failure) failure->assign("qualification receipt identity is invalid"_ctv); return false; }
+    String key = {}, encoded = {}, readFailure = {};
+    if (!nametagQualificationKey(adapter, runUUID, key))
+    { if (failure) failure->assign("qualification receipt run identity is invalid"_ctv); return false; }
+    if (!db.read(nametagQualificationReceiptsColumnFamily, key, encoded, &readFailure))
+    {
+      if (readFailure.equal("record not found"_ctv)) { if (failure) failure->clear(); return true; }
+      if (failure) *failure = readFailure;
+      return false;
+    }
+    if (!BitseryEngine::deserializeSafe(encoded, recorded) || !mothershipNametagQualificationReceiptValid(recorded) ||
+        recorded.runUUID != runUUID || recorded.row != adapter.row || recorded.direction != adapter.direction ||
+        !recorded.rowID.equal(String(adapter.rowID)) ||
+        mothershipNametagQualificationAdapterForTuple(recorded.row, recorded.direction, recorded.rowID,
+            uint32_t((recorded.deadlineAtMilliseconds - recorded.startedAtMilliseconds) / 1000),
+            uint32_t((recorded.convergenceDeadlineAtMilliseconds - recorded.startedAtMilliseconds) / 1000)) != &adapter)
+    { recorded = {}; if (failure) failure->assign("qualification receipt is corrupt or mismatched"_ctv); return false; }
+    MothershipNametagQualificationIntent intent = {};
+    String intentEncoded = {};
+    if (!db.read(nametagQualificationIntentsColumnFamily, key, intentEncoded, failure) ||
+        !BitseryEngine::deserializeSafe(intentEncoded, intent) ||
+        !mothershipNametagQualificationIntentValid(intent)) {
+      recorded = {};
+      if (failure && failure->empty()) failure->assign("qualification receipt has no durable v4 intent"_ctv);
+      return false;
+    }
+    MothershipNametagAllMastersRecord allMasters = {};
+    if (!loadNametagAllMasters(intent.allMastersOperationUUID, allMasters, failure) ||
+        !nametagQualificationAllMastersMatches(intent, allMasters) ||
+        !nametagQualificationReceiptMatchesIntent(recorded, intent) ||
+        !nametagQualificationSeedReceiptMatchesExecution(adapter, intent, recorded, failure)) {
+      recorded = {};
+      if (failure && failure->empty()) failure->assign("qualification receipt does not match durable three-site authority"_ctv);
+      return false;
+    }
+    found = true;
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool recordNametagQualificationReceipt(const MothershipNametagQualificationAdapter& adapter,
+                                         const MothershipNametagQualificationReceipt& requested,
+                                         MothershipNametagQualificationReceipt& recorded,
+                                         bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    if (!mothershipNametagQualificationReceiptValid(requested) ||
+        !nametagQualificationAdapterFrozen(adapter) || requested.row != adapter.row ||
+        requested.direction != adapter.direction || !requested.rowID.equals(String(adapter.rowID)) ||
+        mothershipNametagQualificationAdapterForTuple(requested.row, requested.direction, requested.rowID,
+            uint32_t((requested.deadlineAtMilliseconds - requested.startedAtMilliseconds) / 1000),
+            uint32_t((requested.convergenceDeadlineAtMilliseconds - requested.startedAtMilliseconds) / 1000)) != &adapter)
+    { if (failure) failure->assign("qualification receipt does not bind its exact manifest row"_ctv); return false; }
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure)) return false;
+    String key = {}, intentEncoded = {}, encoded = {}, readFailure = {};
+    if (!nametagQualificationKey(adapter, requested.runUUID, key))
+    { if (failure) failure->assign("qualification receipt run identity is invalid"_ctv); return false; }
+    MothershipNametagQualificationIntent intent = {};
+    if (!db.read(nametagQualificationIntentsColumnFamily, key, intentEncoded, &readFailure) ||
+        !BitseryEngine::deserializeSafe(intentEncoded, intent) || !mothershipNametagQualificationIntentValid(intent))
+    { if (failure) failure->assign("qualification receipt has no exact durable intent"_ctv); return false; }
+    MothershipNametagAllMastersRecord allMasters = {};
+    if (!loadNametagAllMasters(intent.allMastersOperationUUID, allMasters, failure) ||
+        !nametagQualificationAllMastersMatches(intent, allMasters) ||
+        !nametagQualificationReceiptMatchesIntent(requested, intent) ||
+        !nametagQualificationSeedReceiptMatchesExecution(adapter, intent, requested, failure))
+    { if (failure && failure->empty()) failure->assign("qualification receipt does not match durable three-site authority"_ctv); return false; }
+    if (db.read(nametagQualificationReceiptsColumnFamily, key, encoded, &readFailure))
+    {
+      if (!BitseryEngine::deserializeSafe(encoded, recorded) || !mothershipNametagQualificationReceiptValid(recorded))
+      { recorded = {}; if (failure) failure->assign("qualification receipt is corrupt or unsupported"_ctv); return false; }
+      String existing = {}, proposed = {}; auto existingCopy = recorded; auto proposedCopy = requested;
+      BitseryEngine::serialize(existing, existingCopy); BitseryEngine::serialize(proposed, proposedCopy);
+      resumed = existing.equal(proposed);
+      if (!resumed && failure) failure->assign("qualification receipt conflicts with immutable durable receipt"_ctv);
+      return resumed;
+    }
+    if (!readFailure.equal("record not found"_ctv)) { if (failure) *failure = readFailure; return false; }
+    recorded = requested; auto copy = recorded; BitseryEngine::serialize(encoded, copy);
+    return db.write(nametagQualificationReceiptsColumnFamily, key, encoded, failure);
+  }
+
+  bool loadNametagSourceBaseline(uint128_t operationUUID, MothershipNametagSourceBaselineRecord& recorded,
+                                 bool& found, String *failure = nullptr)
+  {
+    recorded = {}; found = false; String key = {}, encoded = {}, readFailure = {};
+    if (!nametagSourceBaselineKey(operationUUID, key)) { if (failure) failure->assign("source baseline operation identity is invalid"_ctv); return false; }
+    if (!db.read(nametagSourceBaselineRecordsColumnFamily, key, encoded, &readFailure)) {
+      if (readFailure.equal("record not found"_ctv)) { if (failure) failure->clear(); return true; }
+      if (failure) *failure = readFailure; return false;
+    }
+    if (!BitseryEngine::deserializeSafe(encoded, recorded) || !mothershipNametagSourceBaselineRecordValid(recorded) ||
+        recorded.command.operationUUID != operationUUID) {
+      recorded = {}; if (failure) failure->assign("source baseline record is corrupt or unsupported"_ctv); return false;
+    }
+    found = true; if (failure) failure->clear(); return true;
+  }
+
+  bool persistNametagSourceBaselineIntent(const MothershipNametagSourceBaselineIntent& proposed,
+      MothershipNametagSourceBaselineIntent& recorded,
+      bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    if (!mothershipNametagSourceBaselineIntentValid(proposed)) { if (failure) failure->assign("source baseline intent is invalid"_ctv); return false; }
+    G6OperationLock lock; if (!lockG6Operations(lock, failure)) return false;
+    String key = {}, encoded = {}, readFailure = {};
+    if (!nametagSourceBaselineKey(proposed.command.operationUUID, key)) return false;
+    if (db.read(nametagSourceBaselineIntentsColumnFamily, key, encoded, &readFailure)) {
+      if (!BitseryEngine::deserializeSafe(encoded, recorded) || !mothershipNametagSourceBaselineIntentValid(recorded)) {
+        recorded = {}; if (failure) failure->assign("source baseline intent is corrupt"_ctv); return false;
+      }
+      String oldBytes = {}, newBytes = {}; auto oldCopy = recorded; auto newCopy = proposed;
+      resumed = BitseryEngine::serialize(oldBytes, oldCopy) && BitseryEngine::serialize(newBytes, newCopy) && oldBytes.equal(newBytes);
+      if (!resumed && failure) failure->assign("source baseline intent conflicts with durable operation"_ctv);
+      return resumed;
+    }
+    if (!readFailure.equal("record not found"_ctv)) { if (failure) *failure = readFailure; return false; }
+    recorded = proposed; auto copy = recorded;
+    return BitseryEngine::serialize(encoded, copy) && db.write(nametagSourceBaselineIntentsColumnFamily, key, encoded, failure);
+  }
+
+  bool loadNametagSourceBaselineIntent(uint128_t operationUUID, MothershipNametagSourceBaselineIntent& recorded,
+      bool& found, String *failure = nullptr)
+  {
+    recorded = {}; found = false; String key = {}, encoded = {}, readFailure = {};
+    if (!nametagSourceBaselineKey(operationUUID, key)) return false;
+    if (!db.read(nametagSourceBaselineIntentsColumnFamily, key, encoded, &readFailure)) {
+      if (readFailure.equal("record not found"_ctv)) { if (failure) failure->clear(); return true; }
+      if (failure) *failure = readFailure; return false;
+    }
+    if (!BitseryEngine::deserializeSafe(encoded, recorded) || !mothershipNametagSourceBaselineIntentValid(recorded) ||
+        recorded.command.operationUUID != operationUUID) { recorded = {}; if (failure) failure->assign("source baseline intent is corrupt"_ctv); return false; }
+    found = true; if (failure) failure->clear(); return true;
+  }
+
+  bool recordNametagSourceBaseline(const MothershipNametagSourceBaselineRecord& requested,
+                                   MothershipNametagSourceBaselineRecord& recorded, bool& resumed,
+                                   String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    if (!mothershipNametagSourceBaselineRecordValid(requested)) {
+      if (failure) failure->assign("source baseline record does not bind an exact completed EWR command"_ctv); return false;
+    }
+    G6OperationLock lock; if (!lockG6Operations(lock, failure)) return false;
+    String key = {}, encoded = {}, readFailure = {};
+    if (!nametagSourceBaselineKey(requested.command.operationUUID, key)) return false;
+    if (db.read(nametagSourceBaselineRecordsColumnFamily, key, encoded, &readFailure)) {
+      if (!BitseryEngine::deserializeSafe(encoded, recorded) || !mothershipNametagSourceBaselineRecordValid(recorded)) {
+        recorded = {}; if (failure) failure->assign("source baseline durable record is corrupt"_ctv); return false;
+      }
+      String oldBytes = {}, newBytes = {}; auto oldCopy = recorded; auto newCopy = requested;
+      resumed = BitseryEngine::serialize(oldBytes, oldCopy) && BitseryEngine::serialize(newBytes, newCopy) && oldBytes.equal(newBytes);
+      if (!resumed && failure) failure->assign("source baseline operation conflicts with immutable completed receipt"_ctv);
+      return resumed;
+    }
+    if (!readFailure.equal("record not found"_ctv)) { if (failure) *failure = readFailure; return false; }
+    recorded = requested; auto copy = recorded;
+    return BitseryEngine::serialize(encoded, copy) && db.write(nametagSourceBaselineRecordsColumnFamily, key, encoded, failure);
+  }
+
+  // Intent is persisted before dispatch.  This keeps a retry bound to the
+  // original target and deadlines even when the process dies between request
+  // transmission and receipt persistence.
+  bool persistNametagQualificationIntent(const MothershipNametagQualificationAdapter& adapter,
+                                         const MothershipNametagQualificationIntent& proposed,
+                                         MothershipNametagQualificationIntent& recorded,
+                                         bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    if (!mothershipNametagQualificationIntentValid(proposed) || !nametagQualificationAdapterFrozen(adapter) || proposed.row != adapter.row ||
+        proposed.direction != adapter.direction || !proposed.rowID.equal(String(adapter.rowID)) ||
+        proposed.deadlineSeconds != adapter.deadlineSeconds || proposed.convergenceSeconds != adapter.convergenceSeconds ||
+        mothershipNametagQualificationAdapterForTuple(proposed.row, proposed.direction, proposed.rowID,
+            proposed.deadlineSeconds, proposed.convergenceSeconds) != &adapter)
+    { if (failure) failure->assign("qualification intent does not bind its exact manifest row"_ctv); return false; }
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure)) return false;
+    String key = {}, encoded = {}, readFailure = {};
+    if (!nametagQualificationKey(adapter, proposed.runUUID, key))
+    { if (failure) failure->assign("qualification intent run identity is invalid"_ctv); return false; }
+    MothershipNametagAllMastersRecord allMasters = {};
+    if (!loadNametagAllMasters(proposed.allMastersOperationUUID, allMasters, failure) ||
+        !nametagQualificationAllMastersMatches(proposed, allMasters))
+    { if (failure && failure->empty()) failure->assign("qualification intent has no exact durable all-masters topology"_ctv); return false; }
+    if (db.read(nametagQualificationIntentsColumnFamily, key, encoded, &readFailure))
+    {
+      if (!BitseryEngine::deserializeSafe(encoded, recorded) || !mothershipNametagQualificationIntentValid(recorded))
+      { recorded = {}; if (failure) failure->assign("qualification intent is corrupt or unsupported"_ctv); return false; }
+      String existing = {}, requested = {}; auto existingCopy = recorded; auto requestedCopy = proposed;
+      BitseryEngine::serialize(existing, existingCopy); BitseryEngine::serialize(requested, requestedCopy);
+      resumed = existing.equal(requested);
+      if (!resumed && failure) failure->assign("qualification intent conflicts with durable target or deadline"_ctv);
+      return resumed;
+    }
+    if (!readFailure.equal("record not found"_ctv)) { if (failure) *failure = readFailure; return false; }
+    recorded = proposed; auto copy = recorded; BitseryEngine::serialize(encoded, copy);
+    return db.write(nametagQualificationIntentsColumnFamily, key, encoded, failure);
+  }
+
   bool admitLocalVMMachineFault(const MothershipLocalVMMachineFaultRequest& requested,
                                 const MothershipPhysicalFaultMachineObservation& admission,
                                 MothershipLocalVMMachineFaultRecord& recorded,
@@ -4904,7 +8258,9 @@ public:
     if (!lockG6Operations(lock, failure)) return false;
     MothershipLocalVMBoundaryDescriptor boundary = {};
     if (!loadLocalVMBoundary(requested.vmBoundaryUUID, boundary, failure) || boundary.retired ||
-        boundary.clusterUUID != requested.clusterUUID || boundary.machineUUID != requested.machineUUID)
+        boundary.clusterUUID != requested.clusterUUID || boundary.machineUUID != requested.machineUUID ||
+        (requested.protocolVersion >= MothershipLocalVMMachineFaultRequest::unreadyUpgradeRecoveryVersion &&
+         boundary.immutableStateSHA256 != requested.expectedBoundarySHA256))
     { if (failure && failure->empty()) failure->assign("local VM fault does not bind an active exact VM boundary"_ctv); return false; }
     String key = {}, encoded = {}, readFailure = {}; key.assignItoh(requested.operationUUID);
     if (db.read(localVMFaultsColumnFamily, key, encoded, &readFailure))
@@ -4992,6 +8348,8 @@ public:
     if (!mothershipLocalAuthorityRecoveryCohortRequestValid(requested, failure)) return false;
     G6OperationLock lock;
     if (!lockG6Operations(lock, failure)) return false;
+    if (requested.protocolVersion >= MothershipLocalAuthorityRecoveryCohortRequest::interruptedUpgradeVersion &&
+        !localRecoveryRuntimeAuthorityMatches(requested, failure)) return false;
     String key = {}, encoded = {}, readFailure = {}; key.assignItoh(requested.operationUUID);
     if (db.read(localAuthorityRecoveryCohortsColumnFamily, key, encoded, &readFailure))
     {
@@ -5008,7 +8366,7 @@ public:
       return true;
     }
     if (!readFailure.equal("record not found"_ctv)) { if (failure) *failure = readFailure; return false; }
-    recorded.protocolVersion = MothershipLocalAuthorityRecoveryCohortRecord::version;
+    recorded.protocolVersion = requested.protocolVersion;
     recorded.request = requested;
     recorded.phase = MothershipLocalAuthorityRecoveryPhase::admitted;
     for (const auto& executor : requested.executors)
@@ -5016,10 +8374,125 @@ public:
       MothershipLocalAuthorityRecoveryBoundaryProgress progress = {};
       progress.boundaryUUID = executor.boundaryUUID;
       recorded.boundaries.push_back(std::move(progress));
+      if (requested.protocolVersion >= MothershipLocalAuthorityRecoveryCohortRequest::interruptedUpgradeVersion) {
+        MothershipLocalRecoveryRuntimeProgress runtime;
+        runtime.boundaryUUID=executor.boundaryUUID; recorded.runtimeProgress.push_back(std::move(runtime));
+      }
     }
     auto copy = recorded; BitseryEngine::serialize(encoded, copy);
     if (!db.write(localAuthorityRecoveryCohortsColumnFamily, key, encoded, failure)) { recorded = {}; return false; }
     if (failure) failure->clear();
+    return true;
+  }
+
+  bool localRecoveryRuntimeAuthorityMatches(const MothershipLocalAuthorityRecoveryCohortRequest& requested,
+                                            String *failure=nullptr)
+  {
+    if (!mothershipLocalRecoveryRuntimeIntentValid(requested)) return false;
+    const auto& runtime=requested.runtime;
+    MothershipUpgradeAdmissionRecord admission;
+    if (!loadUpgradeAdmission(requested.clusterUUID,runtime.upgradeOperationUUID,admission,failure)) return false;
+    String encoded,admissionSHA;
+    if (!BitseryEngine::serialize(encoded,admission) || !prodigyComputeSHA256Hex(encoded,admissionSHA,failure) ||
+        !admission.eligible || admission.approvedPath!=1 || admission.clusterUUID!=requested.clusterUUID ||
+        admission.operationID!=runtime.upgradeOperationUUID || admissionSHA!=runtime.admissionSHA256 ||
+        admission.targetContractSHA256!=runtime.targetContractSHA256) {
+      if (failure) failure->assign("local runtime recovery differs from its admitted upgrade"_ctv);
+      return false;
+    }
+    if (requested.protocolVersion == MothershipLocalAuthorityRecoveryCohortRequest::interruptedUpgradeVersion) {
+      MothershipLocalAuthorityRecoveryCohortRecord predecessor;
+      String predecessorSHA;
+      if (!loadLocalAuthorityRecoveryCohort(runtime.predecessorRecoveryUUID,predecessor,failure) ||
+          !BitseryEngine::serialize(encoded,predecessor) || !prodigyComputeSHA256Hex(encoded,predecessorSHA,failure) ||
+          admission.sourceBundleSHA256!=mothershipLocalInterruptedUpgradeSourceBundle ||
+          admission.sourceProdigySHA256!=mothershipLocalInterruptedUpgradeSourceRuntime ||
+          admission.targetBundleSHA256!=mothershipLocalInterruptedUpgradeTargetBundle ||
+          predecessorSHA!=runtime.predecessorRecoverySHA256 ||
+          predecessor.phase!=MothershipLocalAuthorityRecoveryPhase::recovered ||
+          predecessor.request.clusterUUID!=requested.clusterUUID || predecessor.request.executors.size()!=3) {
+        if (failure) failure->assign("local runtime recovery differs from its admitted upgrade or completed predecessor"_ctv);
+        return false;
+      }
+      for (uint32_t i=0;i<3;++i) {
+        const auto& before=predecessor.request.executors[i]; const auto& after=requested.executors[i];
+        if (before.machineUUID!=after.machineUUID || before.boundaryUUID!=after.boundaryUUID ||
+            before.immutableBoundarySHA256!=after.immutableBoundarySHA256) {
+          if(failure) failure->assign("local runtime recovery substituted a registered predecessor boundary"_ctv);
+          return false;
+        }
+      }
+    } else {
+      const auto& identity=requested.admittedRuntime;
+      if (admission.sourceBundleSHA256!=identity.sourceBundleSHA256 ||
+          admission.sourceContractSHA256!=identity.sourceContractSHA256 ||
+          admission.sourceReleaseID!=identity.sourceReleaseID ||
+          admission.sourceProdigySHA256!=identity.sourceProdigySHA256 ||
+          admission.sourceMothershipSHA256!=identity.sourceMothershipSHA256 ||
+          admission.targetBundleSHA256!=identity.targetBundleSHA256 ||
+          admission.authorityGeneration!=identity.authorityGeneration ||
+          admission.masterUUID!=identity.masterUUID || admission.masterBootNs!=identity.masterBootNs ||
+          admission.semanticObservationSHA256!=identity.semanticObservationSHA256) {
+        if (failure) failure->assign("local runtime recovery changed its immutable admitted runtime identity"_ctv);
+        return false;
+      }
+    }
+    Vector<String> values;
+    if (!db.listValues(localAuthorityRecoveryCohortsColumnFamily,values,failure)) return false;
+    for (const auto& bytes:values) {
+      MothershipLocalAuthorityRecoveryCohortRecord other;
+      if (!BitseryEngine::deserializeSafe(bytes,other) || !mothershipLocalAuthorityRecoveryCohortRecordValid(other)) return false;
+      if (other.request.clusterUUID==requested.clusterUUID && other.request.operationUUID!=requested.operationUUID &&
+          other.phase!=MothershipLocalAuthorityRecoveryPhase::recovered) {
+        if(failure) failure->assign("local runtime recovery has an unresolved prior cohort"_ctv);
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool checkpointLocalRecoveryRuntime(uint128_t operationUUID,const MothershipLocalRecoveryRuntimeProgress& next,
+      MothershipLocalAuthorityRecoveryCohortRecord& recorded,String *failure=nullptr)
+  {
+    G6OperationLock lock;
+    if (!lockG6Operations(lock,failure) || !loadLocalAuthorityRecoveryCohort(operationUUID,recorded,failure) ||
+        recorded.protocolVersion<MothershipLocalAuthorityRecoveryCohortRecord::interruptedUpgradeVersion) return false;
+    for (uint32_t i=0;i<recorded.runtimeProgress.size();++i) {
+      auto& prior=recorded.runtimeProgress[i]; if (prior.boundaryUUID!=next.boundaryUUID) continue;
+      if (mothershipPhysicalFaultExactSerializedEqual(prior,next)) return true;
+      if (recorded.phase==MothershipLocalAuthorityRecoveryPhase::recovered ||
+          recorded.boundaries[i].phase<MothershipLocalAuthorityRecoveryPhase::armed ||
+          (prior.installDispatched && !next.installDispatched) ||
+          (!prior.stateSHA256.empty() && prior.stateSHA256!=next.stateSHA256) ||
+          (!prior.secretsSHA256.empty() && prior.secretsSHA256!=next.secretsSHA256) ||
+          (!prior.activationBootID.empty() && prior.activationBootID!=next.activationBootID) ||
+          (!next.activationBootID.empty() && recorded.boundaries[i].phase<MothershipLocalAuthorityRecoveryPhase::released)) {
+        if(failure)failure->assign("local runtime recovery checkpoint changed or skipped durable evidence"_ctv);
+        return false;
+      }
+      prior=next;
+      if(!mothershipLocalAuthorityRecoveryCohortRecordValid(recorded,failure))return false;
+      String key,bytes;key.assignItoh(operationUUID);BitseryEngine::serialize(bytes,recorded);
+      return db.write(localAuthorityRecoveryCohortsColumnFamily,key,bytes,failure);
+    }
+    if(failure)failure->assign("local runtime recovery checkpoint has no admitted boundary"_ctv);
+    return false;
+  }
+
+  bool loadLocalRecoveryGateways(uint128_t clusterUUID,Vector<CrossClusterMasqueGatewayAuthority>& gateways,
+                                String *failure=nullptr)
+  {
+    gateways.clear();Vector<String> values;
+    if(!db.listValues(crossClusterMasqueGatewaysColumnFamily,values,failure))return false;
+    for(const auto& bytes:values) {
+      CrossClusterMasqueGatewayAuthority authority;
+      if(!BitseryEngine::deserializeSafe(bytes,authority) || !prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(authority))return false;
+      if(authority.localClusterUUID==clusterUUID && authority.state==CrossClusterMasqueGatewayState::active)
+        gateways.push_back(std::move(authority));
+    }
+    std::sort(gateways.begin(),gateways.end(),[](const auto& a,const auto& b) {
+      return a.pairUUID==b.pairUUID ? a.localMachineUUID<b.localMachineUUID : a.pairUUID<b.pairUUID;
+    });
     return true;
   }
 
@@ -5473,6 +8946,11 @@ public:
         if (failure) failure->assign("BGP origin authorization prefixes must be canonical"_ctv);
         return false;
       }
+      if (!mothershipProviderBGPOriginPrefixAllowed(prefix))
+      {
+        if (failure) failure->assign("BGP origin authorization prefixes must not be ULA"_ctv);
+        return false;
+      }
       for (uint32_t other = 0; other < index; ++other)
         if (prefix.equals(candidate.bgpAuthorizedOriginPrefixes[other]))
         {
@@ -5600,6 +9078,31 @@ public:
       stored.controls.clear();
     }
 
+    // Preserve the established configuration-error ordering.  Fragment
+    // allocation scans the registry and also enforces virtual-datacenter
+    // tenancy; malformed cluster requests must still fail their own schema
+    // validation before either of those cross-record checks.  Zero is the
+    // new-cluster "allocate for me" value, so give only this validation copy
+    // a nonzero placeholder and validate the final allocated record again
+    // below.
+    MothershipProdigyCluster preflight = stored;
+    if (preflight.datacenterFragment == 0) preflight.datacenterFragment = 1;
+    if (validateClusterForUpsert(preflight, preflight, failure) == false)
+    {
+      return false;
+    }
+
+    // An existing record owns its mesh prefix permanently. A new record gets
+    // a globally unique prefix before validation/configuration can publish it.
+    if (hadExistingCluster)
+    {
+      stored.datacenterFragment = existingCluster.datacenterFragment;
+    }
+    if (allocateDatacenterFragment(stored, hadExistingCluster, failure) == false)
+    {
+      return false;
+    }
+
     if (validateClusterForUpsert(stored, stored, failure) == false)
     {
       return false;
@@ -5607,17 +9110,8 @@ public:
 
     if (mothershipClusterUsesVirtualDatacenter(stored))
     {
-      if (hadExistingCluster)
-      {
-        stored.datacenterFragment = existingCluster.datacenterFragment;
-      }
-      if (allocateTestDatacenterFragment(stored, hadExistingCluster, failure) == false)
-      {
-        return false;
-      }
-      // Fragment allocation follows ordinary configuration validation.  It
-      // changes the derived control socket domain, so regenerate controls only
-      // after the final fragment is known.
+      // The final fragment changes the derived control socket domain; regenerate
+      // controls after validation has accepted the finalized record.
       mothershipResolveTestClusterControlRecord(stored.controls, stored);
     }
 
@@ -5840,10 +9334,44 @@ public:
       return false;
     }
 
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure)) return false;
+
     MothershipProdigyCluster cluster = {};
     if (getCluster(name, cluster, failure) == false)
     {
       return false;
+    }
+
+    MothershipApplicationPlacement truth; String truthFailure;
+    if (loadTruthPlacement(truth, &truthFailure)) {
+      if (truth.ownerClusterUUID == cluster.clusterUUID) {
+        String inventory, identity, indexedName; identity.assignItoh(cluster.clusterUUID);
+        if (truth.version != 4 || truth.truthRetirementCompletedGeneration == 0 ||
+            truth.truthRetirementOwnerClusterUUID != cluster.clusterUUID ||
+            !db.read(clustersByUUIDColumnFamily, identity, indexedName, nullptr) || indexedName != cluster.name ||
+            !mothershipTruthRetirementInventoryDigest(cluster, inventory) ||
+            inventory != truth.truthRetirementInventorySHA256) {
+          if (failure) failure->assign("cluster removal requires completed exact Truth retirement"_ctv);
+          return false;
+        }
+      }
+    } else if (truthFailure != "record not found"_ctv) {
+      if (failure) *failure = truthFailure;
+      return false;
+    }
+
+    for (uint16_t applicationID : {uint16_t(2), uint16_t(5)}) {
+      MothershipApplicationPlacement placement; String readFailure;
+      if (!loadApplicationPlacement(applicationID, placement, &readFailure)) {
+        if (readFailure == "record not found"_ctv) continue;
+        if (failure) *failure = readFailure;
+        return false;
+      }
+      for (const auto& member : placement.graphReplicas) if (member.clusterUUID == cluster.clusterUUID) {
+        if (failure) failure->assign("cluster removal requires completed graph replica retirement"_ctv);
+        return false;
+      }
     }
 
     String serializedCluster = {};
@@ -5902,5 +9430,391 @@ public:
     }
 
     return true;
+  }
+
+  static bool crossClusterMasqueGatewayMachineRegistered(
+      const MothershipProdigyCluster& cluster, uint128_t machineUUID,
+      const IPAddress *requiredPublicEndpoint = nullptr)
+  {
+    uint32_t matches = 0;
+    bool endpointMatches = requiredPublicEndpoint == nullptr;
+    for (const ClusterMachine& machine : cluster.topology.machines)
+    {
+      if (machine.uuid != machineUUID) continue;
+      ++matches;
+      if (requiredPublicEndpoint == nullptr) continue;
+      for (const ClusterMachineAddress& candidate : machine.addresses.publicAddresses)
+      {
+        IPAddress parsed = {};
+        if (ClusterMachine::parseIPAddressLiteral(candidate.address, parsed) &&
+            parsed.equals(*requiredPublicEndpoint))
+        {
+          endpointMatches = true;
+        }
+      }
+    }
+    return matches == 1 && endpointMatches;
+  }
+
+  bool putCrossClusterMasqueGateway(CrossClusterMasqueGatewayAuthority requested,
+                                    const ProdigyClusterPairEnrollment& enrollment,
+                                    const MothershipProdigyCluster& localCluster,
+                                    const MothershipProdigyCluster& peerCluster,
+                                    CrossClusterMasqueGatewayAuthority& recorded,
+                                    bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    const IPPrefix localPrefix = prodigyContainerDatacenterSitePrefix(localCluster.datacenterFragment);
+    const IPPrefix peerPrefix = prodigyContainerDatacenterSitePrefix(peerCluster.datacenterFragment);
+    const bool derivedFieldsAgree =
+        (requested.pairUUID == 0 || requested.pairUUID == enrollment.pairUUID) &&
+        (requested.pairOperationUUID == 0 || requested.pairOperationUUID == enrollment.operationUUID) &&
+        (requested.localClusterUUID == 0 || requested.localClusterUUID == localCluster.clusterUUID) &&
+        (requested.peerClusterUUID == 0 || requested.peerClusterUUID == peerCluster.clusterUUID) &&
+        (requested.localDatacenterFragment == 0 ||
+         requested.localDatacenterFragment == localCluster.datacenterFragment) &&
+        (requested.peerDatacenterFragment == 0 ||
+         requested.peerDatacenterFragment == peerCluster.datacenterFragment) &&
+        (requested.localSitePrefix.cidr == 0 || requested.localSitePrefix.equals(localPrefix)) &&
+        (requested.peerSitePrefix.cidr == 0 || requested.peerSitePrefix.equals(peerPrefix)) &&
+        (requested.pairAuthorityGeneration == 0 ||
+         requested.pairAuthorityGeneration == enrollment.localAuthorityGeneration) &&
+        (requested.keyGeneration == 0 || requested.keyGeneration == enrollment.agreedKeyEpoch);
+    const MothershipProdigyCluster& listenerCluster =
+        requested.localRole == CrossClusterMasqueGatewayRole::listener ? localCluster : peerCluster;
+    const uint128_t listenerMachineUUID =
+        requested.localRole == CrossClusterMasqueGatewayRole::listener ?
+            requested.localMachineUUID : requested.peerMachineUUID;
+    if (!derivedFieldsAgree || requested.protocolVersion != CrossClusterMasqueGatewayAuthority::version ||
+        requested.localMachineUUID == 0 || requested.peerMachineUUID == 0 ||
+        requested.localMachineUUID == requested.peerMachineUUID ||
+        !prodigyIsSHA256HexDigest(requested.artifactSHA256) || requested.artifactBytes == 0 ||
+        (!prodigyIsSHA256HexDigest(requested.localIdentitySHA256) && requested.localIdentitySHA256 != "-"_ctv) ||
+        (!prodigyIsSHA256HexDigest(requested.peerIdentitySHA256) && requested.peerIdentitySHA256 != "-"_ctv) ||
+        (!prodigyIsSHA256HexDigest(requested.peerTrustSHA256) && requested.peerTrustSHA256 != "-"_ctv) ||
+        requested.listenerPublicUDPEndpoint.isNull() || requested.listenerPublicUDPPort == 0 ||
+        requested.generation == 0 ||
+        (requested.localRole != CrossClusterMasqueGatewayRole::listener &&
+         requested.localRole != CrossClusterMasqueGatewayRole::connector) ||
+        requested.state != CrossClusterMasqueGatewayState::active ||
+        !prodigyClusterPairEnrollmentDescriptorValid(enrollment) ||
+        enrollment.state != ProdigyClusterPairEnrollmentState::active ||
+        enrollment.localClusterUUID != localCluster.clusterUUID ||
+        enrollment.peerClusterUUID != peerCluster.clusterUUID ||
+        localCluster.clusterUUID == 0 || peerCluster.clusterUUID == 0 ||
+        localCluster.clusterUUID == peerCluster.clusterUUID ||
+        localCluster.datacenterFragment == 0 || peerCluster.datacenterFragment == 0 ||
+        localCluster.datacenterFragment == peerCluster.datacenterFragment ||
+        !crossClusterMasqueGatewayMachineRegistered(localCluster, requested.localMachineUUID) ||
+        !crossClusterMasqueGatewayMachineRegistered(peerCluster, requested.peerMachineUUID) ||
+        !crossClusterMasqueGatewayMachineRegistered(
+            listenerCluster, listenerMachineUUID, &requested.listenerPublicUDPEndpoint))
+    { if (failure) failure->assign("cross-cluster MASQUE gateway authority is invalid or stale"_ctv); return false; }
+
+    // The registry, not an operator or a route payload, owns every address
+    // component.  Pair enrollment selects the two clusters; their registered
+    // records supply the globally leased datacenter byte and canonical /96.
+    requested.pairUUID = enrollment.pairUUID;
+    requested.pairOperationUUID = enrollment.operationUUID;
+    requested.localClusterUUID = localCluster.clusterUUID;
+    requested.peerClusterUUID = peerCluster.clusterUUID;
+    requested.localDatacenterFragment = localCluster.datacenterFragment;
+    requested.peerDatacenterFragment = peerCluster.datacenterFragment;
+    requested.localSitePrefix = localPrefix;
+    requested.peerSitePrefix = peerPrefix;
+    requested.pairAuthorityGeneration = enrollment.localAuthorityGeneration;
+    requested.keyGeneration = enrollment.agreedKeyEpoch;
+    if (!prodigyDeriveCrossClusterMasquePrivateBGPTuple(requested))
+    { if (failure) failure->assign("cross-cluster MASQUE private BGP tuple derivation failed"_ctv); return false; }
+    // A retired peer can be replaced only after its withdrawn local authority
+    // has lost the retired topology identity.  Check before touching the
+    // in-memory Vault so a rejected replacement cannot mint even transient
+    // credential material.
+    String predecessorKey = {}, predecessorEncoded = {}, predecessorFailure = {};
+    predecessorKey.snprintf<"{itoa}-{itoa}"_ctv>(requested.pairUUID, requested.localMachineUUID);
+    if (db.read(crossClusterMasqueGatewaysColumnFamily, predecessorKey, predecessorEncoded, &predecessorFailure))
+    {
+      CrossClusterMasqueGatewayAuthority predecessor = {};
+      if (!BitseryEngine::deserializeSafe(predecessorEncoded, predecessor) ||
+          predecessor.protocolVersion != CrossClusterMasqueGatewayAuthority::version)
+      {
+        if (failure) failure->assign("cross-cluster MASQUE gateway record is corrupt"_ctv);
+        return false;
+      }
+      const bool retiredPeerPresent = std::any_of(peerCluster.topology.machines.begin(),
+          peerCluster.topology.machines.end(), [&](const ClusterMachine& machine) {
+            return machine.uuid == predecessor.peerMachineUUID;
+          });
+      if (predecessor.state == CrossClusterMasqueGatewayState::withdrawn &&
+          requested.state == CrossClusterMasqueGatewayState::active &&
+          predecessor.peerMachineUUID != requested.peerMachineUUID && retiredPeerPresent)
+      {
+        if (failure) failure->assign("cross-cluster MASQUE gateway replacement peer remains commissioned"_ctv);
+        return false;
+      }
+    }
+    else if (!predecessorFailure.equal("record not found"_ctv))
+    {
+      if (failure) *failure = predecessorFailure;
+      return false;
+    }
+    ProdigyPairPrivateBGPSecretScope secretScope = {};
+    secretScope.pairUUID = requested.pairUUID; secretScope.operationUUID = requested.pairOperationUUID;
+    secretScope.keyEpoch = requested.keyGeneration; secretScope.tunnelSlot = requested.tunnelSlot;
+    secretScope.clusterUUID = requested.localClusterUUID; secretScope.machineUUID = requested.localMachineUUID;
+    secretScope.authorityGeneration = requested.pairAuthorityGeneration; secretScope.gatewayGeneration = requested.generation;
+    MothershipClusterPairEnrollmentIntent privateIntent = {};
+    if (!loadClusterPairEnrollmentIntent(requested.pairOperationUUID, privateIntent, failure) ||
+        privateIntent.pairUUID != requested.pairUUID || privateIntent.keyEpoch != requested.keyGeneration ||
+        !privateBGPVault.configurePairRoot(privateIntent.root) || !privateBGPVault.importRecords(privateIntent.privateBGPSecrets))
+    { if (failure && failure->empty()) failure->assign("cross-cluster MASQUE private BGP vault cannot hydrate enrolled pair root"_ctv); return false; }
+    // v5 records are decoded above into an otherwise intact enrollment but its
+    // BGP-only entries are intentionally discarded.  Any new gateway commit
+    // upgrades the durable envelope before storing the TLS-bearing record.
+    privateIntent.protocolVersion = MothershipClusterPairEnrollmentIntent::version;
+    String derivedLocalIdentity = {}, derivedPeerIdentity = {}, derivedTrust = {};
+    if (!privateBGPVault.mintAfterActiveEnrollment(secretScope, requested.peerMachineUUID, listenerMachineUUID,
+        requested.listenerPublicUDPEndpoint, requested.privateSessionCredentialSHA256, derivedLocalIdentity,
+        derivedPeerIdentity, derivedTrust, failure))
+    { if (failure && failure->empty()) failure->assign("cross-cluster MASQUE private BGP vault mint failed"_ctv); return false; }
+    if ((requested.localIdentitySHA256 != "-"_ctv && requested.localIdentitySHA256 != derivedLocalIdentity) ||
+        (requested.peerIdentitySHA256 != "-"_ctv && requested.peerIdentitySHA256 != derivedPeerIdentity) ||
+        (requested.peerTrustSHA256 != "-"_ctv && requested.peerTrustSHA256 != derivedTrust))
+    { if (failure) failure->assign("cross-cluster MASQUE gateway TLS identity digest does not match Vault material"_ctv); return false; }
+    requested.localIdentitySHA256 = std::move(derivedLocalIdentity);
+    requested.peerIdentitySHA256 = std::move(derivedPeerIdentity);
+    requested.peerTrustSHA256 = std::move(derivedTrust);
+    if (!prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(requested))
+    { if (failure) failure->assign("cross-cluster MASQUE gateway authority derivation failed"_ctv); return false; }
+    String key = {}; key.snprintf<"{itoa}-{itoa}"_ctv>(requested.pairUUID, requested.localMachineUUID);
+    String encoded = {}, readFailure = {};
+    if (db.read(crossClusterMasqueGatewaysColumnFamily, key, encoded, &readFailure)) {
+      CrossClusterMasqueGatewayAuthority prior = {};
+      if (!BitseryEngine::deserializeSafe(encoded, prior) || prior.protocolVersion != CrossClusterMasqueGatewayAuthority::version) { if (failure) failure->assign("cross-cluster MASQUE gateway record is corrupt"_ctv); return false; }
+      if (requested.generation < prior.generation) { if (failure) failure->assign("cross-cluster MASQUE gateway generation is stale"_ctv); return false; }
+      if (requested.generation == prior.generation) { String requestedEncoded = {}, priorEncoded = {}; CrossClusterMasqueGatewayAuthority requestedCopy = requested, priorCopy = prior; BitseryEngine::serialize(requestedEncoded, requestedCopy); BitseryEngine::serialize(priorEncoded, priorCopy); if (requestedEncoded != priorEncoded) { if (failure) failure->assign("cross-cluster MASQUE gateway generation conflicts"_ctv); return false; } recorded = prior; resumed = true; return true; }
+      if (!prodigyCrossClusterMasqueGatewayAuthorityCanAdvance(prior, requested)) { if (failure) failure->assign("cross-cluster MASQUE gateway transition is invalid"_ctv); return false; }
+    } else if (!readFailure.equal("record not found"_ctv)) { if (failure) *failure = readFailure; return false; }
+    // All rejection/conflict checks above precede exporting the authorization.
+    // A rejected request must not leave a new delivery scope durable.  The
+    // enrollment record is written before the authority so a recovered
+    // authority can always resolve its digest to encrypted credential bytes.
+    privateBGPVault.exportRecords(privateIntent.privateBGPSecrets);
+    String privateIntentKey = {}, privateIntentEncoded = {};
+    privateIntentKey.assignItoh(privateIntent.operationUUID); BitseryEngine::serialize(privateIntentEncoded, privateIntent);
+    const bool privateIntentWritten = db.write(clusterPairEnrollmentsColumnFamily, privateIntentKey, privateIntentEncoded, failure);
+    Vault::secureClearString(privateIntentEncoded);
+    if (!privateIntentWritten) return false;
+    CrossClusterMasqueGatewayAuthority copy = requested; BitseryEngine::serialize(encoded, copy);
+    if (!db.write(crossClusterMasqueGatewaysColumnFamily, key, encoded, failure)) return false;
+    recorded = requested; return true;
+  }
+
+  bool loadCrossClusterMasqueGateway(uint128_t pairUUID, uint128_t localMachineUUID, CrossClusterMasqueGatewayAuthority& record, String *failure = nullptr)
+  { record = {}; String key = {}; key.snprintf<"{itoa}-{itoa}"_ctv>(pairUUID, localMachineUUID); String encoded = {}; if (!db.read(crossClusterMasqueGatewaysColumnFamily, key, encoded, failure)) return false; if (!BitseryEngine::deserializeSafe(encoded, record) || !prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(record) || record.pairUUID != pairUUID || record.localMachineUUID != localMachineUUID) { if (failure) failure->assign("cross-cluster MASQUE gateway record is corrupt"_ctv); return false; } return true; }
+
+  bool withdrawCrossClusterMasqueGateway(uint128_t pairUUID, uint128_t localMachineUUID, uint64_t generation, CrossClusterMasqueGatewayAuthority& record, String *failure = nullptr)
+  {
+    if (!loadCrossClusterMasqueGateway(pairUUID, localMachineUUID, record, failure)) return false;
+    if (generation == record.generation && record.state == CrossClusterMasqueGatewayState::withdrawn)
+    {
+      if (failure) failure->clear();
+      return true;
+    }
+    if (generation <= record.generation || record.state != CrossClusterMasqueGatewayState::active)
+    {
+      if (failure) failure->assign("cross-cluster MASQUE gateway withdrawal generation is stale"_ctv);
+      return false;
+    }
+    CrossClusterMasqueGatewayAuthority withdrawn = record;
+    withdrawn.generation = generation;
+    withdrawn.state = CrossClusterMasqueGatewayState::withdrawn;
+    if (!prodigyCrossClusterMasqueGatewayAuthorityCanAdvance(record, withdrawn))
+    {
+      if (failure) failure->assign("cross-cluster MASQUE gateway withdrawal is invalid"_ctv);
+      return false;
+    }
+    record = std::move(withdrawn);
+    String key = {}; key.snprintf<"{itoa}-{itoa}"_ctv>(pairUUID, localMachineUUID);
+    String encoded = {}; BitseryEngine::serialize(encoded, record);
+    return db.write(crossClusterMasqueGatewaysColumnFamily, key, encoded, failure);
+  }
+
+  // The caller has already authenticated the mTLS control peer.  Re-load the
+  // public descriptor here instead of trusting a relay-provided scope: this
+  // binds delivery to the exact selected Neuron and every live generation.
+  bool deliverCrossClusterPrivateBGPSecret(const ProdigyPairPrivateBGPSecretDeliveryRequest& request,
+                                            const String& authenticatedControlIdentitySHA256,
+                                            ProdigyPairPrivateBGPSecretDeliveryResponse& response,
+                                            String *failure = nullptr)
+  {
+    response.accepted = false;
+    if (request.controlIdentitySHA256 != authenticatedControlIdentitySHA256 ||
+        !prodigyPairPrivateBGPSecretScopeValid(request.scope)) return false;
+    MothershipClusterPairEnrollmentIntent privateIntent = {};
+    if (!loadClusterPairEnrollmentIntent(request.scope.operationUUID, privateIntent, failure) ||
+        privateIntent.pairUUID != request.scope.pairUUID || privateIntent.keyEpoch != request.scope.keyEpoch ||
+        !privateBGPVault.configurePairRoot(privateIntent.root) || !privateBGPVault.importRecords(privateIntent.privateBGPSecrets)) return false;
+    CrossClusterMasqueGatewayAuthority authority = {};
+    if (!loadCrossClusterMasqueGateway(request.scope.pairUUID, request.scope.machineUUID, authority, failure) ||
+        authority.state != CrossClusterMasqueGatewayState::active || authority.pairOperationUUID != request.scope.operationUUID ||
+        authority.keyGeneration != request.scope.keyEpoch || authority.tunnelSlot != request.scope.tunnelSlot ||
+        authority.localClusterUUID != request.scope.clusterUUID || authority.localMachineUUID != request.scope.machineUUID ||
+        authority.pairAuthorityGeneration != request.scope.authorityGeneration || authority.generation != request.scope.gatewayGeneration)
+      return false;
+    return privateBGPVault.deliver(request, authenticatedControlIdentitySHA256,
+        authority.privateSessionCredentialSHA256, response, failure);
+  }
+
+  // Withdrawal/rotation is terminal only after both enrolled halves have
+  // confirmed their local BGP hub/cache was closed. Repeated ACKs and a
+  // resumed delete are harmless, which makes crash recovery idempotent.
+  bool acknowledgeCrossClusterPrivateBGPSecretRevocation(const ProdigyPairPrivateBGPSecretScope& scope,
+                                                           bool& deleted)
+  {
+    deleted = false;
+    MothershipClusterPairEnrollmentIntent privateIntent = {};
+    if (!prodigyPairPrivateBGPSecretScopeValid(scope) || !loadClusterPairEnrollmentIntent(scope.operationUUID, privateIntent) ||
+        privateIntent.pairUUID != scope.pairUUID || !privateBGPVault.configurePairRoot(privateIntent.root) ||
+        !privateBGPVault.importRecords(privateIntent.privateBGPSecrets) || !privateBGPVault.acknowledgeRevocation(scope)) return false;
+    deleted = privateBGPVault.deleteAfterBothRevocationAcknowledgements(scope);
+    privateBGPVault.exportRecords(privateIntent.privateBGPSecrets);
+    String key = {}, encoded = {}; key.assignItoh(privateIntent.operationUUID); BitseryEngine::serialize(encoded, privateIntent);
+    const bool written = db.write(clusterPairEnrollmentsColumnFamily, key, encoded); Vault::secureClearString(encoded);
+    if (!written) { deleted = false; return false; }
+    return true;
+  }
+
+  // The encrypted enrollment record is the restart-safe withdrawal phase.
+  // It is intentionally a Boolean acknowledgement, never a replayable secret
+  // or a copied Neuron receipt.
+  bool crossClusterPrivateBGPSecretRevocationAcknowledged(const ProdigyPairPrivateBGPSecretScope& scope)
+  {
+    MothershipClusterPairEnrollmentIntent privateIntent = {};
+    return prodigyPairPrivateBGPSecretScopeValid(scope) && loadClusterPairEnrollmentIntent(scope.operationUUID, privateIntent) &&
+        privateIntent.pairUUID == scope.pairUUID && privateBGPVault.configurePairRoot(privateIntent.root) &&
+        privateBGPVault.importRecords(privateIntent.privateBGPSecrets) && privateBGPVault.revocationAcknowledged(scope);
+  }
+
+  // The scope key is intentionally independent of the qualification operation
+  // UUID: that lets the registry reject a second active fault against the same
+  // gateway even when a caller supplies a different operation.  The operation
+  // remains part of the persisted request and is checked on every load.
+  static void crossClusterPathFaultLifecycleScopeKey(
+      const ProdigyPairPrivateBGPSecretScope& scope, String& key)
+  {
+    key.clear(); key.append("v1/"_ctv); String field = {};
+    const auto append128 = [&](uint128_t value) { field.clear(); field.assignItoh(value); key.append(field); key.append('/'); };
+    const auto append64 = [&](uint64_t value) { field.clear(); field.assignItoh(value); key.append(field); key.append('/'); };
+    append128(scope.pairUUID); append128(scope.operationUUID); append64(scope.keyEpoch);
+    field.clear(); field.assignItoa(scope.tunnelSlot); key.append(field); key.append('/');
+    append128(scope.clusterUUID); append128(scope.machineUUID); append64(scope.authorityGeneration);
+    field.clear(); field.assignItoh(scope.gatewayGeneration); key.append(field);
+  }
+
+  static void crossClusterPathFaultLifecycleHistoryKey(
+      const ProdigyCrossClusterPathFaultRequest& request, String& key)
+  { crossClusterPathFaultLifecycleScopeKey(request.scope, key); key.append("/"_ctv); String operation = {}; operation.assignItoh(request.operationUUID); key.append(operation); }
+
+  static bool crossClusterPathFaultLifecycleEqual(
+      const ProdigyCrossClusterPathFaultGatewayLifecycleRecord& left,
+      const ProdigyCrossClusterPathFaultGatewayLifecycleRecord& right)
+  {
+    String a = {}, b = {}; auto ac = left, bc = right;
+    return BitseryEngine::serialize(a, ac) && BitseryEngine::serialize(b, bc) && a == b;
+  }
+
+  static bool crossClusterPathFaultLifecycleImmutableEqual(
+      const ProdigyCrossClusterPathFaultGatewayLifecycleRecord& left,
+      const ProdigyCrossClusterPathFaultGatewayLifecycleRecord& right)
+  {
+    auto a = left, b = right;
+    a.phase = b.phase = ProdigyCrossClusterPathFaultGatewayLifecyclePhase::prepared;
+    a.replacementContainerUUID = b.replacementContainerUUID = 0;
+    return crossClusterPathFaultLifecycleEqual(a, b);
+  }
+
+  bool loadCrossClusterPathFaultLifecycle(
+      const ProdigyCrossClusterPathFaultRequest& request,
+      ProdigyCrossClusterPathFaultGatewayLifecycleRecord& record, String *failure = nullptr)
+  {
+    record = {};
+    if (!prodigyCrossClusterPathFaultRequestValid(request)) return false;
+    String key = {}, encoded = {}; crossClusterPathFaultLifecycleHistoryKey(request, key);
+    if (!db.read(crossClusterPathFaultLifecycleHistoryColumnFamily, key, encoded, failure) ||
+        !BitseryEngine::deserializeSafe(encoded, record) ||
+        !prodigyCrossClusterPathFaultGatewayLifecycleRecordValid(record) ||
+        !prodigyCrossClusterPathFaultRequestEqual(record.request, request))
+    { record = {}; if (failure && failure->empty()) failure->assign("cross-cluster path-fault lifecycle record is absent or corrupt"_ctv); return false; }
+    return true;
+  }
+
+  bool putCrossClusterPathFaultLifecycle(
+      const ProdigyCrossClusterPathFaultGatewayLifecycleRecord& requested,
+      ProdigyCrossClusterPathFaultGatewayLifecycleRecord& recorded, bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure)) return false;
+    if (!prodigyCrossClusterPathFaultGatewayLifecycleRecordValid(requested) ||
+        requested.phase != ProdigyCrossClusterPathFaultGatewayLifecyclePhase::prepared) return false;
+    CrossClusterMasqueGatewayAuthority authority = {};
+    if (!loadCrossClusterMasqueGateway(requested.request.authority.pairUUID,
+            requested.request.authority.localMachineUUID, authority, failure)) return false;
+    String expected = {}, observed = {}; auto expectedCopy = requested.request.authority, observedCopy = authority;
+    if (!BitseryEngine::serialize(expected, expectedCopy) || !BitseryEngine::serialize(observed, observedCopy) || expected != observed)
+    { if (failure) failure->assign("cross-cluster path-fault authority is stale"_ctv); return false; }
+    String key = {}, encoded = {}, readFailure = {};
+    crossClusterPathFaultLifecycleScopeKey(requested.request.scope, key);
+    if (db.read(crossClusterPathFaultLifecyclesColumnFamily, key, encoded, &readFailure)) {
+      ProdigyCrossClusterPathFaultGatewayLifecycleRecord prior = {};
+      if (!BitseryEngine::deserializeSafe(encoded, prior) || !prodigyCrossClusterPathFaultGatewayLifecycleRecordValid(prior))
+      { if (failure) failure->assign("cross-cluster path-fault lifecycle record is corrupt"_ctv); return false; }
+      if (crossClusterPathFaultLifecycleEqual(prior, requested)) { recorded = prior; resumed = true; return true; }
+      if (prior.phase != ProdigyCrossClusterPathFaultGatewayLifecyclePhase::restored)
+      { if (failure) failure->assign("cross-cluster path-fault scope already has an active lifecycle"_ctv); return false; }
+    } else if (!readFailure.equal("record not found"_ctv)) { if (failure) *failure = readFailure; return false; }
+    auto copy = requested; BitseryEngine::serialize(encoded, copy);
+    if (!db.write(crossClusterPathFaultLifecyclesColumnFamily, key, encoded, failure)) return false;
+    String historyKey = {}; crossClusterPathFaultLifecycleHistoryKey(requested.request, historyKey);
+    if (!db.write(crossClusterPathFaultLifecycleHistoryColumnFamily, historyKey, encoded, failure)) return false;
+    recorded = requested; return true;
+  }
+
+  bool advanceCrossClusterPathFaultLifecycle(
+      const ProdigyCrossClusterPathFaultGatewayLifecycleRecord& requested,
+      ProdigyCrossClusterPathFaultGatewayLifecycleRecord& recorded, bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure)) return false;
+    if (!prodigyCrossClusterPathFaultGatewayLifecycleRecordValid(requested) ||
+        requested.phase == ProdigyCrossClusterPathFaultGatewayLifecyclePhase::prepared) return false;
+    CrossClusterMasqueGatewayAuthority authority = {};
+    if (!loadCrossClusterMasqueGateway(requested.request.authority.pairUUID,
+            requested.request.authority.localMachineUUID, authority, failure)) return false;
+    String current = {}, expected = {}; auto currentCopy = authority, expectedCopy = requested.request.authority;
+    if (!BitseryEngine::serialize(current, currentCopy) || !BitseryEngine::serialize(expected, expectedCopy) || current != expected)
+    { if (failure) failure->assign("cross-cluster path-fault authority changed during lifecycle"_ctv); return false; }
+    ProdigyCrossClusterPathFaultGatewayLifecycleRecord prior = {};
+    if (!loadCrossClusterPathFaultLifecycle(requested.request, prior, failure) ||
+        !crossClusterPathFaultLifecycleImmutableEqual(prior, requested))
+    { if (failure && failure->empty()) failure->assign("cross-cluster path-fault lifecycle immutable identity changed"_ctv); return false; }
+    if (crossClusterPathFaultLifecycleEqual(prior, requested)) { recorded = prior; resumed = true; return true; }
+    const bool transition =
+        (prior.phase == ProdigyCrossClusterPathFaultGatewayLifecyclePhase::prepared &&
+         requested.phase == ProdigyCrossClusterPathFaultGatewayLifecyclePhase::suspended) ||
+        ((prior.phase == ProdigyCrossClusterPathFaultGatewayLifecyclePhase::suspended ||
+          prior.phase == ProdigyCrossClusterPathFaultGatewayLifecyclePhase::restoreNeeded) &&
+         requested.phase == ProdigyCrossClusterPathFaultGatewayLifecyclePhase::restored) ||
+        (prior.phase == ProdigyCrossClusterPathFaultGatewayLifecyclePhase::suspended &&
+         requested.phase == ProdigyCrossClusterPathFaultGatewayLifecyclePhase::restoreNeeded);
+    if (!transition) { if (failure) failure->assign("cross-cluster path-fault lifecycle transition is invalid"_ctv); return false; }
+    String key = {}, encoded = {}; crossClusterPathFaultLifecycleScopeKey(requested.request.scope, key);
+    auto copy = requested; BitseryEngine::serialize(encoded, copy);
+    if (!db.write(crossClusterPathFaultLifecyclesColumnFamily, key, encoded, failure)) return false;
+    String historyKey = {}; crossClusterPathFaultLifecycleHistoryKey(requested.request, historyKey);
+    if (!db.write(crossClusterPathFaultLifecycleHistoryColumnFamily, historyKey, encoded, failure)) return false;
+    recorded = requested; return true;
   }
 };

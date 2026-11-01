@@ -6,9 +6,279 @@
 #include <algorithm>
 #include <limits>
 #include <map>
+#include <set>
 
 #include <prodigy/persistent.state.h>
 #include <prodigy/retained.container.recovery.h>
+
+static inline bool mothershipRetainedRecoveryPlansEqual(const DeploymentPlan&,const DeploymentPlan&);
+
+// The original same-format repair admits only the unmaterialized first seed. It never
+// edits this snapshot: the command owner checks private copies and retains the
+// original state and paired secrets directories byte-for-byte.
+struct MothershipInitialSeedRuntimeRepairBinding {
+  uint128_t clusterUUID=0, masterMachineUUID=0, localMachineUUID=0, initialSeedOperationUUID=0;
+  Vector<uint128_t> machineUUIDs;
+  uint64_t deploymentID=0, masterGeneration=0, followerGeneration=0;
+  String initialSeedIntentSHA256, initialSeedScopeSHA256, normalizedDeploymentPlan;
+  Vector<CrossClusterMasqueGatewayAuthority> gateways;
+};
+template<typename S> static void serialize(S&& s, MothershipInitialSeedRuntimeRepairBinding& b) {
+  s.value16b(b.clusterUUID); s.value16b(b.masterMachineUUID); s.value16b(b.localMachineUUID);
+  s.value16b(b.initialSeedOperationUUID); s.object(b.machineUUIDs); s.value8b(b.deploymentID);
+  s.value8b(b.masterGeneration); s.value8b(b.followerGeneration);
+  s.text1b(b.initialSeedIntentSHA256,64); s.text1b(b.initialSeedScopeSHA256,64);
+  s.text1b(b.normalizedDeploymentPlan,1024*1024); s.object(b.gateways);
+}
+// The populated 55 -> 56 repair is a separate private request. Neither the
+// original ISRR1 bytes nor Prodigy's persistent or runtime wire format changes.
+struct MothershipPopulatedSeedRuntimeRepairProof {
+  uint32_t predecessorRevision=0, successorRevision=0;
+  uint128_t pulseMachineUUID=0, pulseContainerUUID=0;
+  uint64_t pulsePID=0, pulseStartTicks=0, pulseExecutableBytes=0;
+  uint64_t storageDevice=0, storageInode=0, storageUID=0, storageGID=0;
+  String pulseExecutableSHA256, parametersSHA256, startupParameters;
+  String bootID, linuxMachineID, mountNamespace, networkNamespace, pidNamespace;
+};
+template<typename S> static void serialize(S&& s, MothershipPopulatedSeedRuntimeRepairProof& p) {
+  s.value4b(p.predecessorRevision); s.value4b(p.successorRevision);
+  s.value16b(p.pulseMachineUUID); s.value16b(p.pulseContainerUUID);
+  s.value8b(p.pulsePID); s.value8b(p.pulseStartTicks); s.value8b(p.pulseExecutableBytes);
+  s.value8b(p.storageDevice); s.value8b(p.storageInode); s.value8b(p.storageUID); s.value8b(p.storageGID);
+  s.text1b(p.pulseExecutableSHA256,64); s.text1b(p.parametersSHA256,64); s.text1b(p.startupParameters,1024*1024);
+  s.text1b(p.bootID,36); s.text1b(p.linuxMachineID,32);
+  s.text1b(p.mountNamespace,64); s.text1b(p.networkNamespace,64); s.text1b(p.pidNamespace,64);
+}
+namespace MothershipPopulatedSeedRepair {
+static constexpr uint128_t cluster=(uint128_t(0x376346201b765c8cULL)<<64)|0x02f93b306da9c3daULL;
+static constexpr uint128_t master=(uint128_t(0x877c7e59e5eef3f7ULL)<<64)|0x39efef8930108f1bULL;
+static constexpr uint128_t ord0=(uint128_t(0xcea40e799db96e09ULL)<<64)|0x5b36870c062ea1a3ULL;
+static constexpr uint128_t ord2=(uint128_t(0xc7aa7bc44539ddceULL)<<64)|0xa4ed12482266be69ULL;
+static constexpr uint128_t operation=(uint128_t(0x9f6b07d74dfc42c7ULL)<<64)|0x8a5da98be2cf41d0ULL;
+static constexpr uint64_t deployment=562951979523340ULL;
+static constexpr uint128_t first=(uint128_t(0x6e93a9ae38896399ULL)<<64)|0xeb8834db00f11e94ULL;
+static constexpr uint128_t live=(uint128_t(0xbd56e6d0f3612702ULL)<<64)|0x1cca8796a8c88456ULL;
+static constexpr uint128_t third=(uint128_t(0xfe86243c638b5971ULL)<<64)|0x61f2354826cf77edULL;
+static constexpr uint128_t absentOrd0=(uint128_t(0x44fe02da8616d4abULL)<<64)|0xda79dcd8e11d6f34ULL;
+static constexpr uint128_t absentOrd2=(uint128_t(0x1c7339b976d61584ULL)<<64)|0x7588d9ab5335f3ccULL;
+}
+static inline bool mothershipPopulatedSeedRuntimeRepairBindingValid(
+    const MothershipInitialSeedRuntimeRepairBinding& b,const MothershipPopulatedSeedRuntimeRepairProof& p)
+{
+  using namespace MothershipPopulatedSeedRepair;
+  String digest;
+  return p.predecessorRevision==55 && p.successorRevision==56 && b.clusterUUID==cluster &&
+      b.masterMachineUUID==master && b.initialSeedOperationUUID==operation && b.deploymentID==deployment &&
+      b.masterGeneration==43 && b.followerGeneration==43 && b.machineUUIDs.size()==3 &&
+      b.machineUUIDs[0]==master && ((b.machineUUIDs[1]==ord0 && b.machineUUIDs[2]==ord2) ||
+                                 (b.machineUUIDs[1]==ord2 && b.machineUUIDs[2]==ord0)) &&
+      b.initialSeedIntentSHA256=="a24066295d67e6b92c6a0c4ad8cfedfcce44d2cdd92aaba871738bc1bb05f845"_ctv &&
+      p.pulseMachineUUID==master && p.pulseContainerUUID==live && p.pulsePID==3260 && p.pulseStartTicks==11896 &&
+      p.pulseExecutableBytes==13832704 &&
+      p.pulseExecutableSHA256=="0aa1cae4143847f9e47e8d7099e750f2c3a768fd01c1a66880deeb589919dfec"_ctv &&
+      p.storageDevice==56 && p.storageInode==269 && p.storageUID==9502575 && p.storageGID==9502575 &&
+      p.bootID=="23c00d17-59ed-4370-9d6a-6a66069f01cb"_ctv && p.linuxMachineID=="30b778da1b2745ea8438931b72d01963"_ctv &&
+      p.mountNamespace=="mnt:[4026533488]"_ctv && p.networkNamespace=="net:[4026533492]"_ctv &&
+      p.pidNamespace=="pid:[4026533491]"_ctv && !p.startupParameters.empty() &&
+      p.startupParameters.size()<=1024*1024 && prodigyIsSHA256HexDigest(p.parametersSHA256) &&
+      prodigyComputeSHA256Hex(p.startupParameters,digest) && digest==p.parametersSHA256;
+}
+static inline bool mothershipPopulatedSeedRuntimeRepairScopeValid(
+    const ProdigyPersistentBrainSnapshot&,const MothershipInitialSeedRuntimeRepairBinding&,
+    const MothershipPopulatedSeedRuntimeRepairProof&);
+static inline bool mothershipInitialSeedRuntimeRepairSnapshotValid(
+    const ProdigyPersistentBrainSnapshot& snapshot, const MothershipInitialSeedRuntimeRepairBinding& b,
+    const MothershipPopulatedSeedRuntimeRepairProof *populated=nullptr)
+{
+  if (populated && (!mothershipPopulatedSeedRuntimeRepairBindingValid(b,*populated) ||
+                    !mothershipPopulatedSeedRuntimeRepairScopeValid(snapshot,b,*populated))) return false;
+  // The manifest admits equal generations only for the 54 -> 55 cold-restore
+  // repair, after the first member's authority has reached every Brain. Keep
+  // the private binding unchanged; the 53 -> 54 repair remains divergent.
+  const bool replicatedScope=b.masterGeneration==b.followerGeneration;
+  if (!b.clusterUUID || !b.masterMachineUUID || !b.localMachineUUID || !b.initialSeedOperationUUID ||
+      !b.deploymentID || !b.followerGeneration || b.followerGeneration==UINT64_MAX ||
+      (!replicatedScope && b.masterGeneration!=b.followerGeneration+1) || !prodigyIsSHA256HexDigest(b.initialSeedIntentSHA256) ||
+      !prodigyIsSHA256HexDigest(b.initialSeedScopeSHA256) ||
+      b.machineUUIDs.size()!=3 || b.machineUUIDs[0]!=b.masterMachineUUID ||
+      snapshot.brainConfig.clusterUUID!=b.clusterUUID || snapshot.topology.machines.size()!=3) return false;
+  bool local=false;
+  for (uint32_t i=0;i<3;++i) {
+    if (!b.machineUUIDs[i]) return false;
+    for (uint32_t j=0;j<i;++j) if (b.machineUUIDs[i]==b.machineUUIDs[j]) return false;
+    local|=b.machineUUIDs[i]==b.localMachineUUID;
+    uint32_t found=0;
+    for (const auto& m:snapshot.topology.machines) if (m.uuid==b.machineUUIDs[i] && m.isBrain) ++found;
+    if (found!=1) return false;
+  }
+  const auto& a=snapshot.masterAuthority; const auto& r=a.runtimeState;
+  if (!local || r.generation!=(b.localMachineUUID==b.masterMachineUUID ? b.masterGeneration : b.followerGeneration) ||
+      !r.hasCompletedInitialMasterElection || a.deploymentPlans.size()!=1 || (!populated && !a.failedDeployments.empty()) ||
+      r.updateSelf!=ProdigyPersistentUpdateSelfState{} || r.updateSelfFollowerConcurrency!=0 ||
+      !r.updateSelfFollowerTransitionIssuedPeerKeys.empty() || !r.updateSelfFollowerReadyPeerKeys.empty() ||
+      !r.pendingAddMachinesOperations.empty() || !r.pendingAddMachinesProvisioningIntents.empty() ||
+      !r.pendingAutonomousProvisioningOperations.empty() || !r.pendingElasticAddressAssignments.empty() ||
+      !r.pendingElasticAddressReleases.empty() || !r.statefulWorkerTopologyUpgradeOperations.empty() ||
+      !r.deferredStatefulScaleIntents.empty() || !r.materializedStatefulRecoveryOperations.empty() ||
+      !r.materializedStatefulRecoveryRetries.empty() || !r.taskExecutions.empty() ||
+      !r.statelessDeploymentAdmissions.empty() || !r.statelessDeploymentRetirements.empty() ||
+      r.statefulServingAuthorities.size()!=1 || b.gateways.size()!=6 ||
+      r.crossClusterMasqueGatewayAuthorities.size()!=b.gateways.size()) return false;
+  auto plan=a.deploymentPlans.find(b.deploymentID);
+  DeploymentPlan journalPlan={};
+  if (plan==a.deploymentPlans.end() || !plan->second.isStateful || !plan->second.stateful.allMasters ||
+      !BitseryEngine::deserializeSafe(b.normalizedDeploymentPlan,journalPlan) ||
+      !mothershipRetainedRecoveryPlansEqual(plan->second,journalPlan)) return false;
+  const auto& authority=r.statefulServingAuthorities[0];
+  const auto& scope=authority.initialAllMastersSeedBootstrap;
+  String scopeBytes,scopeSHA; auto scopeCopy=scope;
+  if (!BitseryEngine::serialize(scopeBytes,scopeCopy) || !prodigyComputeSHA256Hex(scopeBytes,scopeSHA) ||
+      scopeSHA!=b.initialSeedScopeSHA256 ||
+      !prodigyValidateStatefulServingAuthorities(r.statefulServingAuthorities,a.servingRuntimeStates,r.generation)) return false;
+  if (authority.phase!=StatefulWorkerTopologyUpgradePhase::initialAllMastersSeedBootstrap ||
+      authority.deploymentID!=b.deploymentID || !authority.allMasters ||
+      authority.members.size()!=(populated ? 3u : (replicatedScope || b.localMachineUUID==b.masterMachineUUID ? 1u : 0u)) ||
+      scope.bootstrap.targetClusterUUID!=b.clusterUUID || scope.bootstrap.targetDeploymentID!=b.deploymentID ||
+      scope.bootstrap.successorOperationUUID!=b.initialSeedOperationUUID || scope.nShardGroups!=1 ||
+      plan->second.config.containerBlobSHA256!=scope.artifactSHA256 || plan->second.config.containerBlobBytes!=scope.artifactBytes) return false;
+  for (const auto& expected:b.gateways) {
+    if (!prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(expected) ||
+        expected.state!=CrossClusterMasqueGatewayState::active || expected.localClusterUUID!=b.clusterUUID) return false;
+    uint32_t matches=0;
+    for (const auto& observed:r.crossClusterMasqueGatewayAuthorities) {
+      if (observed.pairUUID!=expected.pairUUID || observed.localMachineUUID!=expected.localMachineUUID) continue;
+      String x,y; auto xc=expected,yc=observed; BitseryEngine::serialize(x,xc); BitseryEngine::serialize(y,yc);
+      if (x!=y) return false; ++matches;
+    }
+    if (matches!=1) return false;
+  }
+  // Desired initial members may already have been captured, but no live or
+  // ready application record, restart, retirement or second deployment is safe.
+  if (!populated) for (const auto *states:{&a.containerRuntimeStates,&a.servingRuntimeStates}) {
+    if (states->size()>3) return false;
+    for (const auto& state:*states) {
+      const auto& p=state.plan;
+      bool member=false; for (uint128_t id:b.machineUUIDs) member|=id==state.machineUUID;
+      if (!member || p.runtimeReady || p.state!=ContainerState::scheduled || !p.isStateful ||
+          p.system.kind!=SystemContainerKind::none ||
+          ((uint64_t(p.config.applicationID)<<48)|p.config.versionID)!=b.deploymentID) return false;
+    }
+  }
+  return true;
+}
+
+static inline bool mothershipPopulatedSeedRuntimeRepairScopeValid(
+    const ProdigyPersistentBrainSnapshot& snapshot,const MothershipInitialSeedRuntimeRepairBinding& b,
+    const MothershipPopulatedSeedRuntimeRepairProof& proof)
+{
+  using namespace MothershipPopulatedSeedRepair;
+  const auto& a=snapshot.masterAuthority;
+  if (a.runtimeState.statefulServingAuthorities.size()!=1 || a.servingRuntimeStates.size()!=3 ||
+      a.deploymentPlans.size()!=1) return false;
+  const auto& authority=a.runtimeState.statefulServingAuthorities[0];
+  if (authority.revision!=43 || authority.members.size()!=3) return false;
+  const auto& scope=authority.initialAllMastersSeedBootstrap;
+  const auto plan=a.deploymentPlans.find(deployment);
+  if (plan==a.deploymentPlans.end()) return false;
+  const auto knownMachine=[](uint128_t id) -> uint128_t {
+    if (id==first || id==live) return master;
+    if (id==third || id==absentOrd2) return ord2;
+    return id==absentOrd0 ? ord0 : uint128_t(0);
+  };
+  const BrainReplicatedContainerRuntimeState *liveSealed=nullptr;
+  std::set<uint128_t> sealed;
+  for (const auto& member:authority.members)
+    if ((member.containerUUID!=first && member.containerUUID!=live && member.containerUUID!=third) ||
+        member.machineUUID!=knownMachine(member.containerUUID) || member.shardGroup!=0 ||
+        member.isSource || !member.advertiseClient || !sealed.insert(member.containerUUID).second) return false;
+  auto rowScope=[&](const BrainReplicatedContainerRuntimeState& state) {
+    const auto& p=state.plan;
+    return knownMachine(p.uuid)!=0 && state.machineUUID==knownMachine(p.uuid) &&
+        p.config.deploymentID()==deployment && p.isStateful && p.system.kind==SystemContainerKind::none &&
+        p.shardGroup==0 && p.lifetime==ApplicationLifetime::base && !p.useHostNetworkNamespace &&
+        p.taskAttemptNumber==0 && prodigyStatefulServingApplicationConfigEqual(p.config,authority.targetConfig) &&
+        p.statefulTopology.servingMode==StatefulTopologyServingMode::allMastersSeedBootstrap &&
+        p.statefulTopology.allMastersSeedBootstrap==scope.bootstrap;
+  };
+  for (const auto& state:a.servingRuntimeStates) {
+    if (!rowScope(state) || !sealed.contains(state.plan.uuid) || state.plan.nShardGroups!=1 ||
+        state.plan.state!=ContainerState::scheduled || state.plan.runtimeReady) return false;
+    if (state.plan.uuid==live) liveSealed=&state;
+  }
+  if (!liveSealed) return false;
+  // Canonical observations are not rewritten to agree with the desired sealed
+  // rows. Admit only the UUID/state shapes seen on these particular peers.
+  std::set<uint128_t> canonical;
+  for (const auto& state:a.containerRuntimeStates) {
+    const auto& p=state.plan;
+    if (!rowScope(state) || !canonical.insert(p.uuid).second) return false;
+    if (b.localMachineUUID==master) {
+      if ((p.uuid==live && (p.state!=ContainerState::healthy || !p.runtimeReady || p.nShardGroups!=1)) ||
+          (p.uuid==third && (p.state!=ContainerState::scheduled || p.runtimeReady || p.nShardGroups!=1)) ||
+          (p.uuid!=live && p.uuid!=third)) return false;
+    } else {
+      if (b.localMachineUUID==ord2 && p.uuid!=live) return false;
+      if (b.localMachineUUID==ord0 && p.uuid!=first && p.uuid!=live && p.uuid!=absentOrd0 && p.uuid!=absentOrd2) return false;
+      if (p.uuid==live) {
+        if (p.nShardGroups!=1 || (p.state!=ContainerState::scheduled && p.state!=ContainerState::healthy) ||
+            (p.state==ContainerState::healthy && !p.runtimeReady)) return false;
+      } else if (p.state!=ContainerState::scheduled || p.runtimeReady ||
+                 (p.nShardGroups!=1 && !(p.uuid==first && p.nShardGroups==0))) return false;
+    }
+  }
+  if ((b.localMachineUUID==master && canonical!=std::set<uint128_t>{live,third}) ||
+      (b.localMachineUUID==ord0 && canonical!=std::set<uint128_t>{absentOrd0,absentOrd2,first,live}) ||
+      (b.localMachineUUID==ord2 && canonical!=std::set<uint128_t>{live})) return false;
+  // The master owns the ordinary terminal report. Followers may not have
+  // received that local failure record; any present record must be identical
+  // in semantic scope and is sealed verbatim by the private-copy export.
+  if (a.failedDeployments.size()>1 ||
+      (b.localMachineUUID==master && a.failedDeployments.size()!=1)) return false;
+  for (const auto& [id,failed]:a.failedDeployments) {
+    const auto& report=failed.terminalReport;
+    if (id!=deployment || failed.deploymentID!=deployment || failed.applicationID!=2 || failed.failedAtMs<=0 ||
+        !failed.hasTerminalReport || failed.hasOperatorCancellation || failed.hasQualificationCancellation ||
+        !failed.operationID.empty() || failed.successorDeploymentID || failed.cancellationPhase!=CancelDeploymentPhase::none ||
+        failed.cancellationGeneration || failed.cancellationCompletedAtMs ||
+        failed.reason!="stateful container launch is not admitted by serving authority"_ctv ||
+        report.versionID!=plan->second.config.versionID || report.state!=DeploymentState::failed ||
+        !report.isStateful || report.nShardGroups!=1 || report.nTarget!=3 || report.nTargetBase!=3 || report.nTargetSurge ||
+        report.nDeployed!=2 || report.nDeployedBase!=2 || report.nDeployedCanary || report.nDeployedSurge ||
+        report.nHealthy!=1 || report.nHealthyBase!=1 || report.nHealthyCanary || report.nHealthySurge || report.nCrashes ||
+        report.containerRuntimes.size()!=2) return false;
+    std::set<uint128_t> reported;
+    for(const auto& row:report.containerRuntimes) if(!reported.insert(row.uuid).second) return false;
+    if(reported!=std::set<uint128_t>{live,third}) return false;
+  }
+  ContainerParameters parameters={};
+  if (!ProdigyWire::deserializeStartupContainerParameters(proof.startupParameters,parameters)) return false;
+  prodigyRestoreRetainedStartupCPUFields(proof.startupParameters,plan->second,parameters);
+  const auto& p=liveSealed->plan;
+  if (parameters.uuid!=live || parameters.deploymentID!=deployment || parameters.taskAttemptNumber || parameters.justCrashed ||
+      parameters.memoryMB!=p.config.memoryMB || parameters.storageMB!=p.config.storageMB ||
+      parameters.nLogicalCores!=applicationSharedCPUCoreHint(p.config) || parameters.cpuMode!=p.config.cpuMode ||
+      parameters.requestedCPUMillis!=applicationRequestedCPUMillis(p.config) ||
+      parameters.advertisesOnPorts.size()!=p.advertisements.size()) return false;
+  bool address=false;
+  for (const auto& candidate:p.addresses)
+    address|=candidate.network.is6 && candidate.cidr==parameters.private6.cidr &&
+        std::memcmp(candidate.network.v6,parameters.private6.network.v6,sizeof(candidate.network.v6))==0;
+  if (!address || !parameters.private6.network.is6 || parameters.private6.cidr!=128) return false;
+  if (parameters.flags.size()!=2 || parameters.flags[0]!=0 || parameters.flags[1]!=1) return false;
+  auto projected=*liveSealed;
+  for (auto& [service,advertisement]:projected.plan.advertisements) {
+    const auto found=parameters.advertisesOnPorts.find(service);
+    if (found==parameters.advertisesOnPorts.end()) return false;
+    advertisement.port=found->second;
+  }
+  projected.plan.statefulMeshRoles=parameters.statefulMeshRoles; projected.plan.statefulTopology=parameters.statefulTopology;
+  projected.plan.subscriptionPairings=parameters.subscriptionPairings; projected.plan.advertisementPairings=parameters.advertisementPairings;
+  projected.plan.wormholes=parameters.wormholes; projected.plan.whiteholes=parameters.whiteholes;
+  projected.plan.hasCredentialBundle=parameters.hasCredentialBundle; projected.plan.credentialBundle=parameters.credentialBundle;
+  String expected,observed;
+  return prodigyStatefulServingRuntimeDigest(*liveSealed,expected) &&
+      prodigyStatefulServingRuntimeDigest(projected,observed) && expected==observed;
+}
 
 class MothershipRetainedRecoveryMachineInput {
 public:
@@ -498,6 +768,16 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
     const String& rejectedCandidateSHA256 = {})
 {
   if (failure) failure->clear();
+  for (const auto& state : snapshot.masterAuthority.containerRuntimeStates) {
+    const uint16_t app = state.plan.config.applicationID;
+    if (app != 2 && app != 5) continue;
+    auto approved = approvedPlans.find(state.plan.config.deploymentID());
+    if (approved == approvedPlans.end() || state.plan.shardGroup != 0 ||
+        !prodigyGraphTopologyCanonical(approved->second, state.plan.statefulTopology, state.plan.nShardGroups)) {
+      if (failure) failure->assign("retained graph runtime is outside its group-zero authority"_ctv);
+      return false;
+    }
+  }
   if (snapshot.brainConfig.clusterUUID == 0 ||
       snapshot.brainConfig.datacenterFragment == 0 ||
       machines.size() != snapshot.topology.machines.size() ||
@@ -783,7 +1063,8 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
               plan.advertisements.contains(rawRoles.client),
               plan.subscriptionPairings.map.contains(rawRoles.seeding),
               expectedRoles) == false ||
-          serializedLeft != serializedRight || plan.statefulMeshRoles.client == 0 ||
+          serializedLeft != serializedRight ||
+          (!prodigyGraphDeploymentPlanCanonical(existing->second, true) && plan.statefulMeshRoles.client == 0) ||
           plan.statefulMeshRoles.client != expectedRoles.client ||
           plan.statefulMeshRoles.sibling != expectedRoles.sibling ||
           plan.statefulMeshRoles.seeding != expectedRoles.seeding ||
@@ -885,7 +1166,8 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
     const auto& deployment = approvedPlans.find(id)->second;
     if (retiringConflictingClient && retainRetiredConflictingClientForCoordinatorProof && id == retiredDeploymentID) continue;
     if (sealedPartialHandoff && id == partialHandoff->successorDeploymentID) continue;
-    const uint32_t expected = deployment.stateful.allMasters ? count : 1;
+    const uint32_t expected = prodigyGraphDeploymentPlanCanonical(deployment, true) ? 0 :
+        (deployment.stateful.allMasters ? count : 1);
     if (statefulClientMasters[id] != expected) {
       if (failure) failure->assign("retained stateful inventory has missing or conflicting client masters"_ctv);
       return false;

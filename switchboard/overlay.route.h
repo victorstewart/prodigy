@@ -6,6 +6,7 @@
 
 #include <prodigy/types.h>
 #include <switchboard/common/structs.h>
+#include <switchboard/common/local_container_subnet.h>
 #include <switchboard/owned.routable.prefix.h>
 
 static inline bool switchboardOverlayPrefix4Equals(const switchboard_overlay_prefix4_key& lhs, const switchboard_overlay_prefix4_key& rhs)
@@ -68,7 +69,7 @@ static inline void switchboardBuildOverlayHostedIngressRouteEntries(const Vector
 
   for (const SwitchboardOverlayHostedIngressRoute& route : routes)
   {
-    if (route.machineFragment == 0 || route.prefix.network.isNull())
+    if (switchboardOverlayMachineIdentityIsValid(route.machineFragment) == false || route.prefix.network.isNull())
     {
       continue;
     }
@@ -121,6 +122,55 @@ static inline void switchboardBuildOverlayHostedIngressRouteEntries(const Vector
 static inline bool switchboardOverlayMachineRouteEquals(const switchboard_overlay_machine_route& lhs, const switchboard_overlay_machine_route& rhs)
 {
   return lhs.family == rhs.family && lhs.use_gateway_mac == rhs.use_gateway_mac && lhs.next_hop4 == rhs.next_hop4 && lhs.source4 == rhs.source4 && std::memcmp(lhs.next_hop_mac, rhs.next_hop_mac, sizeof(lhs.next_hop_mac)) == 0 && std::memcmp(lhs.next_hop6, rhs.next_hop6, sizeof(lhs.next_hop6)) == 0 && std::memcmp(lhs.source6, rhs.source6, sizeof(lhs.source6)) == 0;
+}
+
+static inline bool switchboardMasqueGatewayContainerFragmentValid(uint8_t fragment)
+{
+  return fragment == SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST ||
+      fragment == SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_SECOND;
+}
+
+static inline bool switchboardOverlayMachineRouteLocalContainerRedirect(
+    const switchboard_overlay_machine_route& route, uint8_t& fragment)
+{
+  fragment = 0;
+  if (route.use_gateway_mac != SWITCHBOARD_OVERLAY_ROUTE_ACTION_LOCAL_CONTAINER_REDIRECT ||
+      !switchboardMasqueGatewayContainerFragmentValid(route.next_hop_mac[0])) return false;
+  for (uint32_t index = 1; index < sizeof(route.next_hop_mac); ++index)
+    if (route.next_hop_mac[index] != 0) return false;
+  fragment = route.next_hop_mac[0];
+  return true;
+}
+
+static inline bool switchboardOverlaySiteRouteSetValid(const switchboard_overlay_site_route_set& routes)
+{
+  if (routes.version != SWITCHBOARD_OVERLAY_SITE_ROUTE_SET_VERSION || routes.count == 0 ||
+      routes.count > SWITCHBOARD_OVERLAY_SITE_ROUTE_SET_MAX_CANDIDATES) return false;
+  for (uint32_t i = 0; i < routes.count; ++i)
+  {
+    const auto& candidate = routes.candidates[i];
+    if ((candidate.family != SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV4 &&
+         candidate.family != SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV6) ||
+        candidate.use_gateway_mac > SWITCHBOARD_OVERLAY_ROUTE_ACTION_LOCAL_CONTAINER_REDIRECT ||
+        (candidate.use_gateway_mac == SWITCHBOARD_OVERLAY_ROUTE_ACTION_LOCAL_CONTAINER_REDIRECT &&
+         (!switchboardMasqueGatewayContainerFragmentValid(candidate.next_hop_mac[0]) ||
+          candidate.next_hop_mac[1] != 0 || candidate.next_hop_mac[2] != 0 ||
+          candidate.next_hop_mac[3] != 0 || candidate.next_hop_mac[4] != 0 ||
+          candidate.next_hop_mac[5] != 0))) return false;
+    for (uint32_t j = 0; j < i; ++j)
+      if (switchboardOverlayMachineRouteEquals(candidate, routes.candidates[j])) return false;
+  }
+  return true;
+}
+
+static inline bool switchboardOverlaySiteRouteSetEquals(const switchboard_overlay_site_route_set& lhs,
+                                                        const switchboard_overlay_site_route_set& rhs)
+{
+  if (lhs.version != rhs.version || lhs.count != rhs.count ||
+      std::memcmp(lhs.reserved, rhs.reserved, sizeof(lhs.reserved)) != 0) return false;
+  for (uint32_t i = 0; i < lhs.count; ++i)
+    if (!switchboardOverlayMachineRouteEquals(lhs.candidates[i], rhs.candidates[i])) return false;
+  return true;
 }
 
 static inline switchboard_overlay_machine_route_key switchboardMakeOverlayMachineRouteKey(uint32_t fragment)
@@ -184,7 +234,7 @@ static inline bool switchboardBuildOverlayMachineRouteValue(const SwitchboardOve
 {
   value = {};
 
-  if (route.machineFragment == 0 || route.nextHop.isNull() || route.sourceAddress.isNull())
+  if (switchboardOverlayRouteKeyIsValid(route.machineFragment) == false || route.nextHop.isNull() || route.sourceAddress.isNull())
   {
     return false;
   }
@@ -195,9 +245,17 @@ static inline bool switchboardBuildOverlayMachineRouteValue(const SwitchboardOve
   }
 
   value.family = route.nextHop.is6 ? SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV6 : SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV4;
-  value.use_gateway_mac = route.useGatewayMAC ? 1u : 0u;
+  value.use_gateway_mac = route.localContainerRedirectFragment != 0 ?
+      SWITCHBOARD_OVERLAY_ROUTE_ACTION_LOCAL_CONTAINER_REDIRECT :
+      (route.useGatewayMAC ? SWITCHBOARD_OVERLAY_ROUTE_ACTION_GATEWAY_MAC : SWITCHBOARD_OVERLAY_ROUTE_ACTION_DIRECT_MAC);
 
-  if (route.useGatewayMAC == false)
+  if (route.localContainerRedirectFragment != 0)
+  {
+    if (!switchboardMasqueGatewayContainerFragmentValid(route.localContainerRedirectFragment)) return false;
+    value.next_hop_mac[0] = route.localContainerRedirectFragment;
+  }
+
+  if (route.localContainerRedirectFragment == 0 && route.useGatewayMAC == false)
   {
     if (switchboardParseMACLiteral(route.nextHopMAC, value.next_hop_mac) == false)
     {

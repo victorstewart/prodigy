@@ -5,7 +5,12 @@ VERSION 3.5.0
 SOURCE URL https://github.com/ogxd/gxhash/archive/refs/tags/3.5.0.tar.gz
 SHA256 2193998ffd0ae6e3db5e4a53d364d98255c2a44f268a11cafbe70a44fbec6768
 BUILD_SYSTEM CARGO
+DEPENDS rust_toolchain VERSION 1.97.1
 CARGO_BUILD_SH <<'EOF'
+# Select both compiler and sysroot from the pinned Depos dependency.
+export PATH="${dep:rust_toolchain}/bin:$PATH"
+export RUSTC="${dep:rust_toolchain}/bin/rustc"
+export RUSTDOC="${dep:rust_toolchain}/bin/rustdoc"
 grep -Fqx 'gxhash = { path = "../", default-features = false }' ffi/Cargo.toml
 python3 - <<'PY'
 from pathlib import Path

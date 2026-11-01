@@ -29,10 +29,15 @@ fn mothership_tunnel_provider_blob_header() -> &'static [u8] {
     b"PRODIGY-DISCOMBOBULATOR-MOTHERSHIP-TUNNEL-PROVIDER\ncontract=prodigy-mothership-tunnel-provider\ncontract_version=1\ncontainer_kind=mothershipTunnelProvider\nrequires_standard_neuron_socket=false\nrequires_mothership_tunnel_gateway=true\nnetwork_policy=tcpEgressOnly\n\n"
 }
 
+fn cross_cluster_masque_gateway_blob_header() -> &'static [u8] {
+    b"PRODIGY-DISCOMBOBULATOR-CROSS-CLUSTER-MASQUE-GATEWAY\ncontract=prodigy-cross-cluster-masque-gateway\ncontract_version=1\ncontainer_kind=crossClusterMasqueGateway\nrequires_standard_neuron_socket=false\nrequires_switchboard_gateway_injection=true\nnetwork_policy=ipv6UdpEgressOnly\n\n"
+}
+
 fn blob_contract_header(bytes: &[u8]) -> Option<&'static [u8]> {
     [
         discombobulator_blob_header(),
         mothership_tunnel_provider_blob_header(),
+        cross_cluster_masque_gateway_blob_header(),
     ]
     .into_iter()
     .find(|header| bytes.starts_with(*header))
@@ -56,10 +61,22 @@ fn assert_mothership_tunnel_provider_blob_header(output_blob: &Path) {
     );
 }
 
+fn assert_cross_cluster_masque_gateway_blob_header(output_blob: &Path) {
+    let bytes = fs::read(output_blob).unwrap();
+    assert!(
+        bytes.starts_with(cross_cluster_masque_gateway_blob_header()),
+        "{} is missing Discombobulator cross-cluster MASQUE gateway blob header",
+        output_blob.display()
+    );
+}
+
 fn assert_output_contract_header(kind: &str, output_blob: &Path) {
     match kind {
         "app" => assert_discombobulator_blob_header(output_blob),
         "mothership-tunnel-provider" => assert_mothership_tunnel_provider_blob_header(output_blob),
+        "cross-cluster-masque-gateway" => {
+            assert_cross_cluster_masque_gateway_blob_header(output_blob)
+        }
         _ => {}
     }
 }
@@ -474,6 +491,55 @@ fn mothership_tunnel_provider_build_emits_system_contract_header() {
         blob_payload_bytes(&output_blob),
         fs::read(cached_path).unwrap()
     );
+}
+
+#[test]
+fn cross_cluster_masque_gateway_build_emits_distinct_system_contract_header() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path();
+    let source_dir = project.join("srcctx");
+    fs::create_dir_all(&source_dir).unwrap();
+    fs::copy(
+        if Path::new("/bin/true").exists() {
+            "/bin/true"
+        } else {
+            "/usr/bin/true"
+        },
+        source_dir.join("gateway"),
+    )
+    .unwrap();
+
+    let discombobulator_file = project.join("MasqueGateway.DiscombobuFile");
+    fs::write(
+        &discombobulator_file,
+        r#"
+      FROM scratch for x86_64
+      COPY {src} ./gateway /gateway/masque
+      SURVIVE /gateway/masque
+      EXECUTE ["/gateway/masque"]
+      "#,
+    )
+    .unwrap();
+
+    let output_blob = project.join("masque-gateway.blob.zst");
+    build_blob_with_contexts(
+        project,
+        &discombobulator_file,
+        &output_blob,
+        "cross-cluster-masque-gateway",
+        &[format!("src={}", source_dir.display())],
+    );
+    assert_cross_cluster_masque_gateway_blob_header(&output_blob);
+    assert!(!fs::read(&output_blob)
+        .unwrap()
+        .starts_with(mothership_tunnel_provider_blob_header()));
+
+    let connection = open_registry(project);
+    let rows = query_artifacts_by_kind(&connection, "cross-cluster-masque-gateway");
+    assert_eq!(rows.len(), 1);
+    assert!(PathBuf::from(&rows[0].path).starts_with(
+        project.join(".discombobulator/artifacts/cross-cluster-masque-gateways/x86_64")
+    ));
 }
 
 #[test]

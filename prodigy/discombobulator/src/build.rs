@@ -22,7 +22,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::fs::OpenOptions;
@@ -40,7 +40,7 @@ use walkdir::WalkDir;
 use zstd::stream::read::Decoder as ZstdDecoder;
 
 const STEP_CACHE_VERSION: &str = "discombobulator-step-cache-v1";
-const ARTIFACT_CACHE_VERSION: &str = "discombobulator-artifact-cache-v2";
+const ARTIFACT_CACHE_VERSION: &str = "discombobulator-artifact-cache-v4";
 const METALOR_RUNTIME_DIR_NAME: &str = ".metalor-runtime";
 const SESSION_STALE_AFTER: Duration = Duration::from_secs(6 * 60 * 60);
 const LOCK_EXCLUSIVE: i32 = 2;
@@ -211,6 +211,7 @@ pub fn run(command: BuildCommand) -> Result<()> {
         OutputKindArg::App => OutputKind::App,
         OutputKindArg::Base => OutputKind::Base,
         OutputKindArg::MothershipTunnelProvider => OutputKind::MothershipTunnelProvider,
+        OutputKindArg::CrossClusterMasqueGateway => OutputKind::CrossClusterMasqueGateway,
     };
     let resolved = resolve_build_spec(&spec, output_kind, &build_args)?;
 
@@ -433,7 +434,9 @@ fn execute_supported_subset(
                 contexts,
             )?;
             let artifact_root = match output_kind {
-                OutputKind::App | OutputKind::MothershipTunnelProvider => {
+                OutputKind::App
+                | OutputKind::MothershipTunnelProvider
+                | OutputKind::CrossClusterMasqueGateway => {
                     let projected_root = session.work_root().join("final");
                     assemble_app_tree(&workspace_root, &projected_root, resolved)?;
 
@@ -500,6 +503,7 @@ fn output_kind_name(output_kind: OutputKind) -> &'static str {
         OutputKind::App => "app",
         OutputKind::Base => "base",
         OutputKind::MothershipTunnelProvider => "mothership-tunnel-provider",
+        OutputKind::CrossClusterMasqueGateway => "cross-cluster-masque-gateway",
     }
 }
 
@@ -589,7 +593,12 @@ fn remove_stale_unreferenced_artifacts(
     storage: &StorageRoot,
     referenced_artifacts: &BTreeSet<PathBuf>,
 ) -> Result<()> {
-    for kind in ["apps", "bases", "mothership-tunnel-providers"] {
+    for kind in [
+        "apps",
+        "bases",
+        "mothership-tunnel-providers",
+        "cross-cluster-masque-gateways",
+    ] {
         let kind_root = storage.root().join("artifacts").join(kind);
         remove_stale_unreferenced_leaf_entries(&kind_root, referenced_artifacts)?;
     }
@@ -856,7 +865,7 @@ fn copy_bundle_runtime_dependencies(
     copy_builder_toolchain_runtimes: bool,
 ) -> Result<()> {
     let mut copied_names = BTreeSet::new();
-    for dependency in read_ldd_dependencies(binary_path)? {
+    for dependency in read_bundle_ldd_dependencies(binary_path)? {
         let Some(dep_name) = dependency.file_name().and_then(OsStr::to_str) else {
             continue;
         };
@@ -2617,7 +2626,7 @@ fn assemble_app_tree(
         );
     }
 
-    copy_elf_runtime_closure(workspace_root, final_tree, &matched)?;
+    copy_elf_runtime_closure(workspace_root, final_tree, &matched, &resolved.env)?;
     Ok(())
 }
 
@@ -2676,10 +2685,15 @@ fn mothership_tunnel_provider_blob_header() -> &'static [u8] {
     b"PRODIGY-DISCOMBOBULATOR-MOTHERSHIP-TUNNEL-PROVIDER\ncontract=prodigy-mothership-tunnel-provider\ncontract_version=1\ncontainer_kind=mothershipTunnelProvider\nrequires_standard_neuron_socket=false\nrequires_mothership_tunnel_gateway=true\nnetwork_policy=tcpEgressOnly\n\n"
 }
 
+fn cross_cluster_masque_gateway_blob_header() -> &'static [u8] {
+    b"PRODIGY-DISCOMBOBULATOR-CROSS-CLUSTER-MASQUE-GATEWAY\ncontract=prodigy-cross-cluster-masque-gateway\ncontract_version=1\ncontainer_kind=crossClusterMasqueGateway\nrequires_standard_neuron_socket=false\nrequires_switchboard_gateway_injection=true\nnetwork_policy=ipv6UdpEgressOnly\n\n"
+}
+
 fn output_blob_header(output_kind: OutputKind) -> Option<&'static [u8]> {
     match output_kind {
         OutputKind::App => Some(discombobulator_blob_header()),
         OutputKind::MothershipTunnelProvider => Some(mothership_tunnel_provider_blob_header()),
+        OutputKind::CrossClusterMasqueGateway => Some(cross_cluster_masque_gateway_blob_header()),
         OutputKind::Base => None,
     }
 }
@@ -2861,37 +2875,63 @@ fn copy_elf_runtime_closure(
     workspace_root: &Path,
     final_tree: &Path,
     matched: &[PathBuf],
+    environment: &[(String, String)],
 ) -> Result<()> {
     let mut copied = BTreeSet::new();
+    let mut copying = BTreeSet::new();
+    let mut pending = BTreeSet::new();
+    let mut inspected = BTreeSet::new();
     for source in matched {
         let relative = source.strip_prefix(workspace_root)?;
-        let projected = final_tree.join(relative);
-        if projected.is_file() == false {
-            continue;
-        }
-
-        if is_elf(&projected)? {
-            if let Some(interpreter) = read_elf_interpreter(&projected)? {
-                copy_runtime_path(
-                    workspace_root,
-                    Path::new(&interpreter),
-                    final_tree,
-                    &mut copied,
-                )?;
-            }
-            let mut dependencies = read_ldd_dependencies(&projected)?;
-            if dependencies.is_empty() {
-                dependencies = resolve_needed_libraries_from_workspace(
-                    workspace_root,
-                    &read_elf_needed_libraries(&projected)?,
-                )?;
-            }
-            for dependency in dependencies {
-                copy_runtime_path(workspace_root, &dependency, final_tree, &mut copied)?;
+        let virtual_path = Path::new("/").join(relative);
+        let resolved_source = workspace_runtime_path(workspace_root, &virtual_path, true)?;
+        if fs::symlink_metadata(&resolved_source)?.is_file() && is_elf(&resolved_source)? {
+            pending.insert(virtual_path);
+        } else if fs::symlink_metadata(&resolved_source)?.is_dir() {
+            for entry in WalkDir::new(&resolved_source)
+                .follow_links(false)
+                .min_depth(1)
+            {
+                let entry = entry?;
+                if entry.file_type().is_file() && is_elf(entry.path())? {
+                    pending.insert(virtual_path.join(entry.path().strip_prefix(&resolved_source)?));
+                }
             }
         }
     }
 
+    // Never execute or inspect a target ELF through the builder's dynamic
+    // loader.  In particular, `ldd` would both execute loader policy and turn
+    // a missing target runtime into a host-runtime copy.
+    while let Some(path) = pending.pop_first() {
+        if !inspected.insert(path.clone()) {
+            continue;
+        }
+        let source = workspace_runtime_path(workspace_root, &path, true)?;
+        if !is_elf(&source)? {
+            continue;
+        }
+        if let Some(interpreter) = read_elf_interpreter(&source)? {
+            let interpreter = copy_runtime_path(
+                workspace_root,
+                Path::new(&interpreter),
+                final_tree,
+                &mut copied,
+                &mut copying,
+            )?;
+            pending.insert(interpreter);
+        }
+        for dependency in resolve_elf_needed_libraries(workspace_root, &path, environment)? {
+            let dependency = copy_runtime_path(
+                workspace_root,
+                &dependency,
+                final_tree,
+                &mut copied,
+                &mut copying,
+            )?;
+            pending.insert(dependency);
+        }
+    }
     Ok(())
 }
 
@@ -2918,32 +2958,27 @@ fn read_elf_interpreter(path: &Path) -> Result<Option<String>> {
     Ok(None)
 }
 
-fn read_ldd_dependencies(path: &Path) -> Result<Vec<PathBuf>> {
+// Flat host bundles intentionally package the current builder's tools.  App
+// artifacts must not call this: their closure is target-workspace-only below.
+fn read_bundle_ldd_dependencies(path: &Path) -> Result<Vec<PathBuf>> {
     let output = Command::new("ldd").arg(path).output()?;
     if output.status.success() == false {
         return Ok(Vec::new());
     }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let mut dependencies = Vec::new();
-    for line in stdout.lines() {
-        if let Some((_, right)) = line.split_once("=>") {
-            let trimmed = right.trim();
-            if let Some(path) = trimmed.split_whitespace().next() {
-                if path.starts_with('/') {
-                    dependencies.push(PathBuf::from(path));
-                }
-            }
-        } else {
-            let trimmed = line.trim();
-            if trimmed.starts_with('/') {
-                if let Some(path) = trimmed.split_whitespace().next() {
-                    dependencies.push(PathBuf::from(path));
-                }
-            }
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let candidate = line
+            .split_once("=>")
+            .map(|(_, right)| right.trim())
+            .unwrap_or_else(|| line.trim());
+        if let Some(path) = candidate
+            .split_whitespace()
+            .next()
+            .filter(|path| path.starts_with('/'))
+        {
+            dependencies.push(PathBuf::from(path));
         }
     }
-
     dependencies.sort();
     dependencies.dedup();
     Ok(dependencies)
@@ -2974,46 +3009,206 @@ fn read_elf_needed_libraries(path: &Path) -> Result<Vec<String>> {
     Ok(needed)
 }
 
-fn resolve_needed_libraries_from_workspace(
+fn read_elf_dynamic_search_paths(path: &Path) -> Result<(Vec<String>, Vec<String>)> {
+    let output = Command::new("readelf").arg("-d").arg(path).output()?;
+    if !output.status.success() {
+        bail!("unable to read ELF dynamic section {}", path.display());
+    }
+    let mut rpath = Vec::new();
+    let mut runpath = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let target = if line.contains("(RUNPATH)") {
+            &mut runpath
+        } else if line.contains("(RPATH)") {
+            &mut rpath
+        } else {
+            continue;
+        };
+        let Some(start) = line.find('[') else {
+            continue;
+        };
+        let Some(end) = line[start + 1..].find(']') else {
+            continue;
+        };
+        target.extend(
+            line[start + 1..start + 1 + end]
+                .split(':')
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_string),
+        );
+    }
+    Ok((rpath, runpath))
+}
+
+fn workspace_runtime_path(
     workspace_root: &Path,
-    needed: &[String],
+    path: &Path,
+    follow_leaf_symlink: bool,
+) -> Result<PathBuf> {
+    let normalized = PathBuf::from(normalize_absolute_path(path)?);
+    let mut remaining = normalized
+        .strip_prefix("/")?
+        .components()
+        .map(|component| match component {
+            Component::Normal(value) => Ok(value.to_os_string()),
+            _ => bail!("normalized runtime path has an invalid component"),
+        })
+        .collect::<Result<VecDeque<_>>>()?;
+    let mut resolved = Vec::<OsString>::new();
+    let mut links = 0usize;
+    while let Some(component) = remaining.pop_front() {
+        let source = workspace_root
+            .join(resolved.iter().collect::<PathBuf>())
+            .join(&component);
+        let metadata = fs::symlink_metadata(&source).with_context(|| {
+            format!(
+                "target runtime path {} is absent from workspace {}",
+                normalized.display(),
+                workspace_root.display()
+            )
+        })?;
+        // Preserve a leaf symlink for the artifact, but resolve every parent
+        // symlink in the workspace namespace.  Absolute link targets are
+        // rooted at that namespace, never at the builder host's `/`.
+        if (remaining.is_empty() && !follow_leaf_symlink) || !metadata.file_type().is_symlink() {
+            resolved.push(component);
+            if remaining.is_empty() {
+                return Ok(workspace_root.join(resolved.iter().collect::<PathBuf>()));
+            }
+            if !metadata.is_dir() {
+                bail!(
+                    "target runtime path {} has a non-directory parent inside workspace {}",
+                    normalized.display(),
+                    workspace_root.display()
+                );
+            }
+            continue;
+        }
+
+        links += 1;
+        if links > 64 {
+            bail!(
+                "target runtime path {} has too many symlink links",
+                normalized.display()
+            );
+        }
+        let target = fs::read_link(&source)?;
+        let target_path = if target.is_absolute() {
+            target
+        } else {
+            PathBuf::from("/")
+                .join(resolved.iter().collect::<PathBuf>())
+                .join(target)
+        };
+        let target_components = PathBuf::from(normalize_absolute_path(&target_path)?)
+            .strip_prefix("/")?
+            .components()
+            .map(|component| match component {
+                Component::Normal(value) => Ok(value.to_os_string()),
+                _ => bail!("unsupported runtime symlink target"),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        resolved.clear();
+        for target_component in target_components.into_iter().rev() {
+            remaining.push_front(target_component);
+        }
+    }
+    bail!(
+        "target runtime path {} is absent from workspace",
+        normalized.display()
+    )
+}
+
+fn runtime_search_paths(
+    elf_path: &Path,
+    environment: &[(String, String)],
+    rpath: &[String],
+    runpath: &[String],
 ) -> Result<Vec<PathBuf>> {
-    let library_index = index_workspace_libraries(workspace_root)?;
+    let origin = elf_path.parent().unwrap_or_else(|| Path::new("/"));
+    let expand = |entry: &str| -> Result<PathBuf> {
+        let expanded = entry
+            .replace("${ORIGIN}", &origin.display().to_string())
+            .replace("$ORIGIN", &origin.display().to_string());
+        if !Path::new(&expanded).is_absolute() {
+            bail!("relative target runtime search path {entry} is unsupported");
+        }
+        let value = PathBuf::from(expanded);
+        Ok(PathBuf::from(normalize_absolute_path(&value)?))
+    };
+    let mut result = Vec::new();
+    let mut append = |entries: Vec<String>| -> Result<()> {
+        for entry in entries {
+            let path = expand(&entry)?;
+            if !result.contains(&path) {
+                result.push(path);
+            }
+        }
+        Ok(())
+    };
+    // DT_RPATH precedes LD_LIBRARY_PATH only when DT_RUNPATH is absent.
+    if runpath.is_empty() {
+        append(rpath.to_vec())?;
+    }
+    for (key, value) in environment {
+        if key == "LD_LIBRARY_PATH" {
+            append(
+                value
+                    .split(':')
+                    .filter(|entry| !entry.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            )?;
+        }
+    }
+    if !runpath.is_empty() {
+        append(runpath.to_vec())?;
+    }
+    append(vec![
+        "/lib".into(),
+        "/lib64".into(),
+        "/usr/lib".into(),
+        "/usr/lib64".into(),
+    ])?;
+    Ok(result)
+}
+
+fn resolve_elf_needed_libraries(
+    workspace_root: &Path,
+    elf_path: &Path,
+    environment: &[(String, String)],
+) -> Result<Vec<PathBuf>> {
+    let source = workspace_runtime_path(workspace_root, elf_path, true)?;
+    let needed = read_elf_needed_libraries(&source)?;
+    let (rpath, runpath) = read_elf_dynamic_search_paths(&source)?;
+    let search = runtime_search_paths(elf_path, environment, &rpath, &runpath)?;
     let mut resolved = Vec::new();
     for library in needed {
-        let Some(path) = library_index.get(OsStr::new(library)) else {
+        let direct = Path::new(&library);
+        let candidate = if direct.is_absolute() {
+            let path = PathBuf::from(normalize_absolute_path(direct)?);
+            workspace_runtime_path(workspace_root, &path, true)
+                .ok()
+                .map(|_| path)
+        } else {
+            search
+                .iter()
+                .map(|directory| directory.join(&library))
+                .find(|path| workspace_runtime_path(workspace_root, path, true).is_ok())
+        };
+        let Some(path) = candidate else {
             bail!(
-                "failed to resolve ELF dependency {} inside {}",
+                "unable to resolve target ELF dependency {} for {} inside workspace {}",
                 library,
+                elf_path.display(),
                 workspace_root.display()
             );
         };
-        resolved.push(path.clone());
+        resolved.push(path);
     }
     resolved.sort();
     resolved.dedup();
     Ok(resolved)
-}
-
-fn index_workspace_libraries(workspace_root: &Path) -> Result<BTreeMap<OsString, PathBuf>> {
-    let mut libraries = BTreeMap::new();
-    for prefix in ["lib", "lib64", "usr/lib", "usr/lib64"] {
-        let root = workspace_root.join(prefix);
-        if root.exists() == false {
-            continue;
-        }
-        for entry in WalkDir::new(&root).follow_links(false) {
-            let entry = entry?;
-            let name = entry.file_name().to_os_string();
-            if libraries.contains_key(&name) == false {
-                libraries.insert(
-                    name,
-                    Path::new("/").join(entry.path().strip_prefix(workspace_root)?),
-                );
-            }
-        }
-    }
-    Ok(libraries)
 }
 
 fn copy_runtime_path(
@@ -3021,53 +3216,424 @@ fn copy_runtime_path(
     path: &Path,
     final_tree: &Path,
     copied: &mut BTreeSet<PathBuf>,
-) -> Result<()> {
+    copying: &mut BTreeSet<PathBuf>,
+) -> Result<PathBuf> {
     let normalized = PathBuf::from(normalize_absolute_path(path)?);
-    if copied.insert(normalized.clone()) == false {
-        return Ok(());
+    if copied.contains(&normalized) {
+        return Ok(normalized);
     }
-
-    let source_root = if workspace_root.join(normalized.strip_prefix("/")?).exists() {
-        workspace_root
-    } else {
-        Path::new("/")
-    };
-    let source_path = source_root.join(normalized.strip_prefix("/")?);
+    if !copying.insert(normalized.clone()) {
+        bail!("target runtime symlink cycle at {}", normalized.display());
+    }
+    let source_path = workspace_runtime_path(workspace_root, &normalized, false)?;
+    let destination = runtime_destination_path(final_tree, &normalized)?;
+    let canonical = Path::new("/").join(source_path.strip_prefix(workspace_root)?);
+    if canonical != normalized {
+        let alias = runtime_relative_link_target(
+            normalized.parent().unwrap_or_else(|| Path::new("/")),
+            &canonical,
+        );
+        symlink(&alias, &destination)?;
+        copy_runtime_path(workspace_root, &canonical, final_tree, copied, copying)?;
+        copying.remove(&normalized);
+        copied.insert(normalized.clone());
+        return Ok(normalized);
+    }
     let source_metadata = fs::symlink_metadata(&source_path)?;
-    let destination = final_tree.join(normalized.strip_prefix("/")?);
     if source_metadata.file_type().is_symlink() {
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let target = fs::read_link(&source_path)?;
-        let _ = fs::remove_file(&destination);
-        symlink(&target, &destination)?;
-        let resolved_target = if target.is_absolute() {
+        let target_is_absolute = target.is_absolute();
+        let resolved_target = if target_is_absolute {
+            target.clone()
+        } else {
+            Path::new("/")
+                .join(
+                    source_path
+                        .parent()
+                        .context("runtime symlink has no parent")?
+                        .strip_prefix(workspace_root)?,
+                )
+                .join(&target)
+        };
+        let resolved_target = PathBuf::from(normalize_absolute_path(&resolved_target)?);
+        let emitted_target = if target_is_absolute {
             target
         } else {
-            normalized
-                .parent()
-                .unwrap_or_else(|| Path::new("/"))
-                .join(target)
+            runtime_relative_link_target(
+                normalized.parent().unwrap_or_else(|| Path::new("/")),
+                &resolved_target,
+            )
         };
-        copy_runtime_path(workspace_root, &resolved_target, final_tree, copied)?;
-        return Ok(());
+        symlink(&emitted_target, &destination)?;
+        copy_runtime_path(
+            workspace_root,
+            &resolved_target,
+            final_tree,
+            copied,
+            copying,
+        )?;
+        copying.remove(&normalized);
+        copied.insert(normalized.clone());
+        return Ok(normalized);
     }
 
     if source_metadata.is_dir() {
-        fs::create_dir_all(&destination)?;
-        return Ok(());
+        fs::create_dir(&destination).or_else(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        })?;
+        copying.remove(&normalized);
+        copied.insert(normalized.clone());
+        return Ok(normalized);
     }
 
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)?;
-    }
     fs::copy(&source_path, &destination)?;
     fs::set_permissions(
         &destination,
         fs::Permissions::from_mode(source_metadata.permissions().mode()),
     )?;
-    Ok(())
+    copying.remove(&normalized);
+    copied.insert(normalized.clone());
+    Ok(normalized)
+}
+
+fn runtime_destination_path(final_tree: &Path, path: &Path) -> Result<PathBuf> {
+    let normalized = PathBuf::from(normalize_absolute_path(path)?);
+    let components = normalized
+        .strip_prefix("/")?
+        .components()
+        .map(|component| match component {
+            Component::Normal(value) => Ok(value.to_os_string()),
+            _ => bail!("normalized runtime destination has an invalid component"),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if components.is_empty() {
+        bail!("runtime destination cannot be the artifact root");
+    }
+    let root = fs::symlink_metadata(final_tree)?;
+    if !root.is_dir() || root.file_type().is_symlink() {
+        bail!(
+            "runtime artifact root {} is not a real directory",
+            final_tree.display()
+        );
+    }
+    let mut parent = final_tree.to_path_buf();
+    for component in &components[..components.len() - 1] {
+        parent.push(component);
+        match fs::symlink_metadata(&parent) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => bail!(
+                "runtime destination parent {} is not a real directory",
+                parent.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&parent)?,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let destination = parent.join(components.last().unwrap());
+    match fs::symlink_metadata(&destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!(
+                "runtime destination {} is an existing symlink",
+                destination.display()
+            );
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(destination)
+}
+
+fn runtime_relative_link_target(from_parent: &Path, target: &Path) -> PathBuf {
+    let from = from_parent
+        .strip_prefix("/")
+        .unwrap_or(from_parent)
+        .components()
+        .collect::<Vec<_>>();
+    let to = target
+        .strip_prefix("/")
+        .unwrap_or(target)
+        .components()
+        .collect::<Vec<_>>();
+    let common = from
+        .iter()
+        .zip(&to)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut result = PathBuf::new();
+    for _ in common..from.len() {
+        result.push("..");
+    }
+    for component in &to[common..] {
+        result.push(component.as_os_str());
+    }
+    if result.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        result
+    }
+}
+
+#[cfg(test)]
+mod runtime_closure_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_closure_copies_workspace_loader_through_rooted_parent_and_leaf_symlinks() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        fs::create_dir_all(workspace.path().join("usr/lib64")).unwrap();
+        fs::create_dir_all(workspace.path().join("usr/lib")).unwrap();
+        fs::write(
+            workspace.path().join("usr/lib/ld-target.so"),
+            b"target-v3-loader",
+        )
+        .unwrap();
+        symlink("/usr/lib64", workspace.path().join("lib64")).unwrap();
+        symlink(
+            "../lib/ld-target.so",
+            workspace.path().join("usr/lib64/ld-linux-x86-64.so.2"),
+        )
+        .unwrap();
+
+        let mut copied = BTreeSet::new();
+        let mut copying = BTreeSet::new();
+        copy_runtime_path(
+            workspace.path(),
+            Path::new("/lib64/ld-linux-x86-64.so.2"),
+            output.path(),
+            &mut copied,
+            &mut copying,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(output.path().join("usr/lib/ld-target.so")).unwrap(),
+            b"target-v3-loader"
+        );
+        assert_eq!(
+            fs::read_link(output.path().join("lib64/ld-linux-x86-64.so.2")).unwrap(),
+            PathBuf::from("../usr/lib64/ld-linux-x86-64.so.2")
+        );
+        copy_runtime_path(
+            workspace.path(),
+            Path::new("/usr/lib64/ld-linux-x86-64.so.2"),
+            output.path(),
+            &mut copied,
+            &mut copying,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_link(output.path().join("usr/lib64/ld-linux-x86-64.so.2")).unwrap(),
+            PathBuf::from("../lib/ld-target.so")
+        );
+    }
+
+    #[test]
+    fn runtime_closure_rejects_missing_workspace_loader_or_dependency() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let mut copied = BTreeSet::new();
+        let mut copying = BTreeSet::new();
+        let error = copy_runtime_path(
+            workspace.path(),
+            Path::new("/lib64/ld-linux-x86-64.so.2"),
+            output.path(),
+            &mut copied,
+            &mut copying,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("absent from workspace"));
+    }
+
+    #[test]
+    fn runtime_closure_keeps_canonical_soname_and_requested_library_alias() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        fs::create_dir_all(workspace.path().join("usr/lib")).unwrap();
+        fs::write(workspace.path().join("usr/lib/libneeded.so.2"), b"needed").unwrap();
+        symlink(
+            "libneeded.so.2",
+            workspace.path().join("usr/lib/libneeded.so"),
+        )
+        .unwrap();
+        symlink("/usr/lib", workspace.path().join("lib")).unwrap();
+
+        copy_runtime_path(
+            workspace.path(),
+            Path::new("/lib/libneeded.so"),
+            output.path(),
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_link(output.path().join("lib/libneeded.so")).unwrap(),
+            PathBuf::from("../usr/lib/libneeded.so")
+        );
+        assert_eq!(
+            fs::read_link(output.path().join("usr/lib/libneeded.so")).unwrap(),
+            PathBuf::from("libneeded.so.2")
+        );
+        assert_eq!(
+            fs::read(output.path().join("usr/lib/libneeded.so.2")).unwrap(),
+            b"needed"
+        );
+        assert_eq!(
+            fs::read(output.path().join("lib/libneeded.so")).unwrap(),
+            b"needed"
+        );
+    }
+
+    #[test]
+    fn runtime_closure_prefers_declared_custom_library_path_and_origin_runpath() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir_all(workspace.path().join("root/database-runtime")).unwrap();
+        fs::create_dir_all(workspace.path().join("app/lib")).unwrap();
+        fs::write(
+            workspace.path().join("root/database-runtime/libhse-3.so.0"),
+            b"hse",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("app/lib/libprivate.so"), b"private").unwrap();
+        let paths = runtime_search_paths(
+            Path::new("/app/server"),
+            &[(
+                "LD_LIBRARY_PATH".to_string(),
+                "/root/database-runtime".to_string(),
+            )],
+            &[],
+            &["$ORIGIN/lib".to_string()],
+        )
+        .unwrap();
+        assert_eq!(paths[0], PathBuf::from("/root/database-runtime"));
+        assert_eq!(paths[1], PathBuf::from("/app/lib"));
+        let error = runtime_search_paths(Path::new("/app/server"), &[], &[], &["relative".into()])
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("relative target runtime search path"));
+    }
+
+    #[test]
+    fn runtime_closure_resolves_recursive_workspace_needed_chain() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = workspace.path().join("root/database-runtime");
+        fs::create_dir_all(&runtime).unwrap();
+        let grandchild_source = runtime.join("grandchild.c");
+        let child_source = runtime.join("child.c");
+        let parent_source = runtime.join("parent.c");
+        fs::write(&grandchild_source, "int grandchild(void) { return 1; }\n").unwrap();
+        fs::write(
+            &child_source,
+            "extern int grandchild(void); int child(void) { return grandchild(); }\n",
+        )
+        .unwrap();
+        fs::write(
+            &parent_source,
+            "extern int child(void); int parent(void) { return child(); }\n",
+        )
+        .unwrap();
+
+        let compile = |source: &Path, output: &Path, library: Option<&str>| {
+            let mut command = Command::new("cc");
+            command.args(["-shared", "-fPIC", "-nostdlib"]);
+            command.arg(source);
+            if let Some(library) = library {
+                command.args(["-L"]);
+                command.arg(&runtime);
+                command.arg(format!("-l{library}"));
+                command.args(["-Wl,-rpath,/root/database-runtime"]);
+            }
+            command.args(["-o"]);
+            command.arg(output);
+            assert!(command.status().unwrap().success());
+        };
+        compile(&grandchild_source, &runtime.join("libgrandchild.so"), None);
+        compile(
+            &child_source,
+            &runtime.join("libchild.so"),
+            Some("grandchild"),
+        );
+        compile(&parent_source, &runtime.join("libparent.so"), Some("child"));
+
+        let environment = vec![(
+            "LD_LIBRARY_PATH".to_string(),
+            "/root/database-runtime".to_string(),
+        )];
+        let output = tempfile::tempdir().unwrap();
+        fs::create_dir_all(output.path().join("root/database-runtime")).unwrap();
+        fs::copy(
+            runtime.join("libparent.so"),
+            output.path().join("root/database-runtime/libparent.so"),
+        )
+        .unwrap();
+        copy_elf_runtime_closure(
+            workspace.path(),
+            output.path(),
+            &[runtime.join("libparent.so")],
+            &environment,
+        )
+        .unwrap();
+        assert!(output
+            .path()
+            .join("root/database-runtime/libchild.so")
+            .is_file());
+        assert!(output
+            .path()
+            .join("root/database-runtime/libgrandchild.so")
+            .is_file());
+    }
+
+    #[test]
+    fn runtime_closure_rejects_workspace_symlink_cycle() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        fs::create_dir_all(workspace.path().join("lib")).unwrap();
+        symlink("b.so", workspace.path().join("lib/a.so")).unwrap();
+        symlink("a.so", workspace.path().join("lib/b.so")).unwrap();
+        let error = copy_runtime_path(
+            workspace.path(),
+            Path::new("/lib/a.so"),
+            output.path(),
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("symlink cycle"));
+    }
+
+    #[test]
+    fn runtime_closure_rejects_inherited_destination_symlinks() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        fs::create_dir_all(workspace.path().join("lib")).unwrap();
+        fs::write(workspace.path().join("lib/libsafe.so"), b"safe").unwrap();
+        symlink("/outside", output.path().join("lib")).unwrap();
+        let error = copy_runtime_path(
+            workspace.path(),
+            Path::new("/lib/libsafe.so"),
+            output.path(),
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("destination parent"));
+
+        let output = tempfile::tempdir().unwrap();
+        fs::create_dir_all(output.path().join("lib")).unwrap();
+        symlink("/outside", output.path().join("lib/libsafe.so")).unwrap();
+        let error = copy_runtime_path(
+            workspace.path(),
+            Path::new("/lib/libsafe.so"),
+            output.path(),
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("existing symlink"));
+    }
 }
 
 fn copy_context_entry(context_root: &Path, source: &Path, destination: &Path) -> Result<()> {

@@ -79,25 +79,55 @@ static inline bool switchboardBuildContainerNetworkIPv6(__u8 *addr6, const struc
   return true;
 }
 
-static inline bool switchboardExtractOverlayMachineFragmentFromIPv6(const __u8 *addr6, __u32 *fragment)
+// The full 32-bit overlay identity is { datacenter:8, machine:24 }.  IPv4
+// keeps its historical low-8 machine lookup separately; it must not collapse
+// IPv6 identities from different datacenters.
+static inline bool switchboardOverlayMachineIdentityIsValid(__u32 identity)
 {
-  if (addr6 == 0 || fragment == 0)
+  return (identity >> 24) != 0 && (identity & 0x00ffffffu) != 0;
+}
+
+// A datacenter route represents the remote container-network /96.  It uses
+// the same full-route map as a machine route, with the machine fragment zero.
+static inline bool switchboardOverlayDatacenterRouteIsValid(__u32 route_key)
+{
+  return (route_key >> 24) != 0 && (route_key & 0x00ffffffu) == 0;
+}
+
+static inline bool switchboardOverlayRouteKeyIsValid(__u32 route_key)
+{
+  return switchboardOverlayMachineIdentityIsValid(route_key) || switchboardOverlayDatacenterRouteIsValid(route_key);
+}
+
+static inline __u32 switchboardMakeOverlayMachineIdentity(__u8 datacenter_fragment, __u32 machine_fragment)
+{
+  if (datacenter_fragment == 0 || machine_fragment == 0 || machine_fragment > 0x00ffffffu)
+  {
+    return 0;
+  }
+
+  return ((__u32)datacenter_fragment << 24) | machine_fragment;
+}
+
+static inline __u32 switchboardMakeOverlayDatacenterRouteKey(__u8 datacenter_fragment)
+{
+  return datacenter_fragment == 0 ? 0 : ((__u32)datacenter_fragment << 24);
+}
+
+static inline bool switchboardExtractOverlayMachineIdentityFromIPv6(const __u8 *addr6, __u32 *identity)
+{
+  if (addr6 == 0 || identity == 0 || switchboardContainerNetworkPrefixMatchesIPv6(addr6) == false)
   {
     return false;
   }
 
-  if (addr6[12] == 0 && addr6[13] == 0 && addr6[14] == 0)
+  if (addr6[11] == 0 || (addr6[12] == 0 && addr6[13] == 0 && addr6[14] == 0) || addr6[15] == 0)
   {
     return false;
   }
 
-  if (addr6[15] == 0)
-  {
-    return false;
-  }
-
-  *fragment = (((__u32)addr6[12]) << 16) | (((__u32)addr6[13]) << 8) | (__u32)addr6[14];
-  return true;
+  *identity = switchboardMakeOverlayMachineIdentity(addr6[11], (((__u32)addr6[12]) << 16) | (((__u32)addr6[13]) << 8) | (__u32)addr6[14]);
+  return switchboardOverlayMachineIdentityIsValid(*identity);
 }
 
 static inline bool switchboardWormholeSourceRewriteEligibleIPv6(const __u8 *src6, const __u8 *dst6)

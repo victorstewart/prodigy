@@ -2,6 +2,9 @@
 #include <networking/includes.h>
 #include <services/debug.h>
 
+#include <bpf/libbpf.h>
+#include <ebpf/common/structs.h>
+
 #include <prodigy/neuron/neuron.h>
 #include <prodigy/quic.cid.generator.h>
 #include <switchboard/common/checksum.h>
@@ -17,6 +20,8 @@
 #include <linux/ip.h>
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
+#include <net/if.h>
+#include <sys/stat.h>
 
 class TestSuite {
 public:
@@ -639,6 +644,21 @@ static void testContainerRouterBPFPathsResolveAlongsideExecutable(TestSuite& sui
     suite.expect(resolved.equals(expected), "container_router_bpf_path_uses_executable_directory");
     suite.expect(prodigyFileReadable(resolved), "container_router_bpf_path_is_readable");
     suite.expect(failure.size() == 0, "container_router_bpf_path_keeps_failure_empty");
+
+    // Opening the ELF through libbpf only enumerates its map metadata; this
+    // focused path never loads or attaches a BPF program.
+    struct bpf_object *bpfObject = bpf_object__open_file(resolved.c_str(), nullptr);
+    bool opened = bpfObject != nullptr && libbpf_get_error(bpfObject) == 0;
+    if (suite.require(opened, "container_router_bpf_grants_map_opens_offline"))
+    {
+      struct bpf_map *grants = bpf_object__find_map_by_name(bpfObject, "ct_tcp_grants");
+      if (suite.require(grants != nullptr, "container_router_bpf_grants_map_is_present"))
+      {
+        suite.expect(bpf_map__max_entries(grants) == CONTAINER_SERVICE_PAIRINGS_MAX_ENTRIES,
+                     "container_router_bpf_grants_map_supports_authenticated_sessions");
+      }
+      bpf_object__close(bpfObject);
+    }
   }
 }
 
@@ -656,21 +676,29 @@ static void testContainerPeerOverlayRoutingSyncPopulatesMapsAndRemovesStaleEntri
   config.overlaySubnets.push_back(makePrefix("2001:db8:abcd:1234::beef/64"));
 
   SwitchboardOverlayMachineRoute route1 = {};
-  route1.machineFragment = 0x000001u;
+  route1.machineFragment = switchboardMakeOverlayMachineIdentity(1, 0x000001u);
   route1.nextHop = IPAddress("198.51.100.44", false);
   route1.sourceAddress = IPAddress("198.51.100.10", false);
   route1.useGatewayMAC = true;
 
   SwitchboardOverlayMachineRoute route2 = {};
-  route2.machineFragment = 0x000002u;
+  route2.machineFragment = switchboardMakeOverlayMachineIdentity(1, 0x000002u);
   route2.nextHop = IPAddress("2001:db8::44", true);
   route2.sourceAddress = IPAddress("2001:db8::10", true);
   route2.nextHopMAC = "fa:6d:18:7d:9f:5e"_ctv;
 
   SwitchboardOverlayMachineRoute route3 = {};
-  route3.machineFragment = 0x010102u;
+  // Same 24-bit machine tag at another datacenter must retain a distinct full
+  // route while making the IPv4 low-8 compatibility lookup ambiguous.
+  route3.machineFragment = switchboardMakeOverlayMachineIdentity(2, 0x000002u);
   route3.nextHop = IPAddress("2001:db8::45", true);
   route3.sourceAddress = IPAddress("2001:db8::11", true);
+
+  SwitchboardOverlayMachineRoute siteRoute = {};
+  siteRoute.machineFragment = switchboardMakeOverlayDatacenterRouteKey(2);
+  siteRoute.nextHop = IPAddress("2001:db8::45", true);
+  siteRoute.sourceAddress = IPAddress("2001:db8::11", true);
+  siteRoute.useGatewayMAC = true;
   route3.useGatewayMAC = true;
 
   SwitchboardOverlayMachineRoute invalidRoute = {};
@@ -681,6 +709,7 @@ static void testContainerPeerOverlayRoutingSyncPopulatesMapsAndRemovesStaleEntri
   config.machineRoutes.push_back(route1);
   config.machineRoutes.push_back(route2);
   config.machineRoutes.push_back(route3);
+  config.machineRoutes.push_back(siteRoute);
   config.machineRoutes.push_back(invalidRoute);
 
   SwitchboardOverlayHostedIngressRoute hostedIngress4 = {};
@@ -762,6 +791,12 @@ static void testContainerPeerOverlayRoutingSyncPopulatesMapsAndRemovesStaleEntri
                                          switchboardMakeOverlayMachineRouteKey(route2.machineFragment),
                                          routeValue),
                  "container_peer_overlay_sync_populates_full_route_map");
+    switchboard_overlay_machine_route siteRouteValue = {};
+    suite.expect(lookupProgramMapElement(peerProgram,
+                                         "ovl_mach_full"_ctv,
+                                         switchboardMakeOverlayMachineRouteKey(siteRoute.machineFragment),
+                                         siteRouteValue),
+                 "container_peer_overlay_sync_populates_datacenter_96_fallback_route");
     suite.expect(routeValue.family == SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV6, "container_peer_overlay_sync_preserves_route_family");
     suite.expect(routeValue.use_gateway_mac == 0, "container_peer_overlay_sync_preserves_direct_mac_flag");
     suite.expect(std::memcmp(routeValue.next_hop6, route2.nextHop.v6, sizeof(routeValue.next_hop6)) == 0, "container_peer_overlay_sync_preserves_route_next_hop");
@@ -1250,10 +1285,29 @@ static void testContainerPeerEgressRouterEnforcesSystemAllowlist(TestSuite& suit
                           "container_peer_egress_router_system_allowlist_proto_denied_runs",
                           nullptr) == NETKIT_DROP,
                  "container_peer_egress_router_system_allowlist_proto_denied_drops");
-    suite.expect(runFrame(makeIPv6L4FrameWithPayload("2606:4700:4700::100", "fd00::1", IPPROTO_TCP, 49'152, 8443, payload, true),
-                          "container_peer_egress_router_system_allowlist_ipv6_runs",
+
+    container_egress_allow6_key allow6 = {};
+    allow6.proto = IPPROTO_UDP;
+    allow6.port = htons(8443);
+    parseIPv6Bytes("2606:4700:4700::100", allow6.addr);
+    suite.expect(updateProgramMapElement(peerProgram, "ct_egr_allow6"_ctv, allow6, allowed),
+                 "container_peer_egress_router_system_allowlist_sets_ipv6_udp_rule");
+    suite.expect(runFrame(makeIPv6L4FrameWithPayload("fd00::2", "2606:4700:4700::100", IPPROTO_UDP, 49'152, 8443, payload, true),
+                          "container_peer_egress_router_system_allowlist_ipv6_allowed_runs",
+                          nullptr) == NETKIT_PASS,
+                 "container_peer_egress_router_system_allowlist_ipv6_udp_exact_peer_passes");
+    suite.expect(runFrame(makeIPv6L4FrameWithPayload("fd00::2", "2606:4700:4700::101", IPPROTO_UDP, 49'152, 8443, payload, true),
+                          "container_peer_egress_router_system_allowlist_ipv6_wrong_peer_runs",
                           nullptr) == NETKIT_DROP,
-                 "container_peer_egress_router_system_allowlist_ipv6_drops");
+                 "container_peer_egress_router_system_allowlist_ipv6_wrong_peer_drops");
+    suite.expect(runFrame(makeIPv6L4FrameWithPayload("fd00::2", "2606:4700:4700::100", IPPROTO_TCP, 49'152, 8443, payload, true),
+                          "container_peer_egress_router_system_allowlist_ipv6_wrong_protocol_runs",
+                          nullptr) == NETKIT_DROP,
+                 "container_peer_egress_router_system_allowlist_ipv6_wrong_protocol_drops");
+    suite.expect(runFrame(makeIPv6L4FrameWithPayload("fd00::2", "2606:4700:4700::100", IPPROTO_UDP, 49'152, 53, payload, true),
+                          "container_peer_egress_router_system_allowlist_ipv6_wrong_port_runs",
+                          nullptr) == NETKIT_DROP,
+                 "container_peer_egress_router_system_allowlist_ipv6_wrong_port_drops");
   }
 
   peerProgram.close();
@@ -2417,6 +2471,228 @@ static void testDeclaredNetworkPairingRevocationPreservesUnrelatedFlows(TestSuit
   peerProgram.close();
 }
 
+static void testPrivateSessionExactFlowLease(TestSuite& suite)
+{
+  String egressPath(PRODIGY_TEST_BINARY_DIR), ingressPath(PRODIGY_TEST_BINARY_DIR);
+  egressPath.append("/container.egress.router.ebpf.o"_ctv);
+  ingressPath.append("/container.ingress.router.ebpf.o"_ctv);
+  BPFProgram egress = {}, ingress = {};
+  if (!suite.require(egress.load(egressPath, "ct_egress"_ctv), "private_session_load_egress") ||
+      !suite.require(ingress.load(ingressPath, "ct_ingress"_ctv), "private_session_load_ingress")) return;
+  local_container_subnet6 sourceSubnet = {}, targetSubnet = {};
+  sourceSubnet.dpfx = 1; sourceSubnet.mpfx[2] = 10;
+  targetSubnet.dpfx = 2; targetSubnet.mpfx[2] = 11;
+  egress.setArrayElement("lc_subnet"_ctv, 0, sourceSubnet);
+  ingress.setArrayElement("lc_subnet"_ctv, 0, targetSubnet);
+  constexpr const char *sourceIP = "fdf8:d94c:7c33:e26e:ca4b:f501:0:a01";
+  constexpr const char *targetIP = "fdf8:d94c:7c33:e26e:ca4b:f502:0:b02";
+  flow_key forward = {}, reverse = {};
+  parseIPv6Bytes(sourceIP, reinterpret_cast<uint8_t *>(forward.srcv6));
+  parseIPv6Bytes(targetIP, reinterpret_cast<uint8_t *>(forward.dstv6));
+  forward.port16[0] = htons(58001); forward.port16[1] = htons(43105); forward.proto = IPPROTO_TCP;
+  std::memcpy(reverse.srcv6, forward.dstv6, 16); std::memcpy(reverse.dstv6, forward.srcv6, 16);
+  reverse.port16[0] = forward.port16[1]; reverse.port16[1] = forward.port16[0]; reverse.proto = IPPROTO_TCP;
+  auto run = [&](BPFProgram& program, uint16_t port, bool syn, bool reset = false) {
+    Vector<uint8_t> payload = {}, output = {};
+    Vector<uint8_t> frame = makeIPv6L4FrameWithPayload(sourceIP, targetIP, IPPROTO_TCP,
+                                                     port, 43105, payload, true);
+    auto *ip = reinterpret_cast<ipv6hdr *>(frame.data() + sizeof(ethhdr));
+    auto *tcp = reinterpret_cast<tcphdr *>(ip + 1);
+    tcp->syn = syn; tcp->ack = !syn; tcp->rst = reset; tcp->check = 0;
+    tcp->check = checksumIPv6Transport(ip->saddr.s6_addr, ip->daddr.s6_addr, IPPROTO_TCP,
+                                      tcp, sizeof(tcphdr), __builtin_offsetof(tcphdr, check));
+    output.resize(frame.size() + 64);
+    LIBBPF_OPTS(bpf_test_run_opts, opts, .data_in = frame.data(), .data_out = output.data(),
+                .data_size_in = static_cast<__u32>(frame.size()),
+                .data_size_out = static_cast<__u32>(output.size()), .repeat = 1, );
+    const int result = bpf_prog_test_run_opts(program.prog_fd, &opts);
+    suite.expect(result == 0, "private_session_packet_run");
+    return result == 0 ? int(opts.retval) : -1;
+  };
+  for (uint8_t mode : {uint8_t(CONTAINER_NETWORK_UNRESTRICTED), uint8_t(CONTAINER_NETWORK_DECLARED_ONLY)}) {
+    container_network_policy source = {}, destination = {};
+    source.mode = destination.mode = mode;
+    source.interContainerMTU = destination.interContainerMTU = 9000;
+    source.containerFragment = 1; destination.containerFragment = 2;
+    egress.setArrayElement("ct_net_policy"_ctv, 0, source);
+    ingress.setArrayElement("ct_net_policy"_ctv, 0, destination);
+    (void)deleteProgramMapElement(egress, "ct_tcp_flows"_ctv, forward);
+    (void)deleteProgramMapElement(ingress, "ct_tcp_flows"_ctv, reverse);
+    suite.expect(run(egress, 58001, true) == NETKIT_DROP &&
+                 run(ingress, 58001, true) == NETKIT_DROP, "private_session_ungranted_syn_rejected");
+    container_tcp_authorization grant = {};
+    grant.authorizationExpiresAtNs = UINT64_MAX;
+    grant.authorizationHi = 11; grant.authorizationLo = 22;
+    suite.require(updateProgramMapElement(egress, "ct_tcp_grants"_ctv, forward, grant) &&
+                  updateProgramMapElement(ingress, "ct_tcp_grants"_ctv, reverse, grant),
+                  "private_session_exact_grants_installed");
+    suite.expect(run(egress, 58001, true) == NETKIT_PASS &&
+                 run(ingress, 58001, true) == NETKIT_PASS, "private_session_exact_syn_allowed");
+    source.isolationOwnerLo = destination.isolationOwnerLo = 42;
+    source.isolationDeadlineNs = destination.isolationDeadlineNs = UINT64_MAX;
+    egress.setArrayElement("ct_net_policy"_ctv, 0, source);
+    ingress.setArrayElement("ct_net_policy"_ctv, 0, destination);
+    suite.expect(run(egress, 58001, true) == NETKIT_DROP && run(ingress, 58001, true) == NETKIT_DROP,
+                 "writer_isolation_blocks_both_packet_directions");
+    source.isolationDeadlineNs = destination.isolationDeadlineNs = 1;
+    egress.setArrayElement("ct_net_policy"_ctv, 0, source);
+    ingress.setArrayElement("ct_net_policy"_ctv, 0, destination);
+    suite.expect(run(egress, 58001, true) == NETKIT_PASS && run(ingress, 58001, true) == NETKIT_PASS,
+                 "writer_isolation_kernel_expiry_restores_previous_policy");
+    source.isolationDeadlineNs = destination.isolationDeadlineNs = 0;
+    source.isolationOwnerLo = destination.isolationOwnerLo = 0;
+    egress.setArrayElement("ct_net_policy"_ctv, 0, source);
+    ingress.setArrayElement("ct_net_policy"_ctv, 0, destination);
+    suite.expect(run(egress, 58002, true) == NETKIT_DROP &&
+                 run(ingress, 58002, true) == NETKIT_DROP, "private_session_other_source_port_rejected");
+    suite.expect(run(egress, 58001, false) == NETKIT_PASS &&
+                 run(ingress, 58001, false) == NETKIT_PASS, "private_session_established_flow_allowed");
+    suite.expect(run(egress, 58001, false, true) == NETKIT_PASS &&
+                 run(ingress, 58001, false, true) == NETKIT_PASS, "private_session_reset_allowed");
+    suite.expect(run(egress, 58001, true) == NETKIT_PASS &&
+                 run(ingress, 58001, true) == NETKIT_PASS, "private_session_reset_preserves_lease");
+    suite.require(deleteProgramMapElement(egress, "ct_tcp_flows"_ctv, forward) &&
+                  deleteProgramMapElement(ingress, "ct_tcp_flows"_ctv, reverse),
+                  "private_session_learned_cache_evicted");
+    suite.expect(run(egress, 58001, true) == NETKIT_PASS &&
+                 run(ingress, 58001, true) == NETKIT_PASS, "private_session_cache_eviction_preserves_lease");
+    container_tcp_flow idle = {}; idle.expiresAtNs = UINT64_MAX;
+    suite.require(updateProgramMapElement(egress, "ct_tcp_flows"_ctv, forward, idle) &&
+                  updateProgramMapElement(ingress, "ct_tcp_flows"_ctv, reverse, idle),
+                  "private_session_long_idle_cache_installed");
+    // A long idle-flow deadline must never outlive the authenticated lease.
+    grant.authorizationExpiresAtNs = 1;
+    suite.require(updateProgramMapElement(egress, "ct_tcp_grants"_ctv, forward, grant) &&
+                  updateProgramMapElement(ingress, "ct_tcp_grants"_ctv, reverse, grant),
+                  "private_session_lease_expired_independently");
+    suite.expect(run(egress, 58001, false) == NETKIT_DROP &&
+                 run(ingress, 58001, false) == NETKIT_DROP, "private_session_expiry_rejects_established_flow");
+    grant.authorizationExpiresAtNs = UINT64_MAX;
+    suite.require(updateProgramMapElement(egress, "ct_tcp_grants"_ctv, forward, grant) &&
+                  updateProgramMapElement(ingress, "ct_tcp_grants"_ctv, reverse, grant),
+                  "private_session_exact_lease_renewed");
+    suite.expect(run(egress, 58001, false) == NETKIT_PASS &&
+                 run(ingress, 58001, false) == NETKIT_PASS, "private_session_renewed_flow_allowed");
+    suite.require(deleteProgramMapElement(egress, "ct_tcp_grants"_ctv, forward) &&
+                  deleteProgramMapElement(ingress, "ct_tcp_grants"_ctv, reverse),
+                  "private_session_exact_grants_revoked");
+    suite.expect(run(egress, 58001, false) == NETKIT_DROP &&
+                 run(ingress, 58001, false) == NETKIT_DROP, "private_session_revoked_flow_cannot_relearn");
+  }
+  ingress.close(); egress.close();
+}
+
+static void testWriterIsolationPolicyLease(TestSuite& suite)
+{
+  String out = {}; out.assign(PRODIGY_TEST_BINARY_DIR); out.append("/container.egress.router.declared.ebpf.o"_ctv);
+  String in = {}; in.assign(PRODIGY_TEST_BINARY_DIR); in.append("/container.ingress.router.declared.ebpf.o"_ctv);
+  BPFProgram peer = {}, primary = {};
+  if (!suite.require(peer.load(out, "ct_egress"_ctv) && primary.load(in, "ct_ingress"_ctv),
+                     "writer_isolation_loads_both_policy_owners")) return;
+  container_network_policy normal = {}; normal.mode = CONTAINER_NETWORK_DECLARED_ONLY;
+  peer.setArrayElement("ct_net_policy"_ctv, 0, normal); primary.setArrayElement("ct_net_policy"_ctv, 0, normal);
+  Container container = {}; container.peer_program = &peer; container.primary_program = &primary;
+  const uint64_t now = 1'000'000'000ULL, deadline = now + 5'000'000'000ULL;
+  suite.expect(container.applyQualificationIsolation(42, now, deadline, false), "writer_isolation_installs_both");
+  bool active = false;
+  suite.expect(container.qualificationIsolationActive(42, now, active) && active, "writer_isolation_reads_exact_lease");
+  suite.expect(!container.applyQualificationIsolation(43, now, deadline, false), "writer_isolation_rejects_other_owner");
+  suite.expect(!container.applyQualificationIsolation(42, now, deadline + 1, false), "writer_isolation_retry_cannot_extend");
+  suite.expect(container.qualificationIsolationActive(42, deadline, active) && !active, "writer_isolation_expires");
+  suite.expect(container.applyQualificationIsolation(42, deadline, 0, true), "writer_isolation_release_clears_both");
+  bool frozen = false;
+  primary.openMap("ct_net_policy"_ctv, [&](int fd) { frozen = fd >= 0 && bpf_map_freeze(fd) == 0; });
+  if (suite.require(frozen, "writer_isolation_freezes_second_map_for_rollback")) {
+    suite.expect(!container.applyQualificationIsolation(44, now, deadline, false), "writer_isolation_second_map_failure_rejected");
+    container_network_policy first = {}; const __u32 key = 0;
+    suite.expect(lookupProgramMapElement(peer, "ct_net_policy"_ctv, key, first) &&
+        !first.isolationDeadlineNs && !first.isolationOwnerHi && !first.isolationOwnerLo,
+        "writer_isolation_second_map_failure_rolls_back_first");
+  }
+  container.peer_program = nullptr; container.primary_program = nullptr;
+  primary.close(); peer.close();
+}
+
+static void testAdoptedHostIngressOverlaySync(TestSuite& suite)
+{
+  const char *parentNet = std::getenv("NAMETAG_PACKET_PARENT_NETNS");
+  char currentNet[128] = {};
+  const ssize_t currentNetLength = ::readlink("/proc/self/ns/net", currentNet, sizeof(currentNet) - 1);
+  struct stat currentMount = {}, initMount = {}, currentNetStat = {}, initNetStat = {};
+  const unsigned int loopback = if_nametoindex("lo");
+  if (!suite.require(parentNet && *parentNet && currentNetLength > 0 &&
+                         std::strcmp(parentNet, currentNet) != 0 &&
+                         ::stat("/proc/self/ns/net", &currentNetStat) == 0 &&
+                         ::stat("/proc/1/ns/net", &initNetStat) == 0 &&
+                         (currentNetStat.st_dev != initNetStat.st_dev || currentNetStat.st_ino != initNetStat.st_ino) &&
+                         ::stat("/proc/self/ns/mnt", &currentMount) == 0 &&
+                         ::stat("/proc/1/ns/mnt", &initMount) == 0 &&
+                         (currentMount.st_dev != initMount.st_dev || currentMount.st_ino != initMount.st_ino) &&
+                         loopback != 0,
+                     "adopted_ingress_requires_private_test_namespace")) return;
+  String path = {};
+  path.assign(PRODIGY_TEST_BINARY_DIR);
+  path.append("/host.ingress.router.ebpf.o"_ctv);
+  BPFProgram loaded = {}, adopted = {};
+  if (!suite.require(loaded.loadAttach(BPF_TCX_INGRESS, int(loopback), path, "host_ingress"_ctv),
+                     "adopted_ingress_attaches_production_program_to_private_loopback")) return;
+  struct bpf_prog_info info = {};
+  uint32_t infoLength = sizeof(info);
+  const int infoResult = bpf_prog_get_info_by_fd(loaded.prog_fd, &info, &infoLength);
+  const int infoError = errno;
+  const bool reopened = infoResult == 0 && info.id != 0 &&
+      adopted.loadPreattached(BPF_TCX_INGRESS, int(loopback), info.id, path);
+  if (!reopened)
+    std::fprintf(stderr, "adopted ingress reopen failed info_result=%d info_errno=%d id=%u name=%s maps=%u reopen_errno=%d path=%s\n",
+                 infoResult, infoError, info.id, info.name, info.nr_map_ids, errno, path.c_str());
+  if (!suite.require(reopened, "adopted_ingress_recovers_program_map_view")) return;
+  suite.expect(!programHasMap(adopted, "ovl_mach_low8"_ctv) && !programHasMap(adopted, "ovl_config"_ctv),
+               "adopted_ingress_omits_unreferenced_legacy_maps");
+  suite.expect(programHasMap(adopted, "ovl_pfx4"_ctv) && programHasMap(adopted, "ovl_pfx6"_ctv) &&
+                   programHasMap(adopted, "ovl_mach_full"_ctv) && programHasMap(adopted, "ovl_site_rts_v2"_ctv) &&
+                   programHasMap(adopted, "ovl_host4"_ctv) && programHasMap(adopted, "ovl_host6"_ctv) &&
+                   programHasMap(adopted, "ovl_peer4"_ctv) && programHasMap(adopted, "ovl_peer6"_ctv),
+               "adopted_ingress_retains_required_routing_and_peer_maps");
+
+  SwitchboardOverlayRoutingConfig config = {};
+  config.containerNetworkViaOverlay = true;
+  config.overlaySubnets.push_back(makePrefix("2001:db8:100::/96"));
+  SwitchboardOverlayMachineRoute route = {};
+  route.machineFragment = switchboardMakeOverlayDatacenterRouteKey(2);
+  route.nextHop = IPAddress("2001:db8::45", true);
+  route.sourceAddress = IPAddress("2001:db8::11", true);
+  route.useGatewayMAC = true;
+  config.machineRoutes.push_back(route);
+
+  ProdigyOverlayPresenceMirror<switchboard_overlay_prefix4_key> p4 = {};
+  ProdigyOverlayPresenceMirror<switchboard_overlay_prefix6_key> p6 = {};
+  ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route> full = {}, low = {};
+  ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_site_route_set> sites = {};
+  ProdigyOverlayValueMirror<switchboard_overlay_prefix4_key, switchboard_overlay_hosted_ingress_route4> host4 = {};
+  ProdigyOverlayValueMirror<switchboard_overlay_prefix6_key, switchboard_overlay_hosted_ingress_route6> host6 = {};
+  ProdigyOverlayPresenceMirror<switchboard_overlay_ingress_peer4_key> peers4 = {};
+  ProdigyOverlayPresenceMirror<switchboard_overlay_ingress_peer6_key> peers6 = {};
+  suite.expect(!prodigySyncOverlayEgressRoutingProgram(&adopted, config, p4, p6, full, low, sites, host4, host6, false),
+               "adopted_ingress_generic_role_fails_without_low8_map");
+  const bool converged = prodigySyncOverlayEgressRoutingProgram(&adopted, config, p4, p6, full, low, sites, host4, host6, true) &&
+      prodigySyncOverlayIngressPeers(&adopted, config, peers4, peers6);
+  switchboard_overlay_site_route_set site = {};
+  suite.expect(converged && lookupProgramMapElement(adopted, "ovl_site_rts_v2"_ctv,
+                   switchboardMakeOverlayMachineRouteKey(route.machineFragment), site),
+               "adopted_ingress_sync_converges_and_installs_site_route");
+
+  String wrongPath = {};
+  wrongPath.assign(PRODIGY_TEST_BINARY_DIR);
+  wrongPath.append("/container.ingress.router.ebpf.o"_ctv);
+  BPFProgram wrong = {};
+  if (suite.require(wrong.load(wrongPath, "ct_ingress"_ctv),
+                    "adopted_ingress_negative_loads_non_host_program")) {
+    suite.expect(!programHasMap(wrong, "ovl_site_rts_v2"_ctv) &&
+                     !prodigySyncOverlayEgressRoutingProgram(&wrong, config, p4, p6, full, low, sites, host4, host6, true),
+                 "adopted_ingress_missing_required_site_map_fails_sync");
+  }
+}
+
 int main(void)
 {
   if (const char *only = std::getenv("PRODIGY_TEST_ONLY");
@@ -2435,6 +2711,26 @@ int main(void)
 
   TestSuite suite = {};
   if (const char *only = std::getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && std::strcmp(only, "adopted-host-ingress-overlay") == 0)
+  {
+    testAdoptedHostIngressOverlaySync(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && std::strcmp(only, "writer-isolation-policy") == 0)
+  {
+    testWriterIsolationPolicyLease(suite);
+    testPrivateSessionExactFlowLease(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && std::strcmp(only, "private-session-flow") == 0)
+  {
+    testPrivateSessionExactFlowLease(suite);
+    testDeclaredNetworkIdleTCPFlowReauthorization(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY");
       only != nullptr && std::strcmp(only, "container-peer-runtime-sync") == 0)
   {
     testContainerPeerRuntimeSyncPopulatesAndClearsWormholeEgressBindings(suite);
@@ -2442,6 +2738,8 @@ int main(void)
   }
 
   testContainerRouterBPFPathsResolveAlongsideExecutable(suite);
+  if (std::getenv("NAMETAG_PACKET_PARENT_NETNS") != nullptr)
+    testAdoptedHostIngressOverlaySync(suite);
   testContainerPeerOverlayRoutingSyncPopulatesMapsAndRemovesStaleEntries(suite);
   testContainerPeerRuntimeSyncPopulatesAndClearsWormholeEgressBindings(suite);
   testSystemEgressPolicyConstrainsIPv4(suite);

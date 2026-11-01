@@ -23,6 +23,21 @@ static String digest(char byte)
   return result;
 }
 
+// Frozen v1 layout, independent of the new conditional serializer branches.
+struct LocalRecoveryRequestV1Fixture { MothershipLocalAuthorityRecoveryCohortRequest value; };
+template<typename S> static void serialize(S&& s,LocalRecoveryRequestV1Fixture& old) {
+  auto& r=old.value;s.value4b(r.protocolVersion);s.value16b(r.operationUUID);s.value16b(r.clusterUUID);
+  s.value8b(r.topologyVersion);s.value4b(r.timeoutMilliseconds);s.object(r.executors);
+}
+struct LocalRecoveryRecordV1Fixture {
+  uint32_t version=1;LocalRecoveryRequestV1Fixture request;
+  MothershipLocalAuthorityRecoveryPhase phase=MothershipLocalAuthorityRecoveryPhase::admitted;
+  Vector<MothershipLocalAuthorityRecoveryBoundaryProgress> boundaries;
+};
+template<typename S> static void serialize(S&& s,LocalRecoveryRecordV1Fixture& old) {
+  s.value4b(old.version);s.object(old.request);s.value1b(old.phase);s.object(old.boundaries);
+}
+
 static MothershipPhysicalFaultMachineObservation observation(uint128_t cluster, uint128_t machine,
                                                              uint64_t topology, char state)
 {
@@ -80,7 +95,9 @@ int main(void)
   const std::string prepareProductionPairCommand = providerSection(
       "void runPrepareProductionPair", "void runRegisterLocalVMBoundary");
   const std::string localAction = providerSection(
-      "bool runLocalVMBoundaryExecutorAction", "void runPrepareProductionPair");
+      "bool runLocalVMBoundaryExecutorAction", "enum class LocalAuthorityRecoveryExecutorPhase");
+  const std::string physicalIdentity = providerSection(
+      "static bool physicalFaultProviderIdentityMatches", "bool parsePhysicalFaultProviderReceipt");
   const std::string physicalReceipt = providerSection(
       "bool parsePhysicalFaultProviderReceipt", "bool describePhysicalFaultExecutorBoundary");
   const std::string physicalArguments = providerSection(
@@ -157,13 +174,30 @@ int main(void)
   suite.expect(!localAction.empty() && localAction.find("assignItoh") == std::string::npos &&
                    localAction.find("mothershipAssignProviderHex128(operationUUID, operation);") != std::string::npos,
                "local_vm_fault_operation_uses_exact_provider_hex");
-  suite.expect(!physicalReceipt.empty() && physicalReceipt.find("assignItoh") == std::string::npos &&
-                   physicalReceipt.find("mothershipAssignProviderHex128(operationUUID, expectedOperation);") != std::string::npos &&
-                   physicalReceipt.find("mothershipAssignProviderHex128(guestUUID, expectedGuest);") != std::string::npos &&
+  suite.expect(!physicalIdentity.empty() && physicalIdentity.find("assignItoh") == std::string::npos &&
+                   physicalIdentity.find("mothershipAssignProviderHex128(request.operationUUID, expectedOperation);") != std::string::npos &&
+                   physicalIdentity.find("mothershipAssignProviderHex128(request.guestUUID, expectedGuest);") != std::string::npos &&
                    !physicalArguments.empty() && physicalArguments.find("assignItoh") == std::string::npos &&
-                   physicalArguments.find("mothershipAssignProviderHex128(operationUUID, operation);") != std::string::npos &&
-                   physicalArguments.find("mothershipAssignProviderHex128(guestUUID, guest);") != std::string::npos,
+                   physicalArguments.find("mothershipAssignProviderHex128(request.operationUUID, operation);") != std::string::npos &&
+                   physicalArguments.find("mothershipAssignProviderHex128(request.guestUUID, guest);") != std::string::npos,
                "physical_fault_provider_wire_identities_use_exact_provider_hex");
+  const std::string physicalLifecycle = providerSection(
+      "bool runPhysicalFaultProviderLifecycle", "void runFaultClusterNetwork");
+  suite.expect(!physicalLifecycle.empty() &&
+                   physicalLifecycle.find("physicalFaultProviderRequestValid") != std::string::npos &&
+                   physicalLifecycle.find("parsePhysicalFaultProviderReceipt(output, request, allowActive, allowTerminal") != std::string::npos &&
+                   physicalLifecycle.find("\"apply\", request, true, false") != std::string::npos &&
+                   physicalLifecycle.find("\"query\", request, true, true") != std::string::npos &&
+                   physicalLifecycle.find("\"remove\", request, false, true") != std::string::npos,
+               "physical_fault_provider_lifecycle_requires_exact_apply_query_remove_receipts");
+  suite.expect(!physicalReceipt.empty() &&
+                   physicalReceipt.find("object.size() == 15") != std::string::npos &&
+                   physicalReceipt.find("object.size() == 13") != std::string::npos &&
+                   physicalReceipt.find("object[\"gatewayEndpoint\"]") != std::string::npos &&
+                   physicalReceipt.find("object[\"flowTarget\"]") != std::string::npos &&
+                   physicalReceipt.find("object[\"flowIdentity\"]") != std::string::npos &&
+                   physicalReceipt.find("object[\"autoRestoreDeadlineMonotonicMs\"]") != std::string::npos,
+               "physical_fault_provider_receipts_have_disjoint_exact_active_and_terminal_schemas");
 
   uint128_t verifiedVMUUID = 0;
   suite.expect(mothershipParseVerifiedLocalVMIdentity(
@@ -227,6 +261,20 @@ int main(void)
   network.sourceTopologyVersion = 7; network.targetTopologyVersion = 9;
   suite.expect(mothershipPhysicalClusterNetworkFaultRequestValid(network, &failure) && failure.empty(),
                "network_request_accepts_exact_bounded_authority");
+  auto masqueGateway = network;
+  masqueGateway.flowTarget = MothershipPhysicalFaultFlowTarget::masqueGateway;
+  masqueGateway.gatewayEndpoint = "198.51.100.40"_ctv;
+  masqueGateway.flowIdentity = "masque:gateway-40/session-7"_ctv;
+  suite.expect(mothershipPhysicalClusterNetworkFaultRequestValid(masqueGateway, &failure) && failure.empty(),
+               "network_request_binds_exact_masque_gateway_and_flow");
+  auto unsafeFlow = masqueGateway;
+  unsafeFlow.flowIdentity.clear();
+  suite.expect(!mothershipPhysicalClusterNetworkFaultRequestValid(unsafeFlow, &failure),
+               "network_request_rejects_unidentified_masque_or_bgp_flow");
+  unsafeFlow = masqueGateway;
+  unsafeFlow.gatewayEndpoint = "not-an-address"_ctv;
+  suite.expect(!mothershipPhysicalClusterNetworkFaultRequestValid(unsafeFlow, &failure),
+               "network_request_rejects_unproven_gateway_endpoint");
 
   MothershipPhysicalClusterNetworkFaultReceipt networkReceipt = {};
   networkReceipt.operationUUID = network.operationUUID; networkReceipt.boundaryUUID = network.boundaryUUID;
@@ -318,6 +366,51 @@ int main(void)
   suite.expect(!mothershipLocalVMMachineFaultRequestValid(localReplay, &failure),
                "local_vm_request_rejects_untyped_boot_identity");
 
+  MothershipLocalVMMachineFaultRequest unready = local;
+  unready.protocolVersion = MothershipLocalVMMachineFaultRequest::unreadyUpgradeRecoveryVersion;
+  unready.operationUUID = 0x5002;
+  unready.action = MothershipLocalVMMachineFaultAction::recoverUnreadyUpgrade;
+  unready.upgradeOperationUUID = 0x9001;
+  unready.targetBundleSHA256 = digest('1');
+  unready.targetContractSHA256 = digest('2');
+  unready.upgradeAdmissionSHA256 = digest('3');
+  unready.expectedBoundarySHA256 = digest('4');
+  for (uint32_t index = 0; index != 32; ++index) unready.expectedLinuxMachineID.append('5');
+  unready.expectedLinuxBootID = "12345678-1234-4abc-8def-123456789abc"_ctv;
+  unready.expectedQemuPID = 42; unready.expectedQemuStarttime = "700"_ctv;
+  unready.incompleteObservationReceiptVersion = 7;
+  suite.expect(mothershipLocalVMMachineFaultRequestValid(unready, &failure) && failure.empty(),
+               "unready_vm_recovery_binds_upgrade_boundary_process_and_linux_boot");
+  auto unboundUnready = unready; unboundUnready.expectedLinuxBootID.clear();
+  suite.expect(!mothershipLocalVMMachineFaultRequestValid(unboundUnready, &failure),
+               "unready_vm_recovery_rejects_missing_linux_boot_identity");
+  unboundUnready = unready; unboundUnready.action = MothershipLocalVMMachineFaultAction::coldReboot;
+  suite.expect(!mothershipLocalVMMachineFaultRequestValid(unboundUnready, &failure),
+               "unready_vm_recovery_is_distinct_from_the_healthy_fault_mode");
+
+  MothershipLocalVMMachineFaultReceipt unreadyReceipt = localReceipt;
+  unreadyReceipt.protocolVersion = MothershipLocalVMMachineFaultReceipt::unreadyUpgradeRecoveryVersion;
+  unreadyReceipt.operationUUID = unready.operationUUID;
+  unreadyReceipt.beforeLinuxMachineID = unready.expectedLinuxMachineID;
+  unreadyReceipt.beforeLinuxBootID = unready.expectedLinuxBootID;
+  unreadyReceipt.beforeQemuPID = unready.expectedQemuPID;
+  unreadyReceipt.beforeQemuStarttime = unready.expectedQemuStarttime;
+  unreadyReceipt.afterLinuxMachineID = unready.expectedLinuxMachineID;
+  unreadyReceipt.afterLinuxBootID = "abcdef12-3456-4abc-8def-123456789abc"_ctv;
+  unreadyReceipt.afterQemuPID = 43; unreadyReceipt.afterQemuStarttime = "800"_ctv;
+  unreadyReceipt.completedObservationReceiptVersion = 8;
+  unreadyReceipt.completedUpgradeReportSHA256 = digest('6');
+  suite.expect(mothershipLocalVMMachineFaultReceiptValid(unready, unreadyReceipt, &failure) && failure.empty(),
+               "unready_vm_recovery_receipt_requires_new_linux_boot_and_fresh_complete_inventory");
+  auto incompleteInventoryReceipt = unreadyReceipt;
+  incompleteInventoryReceipt.completedObservationReceiptVersion = 7;
+  suite.expect(!mothershipLocalVMMachineFaultReceiptValid(unready, incompleteInventoryReceipt, &failure),
+               "unready_vm_recovery_receipt_rejects_nonadvancing_inventory");
+  auto unchangedLinuxBootReceipt = unreadyReceipt;
+  unchangedLinuxBootReceipt.afterLinuxBootID = unready.expectedLinuxBootID;
+  suite.expect(!mothershipLocalVMMachineFaultReceiptValid(unready, unchangedLinuxBootReceipt, &failure),
+               "unready_vm_recovery_receipt_rejects_unchanged_linux_boot");
+
   MothershipLocalAuthorityRecoveryCohortRequest cohort = {};
   cohort.operationUUID = 0x9001; cohort.clusterUUID = 0x9002; cohort.topologyVersion = 17;
   cohort.timeoutMilliseconds = mothershipLocalAuthorityRecoveryMinimumTimeoutMilliseconds;
@@ -364,6 +457,28 @@ int main(void)
   recoveryTopology.machines[1].lifetime = MachineLifetime::reserved;
   suite.expect(!mothershipLocalAuthorityRecoveryTopologyMatches(cohort, recoveryTopology),
                "authority_recovery_rejects_newer_topology_with_boundary_ownership_drift");
+
+  LocalRecoveryRequestV1Fixture legacyRequest;legacyRequest.value=cohort;
+  String legacyRequestBytes,currentRequestBytes;
+  BitseryEngine::serialize(legacyRequestBytes,legacyRequest);BitseryEngine::serialize(currentRequestBytes,cohort);
+  suite.expect(legacyRequestBytes==currentRequestBytes,"local_recovery_v1_request_bytes_preserved");
+  LocalRecoveryRecordV1Fixture legacy;legacy.request=legacyRequest;
+  for(const auto& executor:cohort.executors) {
+    MothershipLocalAuthorityRecoveryBoundaryProgress p;p.boundaryUUID=executor.boundaryUUID;
+    legacy.boundaries.push_back(p);
+  }
+  String legacyBytes,currentBytes;BitseryEngine::serialize(legacyBytes,legacy);
+  MothershipLocalAuthorityRecoveryCohortRecord decoded;
+  suite.expect(BitseryEngine::deserializeSafe(legacyBytes,decoded) &&
+      mothershipLocalAuthorityRecoveryCohortRecordValid(decoded,&failure),"local_recovery_reads_frozen_v1_record");
+  BitseryEngine::serialize(currentBytes,decoded);
+  suite.expect(currentBytes==legacyBytes && decoded.runtimeProgress.empty(),"local_recovery_v1_record_roundtrip_byte_exact");
+  auto invalidRuntime=cohort;invalidRuntime.protocolVersion=2;
+  suite.expect(!mothershipLocalAuthorityRecoveryCohortRequestValid(invalidRuntime,&failure),
+               "local_runtime_repair_rejects_unbound_version_two_request");
+  decoded.protocolVersion=2;
+  suite.expect(!mothershipLocalAuthorityRecoveryCohortRecordValid(decoded,&failure),
+               "local_runtime_repair_cannot_reinterpret_legacy_recovery_record");
 
   return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

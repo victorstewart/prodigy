@@ -1,5 +1,6 @@
 #include <switchboard/pair.control.h>
 #include "persistence_fixture.h"
+#include "owned_ipv6_fixture.h"
 
 #include <array>
 #include <chrono>
@@ -17,6 +18,7 @@ constexpr uint128_t firstNodeUUID = 0x7b01;
 constexpr uint128_t secondNodeUUID = 0x7b02;
 constexpr uint16_t controlPort = 15315;
 constexpr uint32_t pairControlFanoutWidth = 3;
+IPAddress localTestAddress = {};
 
 struct PairProjections {
   ProdigyLocalClusterPairControlProjection first = {};
@@ -27,14 +29,27 @@ struct PairFanoutProjections {
   std::array<ProdigyLocalClusterPairControlProjection, pairControlFanoutWidth * 2> nodes = {};
 };
 
-static ClusterPairControlEndpoint endpoint(uint128_t clusterUUID, uint128_t nodeUUID, const char *address)
+static ClusterPairControlEndpoint endpoint(uint128_t clusterUUID, uint128_t nodeUUID, const char *address,
+                                           uint16_t port = controlPort)
 {
   ClusterPairControlEndpoint value = {};
   value.clusterUUID = clusterUUID;
   value.nodeUUID = nodeUUID;
   value.role = ClusterPairControlNodeRole::switchboard;
   value.address = IPAddress(address, true);
-  value.port = controlPort;
+  value.port = port;
+  return value;
+}
+
+static ClusterPairControlEndpoint ownedEndpoint(uint128_t clusterUUID, uint128_t nodeUUID,
+                                                uint16_t port = controlPort)
+{
+  ClusterPairControlEndpoint value = {};
+  value.clusterUUID = clusterUUID;
+  value.nodeUUID = nodeUUID;
+  value.role = ClusterPairControlNodeRole::switchboard;
+  value.address = localTestAddress;
+  value.port = port;
   return value;
 }
 
@@ -72,8 +87,8 @@ static bool buildComplementaryProjections(PairProjections& output, uint64_t comm
   root.rootGeneration = 5;
   for (uint32_t index = 0; index < root.root.size(); ++index) root.root[index] = uint8_t(index + 1);
 
-  const auto initiator = endpoint(firstClusterUUID, firstNodeUUID, "fd00:ffff:1234::1");
-  const auto responder = endpoint(secondClusterUUID, secondNodeUUID, "fd00:ffff:1234::2");
+  const auto initiator = ownedEndpoint(firstClusterUUID, firstNodeUUID);
+  const auto responder = ownedEndpoint(secondClusterUUID, secondNodeUUID);
   ClusterPairControlResolver firstResolver = {}, secondResolver = {};
   if (!clusterPairPrepareControlResolver(root, initiator, responder, initiator, responder, 11,
                                          "pair-control-ring-unit"_ctv, firstResolver) ||
@@ -101,7 +116,10 @@ static bool buildComplementaryProjections(PairProjections& output, uint64_t comm
 
 static void pairControlNATObservedPeerValidation(TestSuite& suite)
 {
-  const auto privateInitiator = endpoint(firstClusterUUID, firstNodeUUID, "fd00:ffff:1234::1");
+  ClusterPairControlEndpoint privateInitiator = {};
+  privateInitiator.clusterUUID = firstClusterUUID; privateInitiator.nodeUUID = firstNodeUUID;
+  privateInitiator.role = ClusterPairControlNodeRole::switchboard;
+  privateInitiator.address = localTestAddress; privateInitiator.port = controlPort;
   const auto globalResponder = endpoint(secondClusterUUID, secondNodeUUID, "2001:db8:1234::2");
   sockaddr_storage observed = {};
   auto& observed6 = reinterpret_cast<sockaddr_in6&>(observed);
@@ -128,20 +146,37 @@ static void pairControlNATObservedPeerValidation(TestSuite& suite)
       std::memcmp(local.sin6_addr.s6_addr, privateInitiator.address.v6, sizeof(privateInitiator.address.v6)) == 0;
   if (bound.fd >= 0) { ::close(bound.fd); bound.fd = -1; }
 
-  auto unavailableInitiator = privateInitiator;
-  unavailableInitiator.address = IPAddress("fd00:ffff:1234::dead", true);
-  auto unavailableCredential = natCredential;
-  unavailableCredential.initiator = unavailableInitiator;
-  TCPSocket unavailable = {};
-  unavailable.setIPVersion(AF_INET6);
-  unavailable.setDaddr(globalResponder.address, globalResponder.port);
-  const bool unavailableRejected = !switchboardPairControlBindOutboundSource(unavailable, unavailableCredential);
-  if (unavailable.fd >= 0) { ::close(unavailable.fd); unavailable.fd = -1; }
+  auto wrongInitiator = privateInitiator;
+  wrongInitiator.address = IPAddress("::1", true);
+  const bool wrongAddressRejected = !clusterPairControlEndpointNATCompatibleOutbound(wrongInitiator, globalResponder);
   suite.expect(clusterPairControlEndpointNATCompatibleOutbound(privateInitiator, globalResponder) &&
                    !clusterPairControlEndpointNATCompatibleOutbound(globalResponder, privateInitiator) &&
                    switchboardPairControlOutboundSourceAddress(natCredential).equals(privateInitiator.address) &&
-                   exactSource && unavailableRejected && globalSafe && loopbackRejected && multicastRejected,
+                   exactSource && wrongAddressRejected && globalSafe && loopbackRejected && multicastRejected,
                "pair_control_nat_binds_exact_initiator_fails_closed_and_accepts_only_safe_observed_ipv6");
+  ProdigyCousinSessionReceipt sourceReceipt = {};
+  sourceReceipt.localEndpoint = globalResponder; sourceReceipt.remoteEndpoint = privateInitiator;
+  auto& session = sourceReceipt.control.session;
+  session.sourcePermission.protocolVersion = 3; session.sourcePermission.purpose = ProdigyCousinServicePurpose::clientAuthority;
+  session.sourcePermission.transportSourcePolicy = ProdigyCousinTransportSourcePolicy::authenticatedNAT;
+  session.sourcePermission.localClusterUUID = firstClusterUUID; session.sourceNodeUUID = firstNodeUUID;
+  session.sourcePermission.pairUUID = natCredential.pairUUID = 0x7c01;
+  session.rootGeneration = natCredential.rootGeneration = 5; session.keyEpoch = natCredential.keyEpoch = 11;
+  std::memcpy(observed6.sin6_addr.s6_addr, globalResponder.address.v6, 16);
+  suite.expect(switchboardPairControlProjectObservedSessionSource(sourceReceipt, natCredential, observed, sizeof(observed6)) &&
+      sourceReceipt.protocolVersion == 2 && sourceReceipt.authenticatedSourceAddress.equals(globalResponder.address),
+      "nat_session_receipt_projects_only_exact_accepted_credential_source_address");
+  auto wrongCredential = natCredential; ++wrongCredential.keyEpoch;
+  auto reset = sourceReceipt; reset.protocolVersion = 1; reset.authenticatedSourceAddress = {};
+  suite.expect(!switchboardPairControlProjectObservedSessionSource(reset, wrongCredential, observed, sizeof(observed6)),
+      "nat_session_receipt_rejects_different_credential_epoch");
+  std::swap(reset.localEndpoint, reset.remoteEndpoint);
+  suite.expect(!switchboardPairControlProjectObservedSessionSource(reset, natCredential, observed, sizeof(observed6)) ||
+      reset.protocolVersion == 1, "nat_session_receipt_never_attests_initiator_side_socket_as_source_observation");
+  reset = sourceReceipt; reset.protocolVersion = 1; reset.authenticatedSourceAddress = {};
+  std::memcpy(observed6.sin6_addr.s6_addr, privateInitiator.address.v6, 16);
+  suite.expect(!switchboardPairControlProjectObservedSessionSource(reset, natCredential, observed, sizeof(observed6)),
+      "nat_session_receipt_rejects_non_global_observed_source");
 }
 
 static ProdigyCousinDiscoveryPublication buildDiscoveryPublication(uint128_t nodeUUID,
@@ -196,7 +231,7 @@ static ProdigyCousinDiscoveryPublication buildDiscoveryPublication(uint128_t nod
         statefulServiceGroupOwnerForSlot(slot, counterpart.shardGroups) == counterpart.shardGroup)
       counterpart.ownedSlots.insert(slot);
   counterpart.routablePrefixUUID = 0x7e05;
-  counterpart.publicAddress = IPAddress("fd00:ffff:1234::7", true);
+  counterpart.publicAddress = localTestAddress;
   counterpart.publicTCPPort = 8443;
   for (uint32_t index = 0; index < 64; ++index) counterpart.wormholeRevision.append('c');
   snapshot.records.push_back(std::move(counterpart));
@@ -223,7 +258,7 @@ static ProdigyCousinSessionControl buildSessionControl(const ProdigyCousinCounte
   session.sourceShardGroups = 2; session.sourceShardGroup = statefulServiceGroupOwnerForSlot(3, 2);
   session.sourceService = MeshServices::constrainPrefixToGroup(session.sourcePermission.localCousinServicePrefix,
                                                                  session.sourceShardGroup);
-  session.sourceBindingNonce = 1; session.sourceAddress = IPAddress("fd00:ffff:1234::1", true); session.sourceTCPPort = 40001;
+  session.sourceBindingNonce = 1; session.sourceAddress = localTestAddress; session.sourceTCPPort = 40001;
   CousinRouteRecord route = {};
   route.routeUUID = 0x7f10; route.operationUUID = 0x7f11;
   route.pairUUID = session.sourcePermission.pairUUID;
@@ -254,8 +289,8 @@ static bool appendComplementaryEpoch(PairProjections& output, uint64_t keyEpoch)
   root.secondClusterUUID = secondClusterUUID;
   root.rootGeneration = 5;
   for (uint32_t index = 0; index < root.root.size(); ++index) root.root[index] = uint8_t(index + 1);
-  const auto initiator = endpoint(firstClusterUUID, firstNodeUUID, "fd00:ffff:1234::1");
-  const auto responder = endpoint(secondClusterUUID, secondNodeUUID, "fd00:ffff:1234::2");
+  const auto initiator = ownedEndpoint(firstClusterUUID, firstNodeUUID);
+  const auto responder = ownedEndpoint(secondClusterUUID, secondNodeUUID);
   ClusterPairControlResolver firstResolver = {}, secondResolver = {};
   if (!clusterPairPrepareControlResolver(root, initiator, responder, initiator, responder, keyEpoch,
                                          "pair-control-ring-unit"_ctv, firstResolver) ||
@@ -280,13 +315,13 @@ static bool buildThreeByThreeFanout(PairFanoutProjections& output, uint64_t comm
   for (uint32_t index = 0; index < root.root.size(); ++index) root.root[index] = uint8_t(index + 17);
 
   const std::array<ClusterPairControlEndpoint, pairControlFanoutWidth> initiators = {
-      endpoint(firstClusterUUID, firstNodeUUID + 0, "fd00:ffff:1234::1"),
-      endpoint(firstClusterUUID, firstNodeUUID + 1, "fd00:ffff:1234::2"),
-      endpoint(firstClusterUUID, firstNodeUUID + 2, "fd00:ffff:1234::3")};
+      ownedEndpoint(firstClusterUUID, firstNodeUUID + 0, controlPort + 10),
+      ownedEndpoint(firstClusterUUID, firstNodeUUID + 1, controlPort + 11),
+      ownedEndpoint(firstClusterUUID, firstNodeUUID + 2, controlPort + 12)};
   const std::array<ClusterPairControlEndpoint, pairControlFanoutWidth> responders = {
-      endpoint(secondClusterUUID, secondNodeUUID + 0, "fd00:ffff:1234::4"),
-      endpoint(secondClusterUUID, secondNodeUUID + 1, "fd00:ffff:1234::5"),
-      endpoint(secondClusterUUID, secondNodeUUID + 2, "fd00:ffff:1234::6")};
+      ownedEndpoint(secondClusterUUID, secondNodeUUID + 0, controlPort + 20),
+      ownedEndpoint(secondClusterUUID, secondNodeUUID + 1, controlPort + 21),
+      ownedEndpoint(secondClusterUUID, secondNodeUUID + 2, controlPort + 22)};
 
   for (uint32_t index = 0; index < pairControlFanoutWidth; ++index)
   {
@@ -696,12 +731,48 @@ static void pairControlCarrierThreeByThreeFanout(TestSuite& suite)
   suite.expect(quiesceFanout(ring, runtimes), "pair_control_ring_3x3_quiesces_all_six_carriers");
 }
 
+static void pairControlPrivateDiscoveryGate(TestSuite& suite)
+{
+  ProdigyLocalClusterPairControlProjection projection = {};
+  projection.protocolVersion = ProdigyLocalClusterPairControlProjection::privateDiscoveryVersion;
+  ProdigyPairPrivateDiscoveryStatus status = {};
+  status.pairUUID = 11; status.peerClusterUUID = 12; status.activationUUID = 13;
+  status.rootGeneration = 14; status.phase = ProdigyPairPrivateDiscoveryPhase::prepared;
+  projection.privateDiscoveryStatuses.push_back(status);
+  suite.expect(switchboardPairControlPrivateDiscoveryAllowed(projection, 11, 14, 12, false) &&
+      !switchboardPairControlPrivateDiscoveryAllowed(projection, 11, 14, 12, true),
+      "pair_control_private_prepared_receive_only");
+  projection.privateDiscoveryStatuses[0].phase = ProdigyPairPrivateDiscoveryPhase::active;
+  suite.expect(switchboardPairControlPrivateDiscoveryAllowed(projection, 11, 14, 12, true) &&
+      !switchboardPairControlPrivateDiscoveryAllowed(projection, 11, 15, 12, true) &&
+      !switchboardPairControlPrivateDiscoveryAllowed(projection, 11, 14, 99, true) &&
+      !switchboardPairControlPrivateDiscoveryAllowed(projection, 99, 14, 12, true),
+      "pair_control_private_active_exact_identity");
+  projection.privateDiscoveryStatuses[0].activationUUID = 0;
+  suite.expect(!switchboardPairControlPrivateDiscoveryAllowed(projection, 11, 14, 12, false),
+      "pair_control_private_missing_activation_rejected");
+  projection.privateDiscoveryStatuses[0].activationUUID = 13;
+  projection.protocolVersion = ProdigyLocalClusterPairControlProjection::version;
+  suite.expect(!switchboardPairControlPrivateDiscoveryAllowed(projection, 11, 14, 12, true),
+      "pair_control_private_legacy_projection_rejected");
+}
+
 } // namespace
 
 int main()
 {
+  const char *only = std::getenv("PRODIGY_TEST_ONLY");
+  if (only != nullptr && std::strcmp(only, "private-discovery-gate") == 0) {
+    TestSuite suite = {};
+    pairControlPrivateDiscoveryGate(suite);
+    return suite.failed == 0 ? 0 : 1;
+  }
   const char *enabled = std::getenv("PRODIGY_TEST_PAIR_CONTROL_RING");
   if (enabled == nullptr || std::strcmp(enabled, "1") != 0) return 77;
+  if (!prodigyTestOwnedULA(localTestAddress)) {
+    std::fprintf(stderr, "SKIP: NAT socket fixture requires an already assigned non-loopback IPv6 ULA\n");
+    return 77;
+  }
 
   TestSuite suite = {};
   const char *selection = std::getenv("PRODIGY_TEST_ONLY");
@@ -713,6 +784,7 @@ int main()
     pairControlCarrierTransfersSessionControl(suite);
     return suite.failed == 0 ? 0 : 1;
   }
+  pairControlPrivateDiscoveryGate(suite);
   pairControlCarrierReadyAndGenerationAdvance(suite);
   pairControlNATObservedPeerValidation(suite);
   pairControlCarrierRevocationDropsReadinessAndDrains(suite);

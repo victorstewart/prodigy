@@ -15,25 +15,75 @@
 
 enum class SystemContainerKind : uint8_t {
   none = 0,
-  mothershipTunnelProvider = 1
+  mothershipTunnelProvider = 1,
+  crossClusterMasqueGateway = 2
 };
 
-struct SystemContainerEgressPolicy {
-  uint32_t address4 = 0;
-  uint16_t port = 0;
+static inline bool prodigySystemContainerKindValid(SystemContainerKind kind)
+{
+  return kind == SystemContainerKind::mothershipTunnelProvider ||
+      kind == SystemContainerKind::crossClusterMasqueGateway;
+}
 
-  bool configured(void) const { return address4 != 0 && port != 0; }
+static inline const char *prodigySystemContainerArtifactLabel(SystemContainerKind kind)
+{
+  switch (kind)
+  {
+    case SystemContainerKind::mothershipTunnelProvider:
+      return "mothership-tunnel-provider";
+    case SystemContainerKind::crossClusterMasqueGateway:
+      return "cross-cluster-masque-gateway";
+    case SystemContainerKind::none:
+      break;
+  }
+  return nullptr;
+}
+
+struct SystemContainerEgressPolicy {
+  static constexpr uint32_t version = 2;
+  uint32_t policyVersion = version;
+  uint32_t address4 = 0;
+  uint8_t address6[16] = {};
+  uint16_t port = 0;
+  uint8_t protocol = 6; // TCP is retained for mothership-tunnel-provider.
+  bool peerIsIPv6 = false;
+  bool allowIngressFromPeer = false;
+
+  bool configured(void) const
+  {
+    if (policyVersion != version || port == 0 || (protocol != 6 && protocol != 17)) return false;
+    if (!peerIsIPv6) return address4 != 0;
+    for (uint8_t byte : address6) if (byte != 0) return true;
+    return false;
+  }
 };
 
 template <typename S>
 static void serialize(S&& serializer, SystemContainerEgressPolicy& policy)
 {
+  serializer.value4b(policy.policyVersion);
   serializer.value4b(policy.address4);
+  for (uint8_t& byte : policy.address6) serializer.value1b(byte);
   serializer.value2b(policy.port);
+  serializer.value1b(policy.protocol);
+  serializer.value1b(policy.peerIsIPv6);
+  serializer.value1b(policy.allowIngressFromPeer);
 }
 
 constexpr static uint8_t prodigyMothershipTunnelProviderRuntimeFragment = 254;
 constexpr static uint32_t prodigyMothershipTunnelProviderRuntimeUID = 65'535u * uint32_t(prodigyMothershipTunnelProviderRuntimeFragment);
+// A selected gateway machine carries one independent MASQUE runtime for each
+// of the other two sites.  Keep those identities out of the application
+// allocator so their site/machine/container /128s remain stable and cannot be
+// claimed by an ordinary deployment.
+constexpr static uint8_t prodigyCrossClusterMasqueGatewayRuntimeFragmentFirst = 252;
+constexpr static uint8_t prodigyCrossClusterMasqueGatewayRuntimeFragmentSecond = 253;
+
+static inline bool prodigyCrossClusterMasqueGatewayRuntimeFragmentValid(uint8_t fragment)
+{
+  return fragment == prodigyCrossClusterMasqueGatewayRuntimeFragmentFirst ||
+      fragment == prodigyCrossClusterMasqueGatewayRuntimeFragmentSecond;
+}
 
 static inline void prodigyContainerCgroupSlicePath(const String& containerName, String& path)
 {
@@ -126,6 +176,7 @@ static inline String prodigyContainerErrnoString(int err)
 
 constexpr static uint32_t prodigyDiscombobulatorAppContractVersion = 1;
 constexpr static uint32_t prodigyDiscombobulatorMothershipTunnelProviderContractVersion = 1;
+constexpr static uint32_t prodigyDiscombobulatorCrossClusterMasqueGatewayContractVersion = 1;
 
 static inline String prodigyDiscombobulatorBlobHeaderText(void)
 {
@@ -147,6 +198,20 @@ static inline String prodigyDiscombobulatorMothershipTunnelProviderBlobHeaderTex
   text.append("requires_standard_neuron_socket=false\n"_ctv);
   text.append("requires_mothership_tunnel_gateway=true\n"_ctv);
   text.append("network_policy=tcpEgressOnly\n"_ctv);
+  text.append("\n"_ctv);
+  return text;
+}
+
+static inline String prodigyDiscombobulatorCrossClusterMasqueGatewayBlobHeaderText(void)
+{
+  String text = {};
+  text.assign("PRODIGY-DISCOMBOBULATOR-CROSS-CLUSTER-MASQUE-GATEWAY\n"_ctv);
+  text.append("contract=prodigy-cross-cluster-masque-gateway\n"_ctv);
+  text.append("contract_version=1\n"_ctv);
+  text.append("container_kind=crossClusterMasqueGateway\n"_ctv);
+  text.append("requires_standard_neuron_socket=false\n"_ctv);
+  text.append("requires_switchboard_gateway_injection=true\n"_ctv);
+  text.append("network_policy=ipv6UdpEgressOnly\n"_ctv);
   text.append("\n"_ctv);
   return text;
 }
@@ -176,6 +241,22 @@ static inline bool prodigyValidateDiscombobulatorMothershipTunnelProviderBlobHea
     if (failureReport)
     {
       failureReport->assign("container blob is missing the supported Discombobulator mothership tunnel-provider contract header"_ctv);
+    }
+    return false;
+  }
+
+  return true;
+}
+
+static inline bool prodigyValidateDiscombobulatorCrossClusterMasqueGatewayBlobHeaderText(
+    const String& header,
+    String *failureReport = nullptr)
+{
+  if (header.equal(prodigyDiscombobulatorCrossClusterMasqueGatewayBlobHeaderText()) == false)
+  {
+    if (failureReport)
+    {
+      failureReport->assign("container blob is missing the supported Discombobulator cross-cluster MASQUE gateway contract header"_ctv);
     }
     return false;
   }
@@ -283,6 +364,44 @@ static inline bool prodigyOpenMothershipTunnelProviderBlobPayloadAfterContractHe
       "mothership tunnel-provider",
       fd,
       failureReport);
+}
+
+static inline bool prodigyOpenCrossClusterMasqueGatewayBlobPayloadAfterContractHeader(
+    const String& blobPath,
+    int& fd,
+    String *failureReport = nullptr)
+{
+  return prodigyOpenBlobPayloadAfterContractHeaderText(
+      blobPath,
+      prodigyDiscombobulatorCrossClusterMasqueGatewayBlobHeaderText(),
+      "cross-cluster MASQUE gateway",
+      fd,
+      failureReport);
+}
+
+// System artifacts remain a typed Discombobulator boundary.  Callers must
+// never accept one system kind's payload under another kind's launch plan.
+static inline bool prodigyOpenSystemContainerBlobPayloadAfterContractHeader(
+    SystemContainerKind kind, const String& blobPath, int& fd,
+    String *failureReport = nullptr)
+{
+  switch (kind)
+  {
+    case SystemContainerKind::mothershipTunnelProvider:
+      return prodigyOpenMothershipTunnelProviderBlobPayloadAfterContractHeader(
+          blobPath, fd, failureReport);
+    case SystemContainerKind::crossClusterMasqueGateway:
+      return prodigyOpenCrossClusterMasqueGatewayBlobPayloadAfterContractHeader(
+          blobPath, fd, failureReport);
+    case SystemContainerKind::none:
+      break;
+  }
+  fd = -1;
+  if (failureReport)
+  {
+    failureReport->assign("invalid system container artifact kind"_ctv);
+  }
+  return false;
 }
 
 static inline bool prodigyValidateDiscombobulatorContainerBlobHeader(

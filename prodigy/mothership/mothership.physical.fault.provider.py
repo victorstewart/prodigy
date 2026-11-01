@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MAX_DURATION_MS = 60_000
 ROUTE_PROTOCOL = "186"
 ROUTE_PROTOCOL_RENDERINGS = {ROUTE_PROTOCOL, "bgp"}
@@ -51,6 +51,13 @@ class Request:
     guestID: str
     peerAddress: str
     durationMilliseconds: int
+    # These two names make the fault boundary explicit.  Older Mothership
+    # callers omit them, in which case the peer host remains the only allowed
+    # gateway and flow target.  New MASQUE/BGP callers must persist the exact
+    # gateway address and the exact admitted flow label with their operation.
+    gatewayEndpoint: str = ""
+    flowTarget: str = ""
+    flowIdentity: str = ""
 
     @property
     def prefix(self) -> str:
@@ -73,6 +80,28 @@ def validate_request(request: Request) -> None:
         raise ProviderError("peerAddress must be a non-local unicast host address")
     if not isinstance(request.durationMilliseconds, int) or isinstance(request.durationMilliseconds, bool) or not (0 < request.durationMilliseconds <= MAX_DURATION_MS):
         raise ProviderError("durationMilliseconds must be in the bounded fault window")
+    gateway = request.gatewayEndpoint or request.peerAddress
+    try:
+        gateway_address = ipaddress.ip_address(gateway)
+    except ValueError as error:
+        raise ProviderError("gatewayEndpoint must be one exact numeric gateway address") from error
+    if gateway_address != address:
+        raise ProviderError("gatewayEndpoint must exactly name the peer-host fault boundary")
+    target = request.flowTarget or "peer-host"
+    if not (1 <= len(target) <= 256) or not re.fullmatch(r"[A-Za-z0-9._:@/+=-]+", target):
+        raise ProviderError("flowTarget must be a bounded exact fault kind")
+    identity = request.flowIdentity or f"host:{request.peerAddress}"
+    if not (1 <= len(identity) <= 256) or not re.fullmatch(r"[A-Za-z0-9._:@/+=-]+", identity):
+        raise ProviderError("flowIdentity must be a bounded exact MASQUE/BGP flow label")
+
+
+def _canonical_request(request: Request) -> Request:
+    """Return the one durable operation identity accepted by all lifecycle calls."""
+    validate_request(request)
+    return Request(request.operationID, request.role, request.guestID, request.peerAddress,
+                   request.durationMilliseconds, request.gatewayEndpoint or request.peerAddress,
+                   request.flowTarget or "peer-host",
+                   request.flowIdentity or f"host:{request.peerAddress}")
 
 
 def boot_identity(path: str = "/proc/sys/kernel/random/boot_id") -> str:
@@ -348,8 +377,7 @@ def _request_from_state(state: dict) -> Request:
         request = Request(**raw)
     except TypeError as error:
         raise ProviderError("fault state request is malformed") from error
-    validate_request(request)
-    return request
+    return _canonical_request(request)
 
 
 def _same_request(left: Request, right: Request) -> bool:
@@ -357,13 +385,23 @@ def _same_request(left: Request, right: Request) -> bool:
 
 
 def _receipt(state: dict) -> dict:
-    required = ("operationID", "role", "guestID", "peerAddress", "durationMilliseconds",
-                "bootID", "installedAtMonotonicMs", "restoredAtMonotonicMs", "restored")
+    required = ("operationID", "role", "guestID", "peerAddress", "gatewayEndpoint", "flowTarget", "flowIdentity",
+                "durationMilliseconds", "bootID", "installedAtMonotonicMs",
+                "autoRestoreDeadlineMonotonicMs", "restoredAtMonotonicMs", "restored")
     if any(key not in state for key in required) or state["restored"] is not True:
         raise ProviderError("fault state has no terminal restoration receipt")
     if not isinstance(state["installedAtMonotonicMs"], int) or not isinstance(state["restoredAtMonotonicMs"], int) or state["installedAtMonotonicMs"] >= state["restoredAtMonotonicMs"]:
         raise ProviderError("fault receipt monotonic timestamps are not strictly ordered")
     return {key: state[key] for key in required}
+
+
+def _apply_receipt(state: dict) -> dict:
+    required = ("operationID", "role", "guestID", "peerAddress", "gatewayEndpoint", "flowTarget", "flowIdentity",
+                "durationMilliseconds", "bootID", "installedAtMonotonicMs",
+                "autoRestoreDeadlineMonotonicMs", "routeMetric", "authenticated", "restored")
+    if any(key not in state for key in required) or state["restored"] is not False or state["authenticated"] is not True:
+        raise ProviderError("fault state has no authenticated apply receipt")
+    return {"phase": "applied", **{key: state[key] for key in required}}
 
 
 def _reject_colliding_active_state(directory_fd: int, request: Request, *, require_root: bool) -> None:
@@ -380,8 +418,8 @@ def _reject_colliding_active_state(directory_fd: int, request: Request, *, requi
             raise ProviderError("refusing colliding active peer-host fault state")
 
 
-def _complete_active(state: dict, directory_fd: int, name: str, request: Request, ip_binary: str,
-                     now: Callable[[], int], sleep: Callable[[float], None], *, require_root: bool) -> dict:
+def _restore_active(state: dict, directory_fd: int, name: str, request: Request, ip_binary: str,
+                    now: Callable[[], int], *, require_root: bool) -> dict:
     installed = state.get("installedAtMonotonicMs")
     if not isinstance(installed, int) or installed <= 0:
         raise ProviderError("active fault state lacks an installation timestamp")
@@ -393,17 +431,15 @@ def _complete_active(state: dict, directory_fd: int, name: str, request: Request
         if state.get("installIntent") is True and state.get("routeInstalled") is False:
             return _mark_restored(state, directory_fd, name, installed, now, require_root=require_root)
         raise ProviderError("active fault state does not own the expected blackhole route")
-    remaining = request.durationMilliseconds - (now() - installed)
-    if remaining > 0:
-        sleep(remaining / 1000.0)
     _remove(ip_binary, request, metric)
     return _mark_restored(state, directory_fd, name, installed, now, require_root=require_root)
 
 
-def execute(request: Request, state_root: Path, ip_binary: str, *, require_root: bool = True,
-            boot_id: Optional[str] = None, now: Callable[[], int] = lambda: time.monotonic_ns() // 1_000_000,
-            sleep: Callable[[float], None] = time.sleep) -> dict:
-    validate_request(request)
+def apply(request: Request, state_root: Path, ip_binary: str, *, require_root: bool = True,
+          boot_id: Optional[str] = None,
+          now: Callable[[], int] = lambda: time.monotonic_ns() // 1_000_000) -> dict:
+    """Install or replay one exact fault without waiting for its restore window."""
+    request = _canonical_request(request)
     if require_root and os.geteuid() != 0:
         raise ProviderError("physical fault provider requires root")
     current_boot = boot_id or boot_identity()
@@ -424,8 +460,10 @@ def execute(request: Request, state_root: Path, ip_binary: str, *, require_root:
                     if _route_entries(ip_binary, request.prefix):
                         raise ProviderError("restored state collides with a live peer-host route")
                     return _receipt(state)
-                return _complete_active(state, directory_fd, name, request, ip_binary, now, sleep,
-                                        require_root=require_root)
+                if now() >= state.get("autoRestoreDeadlineMonotonicMs", 0):
+                    return _restore_active(state, directory_fd, name, request, ip_binary, now,
+                                           require_root=require_root)
+                return _apply_receipt(state)
 
             _reject_colliding_active_state(directory_fd, request, require_root=require_root)
             _ensure_no_route(ip_binary, request)
@@ -433,12 +471,17 @@ def execute(request: Request, state_root: Path, ip_binary: str, *, require_root:
             if installed <= 0:
                 raise ProviderError("monotonic clock is unavailable")
             metric = _route_metric(request.operationID)
+            deadline = installed + request.durationMilliseconds
             state = {"schemaVersion": SCHEMA_VERSION, "request": asdict(request), "operationID": request.operationID,
                      "role": request.role, "guestID": request.guestID, "peerAddress": request.peerAddress,
+                     "gatewayEndpoint": request.gatewayEndpoint, "flowTarget": request.flowTarget,
+                     "flowIdentity": request.flowIdentity,
                      "durationMilliseconds": request.durationMilliseconds, "bootID": current_boot,
                      "installedAtMonotonicMs": installed, "routeMetric": metric,
+                     "autoRestoreDeadlineMonotonicMs": deadline, "authenticated": True,
                      "installIntent": True, "routeInstalled": False, "restored": False}
             installed_route = False
+            applied = False
             prior_handlers = {}
             blocked = set()
             def interrupted(signum, _frame):
@@ -466,10 +509,10 @@ def execute(request: Request, state_root: Path, ip_binary: str, *, require_root:
                 _atomic_write(directory_fd, name, state, require_root=require_root)
                 signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked)
                 blocked = set()
-                return _complete_active(state, directory_fd, name, request, ip_binary, now, sleep,
-                                        require_root=require_root)
+                applied = True
+                return _apply_receipt(state)
             finally:
-                if installed_route:
+                if installed_route and not applied:
                     # A signal or executor failure after install must attempt the same
                     # verified cleanup before propagating the failure.
                     try:
@@ -493,19 +536,52 @@ def execute(request: Request, state_root: Path, ip_binary: str, *, require_root:
         os.close(directory_fd)
 
 
+def execute(request: Request, state_root: Path, ip_binary: str, *, require_root: bool = True,
+            boot_id: Optional[str] = None,
+            now: Callable[[], int] = lambda: time.monotonic_ns() // 1_000_000,
+            sleep: Callable[[float], None] = time.sleep) -> dict:
+    """Compatibility lifecycle: apply, hold for the bounded window, then restore."""
+    result = apply(request, state_root, ip_binary, require_root=require_root,
+                   boot_id=boot_id, now=now)
+    if result.get("restored") is True:
+        return result
+    deadline = result.get("autoRestoreDeadlineMonotonicMs")
+    if not isinstance(deadline, int):
+        raise ProviderError("fault apply receipt lacks an auto-restore deadline")
+    remaining = deadline - now()
+    if remaining > 0:
+        sleep(remaining / 1000)
+    return remove(request, state_root, ip_binary, require_root=require_root,
+                  boot_id=boot_id, now=now)
+
+
 def query(request: Request, state_root: Path, *, boot_id: Optional[str] = None,
-          require_root: bool = False) -> dict:
-    validate_request(request)
+          require_root: bool = False, ip_binary: Optional[str] = None,
+          now: Callable[[], int] = lambda: time.monotonic_ns() // 1_000_000) -> dict:
+    request = _canonical_request(request)
     directory_fd = _open_state_root(state_root, require_root)
     try:
-        state = _read_state(directory_fd, _state_name(request.operationID), require_root=require_root)
+        lock_fd = _open_lock(directory_fd, require_root)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            state = _read_state(directory_fd, _state_name(request.operationID), require_root=require_root)
+            if (state is not None and state.get("restored") is not True and
+                    now() >= state.get("autoRestoreDeadlineMonotonicMs", 0)):
+                if ip_binary is None:
+                    raise ProviderError("fault reached auto-restore deadline; authenticated cleanup is required")
+                state_request = _request_from_state(state)
+                state = _restore_active(state, directory_fd, _state_name(request.operationID), state_request,
+                                        ip_binary, now, require_root=require_root)
+                return state
+        finally:
+            os.close(lock_fd)
     finally:
         os.close(directory_fd)
     if state is None or not _same_request(_request_from_state(state), request):
         raise ProviderError("no exact durable fault request exists")
     if boot_id is not None and state.get("bootID") != boot_id:
         raise ProviderError("fault state is from a different boot identity")
-    return _receipt(state) if state.get("restored") is True else dict(state)
+    return _receipt(state) if state.get("restored") is True else _apply_receipt(state)
 
 
 def remove(request: Request, state_root: Path, ip_binary: str, *, require_root: bool = True,
@@ -513,7 +589,7 @@ def remove(request: Request, state_root: Path, ip_binary: str, *, require_root: 
     # Removal is intentionally an exact-idempotent execute retry, except it does
     # not wait for the requested window.  It is used only for caller-requested
     # emergency cleanup and still proves restored=true.
-    validate_request(request)
+    request = _canonical_request(request)
     if require_root and os.geteuid() != 0:
         raise ProviderError("physical fault provider requires root")
     directory_fd = _open_state_root(state_root, require_root)
@@ -544,7 +620,8 @@ def remove(request: Request, state_root: Path, ip_binary: str, *, require_root: 
 
 
 def _request_from_args(args: argparse.Namespace) -> Request:
-    return Request(args.operation_id, args.role, args.guest_id, args.peer_address, args.duration_ms)
+    return Request(args.operation_id, args.role, args.guest_id, args.peer_address, args.duration_ms,
+                   args.gateway_endpoint or "", args.flow_target or "", args.flow_identity)
 
 
 def _system_ip_binary() -> str:
@@ -556,13 +633,16 @@ def _system_ip_binary() -> str:
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("execute", "query", "remove"))
+    parser.add_argument("command", choices=("apply", "execute", "query", "remove"))
     parser.add_argument("--state-root", required=True)
     parser.add_argument("--operation-id", required=True)
     parser.add_argument("--role", required=True)
     parser.add_argument("--guest-id", required=True)
     parser.add_argument("--peer-address", required=True)
     parser.add_argument("--duration-ms", required=True, type=int)
+    parser.add_argument("--gateway-endpoint")
+    parser.add_argument("--flow-target")
+    parser.add_argument("--flow-identity", required=True)
     args = parser.parse_args(argv)
     request = _request_from_args(args)
     try:
@@ -570,8 +650,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         # directly with a fake binary rather than weakening the CLI boundary.
         ip_binary = _system_ip_binary()
         root = Path(args.state_root)
-        if args.command == "execute": result = execute(request, root, ip_binary)
-        elif args.command == "query": result = query(request, root, boot_id=boot_identity(), require_root=True)
+        if args.command == "apply": result = apply(request, root, ip_binary)
+        elif args.command == "execute": result = execute(request, root, ip_binary)
+        elif args.command == "query": result = query(request, root, boot_id=boot_identity(), require_root=True,
+                                                        ip_binary=ip_binary)
         else: result = remove(request, root, ip_binary)
         print(json.dumps(result, sort_keys=True, separators=(",", ":")))
         return 0

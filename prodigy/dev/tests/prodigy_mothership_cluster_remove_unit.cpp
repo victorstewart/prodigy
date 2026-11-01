@@ -388,7 +388,11 @@ static bool runMigrationResetCleanupFixture(const char *scenario)
   std::ofstream systemctl(fake + "/systemctl"); systemctl << "#!/bin/sh\necho \"$*\" >>\"$MIGRATION_TEST_ROOT/systemctl.log\"\n"; systemctl.close();
   ::chmod((fake + "/systemctl").c_str(), 0700);
   std::ofstream crashEvidence(dropins + "/20-nametag-crash-evidence.conf"); crashEvidence << "[Service]\nEnvironment=keep=1\n"; crashEvidence.close();
-  std::ofstream migrationFence(dropins + "/99-tidesdb-migration-0123456789abcdef.conf"); migrationFence << "[Unit]\nConditionPathExists=!" << root << "/migration/guest/writers-fenced\n"; migrationFence.close();
+  const bool localAuthorityFence = std::string(scenario) == "local-authority";
+  std::ofstream migrationFence(dropins + "/99-tidesdb-migration-0123456789abcdef.conf");
+  migrationFence << "[Unit]\nConditionPathExists=!" <<
+    (localAuthorityFence ? state + "/mothership-local-authority-runtime/0x0123456789abcdef0123456789abcdef/writers-fenced" : root + "/migration/guest/writers-fenced") << "\n";
+  migrationFence.close();
 
   if (std::string(scenario) == "symlink")
   {
@@ -407,7 +411,7 @@ static bool runMigrationResetCleanupFixture(const char *scenario)
   }
 
   struct stat before = {};
-  bool captured = std::string(scenario) == "normal" && ::stat((source + "/payload").c_str(), &before) == 0;
+  bool captured = (std::string(scenario) == "normal" || localAuthorityFence) && ::stat((source + "/payload").c_str(), &before) == 0;
   String reset = {}, fence = {};
   mothershipAppendProdigyMigrationResetCleanupCommand(uint128_t(0x1234), reset);
   mothershipAppendProdigyMigrationFenceCleanupCommand(fence);
@@ -418,7 +422,7 @@ static bool runMigrationResetCleanupFixture(const char *scenario)
   auto invoke = [&]() { return ::system(("PATH=" + shellQuote(fake) + ":/usr/bin:/bin MIGRATION_TEST_ROOT=" + shellQuote(root) + " /bin/sh -c " + shellQuote(command)).c_str()) == 0; };
   bool first = invoke();
   bool okay = false;
-  if (std::string(scenario) == "normal")
+  if (std::string(scenario) == "normal" || localAuthorityFence)
   {
     struct stat after = {};
     std::ifstream payload(destination + "/payload", std::ios::binary); std::string bytes((std::istreambuf_iterator<char>(payload)), {});
@@ -684,6 +688,7 @@ int main(void)
 
   {
     suite.expect(runMigrationResetCleanupFixture("normal"), "remove_reset_preserves_backup_bytes_and_inode_removes_only_fence_and_is_idempotent");
+    suite.expect(runMigrationResetCleanupFixture("local-authority"), "remove_reset_accepts_exact_local_authority_migration_fence");
     suite.expect(runMigrationResetCleanupFixture("symlink"), "remove_reset_rejects_retained_backup_symlink");
     suite.expect(runMigrationResetCleanupFixture("collision"), "remove_reset_rejects_retained_backup_collision");
   }

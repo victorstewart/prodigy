@@ -244,7 +244,7 @@ static void testMalformedTrailingAndVersionRejected(TestSuite& suite)
                "container_retirement_oversized_carrier_rejected_before_decode");
 
   ProdigyContainerRetirementJournal wrongVersion = journal;
-  wrongVersion.version = 5;
+  wrongVersion.version = 255;
   suite.expect(prodigyWriteContainerRetirementJournalCarrier(carrier, wrongVersion, 1) == false,
                "container_retirement_version_rejected");
 }
@@ -551,7 +551,8 @@ static ProdigyContainerRetirementJournal makeCatchupCompensation(uint32_t count)
   StatefulDataAuthority data;
   data.operationUUID = fence.operationID; data.datasetUUID = 71; data.snapshotUUID = 72;
   data.sourceClusterUUID = fence.targetClusterUUID; data.targetClusterUUID = data.localClusterUUID = fence.sourceClusterUUID;
-  data.writeOwnerClusterUUID = data.sourceClusterUUID; data.authorityEpoch = 2; data.shardGroup = fence.shardGroup;
+  data.writeOwnerClusterUUID = data.sourceClusterUUID; data.authorityEpoch = 2;
+  data.shardGroup = fence.shardGroup; data.nShardGroups = fence.shardGroup + 1;
   data.contractSHA256 = data.shardManifestSHA256 = data.snapshotBoundarySHA256 = data.requiredAppliedWatermarkSHA256 = fence.sourceBlobSHA256;
   String bytes; BitseryEngine::serialize(bytes, data); prodigyComputeSHA256Hex(bytes, fence.dataAuthoritySHA256);
   for (uint32_t index = 0; index < count; ++index) {
@@ -625,6 +626,39 @@ static void testScopedCatchupCompensation(TestSuite& suite)
   suite.expect(!prodigyValidateContainerRetirementJournal(wrongRole), "source_retirement_may_not_claim_empty_target_compensation");
 }
 
+static void testQualificationCancellationJournal(TestSuite& suite)
+{
+  auto journal = makeJournal(2); journal.version = ProdigyContainerRetirementJournal::qualificationVersion;
+  for (auto& intent : journal.intents) {
+    intent.kind = ProdigyContainerRetirementKind::qualificationStatefulCancellation;
+    intent.topologyOperationID = 0; intent.sourceEpoch = intent.targetEpoch = 0;
+    intent.qualificationOperationUUID = 123;
+    intent.qualificationPlacementSHA256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv;
+  }
+  suite.expect(prodigyValidateContainerRetirementJournal(journal), "qualification_retirement_valid");
+  String encoded; auto copy = journal; ProdigyContainerRetirementJournal restored = {};
+  suite.expect(BitseryEngine::serialize(encoded, copy) && BitseryEngine::deserializeSafe(encoded, restored) &&
+      prodigyValidateContainerRetirementJournal(restored) && restored.intents[0].sameIdentity(journal.intents[0]),
+      "qualification_retirement_roundtrip");
+  auto stale = journal; stale.version = ProdigyContainerRetirementJournal::statefulVersion;
+  suite.expect(!prodigyValidateContainerRetirementJournal(stale), "qualification_retirement_old_reader_rejected");
+  restored.intents[0].killAcked = true; restored.intents[0].bootstrap.clear();
+  suite.expect(prodigyValidateContainerRetirementJournal(restored) && !restored.intents[1].killAcked,
+      "qualification_retirement_partial_ack_preserved");
+  ProdigyContainerRetirementJournal merged = {};
+  suite.expect(prodigyMergeContainerRetirementJournal(journal, restored, merged) &&
+      merged.intents[0].killAcked && !merged.intents[1].killAcked,
+      "qualification_retirement_partial_ack_merge");
+  auto missing = restored; missing.intents.erase(missing.intents.begin());
+  suite.expect(!prodigyMergeContainerRetirementJournal(restored, missing, merged),
+      "qualification_retirement_missing_member_not_acknowledged");
+  auto changedScope = restored; changedScope.intents[1].qualificationOperationUUID++;
+  suite.expect(!prodigyMergeContainerRetirementJournal(restored, changedScope, merged),
+      "qualification_retirement_changed_scope_rejected");
+  restored.intents[1].qualificationOperationUUID = 0;
+  suite.expect(!prodigyValidateContainerRetirementJournal(restored), "qualification_retirement_missing_scope_rejected");
+}
+
 static void testCarrierCollisionAndBound(TestSuite& suite)
 {
   bytell_hash_map<uint64_t, TaskExecutionRecord> records = {};
@@ -656,5 +690,6 @@ int main(void)
   testBootstrapSemanticOrderAndTrailingFences(suite);
   testCarrierCollisionAndBound(suite);
   testScopedCatchupCompensation(suite);
+  testQualificationCancellationJournal(suite);
   return suite.failed == 0 ? 0 : 1;
 }

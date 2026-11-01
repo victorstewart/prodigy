@@ -452,6 +452,61 @@ int main(int argc, char *argv[])
   suite.expect(failure.size() == 0, "installed_bundle_sha256_sidecar_read_clears_failure");
   suite.expect(installedBundleExpectedDigest == bundleDigest, "installed_bundle_sha256_sidecar_matches_bundle");
 
+  // A failed durability barrier must leave the predecessor runnable.  This
+  // exercises the generated installer with a real failing `sync -f`, rather
+  // than checking its rendered shell text.
+  String durabilityFailureRoot = {};
+  durabilityFailureRoot.assign(tempDirectory);
+  durabilityFailureRoot.append("/durability-failure-installed-root"_ctv);
+  String durabilityFailureBinary = {};
+  durabilityFailureBinary.assign(durabilityFailureRoot);
+  durabilityFailureBinary.append("/prodigy"_ctv);
+  std::error_code durabilityDirectoryError = {};
+  suite.expect(std::filesystem::create_directories(std::filesystem::path(durabilityFailureRoot.c_str()), durabilityDirectoryError) &&
+                   durabilityDirectoryError.value() == 0,
+               "durability_failure_installer_predecessor_directory_created");
+  suite.expect(Filesystem::openWriteAtClose(-1, durabilityFailureBinary, "predecessor-runtime"_ctv) == 19,
+               "durability_failure_installer_predecessor_written");
+
+  String fakeSyncDirectory = {};
+  fakeSyncDirectory.assign(tempDirectory);
+  fakeSyncDirectory.append("/failing-sync-bin"_ctv);
+  std::error_code fakeSyncDirectoryError = {};
+  suite.expect(std::filesystem::create_directories(std::filesystem::path(fakeSyncDirectory.c_str()), fakeSyncDirectoryError) &&
+                   fakeSyncDirectoryError.value() == 0,
+               "durability_failure_installer_sync_directory_created");
+  String fakeSyncPath = {};
+  fakeSyncPath.assign(fakeSyncDirectory);
+  fakeSyncPath.append("/sync"_ctv);
+  suite.expect(Filesystem::openWriteAtClose(-1, fakeSyncPath, "#!/bin/sh\nexit 73\n"_ctv) == 18 &&
+                   ::chmod(fakeSyncPath.c_str(), 0700) == 0,
+               "durability_failure_installer_sync_failure_hook_ready");
+  String originalPath = {};
+  const char *oldPath = std::getenv("PATH");
+  if (oldPath != nullptr)
+  {
+    originalPath.assign(oldPath);
+  }
+  String failingPath = {};
+  failingPath.assign(fakeSyncDirectory);
+  failingPath.append(':');
+  failingPath.append(originalPath);
+  String durabilityFailureCommand = {};
+  durabilityFailureCommand.assign("PATH="_ctv);
+  prodigyAppendShellSingleQuoted(durabilityFailureCommand, failingPath);
+  durabilityFailureCommand.append("; export PATH; "_ctv);
+  String generatedInstaller = {};
+  prodigyBuildBundleInstallCommand(bundlePath, durabilityFailureRoot, generatedInstaller);
+  durabilityFailureCommand.append(generatedInstaller);
+  suite.expect(prodigyRunLocalShellCommand(durabilityFailureCommand, &failure) == false,
+               "durability_failure_installer_rejects_unsynced_successor");
+  suite.expect(stringContains(failure, "local command failed"),
+               "durability_failure_installer_reports_sync_failure");
+  String predecessorBytes = {};
+  Filesystem::openReadAtClose(-1, durabilityFailureBinary, predecessorBytes);
+  suite.expect(predecessorBytes == "predecessor-runtime"_ctv,
+               "durability_failure_installer_preserves_predecessor");
+
   String bundleBytes = {};
   Filesystem::openReadAtClose(-1, bundlePath, bundleBytes);
   suite.expect(bundleBytes.empty() == false, "bundle_bytes_available_for_normal_stage");

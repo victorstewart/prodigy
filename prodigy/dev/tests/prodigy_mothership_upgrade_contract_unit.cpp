@@ -150,6 +150,9 @@ int main(void)
   changedInput = input; changedInput.noManagedPublicWorkloads = true;
   suite.expect(mothershipPlanUpgrade(contract, changedInput).inputSHA256 != plan.inputSHA256,
                "input_hash_binds_no_managed_public_workloads_receipt");
+  changedInput = input; changedInput.operatorAcceptedActiveWorkloadInterruption = true;
+  suite.expect(mothershipPlanUpgrade(contract, changedInput).inputSHA256 != plan.inputSHA256,
+               "input_hash_binds_operator_accepted_active_workload_interruption");
   changedInput = input; changedInput.observedTargetArchitecture = "x86_64"_ctv;
   suite.expect(mothershipPlanUpgrade(contract, changedInput).inputSHA256 != plan.inputSHA256,
                "input_hash_binds_observed_target_architecture");
@@ -185,7 +188,19 @@ int main(void)
   input.workloads = validInput().workloads;
   suite.expect(!mothershipPlanUpgrade(contract, input).eligible,
                "no_managed_public_workloads_receipt_rejects_workload_claim");
+  input = validInput(); input.publicBaselineHealthy = false; input.workloads.clear();
+  input.operatorAcceptedActiveWorkloadInterruption = true;
+  suite.expect(mothershipPlanUpgrade(contract, input).eligible,
+               "operator_acceptance_qualifies_serial_same_cluster_disposable_workload_interruption");
+  input.workloads = validInput().workloads;
+  suite.expect(!mothershipPlanUpgrade(contract, input).eligible,
+               "operator_interruption_acceptance_rejects_continuity_workload_claims");
+  input.workloads.clear(); input.requestProviderRelocation = true;
+  suite.expect(!mothershipPlanUpgrade(contract, input).eligible,
+               "operator_interruption_acceptance_rejects_relocation");
   input.workloads.clear(); input.noManagedPublicWorkloads = false;
+  input.operatorAcceptedActiveWorkloadInterruption = false;
+  input.requestProviderRelocation = false;
   input.emptyIsolatedTestCluster = true;
   suite.expect(mothershipPlanUpgrade(contract, input).eligible,
                "explicit_empty_isolated_test_profile_has_no_public_workload_baseline");

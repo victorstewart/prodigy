@@ -34,6 +34,7 @@ impl StorageRoot {
             "artifacts/apps",
             "artifacts/bases",
             "artifacts/mothership-tunnel-providers",
+            "artifacts/cross-cluster-masque-gateways",
             "work",
             "tmp",
         ] {
@@ -86,6 +87,7 @@ impl StorageRoot {
             "app" => "artifacts/apps",
             "base" => "artifacts/bases",
             "mothership-tunnel-provider" => "artifacts/mothership-tunnel-providers",
+            "cross-cluster-masque-gateway" => "artifacts/cross-cluster-masque-gateways",
             other => panic!("unsupported artifact kind {other}"),
         };
         self.root.join(directory).join(arch)

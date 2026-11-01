@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -63,6 +64,7 @@ struct ApprovedPredecessor {
 struct Plan {
   std::string identity, operationRoot, registryRoot, bundle, runtimeRoot, statePath, secretsPath, oldRuntimeSHA, oldBundleSHA, serviceRuntimeSHA, serviceBundleSHA, serviceBundlePath, planSHA;
   bool retainedRecovery = false, mixedPredecessors = false, explicitMixedRuntimeInventory = false;
+  bool initialSeedRuntimeRepair = false;
   uint128_t operationID = 0, clusterUUID = 0; uint64_t schemaVersion = 0;
   uint32_t sealedCanonicalContainerCount = 0, staleCoordinatorCanonicalContainerCount = 0, sealedInterruptedExpectedEchos = 0;
   uint128_t staleExcludedContainerUUID = 0;
@@ -162,6 +164,11 @@ inline Plan parse(const char *file) {
     require(splitRoot, "per-host recovery requires a split installed runtime root");
     p.retainedRecovery=true;
   }
+  simdjson::dom::element repair;
+  if (doc["initialSeedRuntimeRepair"].get(repair)==simdjson::SUCCESS) {
+    require(repair.get_bool().get(p.initialSeedRuntimeRepair)==simdjson::SUCCESS && p.initialSeedRuntimeRepair && version==1,
+            "initial seed runtime repair requires an explicit uniform schema-one plan");
+  }
   return p;
 }
 
@@ -188,6 +195,28 @@ inline std::string quiesceServiceCommand(bool retainedRecoveryVerified = false) 
   return "if test \"$(systemctl show -p MainPID --value prodigy)\" != 0; then\n"+str(stop)+"\nfi; test \"$(systemctl show -p MainPID --value prodigy)\" = 0; ";
 }
 
+// Shared stopped-runtime publication. Both recovery owners retain the exact
+// predecessor and reconcile existing roots by identity before any rename.
+inline std::string retainedRuntimePublicationCommand(
+    const std::string& root,const std::string& staged,const std::string& retained,
+    const std::string& oldRuntimeSHA,const std::string& oldBundleSHA,const std::string& newRuntimeSHA)
+{
+  std::string cmd="test \"$(systemctl show -p MainPID --value prodigy)\" = 0; ";
+  cmd+="if test -e "+quote(retained)+"; then test \"$(sha256sum "+quote(retained+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(oldRuntimeSHA)+"; else test \"$(sha256sum "+quote(root+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(oldRuntimeSHA)+"; test \"$(sha256sum "+quote(root+"/prodigy.bundle.tar.zst")+" | cut -d' ' -f1)\" = "+quote(oldBundleSHA)+"; mv -T "+quote(root)+" "+quote(retained)+"; sync -f "+quote(fs::path(root).parent_path().string())+"; fi; ";
+  cmd+="if test ! -e "+quote(root)+"; then test ! -e "+quote(root+".migration-new")+"; cp -a --reflink=auto "+quote(staged)+" "+quote(root+".migration-new")+"; sync -f "+quote(root+".migration-new")+"; mv -T "+quote(root+".migration-new")+" "+quote(root)+"; sync -f "+quote(fs::path(root).parent_path().string())+"; fi; ";
+  return cmd+"test \"$(sha256sum "+quote(root+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(newRuntimeSHA)+"; ";
+}
+
+inline std::string runtimeStartupFenceCommand(const std::string& operationRoot,const std::string& bindingSHA) {
+  const auto fence=operationRoot+"/writers-fenced";
+  const auto dropin="/etc/systemd/system/prodigy.service.d/99-tidesdb-migration-"+bindingSHA.substr(0,16)+".conf";
+  const auto content="[Unit]\nConditionPathExists=!"+fence+"\n";
+  return "umask 077; printf %s "+quote(bindingSHA)+" > "+quote(fence+".new")+"; sync -f "+quote(fence+".new")+"; mv -T "+quote(fence+".new")+" "+quote(fence)+"; sync -f "+quote(operationRoot)+"; mkdir -p /etc/systemd/system/prodigy.service.d; printf %s "+quote(content)+" > "+quote(dropin+".new")+"; sync -f "+quote(dropin+".new")+"; mv -T "+quote(dropin+".new")+" "+quote(dropin)+"; sync -f /etc/systemd/system/prodigy.service.d; systemctl daemon-reload";
+}
+inline std::string runtimeServiceExecStartCheck(const std::string& runtimeRoot) {
+  return "systemctl show -p ExecStart --value prodigy | grep -F -- "+quote(runtimeRoot+"/prodigy")+" > /dev/null; ";
+}
+
 class Execution final : public MothershipTidesDBMigrationHooks {
 public:
   Plan plan; MothershipProdigyCluster cluster; MothershipTidesDBMigrationReceipt receipt;
@@ -200,7 +229,7 @@ public:
   const std::string& servicePredecessorRuntimeSHA() const { return plan.schemaVersion==4 ? plan.serviceRuntimeSHA : plan.oldRuntimeSHA; }
   const std::string& servicePredecessorBundleSHA() const { return plan.schemaVersion==4 ? plan.serviceBundleSHA : plan.oldBundleSHA; }
   std::string serviceExecStartCheck() const {
-    return "systemctl show -p ExecStart --value prodigy | grep -F -- "+quote(serviceRuntimeRoot()+"/prodigy")+" > /dev/null; ";
+    return runtimeServiceExecStartCheck(serviceRuntimeRoot());
   }
   void validateApprovedPredecessors() {
     if (!plan.mixedPredecessors) return;
@@ -484,14 +513,10 @@ public:
   }
   std::string fencePath() const { return remoteRoot+"/writers-fenced"; }
   void fenceWriters() {
-    const auto dropin="/etc/systemd/system/prodigy.service.d/99-tidesdb-migration-"+plan.planSHA.substr(0,16)+".conf";
-    const auto content="[Unit]\nConditionPathExists=!"+fencePath()+"\n";
     for(auto& machine:plan.machines) {
       // Persist the startup fence before stop. Unlike a runtime-only systemd
       // mask it survives a host reboot during directory or executable swaps.
-      std::string cmd="umask 077; printf %s "+quote(plan.planSHA)+" > "+quote(fencePath()+".new")+"; sync -f "+quote(fencePath()+".new")+"; mv -T "+quote(fencePath()+".new")+" "+quote(fencePath())+"; sync -f "+quote(remoteRoot)+"; mkdir -p /etc/systemd/system/prodigy.service.d; ";
-      cmd+="printf %s "+quote(content)+" > "+quote(dropin+".new")+"; sync -f "+quote(dropin+".new")+"; mv -T "+quote(dropin+".new")+" "+quote(dropin)+"; sync -f /etc/systemd/system/prodigy.service.d; systemctl daemon-reload";
-      run(machine.uuid,cmd);
+      run(machine.uuid,runtimeStartupFenceCommand(remoteRoot,plan.planSHA));
     }
   }
   void unfence(Machine& machine) {
@@ -499,7 +524,8 @@ public:
   }
   void quiesce() {
     fenceWriters();
-    for(auto& machine:plan.machines) {
+    for(size_t index=0; index<plan.machines.size(); ++index) {
+      auto& machine=plan.machines[plan.initialSeedRuntimeRepair ? plan.machines.size()-1-index : index];
       // A stopped unit remains stopped through process failure/reentry; no
       // application leaf belongs to this service's cgroup.
       run(machine.uuid,quiesceServiceCommand(plan.retainedRecovery)+observeContainers()+"snapshot_containers > "+quote(remoteRoot+"/containers.stopped")+"; cmp "+quote(remoteRoot+"/containers.before")+" "+quote(remoteRoot+"/containers.stopped"));
@@ -511,6 +537,11 @@ public:
       const auto& observedRoot=activeRuntimeRoot(machine); const auto& serviceRoot=serviceRuntimeRoot();
       const auto observedRetained=observedRoot+(plan.retainedRecovery ? ".retained10-" : ".tidesdb9-")+plan.planSHA.substr(0,16);
       const auto serviceRetained=serviceRoot+(plan.retainedRecovery ? ".service-retained10-" : ".service-tidesdb9-")+plan.planSHA.substr(0,16);
+      if (observedRoot==serviceRoot) {
+        run(machine.uuid,retainedRuntimePublicationCommand(serviceRoot,remoteRuntime,observedRetained,
+            machine.installedRuntimeSHA,machine.installedBundleSHA,str(receipt.newRuntimeSHA256))+serviceExecStartCheck());
+        continue;
+      }
       // Both names are on the preflighted filesystem. Reentry examines exact
       // binary identities instead of treating path existence as installation.
       std::string cmd="test \"$(systemctl show -p MainPID --value prodigy)\" = 0; ";
@@ -527,12 +558,18 @@ public:
       cmd+=serviceExecStartCheck()+"test \"$(sha256sum "+quote(serviceRoot+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(str(receipt.newRuntimeSHA256)); run(machine.uuid,cmd);
     }
   }
-  void activate() {
-    require(mothershipTidesDBMigrationAllDatabasesSwapped(receipt),"not all databases are prepared for activation");
+  void activate(const std::function<void()>& verifySameFormatRepair = {}) {
+    if (plan.initialSeedRuntimeRepair) {
+      require(plan.retainedRecovery && bool(verifySameFormatRepair) && receipt.databases.size()==6,
+              "same-format activation requires the explicit retained repair owner");
+      for (const auto& db:receipt.databases) require(!db.swapped,"same-format repair must not swap databases");
+      if (!receipt.activationBoundaryCrossed) verifySameFormatRepair();
+    } else require(mothershipTidesDBMigrationAllDatabasesSwapped(receipt),"not all databases are prepared for activation");
     if(!receipt.activationBoundaryCrossed) {
       for(auto& machine:plan.machines) {
         verifyRuntime(machine,serviceRuntimeRoot());
-        run(machine.uuid,"test \"$(systemctl show -p MainPID --value prodigy)\" = 0; "+observeContainers()+"snapshot_containers > "+quote(remoteRoot+"/containers.pre-activation")+"; cmp "+quote(remoteRoot+"/containers.before")+" "+quote(remoteRoot+"/containers.pre-activation"));
+        run(machine.uuid,"test \"$(systemctl show -p MainPID --value prodigy)\" = 0; "+observeContainers()+"snapshot_containers > "+quote(remoteRoot+"/containers.pre-activation")+"; "+
+            (plan.initialSeedRuntimeRepair ? "test ! -s "+quote(remoteRoot+"/containers.pre-activation") : "cmp "+quote(remoteRoot+"/containers.before")+" "+quote(remoteRoot+"/containers.pre-activation")));
       }
       receipt.activationBoundaryCrossed=true; receipt.phase=MothershipTidesDBMigrationPhase::activationStarted; persist(receipt,nullptr);
     }
@@ -613,6 +650,7 @@ public:
 inline bool run(const char *planPath, bool rollback, String *failure) {
   try {
     Plan plan=parse(planPath);
+    require(!plan.initialSeedRuntimeRepair,"initial seed runtime repair requires the retained recovery command");
     require(!plan.mixedPredecessors,"mixed predecessors require the retained recovery command");
     require(!plan.retainedRecovery,"per-host installed roots require the retained recovery command");
     Execution execution(std::move(plan)); if(rollback) execution.rollback(); else execution.execute(); return true;

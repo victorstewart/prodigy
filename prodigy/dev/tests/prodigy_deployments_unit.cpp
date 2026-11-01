@@ -23,6 +23,50 @@
 #include <unistd.h>
 #include <simdjson.h>
 
+class ContainerManagerGatewayRecoveryTestAccess {
+public:
+  using RecoveryRecord = ContainerManager::GatewayRecoveryRecord;
+
+  static bool socketPath(uint128_t uuid, String& path)
+  {
+    return ContainerManager::gatewayRecoverySocketPath(uuid, path);
+  }
+
+  static bool tokenValid(const String& token)
+  {
+    return ContainerManager::gatewayRecoveryTokenValid(token);
+  }
+
+  static void generateToken(String& token)
+  {
+    ContainerManager::generateGatewayRecoveryToken(token);
+  }
+
+  static bool appendEnvironment(const SystemContainerRuntimePlan& plan, Vector<String>& environment)
+  {
+    return ContainerManager::appendGatewayRecoveryEnvironment(plan, environment);
+  }
+
+  static bool writeRecordAt(int rootFD, const ContainerPlan& plan, const String& token)
+  {
+    return ContainerManager::writeGatewayRecoveryRecordAt(rootFD, plan, token);
+  }
+
+  static bool readRecordAt(int rootFD, const ContainerPlan& plan, String& token)
+  {
+    return ContainerManager::readGatewayRecoveryRecordAt(rootFD, plan, token);
+  }
+};
+
+class ContainerManagerStorageTestAccess {
+public:
+  static bool prepare(Container *container, String *failureReport = nullptr,
+                      bool requireExistingBackend = false)
+  {
+    return ContainerManager::prepareContainerStorage(container, failureReport, requireExistingBackend);
+  }
+};
+
 class TestBrain final : public BrainBase {
 public:
 
@@ -45,6 +89,8 @@ public:
   bool retirementSettled = false;
   bool servingPreparationApproved = true;
   bool servingRecoveryReady = true;
+  uint32_t desiredGroups = 0;
+  uint32_t desiredStatefulShardGroupCount(uint64_t) const override { return desiredGroups; }
   bool statefulServingRecoveryReady() const override { return servingRecoveryReady; }
   uint32_t servingPreparationCalls = 0;
   StatefulServingLaunchAdmission servingLaunchAdmission = StatefulServingLaunchAdmission::ready;
@@ -225,6 +271,7 @@ public:
 class TestNeuron final : public NeuronBase {
 public:
 
+  MachineHardwareProfile hardwareProfile = {};
   uint32_t killAckCount = 0;
   uint32_t poppedCount = 0;
   uint128_t lastKillAck = 0;
@@ -233,17 +280,23 @@ public:
   void queueContainerKillAck(uint128_t uuid) override { ++killAckCount; lastKillAck = uuid; }
   bool ensureHostNetworkingReady(String * = nullptr) override { return true; }
   void downloadContainer(CoroutineStack *, uint64_t) override {}
+  const MachineHardwareProfile *latestHardwareProfileIfReady(void) const override
+  {
+    return hardwareProfile.inventoryComplete ? &hardwareProfile : nullptr;
+  }
 };
 
 class TestSuite {
 public:
 
   int failed = 0;
+  int passed = 0;
 
   void expect(bool condition, const char *name)
   {
     if (condition)
     {
+      passed += 1;
       basics_log("PASS: %s\n", name);
     }
     else
@@ -1479,6 +1532,127 @@ static __attribute__((noinline)) void testRecoveredStatefulSuccessorTarget(TestS
   delete brain;
 }
 
+struct ProdigyDeploymentTargetTestAccess {
+  static void calculate(ApplicationDeployment& deployment) { deployment.calculateTargets(); }
+};
+
+static void testFreshStatefulFloor(TestSuite& suite)
+{
+  TestBrain brain = {};
+  BrainBase *savedBrain = thisBrain;
+  thisBrain = &brain;
+  auto prepare = [](ApplicationDeployment& deployment, uint16_t app, uint32_t minimum, uint32_t maximum) {
+    seedCommonPlan(deployment, true);
+    deployment.plan.config.type = ApplicationType::stateful;
+    deployment.plan.config.applicationID = app;
+    HorizontalScaler scaler = {};
+    scaler.lifetime = ApplicationLifetime::base;
+    scaler.minValue = minimum;
+    scaler.maxValue = maximum;
+    deployment.plan.horizontalScalers.push_back(scaler);
+  };
+  for (uint16_t app : {uint16_t(3), uint16_t(4)})
+  {
+    ApplicationDeployment fresh = {};
+    prepare(fresh, app, 9, 9);
+    ProdigyDeploymentTargetTestAccess::calculate(fresh);
+    suite.expect(fresh.nShardGroups == 3 && fresh.nTargetBase == 9,
+                 "fresh_kv_floor_is_three_groups_before_scheduling");
+    for (uint32_t group = 0; group < 3; ++group)
+    {
+      for (uint32_t replica = 0; replica < 3; ++replica)
+      {
+        ContainerView view = {};
+        view.isStateful = true;
+        view.shardGroup = group;
+        ContainerPlan generated = view.generatePlan(fresh.plan, fresh.nShardGroups);
+        suite.expect(generated.nShardGroups == 3 && generated.shardGroup == group,
+                     "fresh_kv_generated_plan_has_common_group_count");
+      }
+    }
+  }
+  ApplicationDeployment capped = {};
+  prepare(capped, 3, 10, 9);
+  ProdigyDeploymentTargetTestAccess::calculate(capped);
+  suite.expect(capped.nShardGroups == 3 && capped.nTargetBase == 9, "fresh_floor_respects_whole_group_maximum");
+  ApplicationDeployment unlimited = {};
+  prepare(unlimited, 3, 10, 0);
+  ProdigyDeploymentTargetTestAccess::calculate(unlimited);
+  suite.expect(unlimited.nShardGroups == 4 && unlimited.nTargetBase == 12, "fresh_floor_zero_maximum_is_unbounded");
+  ApplicationDeployment unsharded = {};
+  prepare(unsharded, 3, 9, 9);
+  unsharded.plan.stateful.neverShard = true;
+  ProdigyDeploymentTargetTestAccess::calculate(unsharded);
+  suite.expect(unsharded.nShardGroups == 1 && unsharded.nTargetBase == 3, "fresh_never_shard_remains_one_group");
+  for (uint16_t app : {uint16_t(2), uint16_t(5)})
+  {
+    ApplicationDeployment graph = {};
+    seedCommonPlan(graph, true);
+    graph.plan.config.applicationID = app;
+    graph.plan.config.type = ApplicationType::stateful;
+    graph.plan.stateful.neverShard = true;
+    graph.plan.stateful.allMasters = true;
+    graph.plan.stateful.clientPrefix = prodigyRuntimeStatefulServicePrefix(app, 1);
+    graph.plan.stateful.siblingPrefix = prodigyRuntimeStatefulServicePrefix(app, 2);
+    graph.plan.stateful.cousinPrefix = prodigyRuntimeStatefulServicePrefix(app, 3);
+    graph.plan.stateful.seedingPrefix = prodigyRuntimeStatefulServicePrefix(app, 4);
+    graph.plan.stateful.shardingPrefix = prodigyRuntimeStatefulServicePrefix(app, 5);
+    ProdigyDeploymentTargetTestAccess::calculate(graph);
+    suite.expect(graph.state != DeploymentState::failed && graph.nShardGroups == 1 && graph.nTargetBase == 3,
+                 "canonical_graph_remains_one_group");
+  }
+  ApplicationDeployment previous = {};
+  previous.nShardGroups = 2;
+  ApplicationDeployment successor = {};
+  prepare(successor, 3, 9, 9);
+  successor.previous = &previous;
+  ProdigyDeploymentTargetTestAccess::calculate(successor);
+  suite.expect(successor.nShardGroups == 2 && successor.nTargetBase == 6, "predecessor_topology_is_preserved");
+  ApplicationDeployment recovered = {};
+  prepare(recovered, 3, 9, 9);
+  Machine machine = {};
+  ContainerView restored = {};
+  restored.machine = &machine;
+  restored.deploymentID = recovered.plan.config.deploymentID();
+  restored.isStateful = true;
+  restored.shardGroup = 1;
+  restored.state = ContainerState::healthy;
+  recovered.containers.insert(&restored);
+  ProdigyDeploymentTargetTestAccess::calculate(recovered);
+  suite.expect(recovered.nShardGroups == 2 && recovered.nTargetBase == 6, "recovered_inventory_topology_is_preserved");
+  recovered.containers.erase(&restored);
+  ApplicationDeployment queued = {};
+  prepare(queued, 3, 9, 9);
+  queued.toSchedule.push_back(nullptr);
+  ProdigyDeploymentTargetTestAccess::calculate(queued);
+  suite.expect(queued.nShardGroups == 1 && queued.nTargetBase == 3, "queued_work_blocks_genesis_floor");
+  queued.toSchedule.clear();
+  ApplicationDeployment waiting = {};
+  prepare(waiting, 3, 9, 9);
+  waiting.waitingOnContainers.insert_or_assign(&restored, ContainerState::healthy);
+  ProdigyDeploymentTargetTestAccess::calculate(waiting);
+  suite.expect(waiting.nShardGroups == 1 && waiting.nTargetBase == 3, "waiting_work_blocks_genesis_floor");
+  waiting.waitingOnContainers.clear();
+  brain.desiredGroups = 2;
+  ApplicationDeployment authoritative = {};
+  prepare(authoritative, 3, 9, 9);
+  ProdigyDeploymentTargetTestAccess::calculate(authoritative);
+  suite.expect(authoritative.nShardGroups == 2 && authoritative.nTargetBase == 6, "authority_topology_is_preserved");
+  brain.desiredGroups = 0;
+  for (uint8_t mode = 0; mode < 4; ++mode)
+  {
+    ApplicationDeployment retained = {};
+    prepare(retained, 3, 9, 9);
+    if (mode == 0) retained.state = DeploymentState::running;
+    if (mode == 1) retained.materializedStatefulRecoveryOwnsTransition = true;
+    if (mode == 2) retained.hasRetainedStorageRecoverySource = true;
+    if (mode == 3) retained.deferredStatefulTargetShardGroups = 2;
+    ProdigyDeploymentTargetTestAccess::calculate(retained);
+    suite.expect(retained.nShardGroups == 1 && retained.nTargetBase == 3, "recovery_state_does_not_invent_floor_topology");
+  }
+  thisBrain = savedBrain;
+}
+
 static void testRecoveredStatefulHeadShardTarget(TestSuite& suite)
 {
   TestBrain brain = {};
@@ -2661,6 +2835,194 @@ static void testStatefulHorizontalAutoscaleDispatch(TestSuite& suite)
     thisBrain = savedBrain;
 }
 
+static void testStatefulHorizontalAutoscaleFloorDispatch(TestSuite& suite)
+{
+  for (uint32_t scenario = 0; scenario < 3; ++scenario)
+  {
+    const bool zeroSample = (scenario == 1);
+    const bool topologyLocked = (scenario == 2);
+    ScopedFreshRing ring;
+    TestBrain brain;
+    BrainBase *savedBrain = thisBrain;
+    thisBrain = &brain;
+    Rack racks[3]; Machine machines[3]; ScopedSocketPair sockets[3];
+    bool ready = true;
+    for (uint32_t index = 0; index < 3; ++index)
+    {
+      racks[index].uuid = 0x19604400 + index + (scenario * 0x10);
+      ready = ready && sockets[index].create(suite, "stateful_horizontal_floor_socket") &&
+          seedSchedulableMachine(brain, racks[index], machines[index], 0x19604500 + index + (scenario * 0x10),
+                                 0x0a000501 + index + (scenario * 0x10), "stateful-horizontal-floor"_ctv, sockets[index]);
+      brain.racks.insert_or_assign(racks[index].uuid, &racks[index]);
+    }
+
+    ApplicationDeployment deployment = {};
+    seedCommonPlan(deployment, true);
+    deployment.plan.config.type = ApplicationType::stateful;
+    deployment.plan.config.architecture = nametagCurrentBuildMachineArchitecture();
+    deployment.plan.config.applicationID = 998;
+    deployment.plan.stateful.clientPrefix = MeshServices::generateStatefulService(998, 1);
+    deployment.plan.stateful.siblingPrefix = MeshServices::generateStatefulService(998, 2);
+    deployment.plan.stateful.cousinPrefix = MeshServices::generateStatefulService(998, 3);
+    deployment.plan.stateful.seedingPrefix = MeshServices::generateStatefulService(998, 4);
+    deployment.plan.stateful.shardingPrefix = MeshServices::generateStatefulService(998, 5);
+    deployment.plan.stateful.allMasters = true;
+    deployment.state = DeploymentState::running;
+    deployment.nShardGroups = 1;
+    deployment.recomputeStatefulBaseTargetFromShardGroups();
+    brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+
+    ContainerView existing[3];
+    for (uint32_t index = 0; index < 3; ++index)
+    {
+      existing[index].uuid = 0x19604600 + index + (scenario * 0x10);
+      existing[index].deploymentID = deployment.plan.config.deploymentID();
+      existing[index].applicationID = deployment.plan.config.applicationID;
+      existing[index].machine = &machines[index];
+      existing[index].isStateful = true;
+      existing[index].shardGroup = 0;
+      existing[index].lifetime = ApplicationLifetime::base;
+      existing[index].state = ContainerState::healthy;
+      existing[index].runtimeReady = true;
+      existing[index].explicitStatefulMeshRoles = StatefulMeshRoles::forShardGroup(deployment.plan.stateful, deployment.plan.config.applicationID, 0);
+      deployment.containers.insert(&existing[index]);
+      deployment.containersByShardGroup.insert(0, &existing[index]);
+      deployment.countPerMachine[&machines[index]] += 1;
+      deployment.countPerRack[&racks[index]] += 1;
+      deployment.racksByShardGroup[0].insert(&racks[index]);
+      brain.containers.insert_or_assign(existing[index].uuid, &existing[index]);
+      machines[index].upsertContainerIndexEntry(deployment.plan.config.deploymentID(), &existing[index]);
+    }
+    deployment.nDeployedBase = 3;
+    deployment.nHealthyBase = 3;
+
+    HorizontalScaler scaler = {};
+    scaler.name.assign(ProdigyMetrics::runtimeContainerCpuUtilPctName);
+    scaler.percentile = 95.;
+    scaler.lookbackSeconds = 60;
+    scaler.threshold = .1;
+    scaler.direction = Scaler::Direction::upscale;
+    scaler.lifetime = ApplicationLifetime::base;
+    scaler.minValue = 9;
+    scaler.maxValue = 9;
+    deployment.plan.horizontalScalers.push_back(scaler);
+    if (topologyLocked)
+    {
+      deployment.statefulWorkerTopologyUpgradePending = true;
+      deployment.statefulWorkerTopologyLockedShardGroups.insert(0);
+      brain.metrics.record(deployment.plan.config.deploymentID(), 0x19604720,
+                           ProdigyMetrics::runtimeContainerCpuUtilPctKey(), Time::now<TimeResolution::ms>(), .95);
+    }
+    else if (zeroSample)
+    {
+      brain.metrics.record(deployment.plan.config.deploymentID(), 0x19604710,
+                           ProdigyMetrics::runtimeContainerCpuUtilPctKey(), Time::now<TimeResolution::ms>(), 0.0);
+    }
+
+    TimeoutPacket autoscalePacket = {};
+    autoscalePacket.flags = uint64_t(DeploymentTimeoutFlags::autoscale);
+    deployment.dispatchTimeout(&autoscalePacket);
+
+    if (topologyLocked)
+    {
+      suite.expect(ready && deployment.nShardGroups == 1 && deployment.nTargetBase == 3 &&
+                       deployment.deferredStatefulTargetShardGroups == 3 && deployment.waitingOnContainers.empty(),
+                   "stateful_horizontal_floor_topology_lock_high_metric_keeps_bounded_deferred_target");
+      deployment.clearStatefulWorkerTopologyUpgradeOperation();
+      deployment.dispatchDeferredStatefulScaleIntent();
+    }
+    else
+    {
+      suite.expect(ready && deployment.nShardGroups == 2 && deployment.nTargetBase == 6 &&
+                       deployment.deferredStatefulTargetShardGroups == 3 && deployment.waitingOnContainers.size() == 3,
+                   zeroSample ? "stateful_horizontal_floor_zero_metric_queues_second_group" :
+                                "stateful_horizontal_floor_missing_metric_queues_second_group");
+    }
+
+    Vector<ContainerView *> firstGrowth;
+    for (ContainerView *container : deployment.containers)
+    {
+      if (container != nullptr && container->shardGroup == 1)
+      {
+        firstGrowth.push_back(container);
+      }
+    }
+    suite.expect(firstGrowth.size() == 3, topologyLocked ? "stateful_horizontal_floor_topology_unlock_dispatches_first_group" :
+                                         zeroSample ? "stateful_horizontal_floor_zero_metric_first_group_has_three_replicas" :
+                                                      "stateful_horizontal_floor_missing_metric_first_group_has_three_replicas");
+    for (ContainerView *container : firstGrowth)
+    {
+      deployment.containerIsRuntimeReady(container);
+      deployment.containerIsHealthy(container);
+    }
+    suite.expect(deployment.waitingOnContainers.empty() && deployment.schedulingStack.execution == nullptr,
+                 "stateful_horizontal_floor_first_group_health_resumes_scheduler");
+    TimeoutPacket shardReadyPacket = {};
+    shardReadyPacket.flags = uint64_t(DeploymentTimeoutFlags::shardGroupReady);
+    deployment.dispatchTimeout(&shardReadyPacket);
+
+    suite.expect(deployment.nShardGroups == 3 && deployment.nTargetBase == 9 &&
+                     deployment.deferredStatefulTargetShardGroups == 3 && deployment.waitingOnContainers.size() == 3,
+                 topologyLocked ? "stateful_horizontal_floor_topology_unlock_readiness_dispatches_second_group" :
+                 zeroSample ? "stateful_horizontal_floor_zero_metric_readiness_dispatches_next_group" :
+                              "stateful_horizontal_floor_missing_metric_readiness_dispatches_next_group");
+
+    Vector<ContainerView *> secondGrowth;
+    for (ContainerView *container : deployment.containers)
+    {
+      if (container != nullptr && container->shardGroup == 2)
+      {
+        secondGrowth.push_back(container);
+      }
+    }
+    suite.expect(secondGrowth.size() == 3, topologyLocked ? "stateful_horizontal_floor_topology_unlock_second_group_has_three_replicas" :
+                                          zeroSample ? "stateful_horizontal_floor_zero_metric_second_group_has_three_replicas" :
+                                                       "stateful_horizontal_floor_missing_metric_second_group_has_three_replicas");
+    for (ContainerView *container : secondGrowth)
+    {
+      deployment.containerIsRuntimeReady(container);
+      deployment.containerIsHealthy(container);
+    }
+    suite.expect(deployment.waitingOnContainers.empty() && deployment.schedulingStack.execution == nullptr,
+                 "stateful_horizontal_floor_second_group_health_resumes_scheduler");
+    deployment.dispatchTimeout(&shardReadyPacket);
+    suite.expect(deployment.nShardGroups == 3 && deployment.nTargetBase == 9 &&
+                     deployment.deferredStatefulTargetShardGroups == 0,
+                 topologyLocked ? "stateful_horizontal_floor_topology_unlock_completes_three_groups" :
+                 zeroSample ? "stateful_horizontal_floor_zero_metric_completes_three_groups" :
+                              "stateful_horizontal_floor_missing_metric_completes_three_groups");
+
+    Vector<ContainerView *> created;
+    for (ContainerView *container : deployment.containers)
+    {
+      if (container != &existing[0] && container != &existing[1] && container != &existing[2])
+      {
+        created.push_back(container);
+      }
+    }
+    for (ContainerView *container : created)
+    {
+      deployment.waitingOnContainers.erase(container);
+      deployment.containers.erase(container);
+      while (deployment.containersByShardGroup.eraseEntry(container->shardGroup, container)) {}
+      container->machine->removeContainerIndexEntry(container->deploymentID, container);
+      brain.containers.erase(container->uuid);
+      delete container;
+    }
+    for (uint32_t index = 0; index < 3; ++index)
+    {
+      deployment.containers.erase(&existing[index]);
+      while (deployment.containersByShardGroup.eraseEntry(existing[index].shardGroup, &existing[index])) {}
+      machines[index].removeContainerIndexEntry(existing[index].deploymentID, &existing[index]);
+      brain.containers.erase(existing[index].uuid);
+      brain.machines.erase(&machines[index]);
+      brain.racks.erase(racks[index].uuid);
+    }
+    brain.deployments.erase(deployment.plan.config.deploymentID());
+    thisBrain = savedBrain;
+  }
+}
+
 static void testPendingCreateMarkerGenerationOwnership(TestSuite& suite)
 {
   TemporaryDirectory containersRoot;
@@ -2727,9 +3089,726 @@ static void testPendingCreateMarkerGenerationOwnership(TestSuite& suite)
                "rejected_artifact_janitor_erases_recycled_pid_artifact_tree");
 }
 
+static void testRootfsHostMountTargets(TestSuite& suite)
+{
+  TemporaryDirectory artifactRoot;
+  suite.expect(artifactRoot.create(), "rootfs_host_mount_targets_fixture_mkdtemp_created");
+
+  if (artifactRoot.path.size() > 0)
+  {
+    std::filesystem::path artifactRootPath = filesystemPathFromString(artifactRoot.path);
+    suite.expect(createDirectoryFixture(artifactRootPath / "rootfs"), "rootfs_host_mount_targets_fixture_rootfs_created");
+
+    Container container {};
+    container.artifactRootPath.assign(artifactRoot.path);
+    container.userID = uint32_t(fixtureWritableUserID());
+    container.executionHostID = uint32_t(fixtureWritableUserID());
+
+    String failure = {};
+    bool prepared = ContainerManager::debugPrepareContainerRootFSMountTargets(&container, &failure);
+    suite.expect(prepared, "rootfs_host_mount_targets_prepare_succeeds");
+    suite.expect(failure.size() == 0, "rootfs_host_mount_targets_prepare_clears_failure");
+    suite.expect(
+        std::filesystem::exists(artifactRootPath / "rootfs" / "etc" / "resolv.conf"),
+        "rootfs_host_mount_targets_prepare_creates_resolv_conf_target");
+    suite.expect(
+        std::filesystem::exists(artifactRootPath / "rootfs" / "proc"),
+        "rootfs_host_mount_targets_prepare_creates_proc_directory");
+    suite.expect(
+        std::filesystem::exists(artifactRootPath / "rootfs" / "dev" / "null"),
+        "rootfs_host_mount_targets_prepare_creates_standard_device_nodes");
+    suite.expect(!std::filesystem::exists(artifactRootPath / "rootfs" / "dev" / "net" / "tun"),
+        "rootfs_ordinary_container_has_no_tun_target");
+    int gatewayTestPair[2] = {-1, -1};
+    const bool socketPairReady = ::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, gatewayTestPair) == 0;
+    suite.expect(socketPairReady, "gateway_readiness_descriptor_fixture_created");
+    if (socketPairReady)
+    {
+      const bool secured = ::fchmod(gatewayTestPair[0], 0600) == 0;
+      suite.expect(secured && Container::gatewayReadinessSocketFDValid(gatewayTestPair[0], getuid(), getgid()),
+          "gateway_readiness_descriptor_accepts_exact_socket_owner");
+      suite.expect(!Container::gatewayReadinessSocketFDValid(gatewayTestPair[0], uid_t(getuid() + 1), getgid()) &&
+          !Container::gatewayReadinessSocketFDValid(-1, getuid(), getgid()),
+          "gateway_readiness_descriptor_rejects_wrong_owner_and_missing_fd");
+      ::close(gatewayTestPair[0]); ::close(gatewayTestPair[1]);
+    }
+    suite.expect(Container::gatewayReadinessPeerIDsMatch(16514820, uid_t(16514820), gid_t(16514820)),
+        "gateway_readiness_accepts_mapped_root_ids");
+    suite.expect(!Container::gatewayReadinessPeerIDsMatch(16514820, uid_t(0), gid_t(0)) &&
+        !Container::gatewayReadinessPeerIDsMatch(16514820, uid_t(16514820), gid_t(1)),
+        "gateway_readiness_rejects_other_peer_ids");
+    container.plan.uuid = 123;
+    container.plan.system.gatewayLaunchToken = "0123456789abcdef0123456789abcdef"_ctv;
+    String gatewayDirectory = {};
+    suite.expect(Container::gatewayReadinessDirectoryPath(container.plan.uuid, gatewayDirectory) &&
+        gatewayDirectory.equal("/run/prodigy/containers/123"_ctv),
+        "gateway_readiness_directory_is_fixed_below_container_runtime_root");
+    String gatewaySocket = {};
+    suite.expect(Container::gatewayReadinessSocketPath(container.plan.uuid, container.plan.system.gatewayLaunchToken, gatewaySocket) &&
+        gatewaySocket.equal("/run/prodigy/containers/123/masque-gateway-ready.soc"_ctv),
+        "gateway_readiness_socket_uses_fixed_control_name");
+    suite.expect(!Container::gatewayReadinessDirectoryFDValid(-1),
+        "gateway_readiness_directory_rejects_missing_descriptor");
+    container.plan.system.gatewayReadinessSocket = gatewaySocket;
+    String selectedSocket = {};
+    suite.expect(!container.gatewayReadinessMountPath(selectedSocket), "ordinary_container_has_no_gateway_socket_mount");
+    container.plan.system.kind = SystemContainerKind::crossClusterMasqueGateway;
+    suite.expect(container.gatewayReadinessMountPath(selectedSocket) && selectedSocket == gatewaySocket,
+        "gateway_socket_mount_selects_exact_authority_path");
+    String selectedDirectory = {};
+    suite.expect(container.gatewayReadinessMountDirectoryPath(selectedDirectory) && selectedDirectory == gatewayDirectory,
+        "gateway_directory_mount_selects_exact_runtime_directory");
+    container.plan.system.gatewayReadinessSocket.assign("/tmp/other.soc"_ctv);
+    suite.expect(!container.gatewayReadinessMountPath(selectedSocket), "gateway_socket_mount_rejects_mismatched_path");
+    container.plan.system.gatewayReadinessSocket = gatewaySocket;
+    failure.clear();
+    suite.expect(ContainerManager::debugPrepareContainerRootFSMountTargets(&container, &failure) &&
+        std::filesystem::exists(artifactRootPath / "rootfs" / "dev" / "net" / "tun"),
+        "rootfs_gateway_prepares_tun_mount_target");
+    struct stat etcStat = {};
+    struct stat resolvStat = {};
+    int etcStatResult = ::stat((artifactRootPath / "rootfs" / "etc").c_str(), &etcStat);
+    int resolvStatResult = ::stat((artifactRootPath / "rootfs" / "etc" / "resolv.conf").c_str(), &resolvStat);
+    suite.expect(
+        etcStatResult == 0 && etcStat.st_uid == fixtureWritableUserID() && etcStat.st_gid == fixtureWritableGroupID(),
+        "rootfs_host_mount_targets_prepare_sets_etc_ownership");
+    suite.expect(
+        etcStatResult == 0 && (etcStat.st_mode & 07777) == 0755,
+        "rootfs_host_mount_targets_prepare_sets_etc_mode");
+    suite.expect(
+        resolvStatResult == 0 && resolvStat.st_uid == fixtureWritableUserID() && resolvStat.st_gid == fixtureWritableGroupID(),
+        "rootfs_host_mount_targets_prepare_sets_resolv_conf_ownership");
+    suite.expect(
+        std::filesystem::exists(artifactRootPath / "rootfs" / "run" / "systemd" / "resolve" / "io.systemd.Resolve") == false,
+        "rootfs_host_mount_targets_prepare_does_not_create_systemd_resolve_target");
+    suite.expect(
+        std::filesystem::exists(artifactRootPath / "rootfs" / "var" / "cache" / "ca-certs") == false,
+        "rootfs_host_mount_targets_prepare_does_not_create_host_ca_cache_target");
+  }
+}
+
+static void testGatewayRecoveryTokenRecord(TestSuite& suite)
+{
+  TemporaryDirectory root;
+  suite.expect(root.create(), "gateway_recovery_record_fixture_created");
+  if (root.path.size() == 0 || getuid() != 0) return;
+  ContainerPlan plan = {}; plan.uuid = 99123; plan.system.kind = SystemContainerKind::crossClusterMasqueGateway;
+  plan.system.gatewayPairUUID = 1; plan.system.gatewayLocalClusterUUID = 2; plan.system.gatewayLocalMachineUUID = 3;
+  plan.system.gatewayKeyEpoch = 4; plan.system.gatewayAuthorityGeneration = 5; plan.system.gatewayGeneration = 6;
+  String token = "0123456789abcdef0123456789abcdef"_ctv, observed = {};
+  String recoverySocket = {};
+  suite.expect(ContainerManagerGatewayRecoveryTestAccess::socketPath(plan.uuid, recoverySocket),
+               "gateway_recovery_socket_path_derived_from_container_uuid");
+  plan.system.gatewayRecoverySocket = recoverySocket;
+  plan.system.gatewayRecoveryToken = token;
+  Vector<String> environment = {};
+  suite.expect(ContainerManagerGatewayRecoveryTestAccess::appendEnvironment(plan.system, environment) &&
+                   environment.size() == 2 &&
+                   environment[0] == "PRODIGY_MASQUE_RECOVERY_SOCKET=/run/prodigy/containers/99123/masque-gateway-recovery.soc"_ctv &&
+                   environment[1] == "PRODIGY_MASQUE_RECOVERY_TOKEN=0123456789abcdef0123456789abcdef"_ctv,
+               "gateway_recovery_environment_has_exact_key_values");
+  const std::filesystem::path directory = filesystemPathFromString(root.path) / "99123";
+  suite.expect(createDirectoryFixture(directory) && chmod(directory.c_str(), 0711) == 0,
+               "gateway_recovery_record_fixture_directory_secure");
+  int rootFD = open(root.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  suite.expect(ContainerManagerGatewayRecoveryTestAccess::tokenValid(token) &&
+               !ContainerManagerGatewayRecoveryTestAccess::tokenValid("0123456789abcdef0123456789abcdeg"_ctv),
+               "gateway_recovery_token_is_exact_lowercase_hex");
+  String generated = {}; ContainerManagerGatewayRecoveryTestAccess::generateToken(generated);
+  suite.expect(generated.size() == 32 && ContainerManagerGatewayRecoveryTestAccess::tokenValid(generated),
+               "gateway_recovery_token_generation_is_exact_lowercase_hex");
+  plan.system.gatewayRecoverySocket = "/run/prodigy/containers/99123/masque-gateway-recovery.soc"_ctv;
+  plan.system.gatewayRecoveryToken = token;
+  Brain::normalizeCrossClusterMasqueGatewayPlan(plan);
+  suite.expect(plan.system.gatewayRecoverySocket.size() == 0 && plan.system.gatewayRecoveryToken.size() == 0,
+               "gateway_recovery_fields_are_scrubbed_by_brain_normalization");
+  plan.system.kind = SystemContainerKind::crossClusterMasqueGateway;
+  plan.system.gatewayPairUUID = 1; plan.system.gatewayLocalClusterUUID = 2; plan.system.gatewayLocalMachineUUID = 3;
+  plan.system.gatewayKeyEpoch = 4; plan.system.gatewayAuthorityGeneration = 5; plan.system.gatewayGeneration = 6;
+  suite.expect(rootFD >= 0 && ContainerManagerGatewayRecoveryTestAccess::writeRecordAt(rootFD, plan, token) &&
+               ContainerManagerGatewayRecoveryTestAccess::readRecordAt(rootFD, plan, observed) && observed == token,
+               "gateway_recovery_record_exact_roundtrip");
+  struct stat record = {};
+  suite.expect(stat((directory / "masque-gateway-recovery.v1").c_str(), &record) == 0 && record.st_uid == 0 &&
+               (record.st_mode & 07777) == 0600, "gateway_recovery_record_root_0600");
+  suite.expect(ContainerManagerGatewayRecoveryTestAccess::writeRecordAt(rootFD, plan, token),
+               "gateway_recovery_record_exact_existing_is_idempotent");
+  String conflict = "fedcba9876543210fedcba9876543210"_ctv;
+  suite.expect(!ContainerManagerGatewayRecoveryTestAccess::writeRecordAt(rootFD, plan, conflict) &&
+               ContainerManagerGatewayRecoveryTestAccess::readRecordAt(rootFD, plan, observed) && observed == token,
+               "gateway_recovery_record_conflict_fails_closed_without_overwrite");
+  for (uint8_t field = 0; field < 7; ++field)
+  {
+    ContainerPlan mismatch = plan;
+    if (field == 0) mismatch.uuid++;
+    if (field == 1) mismatch.system.gatewayPairUUID++;
+    if (field == 2) mismatch.system.gatewayLocalClusterUUID++;
+    if (field == 3) mismatch.system.gatewayLocalMachineUUID++;
+    if (field == 4) mismatch.system.gatewayKeyEpoch++;
+    if (field == 5) mismatch.system.gatewayAuthorityGeneration++;
+    if (field == 6) mismatch.system.gatewayGeneration++;
+    suite.expect(!ContainerManagerGatewayRecoveryTestAccess::readRecordAt(rootFD, mismatch, observed),
+                 "gateway_recovery_record_tuple_mismatch_rejected");
+  }
+  int recordFD = openat(rootFD, "99123/masque-gateway-recovery.v1", O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+  ContainerManagerGatewayRecoveryTestAccess::RecoveryRecord raw = {};
+  suite.expect(recordFD >= 0 && read(recordFD, &raw, sizeof(raw)) == ssize_t(sizeof(raw)),
+               "gateway_recovery_record_raw_fixture_opened");
+  bool reservedZero = true;
+  for (uint8_t value : raw.reserved) reservedZero = reservedZero && value == 0;
+  suite.expect(sizeof(raw) == 128 && raw.version == 1 && reservedZero &&
+                   raw.containerUUID[13] == 0x01 && raw.containerUUID[14] == 0x83 &&
+                   raw.containerUUID[15] == 0x33 && raw.pairUUID[15] == 1 &&
+                   raw.localClusterUUID[15] == 2 && raw.localMachineUUID[15] == 3 &&
+                   raw.keyEpoch[7] == 4 && raw.authorityGeneration[7] == 5 &&
+                   raw.gatewayGeneration[7] == 6 && memcmp(raw.token, token.data(), 32) == 0,
+               "gateway_recovery_record_has_fixed_versioned_big_endian_bytes");
+  if (recordFD >= 0)
+  {
+    raw.version = 2;
+    suite.expect(pwrite(recordFD, &raw, sizeof(raw), 0) == ssize_t(sizeof(raw)) &&
+                     !ContainerManagerGatewayRecoveryTestAccess::readRecordAt(rootFD, plan, observed),
+                 "gateway_recovery_record_version_rejected");
+    close(recordFD);
+  }
+  unlinkat(rootFD, "99123/masque-gateway-recovery.v1", 0);
+  suite.expect(ContainerManagerGatewayRecoveryTestAccess::writeRecordAt(rootFD, plan, token),
+               "gateway_recovery_record_recreated_after_fixture_corruption");
+  recordFD = openat(rootFD, "99123/masque-gateway-recovery.v1", O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW);
+  suite.expect(recordFD >= 0 && write(recordFD, "x", 1) == 1, "gateway_recovery_record_trailing_fixture_written");
+  if (recordFD >= 0) close(recordFD);
+  suite.expect(!ContainerManagerGatewayRecoveryTestAccess::readRecordAt(rootFD, plan, observed),
+               "gateway_recovery_record_trailing_data_rejected");
+  unlinkat(rootFD, "99123/masque-gateway-recovery.v1", 0);
+  suite.expect(symlinkat("not-a-record", rootFD, "99123/masque-gateway-recovery.v1") == 0 &&
+                   !ContainerManagerGatewayRecoveryTestAccess::readRecordAt(rootFD, plan, observed) &&
+                   !ContainerManagerGatewayRecoveryTestAccess::writeRecordAt(rootFD, plan, token),
+               "gateway_recovery_record_symlink_rejected_without_mutation");
+  struct stat link = {};
+  suite.expect(fstatat(rootFD, "99123/masque-gateway-recovery.v1", &link, AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(link.st_mode),
+               "gateway_recovery_record_symlink_target_preserved");
+  if (rootFD >= 0) close(rootFD);
+}
+
+// Opt-in only: this exercises a private user and mount namespace on a
+// verified disposable guest; it does not touch host networking or services.
+static void testGatewaySocketNamespace(TestSuite& suite)
+{
+  constexpr uid_t mappedID = 16514820;
+  char sourceTemplate[] = "/tmp/prodigy-gateway-source-XXXXXX";
+  char rootTemplate[] = "/tmp/prodigy-gateway-root-XXXXXX";
+  char *sourceDirectory = mkdtemp(sourceTemplate);
+  char *rootDirectory = mkdtemp(rootTemplate);
+  if (!sourceDirectory || !rootDirectory) { suite.expect(false, "gateway_namespace_fixture_directories"); return; }
+  std::string source = std::string(sourceDirectory) + "/masque-gateway-ready.soc";
+  int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  sockaddr_un address = {}; address.sun_family = AF_UNIX;
+  if (source.size() >= sizeof(address.sun_path)) { suite.expect(false, "gateway_namespace_fixture_path"); return; }
+  memcpy(address.sun_path, source.c_str(), source.size() + 1);
+  int sync[2] = {-1, -1};
+  bool setup = listener >= 0 && bind(listener, reinterpret_cast<sockaddr *>(&address), sizeof(address)) == 0 &&
+      chown(source.c_str(), mappedID, mappedID) == 0 && chmod(source.c_str(), 0600) == 0 && listen(listener, 1) == 0 &&
+      chown(sourceDirectory, 0, 0) == 0 && chmod(sourceDirectory, 0711) == 0 &&
+      chown(rootDirectory, mappedID, mappedID) == 0 && socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sync) == 0;
+  if (!setup) { suite.expect(false, "gateway_namespace_fixture_setup"); if (listener >= 0) close(listener); unlink(source.c_str()); rmdir(sourceDirectory); rmdir(rootDirectory); return; }
+  pid_t child = fork();
+  if (child == 0)
+  {
+    alarm(15); close(sync[0]); close(listener);
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0 || write(sync[1], "U", 1) != 1) _exit(10);
+    char ready = 0; iovec io = {&ready, 1}; alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int))] = {};
+    msghdr msg = {}; msg.msg_iov = &io; msg.msg_iovlen = 1; msg.msg_control = control; msg.msg_controllen = sizeof(control);
+    if (recvmsg(sync[1], &msg, MSG_CMSG_CLOEXEC) != 1 || ready != 'G' || (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC))) _exit(11);
+    cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); int socketFD = -1;
+    if (!cmsg || cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS ||
+        cmsg->cmsg_len != CMSG_LEN(sizeof(int)) || CMSG_NXTHDR(&msg, cmsg)) _exit(12);
+    memcpy(&socketFD, CMSG_DATA(cmsg), sizeof(socketFD));
+    if (setresgid(0, 0, 0) || setresuid(0, 0, 0) ||
+        !Container::gatewayReadinessDirectoryMountFDValid(socketFD)) _exit(13);
+    if (mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) _exit(15);
+    Container container; container.plan.uuid = 123;
+    container.plan.system.kind = SystemContainerKind::crossClusterMasqueGateway;
+    container.plan.system.gatewayLaunchToken = "0123456789abcdef0123456789abcdef"_ctv;
+    if (!Container::gatewayReadinessSocketPath(container.plan.uuid, container.plan.system.gatewayLaunchToken,
+                                              container.plan.system.gatewayReadinessSocket)) _exit(16);
+    String root = {}; root.assign(rootDirectory); String failure = {};
+    if (!ContainerManager::debugMountGatewayReadinessDirectory(&container, root, socketFD, &failure)) {
+      std::fprintf(stderr, "gateway namespace mount failure: %s errno=%d\n", failure.c_str(), errno); _exit(17);
+    }
+    close(socketFD);
+    std::string target = std::string(rootDirectory) + container.plan.system.gatewayReadinessSocket.c_str();
+    struct stat first = {};
+    if (stat(target.c_str(), &first) != 0 || !S_ISSOCK(first.st_mode)) _exit(18);
+    if (unlink(target.c_str()) == 0) _exit(19);
+    int client = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    sockaddr_un targetAddress = {}; targetAddress.sun_family = AF_UNIX;
+    if (target.size() >= sizeof(targetAddress.sun_path)) _exit(20);
+    memcpy(targetAddress.sun_path, target.c_str(), target.size() + 1);
+    if (client < 0 || connect(client, reinterpret_cast<sockaddr *>(&targetAddress), sizeof(targetAddress)) != 0 || write(client, "R", 1) != 1) _exit(21);
+    close(client);
+    if (write(sync[1], "P", 1) != 1 || read(sync[1], &ready, 1) != 1 || ready != 'N') _exit(22);
+    struct stat replacement = {};
+    if (stat(target.c_str(), &replacement) != 0 || !S_ISSOCK(replacement.st_mode) || replacement.st_ino == first.st_ino) _exit(23);
+    client = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (client < 0 || connect(client, reinterpret_cast<sockaddr *>(&targetAddress), sizeof(targetAddress)) != 0 || write(client, "S", 1) != 1) _exit(24);
+    close(client); close(sync[1]); _exit(0);
+  }
+  close(sync[1]);
+  bool parentOK = child > 0;
+  char signalByte = 0;
+  if (parentOK) parentOK = read(sync[0], &signalByte, 1) == 1 && signalByte == 'U';
+  auto writeMap = [&](const char *name, const char *value) {
+    char path[128]; snprintf(path, sizeof(path), "/proc/%ld/%s", long(child), name);
+    int fd = open(path, O_WRONLY | O_CLOEXEC); if (fd < 0) return false;
+    const size_t length = strlen(value); bool ok = write(fd, value, length) == ssize_t(length); close(fd); return ok;
+  };
+  if (parentOK) parentOK = writeMap("setgroups", "deny") && writeMap("uid_map", "0 16514820 1\n") && writeMap("gid_map", "0 16514820 1\n");
+  int sourceFD = parentOK ? open(sourceDirectory, O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW) : -1;
+  if (sourceFD < 0) parentOK = false;
+  if (parentOK)
+  {
+    int mountFD = Container::gatewayReadinessDetachedMount(sourceFD);
+    close(sourceFD); sourceFD = mountFD;
+    if (sourceFD < 0) { std::fprintf(stderr, "gateway namespace open_tree/mount_setattr failed errno=%d\n", errno); parentOK = false; }
+  }
+  if (parentOK)
+  {
+    char byte = 'G'; iovec io = {&byte, 1}; alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int))] = {};
+    msghdr msg = {}; msg.msg_iov = &io; msg.msg_iovlen = 1; msg.msg_control = control; msg.msg_controllen = sizeof(control);
+    cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg->cmsg_level = SOL_SOCKET; cmsg->cmsg_type = SCM_RIGHTS; cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cmsg), &sourceFD, sizeof(sourceFD)); parentOK = sendmsg(sync[0], &msg, 0) == 1;
+  }
+  if (sourceFD >= 0) close(sourceFD);
+  if (!parentOK && child > 0) kill(child, SIGKILL);
+  if (parentOK)
+  {
+    pollfd pfd = {listener, POLLIN, 0};
+    if (poll(&pfd, 1, 10000) != 1) parentOK = false;
+    else { int accepted = accept4(listener, nullptr, nullptr, SOCK_CLOEXEC); char byte = 0; parentOK = accepted >= 0 && read(accepted, &byte, 1) == 1 && byte == 'R'; if (accepted >= 0) close(accepted); }
+  }
+  if (parentOK)
+  {
+    char replace = 0;
+    parentOK = read(sync[0], &replace, 1) == 1 && replace == 'P';
+  }
+  if (parentOK)
+  {
+    close(listener); listener = -1;
+    parentOK = unlink(source.c_str()) == 0;
+    listener = parentOK ? socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0) : -1;
+    parentOK = listener >= 0 && bind(listener, reinterpret_cast<sockaddr *>(&address), sizeof(address)) == 0 &&
+        chown(source.c_str(), mappedID, mappedID) == 0 && chmod(source.c_str(), 0600) == 0 && listen(listener, 1) == 0;
+  }
+  if (parentOK) parentOK = write(sync[0], "N", 1) == 1;
+  if (parentOK)
+  {
+    pollfd pfd = {listener, POLLIN, 0};
+    if (poll(&pfd, 1, 10000) != 1) parentOK = false;
+    else { int accepted = accept4(listener, nullptr, nullptr, SOCK_CLOEXEC); char byte = 0; parentOK = accepted >= 0 && read(accepted, &byte, 1) == 1 && byte == 'S'; if (accepted >= 0) close(accepted); }
+  }
+  int status = 0; if (child > 0) waitpid(child, &status, 0);
+  close(sync[0]);
+  if (!parentOK || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+    std::fprintf(stderr, "gateway namespace test parent=%d childStatus=%d\n", int(parentOK), status);
+  suite.expect(parentOK && WIFEXITED(status) && WEXITSTATUS(status) == 0, "gateway_namespace_fd_bind_and_connect");
+  if (listener >= 0) close(listener); unlink(source.c_str()); rmdir(sourceDirectory);
+  std::error_code cleanupError; std::filesystem::remove_all(rootDirectory, cleanupError);
+}
+
+static void testStatefulInplaceCapacity(TestSuite& suite)
+{
+  {
+    ScopedFreshRing ring;
+    TestBrain brain;
+    BrainBase *savedBrain = thisBrain;
+    thisBrain = &brain;
+
+    Rack rack {};
+    rack.uuid = 19'510'001;
+    brain.racks.insert_or_assign(rack.uuid, &rack);
+
+    ScopedSocketPair socket = {};
+    bool socketReady = socket.create(suite, "measure_stateful_previous_creates_socketpair");
+
+    Machine machine = {};
+    machine.uuid = uint128_t(0x19510001);
+    machine.slug = "measure-previous"_ctv;
+    machine.rack = &rack;
+    machine.state = MachineState::healthy;
+    machine.lifetime = MachineLifetime::owned;
+    machine.nLogicalCores_available = 8;
+    machine.memoryMB_available = 8192;
+    machine.storageMB_available = 4096;
+    bool machineReady = socketReady && armNeuronControlStream(machine, socket);
+    rack.machines.insert(&machine);
+    brain.machines.insert(&machine);
+
+    suite.expect(machineReady, "measure_stateful_previous_seeds_machine_neuron_control_stream");
+
+    ApplicationDeployment previous;
+    seedCommonPlan(previous, true);
+    previous.plan.config.versionID = 1;
+    previous.plan.stateful.allowUpdateInPlace = true;
+    previous.plan.moveConstructively = true;
+    previous.nShardGroups = 1;
+
+    ContainerView oldContainer = {};
+    oldContainer.uuid = uint128_t(0x19510010);
+    oldContainer.deploymentID = previous.plan.config.deploymentID();
+    oldContainer.applicationID = previous.plan.config.applicationID;
+    oldContainer.machine = &machine;
+    oldContainer.lifetime = ApplicationLifetime::base;
+    oldContainer.state = ContainerState::healthy;
+    oldContainer.isStateful = true;
+    oldContainer.shardGroup = 0;
+    previous.containers.insert(&oldContainer);
+    previous.containersByShardGroup.insert(oldContainer.shardGroup, &oldContainer);
+    brain.containers.insert_or_assign(oldContainer.uuid, &oldContainer);
+    machine.upsertContainerIndexEntry(oldContainer.deploymentID, &oldContainer);
+
+    ApplicationDeployment deployment;
+    seedCommonPlan(deployment, true);
+    deployment.plan.config.versionID = 2;
+    deployment.plan.stateful.allowUpdateInPlace = true;
+    deployment.plan.moveConstructively = true;
+    deployment.previous = &previous;
+
+    uint32_t measured = deployment.measure();
+    suite.expect(measured == 1, "measure_stateful_previous_fixture_updates_in_place_fit");
+    machine.nLogicalCores_available = 0;
+    machine.memoryMB_available = 0;
+    machine.storageMB_available = 0;
+    suite.expect(deployment.measure() == 1, "measure_stateful_full_capacity_reuses_exact_predecessor");
+    deployment.plan.config.memoryMB = previous.plan.config.memoryMB + 1;
+    suite.expect(deployment.measure() == 0, "measure_stateful_full_capacity_rejects_larger_successor");
+    deployment.plan.config.memoryMB = previous.plan.config.memoryMB;
+    suite.expect(oldContainer.state == ContainerState::healthy && oldContainer.plannedWork == nullptr,
+                 "measure_stateful_full_capacity_restores_predecessor");
+    suite.expect(machine.nLogicalCores_available == 0 && machine.memoryMB_available == 0 &&
+                 machine.storageMB_available == 0,
+                 "measure_stateful_full_capacity_restores_machine_resources");
+    machine.removeContainerIndexEntry(oldContainer.deploymentID, &oldContainer);
+    suite.expect(deployment.measure() == 0, "measure_stateful_rejects_unindexed_predecessor_credit");
+    machine.upsertContainerIndexEntry(oldContainer.deploymentID, &oldContainer);
+    suite.expect(oldContainer.state == ContainerState::healthy, "measure_stateful_restores_previous_container_state");
+    suite.expect(oldContainer.plannedWork == nullptr, "measure_stateful_restores_previous_container_planned_work");
+    suite.expect(brain.containers.size() == 1 && brain.containers.contains(oldContainer.uuid), "measure_stateful_keeps_previous_brain_container_only");
+    suite.expect(machine.containersByDeploymentID.size() == 1, "measure_stateful_keeps_only_previous_machine_index");
+    suite.expect(machine.containersByDeploymentID.hasEntryFor(previous.plan.config.deploymentID(), &oldContainer), "measure_stateful_preserves_previous_machine_entry");
+    suite.expect(machine.containersByDeploymentID.find(deployment.plan.config.deploymentID()) == machine.containersByDeploymentID.end(), "measure_stateful_removes_new_deployment_machine_entry");
+    suite.expect(deployment.containers.size() == 0, "measure_stateful_previous_cleanup_new_container_set");
+    suite.expect(deployment.toSchedule.size() == 0, "measure_stateful_previous_cleanup_new_work");
+
+    previous.containers.erase(&oldContainer);
+    while (previous.containersByShardGroup.eraseEntry(oldContainer.shardGroup, &oldContainer))
+    {
+    }
+    brain.containers.erase(oldContainer.uuid);
+    machine.removeContainerIndexEntry(oldContainer.deploymentID, &oldContainer);
+    rack.machines.erase(&machine);
+    brain.machines.erase(&machine);
+    brain.racks.erase(rack.uuid);
+    thisBrain = savedBrain;
+  }
+}
+
+static void testReplacementWaitLifetime(TestSuite& suite)
+{
+  using WaitStack = ContainerManager::ReplacementWaitStack;
+  {
+    ScopedFreshRing ring;
+    Neuron neuron;
+    Container predecessor;
+    predecessor.plan.uuid = 0x58c001;
+    predecessor.plan.config.type = ApplicationType::stateful;
+    predecessor.pid = 123;
+    predecessor.fd = -1;
+    predecessor.pidfd = -1;
+    predecessor.killedOnPurpose = true;
+    predecessor.waitidPending = true;
+    predecessor.infop.si_pid = predecessor.pid;
+    predecessor.infop.si_code = CLD_EXITED;
+    predecessor.infop.si_status = 0;
+    uint32_t resumed = 0;
+    bool retired = false;
+    bool unsafeRetirementRequested = false;
+    auto wait = [&](WaitStack *stack) -> void {
+      predecessor.resumeAfterShutdown = stack;
+      co_await stack->suspend();
+      stack->finish();
+#ifdef PRODIGY_TEST_REPLACEMENT_WAIT_LIFETIME
+      suite.expect(!unsafeRetirementRequested && !retired,
+                   "replacement_waitid_defers_retirement_until_consumer_returns");
+#else
+      suite.expect(stack->hasSuspendedCoroutines() == false,
+                   "replacement_waitid_keeps_finished_stack_until_consumer_returns");
+#endif
+      ++resumed;
+    };
+#ifdef PRODIGY_TEST_REPLACEMENT_WAIT_LIFETIME
+    wait(new WaitStack(&retired, &unsafeRetirementRequested));
+#else
+    wait(new WaitStack());
+#endif
+    suite.expect(resumed == 0 && predecessor.resumeAfterShutdown != nullptr,
+                 "replacement_waitid_continuation_waits_for_exit");
+    neuron.waitidHandler(&predecessor);
+    suite.expect(resumed == 1 && predecessor.resumeAfterShutdown == nullptr && !predecessor.waitidPending,
+                 "replacement_waitid_clears_owner_and_resumes_once");
+#ifdef PRODIGY_TEST_REPLACEMENT_WAIT_LIFETIME
+    suite.expect(retired, "replacement_waitid_retires_after_consumer_returns");
+#endif
+  }
+
+  TemporaryDirectory fixture;
+  suite.expect(fixture.create(".run"), "replacement_drain_lifetime_fixture_created");
+  if (fixture.path.empty()) return;
+  const auto root = filesystemPathFromString(fixture.path);
+  const auto events = root / "cgroup.events";
+  Container predecessor;
+  predecessor.cgroup = open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  suite.expect(predecessor.cgroup >= 0, "replacement_drain_lifetime_fixture_opened");
+  if (predecessor.cgroup < 0) return;
+
+  struct DelayQueue {
+    TimeoutPacket *pending = nullptr;
+    uint32_t queued = 0;
+    uint32_t canceled = 0;
+    static void queue(void *context, TimeoutPacket *packet)
+    {
+      auto& self = *static_cast<DelayQueue *>(context);
+      self.pending = packet;
+      ++self.queued;
+    }
+    static void cancel(void *context, TimeoutPacket *)
+    {
+      ++static_cast<DelayQueue *>(context)->canceled;
+    }
+    void complete()
+    {
+      TimeoutPacket *packet = std::exchange(pending, nullptr);
+      if (packet) packet->dispatcher->dispatchTimeout(packet);
+    }
+  } queue;
+  ProdigyHostDelayOperation::Submission submission{&queue, DelayQueue::queue, DelayQueue::cancel};
+
+  for (bool reachesEmpty : {true, false})
+  {
+    bool drained = false;
+    bool finished = false;
+    bool retired = false;
+    bool unsafeRetirementRequested = false;
+    String failure;
+    suite.expect(writeFileFixture(events, "populated 1\n"), "replacement_drain_lifetime_starts_populated");
+    auto wait = [&](WaitStack *stack) -> void {
+      bool resumedInConsumer = false;
+      if (uint32_t index = stack->nextSuspendIndex(); stack->didSuspend([&] {
+            ContainerManager::waitForPredecessorCgroupDrain(&predecessor, stack, drained, &failure, 2, 1, submission);
+          }))
+      {
+        co_await stack->suspendAtIndex(index);
+        resumedInConsumer = true;
+      }
+      stack->finish();
+#ifdef PRODIGY_TEST_REPLACEMENT_WAIT_LIFETIME
+      if (resumedInConsumer)
+        suite.expect(!unsafeRetirementRequested && !retired,
+                     "replacement_drain_defers_retirement_until_timer_consumer_returns");
+#else
+      if (resumedInConsumer)
+        suite.expect(!stack->hasSuspendedCoroutines(), "replacement_drain_keeps_finished_stack_until_timer_consumer_returns");
+#endif
+      finished = true;
+    };
+#ifdef PRODIGY_TEST_REPLACEMENT_WAIT_LIFETIME
+    wait(new WaitStack(&retired, &unsafeRetirementRequested));
+#else
+    wait(new WaitStack());
+#endif
+    suite.expect(!finished && queue.pending != nullptr, "replacement_drain_blocks_on_owned_timer");
+    queue.complete();
+    suite.expect(!finished && queue.pending != nullptr && !retired && !unsafeRetirementRequested,
+                 "replacement_drain_rearms_without_retiring_active_stack");
+    if (reachesEmpty)
+      suite.expect(writeFileFixture(events, "populated 0\n"), "replacement_drain_lifetime_records_empty_cgroup");
+    queue.complete();
+    suite.expect(finished && retired && drained == reachesEmpty && queue.pending == nullptr && queue.canceled == 0,
+                 "replacement_drain_completes_success_or_deadline_and_releases_timer");
+    suite.expect(reachesEmpty ? failure.empty() : !failure.empty(), "replacement_drain_preserves_empty_cgroup_guard");
+  }
+  suite.expect(writeFileFixture(events, "populated 0\n"), "replacement_drain_synchronous_fixture_empty");
+  bool drained = false;
+  bool retired = false;
+  bool unsafeRetirementRequested = false;
+  String failure;
+#ifdef PRODIGY_TEST_REPLACEMENT_WAIT_LIFETIME
+  WaitStack *synchronous = new WaitStack(&retired, &unsafeRetirementRequested);
+#else
+  WaitStack *synchronous = new WaitStack();
+#endif
+  const uint32_t queuedBefore = queue.queued;
+  const bool suspended = synchronous->didSuspend([&] {
+    ContainerManager::waitForPredecessorCgroupDrain(&predecessor, synchronous, drained, &failure, 2, 1, submission);
+  });
+  suite.expect(!suspended && drained && failure.empty() && queue.queued == queuedBefore,
+               "replacement_drain_empty_cgroup_finishes_without_timer");
+  synchronous->finish();
+#ifdef PRODIGY_TEST_REPLACEMENT_WAIT_LIFETIME
+  suite.expect(retired && !unsafeRetirementRequested,
+               "replacement_drain_synchronous_completion_retires_without_consumer");
+#endif
+  close(predecessor.cgroup);
+  predecessor.cgroup = -1;
+}
+
+static void testAllMastersBootstrapSeedingSubscription(TestSuite& suite)
+{
+  class RemoteOnlyMeshNode final : public MeshNode {
+  public:
+    uint32_t subscriptionActivations = 0;
+    void advertisementPairing(uint128_t, uint128_t, uint64_t, uint16_t, bool) override {}
+    void subscriptionPairing(uint128_t, uint128_t, uint64_t, uint16_t, uint16_t, bool activate) override
+    { if (activate) ++subscriptionActivations; }
+  };
+
+  auto verifyApplication = [&]<uint16_t applicationID>() {
+    DeploymentPlan plan = {};
+    plan.config.applicationID = applicationID;
+    plan.config.versionID = 1;
+    plan.config.type = ApplicationType::stateful;
+    plan.isStateful = true;
+    plan.stateful.allMasters = true;
+    plan.stateful.clientPrefix = MeshServices::generateStatefulService(applicationID, 1);
+    plan.stateful.siblingPrefix = MeshServices::generateStatefulService(applicationID, 2);
+    plan.stateful.cousinPrefix = MeshServices::generateStatefulService(applicationID, 3);
+    plan.stateful.seedingPrefix = MeshServices::generateStatefulService(applicationID, 4);
+    plan.stateful.shardingPrefix = MeshServices::generateStatefulService(applicationID, 5);
+    const uint32_t groups = applicationID == 3 || applicationID == 4 ? 3 : 1;
+    for (uint32_t group = 0; group < groups; ++group) {
+      ProdigyContainerServiceDefinitionContext context = {};
+      context.isStateful = true;
+      context.roles = StatefulMeshRoles::forShardGroup(plan.stateful, applicationID, group);
+      context.nShardGroups = groups;
+      context.dataStrategy = DataStrategy::genesis;
+      prodigyPopulateDefaultStatefulTopology(context.topology, group, plan.config);
+      context.topology.servingMode = StatefulTopologyServingMode::allMastersSeedBootstrap;
+      auto& bootstrap = context.topology.allMastersSeedBootstrap;
+      bootstrap.sourceClusterUUID = 11;
+      bootstrap.targetClusterUUID = 12;
+      bootstrap.targetDeploymentID = plan.config.deploymentID();
+      bootstrap.qualificationRunUUID = bootstrap.successorOperationUUID = 13;
+      bootstrap.shardGroup = group;
+      bootstrap.expectedSeedGeneration = 1;
+      suite.expect(prodigyStatefulTopologyIsAllMastersSeedBootstrap(context.topology),
+                   "bootstrap_seeding_fixture_has_valid_bound_scope");
+      auto verify = [&](uint32_t expected, SubscriptionNature expectedNature) {
+        ProdigyContainerServiceDefinitions definitions;
+        const bool built = prodigyBuildContainerServiceDefinitions(plan, context, definitions);
+        bytell_hash_map<uint64_t, Subscription> subscriptions;
+        const Subscription *seeding = nullptr;
+        uint32_t count = 0;
+        for (const auto& subscription : definitions.subscriptions) {
+          subscriptions.emplace(subscription.service, subscription);
+          if (subscription.service == context.roles.seeding) { ++count; seeding = &subscription; }
+        }
+        ProdigyLocalCousinServicePermission permission;
+        permission.protocolVersion = ProdigyLocalCousinServicePermission::purposeVersion;
+        permission.purpose = ProdigyCousinServicePurpose::seeding;
+        permission.localHalf = CousinRouteHalf::source;
+        suite.expect(built && count == expected,
+                     "bootstrap_seeding_has_exactly_one_required_subscription");
+        suite.expect(expected == 0 || (seeding != nullptr && seeding->nature == expectedNature &&
+                     seeding->startAt == ContainerState::scheduled && seeding->stopAt == ContainerState::destroying),
+                     "bootstrap_seeding_preserves_exact_nature_and_lifecycle");
+        suite.expect(prodigyCousinSourceSubscriptionMatches(permission, context.roles.seeding,
+                         subscriptions, ContainerState::healthy) == (expected == 1),
+                     "bootstrap_seeding_subscription_allows_owner_session_after_readiness");
+        if (expected == 1 && expectedNature == SubscriptionNature::none) {
+          suite.expect(prodigyCousinSourceSubscriptionMatches(permission, context.roles.seeding,
+                           subscriptions, ContainerState::scheduled),
+                       "bootstrap_remote_only_subscription_is_active_while_scheduled");
+          suite.expect(!prodigyCousinSourceSubscriptionMatches(permission, context.roles.seeding + 1,
+                           subscriptions, ContainerState::healthy),
+                       "bootstrap_remote_only_subscription_rejects_wrong_service");
+          bytell_hash_map<uint64_t, Subscription> absent;
+          suite.expect(!prodigyCousinSourceSubscriptionMatches(permission, context.roles.seeding,
+                           absent, ContainerState::healthy),
+                       "bootstrap_remote_only_subscription_rejects_absent_service");
+          RemoteOnlyMeshNode advertiser, subscriber;
+          advertiser.applicationID = subscriber.applicationID = applicationID;
+          advertiser.meshAddress = 101; subscriber.meshAddress = 102;
+          advertiser.remainingSubscriberCapacity = subscriber.remainingSubscriberCapacity = 1;
+          Mesh mesh;
+          mesh.subscribe(context.roles.seeding, &subscriber, SubscriptionNature::none, false);
+          mesh.advertise(context.roles.seeding, &advertiser, 1111, false);
+          suite.expect(subscriber.subscriptionActivations == 0,
+                       "bootstrap_remote_only_subscription_does_not_create_local_mesh_pairing");
+        }
+      };
+      verify(1, SubscriptionNature::none);
+      context.seedingAlways = true;
+      verify(1, SubscriptionNature::all);
+      context.seedingAlways = false;
+      context.dataStrategy = DataStrategy::seeding;
+      verify(1, SubscriptionNature::all);
+      context.topology.servingMode = StatefulTopologyServingMode::serve;
+      context.dataStrategy = DataStrategy::genesis;
+      verify(0, SubscriptionNature::none);
+      context.dataStrategy = DataStrategy::changelog;
+      verify(1, SubscriptionNature::all);
+    }
+  };
+  verifyApplication.template operator()<2>();
+  verifyApplication.template operator()<3>();
+  verifyApplication.template operator()<4>();
+  verifyApplication.template operator()<5>();
+}
+
 int main(void)
 {
   TestSuite suite;
+  const char *selector = std::getenv("PRODIGY_TEST_ONLY");
+  if (selector == nullptr || std::strcmp(selector, "bootstrap-seeding-subscription") == 0)
+  {
+    testAllMastersBootstrapSeedingSubscription(suite);
+    if (selector != nullptr) {
+      dprintf(STDOUT_FILENO, "bootstrap_seeding_subscription passed=%d failed=%d\n", suite.passed, suite.failed);
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+  }
+  if (selector != nullptr && std::strcmp(selector, "replacement-wait-lifetime") == 0)
+  {
+    testReplacementWaitLifetime(suite);
+    dprintf(STDOUT_FILENO, "replacement_wait_lifetime passed=%d failed=%d\n", suite.passed, suite.failed);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (selector != nullptr && std::strcmp(selector, "stateful-inplace-capacity") == 0)
+  {
+    testStatefulInplaceCapacity(suite);
+    dprintf(STDOUT_FILENO, "stateful_inplace_capacity passed=%d failed=%d\n",
+            suite.passed, suite.failed);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (std::getenv("PRODIGY_TEST_FRESH_STATEFUL_FLOOR_ONLY") != nullptr)
+  {
+    testFreshStatefulFloor(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (std::getenv("PRODIGY_TEST_GATEWAY_SOCKET_NAMESPACE_ONLY") != nullptr)
+  {
+    testGatewaySocketNamespace(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (std::getenv("PRODIGY_TEST_GATEWAY_MOUNT_TARGET_ONLY") != nullptr)
+  {
+    testRootfsHostMountTargets(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (std::getenv("PRODIGY_TEST_GATEWAY_RECOVERY_TOKEN_ONLY") != nullptr)
+  {
+    testGatewayRecoveryTokenRecord(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (std::getenv("PRODIGY_TEST_PENDING_CREATE_MARKER_ONLY") != nullptr)
   {
     testPendingCreateMarkerGenerationOwnership(suite);
@@ -2797,6 +3876,7 @@ int main(void)
   if (std::getenv("PRODIGY_TEST_STATEFUL_HORIZONTAL_DISPATCH_ONLY") != nullptr)
   {
     testStatefulHorizontalAutoscaleDispatch(suite);
+    testStatefulHorizontalAutoscaleFloorDispatch(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (std::getenv("PRODIGY_TEST_INPLACE_PAIRING_ONLY") != nullptr)
@@ -2806,6 +3886,7 @@ int main(void)
   }
   if (std::getenv("PRODIGY_TEST_RECOVERED_STATEFUL_TARGET_ONLY") != nullptr)
   {
+    testFreshStatefulFloor(suite);
     testRecoveredStatefulSuccessorTarget(suite, true);
     testRecoveredStatefulSuccessorTarget(suite, false);
     testRecoveredStatefulHeadShardTarget(suite);
@@ -2844,6 +3925,54 @@ int main(void)
     suite.expect(writeFileFixture(artifact / "rootfs" / "keep", "retained-rootfs") &&
                      writeFileFixture(sentinel, "retained-database"),
                  "cold_restart_retained_fixture_has_rootfs_and_storage");
+
+    // A hardware refresh can discover an eligible storage mount after a
+    // retained container was originally created with direct storage.  The
+    // cold-restart owner must preserve the populated direct backend rather
+    // than requiring a newly-derived loop backing file.
+    NeuronBase *savedStorageNeuron = thisNeuron;
+    TestNeuron storageNeuron = {};
+    storageNeuron.hardwareProfile.inventoryComplete = true;
+    MachineDiskHardwareProfile refreshedDisk = {};
+    refreshedDisk.mountPath.assign("/dev/shm"_ctv);
+    storageNeuron.hardwareProfile.disks.push_back(std::move(refreshedDisk));
+    thisNeuron = &storageNeuron;
+    Container retainedDirect = {};
+    retainedDirect.plan.uuid = uint128_t(0xC024);
+    retainedDirect.plan.config.applicationID = 77;
+    retainedDirect.plan.config.versionID = 9;
+    retainedDirect.plan.config.type = ApplicationType::stateful;
+    retainedDirect.plan.config.storageMB = 256;
+    retainedDirect.executionHostID = uint32_t(geteuid());
+    retainedDirect.name.assignItoa(retainedDirect.plan.uuid);
+    String retainedDirectPath = {};
+    prodigyContainerStorageRootPathForName(retainedDirect.name, retainedDirectPath);
+    const auto retainedDirectRoot = filesystemPathFromString(retainedDirectPath);
+    const auto retainedDirectSentinel = retainedDirectRoot / "kvdb" / "sentinel";
+    String refreshedBackingPath = {};
+    prodigyContainerStorageBackingFilePathForMount("/dev/shm"_ctv, retainedDirect.name,
+                                                   refreshedBackingPath);
+    suite.expect(!std::filesystem::exists(retainedDirectRoot) &&
+                     !std::filesystem::exists(filesystemPathFromString(refreshedBackingPath)),
+                 "cold_restart_layout_drift_fixture_is_fresh");
+    if (!std::filesystem::exists(retainedDirectRoot) &&
+        !std::filesystem::exists(filesystemPathFromString(refreshedBackingPath)))
+    {
+      suite.expect(writeFileFixture(retainedDirectSentinel, "retained-database"),
+                   "cold_restart_layout_drift_direct_backend_created");
+      String retainedDirectFailure = {};
+      suite.expect(ContainerManagerStorageTestAccess::prepare(
+                       &retainedDirect, &retainedDirectFailure, true) &&
+                       retainedDirect.storageUsesLoopFilesystem == false &&
+                       retainedDirect.storageRootPath.equals(retainedDirectPath) &&
+                       retainedDirect.storagePayloadPath.equals(retainedDirectPath) &&
+                       retainedDirect.storageLoopDevices.empty() &&
+                       std::filesystem::exists(retainedDirectSentinel) &&
+                       !std::filesystem::exists(filesystemPathFromString(refreshedBackingPath)),
+                   "cold_restart_layout_drift_preserves_proven_direct_backend");
+      std::filesystem::remove_all(retainedDirectRoot);
+    }
+    thisNeuron = savedStorageNeuron;
 
     // Process-present re-adoption must record an existing direct backend
     // without altering it, so a later observed crash-backoff replacement has
@@ -2942,6 +4071,8 @@ int main(void)
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
 
+  testReplacementWaitLifetime(suite);
+  testFreshStatefulFloor(suite);
   testRecoveredStatefulMasterAdvertisementFence(suite);
   testProtectedCousinServiceDefinitions(suite);
 
@@ -5236,54 +6367,7 @@ int main(void)
     }
   }
 
-  {
-    TemporaryDirectory artifactRoot;
-    suite.expect(artifactRoot.create(), "rootfs_host_mount_targets_fixture_mkdtemp_created");
-
-    if (artifactRoot.path.size() > 0)
-    {
-      std::filesystem::path artifactRootPath = filesystemPathFromString(artifactRoot.path);
-      suite.expect(createDirectoryFixture(artifactRootPath / "rootfs"), "rootfs_host_mount_targets_fixture_rootfs_created");
-
-      Container container {};
-      container.artifactRootPath.assign(artifactRoot.path);
-      container.userID = uint32_t(fixtureWritableUserID());
-      container.executionHostID = uint32_t(fixtureWritableUserID());
-
-      String failure = {};
-      bool prepared = ContainerManager::debugPrepareContainerRootFSMountTargets(&container, &failure);
-      suite.expect(prepared, "rootfs_host_mount_targets_prepare_succeeds");
-      suite.expect(failure.size() == 0, "rootfs_host_mount_targets_prepare_clears_failure");
-      suite.expect(
-          std::filesystem::exists(artifactRootPath / "rootfs" / "etc" / "resolv.conf"),
-          "rootfs_host_mount_targets_prepare_creates_resolv_conf_target");
-      suite.expect(
-          std::filesystem::exists(artifactRootPath / "rootfs" / "proc"),
-          "rootfs_host_mount_targets_prepare_creates_proc_directory");
-      suite.expect(
-          std::filesystem::exists(artifactRootPath / "rootfs" / "dev" / "null"),
-          "rootfs_host_mount_targets_prepare_creates_standard_device_nodes");
-      struct stat etcStat = {};
-      struct stat resolvStat = {};
-      int etcStatResult = ::stat((artifactRootPath / "rootfs" / "etc").c_str(), &etcStat);
-      int resolvStatResult = ::stat((artifactRootPath / "rootfs" / "etc" / "resolv.conf").c_str(), &resolvStat);
-      suite.expect(
-          etcStatResult == 0 && etcStat.st_uid == fixtureWritableUserID() && etcStat.st_gid == fixtureWritableGroupID(),
-          "rootfs_host_mount_targets_prepare_sets_etc_ownership");
-      suite.expect(
-          etcStatResult == 0 && (etcStat.st_mode & 07777) == 0755,
-          "rootfs_host_mount_targets_prepare_sets_etc_mode");
-      suite.expect(
-          resolvStatResult == 0 && resolvStat.st_uid == fixtureWritableUserID() && resolvStat.st_gid == fixtureWritableGroupID(),
-          "rootfs_host_mount_targets_prepare_sets_resolv_conf_ownership");
-      suite.expect(
-          std::filesystem::exists(artifactRootPath / "rootfs" / "run" / "systemd" / "resolve" / "io.systemd.Resolve") == false,
-          "rootfs_host_mount_targets_prepare_does_not_create_systemd_resolve_target");
-      suite.expect(
-          std::filesystem::exists(artifactRootPath / "rootfs" / "var" / "cache" / "ca-certs") == false,
-          "rootfs_host_mount_targets_prepare_does_not_create_host_ca_cache_target");
-    }
-  }
+  testRootfsHostMountTargets(suite);
 
   {
     suite.expect(
@@ -7872,6 +8956,7 @@ int main(void)
   }
 
   testStatefulHorizontalAutoscaleDispatch(suite);
+  testStatefulHorizontalAutoscaleFloorDispatch(suite);
 
   {
     ScopedFreshRing ring;
@@ -12858,80 +13943,7 @@ int main(void)
     thisBrain = savedBrain;
   }
 
-  {
-    ScopedFreshRing ring;
-    TestBrain brain;
-    BrainBase *savedBrain = thisBrain;
-    thisBrain = &brain;
-
-    Rack rack {};
-    rack.uuid = 19'510'001;
-    brain.racks.insert_or_assign(rack.uuid, &rack);
-
-    ScopedSocketPair socket = {};
-    bool socketReady = socket.create(suite, "measure_stateful_previous_creates_socketpair");
-
-    Machine machine = {};
-    machine.uuid = uint128_t(0x19510001);
-    machine.slug = "measure-previous"_ctv;
-    machine.rack = &rack;
-    machine.state = MachineState::healthy;
-    machine.lifetime = MachineLifetime::owned;
-    machine.nLogicalCores_available = 8;
-    machine.memoryMB_available = 8192;
-    machine.storageMB_available = 4096;
-    bool machineReady = socketReady && armNeuronControlStream(machine, socket);
-    rack.machines.insert(&machine);
-    brain.machines.insert(&machine);
-
-    suite.expect(machineReady, "measure_stateful_previous_seeds_machine_neuron_control_stream");
-
-    ApplicationDeployment previous;
-    seedCommonPlan(previous, true);
-    previous.plan.config.versionID = 1;
-    previous.nShardGroups = 1;
-
-    ContainerView oldContainer = {};
-    oldContainer.uuid = uint128_t(0x19510010);
-    oldContainer.deploymentID = previous.plan.config.deploymentID();
-    oldContainer.applicationID = previous.plan.config.applicationID;
-    oldContainer.machine = &machine;
-    oldContainer.lifetime = ApplicationLifetime::base;
-    oldContainer.state = ContainerState::healthy;
-    oldContainer.isStateful = true;
-    oldContainer.shardGroup = 0;
-    previous.containers.insert(&oldContainer);
-    previous.containersByShardGroup.insert(oldContainer.shardGroup, &oldContainer);
-    brain.containers.insert_or_assign(oldContainer.uuid, &oldContainer);
-    machine.upsertContainerIndexEntry(oldContainer.deploymentID, &oldContainer);
-
-    ApplicationDeployment deployment;
-    seedCommonPlan(deployment, true);
-    deployment.plan.config.versionID = 2;
-    deployment.previous = &previous;
-
-    uint32_t measured = deployment.measure();
-    suite.expect(measured == 1, "measure_stateful_previous_fixture_updates_in_place_fit");
-    suite.expect(oldContainer.state == ContainerState::healthy, "measure_stateful_restores_previous_container_state");
-    suite.expect(oldContainer.plannedWork == nullptr, "measure_stateful_restores_previous_container_planned_work");
-    suite.expect(brain.containers.size() == 1 && brain.containers.contains(oldContainer.uuid), "measure_stateful_keeps_previous_brain_container_only");
-    suite.expect(machine.containersByDeploymentID.size() == 1, "measure_stateful_keeps_only_previous_machine_index");
-    suite.expect(machine.containersByDeploymentID.hasEntryFor(previous.plan.config.deploymentID(), &oldContainer), "measure_stateful_preserves_previous_machine_entry");
-    suite.expect(machine.containersByDeploymentID.find(deployment.plan.config.deploymentID()) == machine.containersByDeploymentID.end(), "measure_stateful_removes_new_deployment_machine_entry");
-    suite.expect(deployment.containers.size() == 0, "measure_stateful_previous_cleanup_new_container_set");
-    suite.expect(deployment.toSchedule.size() == 0, "measure_stateful_previous_cleanup_new_work");
-
-    previous.containers.erase(&oldContainer);
-    while (previous.containersByShardGroup.eraseEntry(oldContainer.shardGroup, &oldContainer))
-    {
-    }
-    brain.containers.erase(oldContainer.uuid);
-    machine.removeContainerIndexEntry(oldContainer.deploymentID, &oldContainer);
-    rack.machines.erase(&machine);
-    brain.machines.erase(&machine);
-    brain.racks.erase(rack.uuid);
-    thisBrain = savedBrain;
-  }
+  testStatefulInplaceCapacity(suite);
 
   {
     ScopedFreshRing ring;

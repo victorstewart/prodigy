@@ -274,7 +274,10 @@ public:
   bytell_hash_subvector<uint64_t, ContainerView *> containersByDeploymentID;
 
   // Machine-local networking addresses containers by an 8-bit fragment.
-  constexpr static uint32_t maxSchedulableContainers = 254u;
+  // 0 is invalid; 252/253 are the two per-host cross-site gateways and 254 is
+  // the Mothership provider.  Ordinary applications may use exactly 252
+  // container fragments (1..251 and 255).
+  constexpr static uint32_t maxSchedulableContainers = 252u;
 
   uint32_t indexedContainerCount(void)
   {
@@ -420,6 +423,7 @@ public:
   bool containerFragmentAvailable(uint8_t fragment) const
   {
     return fragment != 0 &&
+           !prodigyCrossClusterMasqueGatewayRuntimeFragmentValid(fragment) &&
            fragment != prodigyMothershipTunnelProviderRuntimeFragment &&
            usedContainerFragments.contains(fragment) == false;
   }
@@ -522,17 +526,20 @@ inline void MachineSSH::restartProdigy(void)
   }
 
   co_await suspendAtIndex(suspendIndex);
-  if (failed)
+  if (failed || remediationCanceled)
   {
     co_return;
   }
 
   suspendIndex = nextSuspendIndex();
 
+  std::fprintf(stderr, "prodigy recovery ssh restart dispatch uuid=%llu private4=%u\n",
+               (unsigned long long)(machine ? machine->uuid : 0),
+               unsigned(machine ? machine->private4 : 0));
   executeCommand("systemctl restart prodigy"_ctv);
 
   co_await suspendAtIndex(suspendIndex);
-  if (failed)
+  if (failed || remediationCanceled)
   {
     co_return;
   }

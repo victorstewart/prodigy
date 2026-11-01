@@ -129,8 +129,9 @@ namespace Pulse {
 constexpr uint16_t applicationID = 2;
 constexpr uint64_t clients = MeshServices::generateStatefulService(applicationID, 1);
 constexpr uint64_t siblings = MeshServices::generateStatefulService(applicationID, 2);
-constexpr uint64_t seeding = MeshServices::generateStatefulService(applicationID, 3);
-constexpr uint64_t seeders = MeshServices::generateStatefulService(applicationID, 4);
+constexpr uint64_t legacySeedingSlot3 = MeshServices::generateStatefulService(applicationID, 3);
+constexpr uint64_t seeding = MeshServices::generateStatefulService(applicationID, 4);
+constexpr uint64_t seeders = seeding; // Historical spelling of the canonical seeding role.
 } // namespace Pulse
 
 namespace Truth {
@@ -163,7 +164,8 @@ namespace Radar {
 constexpr uint16_t applicationID = 5;
 constexpr uint64_t clients = MeshServices::generateStatefulService(applicationID, 1);
 constexpr uint64_t siblings = MeshServices::generateStatefulService(applicationID, 2);
-constexpr uint64_t seeding = MeshServices::generateStatefulService(applicationID, 3);
+constexpr uint64_t legacySeedingSlot3 = MeshServices::generateStatefulService(applicationID, 3);
+constexpr uint64_t seeding = MeshServices::generateStatefulService(applicationID, 4);
 } // namespace Radar
 
 namespace Nametag {
@@ -203,7 +205,7 @@ static inline bytell_hash_map<String, uint64_t> serviceMappings = [](void) -> au
   mappings["MeshRegistry::Pulse::clients"] = Pulse::clients;
   mappings["MeshRegistry::Pulse::siblings"] = Pulse::siblings;
   mappings["MeshRegistry::Pulse::seeders"] = Pulse::seeders;
-  mappings["MeshRegistry::Pulse::seeding"] = Pulse::seeding;
+  mappings["MeshRegistry::Pulse::legacySeedingSlot3"] = Pulse::legacySeedingSlot3;
   mappings["MeshRegistry::Pulse::seeding"] = Pulse::seeding;
 
   mappings["MeshRegistry::Truth::clients"] = Truth::clients;
@@ -232,6 +234,7 @@ static inline bytell_hash_map<String, uint64_t> serviceMappings = [](void) -> au
   mappings["MeshRegistry::Radar::clients"] = Radar::clients;
   mappings["MeshRegistry::Radar::siblings"] = Radar::siblings;
   mappings["MeshRegistry::Radar::seeding"] = Radar::seeding;
+  mappings["MeshRegistry::Radar::legacySeedingSlot3"] = Radar::legacySeedingSlot3;
 
   mappings["MeshRegistry::Telnyx::clients"] = Telnyx::clients;
   mappings["MeshRegistry::AppleNotifs::clients"] = AppleNotifs::clients;

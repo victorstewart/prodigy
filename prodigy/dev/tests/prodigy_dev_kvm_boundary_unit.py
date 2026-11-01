@@ -3,6 +3,8 @@
 from __future__ import annotations
 import importlib.util
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -109,6 +111,78 @@ class KvmBoundaryUnit(unittest.TestCase):
             with self.assertRaises(KVM.BoundaryError):
                 KVM.load_persistent_state(state, "g6-local")
         self.assertEqual(network["netdevs"][-1], "hubport,id=clusterlan,hubid=0")
+
+    def test_cluster_lan_ipv6_is_task_stable_and_guest_unique(self):
+        subnet, first = KVM.derive_cluster_lan_ipv6(
+            "g6-local", "02:06:00:00:00:01", "12345678-1234-4234-9234-123456789abc")
+        repeated_subnet, repeated = KVM.derive_cluster_lan_ipv6(
+            "g6-local", "02:06:00:00:00:01", "12345678-1234-4234-9234-123456789abc")
+        _, second = KVM.derive_cluster_lan_ipv6(
+            "g6-local", "02:06:00:00:00:02", "12345678-1234-4234-9234-123456789abc")
+        other_subnet, _ = KVM.derive_cluster_lan_ipv6(
+            "g7-local", "02:06:00:00:00:01", "12345678-1234-4234-9234-123456789abc")
+        self.assertEqual((subnet, first), (repeated_subnet, repeated))
+        self.assertTrue(subnet.network_address.is_private); self.assertIn(first, subnet)
+        self.assertNotEqual(first, second); self.assertNotEqual(subnet, other_subnet)
+
+    def test_cluster_lan_mac_requires_one_saved_clusterlan_device(self):
+        record = {"qemuCommand": ["qemu", "-netdev", "user,id=guestnet", "-device", "virtio-net-pci,netdev=guestnet",
+                                  "-netdev", "hubport,id=clusterlan,hubid=0", "-device", "virtio-net-pci,netdev=clusterlan,mac=02:06:00:00:00:01"],
+                  "network": {"netdevs": ["user,id=guestnet", "hubport,id=clusterlan,hubid=0"],
+                              "devices": ["virtio-net-pci,netdev=guestnet", "virtio-net-pci,netdev=clusterlan,mac=02:06:00:00:00:01"]}}
+        self.assertEqual(KVM.cluster_lan_mac_from_persistent_network(record), "02:06:00:00:00:01")
+        record["network"] = dict(record["network"])
+        record["network"]["devices"] = ["virtio-net-pci,netdev=guestnet"]
+        with self.assertRaisesRegex(KVM.BoundaryError, "QEMU network devices differ"):
+            KVM.cluster_lan_mac_from_persistent_network(record)
+
+    def test_cluster_lan_action_is_exact_identity_bound_and_owner_shaped(self):
+        record = {"qemuPID": 42, "qemuStarttime": "7", "qemuCommand": ["qemu", "-netdev", "user,id=guestnet", "-device", "virtio-net-pci,netdev=guestnet",
+                                                                             "-netdev", "hubport,id=clusterlan,hubid=0", "-device", "virtio-net-pci,netdev=clusterlan,mac=02:06:00:00:00:01"],
+                  "network": {"netdevs": ["user,id=guestnet", "hubport,id=clusterlan,hubid=0"],
+                              "devices": ["virtio-net-pci,netdev=guestnet", "virtio-net-pci,netdev=clusterlan,mac=02:06:00:00:00:01"]}}
+        args = mock.Mock(guest_uuid=KVM.uuid.UUID("12345678-1234-4234-9234-123456789abc"))
+        result = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(KVM, "command_matches", return_value=True), \
+             mock.patch.object(KVM, "persistent_guest_args", return_value=(args, "f" * 32)), \
+             mock.patch.object(KVM, "verify_persistent_guest") as verify, \
+             mock.patch.object(KVM, "guest_run", return_value=result) as run:
+            receipt = KVM.configure_cluster_lan_ipv6(record, "g6-local")
+        verify.assert_called_once_with(record, 42, "7")
+        script = run.call_args.args[1]
+        self.assertIn("/sys/class/net/lan0/address", script)
+        self.assertIn("10-cloud-init-lan0.network.d/50-prodigy-cluster-lan-ipv6.conf", script)
+        self.assertIn("networkctl reload", script); self.assertIn("networkctl reconfigure lan0", script)
+        self.assertIn("if test ! -f \"$dropin\"", script)
+        self.assertNotIn("guest_command", script)
+        self.assertEqual(receipt["interface"], "lan0"); self.assertEqual(receipt["mac"], "02:06:00:00:00:01")
+        with mock.patch.object(KVM, "command_matches", return_value=False):
+            with self.assertRaisesRegex(KVM.BoundaryError, "exact QEMU process identity"):
+                KVM.configure_cluster_lan_ipv6(record, "g6-local")
+
+    def test_guest_linux_identity_uses_the_pinned_boundary_and_exact_qemu(self):
+        machine_id = "1" * 32
+        boot_id = "12345678-1234-4abc-8def-123456789abc"
+        record = {"qemuPID": 42, "qemuStarttime": "7", "qemuCommand": ["qemu"]}
+        args = mock.Mock(expected_machine_id=machine_id)
+        result = mock.Mock(returncode=0, stdout=f"{machine_id}\n{boot_id}\n", stderr="")
+        with mock.patch.object(KVM, "command_matches", return_value=True), \
+             mock.patch.object(KVM, "persistent_guest_args", return_value=(args, "f" * 32)), \
+             mock.patch.object(KVM, "verify_persistent_guest") as verify, \
+             mock.patch.object(KVM, "guest_run", return_value=result) as run:
+            identity = KVM.query_guest_linux_identity(record)
+        verify.assert_called_once_with(record, 42, "7")
+        self.assertIn("/etc/machine-id", run.call_args.args[1])
+        self.assertIn("/proc/sys/kernel/random/boot_id", run.call_args.args[1])
+        self.assertEqual(identity, {"machineID": machine_id, "bootID": boot_id,
+                                    "qemuPID": 42, "qemuStarttime": "7"})
+        result.stdout = f"{machine_id}\nnot-a-boot-id\n"
+        with mock.patch.object(KVM, "command_matches", return_value=True), \
+             mock.patch.object(KVM, "persistent_guest_args", return_value=(args, "f" * 32)), \
+             mock.patch.object(KVM, "verify_persistent_guest"), \
+             mock.patch.object(KVM, "guest_run", return_value=result), \
+             self.assertRaisesRegex(KVM.BoundaryError, "identity observation is invalid"):
+            KVM.query_guest_linux_identity(record)
 
     def test_lan_socket_parameters_are_atomic_and_bounded(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -295,6 +369,224 @@ class KvmBoundaryUnit(unittest.TestCase):
              self.assertRaisesRegex(KVM.BoundaryError, "identity changed"):
             KVM.stop_persistent_qemu(record, "exact cleanup")
         kill.assert_not_called()
+
+    def test_spawned_qemu_identity_observation_tolerates_exec_proc_visibility_race(self):
+        process = mock.Mock(pid=55, returncode=None); process.poll.return_value = None
+        with mock.patch.object(KVM, "proc_starttime", side_effect=[None, "old", "new"]), \
+             mock.patch.object(KVM, "command_matches", side_effect=[False, True]), \
+             mock.patch.object(KVM.time, "monotonic", side_effect=[0.0, .01, .02]), \
+             mock.patch.object(KVM.time, "sleep") as sleep:
+            self.assertEqual(KVM.observe_spawned_qemu_identity(process, ["qemu"]), "new")
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_spawned_qemu_identity_observation_rejects_exit_or_persistent_mismatch(self):
+        exited = mock.Mock(pid=55, returncode=17); exited.poll.return_value = 17
+        with self.assertRaisesRegex(KVM.BoundaryError, "exited during exec observation"):
+            KVM.observe_spawned_qemu_identity(exited, ["qemu"])
+        running = mock.Mock(pid=55, returncode=None); running.poll.return_value = None
+        with mock.patch.object(KVM, "proc_starttime", return_value="wrong"), \
+             mock.patch.object(KVM, "command_matches", return_value=False), \
+             mock.patch.object(KVM.time, "monotonic", side_effect=[0.0, 2.0]), \
+             mock.patch.object(KVM.time, "sleep"):
+            with self.assertRaisesRegex(KVM.BoundaryError, "bounded exec observation"):
+                KVM.observe_spawned_qemu_identity(running, ["qemu"])
+
+    def stopped_recovery_record(self, root: Path, *, pid: int = 42, starttime: str = "old"):
+        root = root.resolve()
+        overlay, vars_copy = root / "overlay.qcow2", root / "vars.fd"
+        overlay.write_bytes(b"overlay"); vars_copy.write_bytes(b"vars")
+        guest, host = "12345678-1234-4234-9234-123456789abc", "f" * 32
+        net = "user,id=guestnet,restrict=on,hostfwd=tcp:127.0.0.1:2222-:22"
+        command = ["qemu-system-x86_64", "-accel", "kvm", "-uuid", guest,
+                   "-drive", f"if=pflash,format=raw,file={vars_copy}", "-drive",
+                   f"file={overlay},if=virtio,format=qcow2,cache=none", "-netdev", net,
+                   "-device", "virtio-net-pci,netdev=guestnet", "-pidfile", str(root / "qemu.pid"),
+                   "-qmp", f"unix:{root / 'qmp.sock'},server=on,wait=off"]
+        return {"taskID": "g6-task", "qemuPID": pid, "qemuStarttime": starttime,
+                "qemuCommand": command, "overlay": str(overlay), "ovmfVars": str(vars_copy),
+                "guestUUID": guest, "machineID": "0" * 32, "qmpSocket": str(root / "qmp.sock"),
+                "network": {"netdevs": [net], "devices": ["virtio-net-pci,netdev=guestnet"]},
+                "boundaryVerification": {"knownHosts": str(root / "known_hosts"),
+                    "sshPrivateKey": str(root / "key"), "sshUser": "root", "sshPort": 2222,
+                    "bootTimeout": 30, "guestUUID": guest, "machineID": "0" * 32,
+                    "hostMachineID": host}}
+
+    def test_recover_stopped_binds_absent_exact_pid_and_reuses_cold_reboot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, state, operation = Path(directory), Path(directory) / "state", "1" * 32
+            record = self.stopped_recovery_record(root); expected = "a" * 64
+            receipt = {"operationID": operation, "beforePID": 42, "beforeStarttime": "old",
+                       "afterPID": 55, "afterStarttime": "new", "startedAtMonotonicMs": 1,
+                       "completedAtMonotonicMs": 2, "completed": True,
+                       "recoveryProtocol": "prodigy-kvm-stopped-recovery-v1",
+                       "recoveryExpectedGuestUUID": record["guestUUID"],
+                       "recoveryExpectedStateSHA256": expected,
+                       "recoveryPriorIdentity": {"pid": 42, "starttime": "old"}}
+            def resume(value, _path, _operation):
+                value["qemuPID"], value["qemuStarttime"], value["lastColdReboot"] = 55, "new", receipt
+                return receipt
+            with mock.patch.object(KVM, "current_host_machine_id", return_value="f" * 32), \
+                 mock.patch.object(KVM, "proc_starttime", return_value=None), \
+                 mock.patch.object(KVM, "command_matches", return_value=True), \
+                 mock.patch.object(KVM, "verify_persistent_guest") as verify, \
+                 mock.patch.object(KVM, "write_persistent_state") as write, \
+                 mock.patch.object(KVM, "resume_cold_reboot", side_effect=resume) as resume:
+                recovered = KVM.recover_stopped_boundary(record, state, operation,
+                                                          record["guestUUID"], expected, expected)
+            resume.assert_called_once_with(record, state, operation)
+            self.assertTrue(recovered["completed"])
+            self.assertEqual(recovered["recoveryPriorIdentity"], {"pid": 42, "starttime": "old"})
+            self.assertEqual(recovered["recoveryExpectedStateSHA256"], expected)
+            verify.assert_called_once_with(record, 55, "new")
+            self.assertEqual(write.call_count, 1)
+
+    def test_recover_stopped_cli_requires_one_typed_exact_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, state, operation = Path(directory), Path(directory) / "state", "1" * 32
+            record = self.stopped_recovery_record(root); expected = "a" * 64
+            response = {"operationUUID": operation, "completed": True}
+            arguments = ["recover-stopped", "--state", str(state), "--task-id", "g6-task",
+                         "--operation-uuid", operation, "--expected-guest-uuid", record["guestUUID"],
+                         "--expected-state-sha256", expected]
+            with mock.patch.object(KVM, "digest", return_value=expected), \
+                 mock.patch.object(KVM, "load_persistent_state", return_value=record), \
+                 mock.patch.object(KVM, "recover_stopped_boundary", return_value=response) as recover:
+                self.assertEqual(KVM._lifecycle_main(arguments), 0)
+            recover.assert_called_once_with(record, state.resolve(), operation, record["guestUUID"], expected, expected)
+            with self.assertRaisesRegex(KVM.BoundaryError, "requires canonical"):
+                KVM._lifecycle_main(arguments[:-2])
+
+    def test_recover_stopped_subprocess_dispatches_to_lifecycle_not_normal_argparse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, state, operation = Path(directory), Path(directory) / "boundary.json", "1" * 32
+            record = self.stopped_recovery_record(root)
+            KVM.write_persistent_state(state, record); expected = KVM.digest(state)
+            # Fail before any host-dependent checks or lifecycle action on
+            # both Darwin and Linux, while still exercising the real CLI.
+            expected = ("0" if expected[0] != "0" else "1") + expected[1:]
+            result = subprocess.run([sys.executable, str(SOURCE), "recover-stopped", "--state", str(state),
+                                     "--task-id", "g6-task", "--operation-uuid", operation,
+                                     "--expected-guest-uuid", record["guestUUID"],
+                                     "--expected-state-sha256", expected], text=True, capture_output=True, check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("persistent state SHA-256 differs from recovery request", result.stderr)
+            self.assertNotIn("the following arguments are required", result.stderr)
+
+    def test_recover_stopped_rejects_wrong_hash_uuid_host_or_live_pid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, state, operation = Path(directory), Path(directory) / "state", "1" * 32
+            record = self.stopped_recovery_record(root); expected = "a" * 64
+            with mock.patch.object(KVM, "current_host_machine_id", return_value="f" * 32), \
+                 mock.patch.object(KVM, "proc_starttime", return_value=None):
+                with self.assertRaisesRegex(KVM.BoundaryError, "SHA-256"):
+                    KVM.recover_stopped_boundary(record, state, operation, record["guestUUID"], expected, "b" * 64)
+                with self.assertRaisesRegex(KVM.BoundaryError, "UUID"):
+                    KVM.recover_stopped_boundary(record, state, operation, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", expected, expected)
+            record = self.stopped_recovery_record(root)
+            with mock.patch.object(KVM, "current_host_machine_id", return_value="e" * 32), \
+                 mock.patch.object(KVM, "proc_starttime", return_value=None), \
+                 self.assertRaisesRegex(KVM.BoundaryError, "host machine identity"):
+                KVM.recover_stopped_boundary(record, state, operation, record["guestUUID"], expected, expected)
+            record = self.stopped_recovery_record(root)
+            with mock.patch.object(KVM, "current_host_machine_id", return_value="f" * 32), \
+                 mock.patch.object(KVM, "proc_starttime", return_value="reused"), \
+                 self.assertRaisesRegex(KVM.BoundaryError, "still live or has been reused"):
+                KVM.recover_stopped_boundary(record, state, operation, record["guestUUID"], expected, expected)
+
+    def test_recover_stopped_rejects_competing_unfinished_reboot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, state = Path(directory), Path(directory) / "state"
+            record = self.stopped_recovery_record(root)
+            record["lastColdReboot"] = {"operationID": "2" * 32, "beforePID": 42,
+                                        "beforeStarttime": "old", "startedAtMonotonicMs": 1,
+                                        "completed": False}
+            with mock.patch.object(KVM, "current_host_machine_id", return_value="f" * 32), \
+                 mock.patch.object(KVM, "proc_starttime", return_value=None), \
+                 self.assertRaisesRegex(KVM.BoundaryError, "unfinished reboot"):
+                KVM.recover_stopped_boundary(record, state, "1" * 32, record["guestUUID"], "a" * 64, "a" * 64)
+
+    def test_recover_stopped_requires_exact_saved_qmp_and_pidfile_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, state, operation = Path(directory), Path(directory) / "state", "1" * 32
+            for option, value in (("-qmp", "unix:/tmp/wrong.sock,server=on,wait=off"), ("-pidfile", "relative.pid")):
+                record = self.stopped_recovery_record(root)
+                index = record["qemuCommand"].index(option) + 1; record["qemuCommand"][index] = value
+                with mock.patch.object(KVM, "current_host_machine_id", return_value="f" * 32), \
+                     mock.patch.object(KVM, "proc_starttime", return_value=None), \
+                     self.assertRaisesRegex(KVM.BoundaryError, "unsafe|identity command"):
+                    KVM.recover_stopped_boundary(record, state, operation, record["guestUUID"], "a" * 64, "a" * 64)
+            record = self.stopped_recovery_record(root); Path(record["qmpSocket"]).mkdir()
+            with mock.patch.object(KVM, "current_host_machine_id", return_value="f" * 32), \
+                 mock.patch.object(KVM, "proc_starttime", return_value=None), \
+                 self.assertRaisesRegex(KVM.BoundaryError, "QMP socket path is unsafe"):
+                KVM.recover_stopped_boundary(record, state, operation, record["guestUUID"], "a" * 64, "a" * 64)
+            fresh = root / "pidfile-case"; fresh.mkdir()
+            record = self.stopped_recovery_record(fresh); pidfile = Path(record["qemuCommand"][record["qemuCommand"].index("-pidfile") + 1]); pidfile.mkdir()
+            with mock.patch.object(KVM, "current_host_machine_id", return_value="f" * 32), \
+                 mock.patch.object(KVM, "proc_starttime", return_value=None), \
+                 self.assertRaisesRegex(KVM.BoundaryError, "pidfile path is unsafe"):
+                KVM.recover_stopped_boundary(record, state, operation, record["guestUUID"], "a" * 64, "a" * 64)
+
+    def test_recover_stopped_crash_resume_and_completed_retry_are_exact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, state, operation = Path(directory), Path(directory) / "state", "1" * 32
+            record = self.stopped_recovery_record(root, pid=55, starttime="new"); expected = "a" * 64
+            prior = {"pid": 42, "starttime": "old"}
+            completed = {"operationID": operation, "beforePID": 42, "beforeStarttime": "old",
+                         "afterPID": 55, "afterStarttime": "new", "startedAtMonotonicMs": 1,
+                         "completedAtMonotonicMs": 2, "completed": True,
+                         "recoveryProtocol": "prodigy-kvm-stopped-recovery-v1",
+                         "recoveryExpectedGuestUUID": record["guestUUID"],
+                         "recoveryExpectedStateSHA256": expected,
+                         "recoveryPriorIdentity": prior}
+            record["lastColdReboot"] = completed
+            with mock.patch.object(KVM, "current_host_machine_id", return_value="f" * 32), \
+                 mock.patch.object(KVM, "proc_starttime", return_value=None), \
+                 mock.patch.object(KVM, "command_matches", return_value=True), \
+                 mock.patch.object(KVM, "verify_persistent_guest"), \
+                 mock.patch.object(KVM, "resume_cold_reboot", return_value=completed) as resume, \
+                 mock.patch.object(KVM, "write_persistent_state"):
+                recovered = KVM.recover_stopped_boundary(record, state, operation, record["guestUUID"], expected, "changed" * 9 + "a")
+            resume.assert_not_called(); self.assertTrue(recovered["completed"])
+            with mock.patch.object(KVM, "current_host_machine_id", return_value="f" * 32), \
+                 mock.patch.object(KVM, "command_matches", return_value=True), \
+                 mock.patch.object(KVM, "verify_persistent_guest") as verify, \
+                 mock.patch.object(KVM, "write_persistent_state") as write:
+                retried = KVM.recover_stopped_boundary(record, state, operation, record["guestUUID"], expected, "different" * 8)
+            self.assertIs(retried, record["lastColdReboot"]); verify.assert_called_once(); write.assert_not_called()
+            with mock.patch.object(KVM, "current_host_machine_id", return_value="f" * 32), \
+                 self.assertRaisesRegex(KVM.BoundaryError, "inputs differ"):
+                KVM.recover_stopped_boundary(record, state, operation, record["guestUUID"], "b" * 64, expected)
+
+    def test_recover_stopped_archives_completed_receipt_before_a_later_oom_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, state, first, second = Path(directory), Path(directory) / "state", "1" * 32, "2" * 32
+            record = self.stopped_recovery_record(root, pid=55, starttime="new"); old_hash, new_hash = "a" * 64, "b" * 64
+            record["lastColdReboot"] = {"operationID": first, "beforePID": 42, "beforeStarttime": "old",
+                "afterPID": 55, "afterStarttime": "new", "startedAtMonotonicMs": 1,
+                "completedAtMonotonicMs": 2, "completed": True,
+                "recoveryProtocol": "prodigy-kvm-stopped-recovery-v1",
+                "recoveryExpectedGuestUUID": record["guestUUID"], "recoveryExpectedStateSHA256": old_hash,
+                "recoveryPriorIdentity": {"pid": 42, "starttime": "old"}}
+            completed = {"operationID": second, "beforePID": 55, "beforeStarttime": "new",
+                "afterPID": 66, "afterStarttime": "next", "startedAtMonotonicMs": 3,
+                "completedAtMonotonicMs": 4, "completed": True,
+                "recoveryProtocol": "prodigy-kvm-stopped-recovery-v1",
+                "recoveryExpectedGuestUUID": record["guestUUID"], "recoveryExpectedStateSHA256": new_hash,
+                "recoveryPriorIdentity": {"pid": 55, "starttime": "new"}}
+            def resume(value, _path, _operation):
+                value["qemuPID"], value["qemuStarttime"], value["lastColdReboot"] = 66, "next", completed
+                return completed
+            with mock.patch.object(KVM, "current_host_machine_id", return_value="f" * 32), \
+                 mock.patch.object(KVM, "proc_starttime", return_value=None), \
+                 mock.patch.object(KVM, "command_matches", return_value=True), \
+                 mock.patch.object(KVM, "verify_persistent_guest"), \
+                 mock.patch.object(KVM, "resume_cold_reboot", side_effect=resume) as restart, \
+                 mock.patch.object(KVM, "write_persistent_state"):
+                result = KVM.recover_stopped_boundary(record, state, second, record["guestUUID"], new_hash, new_hash)
+            restart.assert_called_once_with(record, state, second)
+            self.assertEqual(result["operationID"], second)
+            self.assertEqual(record["completedColdReboots"][0]["operationID"], first)
 
     def test_cold_reboot_receipt_is_exact_retry_identity(self):
         record = {"lastColdReboot": {"operationID": "1" * 32, "beforePID": 4, "beforeStarttime": "8",

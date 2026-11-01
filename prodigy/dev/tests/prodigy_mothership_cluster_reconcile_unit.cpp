@@ -153,6 +153,53 @@ int main(void)
   suite.expect(built, "reconcile_known_identity_unchanged_rack_ok");
   suite.expect(request.adoptedMachines.empty(), "reconcile_known_identity_unchanged_rack_noop");
 
+  prodigyAppendUniqueClusterMachineAddress(cluster.machines[0].addresses.publicAddresses, "fec0::123"_ctv, 64);
+  request = {}; failure.clear();
+  built = mothershipBuildClusterAddMachinesRequest(cluster, topology, request, &failure);
+  suite.expect(built && request.adoptedMachines.size() == 1 &&
+      request.adoptedMachines[0].addresses.privateAddresses.size() == 2 &&
+      request.adoptedMachines[0].addresses.publicAddresses.size() == 2,
+      "reconcile_explicit_uuid_adds_ipv6_preserving_existing_addresses");
+  cluster.machines.push_back(cluster.machines[0]);
+  request = {}; failure.clear();
+  suite.expect(!mothershipBuildClusterAddMachinesRequest(cluster, topology, request, &failure) && request.adoptedMachines.empty(),
+      "reconcile_explicit_uuid_rejects_duplicate_desired_identity");
+  cluster.machines.pop_back();
+  cluster.machines[0].addresses.publicAddresses.pop_back();
+
+  {
+    MothershipProdigyCluster local = cluster;
+    local.deploymentMode = MothershipClusterDeploymentMode::local;
+    local.includeLocalMachine = true;
+    prodigyAppendUniqueClusterMachineAddress(local.machines[0].addresses.publicAddresses, "fec0::123"_ctv, 64);
+    ClusterTopology three = topology;
+    ClusterMachine other1 = enrichedExistingBrain; other1.uuid = 0x4444; other1.ssh.address = "10.44.0.1"_ctv;
+    other1.addresses = {}; other1.peerAddresses.clear();
+    prodigyAppendUniqueClusterMachineAddress(other1.addresses.privateAddresses, "10.44.0.1"_ctv, 24);
+    ClusterMachine other2 = other1; other2.uuid = 0x5555; other2.ssh.address = "10.44.0.2"_ctv;
+    other2.addresses = {}; prodigyAppendUniqueClusterMachineAddress(other2.addresses.privateAddresses, "10.44.0.2"_ctv, 24);
+    three.machines.push_back(other1); three.machines.push_back(other2);
+    for (const auto& other : {other1, other2}) {
+      MothershipProdigyClusterMachine entry = {};
+      entry.source = MothershipClusterMachineSource::adopted; entry.backing = other.backing; entry.kind = other.kind;
+      entry.lifetime = other.lifetime; entry.isBrain = other.isBrain; entry.cloud = other.cloud; entry.ssh = other.ssh;
+      entry.addresses = other.addresses; entry.ownership = other.ownership; entry.uuid = other.uuid; entry.rackUUID = other.rackUUID;
+      local.machines.push_back(std::move(entry));
+    }
+    bool changed = false; request = {}; failure.clear();
+    built = mothershipBuildDesiredClusterReconcileRequest(local, local, three, request, changed, &failure, &three.machines[0], true);
+    suite.expect(built && changed && three.machines.size() == 3 && request.adoptedMachines.size() == 1 &&
+        request.adoptedMachines[0].uuid == three.machines[0].uuid && request.removedMachines.empty() && request.readyMachines.empty(),
+        "reconcile_explicit_seed_addition_preserves_three_identities");
+    if (request.adoptedMachines.size() == 1) three.machines[0] = request.adoptedMachines[0];
+    local.machines.erase(local.machines.begin());
+    changed = false; request = {}; failure.clear();
+    built = mothershipBuildDesiredClusterReconcileRequest(local, local, three, request, changed, &failure, &three.machines[0], true);
+    suite.expect(built && !changed && request.removedMachines.empty() && request.adoptedMachines.empty() &&
+        three.machines.size() == 3 && three.machines[0].addresses.publicAddresses.size() == 2,
+        "reconcile_canonical_local_spec_retains_seed_address_without_change");
+  }
+
   cluster.machines[0].ssh.address.assign("203.0.113.99"_ctv);
   request = {};
   failure.clear();

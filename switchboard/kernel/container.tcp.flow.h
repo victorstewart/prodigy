@@ -9,6 +9,14 @@ struct {
   __uint(max_entries, CONTAINER_TCP_FLOWS_MAP_ENTRIES);
 } ct_tcp_flows SEC(".maps");
 
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __type(key, struct flow_key);
+  __type(value, struct container_tcp_authorization);
+  // Private sessions also serve unrestricted containers and need concurrent grants.
+  __uint(max_entries, CONTAINER_SERVICE_PAIRINGS_MAX_ENTRIES);
+} ct_tcp_grants SEC(".maps");
+
 __attribute__((__always_inline__)) static inline bool containerTCPFlowCurrent(const struct flow_key *flow, bool closing, bool reset)
 {
   struct container_tcp_flow *state = bpf_map_lookup_elem(&ct_tcp_flows, flow);
@@ -31,6 +39,13 @@ __attribute__((__always_inline__)) static inline bool containerTCPFlowCurrent(co
     state->expiresAtNs = now + (closing ? CONTAINER_TCP_FLOW_CLOSE_NS : CONTAINER_TCP_FLOW_IDLE_NS);
   }
   return true;
+}
+
+__attribute__((__always_inline__)) static inline bool containerTCPFlowHasBoundAuthorization(const struct flow_key *flow)
+{
+  struct container_tcp_authorization *state = bpf_map_lookup_elem(&ct_tcp_grants, flow);
+  return state != NULL && state->authorizationExpiresAtNs > bpf_ktime_get_ns() &&
+      (state->authorizationHi != 0 || state->authorizationLo != 0);
 }
 
 __attribute__((__always_inline__)) static inline bool containerAuthorizeTCPFlow(const struct flow_key *flow)

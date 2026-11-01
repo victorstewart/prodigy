@@ -34,6 +34,7 @@ public:
 class ProdigyCousinDiscoverySnapshot {
 public:
   static constexpr uint32_t version = 1;
+  static constexpr uint32_t privateContainerVersion = 2;
   uint32_t protocolVersion = version;
   uint128_t pairUUID = 0;
   uint128_t sourceClusterUUID = 0;
@@ -172,18 +173,22 @@ static inline bool prodigyCousinDirectIPv6AddressValid(const IPAddress& value)
   return !loopback && !mappedV4 && !linkLocal && address[0] != 0xff;
 }
 
-static inline bool prodigyCousinCounterpartValid(const ProdigyCousinCounterpart& value)
+static inline bool prodigyCousinCounterpartValid(const ProdigyCousinCounterpart& value, bool allowPrivateContainer = false)
 {
   if (!prodigyLocalCousinServicePermissionValid(value.permission) ||
       value.permission.localHalf != CousinRouteHalf::destination ||
       value.permission.state != ProdigyLocalCousinServicePermissionState::active || value.containerUUID == 0 ||
       value.nodeUUID == 0 || value.containerID == 0 || value.shardGroups == 0 ||
       value.shardGroups >= nStatefulServiceGroupSlots - 1 || value.shardGroup >= value.shardGroups ||
+      !prodigyCousinServicePermissionGroupValid(value.permission, value.shardGroup, value.shardGroups) ||
       !MeshServices::isShard(value.service) ||
       value.service != MeshServices::constrainPrefixToGroup(value.permission.localCousinServicePrefix, value.shardGroup) ||
-      value.servicePort == 0 || value.ownedSlots.empty() || value.routablePrefixUUID == 0 ||
+      (value.permission.protocolVersion >= ProdigyLocalCousinServicePermission::purposeVersion && value.service != value.permission.authorizedService) ||
+      value.servicePort == 0 || value.ownedSlots.empty() ||
       !prodigyCousinDirectIPv6AddressValid(value.publicAddress) || value.publicTCPPort == 0 ||
-      !prodigyIsSHA256HexDigest(value.wormholeRevision)) return false;
+      (value.routablePrefixUUID == 0 ?
+       (!allowPrivateContainer || !value.wormholeRevision.empty() || value.publicTCPPort != value.servicePort) :
+       !prodigyIsSHA256HexDigest(value.wormholeRevision))) return false;
   for (uint16_t slot = 0; slot < nStatefulServiceGroupSlots; ++slot)
   {
     const bool expected = value.permission.slots.contains(slot) &&
@@ -195,7 +200,8 @@ static inline bool prodigyCousinCounterpartValid(const ProdigyCousinCounterpart&
 
 static inline bool prodigyCousinDiscoverySnapshotValid(const ProdigyCousinDiscoverySnapshot& snapshot)
 {
-  if (snapshot.protocolVersion != ProdigyCousinDiscoverySnapshot::version || snapshot.pairUUID == 0 ||
+  if ((snapshot.protocolVersion != ProdigyCousinDiscoverySnapshot::version &&
+       snapshot.protocolVersion != ProdigyCousinDiscoverySnapshot::privateContainerVersion) || snapshot.pairUUID == 0 ||
       snapshot.sourceClusterUUID == 0 || snapshot.peerClusterUUID == 0 ||
       snapshot.sourceClusterUUID == snapshot.peerClusterUUID || snapshot.rootGeneration == 0 ||
       snapshot.keyEpoch == 0 || snapshot.authorityGeneration == 0 ||
@@ -203,13 +209,14 @@ static inline bool prodigyCousinDiscoverySnapshotValid(const ProdigyCousinDiscov
   for (uint32_t index = 0; index < snapshot.records.size(); ++index)
   {
     const auto& record = snapshot.records[index];
-    if (!prodigyCousinCounterpartValid(record) || record.permission.pairUUID != snapshot.pairUUID ||
+    if (!prodigyCousinCounterpartValid(record, snapshot.protocolVersion == ProdigyCousinDiscoverySnapshot::privateContainerVersion) || record.permission.pairUUID != snapshot.pairUUID ||
         record.permission.localClusterUUID != snapshot.sourceClusterUUID ||
         record.permission.peerClusterUUID != snapshot.peerClusterUUID ||
         record.permission.acceptedAuthorityGeneration > snapshot.authorityGeneration) return false;
     for (uint32_t earlier = 0; earlier < index; ++earlier)
       if (snapshot.records[earlier].containerUUID == record.containerUUID &&
-          snapshot.records[earlier].permission.permissionUUID == record.permission.permissionUUID) return false;
+          snapshot.records[earlier].permission.permissionUUID == record.permission.permissionUUID &&
+          (snapshot.records[earlier].routablePrefixUUID == 0) == (record.routablePrefixUUID == 0)) return false;
   }
   return true;
 }
@@ -239,9 +246,9 @@ static inline bool prodigyCousinDiscoveryQueryValid(const ProdigyCousinDiscovery
 }
 
 static inline bool prodigyCousinCounterpartMatchesPermission(const ProdigyCousinCounterpart& counterpart,
-    const ProdigyLocalCousinServicePermission& sourcePermission, uint16_t slot)
+    const ProdigyLocalCousinServicePermission& sourcePermission, uint16_t slot, bool allowPrivateContainer = false)
 {
-  if (!prodigyCousinCounterpartValid(counterpart) ||
+  if (!prodigyCousinCounterpartValid(counterpart, allowPrivateContainer) ||
       !prodigyLocalCousinServicePermissionValid(sourcePermission) ||
       sourcePermission.localHalf != CousinRouteHalf::source ||
       sourcePermission.state != ProdigyLocalCousinServicePermissionState::active || slot >= nStatefulServiceGroupSlots ||
@@ -256,5 +263,6 @@ static inline bool prodigyCousinCounterpartMatchesPermission(const ProdigyCousin
       sourcePermission.peerApplicationID == destination.localApplicationID &&
       sourcePermission.localCousinServicePrefix == destination.peerCousinServicePrefix &&
       sourcePermission.peerCousinServicePrefix == destination.localCousinServicePrefix &&
-      sourcePermission.slots.contains(slot) && destination.slots.contains(slot);
+      sourcePermission.slots.contains(slot) && destination.slots.contains(slot) &&
+      prodigyCousinServicePermissionPeerScopeMatches(sourcePermission, destination);
 }

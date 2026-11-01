@@ -2,6 +2,7 @@
 
 #include <ebpf/kernel/containersubnet.h>
 
+#include <switchboard/common/gateway.injection.h>
 #include <switchboard/kernel/csum.h>
 #include <switchboard/kernel/l4.ports.h>
 #include <switchboard/kernel/maps.h>
@@ -267,11 +268,6 @@ __attribute__((__always_inline__)) static inline int switchboardMaybeLearnWhiteh
     return TC_ACT_SHOT;
   }
 
-  struct flow_key flow = {};
-  bpf_memcpy(flow.srcv6, ip6h->saddr.s6_addr32, sizeof(flow.srcv6));
-  bpf_memcpy(flow.dstv6, ip6h->daddr.s6_addr32, sizeof(flow.dstv6));
-  flow.proto = ip6h->nexthdr;
-
   struct switchboard_l4_ports l4 = {};
   if (ip6h->nexthdr != IPPROTO_TCP && ip6h->nexthdr != IPPROTO_UDP)
   {
@@ -281,17 +277,18 @@ __attribute__((__always_inline__)) static inline int switchboardMaybeLearnWhiteh
   {
     return TC_ACT_SHOT;
   }
-  flow.port16[0] = l4.source;
-  flow.port16[1] = l4.dest;
-
   struct switchboard_whitehole_binding binding = {};
-  if (whitehole_binding_lookup(flow.proto, true, flow.srcv6, flow.port16[0], &binding) == false)
+  if (whitehole_binding_lookup(ip6h->nexthdr, true, ip6h->saddr.s6_addr32, l4.source, &binding) == false)
   {
     return TC_ACT_OK;
   }
 
   struct flow_key reverse = {};
-  reverse_flow_key(&flow, &reverse);
+  bpf_memcpy(reverse.srcv6, ip6h->daddr.s6_addr32, sizeof(reverse.srcv6));
+  bpf_memcpy(reverse.dstv6, ip6h->saddr.s6_addr32, sizeof(reverse.dstv6));
+  reverse.port16[0] = l4.dest;
+  reverse.port16[1] = l4.source;
+  reverse.proto = ip6h->nexthdr;
   struct switchboard_whitehole_reply reply = {
       .binding = binding,
       .expiresAtNs = bpf_ktime_get_ns() + WHITEHOLE_REPLY_IDLE_NS,
@@ -333,7 +330,7 @@ __attribute__((__always_inline__)) static inline int switchboardMaybeEncapOverla
   __u16 inner_packet_len = (__u16)(skb->len - sizeof(struct ethhdr));
   if (switchboardEncapSKBV6(skb, inner_packet_len, IPPROTO_IPIP, route) || switchboardEncapSKBV4(skb, inner_packet_len, IPPROTO_IPIP, route))
   {
-    return TC_ACT_OK;
+    return switchboardCompleteMasqueGatewayInjection(skb, route);
   }
 
   return TC_ACT_SHOT;
@@ -365,7 +362,7 @@ __attribute__((__always_inline__)) static inline int switchboardMaybeEncapOverla
     return TC_ACT_SHOT;
   }
 
-  struct switchboard_overlay_machine_route *route = lookupOverlayMachineRouteFull(&key);
+  struct switchboard_overlay_machine_route *route = lookupOverlayMachineRouteByFragment(key.fragment);
   if (route == NULL)
   {
     return TC_ACT_SHOT;
@@ -374,7 +371,7 @@ __attribute__((__always_inline__)) static inline int switchboardMaybeEncapOverla
   __u16 inner_packet_len = (__u16)(skb->len - sizeof(struct ethhdr));
   if (switchboardEncapSKBV6(skb, inner_packet_len, IPPROTO_IPV6, route) || switchboardEncapSKBV4(skb, inner_packet_len, IPPROTO_IPV6, route))
   {
-    return TC_ACT_OK;
+    return switchboardCompleteMasqueGatewayInjection(skb, route);
   }
 
   return TC_ACT_SHOT;

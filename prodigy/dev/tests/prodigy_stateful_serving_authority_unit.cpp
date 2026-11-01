@@ -77,6 +77,98 @@ static String digest(char value)
   String result; for (uint32_t index = 0; index < 64; ++index) result.append(value); return result;
 }
 
+// Frozen v26/v1 wire model. Keep this independent from StatefulDataAuthority
+// so the compatibility check fails if a new field is ever inserted into the
+// legacy byte layout again.
+class LegacyStatefulDataAuthorityV1Wire {
+public:
+  uint32_t contractVersion = StatefulDataAuthority::legacyContractVersion;
+  uint128_t operationUUID = 0;
+  uint128_t previousOperationUUID = 0;
+  uint64_t previousAuthorityEpoch = 0;
+  uint128_t datasetUUID = 0;
+  uint128_t snapshotUUID = 0;
+  uint128_t sourceClusterUUID = 0;
+  uint128_t targetClusterUUID = 0;
+  uint128_t localClusterUUID = 0;
+  uint128_t writeOwnerClusterUUID = 0;
+  uint64_t authorityEpoch = 0;
+  uint32_t shardGroup = 0;
+  StatefulDataAuthorityMode mode = StatefulDataAuthorityMode::catchupOnly;
+  String contractSHA256;
+  String shardManifestSHA256;
+  String snapshotBoundarySHA256;
+  String requiredAppliedWatermarkSHA256;
+};
+
+template <typename S>
+static void serialize(S&& serializer, LegacyStatefulDataAuthorityV1Wire& authority)
+{
+  serializer.value4b(authority.contractVersion);
+  serializer.value16b(authority.operationUUID);
+  serializer.value16b(authority.previousOperationUUID);
+  serializer.value8b(authority.previousAuthorityEpoch);
+  serializer.value16b(authority.datasetUUID);
+  serializer.value16b(authority.snapshotUUID);
+  serializer.value16b(authority.sourceClusterUUID);
+  serializer.value16b(authority.targetClusterUUID);
+  serializer.value16b(authority.localClusterUUID);
+  serializer.value16b(authority.writeOwnerClusterUUID);
+  serializer.value8b(authority.authorityEpoch);
+  serializer.value4b(authority.shardGroup);
+  serializer.value1b(authority.mode);
+  serializer.text1b(authority.contractSHA256, 64);
+  serializer.text1b(authority.shardManifestSHA256, 64);
+  serializer.text1b(authority.snapshotBoundarySHA256, 64);
+  serializer.text1b(authority.requiredAppliedWatermarkSHA256, 64);
+}
+
+static void testStatefulDataAuthorityWireCompatibility()
+{
+  LegacyStatefulDataAuthorityV1Wire legacy;
+  legacy.operationUUID = 11; legacy.datasetUUID = 12; legacy.snapshotUUID = 13;
+  legacy.sourceClusterUUID = 14; legacy.targetClusterUUID = 15;
+  legacy.localClusterUUID = legacy.targetClusterUUID;
+  legacy.writeOwnerClusterUUID = legacy.targetClusterUUID;
+  legacy.authorityEpoch = 16; legacy.shardGroup = 2;
+  legacy.mode = StatefulDataAuthorityMode::writeOwner;
+  legacy.contractSHA256 = digest('a'); legacy.shardManifestSHA256 = digest('b');
+  legacy.snapshotBoundarySHA256 = digest('c'); legacy.requiredAppliedWatermarkSHA256 = digest('d');
+
+  StatefulDataAuthority authority;
+  authority.contractVersion = StatefulDataAuthority::legacyContractVersion;
+  authority.operationUUID = legacy.operationUUID; authority.datasetUUID = legacy.datasetUUID;
+  authority.snapshotUUID = legacy.snapshotUUID; authority.sourceClusterUUID = legacy.sourceClusterUUID;
+  authority.targetClusterUUID = legacy.targetClusterUUID; authority.localClusterUUID = legacy.localClusterUUID;
+  authority.writeOwnerClusterUUID = legacy.writeOwnerClusterUUID; authority.authorityEpoch = legacy.authorityEpoch;
+  authority.shardGroup = legacy.shardGroup; authority.mode = legacy.mode;
+  authority.contractSHA256 = legacy.contractSHA256; authority.shardManifestSHA256 = legacy.shardManifestSHA256;
+  authority.snapshotBoundarySHA256 = legacy.snapshotBoundarySHA256;
+  authority.requiredAppliedWatermarkSHA256 = legacy.requiredAppliedWatermarkSHA256;
+
+  String frozenBytes, legacyBytes;
+  BitseryEngine::serialize(frozenBytes, legacy); BitseryEngine::serialize(legacyBytes, authority);
+  check(frozenBytes == legacyBytes, "stateful authority v1 bytes preserve the exact v26 layout");
+  StatefulDataAuthority decodedLegacy;
+  check(BitseryEngine::deserializeSafe(frozenBytes, decodedLegacy) &&
+      decodedLegacy.contractVersion == StatefulDataAuthority::legacyContractVersion &&
+      decodedLegacy.nShardGroups == 0 && prodigyStatefulDataAuthorityValid(decodedLegacy),
+      "stateful authority v1 persisted bytes remain readable");
+
+  authority.contractVersion = StatefulDataAuthority::version; authority.nShardGroups = 3;
+  auto currentBase = legacy; currentBase.contractVersion = StatefulDataAuthority::version;
+  String currentBaseBytes, currentBytes;
+  BitseryEngine::serialize(currentBaseBytes, currentBase); BitseryEngine::serialize(currentBytes, authority);
+  String currentPrefix = currentBytes; currentPrefix.resize(currentBaseBytes.size());
+  StatefulDataAuthority decodedCurrent;
+  check(currentBytes.size() == currentBaseBytes.size() + sizeof(uint32_t) && currentPrefix == currentBaseBytes &&
+      BitseryEngine::deserializeSafe(currentBytes, decodedCurrent) && decodedCurrent.nShardGroups == 3 &&
+      prodigyStatefulDataAuthorityEqual(decodedCurrent, authority),
+      "stateful authority v2 appends cardinality after the legacy wire");
+  authority.contractVersion = StatefulDataAuthority::legacyContractVersion;
+  check(!prodigyStatefulDataAuthorityValid(authority), "legacy authority cannot smuggle an unserialized cardinality");
+}
+
 static ProdigyStatefulServingAuthority applicationAuthority(uint32_t shard, StatefulDataAuthorityMode mode,
     Vector<BrainReplicatedContainerRuntimeState>& states)
 {
@@ -89,7 +181,8 @@ static ProdigyStatefulServingAuthority applicationAuthority(uint32_t shard, Stat
   result.admittedPlanSHA256 = result.requestPlanSHA256 = digest('c');
   auto& data = result.dataAuthority;
   data.operationUUID = result.operationID; data.datasetUUID = 20; data.snapshotUUID = 21;
-  data.sourceClusterUUID = 30; data.targetClusterUUID = 40; data.authorityEpoch = 5; data.shardGroup = shard;
+  data.sourceClusterUUID = 30; data.targetClusterUUID = 40; data.authorityEpoch = 5;
+  data.shardGroup = shard; data.nShardGroups = 3;
   data.mode = mode; data.contractSHA256 = digest('d'); data.shardManifestSHA256 = digest('e');
   const bool source = mode == StatefulDataAuthorityMode::fenced || mode == StatefulDataAuthorityMode::snapshotPreparing;
   const bool serving = mode == StatefulDataAuthorityMode::writeOwner || mode == StatefulDataAuthorityMode::snapshotPreparing;
@@ -214,6 +307,7 @@ static void testApplicationShardAuthority()
 
 int main()
 {
+  testStatefulDataAuthorityWireCompatibility();
   testApplicationShardAuthority();
   const auto steadyPhase = StatefulWorkerTopologyUpgradePhase::none;
   const auto bluePhase = StatefulWorkerTopologyUpgradePhase::blueDraining;

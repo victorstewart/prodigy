@@ -384,23 +384,21 @@ __attribute__((__always_inline__)) static inline int switchboardRouteSelectedWor
   {
     return TC_ACT_SHOT;
   }
-  __u32 machineFragment = ((__u32)containerID->value[1] << 16) |
+  __u32 machineFragment = switchboardMakeOverlayMachineIdentity(containerID->value[0], ((__u32)containerID->value[1] << 16) |
                           ((__u32)containerID->value[2] << 8) |
-                          (__u32)containerID->value[3];
+                          (__u32)containerID->value[3]);
   struct switchboard_overlay_machine_route *route = lookupOverlayMachineRouteByFragment(machineFragment);
   if (skb->len <= sizeof(struct ethhdr) || skb->len - sizeof(struct ethhdr) > 0xffffu)
   {
     return TC_ACT_SHOT;
   }
   __u16 innerBytes = (__u16)(skb->len - sizeof(struct ethhdr));
-  return innerBytes <= WORMHOLE_PUBLIC_INGRESS_L3_MTU && route != NULL &&
-                 switchboardEncapWormholeSKB(skb,
-                                             innerBytes,
-                                             isIPv6 ? IPPROTO_IPV6 : IPPROTO_IPIP,
-                                             route,
-                                             containerID)
-             ? TC_ACT_OK
-             : TC_ACT_SHOT;
+  if (innerBytes > WORMHOLE_PUBLIC_INGRESS_L3_MTU || route == NULL ||
+      switchboardEncapWormholeSKB(skb, innerBytes, isIPv6 ? IPPROTO_IPV6 : IPPROTO_IPIP, route, containerID) == false)
+  {
+    return TC_ACT_SHOT;
+  }
+  return switchboardCompleteMasqueGatewayInjection(skb, route);
 }
 
 __attribute__((__always_inline__)) static inline bool switchboardLearnAndRewriteLocalWormholeIPv6(struct __sk_buff *skb,
@@ -1004,11 +1002,102 @@ __attribute__((__always_inline__)) static inline int maybe_redirect_plain_local_
   return TC_ACT_SHOT;
 }
 
+// Ensure only the headers used by the early Whitehole-reply classifier are
+// linear. Reply packets may arrive with their L4 header in skb fragments; a
+// direct data/data_end parse would otherwise treat a live binding as absent and
+// let the packet fall through to the native host. Payload bytes are never pulled.
+__attribute__((__always_inline__)) static inline bool ensure_whitehole_transport_headers_linear(struct __sk_buff *skb,
+                                                                                                 __be16 wire_protocol,
+                                                                                                 bool *whitehole_classifier_allowed)
+{
+  if (skb == NULL || whitehole_classifier_allowed == NULL)
+  {
+    return false;
+  }
+  *whitehole_classifier_allowed = true;
+
+  const __u32 ethernetBytes = switchboardPacketBudgetEthernetHeaderBytes();
+  __u32 networkBytes = 0u;
+  if (wire_protocol == BE_ETH_P_IP)
+  {
+    networkBytes = switchboardPacketBudgetIPv4HeaderBytes();
+  }
+  else if (wire_protocol == BE_ETH_P_IPV6)
+  {
+    networkBytes = switchboardPacketBudgetIPv6HeaderBytes();
+  }
+  else
+  {
+    return true;
+  }
+
+  void *data = (void *)(long)skb->data;
+  void *data_end = (void *)(long)skb->data_end;
+  if (data + ethernetBytes + networkBytes > data_end && bpf_skb_pull_data(skb, ethernetBytes + networkBytes) != 0)
+  {
+    return false;
+  }
+
+  data = (void *)(long)skb->data;
+  data_end = (void *)(long)skb->data_end;
+  struct ethhdr *eth = data;
+  if ((void *)(eth + 1) > data_end || eth->h_proto != wire_protocol)
+  {
+    return false;
+  }
+
+  __u8 protocol = 0u;
+  if (wire_protocol == BE_ETH_P_IP)
+  {
+    struct iphdr *iph = (struct iphdr *)(eth + 1);
+    if ((void *)(iph + 1) > data_end || iph->version != 4u)
+    {
+      return false;
+    }
+    protocol = iph->protocol;
+    // Whitehole parsing has a fixed IPv4 L4 offset. Preserve the former native
+    // path for options and fragments instead of misclassifying their bytes.
+    if ((protocol == IPPROTO_TCP || protocol == IPPROTO_UDP) && switchboard_unfragmented_ipv4(iph, data_end) == false)
+    {
+      *whitehole_classifier_allowed = false;
+      return true;
+    }
+  }
+  else
+  {
+    struct ipv6hdr *ip6h = (struct ipv6hdr *)(eth + 1);
+    if ((void *)(ip6h + 1) > data_end)
+    {
+      return false;
+    }
+    protocol = ip6h->nexthdr;
+  }
+
+  if (protocol != IPPROTO_TCP && protocol != IPPROTO_UDP)
+  {
+    return true;
+  }
+
+  const __u32 transportBytes = switchboardPacketBudgetTransportHeaderBytes(protocol);
+  const __u32 requiredBytes = ethernetBytes + networkBytes + transportBytes;
+  if (transportBytes == 0u)
+  {
+    return false;
+  }
+  if (data + requiredBytes <= data_end)
+  {
+    return true;
+  }
+  return bpf_skb_pull_data(skb, requiredBytes) == 0;
+}
+
 // Native host traffic should bypass the heavier overlay/container parsing path.
 // The maintained host-control failure is on plain machine-to-machine TCP/UDP,
 // so only keep packets on the slow path when they can still target a container,
 // a whitehole reply binding, or an overlay decap path.
-__attribute__((__always_inline__)) static inline bool should_fast_pass_native_host_packet(struct ethhdr *eth, void *data_end)
+__attribute__((__always_inline__)) static inline bool should_fast_pass_native_host_packet(struct ethhdr *eth,
+                                                                                              void *data_end,
+                                                                                              bool whitehole_classifier_allowed)
 {
   if (eth == NULL)
   {
@@ -1035,7 +1124,8 @@ __attribute__((__always_inline__)) static inline bool should_fast_pass_native_ho
       return false;
     }
 
-    if (lookup_whitehole_reply_binding_ipv4(eth, data_end, &replyBinding, &whiteholeBound) || whiteholeBound)
+    if (whitehole_classifier_allowed &&
+        (lookup_whitehole_reply_binding_ipv4(eth, data_end, &replyBinding, &whiteholeBound) || whiteholeBound))
     {
       return false;
     }
@@ -1063,7 +1153,8 @@ __attribute__((__always_inline__)) static inline bool should_fast_pass_native_ho
       return false;
     }
 
-    if (lookup_whitehole_reply_binding_ipv6(eth, data_end, &replyBinding, &whiteholeBound) || whiteholeBound)
+    if (whitehole_classifier_allowed &&
+        (lookup_whitehole_reply_binding_ipv6(eth, data_end, &replyBinding, &whiteholeBound) || whiteholeBound))
     {
       return false;
     }
@@ -1086,10 +1177,27 @@ int host_ingress(struct __sk_buff *skb)
     return TC_ACT_SHOT;
   }
 
+  bool whiteholeClassifierAllowed = true;
+  if (ensure_whitehole_transport_headers_linear(skb, eth->h_proto, &whiteholeClassifierAllowed) == false)
+  {
+    return TC_ACT_SHOT;
+  }
+
+  // bpf_skb_pull_data() can invalidate packet pointers even when it only pulls
+  // the bounded L4 prefix. Refresh before the Whitehole and native-host paths.
+  data_end = (void *)(long)skb->data_end;
+  eth = (struct ethhdr *)(long)skb->data;
+  if ((void *)(eth + 1) > data_end)
+  {
+    return TC_ACT_SHOT;
+  }
+
   struct packet_description portalPacket = {};
 
   bool handledWhiteholeReply = false;
-  int whiteholeReplyAction = maybe_redirect_whitehole_reply(eth, data_end, &handledWhiteholeReply);
+  int whiteholeReplyAction = whiteholeClassifierAllowed
+                                ? maybe_redirect_whitehole_reply(eth, data_end, &handledWhiteholeReply)
+                                : TC_ACT_OK;
   if (handledWhiteholeReply)
   {
     return whiteholeReplyAction;
@@ -1130,7 +1238,7 @@ int host_ingress(struct __sk_buff *skb)
     return plainLocalIPv6Action;
   }
 
-  if (should_fast_pass_native_host_packet(eth, data_end))
+  if (should_fast_pass_native_host_packet(eth, data_end, whiteholeClassifierAllowed))
   {
     return TC_ACT_OK;
   }

@@ -3,6 +3,7 @@
 
 #include <switchboard/common/local_container_subnet.h>
 #include <switchboard/overlay.route.h>
+#include <switchboard/common/gateway.injection.h>
 #include <switchboard/whitehole.route.h>
 
 #include <arpa/inet.h>
@@ -82,7 +83,7 @@ int main(void)
   suite.expect(std::memcmp(keys6[0].addr, expectedIPv6, sizeof(expectedIPv6)) == 0, "switchboard_overlay_prefix_ipv6_masks_host_bits");
 
   SwitchboardOverlayMachineRoute route4 = {};
-  route4.machineFragment = 0x2A;
+  route4.machineFragment = switchboardMakeOverlayMachineIdentity(1, 0x2A);
   route4.nextHop = IPAddress("198.51.100.44", false);
   route4.sourceAddress = IPAddress("198.51.100.10", false);
   route4.useGatewayMAC = true;
@@ -95,7 +96,7 @@ int main(void)
   suite.expect(value4.source4 == route4.sourceAddress.v4, "switchboard_overlay_route_value_ipv4_source");
 
   SwitchboardOverlayMachineRoute route6 = {};
-  route6.machineFragment = 0x010203u;
+  route6.machineFragment = switchboardMakeOverlayMachineIdentity(1, 0x010203u);
   route6.nextHop = IPAddress("2001:db8::44", true);
   route6.sourceAddress = IPAddress("2001:db8::10", true);
   route6.useGatewayMAC = true;
@@ -108,6 +109,98 @@ int main(void)
   suite.expect(std::memcmp(value6.source6, route6.sourceAddress.v6, sizeof(value6.source6)) == 0, "switchboard_overlay_route_value_ipv6_source");
   const uint8_t zeroMAC[6] = {};
   suite.expect(std::memcmp(value6.next_hop_mac, zeroMAC, sizeof(zeroMAC)) == 0, "switchboard_overlay_route_value_ipv6_gateway_mac_unbound");
+
+  SwitchboardOverlayMachineRoute gatewayInjection = route6;
+  gatewayInjection.localContainerRedirectFragment = SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST;
+  switchboard_overlay_machine_route injectedValue = {};
+  uint8_t redirectFragment = 0;
+  suite.expect(switchboardBuildOverlayMachineRouteValue(gatewayInjection, injectedValue) &&
+                    injectedValue.use_gateway_mac == SWITCHBOARD_OVERLAY_ROUTE_ACTION_LOCAL_CONTAINER_REDIRECT &&
+                    switchboardOverlayMachineRouteLocalContainerRedirect(injectedValue, redirectFragment) &&
+                    redirectFragment == SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST,
+                "switchboard_overlay_route_value_marks_reserved_gateway_fragment_for_local_redirect");
+  gatewayInjection.localContainerRedirectFragment = 17;
+  suite.expect(!switchboardBuildOverlayMachineRouteValue(gatewayInjection, injectedValue),
+                "switchboard_overlay_route_value_rejects_non_gateway_local_redirect_fragment");
+  suite.expect(switchboardBuildOverlayMachineRouteValue(route6, injectedValue) &&
+                    injectedValue.use_gateway_mac == SWITCHBOARD_OVERLAY_ROUTE_ACTION_GATEWAY_MAC,
+                "switchboard_overlay_route_value_keeps_ordinary_gateway_route_unchanged");
+
+  local_container_subnet6 gatewaySubnet = {};
+  gatewaySubnet.dpfx = 1; gatewaySubnet.mpfx[0] = 2; gatewaySubnet.mpfx[1] = 3; gatewaySubnet.mpfx[2] = 4;
+  uint8_t injectionSource[16] = {};
+  uint8_t injectionDestination[16] = {};
+  std::memcpy(injectionSource, container_network_subnet6.value, sizeof(container_network_subnet6.value));
+  std::memcpy(injectionDestination, container_network_subnet6.value, sizeof(container_network_subnet6.value));
+  std::memcpy(injectionSource + 11, &gatewaySubnet, sizeof(gatewaySubnet));
+  std::memcpy(injectionDestination + 11, &gatewaySubnet, sizeof(gatewaySubnet));
+  injectionDestination[15] = SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST;
+  suite.expect(switchboardMasqueGatewayInjectionOuterValid(SWITCHBOARD_MASQUE_GATEWAY_INJECTION_SKB_MARK,
+                    SWITCHBOARD_IP_PROTOCOL_IPV6, injectionSource, injectionDestination, &gatewaySubnet),
+                "switchboard_gateway_injection_marker_accepts_exact_reserved_gateway_outer_packet");
+  suite.expect(!switchboardMasqueGatewayInjectionOuterValid(0, SWITCHBOARD_IP_PROTOCOL_IPV6,
+                    injectionSource, injectionDestination, &gatewaySubnet) &&
+                    !switchboardMasqueGatewayInjectionOuterValid(SWITCHBOARD_MASQUE_GATEWAY_INJECTION_SKB_MARK,
+                    SWITCHBOARD_IP_PROTOCOL_IPV6, injectionSource, injectionDestination, nullptr),
+                "switchboard_gateway_injection_marker_rejects_missing_marker_or_gateway_boundary");
+  injectionDestination[15] = 17;
+  suite.expect(!switchboardMasqueGatewayInjectionOuterValid(SWITCHBOARD_MASQUE_GATEWAY_INJECTION_SKB_MARK,
+                    SWITCHBOARD_IP_PROTOCOL_IPV6, injectionSource, injectionDestination, &gatewaySubnet) &&
+                    !switchboardMasqueGatewayRedirectPermitted(SWITCHBOARD_OVERLAY_ROUTE_ACTION_LOCAL_CONTAINER_REDIRECT,
+                    SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST, false),
+                "switchboard_gateway_injection_rejects_non_gateway_container_and_missing_boundary_map");
+
+  uint8_t remoteTransitSource[16] = {};
+  uint8_t localTransitDifferentMachine[16] = {};
+  uint8_t localTransitSameMachine[16] = {};
+  std::memcpy(remoteTransitSource, container_network_subnet6.value, sizeof(remoteTransitSource));
+  std::memcpy(localTransitDifferentMachine, container_network_subnet6.value, sizeof(localTransitDifferentMachine));
+  std::memcpy(localTransitSameMachine, container_network_subnet6.value, sizeof(localTransitSameMachine));
+  remoteTransitSource[11] = 2; remoteTransitSource[12] = 0x16; remoteTransitSource[13] = 0x25; remoteTransitSource[14] = 0x5b; remoteTransitSource[15] = 0x66;
+  localTransitDifferentMachine[11] = gatewaySubnet.dpfx; localTransitDifferentMachine[12] = 0x17; localTransitDifferentMachine[13] = 0x39; localTransitDifferentMachine[14] = 0x2c; localTransitDifferentMachine[15] = 0x67;
+  localTransitSameMachine[11] = gatewaySubnet.dpfx; localTransitSameMachine[12] = gatewaySubnet.mpfx[0]; localTransitSameMachine[13] = gatewaySubnet.mpfx[1]; localTransitSameMachine[14] = gatewaySubnet.mpfx[2]; localTransitSameMachine[15] = 0x68;
+  switchboard_overlay_machine_route transitRoute = {};
+  transitRoute.family = SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV6;
+  transitRoute.use_gateway_mac = SWITCHBOARD_OVERLAY_ROUTE_ACTION_LOCAL_CONTAINER_REDIRECT;
+  transitRoute.next_hop_mac[0] = SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST;
+  suite.expect(switchboardContainerIPv6TargetsLocalMachine(localTransitSameMachine, &gatewaySubnet) &&
+                    !switchboardContainerIPv6TargetsLocalMachine(localTransitDifferentMachine, &gatewaySubnet),
+               "switchboard_masque_gateway_transit_preserves_same_machine_fast_path_and_remote_machine_overlay_path");
+  suite.expect(switchboardMasqueGatewayRemoteTransitPermitted(CONTAINER_NETWORK_DESTINATION_ALLOWLIST, &gatewaySubnet,
+                    SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST, remoteTransitSource, localTransitDifferentMachine, true, &transitRoute) &&
+                    switchboardMasqueGatewayRemoteTransitPermitted(CONTAINER_NETWORK_DESTINATION_ALLOWLIST, &gatewaySubnet,
+                    SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST, remoteTransitSource, localTransitSameMachine, true, &transitRoute),
+               "switchboard_masque_gateway_transit_accepts_selected_remote_site_to_local_dc_across_or_within_machine");
+  auto wrongTransitRoute = transitRoute;
+  wrongTransitRoute.next_hop_mac[0] = SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_SECOND;
+  auto directTransitRoute = transitRoute;
+  directTransitRoute.use_gateway_mac = SWITCHBOARD_OVERLAY_ROUTE_ACTION_DIRECT_MAC;
+  uint8_t localTransitSource[16] = {}; std::memcpy(localTransitSource, localTransitSameMachine, sizeof(localTransitSource));
+  uint8_t remoteTransitDestination[16] = {}; std::memcpy(remoteTransitDestination, remoteTransitSource, sizeof(remoteTransitDestination));
+  remoteTransitDestination[11] = 2; remoteTransitDestination[15] = 0x69;
+  uint8_t gatewayTransitSource[16] = {}; std::memcpy(gatewayTransitSource, remoteTransitSource, sizeof(gatewayTransitSource));
+  gatewayTransitSource[15] = SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST;
+  uint8_t gatewayTransitDestination[16] = {}; std::memcpy(gatewayTransitDestination, localTransitSameMachine, sizeof(gatewayTransitDestination));
+  gatewayTransitDestination[15] = SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_SECOND;
+  suite.expect(!switchboardMasqueGatewayRemoteTransitPermitted(CONTAINER_NETWORK_DESTINATION_ALLOWLIST, &gatewaySubnet,
+                    SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST, remoteTransitSource, localTransitDifferentMachine, true, nullptr) &&
+                    !switchboardMasqueGatewayRemoteTransitPermitted(CONTAINER_NETWORK_DESTINATION_ALLOWLIST, &gatewaySubnet,
+                    SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST, remoteTransitSource, localTransitDifferentMachine, true, &wrongTransitRoute) &&
+                    !switchboardMasqueGatewayRemoteTransitPermitted(CONTAINER_NETWORK_DESTINATION_ALLOWLIST, &gatewaySubnet,
+                    SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST, remoteTransitSource, localTransitDifferentMachine, true, &directTransitRoute) &&
+                    !switchboardMasqueGatewayRemoteTransitPermitted(CONTAINER_NETWORK_DENY, &gatewaySubnet,
+                    SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST, remoteTransitSource, localTransitDifferentMachine, true, &transitRoute) &&
+                    !switchboardMasqueGatewayRemoteTransitPermitted(CONTAINER_NETWORK_DESTINATION_ALLOWLIST, &gatewaySubnet,
+                    SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST, localTransitSource, localTransitDifferentMachine, true, &transitRoute) &&
+                    !switchboardMasqueGatewayRemoteTransitPermitted(CONTAINER_NETWORK_DESTINATION_ALLOWLIST, &gatewaySubnet,
+                    SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST, remoteTransitSource, remoteTransitDestination, true, &transitRoute) &&
+                    !switchboardMasqueGatewayRemoteTransitPermitted(CONTAINER_NETWORK_DESTINATION_ALLOWLIST, &gatewaySubnet,
+                    SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST, gatewayTransitSource, localTransitDifferentMachine, true, &transitRoute) &&
+                    !switchboardMasqueGatewayRemoteTransitPermitted(CONTAINER_NETWORK_DESTINATION_ALLOWLIST, &gatewaySubnet,
+                    SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST, remoteTransitSource, gatewayTransitDestination, true, &transitRoute) &&
+                    !switchboardMasqueGatewayRemoteTransitPermitted(CONTAINER_NETWORK_DESTINATION_ALLOWLIST, &gatewaySubnet,
+                    SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST, remoteTransitSource, localTransitDifferentMachine, false, &transitRoute),
+               "switchboard_masque_gateway_transit_rejects_wrong_route_direction_endpoint_or_effective_policy");
 
   SwitchboardOverlayMachineRoute mixed = route6;
   mixed.sourceAddress = IPAddress("198.51.100.10", false);
@@ -124,13 +217,49 @@ int main(void)
 
   switchboard_overlay_machine_route_key fullKey = switchboardMakeOverlayMachineRouteKey(route6.machineFragment);
   switchboard_overlay_machine_route_key lowKey = switchboardMakeOverlayMachineRouteKey(route4.machineFragment & 0xFFu);
-  suite.expect(fullKey.fragment == 0x010203u, "switchboard_overlay_route_key_full_fragment");
+  suite.expect(fullKey.fragment == switchboardMakeOverlayMachineIdentity(1, 0x010203u), "switchboard_overlay_route_key_full_identity");
   suite.expect(lowKey.fragment == 0x2Au, "switchboard_overlay_route_key_low8_fragment");
+
+  const uint32_t siteRouteKey = switchboardMakeOverlayDatacenterRouteKey(2);
+  suite.expect(siteRouteKey == 0x02000000u && switchboardOverlayDatacenterRouteIsValid(siteRouteKey), "switchboard_overlay_route_key_datacenter_96");
+  suite.expect(switchboardOverlayRouteKeyIsValid(route6.machineFragment), "switchboard_overlay_route_key_exact_machine_valid");
+  suite.expect(switchboardOverlayRouteKeyIsValid(siteRouteKey), "switchboard_overlay_route_key_site_valid");
+  suite.expect(switchboardMakeOverlayDatacenterRouteKey(0) == 0 && !switchboardOverlayDatacenterRouteIsValid(0), "switchboard_overlay_route_key_rejects_zero_datacenter");
+
+  SwitchboardOverlayMachineRoute siteRoute = route6;
+  siteRoute.machineFragment = siteRouteKey;
+  suite.expect(switchboardBuildOverlayMachineRouteValue(siteRoute, value6), "switchboard_overlay_route_value_datacenter_96_builds");
+
+  switchboard_overlay_site_route_set siteRoutes = {};
+  siteRoutes.version = SWITCHBOARD_OVERLAY_SITE_ROUTE_SET_VERSION;
+  siteRoutes.count = 3;
+  siteRoutes.candidates[0] = value6;
+  siteRoutes.candidates[1] = value6;
+  siteRoutes.candidates[1].next_hop6[15] = 45;
+  siteRoutes.candidates[2] = value6;
+  siteRoutes.candidates[2].next_hop6[15] = 46;
+  suite.expect(switchboardOverlaySiteRouteSetValid(siteRoutes), "switchboard_overlay_site_route_set_accepts_three_distinct_candidates");
+  siteRoutes.candidates[2] = siteRoutes.candidates[1];
+  suite.expect(!switchboardOverlaySiteRouteSetValid(siteRoutes), "switchboard_overlay_site_route_set_rejects_duplicate_candidate");
+  siteRoutes.candidates[2] = value6;
+  siteRoutes.candidates[2].next_hop6[15] = 46;
+  const uint32_t selectionHash = route6.machineFragment ^ (route6.machineFragment >> 16) ^ 0x9e3779b9u;
+  siteRoutes.count = 1;
+  suite.expect(switchboardOverlaySiteRouteSetValid(siteRoutes) && selectionHash % siteRoutes.count == 0,
+               "switchboard_overlay_site_route_set_one_candidate_selects_index_zero");
+  siteRoutes.count = SWITCHBOARD_OVERLAY_SITE_ROUTE_SET_MAX_CANDIDATES;
+  suite.expect(switchboardOverlaySiteRouteSetValid(siteRoutes) &&
+                   selectionHash % siteRoutes.count < SWITCHBOARD_OVERLAY_SITE_ROUTE_SET_MAX_CANDIDATES,
+               "switchboard_overlay_site_route_set_maximum_candidate_modulo_is_array_bounded");
+  siteRoutes.count = 0;
+  suite.expect(!switchboardOverlaySiteRouteSetValid(siteRoutes), "switchboard_overlay_site_route_set_rejects_zero_count");
+  siteRoutes.count = 4;
+  suite.expect(!switchboardOverlaySiteRouteSetValid(siteRoutes), "switchboard_overlay_site_route_set_rejects_unbounded_count");
 
   Vector<SwitchboardOverlayHostedIngressRoute> hostedIngressRoutes = {};
   SwitchboardOverlayHostedIngressRoute hosted6 = {};
   hosted6.prefix = makePrefix("2001:db8:100::c/128");
-  hosted6.machineFragment = 0x010203u;
+  hosted6.machineFragment = switchboardMakeOverlayMachineIdentity(1, 0x010203u);
   hostedIngressRoutes.push_back(hosted6);
 
   SwitchboardOverlayHostedIngressRoute hosted6Duplicate = hosted6;
@@ -138,7 +267,7 @@ int main(void)
 
   SwitchboardOverlayHostedIngressRoute hosted4 = {};
   hosted4.prefix = makePrefix("203.0.113.9/32");
-  hosted4.machineFragment = 0x2Au;
+  hosted4.machineFragment = switchboardMakeOverlayMachineIdentity(1, 0x2Au);
   hostedIngressRoutes.push_back(hosted4);
 
   Vector<std::pair<switchboard_overlay_prefix4_key, switchboard_overlay_hosted_ingress_route4>> hostedIngressEntries4 = {};
@@ -399,20 +528,39 @@ int main(void)
   suite.expect(switchboardContainerIDTargetsRemoteMachine(&unresolvedContainerID, &localSubnet) == false, "switchboard_container_id_unresolved_container_is_not_remote");
 
   switchboard_overlay_machine_route_key localRouteKey = {};
-  suite.expect(switchboardExtractOverlayMachineFragmentFromIPv6(localContainerIPv6, &localRouteKey.fragment), "switchboard_overlay_route_key_ipv6_extracts_local_machine_fragment");
-  suite.expect(localRouteKey.fragment == 0x8a8520u, "switchboard_overlay_route_key_ipv6_local_machine_fragment_value");
+  suite.expect(switchboardExtractOverlayMachineIdentityFromIPv6(localContainerIPv6, &localRouteKey.fragment), "switchboard_overlay_route_key_ipv6_extracts_local_machine_identity");
+  suite.expect(localRouteKey.fragment == switchboardMakeOverlayMachineIdentity(localSubnet.dpfx, 0x8a8520u), "switchboard_overlay_route_key_ipv6_local_machine_identity_value");
 
   switchboard_overlay_machine_route_key remoteRouteKey = {};
-  suite.expect(switchboardExtractOverlayMachineFragmentFromIPv6(remoteContainerIPv6, &remoteRouteKey.fragment), "switchboard_overlay_route_key_ipv6_extracts_remote_machine_fragment");
-  suite.expect(remoteRouteKey.fragment == 0xa57701u, "switchboard_overlay_route_key_ipv6_remote_machine_fragment_value");
+  suite.expect(switchboardExtractOverlayMachineIdentityFromIPv6(remoteContainerIPv6, &remoteRouteKey.fragment), "switchboard_overlay_route_key_ipv6_extracts_remote_machine_identity");
+  suite.expect(remoteRouteKey.fragment == switchboardMakeOverlayMachineIdentity(remoteContainerID.value[0], 0xa57701u), "switchboard_overlay_route_key_ipv6_remote_machine_identity_value");
 
   uint8_t zeroMachineFragmentIPv6[16] = {};
   std::memcpy(zeroMachineFragmentIPv6, container_network_subnet6.value, sizeof(container_network_subnet6.value));
   zeroMachineFragmentIPv6[11] = localSubnet.dpfx;
   zeroMachineFragmentIPv6[15] = 0x9e;
-  suite.expect(switchboardExtractOverlayMachineFragmentFromIPv6(zeroMachineFragmentIPv6, &remoteRouteKey.fragment) == false, "switchboard_overlay_route_key_ipv6_rejects_zero_machine_fragment");
+  suite.expect(switchboardExtractOverlayMachineIdentityFromIPv6(zeroMachineFragmentIPv6, &remoteRouteKey.fragment) == false, "switchboard_overlay_route_key_ipv6_rejects_zero_machine_fragment");
 
-  suite.expect(switchboardExtractOverlayMachineFragmentFromIPv6(zeroContainerFragmentIPv6, &remoteRouteKey.fragment) == false, "switchboard_overlay_route_key_ipv6_rejects_zero_container_fragment");
+  suite.expect(switchboardExtractOverlayMachineIdentityFromIPv6(zeroContainerFragmentIPv6, &remoteRouteKey.fragment) == false, "switchboard_overlay_route_key_ipv6_rejects_zero_container_fragment");
+
+  uint8_t wrongPrefixIPv6[16] = {};
+  std::memcpy(wrongPrefixIPv6, remoteContainerIPv6, sizeof(wrongPrefixIPv6));
+  wrongPrefixIPv6[0] ^= 0x01;
+  suite.expect(switchboardExtractOverlayMachineIdentityFromIPv6(wrongPrefixIPv6, &remoteRouteKey.fragment) == false, "switchboard_overlay_route_key_ipv6_rejects_wrong_fixed_prefix");
+
+  uint8_t zeroDatacenterIPv6[16] = {};
+  std::memcpy(zeroDatacenterIPv6, remoteContainerIPv6, sizeof(zeroDatacenterIPv6));
+  zeroDatacenterIPv6[11] = 0;
+  suite.expect(switchboardExtractOverlayMachineIdentityFromIPv6(zeroDatacenterIPv6, &remoteRouteKey.fragment) == false, "switchboard_overlay_route_key_ipv6_rejects_zero_datacenter_fragment");
+
+  const uint32_t sameMachineAtFirstDatacenter = switchboardMakeOverlayMachineIdentity(1, 0x123456u);
+  const uint32_t sameMachineAtSecondDatacenter = switchboardMakeOverlayMachineIdentity(2, 0x123456u);
+  suite.expect(sameMachineAtFirstDatacenter != sameMachineAtSecondDatacenter &&
+                   switchboardOverlayMachineIdentityIsValid(sameMachineAtFirstDatacenter) &&
+                   switchboardOverlayMachineIdentityIsValid(sameMachineAtSecondDatacenter),
+               "switchboard_overlay_route_key_distinguishes_datacenters_with_same_machine_fragment");
+  suite.expect(switchboardMakeOverlayMachineIdentity(0, 1) == 0 && switchboardMakeOverlayMachineIdentity(1, 0) == 0,
+               "switchboard_overlay_route_key_rejects_zero_identity_components");
 
   uint8_t rebuiltContainerIPv6[16] = {};
   suite.expect(switchboardBuildContainerNetworkIPv6(rebuiltContainerIPv6, &localContainerID), "switchboard_builds_container_ipv6_from_container_id");

@@ -61,6 +61,12 @@ static inline bool switchboardContainerDestinationIPv6(const __u8 address[16])
   return true;
 }
 
+static inline bool switchboardCrossSiteContainerFlow(const __u8 source[16], const __u8 destination[16])
+{
+  return switchboardContainerDestinationIPv6(source) &&
+      switchboardContainerDestinationIPv6(destination) && source[11] != destination[11];
+}
+
 // IANA IPv6 Global Unicast and Special-Purpose registries, 2025-10-10.
 // Unlisted 2000::/3 space is reserved, so this is intentionally an allocation
 // whitelist rather than a broad global-unicast test.

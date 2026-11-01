@@ -264,6 +264,20 @@ enum class ContainerTopic : std::uint16_t {
   wormholesRefresh = 13,
   runtimeReady = 14,
   taskResult = 15,
+  cousinSessionRequest = 16,
+  cousinSessionCommand = 17,
+  cousinSessionAck = 18,
+  statefulDataAuthority = 19,
+  cousinCarrierFrame = 20,
+  app6TruthMeshReceipt = 21,
+  statefulStoreReceipt = 22,
+  statefulStoreSeedAuthority = 23,
+  nametagQualificationApplicationReceipt = 24,
+  nametagQualificationApplicationCommand = 25,
+  nametagSourceBaseline = 26,
+  statefulStoreSourceCut = 27,
+  statefulStoreProofRecovery = 28,
+  nametagHandoffBarrier = 29,
 };
 
 struct MessageFrame {
@@ -1019,7 +1033,7 @@ static inline bool decodeResourceDeltaPayload(Reader& reader, ResourceDelta& del
 
 static inline bool validTopic(std::uint16_t rawTopic)
 {
-  return rawTopic <= static_cast<std::uint16_t>(ContainerTopic::taskResult);
+  return rawTopic <= static_cast<std::uint16_t>(ContainerTopic::statefulStoreProofRecovery);
 }
 } // namespace Detail
 
@@ -1891,6 +1905,19 @@ public:
       case ContainerTopic::statistics:
       case ContainerTopic::taskResult:
       case ContainerTopic::resourceDeltaAck:
+      case ContainerTopic::cousinSessionRequest:
+      case ContainerTopic::cousinSessionAck:
+      case ContainerTopic::statefulDataAuthority:
+      case ContainerTopic::cousinCarrierFrame:
+      case ContainerTopic::app6TruthMeshReceipt:
+      case ContainerTopic::statefulStoreReceipt:
+      case ContainerTopic::statefulStoreSeedAuthority:
+      case ContainerTopic::nametagQualificationApplicationReceipt:
+      case ContainerTopic::nametagQualificationApplicationCommand:
+      case ContainerTopic::statefulStoreProofRecovery:
+      case ContainerTopic::nametagHandoffBarrier:
+      case ContainerTopic::statefulStoreSourceCut:
+      case ContainerTopic::nametagSourceBaseline:
         {
           return Result::ok;
         }
@@ -2010,6 +2037,10 @@ public:
           }
 
           return Result::ok;
+        }
+      case ContainerTopic::cousinSessionCommand:
+        {
+          return Result::protocol;
         }
     }
 

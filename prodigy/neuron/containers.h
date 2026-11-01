@@ -41,6 +41,7 @@
 #include <prodigy/bundle.artifact.h>
 #include <prodigy/container.contract.h>
 #include <prodigy/container.mesh.identity.h>
+#include <prodigy/cousin.session.h>
 #include <prodigy/declared.network.policy.h>
 #include <prodigy/system.container.policy.h>
 #include <prodigy/wire.h>
@@ -214,6 +215,38 @@ static inline bool prodigyParseLinuxCPUList(
     }
   }
   return parsed.count != 0;
+}
+
+// A partition removes its exclusive CPUs from the parent's effective set.
+// Reclaim only our own partition's kernel-reported exclusive CPUs on restart.
+static inline bool prodigyContainerCPUDiscovery(
+    const String& rootEffective, const String& partitionState,
+    const String& exclusiveEffective, const String& onlineCPUs, ProdigyLinuxCPUList& result)
+{
+  ProdigyLinuxCPUList online = {};
+  if (!prodigyParseLinuxCPUList(rootEffective, result) ||
+      !prodigyParseLinuxCPUList(onlineCPUs, online)) return false;
+  uint64_t first = 0, last = partitionState.size();
+  while (first < last && std::isspace(static_cast<unsigned char>(partitionState[first]))) ++first;
+  while (last > first && std::isspace(static_cast<unsigned char>(partitionState[last - 1]))) --last;
+  const auto matches = [&](const char *value) {
+    const size_t length = std::strlen(value);
+    return last - first == length && std::memcmp(partitionState.data() + first, value, length) == 0;
+  };
+  if (matches("member")) return true;
+  if (!matches("root") && !matches("isolated")) return false;
+  ProdigyLinuxCPUList owned = {};
+  if (!prodigyParseLinuxCPUList(exclusiveEffective, owned)) return false;
+  for (uint16_t cpu = 0; cpu < 256; ++cpu)
+  {
+    if (owned.contains[cpu] && online.contains[cpu] && !result.contains[cpu])
+    {
+      result.contains[cpu] = 1;
+      ++result.count;
+      if (result.maxPlusOne < cpu + 1) result.maxPlusOne = cpu + 1;
+    }
+  }
+  return true;
 }
 
 static inline bool prodigyFormatLinuxCPUList(
@@ -429,12 +462,11 @@ constexpr static ProdigyResidualNetkitAction prodigyResidualNetkitAction(
              : ProdigyResidualNetkitAction::reject;
 }
 
-static void installDatacenterMeshRoutes(NetDevice& device, uint8_t datacenterFragment)
+static void installContainerMeshRoutes(NetDevice& device)
 {
-  auto addDatacenterRoute = [&](const container_network_subnet6_prefix& subnet) -> void {
+  auto addContainerNetworkRoute = [&](const container_network_subnet6_prefix& subnet) -> void {
     uint8_t routeBytes[16] = {0};
-    memcpy(routeBytes, subnet.value, 11);
-    routeBytes[11] = datacenterFragment;
+    memcpy(routeBytes, subnet.value, sizeof(subnet.value));
 
     char routeText[INET6_ADDRSTRLEN] = {0};
     if (inet_ntop(AF_INET6, routeBytes, routeText, sizeof(routeText)) == nullptr)
@@ -444,10 +476,10 @@ static void installDatacenterMeshRoutes(NetDevice& device, uint8_t datacenterFra
 
     String routePrefix;
     routePrefix.assign(routeText);
-    device.addDirectRoute(routePrefix, 96, AF_INET6);
+    device.addDirectRoute(routePrefix, 88, AF_INET6);
   };
 
-  addDatacenterRoute(container_network_subnet6);
+  addContainerNetworkRoute(container_network_subnet6);
 }
 
 template <typename Key>
@@ -550,7 +582,7 @@ static void prodigySortUniqueOverlayEntries(Vector<std::pair<Key, Value>>& entri
 }
 
 template <typename Key, StringType MapName, typename Less>
-static void prodigySyncOverlayPresenceMap(BPFProgram *program,
+static bool prodigySyncOverlayPresenceMap(BPFProgram *program,
                                           MapName&& mapName,
                                           ProdigyOverlayPresenceMirror<Key>& installed,
                                           Vector<Key>& desiredKeys,
@@ -562,7 +594,7 @@ static void prodigySyncOverlayPresenceMap(BPFProgram *program,
   {
     installed.keys = desiredKeys;
     installed.mapID = 0;
-    return;
+    return false;
   }
 
   bool mapInfoAvailable = false;
@@ -680,10 +712,11 @@ static void prodigySyncOverlayPresenceMap(BPFProgram *program,
     installed.keys.clear();
     installed.mapID = 0;
   }
+  return mapInfoAvailable && converged;
 }
 
 template <typename Key, typename Value, StringType MapName, typename Less, typename ValueEquals>
-static void prodigySyncOverlayValueMap(BPFProgram *program,
+static bool prodigySyncOverlayValueMap(BPFProgram *program,
                                        MapName&& mapName,
                                        ProdigyOverlayValueMirror<Key, Value>& installed,
                                        Vector<std::pair<Key, Value>>& desiredEntries,
@@ -696,10 +729,11 @@ static void prodigySyncOverlayValueMap(BPFProgram *program,
   {
     installed.entries = desiredEntries;
     installed.mapID = 0;
-    return;
+    return false;
   }
 
   bool mapInfoAvailable = false;
+  bool converged = false;
   uint32_t mapID = 0;
   program->openMap(mapName, [&](int map_fd) -> void {
     if (map_fd < 0)
@@ -712,9 +746,15 @@ static void prodigySyncOverlayValueMap(BPFProgram *program,
     __u32 mapInfoLen = sizeof(mapInfo);
     mapInfoAvailable = (bpf_map_get_info_by_fd(map_fd, &mapInfo, &mapInfoLen) == 0);
     mapID = mapInfoAvailable ? uint32_t(mapInfo.id) : 0;
+    if (mapInfoAvailable == false)
+    {
+      basics_log("Prodigy overlay value map info failed map=%s errno=%d\n", mapName.c_str(), errno);
+      return;
+    }
 
     const bool mirrorTrusted = mapInfoAvailable && installed.mapID != 0 && installed.mapID == mapID;
     const bool mapRecreated = mapInfoAvailable && installed.mapID != 0 && installed.mapID != mapID;
+    bool operationsSucceeded = true;
     auto installedIt = installed.entries.begin();
     auto desiredIt = desiredEntries.begin();
 
@@ -725,6 +765,7 @@ static void prodigySyncOverlayValueMap(BPFProgram *program,
         if (bpf_map_update_elem(map_fd, &desiredIt->first, &desiredIt->second, BPF_ANY) != 0)
         {
           basics_log("Prodigy overlay value update failed map=%s errno=%d\n", mapName.c_str(), errno);
+          operationsSucceeded = false;
         }
         ++desiredIt;
         continue;
@@ -732,9 +773,10 @@ static void prodigySyncOverlayValueMap(BPFProgram *program,
 
       if (desiredIt == desiredEntries.end())
       {
-        if (mapRecreated == false && bpf_map_delete_elem(map_fd, &installedIt->first) != 0)
+        if (mapRecreated == false && bpf_map_delete_elem(map_fd, &installedIt->first) != 0 && errno != ENOENT)
         {
           basics_log("Prodigy overlay value delete failed map=%s errno=%d\n", mapName.c_str(), errno);
+          operationsSucceeded = false;
         }
         ++installedIt;
         continue;
@@ -742,9 +784,10 @@ static void prodigySyncOverlayValueMap(BPFProgram *program,
 
       if (less(installedIt->first, desiredIt->first))
       {
-        if (mapRecreated == false && bpf_map_delete_elem(map_fd, &installedIt->first) != 0)
+        if (mapRecreated == false && bpf_map_delete_elem(map_fd, &installedIt->first) != 0 && errno != ENOENT)
         {
           basics_log("Prodigy overlay value delete failed map=%s errno=%d\n", mapName.c_str(), errno);
+          operationsSucceeded = false;
         }
         ++installedIt;
         continue;
@@ -755,6 +798,7 @@ static void prodigySyncOverlayValueMap(BPFProgram *program,
         if (bpf_map_update_elem(map_fd, &desiredIt->first, &desiredIt->second, BPF_ANY) != 0)
         {
           basics_log("Prodigy overlay value update failed map=%s errno=%d\n", mapName.c_str(), errno);
+          operationsSucceeded = false;
         }
         ++desiredIt;
         continue;
@@ -764,24 +808,37 @@ static void prodigySyncOverlayValueMap(BPFProgram *program,
           bpf_map_update_elem(map_fd, &desiredIt->first, &desiredIt->second, BPF_ANY) != 0)
       {
         basics_log("Prodigy overlay value update failed map=%s errno=%d\n", mapName.c_str(), errno);
+        operationsSucceeded = false;
       }
       ++installedIt;
       ++desiredIt;
     }
+    converged = operationsSucceeded;
   });
 
-  installed.entries = desiredEntries;
-  installed.mapID = mapInfoAvailable ? mapID : 0;
+  if (mapInfoAvailable && converged)
+  {
+    installed.entries = desiredEntries;
+    installed.mapID = mapID;
+  }
+  else
+  {
+    installed.entries.clear();
+    installed.mapID = 0;
+  }
+  return mapInfoAvailable && converged;
 }
 
 static void prodigyBuildOverlayDesiredRoutes(const SwitchboardOverlayRoutingConfig& config,
                                              Vector<std::pair<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route>>& desiredRoutesFull,
-                                             Vector<std::pair<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route>>& desiredRoutesLow8)
+                                             Vector<std::pair<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route>>& desiredRoutesLow8,
+                                             Vector<std::pair<switchboard_overlay_machine_route_key, switchboard_overlay_site_route_set>>& desiredSiteRoutes)
 {
   uint8_t low8Counts[256] = {0};
 
   desiredRoutesFull.clear();
   desiredRoutesLow8.clear();
+  desiredSiteRoutes.clear();
   desiredRoutesFull.reserve(config.machineRoutes.size());
   desiredRoutesLow8.reserve(config.machineRoutes.size());
 
@@ -793,6 +850,29 @@ static void prodigyBuildOverlayDesiredRoutes(const SwitchboardOverlayRoutingConf
       continue;
     }
 
+    const bool datacenterFallback = (route.machineFragment & 0x00ffffffu) == 0 &&
+        (route.machineFragment >> 24) != 0;
+    if (datacenterFallback)
+    {
+      auto key = switchboardMakeOverlayMachineRouteKey(route.machineFragment);
+      auto found = std::find_if(desiredSiteRoutes.begin(), desiredSiteRoutes.end(),
+          [&](const auto& entry) { return switchboardOverlayMachineRouteKeyEquals(entry.first, key); });
+      if (found == desiredSiteRoutes.end())
+      {
+        switchboard_overlay_site_route_set routes = {};
+        routes.version = SWITCHBOARD_OVERLAY_SITE_ROUTE_SET_VERSION;
+        desiredSiteRoutes.emplace_back(key, routes);
+        found = desiredSiteRoutes.end() - 1;
+      }
+      auto& routes = found->second;
+      bool duplicate = false;
+      for (uint32_t index = 0; index < routes.count; ++index)
+        if (switchboardOverlayMachineRouteEquals(routes.candidates[index], value)) duplicate = true;
+      if (!duplicate && routes.count < SWITCHBOARD_OVERLAY_SITE_ROUTE_SET_MAX_CANDIDATES)
+        routes.candidates[routes.count++] = value;
+      continue;
+    }
+
     desiredRoutesFull.emplace_back(switchboardMakeOverlayMachineRouteKey(route.machineFragment), value);
 
     uint32_t low8 = route.machineFragment & 0xFFu;
@@ -800,6 +880,17 @@ static void prodigyBuildOverlayDesiredRoutes(const SwitchboardOverlayRoutingConf
     {
       low8Counts[low8] += 1;
     }
+  }
+
+  for (auto& entry : desiredSiteRoutes)
+  {
+    auto& routes = entry.second;
+    for (uint32_t i = 1; i < routes.count; ++i)
+      for (uint32_t j = i; j > 0 && std::memcmp(&routes.candidates[j - 1], &routes.candidates[j], sizeof(routes.candidates[0])) > 0; --j)
+      {
+        auto saved = routes.candidates[j - 1]; routes.candidates[j - 1] = routes.candidates[j]; routes.candidates[j] = saved;
+      }
+    if (!switchboardOverlaySiteRouteSetValid(routes)) routes = {};
   }
 
   for (const SwitchboardOverlayMachineRoute& route : config.machineRoutes)
@@ -818,6 +909,24 @@ static void prodigyBuildOverlayDesiredRoutes(const SwitchboardOverlayRoutingConf
 
     desiredRoutesLow8.emplace_back(switchboardMakeOverlayMachineRouteKey(low8), value);
   }
+}
+
+static bool prodigyOverlaySiteRouteMirrorContains(
+    const ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key,
+                                    switchboard_overlay_site_route_set>& installed,
+    const SwitchboardOverlayMachineRoute& route)
+{
+  if (installed.mapID == 0 || (route.machineFragment & 0x00ffffffu) != 0 ||
+      (route.machineFragment >> 24) == 0) return false;
+  switchboard_overlay_machine_route expected = {};
+  if (!switchboardBuildOverlayMachineRouteValue(route, expected)) return false;
+  const auto key = switchboardMakeOverlayMachineRouteKey(route.machineFragment);
+  const auto found = std::find_if(installed.entries.begin(), installed.entries.end(),
+      [&](const auto& entry) { return switchboardOverlayMachineRouteKeyEquals(entry.first, key); });
+  if (found == installed.entries.end() || !switchboardOverlaySiteRouteSetValid(found->second)) return false;
+  for (uint32_t index = 0; index < found->second.count; ++index)
+    if (switchboardOverlayMachineRouteEquals(found->second.candidates[index], expected)) return true;
+  return false;
 }
 
 static void prodigyBuildOverlayDesiredHostedIngressRoutes(const SwitchboardOverlayRoutingConfig& config,
@@ -844,7 +953,7 @@ static bool prodigyOverlayIngressPeer6KeyLess(const switchboard_overlay_ingress_
   return sourceOrder != 0 ? sourceOrder < 0 : std::memcmp(lhs.destination, rhs.destination, sizeof(lhs.destination)) < 0;
 }
 
-static void prodigySyncOverlayIngressPeers(BPFProgram *program,
+static bool prodigySyncOverlayIngressPeers(BPFProgram *program,
                                            const SwitchboardOverlayRoutingConfig& config,
                                            ProdigyOverlayPresenceMirror<switchboard_overlay_ingress_peer4_key>& installed4,
                                            ProdigyOverlayPresenceMirror<switchboard_overlay_ingress_peer6_key>& installed6)
@@ -853,6 +962,7 @@ static void prodigySyncOverlayIngressPeers(BPFProgram *program,
   Vector<switchboard_overlay_ingress_peer6_key> peers6 = {};
   for (const SwitchboardOverlayMachineRoute& route : config.machineRoutes)
   {
+    if (route.localContainerRedirectFragment != 0) continue;
     switchboard_overlay_machine_route value = {};
     if (switchboardBuildOverlayMachineRouteValue(route, value) == false)
     {
@@ -872,74 +982,90 @@ static void prodigySyncOverlayIngressPeers(BPFProgram *program,
     }
   }
 
-  prodigySyncOverlayPresenceMap(program, "ovl_peer4"_ctv, installed4, peers4, prodigyOverlayIngressPeer4KeyLess);
-  prodigySyncOverlayPresenceMap(program, "ovl_peer6"_ctv, installed6, peers6, prodigyOverlayIngressPeer6KeyLess);
+  const bool ipv4 = prodigySyncOverlayPresenceMap(
+      program, "ovl_peer4"_ctv, installed4, peers4, prodigyOverlayIngressPeer4KeyLess);
+  const bool ipv6 = prodigySyncOverlayPresenceMap(
+      program, "ovl_peer6"_ctv, installed6, peers6, prodigyOverlayIngressPeer6KeyLess);
+  return ipv4 && ipv6;
 }
 
-static void prodigySyncOverlayEgressRoutingProgram(BPFProgram *program,
+static bool prodigySyncOverlayEgressRoutingProgram(BPFProgram *program,
                                                    const SwitchboardOverlayRoutingConfig& config,
                                                    ProdigyOverlayPresenceMirror<switchboard_overlay_prefix4_key>& installedPrefixes4,
                                                    ProdigyOverlayPresenceMirror<switchboard_overlay_prefix6_key>& installedPrefixes6,
                                                    ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route>& installedRouteKeysFull,
                                                    ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route>& installedRouteKeysLow8,
+                                                   ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_site_route_set>& installedSiteRouteSets,
                                                    ProdigyOverlayValueMirror<switchboard_overlay_prefix4_key, switchboard_overlay_hosted_ingress_route4>& installedHostedIngressRouteKeys4,
-                                                   ProdigyOverlayValueMirror<switchboard_overlay_prefix6_key, switchboard_overlay_hosted_ingress_route6>& installedHostedIngressRouteKeys6)
+                                                   ProdigyOverlayValueMirror<switchboard_overlay_prefix6_key, switchboard_overlay_hosted_ingress_route6>& installedHostedIngressRouteKeys6,
+                                                   bool hostIngress = false)
 {
+  bool converged = program != nullptr;
   Vector<switchboard_overlay_prefix4_key> desiredPrefixes4 = {};
   Vector<switchboard_overlay_prefix6_key> desiredPrefixes6 = {};
   switchboardBuildOverlayPrefixKeys(config.overlaySubnets, desiredPrefixes4, desiredPrefixes6);
 
-  prodigySyncOverlayPresenceMap(program,
+  converged = prodigySyncOverlayPresenceMap(program,
                                 "ovl_pfx4"_ctv,
                                 installedPrefixes4,
                                 desiredPrefixes4,
-                                prodigyOverlayPrefix4KeyLess);
-  prodigySyncOverlayPresenceMap(program,
+                                prodigyOverlayPrefix4KeyLess) && converged;
+  converged = prodigySyncOverlayPresenceMap(program,
                                 "ovl_pfx6"_ctv,
                                 installedPrefixes6,
                                 desiredPrefixes6,
-                                prodigyOverlayPrefix6KeyLess);
+                                prodigyOverlayPrefix6KeyLess) && converged;
 
   Vector<std::pair<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route>> desiredRoutesFull = {};
   Vector<std::pair<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route>> desiredRoutesLow8 = {};
-  prodigyBuildOverlayDesiredRoutes(config, desiredRoutesFull, desiredRoutesLow8);
+  Vector<std::pair<switchboard_overlay_machine_route_key, switchboard_overlay_site_route_set>> desiredSiteRoutes = {};
+  prodigyBuildOverlayDesiredRoutes(config, desiredRoutesFull, desiredRoutesLow8, desiredSiteRoutes);
 
-  prodigySyncOverlayValueMap(program,
+  converged = prodigySyncOverlayValueMap(program,
                              "ovl_mach_full"_ctv,
                              installedRouteKeysFull,
                              desiredRoutesFull,
                              prodigyOverlayMachineRouteKeyLess,
-                             switchboardOverlayMachineRouteEquals);
-  prodigySyncOverlayValueMap(program,
-                             "ovl_mach_low8"_ctv,
-                             installedRouteKeysLow8,
-                             desiredRoutesLow8,
+                             switchboardOverlayMachineRouteEquals) && converged;
+  converged = prodigySyncOverlayValueMap(program,
+                             "ovl_site_rts_v2"_ctv,
+                             installedSiteRouteSets,
+                             desiredSiteRoutes,
                              prodigyOverlayMachineRouteKeyLess,
-                             switchboardOverlayMachineRouteEquals);
+                             switchboardOverlaySiteRouteSetEquals) && converged;
+  // Host ingress routes by full identity and site; it does not reference low8.
+  if (!hostIngress)
+    converged = prodigySyncOverlayValueMap(program,
+                               "ovl_mach_low8"_ctv,
+                               installedRouteKeysLow8,
+                               desiredRoutesLow8,
+                               prodigyOverlayMachineRouteKeyLess,
+                               switchboardOverlayMachineRouteEquals) && converged;
 
   Vector<std::pair<switchboard_overlay_prefix4_key, switchboard_overlay_hosted_ingress_route4>> desiredHostedIngressRoutes4 = {};
   Vector<std::pair<switchboard_overlay_prefix6_key, switchboard_overlay_hosted_ingress_route6>> desiredHostedIngressRoutes6 = {};
   prodigyBuildOverlayDesiredHostedIngressRoutes(config, desiredHostedIngressRoutes4, desiredHostedIngressRoutes6);
 
-  prodigySyncOverlayValueMap(program,
+  converged = prodigySyncOverlayValueMap(program,
                              "ovl_host4"_ctv,
                              installedHostedIngressRouteKeys4,
                              desiredHostedIngressRoutes4,
                              prodigyOverlayPrefix4KeyLess,
-                             prodigyOverlayHostedIngressRoute4Equals);
-  prodigySyncOverlayValueMap(program,
+                             prodigyOverlayHostedIngressRoute4Equals) && converged;
+  converged = prodigySyncOverlayValueMap(program,
                              "ovl_host6"_ctv,
                              installedHostedIngressRouteKeys6,
                              desiredHostedIngressRoutes6,
                              prodigyOverlayPrefix6KeyLess,
-                             prodigyOverlayHostedIngressRoute6Equals);
+                             prodigyOverlayHostedIngressRoute6Equals) && converged;
 
-  if (program)
+  if (program && !hostIngress)
   {
     switchboard_overlay_config overlayConfig = {};
     overlayConfig.container_network_enabled = config.containerNetworkViaOverlay ? 1 : 0;
     program->setArrayElement("ovl_config"_ctv, 0, overlayConfig);
   }
+  return converged;
 }
 
 static bool bringContainerLoopbackUp(int peernetnsfd, int hostnetnsfd, uint64_t containerUUID, String *failureReport = nullptr)
@@ -1056,6 +1182,78 @@ static bool enableContainerTCPFastOpen(uint64_t containerUUID, String *failureRe
   return false;
 }
 
+// A cross-cluster gateway is the only container that forwards an accepted
+// CONNECT-IP packet between its netkit and private tunnel. This routine never
+// suspends while joined to the peer namespace; a failed restoration is fatal.
+static bool configureCrossClusterMasqueGatewayIPv6Forwarding(
+    int peerNetworkNamespaceFD, int callerNetworkNamespaceFD,
+    const String& peerDevice, uint64_t containerUUID, String *failureReport = nullptr)
+{
+#ifdef __linux__
+  if (peerNetworkNamespaceFD < 0 || callerNetworkNamespaceFD < 0 || peerDevice.size() == 0)
+  {
+    if (failureReport) failureReport->assign("gateway IPv6 forwarding namespace is unavailable"_ctv);
+    return false;
+  }
+  struct stat peerNamespace = {}, callerNamespace = {}, currentNamespace = {};
+  if (fstat(peerNetworkNamespaceFD, &peerNamespace) != 0 || fstat(callerNetworkNamespaceFD, &callerNamespace) != 0 ||
+      stat("/proc/self/ns/net", &currentNamespace) != 0 ||
+      (peerNamespace.st_dev == callerNamespace.st_dev && peerNamespace.st_ino == callerNamespace.st_ino) ||
+      currentNamespace.st_dev != callerNamespace.st_dev || currentNamespace.st_ino != callerNamespace.st_ino)
+  {
+    if (failureReport) failureReport->assign("gateway IPv6 forwarding namespace identity is unsafe"_ctv);
+    return false;
+  }
+  if (::setns(peerNetworkNamespaceFD, CLONE_NEWNET) != 0)
+  {
+    if (failureReport) failureReport->snprintf<"gateway IPv6 forwarding could not join namespace for container {itoa}: {}"_ctv>(
+        containerUUID, String(strerror(errno)));
+    return false;
+  }
+  bool configured = true;
+  int configurationErrno = 0;
+  String peerDeviceText = {};
+  peerDeviceText.assign(peerDevice);
+  const char *scopes[] = {"all", "default", peerDeviceText.c_str()};
+  String path = {};
+  for (const char *scope : scopes)
+  {
+    path.assign("/proc/sys/net/ipv6/conf/"_ctv); path.append(scope); path.append("/forwarding"_ctv);
+    if (writeProcSysctlValue(path.c_str(), "1") == false) { configurationErrno = errno; configured = false; break; }
+    int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    char actual[2] = {};
+    const ssize_t actualBytes = fd >= 0 ? read(fd, actual, sizeof(actual)) : -1;
+    if (fd >= 0) close(fd);
+    if (actualBytes != 2 || actual[0] != '1' || actual[1] != '\n')
+    {
+      configurationErrno = actualBytes < 0 ? errno : EIO;
+      configured = false;
+      break;
+    }
+  }
+  const bool restored = ::setns(callerNetworkNamespaceFD, CLONE_NEWNET) == 0;
+  const int restoreErrno = errno;
+  if (!restored)
+  {
+    basics_log("gateway IPv6 forwarding namespace restoration failed uuid=%llu errno=%d(%s)\n",
+               (unsigned long long)containerUUID, restoreErrno, strerror(restoreErrno));
+    std::abort();
+  }
+  if (!configured)
+  {
+    if (failureReport) failureReport->snprintf<"gateway IPv6 forwarding setup failed for container {itoa}"_ctv>(containerUUID);
+    basics_log("gateway IPv6 forwarding setup failed uuid=%llu path=%s errno=%d(%s)\n",
+               (unsigned long long)containerUUID, path.c_str(), configurationErrno, strerror(configurationErrno));
+    return false;
+  }
+  return true;
+#else
+  (void)peerNetworkNamespaceFD; (void)callerNetworkNamespaceFD; (void)peerDevice; (void)containerUUID;
+  if (failureReport) failureReport->assign("gateway IPv6 forwarding requires Linux namespaces"_ctv);
+  return false;
+#endif
+}
+
 static std::filesystem::path prodigyFilesystemPathFromString(const String& path)
 {
   String pathText = {};
@@ -1131,6 +1329,9 @@ public:
   };
 
   ContainerPlan plan;
+  StatefulDataAuthorityPreparation statefulPreparationRequest;
+  ProdigyNametagQualificationWriterIsolation qualificationIsolationArm = {};
+  uint64_t qualificationIsolationDeadlineNs = 0;
   uint64_t neuronScalingDimensionsMask = 0;
   uint32_t neuronMetricsCadenceMs = 0;
   TimeoutPacket *killSwitch = nullptr; // must be a pointer otherwise if they container gets destroyed the packet is also destroyed
@@ -1187,6 +1388,7 @@ public:
   String storagePayloadPath;
   String runtimePath;
   String neuronListenerPath;
+  bool gatewayReadinessListenerReady = false;
   Vector<StorageLoopDevice> storageLoopDevices;
 
   bool isSystemContainer(void) const
@@ -1210,6 +1412,84 @@ public:
     neuronListenerPath.append("/neuron.soc"_ctv);
   }
 
+  static bool gatewayReadinessDirectoryPath(uint128_t uuid, String& path)
+  {
+    if (uuid == 0) return false;
+    String runtimeName = {};
+    runtimeName.assignItoa(uuid);
+    path.assign(containerRuntimeRootPath);
+    path.append("/"_ctv);
+    path.append(runtimeName);
+    return true;
+  }
+
+  static bool gatewayReadinessSocketPath(uint128_t uuid, const String& token, String& path)
+  {
+    if (token.size() < 32 || gatewayReadinessDirectoryPath(uuid, path) == false) return false;
+    path.append("/masque-gateway-ready.soc"_ctv);
+    return true;
+  }
+
+  static bool gatewayReadinessPeerIDsMatch(uint32_t expectedHostID, uid_t uid, gid_t gid)
+  {
+    return uid == uid_t(expectedHostID) && gid == gid_t(expectedHostID);
+  }
+
+  static bool gatewayReadinessSocketFDValid(int fd, uid_t uid, gid_t gid)
+  {
+    struct stat info = {};
+    return fd >= 0 && fstat(fd, &info) == 0 && S_ISSOCK(info.st_mode) &&
+        info.st_uid == uid && info.st_gid == gid && (info.st_mode & 07777) == 0600;
+  }
+
+  static bool gatewayReadinessDirectoryFDValid(int fd)
+  {
+    struct stat info = {};
+    return fd >= 0 && fstat(fd, &info) == 0 && S_ISDIR(info.st_mode) &&
+        info.st_uid == 0 && (info.st_mode & (S_IWGRP | S_IWOTH)) == 0;
+  }
+
+  static bool gatewayReadinessDirectoryMountFDValid(int fd)
+  {
+    struct stat info = {};
+    return fd >= 0 && fstat(fd, &info) == 0 && S_ISDIR(info.st_mode) &&
+        (info.st_mode & 07777) == 0711;
+  }
+
+  static int gatewayReadinessDetachedMount(int directoryFD)
+  {
+    if (Container::gatewayReadinessDirectoryFDValid(directoryFD) == false)
+    {
+      errno = EPERM;
+      return -1;
+    }
+    int mountFD = int(syscall(SYS_open_tree, directoryFD, "", OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_EMPTY_PATH));
+    if (mountFD < 0) return -1;
+    struct mount_attr attributes = {};
+    attributes.attr_set = MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC;
+    if (syscall(SYS_mount_setattr, mountFD, "", AT_EMPTY_PATH, &attributes, sizeof(attributes)) != 0)
+    {
+      int saved = errno; ::close(mountFD); errno = saved; return -1;
+    }
+    return mountFD;
+  }
+
+  bool gatewayReadinessMountPath(String& path) const
+  {
+    return plan.system.kind == SystemContainerKind::crossClusterMasqueGateway &&
+        gatewayReadinessSocketPath(plan.uuid, plan.system.gatewayLaunchToken, path) &&
+        path == plan.system.gatewayReadinessSocket;
+  }
+
+  bool gatewayReadinessMountDirectoryPath(String& path) const
+  {
+    String socketPath = {};
+    return plan.system.kind == SystemContainerKind::crossClusterMasqueGateway &&
+        gatewayReadinessSocketPath(plan.uuid, plan.system.gatewayLaunchToken, socketPath) &&
+        socketPath == plan.system.gatewayReadinessSocket &&
+        gatewayReadinessDirectoryPath(plan.uuid, path);
+  }
+
   bool systemEgressConstrained(void) const
   {
     return isSystemContainer() && plan.system.egress.configured();
@@ -1230,13 +1510,9 @@ public:
       return false;
     }
 
-    container_egress_allow_key key = {};
-    key.addr = htonl(plan.system.egress.address4);
-    key.proto = IPPROTO_TCP;
-    key.port = htons(plan.system.egress.port);
-
     bool ok = false;
-    peer_program->openMap("ct_egress_allow"_ctv, [&](int mapFD) -> void {
+    const auto sync = [&](String mapName, const auto& key) {
+    peer_program->openMap(mapName, [&](int mapFD) -> void {
       if (mapFD < 0)
       {
         return;
@@ -1245,10 +1521,53 @@ public:
       ok = true;
       ok = bpf_map_update_elem(mapFD, &key, &value, BPF_ANY) == 0;
     });
+    };
+    if (plan.system.egress.peerIsIPv6)
+    {
+      container_egress_allow6_key key = {};
+      std::memcpy(key.addr, plan.system.egress.address6, sizeof(key.addr));
+      key.proto = plan.system.egress.protocol;
+      key.port = htons(plan.system.egress.port);
+      sync("ct_egr_allow6"_ctv, key);
+    }
+    else
+    {
+      container_egress_allow_key key = {};
+      key.addr = htonl(plan.system.egress.address4);
+      key.proto = plan.system.egress.protocol;
+      key.port = htons(plan.system.egress.port);
+      sync("ct_egress_allow"_ctv, key);
+    }
     if (ok == false && failureReport)
     {
       failureReport->assign("failed to sync system egress allowlist"_ctv);
     }
+    return ok;
+  }
+
+  bool syncSystemIngressAllowlist(String *failureReport = nullptr)
+  {
+    if (!systemEgressConstrained()) return true;
+    if (primary_program == nullptr) { if (failureReport) failureReport->assign("system ingress allowlist unavailable"_ctv); return false; }
+    bool ok = false;
+    const auto sync = [&](String mapName, const auto& key) {
+      primary_program->openMap(mapName, [&](int mapFD) -> void {
+        if (mapFD < 0) return;
+        __u8 value = plan.system.egress.allowIngressFromPeer ? 2 : 1;
+        ok = bpf_map_update_elem(mapFD, &key, &value, BPF_ANY) == 0;
+      });
+    };
+    if (plan.system.egress.peerIsIPv6) {
+      container_egress_allow6_key key = {};
+      if (!plan.system.egress.allowIngressFromPeer)
+        std::memcpy(key.addr, plan.system.egress.address6, sizeof(key.addr));
+      key.proto = plan.system.egress.protocol; key.port = htons(plan.system.egress.port); sync("ct_ing_allow6"_ctv, key);
+    } else {
+      container_egress_allow_key key = {};
+      if (!plan.system.egress.allowIngressFromPeer) key.addr = htonl(plan.system.egress.address4);
+      key.proto = plan.system.egress.protocol; key.port = htons(plan.system.egress.port); sync("ct_ing_allow"_ctv, key);
+    }
+    if (!ok && failureReport) failureReport->assign("failed to sync system ingress allowlist"_ctv);
     return ok;
   }
 
@@ -1258,6 +1577,7 @@ public:
   ProdigyOverlayPresenceMirror<switchboard_overlay_prefix6_key> installedPeerOverlayPrefixes6 = {};
   ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route> installedPeerOverlayRouteKeysFull = {};
   ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route> installedPeerOverlayRouteKeysLow8 = {};
+  ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_site_route_set> installedPeerOverlaySiteRouteSets = {};
   ProdigyOverlayValueMirror<switchboard_overlay_prefix4_key, switchboard_overlay_hosted_ingress_route4> installedPeerHostedIngressRouteKeys4 = {};
   ProdigyOverlayValueMirror<switchboard_overlay_prefix6_key, switchboard_overlay_hosted_ingress_route6> installedPeerHostedIngressRouteKeys6 = {};
   ProdigyOverlayValueMirror<portal_definition, switchboard_whitehole_binding> installedPeerWhiteholeBindingKeys = {};
@@ -1501,27 +1821,34 @@ private:
 
 public:
 
-  void syncPeerOverlayRoutingProgram(void)
+  bool syncPeerOverlayRoutingProgram(void)
   {
     if (thisNeuron == nullptr)
     {
-      return;
+      return false;
     }
 
     const SwitchboardOverlayRoutingConfig *overlayConfig = thisNeuron->overlayRoutingConfigForContainerNetworking();
     if (overlayConfig == nullptr)
     {
-      return;
+      return false;
     }
 
-    prodigySyncOverlayEgressRoutingProgram(peer_program,
-                                           *overlayConfig,
-                                           installedPeerOverlayPrefixes4,
-                                           installedPeerOverlayPrefixes6,
-                                           installedPeerOverlayRouteKeysFull,
-                                           installedPeerOverlayRouteKeysLow8,
-                                           installedPeerHostedIngressRouteKeys4,
-                                           installedPeerHostedIngressRouteKeys6);
+    return prodigySyncOverlayEgressRoutingProgram(peer_program,
+                                                  *overlayConfig,
+                                                  installedPeerOverlayPrefixes4,
+                                                  installedPeerOverlayPrefixes6,
+                                                  installedPeerOverlayRouteKeysFull,
+                                                  installedPeerOverlayRouteKeysLow8,
+                                                  installedPeerOverlaySiteRouteSets,
+                                                  installedPeerHostedIngressRouteKeys4,
+                                                  installedPeerHostedIngressRouteKeys6);
+  }
+
+  bool peerOverlaySiteRouteInstalled(const SwitchboardOverlayMachineRoute& route) const
+  {
+    return peer_program != nullptr &&
+        prodigyOverlaySiteRouteMirrorContains(installedPeerOverlaySiteRouteSets, route);
   }
 
   uint32_t localContainerID(void) const
@@ -1765,6 +2092,74 @@ public:
     return clearBPFMap<flow_key>(peer_program, "ct_tcp_flows"_ctv);
   }
 
+  static bool privateSessionTCPFlow(const ProdigyCousinSessionRecord& session,
+                                    CousinRouteHalf half, flow_key& flow)
+  {
+    flow = {};
+    if (!prodigyCousinSessionRecordValid(session) ||
+        !prodigyCousinSessionUsesPrivateContainerEndpoints(session) ||
+        !cousinRouteHalfValid(half)) return false;
+    const bool source = half == CousinRouteHalf::source;
+    std::memcpy(flow.srcv6, source ? session.sourceAddress.v6 : session.destination.publicAddress.v6, 16);
+    std::memcpy(flow.dstv6, source ? session.destination.publicAddress.v6 : session.sourceAddress.v6, 16);
+    flow.port16[0] = htons(source ? session.sourceTCPPort : session.destination.publicTCPPort);
+    flow.port16[1] = htons(source ? session.destination.publicTCPPort : session.sourceTCPPort);
+    flow.proto = IPPROTO_TCP;
+    return true;
+  }
+
+  bool applyPrivateSessionTCPFlow(const ProdigyCousinSessionRecord& session,
+                                  CousinRouteHalf half, uint64_t expiresAtNs, bool revoke)
+  {
+    flow_key flow = {};
+    if (!privateSessionTCPFlow(session, half, flow) || !peer_program || !primary_program ||
+        (!revoke && expiresAtNs == 0)) return false;
+    const uint64_t hi = uint64_t(session.sessionUUID >> 64), lo = uint64_t(session.sessionUUID);
+    bool applied = false;
+    // The two directions may have separate learned-flow caches. Session
+    // authority is installed in both programs before acknowledging the lease.
+    peer_program->openMap("ct_tcp_grants"_ctv, [&](int peerFD) {
+      if (peerFD < 0) return;
+      primary_program->openMap("ct_tcp_grants"_ctv, [&](int primaryFD) {
+        if (primaryFD < 0) return;
+        const int maps[] = {peerFD, primaryFD};
+        bool present[2] = {};
+        for (unsigned i = 0; i < 2; ++i) {
+          container_tcp_authorization previous = {};
+          const int found = bpf_map_lookup_elem(maps[i], &flow, &previous);
+          if (found != 0 && errno != ENOENT) return;
+          present[i] = found == 0;
+          // Only the exact retained session may renew or remove its tuple.
+          if (present[i] && (previous.authorizationHi != hi || previous.authorizationLo != lo)) return;
+        }
+        if (revoke) {
+          applied = true;
+          for (unsigned i = 0; i < 2; ++i)
+            if (present[i] && bpf_map_delete_elem(maps[i], &flow) != 0 && errno != ENOENT) applied = false;
+          return;
+        }
+        container_tcp_authorization grant = {};
+        grant.authorizationExpiresAtNs = expiresAtNs;
+        grant.authorizationHi = hi; grant.authorizationLo = lo;
+        applied = true;
+        for (unsigned i = 0; i < 2; ++i)
+          if (bpf_map_update_elem(maps[i], &flow, &grant, present[i] ? BPF_EXIST : BPF_NOEXIST) != 0) {
+            applied = false; break;
+          }
+        if (!applied) {
+          // A partial install/renewal must fail closed in both directions.
+          for (const int fd : maps) {
+            container_tcp_authorization current = {};
+            if (bpf_map_lookup_elem(fd, &flow, &current) == 0 &&
+                current.authorizationHi == hi && current.authorizationLo == lo)
+              (void)bpf_map_delete_elem(fd, &flow);
+          }
+        }
+      });
+    });
+    return applied;
+  }
+
   bool revokeAuthorizedTCPFlows(uint128_t peerAddress, uint16_t servicePort, bool advertisement)
   {
     if (peer_program == nullptr)
@@ -1797,6 +2192,150 @@ public:
       }
     });
     return ok;
+  }
+
+  // The retained-program path must not write a new policy layout into an
+  // older pinned map. A missing or different-sized map requires reattachment.
+  static bool containerNetworkPolicyMapCompatible(BPFProgram *program)
+  {
+    if (!program) return false;
+    bool compatible = false;
+    program->openMap("ct_net_policy"_ctv, [&](int fd) {
+      bpf_map_info info = {}; __u32 size = sizeof(info);
+      compatible = fd >= 0 && bpf_obj_get_info_by_fd(fd, &info, &size) == 0 &&
+          info.type == BPF_MAP_TYPE_ARRAY && info.key_size == sizeof(__u32) &&
+          info.value_size == sizeof(container_network_policy) && info.max_entries == 1;
+    });
+    return compatible;
+  }
+
+  enum class ContainerPreattachedProgramState : uint8_t
+  {
+    queryError,
+    absent,
+    present,
+  };
+
+  static ContainerPreattachedProgramState containerPreattachedProgramState(
+      const NetDevice& device, enum bpf_attach_type attachType)
+  {
+    if (device.ifidx == 0) return ContainerPreattachedProgramState::queryError;
+    struct bpf_prog_query_opts options = {};
+    options.sz = sizeof(options);
+    __u32 programID = 0;
+    options.prog_ids = &programID;
+    options.prog_cnt = 1;
+    if (bpf_prog_query_opts(device.ifidx, attachType, &options) != 0)
+    {
+      return ContainerPreattachedProgramState::queryError;
+    }
+    return options.prog_cnt == 0 ? ContainerPreattachedProgramState::absent
+                                 : ContainerPreattachedProgramState::present;
+  }
+
+  bool attachContainerIngressProgram(NetDevice& device, String& path,
+                                     bool& tcpFlowMapReused, bool requireWormholeMaps)
+  {
+    tcpFlowMapReused = plan.networkAccess != ContainerNetworkAccess::declaredOnly;
+    BPFProgram *attached = device.attachBPF(prodigyContainerIngressNetkitAttachType(), path, "ct_ingress"_ctv,
+        [&](struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
+          switchboardConfigureDevelopmentWhiteholeMapAllocation(obj);
+          (void)switchboardReusePinnedWormholeFlowMaps(obj, thisNeuron->eth.ifidx, inner_map_fds);
+          if (plan.networkAccess == ContainerNetworkAccess::declaredOnly)
+          {
+            tcpFlowMapReused = switchboardReusePinnedContainerTCPFlowMap(obj, netdevs.host.ifidx, inner_map_fds);
+          }
+        });
+    if (attached == nullptr ||
+        (requireWormholeMaps && switchboardProgramUsesPinnedWormholeFlowMaps(
+            attached, thisNeuron->eth.ifidx, SwitchboardWormholeMapConsumer::forwarding) == false) ||
+        containerNetworkPolicyMapCompatible(attached) == false)
+    {
+      if (attached) device.detachBPF(prodigyContainerIngressNetkitAttachType());
+      return false;
+    }
+
+    // A zero policy has no container fragment, so the kernel router rejects
+    // packets until the caller has installed allowlists and a final policy.
+    container_network_policy denied = {};
+    attached->setArrayElement("ct_net_policy"_ctv, 0, denied);
+    primary_program = attached;
+    return true;
+  }
+
+  // This is the existing per-container policy owner. An exact nonzero owner
+  // may install/retry or release its cut; another owner cannot replace it.
+  // The kernel deadline independently restores the normal policy on expiry.
+  bool applyQualificationIsolation(uint128_t owner, uint64_t nowNs,
+                                   uint64_t deadlineNs, bool release)
+  {
+    constexpr uint64_t maximumDurationNs = 60'000'000'000ULL;
+    if (!owner || !nowNs || (!release && (deadlineNs <= nowNs || deadlineNs - nowNs > maximumDurationNs)) ||
+        !containerNetworkPolicyMapCompatible(peer_program) ||
+        !containerNetworkPolicyMapCompatible(primary_program)) return false;
+    const uint64_t hi = uint64_t(owner >> 64), lo = uint64_t(owner);
+    bool success = false;
+    peer_program->openMap("ct_net_policy"_ctv, [&](int peerFD) {
+      if (peerFD < 0) return;
+      primary_program->openMap("ct_net_policy"_ctv, [&](int primaryFD) {
+        if (primaryFD < 0) return;
+        const __u32 key = 0; const int fds[] = {peerFD, primaryFD};
+        container_network_policy previous[2] = {}, next[2] = {}, observed = {};
+        for (unsigned i = 0; i < 2; ++i) {
+          if (bpf_map_lookup_elem(fds[i], &key, &previous[i]) != 0) return;
+          const auto& old = previous[i];
+          if (old.isolationDeadlineNs > nowNs &&
+              (old.isolationOwnerHi != hi || old.isolationOwnerLo != lo)) return;
+          // A retry must never extend a lease already installed in the kernel.
+          if (!release && old.isolationDeadlineNs > nowNs &&
+              old.isolationDeadlineNs != deadlineNs) return;
+          if (release && (old.isolationOwnerHi != hi || old.isolationOwnerLo != lo)) return;
+          next[i] = old; next[i].isolationDeadlineNs = release ? 0 : deadlineNs;
+          next[i].isolationOwnerHi = release ? 0 : hi;
+          next[i].isolationOwnerLo = release ? 0 : lo;
+        }
+        if (bpf_map_update_elem(fds[0], &key, &next[0], BPF_ANY) != 0) return;
+        if (bpf_map_update_elem(fds[1], &key, &next[1], BPF_ANY) != 0) {
+          (void)bpf_map_update_elem(fds[0], &key, &previous[0], BPF_ANY); return;
+        }
+        success = true;
+        for (unsigned i = 0; i < 2; ++i) {
+          if (bpf_map_lookup_elem(fds[i], &key, &observed) != 0 ||
+              std::memcmp(&observed, &next[i], sizeof(observed)) != 0) success = false;
+        }
+        if (!success) for (unsigned i = 0; i < 2; ++i)
+          (void)bpf_map_update_elem(fds[i], &key, &previous[i], BPF_ANY);
+      });
+    });
+    return success;
+  }
+
+  bool qualificationIsolationState(uint128_t& owner, uint64_t& deadlineNs) const
+  {
+    owner = 0; deadlineNs = 0;
+    if (!containerNetworkPolicyMapCompatible(peer_program) ||
+        !containerNetworkPolicyMapCompatible(primary_program)) return false;
+    container_network_policy values[2] = {}; bool read[2] = {};
+    BPFProgram *programs[] = {peer_program, primary_program};
+    for (unsigned i = 0; i < 2; ++i) programs[i]->openMap("ct_net_policy"_ctv, [&](int fd) {
+      const __u32 key = 0;
+      read[i] = fd >= 0 && bpf_map_lookup_elem(fd, &key, &values[i]) == 0;
+    });
+    if (!read[0] || !read[1] || values[0].isolationDeadlineNs != values[1].isolationDeadlineNs ||
+        values[0].isolationOwnerHi != values[1].isolationOwnerHi ||
+        values[0].isolationOwnerLo != values[1].isolationOwnerLo) return false;
+    owner = (uint128_t(values[0].isolationOwnerHi) << 64) | values[0].isolationOwnerLo;
+    deadlineNs = values[0].isolationDeadlineNs;
+    return true;
+  }
+
+  bool qualificationIsolationActive(uint128_t owner, uint64_t nowNs, bool& active) const
+  {
+    uint128_t observedOwner = 0; uint64_t deadline = 0; active = false;
+    if (!owner || !nowNs || !qualificationIsolationState(observedOwner, deadline) ||
+        observedOwner != owner) return false;
+    active = deadline > nowNs;
+    return true;
   }
 
   void denyDeclaredNetwork(void)
@@ -1888,7 +2427,8 @@ public:
     return plan.wormholes.empty() ||
            (thisNeuron != nullptr &&
            switchboardProgramUsesPinnedWormholeFlowMaps(peer_program, thisNeuron->eth.ifidx) &&
-           switchboardProgramUsesPinnedWormholeFlowMaps(primary_program, thisNeuron->eth.ifidx));
+           switchboardProgramUsesPinnedWormholeFlowMaps(primary_program, thisNeuron->eth.ifidx,
+                                                       SwitchboardWormholeMapConsumer::forwarding));
   }
 
   uint32_t desiredInterContainerMTU(String *failureReport = nullptr) const
@@ -1955,8 +2495,10 @@ public:
       return false;
     }
     networkPolicy = {};
-    networkPolicy.requiresPublic4 = (needsAnyExternalAddressFamily(plan, ExternalAddressFamily::ipv4) || systemEgressConstrained()) ? 1 : 0;
-    networkPolicy.requiresPublic6 = needsAnyExternalAddressFamily(plan, ExternalAddressFamily::ipv6) ? 1 : 0;
+    networkPolicy.requiresPublic4 = (needsAnyExternalAddressFamily(plan, ExternalAddressFamily::ipv4) ||
+                                     (systemEgressConstrained() && !plan.system.egress.peerIsIPv6)) ? 1 : 0;
+    networkPolicy.requiresPublic6 = (needsAnyExternalAddressFamily(plan, ExternalAddressFamily::ipv6) ||
+                                     (systemEgressConstrained() && plan.system.egress.peerIsIPv6)) ? 1 : 0;
     networkPolicy.mode = plan.networkAccess == ContainerNetworkAccess::declaredOnly
                              ? CONTAINER_NETWORK_DECLARED_ONLY
                              : (systemEgressConstrained() ? CONTAINER_NETWORK_DESTINATION_ALLOWLIST
@@ -2203,33 +2745,124 @@ public:
     {
       return false;
     }
+    const auto primaryState = containerPreattachedProgramState(
+        netdevs.host, prodigyContainerIngressNetkitAttachType());
     primary_program = netdevs.host.loadPreattachedProgram(prodigyContainerIngressNetkitAttachType(), path);
+    bool primaryRepaired = false;
+    container_network_policy retainedPeerPolicy = {};
+    if (primary_program == nullptr)
+    {
+      // Repair only a positively observed absent ingress hook. A failed
+      // query or a present-but-unloadable program may be a foreign/stale
+      // attachment and must remain untouched for retirement to resolve.
+      if (primaryState != ContainerPreattachedProgramState::absent || peer_program == nullptr ||
+          switchboardProgramUsesPinnedWormholeFlowMaps(peer_program, thisNeuron->eth.ifidx) == false ||
+          containerNetworkPolicyMapCompatible(peer_program) == false)
+      {
+        if (failureReport) failureReport->assign("container wormhole flow state unavailable"_ctv);
+        return false;
+      }
+      bool peerPolicyRead = false;
+      peer_program->openMap("ct_net_policy"_ctv, [&](int fd) {
+        const __u32 key = 0;
+        peerPolicyRead = fd >= 0 && bpf_map_lookup_elem(fd, &key, &retainedPeerPolicy) == 0;
+      });
+      struct timespec now = {};
+      if (!peerPolicyRead || clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 ||
+          (retainedPeerPolicy.isolationDeadlineNs >
+               uint64_t(now.tv_sec) * 1'000'000'000ULL + uint64_t(now.tv_nsec) &&
+           !(retainedPeerPolicy.isolationOwnerHi || retainedPeerPolicy.isolationOwnerLo)))
+      {
+        if (failureReport) failureReport->assign("container retained network isolation unavailable"_ctv);
+        return false;
+      }
+      if (retainedPeerPolicy.isolationDeadlineNs >
+          uint64_t(now.tv_sec) * 1'000'000'000ULL + uint64_t(now.tv_nsec))
+      {
+        networkPolicy.isolationDeadlineNs = retainedPeerPolicy.isolationDeadlineNs;
+        networkPolicy.isolationOwnerHi = retainedPeerPolicy.isolationOwnerHi;
+        networkPolicy.isolationOwnerLo = retainedPeerPolicy.isolationOwnerLo;
+      }
+      bool tcpFlowMapReused = false;
+      if (attachContainerIngressProgram(netdevs.host, path, tcpFlowMapReused, true) == false || !tcpFlowMapReused)
+      {
+        if (primary_program)
+        {
+          netdevs.host.detachBPF(prodigyContainerIngressNetkitAttachType());
+          primary_program = nullptr;
+        }
+        if (failureReport) failureReport->assign("failed to restore absent container ingress bpf"_ctv);
+        return false;
+      }
+      primaryRepaired = true;
+    }
+    auto abandonRepairedPrimary = [&]() -> bool {
+      if (primaryRepaired && primary_program)
+      {
+        netdevs.host.detachBPF(prodigyContainerIngressNetkitAttachType());
+        primary_program = nullptr;
+      }
+      return false;
+    };
     // A retained netkit pair can outlive the program family that created it.
     // Do not write any maps or synchronize this candidate until both attached
     // programs prove they share the host's authoritative wormhole flow maps.
     // In particular, loadPreattachedProgram can identify a stale program by
     // attach type before its map contract has been validated.
-    if (peer_program == nullptr || primary_program == nullptr || wormholeFlowMapsShared() == false)
+    if (peer_program == nullptr || primary_program == nullptr || wormholeFlowMapsShared() == false ||
+        !containerNetworkPolicyMapCompatible(peer_program) || !containerNetworkPolicyMapCompatible(primary_program))
     {
       if (failureReport)
       {
         failureReport->assign("container wormhole flow state unavailable"_ctv);
       }
-      return false;
+      return abandonRepairedPrimary();
     }
 
+    // Do not silently heal an unexpired retained isolation during reconnect.
+    struct timespec now = {};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0) return abandonRepairedPrimary();
+    const uint64_t nowNs = uint64_t(now.tv_sec) * 1'000'000'000ULL + uint64_t(now.tv_nsec);
+    container_network_policy retained[2] = {}; bool read[2] = {};
+    if (primaryRepaired)
+    {
+      retained[0] = retainedPeerPolicy; retained[1] = retainedPeerPolicy;
+      read[0] = true; read[1] = true;
+    }
+    else
+    {
+      BPFProgram *programs[] = {peer_program, primary_program};
+      for (unsigned i = 0; i < 2; ++i) programs[i]->openMap("ct_net_policy"_ctv, [&](int fd) {
+        const __u32 key = 0;
+        read[i] = fd >= 0 && bpf_map_lookup_elem(fd, &key, &retained[i]) == 0;
+      });
+    }
+    if (!read[0] || !read[1]) return abandonRepairedPrimary();
+    const bool active0 = retained[0].isolationDeadlineNs > nowNs;
+    const bool active1 = retained[1].isolationDeadlineNs > nowNs;
+    if (active0 != active1 || (active0 &&
+        (retained[0].isolationDeadlineNs != retained[1].isolationDeadlineNs ||
+         retained[0].isolationOwnerHi != retained[1].isolationOwnerHi ||
+         retained[0].isolationOwnerLo != retained[1].isolationOwnerLo ||
+         !(retained[0].isolationOwnerHi || retained[0].isolationOwnerLo)))) return abandonRepairedPrimary();
+    if (active0) {
+      networkPolicy.isolationDeadlineNs = retained[0].isolationDeadlineNs;
+      networkPolicy.isolationOwnerHi = retained[0].isolationOwnerHi;
+      networkPolicy.isolationOwnerLo = retained[0].isolationOwnerLo;
+    }
     peer_program->setArrayElement("lc_subnet"_ctv, 0, thisNeuron->lcsubnet6);
     peer_program->setArrayElement("mac_map"_ctv, 0, thisNeuron->eth.mac);
     peer_program->setArrayElement("gw_mac_map"_ctv, 0, thisNeuron->eth.gateway_mac);
     peer_program->setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
     if (syncSystemEgressAllowlist(failureReport) == false)
     {
-      return false;
+      return abandonRepairedPrimary();
     }
     thisNeuron->syncWhiteholeBindingsForContainerPeer(this);
 
     primary_program->setArrayElement("lc_subnet"_ctv, 0, thisNeuron->lcsubnet6);
-    primary_program->setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
+    if (syncSystemIngressAllowlist(failureReport) == false) return abandonRepairedPrimary();
+    if (!primaryRepaired) primary_program->setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
 
     if (plan.networkAccess == ContainerNetworkAccess::declaredOnly &&
         (tcpFlowMapsShared() == false || syncDeclaredNetworkPolicy() == false))
@@ -2238,17 +2871,15 @@ public:
       {
         failureReport->assign("declared network state unavailable"_ctv);
       }
-      return false;
+      return abandonRepairedPrimary();
     }
 
     bool synced = syncContainerDeviceMaps(this, false, failureReport);
-    if (synced)
-    {
-      syncPeerOverlayRoutingProgram();
-      thisNeuron->syncContainerSwitchboardRuntime(this);
-    }
-
-    return synced;
+    if (!synced) return abandonRepairedPrimary();
+    if (primaryRepaired) primary_program->setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
+    syncPeerOverlayRoutingProgram();
+    thisNeuron->syncContainerSwitchboardRuntime(this);
+    return true;
   }
 
   static void retireRestoreDescriptor(int& descriptor)
@@ -2395,6 +3026,9 @@ public:
     }
     if (!isCurrent()) co_return false;
     if (applyHostNetkitIPv4SourceValidationValues(failureReport) == false) co_return false;
+    if (plan.system.kind == SystemContainerKind::crossClusterMasqueGateway &&
+        configureCrossClusterMasqueGatewayIPv6Forwarding(namespaces.peer, namespaces.host, netdevs.peer.name, plan.uuid, failureReport) == false)
+      co_return false;
     co_return finishNetworkRestore(failureReport);
   }
 
@@ -2512,6 +3146,14 @@ public:
       return false;
     }
 
+    if (plan.system.kind == SystemContainerKind::crossClusterMasqueGateway &&
+        configureCrossClusterMasqueGatewayIPv6Forwarding(peernetnsfd, hostnetnsfd, peer.name, plan.uuid, failureReport) == false)
+    {
+      ::close(peernetnsfd);
+      ::close(hostnetnsfd);
+      return false;
+    }
+
     for (const IPPrefix& prefix : plan.addresses)
     {
       peer.addIP(prefix);
@@ -2560,7 +3202,7 @@ public:
 
     // Mesh subscriptions target datacenter-scoped container IPv6s (prefix11 + dpfx + machine + fragment).
     // Add datacenter-wide /96 routes so cross-machine container traffic is routable from this netns.
-    installDatacenterMeshRoutes(peer, thisNeuron->lcsubnet6.dpfx);
+    installContainerMeshRoutes(peer);
 
     struct container_network_policy networkPolicy = {};
     if (buildContainerNetworkPolicy(networkPolicy, failureReport) == false)
@@ -2704,25 +3346,9 @@ public:
       }
       return false;
     }
-    bool tcpFlowMapReused = plan.networkAccess != ContainerNetworkAccess::declaredOnly;
-    primary_program = host.attachBPF(prodigyContainerIngressNetkitAttachType(), path, "ct_ingress"_ctv,
-                                     [&](struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
-                                       switchboardConfigureDevelopmentWhiteholeMapAllocation(obj);
-                                       (void)switchboardReusePinnedWormholeFlowMaps(obj, thisNeuron->eth.ifidx, inner_map_fds);
-                                       if (plan.networkAccess == ContainerNetworkAccess::declaredOnly)
-                                       {
-                                         tcpFlowMapReused = switchboardReusePinnedContainerTCPFlowMap(obj, netdevs.host.ifidx, inner_map_fds);
-                                       }
-                                     });
-    if (primary_program == nullptr ||
-        (plan.wormholes.empty() == false &&
-         switchboardProgramUsesPinnedWormholeFlowMaps(primary_program, thisNeuron->eth.ifidx) == false))
+    bool tcpFlowMapReused = false;
+    if (attachContainerIngressProgram(host, path, tcpFlowMapReused, !plan.wormholes.empty()) == false)
     {
-      if (primary_program)
-      {
-        host.detachBPF(prodigyContainerIngressNetkitAttachType());
-        primary_program = nullptr;
-      }
       if (failureReport)
       {
         failureReport->snprintf<"failed to attach container ingress bpf for container {itoa} path={}"_ctv>(plan.uuid, path);
@@ -2744,6 +3370,12 @@ public:
       return false;
     }
     primary_program->setArrayElement("lc_subnet"_ctv, 0, thisNeuron->lcsubnet6);
+    if (syncSystemIngressAllowlist(failureReport) == false)
+    {
+      if (peernetnsfd >= 0) ::close(peernetnsfd);
+      if (hostnetnsfd >= 0) ::close(hostnetnsfd);
+      return false;
+    }
     primary_program->setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
 
     if (plan.networkAccess == ContainerNetworkAccess::declaredOnly &&
@@ -3154,6 +3786,11 @@ class ContainerManager {
 private:
 
   friend bool Container::waitForHostNetkitUdevInitialization(String *failureReport);
+  // Neuron owns retained-process admission and must bind the exact
+  // root-owned gateway recovery record before it can resume stateUpload.
+  friend class Neuron;
+  friend class ContainerManagerGatewayRecoveryTestAccess;
+  friend class ContainerManagerStorageTestAccess;
 
   int slicefd;
   static inline bool rootCgroupSeeded = false;
@@ -6984,10 +7621,211 @@ private:
     return true;
   }
 
+  // This root-owned record is consumed by a replacement binary, so its bytes
+  // cannot depend on compiler padding or host integer layout. All integers are
+  // big-endian and the reserved bytes must remain zero.
+  struct GatewayRecoveryRecord {
+    uint8_t version = 1;
+    uint8_t reserved[7] = {};
+    uint8_t containerUUID[16] = {}, pairUUID[16] = {};
+    uint8_t localClusterUUID[16] = {}, localMachineUUID[16] = {};
+    uint8_t keyEpoch[8] = {}, authorityGeneration[8] = {}, gatewayGeneration[8] = {};
+    char token[32] = {};
+  };
+  static_assert(sizeof(GatewayRecoveryRecord) == 128);
+
+  template <typename Integer, size_t N>
+  static void encodeGatewayRecoveryInteger(Integer value, uint8_t (&encoded)[N])
+  {
+    for (size_t i = N; i > 0; --i)
+    {
+      encoded[i - 1] = uint8_t(value & Integer(0xff));
+      value >>= 8;
+    }
+  }
+
+  static GatewayRecoveryRecord makeGatewayRecoveryRecord(const ContainerPlan& plan, const String& token)
+  {
+    GatewayRecoveryRecord record = {};
+    encodeGatewayRecoveryInteger(plan.uuid, record.containerUUID);
+    encodeGatewayRecoveryInteger(plan.system.gatewayPairUUID, record.pairUUID);
+    encodeGatewayRecoveryInteger(plan.system.gatewayLocalClusterUUID, record.localClusterUUID);
+    encodeGatewayRecoveryInteger(plan.system.gatewayLocalMachineUUID, record.localMachineUUID);
+    encodeGatewayRecoveryInteger(plan.system.gatewayKeyEpoch, record.keyEpoch);
+    encodeGatewayRecoveryInteger(plan.system.gatewayAuthorityGeneration, record.authorityGeneration);
+    encodeGatewayRecoveryInteger(plan.system.gatewayGeneration, record.gatewayGeneration);
+    memcpy(record.token, token.data(), sizeof(record.token));
+    return record;
+  }
+
+  static bool readGatewayRecoveryRecordFD(int fd, GatewayRecoveryRecord& record)
+  {
+    uint8_t *bytes = reinterpret_cast<uint8_t *>(&record);
+    size_t offset = 0;
+    while (offset < sizeof(record))
+    {
+      const ssize_t result = pread(fd, bytes + offset, sizeof(record) - offset, off_t(offset));
+      if (result > 0) { offset += size_t(result); continue; }
+      if (result < 0 && errno == EINTR) continue;
+      return false;
+    }
+    uint8_t trailing = 0;
+    return pread(fd, &trailing, 1, off_t(sizeof(record))) == 0;
+  }
+
+  static bool writeGatewayRecoveryRecordFD(int fd, const GatewayRecoveryRecord& record)
+  {
+    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&record);
+    size_t offset = 0;
+    while (offset < sizeof(record))
+    {
+      const ssize_t result = write(fd, bytes + offset, sizeof(record) - offset);
+      if (result > 0) { offset += size_t(result); continue; }
+      if (result < 0 && errno == EINTR) continue;
+      return false;
+    }
+    return true;
+  }
+
+  static bool gatewayRecoverySocketPath(uint128_t uuid, String& path)
+  {
+    return Container::gatewayReadinessDirectoryPath(uuid, path) &&
+        (path.append("/masque-gateway-recovery.soc"_ctv), true);
+  }
+
+  static bool gatewayRecoveryTokenValid(const String& token)
+  {
+    if (token.size() != 32) return false;
+    for (uint64_t i = 0; i < token.size(); ++i)
+      if (!((token[i] >= '0' && token[i] <= '9') || (token[i] >= 'a' && token[i] <= 'f'))) return false;
+    return true;
+  }
+
+  static void generateGatewayRecoveryToken(String& token)
+  {
+    uint128_t value = 0;
+    while (value == 0) value = Random::generateNumberWithNBits<128, uint128_t>();
+    char encoded[32] = {};
+    constexpr char digits[] = "0123456789abcdef";
+    for (size_t i = sizeof(encoded); i > 0; --i)
+    {
+      encoded[i - 1] = digits[uint8_t(value & uint128_t(0xf))];
+      value >>= 4;
+    }
+    token.assign(encoded, sizeof(encoded));
+  }
+
+  static bool appendGatewayRecoveryEnvironment(const SystemContainerRuntimePlan& gateway, Vector<String>& environment)
+  {
+    if (gateway.gatewayRecoverySocket.empty() || !gatewayRecoveryTokenValid(gateway.gatewayRecoveryToken)) return false;
+    String socket = {};
+    socket.assign("PRODIGY_MASQUE_RECOVERY_SOCKET="_ctv);
+    socket.append(gateway.gatewayRecoverySocket);
+    environment.push_back(std::move(socket));
+    String token = {};
+    token.assign("PRODIGY_MASQUE_RECOVERY_TOKEN="_ctv);
+    token.append(gateway.gatewayRecoveryToken);
+    environment.push_back(std::move(token));
+    return true;
+  }
+
+  static bool gatewayRecoveryRecordMatches(const GatewayRecoveryRecord& record, const ContainerPlan& plan)
+  {
+    String storedToken = {};
+    storedToken.assign(record.token, sizeof(record.token));
+    if (record.version != 1 || !gatewayRecoveryTokenValid(storedToken)) return false;
+    for (uint8_t value : record.reserved) if (value != 0) return false;
+    const GatewayRecoveryRecord expected = makeGatewayRecoveryRecord(plan, storedToken);
+    return memcmp(&record, &expected, sizeof(record)) == 0;
+  }
+
+  static bool gatewayRecoveryRecordFDMatches(int fd, const ContainerPlan& plan,
+                                             const GatewayRecoveryRecord& intended)
+  {
+    struct stat info = {};
+    GatewayRecoveryRecord existing = {};
+    return fd >= 0 && fstat(fd, &info) == 0 && S_ISREG(info.st_mode) && info.st_uid == 0 &&
+        (info.st_mode & 07777) == 0600 && info.st_size == off_t(sizeof(existing)) &&
+        readGatewayRecoveryRecordFD(fd, existing) && gatewayRecoveryRecordMatches(existing, plan) &&
+        memcmp(existing.token, intended.token, sizeof(existing.token)) == 0;
+  }
+
+  static bool writeGatewayRecoveryRecordAt(int rootFD, const ContainerPlan& plan, const String& token, String *failureReport = nullptr)
+  {
+    if (plan.system.kind != SystemContainerKind::crossClusterMasqueGateway || !gatewayRecoveryTokenValid(token)) return false;
+    String name = {}; name.assignItoa(plan.uuid);
+    int directoryFD = Filesystem::openDirectoryAt(rootFD, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC, secureContainerResolveFlags);
+    if (directoryFD < 0) return false;
+    const GatewayRecoveryRecord record = makeGatewayRecoveryRecord(plan, token);
+    struct stat prior = {}; if (fstatat(directoryFD, "masque-gateway-recovery.v1", &prior, AT_SYMLINK_NOFOLLOW) == 0) {
+      int existingFD = openat(directoryFD, "masque-gateway-recovery.v1", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+      const bool identical = gatewayRecoveryRecordFDMatches(existingFD, plan, record);
+      if (existingFD >= 0) close(existingFD); close(directoryFD); return identical;
+    } else if (errno != ENOENT) { close(directoryFD); return false; }
+    String temporary = ".masque-gateway-recovery.v1."_ctv;
+    String nonce = {}; nonce.assignItoh(Random::generateNumberWithNBits<128, uint128_t>());
+    temporary.append(nonce); temporary.append(".tmp"_ctv);
+    int fd = openat(directoryFD, temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    bool ok = fd >= 0 && fchmod(fd, 0600) == 0 && writeGatewayRecoveryRecordFD(fd, record) && fsync(fd) == 0;
+    if (fd >= 0 && close(fd) != 0) ok = false;
+    if (!ok)
+    {
+      if (fd >= 0) (void)unlinkat(directoryFD, temporary.c_str(), 0);
+      close(directoryFD);
+      return false;
+    }
+    if (renameat2(directoryFD, temporary.c_str(), directoryFD, "masque-gateway-recovery.v1", RENAME_NOREPLACE) != 0)
+    {
+      const int renameErrno = errno;
+      (void)unlinkat(directoryFD, temporary.c_str(), 0);
+      if (renameErrno == EEXIST)
+      {
+        int existingFD = openat(directoryFD, "masque-gateway-recovery.v1", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        const bool identical = gatewayRecoveryRecordFDMatches(existingFD, plan, record);
+        if (existingFD >= 0) close(existingFD);
+        close(directoryFD);
+        return identical;
+      }
+      close(directoryFD);
+      errno = renameErrno;
+      return false;
+    }
+    ok = fsync(directoryFD) == 0;
+    close(directoryFD);
+    return ok;
+  }
+
+  static bool writeGatewayRecoveryRecord(const ContainerPlan& plan, const String& token, String *failureReport = nullptr)
+  {
+    int rootFD = -1; if (!openContainerRuntimeRoot(rootFD, failureReport)) return false;
+    const bool written = writeGatewayRecoveryRecordAt(rootFD, plan, token, failureReport); close(rootFD); return written;
+  }
+
+  static bool readGatewayRecoveryRecordAt(int rootFD, const ContainerPlan& plan, String& token, String *failureReport = nullptr)
+  {
+    token.clear();
+    String name = {}; name.assignItoa(plan.uuid);
+    int directoryFD = Filesystem::openDirectoryAt(rootFD, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC, secureContainerResolveFlags);
+    if (directoryFD < 0) return false;
+    int fd = openat(directoryFD, "masque-gateway-recovery.v1", O_RDONLY | O_CLOEXEC | O_NOFOLLOW); close(directoryFD);
+    struct stat info = {}; GatewayRecoveryRecord record = {};
+    const bool ok = fd >= 0 && fstat(fd, &info) == 0 && S_ISREG(info.st_mode) && info.st_uid == 0 &&
+        (info.st_mode & 07777) == 0600 && info.st_size == off_t(sizeof(record)) &&
+        readGatewayRecoveryRecordFD(fd, record) && gatewayRecoveryRecordMatches(record, plan);
+    if (fd >= 0) close(fd); if (!ok) return false; token.assign(record.token, 32); return true;
+  }
+
+  static bool readGatewayRecoveryRecord(const ContainerPlan& plan, String& token, String *failureReport = nullptr)
+  {
+    int rootFD = -1; if (!openContainerRuntimeRoot(rootFD, failureReport)) return false;
+    const bool read = readGatewayRecoveryRecordAt(rootFD, plan, token, failureReport); close(rootFD); return read;
+  }
+
   static bool prepareContainerNeuronListener(Container *container, int& listenerFD, String *failureReport = nullptr)
   {
     listenerFD = -1;
-    if (container == nullptr || container->exposesNeuronSocket() == false)
+    if (container == nullptr || (container->exposesNeuronSocket() == false &&
+        container->plan.system.kind != SystemContainerKind::crossClusterMasqueGateway))
     {
       return true;
     }
@@ -7051,7 +7889,9 @@ private:
       return false;
     }
 
-    if (fchmodat(containerRuntimeFD, "", 0700, AT_EMPTY_PATH) != 0)
+    const mode_t runtimeDirectoryMode =
+        container->plan.system.kind == SystemContainerKind::crossClusterMasqueGateway ? 0711 : 0700;
+    if (fchmodat(containerRuntimeFD, "", runtimeDirectoryMode, AT_EMPTY_PATH) != 0)
     {
       if (failureReport)
       {
@@ -7062,6 +7902,20 @@ private:
       }
       close(containerRuntimeFD);
       return false;
+    }
+
+    if (container->plan.system.kind == SystemContainerKind::crossClusterMasqueGateway &&
+        writeGatewayRecoveryRecord(container->plan, container->plan.system.gatewayRecoveryToken, failureReport) == false)
+    {
+      if (failureReport && failureReport->size() == 0) failureReport->assign("gateway recovery record creation failed"_ctv);
+      close(containerRuntimeFD);
+      return false;
+    }
+
+    if (!container->exposesNeuronSocket())
+    {
+      close(containerRuntimeFD);
+      return true;
     }
 
     if (unlinkat(containerRuntimeFD, "neuron.soc", 0) != 0 && errno != ENOENT)
@@ -7130,9 +7984,60 @@ private:
     return true;
   }
 
+  static bool openGatewayReadinessRuntimeDirectory(Container *container, int& directoryFD, String *failureReport = nullptr)
+  {
+    directoryFD = -1;
+    if (container == nullptr || container->plan.system.kind != SystemContainerKind::crossClusterMasqueGateway)
+    {
+      errno = EINVAL;
+      return false;
+    }
+    String expectedPath = {};
+    if (container->gatewayReadinessMountDirectoryPath(expectedPath) == false)
+    {
+      if (failureReport) failureReport->assign("gateway readiness directory path is invalid"_ctv);
+      errno = EINVAL;
+      return false;
+    }
+    int runtimeRootFD = -1;
+    if (openContainerRuntimeRoot(runtimeRootFD, failureReport) == false) return false;
+    String runtimeName = {};
+    runtimeName.assignItoa(container->plan.uuid);
+    directoryFD = Filesystem::openDirectoryAt(runtimeRootFD, runtimeName,
+                                               O_PATH | O_DIRECTORY | O_CLOEXEC,
+                                               secureContainerResolveFlags);
+    close(runtimeRootFD);
+    if (Container::gatewayReadinessDirectoryFDValid(directoryFD) == false)
+    {
+      int directoryErrno = directoryFD < 0 ? errno : EPERM;
+      if (failureReport)
+      {
+        failureReport->snprintf<"gateway readiness directory failed ownership/mode validation {} errno={}({})"_ctv>(
+            expectedPath, directoryErrno, String(strerror(directoryErrno)));
+      }
+      if (directoryFD >= 0) close(directoryFD);
+      directoryFD = -1;
+      errno = directoryErrno;
+      return false;
+    }
+    struct stat directoryStat = {};
+    const int directoryStatResult = fstat(directoryFD, &directoryStat);
+    if (directoryStatResult != 0 || (directoryStat.st_mode & 07777) != 0711)
+    {
+      int directoryErrno = directoryStatResult != 0 ? errno : EPERM;
+      if (failureReport) failureReport->assign("gateway readiness directory is not traversable and immutable"_ctv);
+      close(directoryFD);
+      directoryFD = -1;
+      errno = directoryErrno;
+      return false;
+    }
+    return true;
+  }
+
   static void cleanupContainerNeuronListener(Container *container)
   {
-    if (container == nullptr || container->exposesNeuronSocket() == false)
+    if (container == nullptr || (container->exposesNeuronSocket() == false &&
+        container->plan.system.kind != SystemContainerKind::crossClusterMasqueGateway))
     {
       return;
     }
@@ -7154,6 +8059,7 @@ private:
     if (containerRuntimeFD >= 0)
     {
       (void)unlinkat(containerRuntimeFD, "neuron.soc", 0);
+      (void)unlinkat(containerRuntimeFD, "masque-gateway-recovery.v1", 0);
       close(containerRuntimeFD);
       (void)unlinkat(runtimeRootFD, runtimeName.c_str(), AT_REMOVEDIR);
     }
@@ -7758,6 +8664,18 @@ private:
     }
     close(devFD);
 
+    if (container != nullptr && container->plan.system.kind == SystemContainerKind::crossClusterMasqueGateway)
+    {
+      int netFD = -1, tunFD = -1;
+      if (!openContainerDirectoryTreeAt(rootfd, "dev/net"_ctv, true, S_IRWXU, netFD, failureReport)) return false;
+      const bool ready = assignContainerDescriptorOwnership(netFD, userID, groupID, failureReport) &&
+          openContainerFileAtNoSymlinks(rootfd, "dev/net/tun"_ctv, true, S_IRUSR | S_IWUSR, tunFD, failureReport) &&
+          assignContainerDescriptorOwnership(tunFD, userID, groupID, failureReport);
+      if (tunFD >= 0) close(tunFD);
+      close(netFD);
+      if (!ready) return false;
+    }
+
     int procFD = -1;
     if (openContainerDirectoryTreeAt(rootfd, "proc"_ctv, true, S_IRWXU, procFD, failureReport) == false)
     {
@@ -7869,7 +8787,7 @@ private:
     return true;
   }
 
-  static bool bindMountSystemSocketIntoRootFS(int rootfd, const String& sourcePath, const String& absoluteTargetPath, const String& containerRoot, String *failureReport = nullptr)
+  static bool bindMountSystemSocketIntoRootFS(int rootfd, const String& sourcePath, const String& absoluteTargetPath, const String& containerRoot, String *failureReport = nullptr, int detachedMountFD = -1)
   {
     String relativeTargetPath = {};
     if (containerAbsolutePathToRelative(absoluteTargetPath, relativeTargetPath, "system container socket"_ctv, false, failureReport) == false)
@@ -7878,7 +8796,8 @@ private:
     }
 
     struct stat sourceStat = {};
-    if (sourcePath.size() == 0 || sourcePath[0] != '/' || pathStat(sourcePath, sourceStat) == false || S_ISSOCK(sourceStat.st_mode) == 0)
+    if ((detachedMountFD >= 0 ? fstat(detachedMountFD, &sourceStat) != 0 :
+         (sourcePath.size() == 0 || sourcePath[0] != '/' || pathStat(sourcePath, sourceStat) == false)) || S_ISSOCK(sourceStat.st_mode) == 0)
     {
       if (failureReport)
       {
@@ -7895,6 +8814,15 @@ private:
     String targetPath = {};
     targetPath.assign(containerRoot);
     targetPath.append(absoluteTargetPath);
+    if (detachedMountFD >= 0)
+    {
+      if (syscall(SYS_move_mount, detachedMountFD, "", -1, targetPath.c_str(), MOVE_MOUNT_F_EMPTY_PATH) != 0)
+      {
+        if (failureReport) failureReport->snprintf<"failed to attach gateway readiness socket mount to {} errno={itoa}"_ctv>(absoluteTargetPath, uint64_t(errno));
+        return false;
+      }
+      return true;
+    }
     String sourcePathText = {};
     sourcePathText.assign(sourcePath);
     if (mount(sourcePathText.c_str(), targetPath.c_str(), nullptr, MS_BIND, nullptr) != 0 ||
@@ -7910,8 +8838,61 @@ private:
     return true;
   }
 
-  static bool materializeSystemContainerRootFSMounts(Container *container, int rootfd, const String& containerRoot, String *failureReport = nullptr)
+  static bool moveGatewayReadinessDirectoryIntoRootFS(int rootfd, const String& absoluteTargetPath,
+                                                       const String& containerRoot, int detachedMountFD,
+                                                       String *failureReport = nullptr)
   {
+    String relativeTargetPath = {};
+    if (containerAbsolutePathToRelative(absoluteTargetPath, relativeTargetPath, "gateway readiness directory"_ctv, false, failureReport) == false ||
+        Container::gatewayReadinessDirectoryMountFDValid(detachedMountFD) == false)
+    {
+      if (failureReport && failureReport->size() == 0) failureReport->assign("gateway readiness directory descriptor invalid"_ctv);
+      return false;
+    }
+    int targetFD = -1;
+    if (openContainerDirectoryTreeAt(rootfd, relativeTargetPath, false, 0, targetFD, failureReport) == false) return false;
+    close(targetFD);
+    String targetPath = {};
+    targetPath.assign(containerRoot);
+    targetPath.append(absoluteTargetPath);
+    if (syscall(SYS_move_mount, detachedMountFD, "", -1, targetPath.c_str(), MOVE_MOUNT_F_EMPTY_PATH) != 0)
+    {
+      if (failureReport) failureReport->snprintf<"failed to attach gateway readiness directory mount to {} errno={itoa}"_ctv>(absoluteTargetPath, uint64_t(errno));
+      return false;
+    }
+    return true;
+  }
+
+  static bool materializeSystemContainerRootFSMounts(Container *container, int rootfd, const String& containerRoot, int gatewayDirectoryFD, String *failureReport = nullptr)
+  {
+    if (container->plan.system.kind == SystemContainerKind::crossClusterMasqueGateway)
+    {
+      String expectedDirectory = {};
+      if (!container->gatewayReadinessMountDirectoryPath(expectedDirectory))
+      {
+        if (failureReport) failureReport->assign("invalid gateway readiness directory path"_ctv);
+        return false;
+      }
+      // These are rootfs directories, not the host runtime directory. The
+      // mapped gateway root must be able to traverse them to reach its socket.
+      String runtimeName = {}; runtimeName.assignItoa(container->plan.uuid);
+      String gatewayDirectory = {}; gatewayDirectory.assign("run/prodigy/containers/"_ctv); gatewayDirectory.append(runtimeName);
+      for (const String& directory : {String("run"_ctv), String("run/prodigy"_ctv),
+                                      String("run/prodigy/containers"_ctv), gatewayDirectory})
+      {
+        int directoryFD = -1;
+        if (!openContainerDirectoryTreeAt(rootfd, directory, true, 0711, directoryFD, failureReport)) return false;
+        const bool accessible = fchmodat(directoryFD, "", 0711, AT_EMPTY_PATH) == 0;
+        close(directoryFD);
+        if (!accessible) { if (failureReport) failureReport->assign("gateway readiness path permissions failed"_ctv); return false; }
+      }
+      if (Container::gatewayReadinessDirectoryMountFDValid(gatewayDirectoryFD) == false)
+      {
+        if (failureReport) failureReport->assign("gateway readiness directory descriptor invalid"_ctv);
+        return false;
+      }
+      return moveGatewayReadinessDirectoryIntoRootFS(rootfd, expectedDirectory, containerRoot, gatewayDirectoryFD, failureReport);
+    }
     if (container->plan.system.kind != SystemContainerKind::mothershipTunnelProvider)
     {
       return true;
@@ -8178,6 +9159,16 @@ public:
     bool mounted = mountAssignedGPUDevicesInCurrentNamespace(container, containerRoot, containerRootFD, failureReport);
     close(containerRootFD);
     return mounted;
+  }
+
+  static bool debugMountGatewayReadinessDirectory(Container *container, const String& root, int directoryFD, String *failureReport = nullptr)
+  {
+    int rootfd = Filesystem::openDirectoryAt(-1, root, O_PATH | O_DIRECTORY | O_CLOEXEC,
+                                            RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS);
+    if (rootfd < 0) return false;
+    const bool ok = materializeSystemContainerRootFSMounts(container, rootfd, root, directoryFD, failureReport);
+    close(rootfd);
+    return ok;
   }
 
   static bool debugOpenVerifiedContainerRootfs(Container *container, String *failureReport = nullptr)
@@ -8724,6 +9715,51 @@ public:
       return false;
     }
 
+    // A reboot can change the inventoried mount set without changing the
+    // backend which owns a retained container.  In particular, firmware
+    // mounts discovered after the original direct allocation must not make a
+    // cold restart reinterpret that populated direct backend as a missing
+    // loop-backed one.  Adopt the direct layout only when it is unambiguous:
+    // it has retained content, no loop payload directory, and none of the
+    // currently-derived backing files exists.  Partial or mixed layouts keep
+    // following the strict loop-backed checks below.
+    if (requireExistingBackend && devicePlans.size() > 0)
+    {
+      Vector<Container::StorageLoopDevice> expectedLoopDevices = {};
+      fillStorageLoopDevicesFromPlans(devicePlans, expectedLoopDevices);
+      if (anyContainerStorageBackingFileExists(expectedLoopDevices) == false)
+      {
+        int directFD = Filesystem::openDirectoryAt(
+            -1, container->storageRootPath, O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+            RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS);
+        if (directFD >= 0)
+        {
+          Vector<String> retainedEntries = {};
+          bool entriesListed = listDirectoryEntriesAt(directFD, retainedEntries);
+          close(directFD);
+          bool hasLoopPayload = false;
+          for (const String& entry : retainedEntries)
+          {
+            hasLoopPayload |= entry.equal("data"_ctv);
+          }
+          if (entriesListed && retainedEntries.size() > 0 && hasLoopPayload == false)
+          {
+            if (chown(container->storageRootPath.c_str(), uid_t(container->executionHostID),
+                      gid_t(container->executionHostID)) != 0)
+            {
+              basics_log("createContainer retained direct storage chown failed uuid=%llu path=%s executionHostID=%u errno=%d(%s)\n",
+                         (unsigned long long)container->plan.uuid,
+                         container->storageRootPath.c_str(),
+                         unsigned(container->executionHostID),
+                         errno,
+                         strerror(errno));
+            }
+            return true;
+          }
+        }
+      }
+    }
+
     if (devicePlans.size() == 0)
     {
       struct stat metadata = {};
@@ -9153,12 +10189,16 @@ public:
 
     // Parse Linux's canonical comma-separated singleton and range form without
     // inventing CPUs between sparse ranges.
+    String partitionState = {}, exclusiveEffective = {}, onlineCPUs = {};
+    Filesystem::openReadAtClose(containersFD, "cpuset.cpus.partition"_ctv, partitionState);
+    Filesystem::openReadAtClose(containersFD, "cpuset.cpus.exclusive.effective"_ctv, exclusiveEffective);
+    Filesystem::openReadAtClose(-1, "/sys/devices/system/cpu/online"_ctv, onlineCPUs);
     ProdigyLinuxCPUList effectiveCPUs = {};
-    if (prodigyParseLinuxCPUList(cpusEffective, effectiveCPUs) == false)
+    if (!prodigyContainerCPUDiscovery(cpusEffective, partitionState, exclusiveEffective, onlineCPUs, effectiveCPUs))
     {
       if (failureReport)
       {
-        failureReport->assign("root effective CPU set is malformed or exceeds 256 CPUs"_ctv);
+        failureReport->assign("root CPU set or owned container partition is invalid"_ctv);
       }
       close(containersFD);
       close(rootFD);
@@ -10061,6 +11101,52 @@ public:
     return true;
   }
 
+  // A replacement continuation finishes its wait while co_consume is still
+  // inspecting this stack. Retire it after the outermost consumer returns,
+  // using the same ownership rule as the deployment drain continuation.
+  class ReplacementWaitStack final : public CoroutineStack
+  {
+    uint32_t consumers = 0;
+    bool finished = false;
+#ifdef PRODIGY_TEST_REPLACEMENT_WAIT_LIFETIME
+    bool *retirementObserved = nullptr;
+#endif
+
+  public:
+
+#ifdef PRODIGY_TEST_REPLACEMENT_WAIT_LIFETIME
+    explicit ReplacementWaitStack(bool *retired = nullptr, bool * = nullptr)
+      : retirementObserved(retired)
+    {
+    }
+
+    ~ReplacementWaitStack()
+    {
+      if (retirementObserved) *retirementObserved = true;
+    }
+#endif
+
+    void co_consume(void) override
+    {
+      ++consumers;
+      CoroutineStack::co_consume();
+      --consumers;
+      if (finished && consumers == 0)
+      {
+        delete this;
+      }
+    }
+
+    void finish(void)
+    {
+      finished = true;
+      if (consumers == 0)
+      {
+        delete this;
+      }
+    }
+  };
+
   // The leader can have exited while a descendant is still releasing its
   // cgroup membership.  Keep the final empty-cgroup guard authoritative, but
   // give that membership a short Ring-driven drain window before rejecting a
@@ -10070,7 +11156,8 @@ public:
                                             bool& drained,
                                             String *failureReport = nullptr,
                                             uint64_t maximumWaitUs = 1'000'000,
-                                            uint64_t pollWaitUs = 20'000)
+                                            uint64_t pollWaitUs = 20'000,
+                                            ProdigyHostDelayOperation::Submission delaySubmission = ProdigyHostDelayOperation::submission())
   {
     drained = false;
     if (predecessor == nullptr || predecessor->cgroup < 0 || coro == nullptr ||
@@ -10103,7 +11190,7 @@ public:
       }
 
       const uint64_t delayUs = std::min(pollWaitUs, maximumWaitUs - waitedUs);
-      ProdigyHostDelayOperation delay(*coro);
+      ProdigyHostDelayOperation delay(delaySubmission, *coro);
       if (delay.scheduleUs(delayUs) == false)
       {
         if (failureReport) failureReport->assign("legacy storage handoff could not schedule cgroup drain wait"_ctv);
@@ -10633,102 +11720,13 @@ public:
     }
   }
 
-  static void createContainer(ContainerPlan& plan, const String& compressedContainerPath, Container *& container, String *failure = nullptr)
+  // Only the unpublished object's filesystem and launch metadata belong to
+  // this worker stage. Neuron maps, core leases, cgroups and cleanup stay on Ring.
+  static bool materializeContainerArtifact(Container *container,
+                                            const String& compressedContainerPath,
+                                            String *failure)
   {
-    container = nullptr;
-    if (failure)
-    {
-      failure->clear();
-    }
-    if (approveCapabilities(plan) == false)
-    {
-      if (failure)
-      {
-        failure->assign(
-            "host network namespace or requested capability is not approved"_ctv);
-      }
-      return;
-    }
-    if (thisNeuron == nullptr ||
-        !prodigyValidateContainerPlanMeshIdentity(plan, thisNeuron->lcsubnet6))
-    {
-      if (failure)
-      {
-        failure->assign("container mesh identity is invalid"_ctv);
-      }
-      return;
-    }
-    if (ensureRootCgroupReady(failure) == false)
-    {
-      return;
-    }
-    uint32_t userID = 0;
-    uint32_t executionHostID = 0;
-    if (prodigyDeriveContainerHostIDs(plan, userID, executionHostID) == false)
-    {
-      if (failure)
-      {
-        failure->assign("invalid container user namespace mapping"_ctv);
-      }
-      basics_log("createContainer rejected deploymentID=%llu appID=%u reason=invalid user namespace mapping\n",
-                 (unsigned long long)plan.config.deploymentID(),
-                 unsigned(plan.config.applicationID));
-      return;
-    }
-
-    container = new Container();
-    container->plan = plan;
-    container->name.assignItoa(plan.uuid);
-    container->userID = userID;
-    container->executionHostID = executionHostID;
-    container->rBuffer.reserve(8_KB);
-    container->wBuffer.reserve(16_KB);
-    if (container->plan.usesIsolatedCPUs())
-    {
-      if (allocateCores(container) == false)
-      {
-        if (failure)
-        {
-          failure->snprintf<"insufficient isolated cores: requested={itoa} available={itoa}"_ctv>(uint64_t(plan.logicalCores()), uint64_t(thisNeuron->lcoreCount));
-        }
-        basics_log("createContainer rejected deploymentID=%llu appID=%u reason=insufficient isolated cores requested=%u lcoreCount=%u\n",
-                   (unsigned long long)plan.config.deploymentID(),
-                   unsigned(plan.config.applicationID),
-                   unsigned(plan.logicalCores()),
-                   unsigned(thisNeuron->lcoreCount));
-        delete container;
-        container = nullptr;
-        return;
-      }
-    }
-
-    String rejectedArtifactJanitorFailure = {};
-    if (cleanupRejectedOrphanedContainerArtifactsAtPath("/containers"_ctv, &rejectedArtifactJanitorFailure) == false && rejectedArtifactJanitorFailure.size() > 0)
-    {
-      basics_log("createContainer rejected/orphaned artifact janitor encountered errors reason=%s\n",
-                 rejectedArtifactJanitorFailure.c_str());
-    }
-
-    // this must come after the name and cores assignments
-    String cgroupFailure;
-    container->cgroup = create_cgroupv2(container, &cgroupFailure);
-    if (container->cgroup < 0)
-    {
-      if (failure)
-      {
-        failure->assign(cgroupFailure.size() > 0
-                            ? cgroupFailure
-                            : "container cgroup creation failed"_ctv);
-      }
-      basics_log("createContainer rejected uuid=%llu reason=%s\n",
-                 (unsigned long long)container->plan.uuid,
-                 cgroupFailure.size() > 0 ? cgroupFailure.c_str() :
-                                            "container cgroup creation failed");
-      cleanupContainerAfterFailedCreate(container);
-      container = nullptr;
-      return;
-    }
-
+    const ContainerPlan& plan = container->plan;
     struct DeploymentExtractionLock {
       int fd = -1;
 
@@ -10745,8 +11743,17 @@ public:
     String artifactKey = {};
     if (container->isSystemContainer())
     {
+      const char *kind = prodigySystemContainerArtifactLabel(plan.system.kind);
+      if (kind == nullptr)
+      {
+        if (failure)
+        {
+          failure->assign("invalid system container artifact kind"_ctv);
+        }
+        return false;
+      }
       artifactKey.assign("system."_ctv);
-      artifactKey.append("mothership-tunnel-provider"_ctv);
+      artifactKey.append(kind);
       artifactKey.append("."_ctv);
       artifactKey.append(plan.system.artifact.sha256);
     }
@@ -10770,9 +11777,7 @@ public:
                  extractionLockPath.c_str(),
                  errno,
                  strerror(errno));
-      cleanupContainerAfterFailedCreate(container);
-      container = nullptr;
-      return;
+      return false;
     }
 
     if (flock(extractionLock.fd, LOCK_EX) != 0)
@@ -10785,9 +11790,7 @@ public:
                  extractionLockPath.c_str(),
                  errno,
                  strerror(errno));
-      cleanupContainerAfterFailedCreate(container);
-      container = nullptr;
-      return;
+      return false;
     }
 
     String receiveScratchPath = {};
@@ -10805,9 +11808,7 @@ public:
                  receiveScratchPath.c_str(),
                  errno,
                  strerror(errno));
-      cleanupContainerAfterFailedCreate(container);
-      container = nullptr;
-      return;
+      return false;
     }
 
     struct ReceiveScratchCleanup {
@@ -10828,29 +11829,10 @@ public:
     // 1) verify and skip Prodigy blob contract header
     // 2) zstd -d -c <payload-fd> | 3) btrfs receive <scratch>
     {
-      // Guardian sets SIGCHLD to SIG_IGN globally; restore default disposition for
-      // explicit child supervision in this extraction pipeline.
-      struct sigaction oldSigChld {};
-      struct sigaction defaultSigChld {};
-      sigemptyset(&defaultSigChld.sa_mask);
-      defaultSigChld.sa_handler = SIG_DFL;
-      defaultSigChld.sa_flags = 0;
-      sigaction(SIGCHLD, &defaultSigChld, &oldSigChld);
-      auto restoreSigChld = [&](void) -> void {
-        if (prodigySigchldIsDefaultWaitable(oldSigChld))
-        {
-          sigaction(SIGCHLD, &oldSigChld, nullptr);
-        }
-        else
-        {
-          prodigyEnsureSigchldDefaultWaitable();
-        }
-      };
-
       int compressedPayloadFD = -1;
       String contractFailure = {};
       bool contractOK = container->isSystemContainer()
-                            ? prodigyOpenMothershipTunnelProviderBlobPayloadAfterContractHeader(compressedContainerPath, compressedPayloadFD, &contractFailure)
+                            ? prodigyOpenSystemContainerBlobPayloadAfterContractHeader(container->plan.system.kind, compressedContainerPath, compressedPayloadFD, &contractFailure)
                             : prodigyOpenContainerBlobPayloadAfterContractHeader(compressedContainerPath, compressedPayloadFD, &contractFailure);
       if (contractOK == false)
       {
@@ -10859,10 +11841,7 @@ public:
           failure->assign(contractFailure);
         }
         basics_log("createContainer rejected container blob contract: %s\n", contractFailure.c_str());
-        restoreSigChld();
-        cleanupContainerAfterFailedCreate(container);
-        container = nullptr;
-        return;
+        return false;
       }
 
       int pipefd[2];
@@ -10874,10 +11853,7 @@ public:
         }
         basics_log("createContainer pipe failed errno=%d(%s)\n", errno, strerror(errno));
         close(compressedPayloadFD);
-        restoreSigChld();
-        cleanupContainerAfterFailedCreate(container);
-        container = nullptr;
-        return;
+        return false;
       }
 
       // Spawn btrfs receive, stdin = pipe read, target = unique scratch parent
@@ -10977,8 +11953,6 @@ public:
       bool zstd_ok = waitForSpawned(zstd_pid, zstd_status, "zstd");
       bool recv_ok = waitForSpawned(recv_pid, recv_status, "btrfs_receive");
 
-      restoreSigChld();
-
       if (zstd_ok == false || recv_ok == false)
       {
         if (failure)
@@ -10986,9 +11960,7 @@ public:
           failure->snprintf<"container image extraction failed: zstd_status={itoa} btrfs_receive_status={itoa}"_ctv>(uint64_t(uint32_t(zstd_status)), uint64_t(uint32_t(recv_status)));
         }
         basics_log("createContainer image extraction failed zstd_ok=%d recv_ok=%d\n", int(zstd_ok), int(recv_ok));
-        cleanupContainerAfterFailedCreate(container);
-        container = nullptr;
-        return;
+        return false;
       }
     }
 
@@ -11009,9 +11981,7 @@ public:
                  (unsigned long long)plan.config.deploymentID(),
                  receiveScratchPath.c_str(),
                  receiveScratchSelectionFailure.c_str());
-      cleanupContainerAfterFailedCreate(container);
-      container = nullptr;
-      return;
+      return false;
     }
 
     String artifactShapeFailure = {};
@@ -11025,9 +11995,7 @@ public:
                  (unsigned long long)plan.config.deploymentID(),
                  receivedSubvolumePath.c_str(),
                  artifactShapeFailure.c_str());
-      cleanupContainerAfterFailedCreate(container);
-      container = nullptr;
-      return;
+      return false;
     }
 
     String artifactLimitFailure = {};
@@ -11046,9 +12014,7 @@ public:
                  (unsigned long long)plan.config.deploymentID(),
                  receivedSubvolumePath.c_str(),
                  artifactLimitFailure.c_str());
-      cleanupContainerAfterFailedCreate(container);
-      container = nullptr;
-      return;
+      return false;
     }
 
     String artifactWritableFailure = {};
@@ -11062,9 +12028,7 @@ public:
                  (unsigned long long)plan.config.deploymentID(),
                  receivedSubvolumePath.c_str(),
                  artifactWritableFailure.c_str());
-      cleanupContainerAfterFailedCreate(container);
-      container = nullptr;
-      return;
+      return false;
     }
 
     String pendingMarkerFailure = {};
@@ -11078,9 +12042,7 @@ public:
                  (unsigned long long)plan.config.deploymentID(),
                  receivedSubvolumePath.c_str(),
                  pendingMarkerFailure.c_str());
-      cleanupContainerAfterFailedCreate(container);
-      container = nullptr;
-      return;
+      return false;
     }
 
     container->artifactRootPath.assign(receivedSubvolumePath);
@@ -11098,9 +12060,7 @@ public:
                  (unsigned long long)container->plan.uuid,
                  container->artifactRootPath.c_str(),
                  launchMetadataFailure.c_str());
-      cleanupContainerAfterFailedCreate(container);
-      container = nullptr;
-      return;
+      return false;
     }
 
     int rootfd = -1;
@@ -11122,9 +12082,7 @@ public:
                    (unsigned long long)container->plan.uuid,
                    rootfsFailure.c_str());
       }
-      cleanupContainerAfterFailedCreate(container);
-      container = nullptr;
-      return;
+      return false;
     }
 
     if (assignContainerRootfsOwnership(rootfd, uid_t(container->userID), gid_t(container->userID), &rootfsFailure) == false)
@@ -11138,10 +12096,8 @@ public:
                  container->rootfsPath.c_str(),
                  unsigned(container->userID),
                  rootfsFailure.c_str());
-      cleanupContainerAfterFailedCreate(container);
-      container = nullptr;
       close(rootfd);
-      return;
+      return false;
     }
 
     if (validateContainerLaunchTargetsInRootfs(container, rootfd, &rootfsFailure) == false)
@@ -11154,10 +12110,8 @@ public:
                  (unsigned long long)container->plan.uuid,
                  receivedSubvolumePath.c_str(),
                  rootfsFailure.c_str());
-      cleanupContainerAfterFailedCreate(container);
-      container = nullptr;
       close(rootfd);
-      return;
+      return false;
     }
 
     if (prepareContainerRootFSMountTargets(container, rootfd, &rootfsFailure) == false)
@@ -11170,31 +12124,11 @@ public:
                  (unsigned long long)container->plan.uuid,
                  receivedSubvolumePath.c_str(),
                  rootfsFailure.c_str());
-      cleanupContainerAfterFailedCreate(container);
-      container = nullptr;
       close(rootfd);
-      return;
+      return false;
     }
 
     close(rootfd);
-
-    if (plan.config.storageMB > 0)
-    {
-      String storageFailure;
-      if (prepareContainerStorage(container, &storageFailure) == false)
-      {
-        if (failure)
-        {
-          failure->assign(storageFailure.size() > 0 ? storageFailure : "container storage preparation failed"_ctv);
-        }
-        basics_log("createContainer storage prepare failed uuid=%llu reason=%s\n",
-                   (unsigned long long)container->plan.uuid,
-                   (storageFailure.size() ? storageFailure.c_str() : "unknown"));
-        cleanupContainerAfterFailedCreate(container);
-        container = nullptr;
-        return;
-      }
-    }
 
     String finalArtifactRootPath = {};
     finalArtifactRootPath.assign("/containers/"_ctv);
@@ -11215,9 +12149,7 @@ public:
                  receivedSubvolumePath.c_str(),
                  finalArtifactRootPath.c_str(),
                  artifactMoveFailure.c_str());
-      cleanupContainerAfterFailedCreate(container);
-      container = nullptr;
-      return;
+      return false;
     }
 
 #if PRODIGY_DEBUG
@@ -11236,7 +12168,178 @@ public:
     container->rootfsPath.assign(finalArtifactRootPath);
     container->rootfsPath.append("/rootfs"_ctv);
 
-    return;
+    return true;
+  }
+
+  static ProdigyHostTask<bool> materializeContainerArtifactAsync(
+      Container *container, String compressedContainerPath,
+      uint64_t admissionGeneration, String *failure)
+  {
+    NeuronBase *neuron = thisNeuron;
+    ProdigyArtifactIO *io = neuron ? neuron->containerArtifactIO() : nullptr;
+    if (!container || !io || !prodigyEnsureSigchldDefaultWaitable())
+    {
+      if (failure) failure->assign("container artifact worker unavailable"_ctv);
+      co_return false;
+    }
+    struct Result {
+      bool prepared = false;
+      String failure;
+    };
+    auto result = std::make_shared<Result>();
+    const uint128_t uuid = container->plan.uuid;
+    const bool submitted = co_await ProdigyHostCompletion<bool>(
+        [io, container, compressedContainerPath = std::move(compressedContainerPath), result](auto complete) {
+          if (!io->submit(0,
+              [container, compressedContainerPath, result] {
+                result->prepared = materializeContainerArtifact(
+                    container, compressedContainerPath, &result->failure);
+              },
+              [complete] { complete(true); },
+              [result, complete](std::exception_ptr) {
+                result->failure.assign("container artifact preparation failed"_ctv);
+                complete(true);
+              }))
+          {
+            result->failure.assign("container artifact worker admission rejected"_ctv);
+            complete(false);
+          }
+        });
+    if (failure) *failure = std::move(result->failure);
+    // A kill or control-generation change can arrive while extraction owns
+    // the private object. A completed image is not permission to launch it.
+    if (!neuron->pendingContainerLaunchIsCurrent(uuid, admissionGeneration))
+    {
+      if (failure) failure->assign("container launch retired during artifact preparation"_ctv);
+      co_return false;
+    }
+    co_return submitted && result->prepared;
+  }
+
+  static ProdigyHostTask<bool> createContainer(ContainerPlan& plan,
+                                               const String& compressedContainerPath,
+                                               Container *& container,
+                                               String *failure = nullptr,
+                                               uint64_t admissionGeneration = 0)
+  {
+    container = nullptr;
+    if (failure)
+    {
+      failure->clear();
+    }
+    if (approveCapabilities(plan) == false)
+    {
+      if (failure)
+      {
+        failure->assign(
+            "host network namespace or requested capability is not approved"_ctv);
+      }
+      co_return false;
+    }
+    if (thisNeuron == nullptr ||
+        !prodigyValidateContainerPlanMeshIdentity(plan, thisNeuron->lcsubnet6))
+    {
+      if (failure)
+      {
+        failure->assign("container mesh identity is invalid"_ctv);
+      }
+      co_return false;
+    }
+    if (ensureRootCgroupReady(failure) == false)
+    {
+      co_return false;
+    }
+    uint32_t userID = 0;
+    uint32_t executionHostID = 0;
+    if (prodigyDeriveContainerHostIDs(plan, userID, executionHostID) == false)
+    {
+      if (failure)
+      {
+        failure->assign("invalid container user namespace mapping"_ctv);
+      }
+      basics_log("createContainer rejected deploymentID=%llu appID=%u reason=invalid user namespace mapping\n",
+                 (unsigned long long)plan.config.deploymentID(),
+                 unsigned(plan.config.applicationID));
+      co_return false;
+    }
+
+    container = new Container();
+    container->plan = plan;
+    container->name.assignItoa(plan.uuid);
+    container->userID = userID;
+    container->executionHostID = executionHostID;
+    container->rBuffer.reserve(8_KB);
+    container->wBuffer.reserve(16_KB);
+    if (container->plan.usesIsolatedCPUs())
+    {
+      if (allocateCores(container) == false)
+      {
+        if (failure)
+        {
+          failure->snprintf<"insufficient isolated cores: requested={itoa} available={itoa}"_ctv>(uint64_t(plan.logicalCores()), uint64_t(thisNeuron->lcoreCount));
+        }
+        basics_log("createContainer rejected deploymentID=%llu appID=%u reason=insufficient isolated cores requested=%u lcoreCount=%u\n",
+                   (unsigned long long)plan.config.deploymentID(),
+                   unsigned(plan.config.applicationID),
+                   unsigned(plan.logicalCores()),
+                   unsigned(thisNeuron->lcoreCount));
+        delete container;
+        container = nullptr;
+        co_return false;
+      }
+    }
+
+    String rejectedArtifactJanitorFailure = {};
+    if (cleanupRejectedOrphanedContainerArtifactsAtPath("/containers"_ctv, &rejectedArtifactJanitorFailure) == false && rejectedArtifactJanitorFailure.size() > 0)
+    {
+      basics_log("createContainer rejected/orphaned artifact janitor encountered errors reason=%s\n",
+                 rejectedArtifactJanitorFailure.c_str());
+    }
+
+    // this must come after the name and cores assignments
+    String cgroupFailure;
+    container->cgroup = create_cgroupv2(container, &cgroupFailure);
+    if (container->cgroup < 0)
+    {
+      if (failure)
+      {
+        failure->assign(cgroupFailure.size() > 0
+                            ? cgroupFailure
+                            : "container cgroup creation failed"_ctv);
+      }
+      basics_log("createContainer rejected uuid=%llu reason=%s\n",
+                 (unsigned long long)container->plan.uuid,
+                 cgroupFailure.size() > 0 ? cgroupFailure.c_str() :
+                                            "container cgroup creation failed");
+      cleanupContainerAfterFailedCreate(container);
+      container = nullptr;
+      co_return false;
+    }
+
+    if (co_await materializeContainerArtifactAsync(
+            container, compressedContainerPath, admissionGeneration, failure) == false)
+    {
+      cleanupContainerAfterFailedCreate(container);
+      container = nullptr;
+      co_return false;
+    }
+
+    if (plan.config.storageMB > 0)
+    {
+      String storageFailure;
+      if (prepareContainerStorage(container, &storageFailure) == false)
+      {
+        if (failure)
+          failure->assign(storageFailure.size() > 0 ? storageFailure : "container storage preparation failed"_ctv);
+        basics_log("createContainer storage prepare failed uuid=%llu reason=%s\n",
+                   (unsigned long long)container->plan.uuid,
+                   storageFailure.size() ? storageFailure.c_str() : "unknown");
+        cleanupContainerAfterFailedCreate(container);
+        container = nullptr;
+        co_return false;
+      }
+    }
+    co_return true;
   }
 
   static void seedDynamicData(Container *container)
@@ -11435,7 +12538,7 @@ public:
     return false;
   }
 
-  static bool mountRootFSInCurrentNamespace(Container *container, bool isRestart, int idMapPID, String *failureReport = nullptr)
+  static bool mountRootFSInCurrentNamespace(Container *container, bool isRestart, int idMapPID, int gatewayDirectoryFD, String *failureReport = nullptr)
   {
     (void)isRestart;
     String path;
@@ -11561,7 +12664,7 @@ public:
     }
 
     String systemMountFailure = {};
-    if (materializeSystemContainerRootFSMounts(container, rootfd, containerRoot, &systemMountFailure) == false)
+    if (materializeSystemContainerRootFSMounts(container, rootfd, containerRoot, gatewayDirectoryFD, &systemMountFailure) == false)
     {
       basics_log("mountRootFS system container mounts failed uuid=%llu root=%s reason=%s\n",
                  (unsigned long long)container->plan.uuid,
@@ -11581,6 +12684,27 @@ public:
                  containerRoot.c_str(),
                  deviceMountFailure.c_str());
       return fail("mount host devices", errno, &deviceMountFailure);
+    }
+    if (container->plan.system.kind == SystemContainerKind::crossClusterMasqueGateway)
+    {
+      struct stat tun = {};
+      int tunError = 0;
+      if (::stat("/dev/net/tun", &tun) != 0)
+        tunError = errno;
+      else if (!S_ISCHR(tun.st_mode) || major(tun.st_rdev) != 10 || minor(tun.st_rdev) != 200)
+      {
+        tunError = ENODEV;
+        deviceMountFailure.assign("gateway requires the TUN character device 10:200"_ctv);
+      }
+      else if (!bindMountHostDeviceIntoRootFS("/dev/net/tun"_ctv, containerRoot, &deviceMountFailure))
+        tunError = errno != 0 ? errno : EIO;
+      if (tunError != 0)
+      {
+        basics_log("mountRootFS gateway tun device mount failed uuid=%llu root=%s errno=%d(%s) reason=%s\n",
+                   (unsigned long long)container->plan.uuid, containerRoot.c_str(),
+                   tunError, strerror(tunError), deviceMountFailure.c_str());
+        return fail("mount gateway tun device", tunError, &deviceMountFailure);
+      }
     }
 
     if (container->plan.config.storageMB > 0)
@@ -12524,11 +13648,25 @@ public:
       }
 
       StartupSyncPayload startupPayload;
-      ssize_t startupRead = read(startupSync[0], &startupPayload, sizeof(startupPayload));
+      int gatewayDirectoryFD = -1;
+      alignas(cmsghdr) char startupControl[CMSG_SPACE(sizeof(int))] = {};
+      iovec startupIO = {&startupPayload, sizeof(startupPayload)};
+      msghdr startupMessage = {};
+      startupMessage.msg_iov = &startupIO; startupMessage.msg_iovlen = 1;
+      startupMessage.msg_control = startupControl; startupMessage.msg_controllen = sizeof(startupControl);
+      ssize_t startupRead = recvmsg(startupSync[0], &startupMessage, MSG_CMSG_CLOEXEC);
+      cmsghdr *startupCmsg = CMSG_FIRSTHDR(&startupMessage);
+      const bool ancillaryValid = !startupCmsg ||
+          (startupCmsg->cmsg_level == SOL_SOCKET && startupCmsg->cmsg_type == SCM_RIGHTS &&
+           startupCmsg->cmsg_len == CMSG_LEN(sizeof(int)) && CMSG_NXTHDR(&startupMessage, startupCmsg) == nullptr);
+      if (startupCmsg && ancillaryValid)
+        memcpy(&gatewayDirectoryFD, CMSG_DATA(startupCmsg), sizeof(gatewayDirectoryFD));
       close(startupSync[0]);
       bool childUsesUserNamespace = useUserNamespace;
 
-      if (startupRead != ssize_t(sizeof(startupPayload)) || startupPayload.startSignal != 1 || (childUsesUserNamespace && startupPayload.idMapPID <= 0))
+      if (startupRead != ssize_t(sizeof(startupPayload)) || !ancillaryValid || (startupMessage.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) ||
+          startupPayload.startSignal != 1 || (childUsesUserNamespace && startupPayload.idMapPID <= 0) ||
+          ((container->plan.system.kind == SystemContainerKind::crossClusterMasqueGateway) != (gatewayDirectoryFD >= 0)))
       {
         String startupFailure = {};
         startupFailure.snprintf<"read={} signal={} idMapPID={} userns={}"_ctv>(
@@ -12556,6 +13694,12 @@ public:
         failStartup("namespace root setup failed", &identityFailure);
       }
 
+      if (gatewayDirectoryFD >= 0)
+      {
+        if (!Container::gatewayReadinessDirectoryMountFDValid(gatewayDirectoryFD))
+          failStartup("gateway readiness directory descriptor rejected");
+      }
+
       String noNewPrivsFailure = {};
       if (setContainerNoNewPrivileges(container, &noNewPrivsFailure) == false)
       {
@@ -12566,10 +13710,11 @@ public:
       }
 
       String mountRootFailure = {};
-      if (mountRootFSInCurrentNamespace(container, isRestart, startupPayload.idMapPID, &mountRootFailure) == false)
+      if (mountRootFSInCurrentNamespace(container, isRestart, startupPayload.idMapPID, gatewayDirectoryFD, &mountRootFailure) == false)
       {
         failStartup("mount rootfs failed", &mountRootFailure);
       }
+      if (gatewayDirectoryFD >= 0) close(gatewayDirectoryFD);
       insideContainerRoot = true;
 
       if (sethostname("x", 1) != 0)
@@ -12648,6 +13793,7 @@ public:
       }
 
       int execParamsFD = -1;
+      Vector<int32_t> execGatewayCredentialFDs;
       Vector<int32_t> execIsolatedChildCgroups;
       execIsolatedChildCgroups.reserve(container->isolatedChildCgroups.size());
       for (int inheritedFD : container->isolatedChildCgroups)
@@ -12819,6 +13965,56 @@ public:
         pushSystemEnv("PRODIGY_TUNNEL_EGRESS_HOST="_ctv, host);
         pushSystemEnv("PRODIGY_TUNNEL_EGRESS_PORT="_ctv, port);
       }
+      else if (container->plan.system.kind == SystemContainerKind::crossClusterMasqueGateway)
+      {
+        String launchFailure = {};
+        if (!thisNeuron->prepareCrossClusterMasqueGatewayExec(container->plan,
+                container->executeArgs, execGatewayCredentialFDs, &launchFailure))
+        {
+          failStartup("cross-cluster MASQUE gateway launch preparation failed", &launchFailure);
+        }
+        const auto& gateway = container->plan.system;
+        if (gateway.gatewayReadinessSocket.size() == 0 || gateway.gatewayLaunchToken.size() < 32 ||
+            gateway.gatewayRecoverySocket.size() == 0 || !gatewayRecoveryTokenValid(gateway.gatewayRecoveryToken) ||
+            gateway.gatewayRole.size() == 0 || gateway.gatewayRoutes.size() == 0 || gateway.gatewayEndpoint.size() == 0 ||
+            !prodigyIsSHA256HexDigest(gateway.gatewayLocalIdentity) ||
+            !prodigyIsSHA256HexDigest(gateway.gatewayPeerIdentity) ||
+            !prodigyIsSHA256HexDigest(gateway.gatewayPeerTrust) ||
+            !prodigyCrossClusterMasqueGatewayRuntimePlanAuthorityConfigured(gateway))
+        {
+          failStartup("cross-cluster MASQUE gateway authority environment missing");
+        }
+        auto pushGatewayEnv = [&](StringType auto&& key, const String& value) {
+          String assignment = {}; assignment.assign(key); assignment.append(value);
+          container->executeEnv.push_back(std::move(assignment));
+        };
+        pushGatewayEnv("PRODIGY_MASQUE_READY_SOCKET="_ctv, gateway.gatewayReadinessSocket);
+        pushGatewayEnv("PRODIGY_MASQUE_LAUNCH_TOKEN="_ctv, gateway.gatewayLaunchToken);
+        if (!appendGatewayRecoveryEnvironment(gateway, container->executeEnv))
+        {
+          failStartup("cross-cluster MASQUE gateway recovery environment missing");
+        }
+        pushGatewayEnv("PRODIGY_MASQUE_ROLE="_ctv, gateway.gatewayRole);
+        pushGatewayEnv("PRODIGY_MASQUE_ROUTES="_ctv, gateway.gatewayRoutes);
+        pushGatewayEnv("PRODIGY_MASQUE_ENDPOINT="_ctv, gateway.gatewayEndpoint);
+        if (!container->plan.whiteholes.empty())
+        {
+          const Whitehole& source = container->plan.whiteholes[0];
+          String sourceAddress = {}, sourcePort = {};
+          if (!ClusterMachine::renderIPAddressLiteral(source.address, sourceAddress))
+            failStartup("invalid MASQUE source address");
+          sourcePort.assignItoa(source.sourcePort);
+          pushGatewayEnv("PRODIGY_MASQUE_SOURCE_ADDRESS="_ctv, sourceAddress);
+          pushGatewayEnv("PRODIGY_MASQUE_SOURCE_PORT="_ctv, sourcePort);
+        }
+        pushGatewayEnv("PRODIGY_MASQUE_LOCAL_IDENTITY_SHA256="_ctv, gateway.gatewayLocalIdentity);
+        pushGatewayEnv("PRODIGY_MASQUE_PEER_IDENTITY_SHA256="_ctv, gateway.gatewayPeerIdentity);
+        pushGatewayEnv("PRODIGY_MASQUE_PEER_TRUST_SHA256="_ctv, gateway.gatewayPeerTrust);
+        if (!prodigyAppendCrossClusterMasqueGatewayAuthorityEnvironment(gateway, container->executeEnv))
+        {
+          failStartup("cross-cluster MASQUE gateway authority references missing");
+        }
+      }
 
       for (const String& assignment : container->executeEnv)
       {
@@ -12870,6 +14066,7 @@ public:
       containerOutputLogFDs[1] = -1;
 
       Vector<int32_t> execAdditionalPreservedFDs = execIsolatedChildCgroups;
+      for (int fd : execGatewayCredentialFDs) execAdditionalPreservedFDs.push_back(fd);
       if (execNeuronListenerFD >= 0)
       {
         execAdditionalPreservedFDs.push_back(execNeuronListenerFD);
@@ -13032,7 +14229,7 @@ public:
 
         // Host-netns containers still need datacenter-scoped mesh routes for
         // container-to-container probes and other mesh-targeted traffic.
-        installDatacenterMeshRoutes(thisNeuron->eth, thisNeuron->lcsubnet6.dpfx);
+        installContainerMeshRoutes(thisNeuron->eth);
       }
 
       if (container->plan.usesIsolatedCPUs())
@@ -13064,6 +14261,74 @@ public:
       }
 
       thisNeuron->pushContainer(container);
+      if (container->plan.system.kind == SystemContainerKind::crossClusterMasqueGateway &&
+          !container->gatewayReadinessListenerReady)
+      {
+        if (failureReport) failureReport->assign("gateway readiness listener creation failed"_ctv);
+        basics_log("startContainer gateway readiness listener creation failed uuid=%llu\n", (unsigned long long)container->plan.uuid);
+        close(startupSync[1]);
+        thisNeuron->popContainer(container);
+        kill(container->pid, SIGKILL);
+        waitpid(container->pid, nullptr, 0);
+        if (container->pidfd > 0) { close(container->pidfd); container->pidfd = -1; }
+        return false;
+      }
+      int gatewayDirectoryFD = -1;
+      if (container->plan.system.kind == SystemContainerKind::crossClusterMasqueGateway)
+      {
+        if (!ContainerManager::openGatewayReadinessRuntimeDirectory(container, gatewayDirectoryFD, failureReport))
+        {
+          if (gatewayDirectoryFD >= 0) close(gatewayDirectoryFD);
+          if (failureReport && failureReport->size() == 0) failureReport->assign("gateway readiness directory descriptor invalid"_ctv);
+          basics_log("startContainer gateway readiness directory descriptor invalid uuid=%llu\n", (unsigned long long)container->plan.uuid);
+          close(startupSync[1]); thisNeuron->popContainer(container);
+          kill(container->pid, SIGKILL); waitpid(container->pid, nullptr, 0);
+          if (container->pidfd > 0) { close(container->pidfd); container->pidfd = -1; }
+          return false;
+        }
+        int mountFD = Container::gatewayReadinessDetachedMount(gatewayDirectoryFD);
+        close(gatewayDirectoryFD);
+        gatewayDirectoryFD = mountFD;
+        if (gatewayDirectoryFD < 0)
+        {
+          if (failureReport) failureReport->assign("gateway readiness detached mount creation failed"_ctv);
+          basics_log("startContainer gateway readiness detached mount creation failed uuid=%llu errno=%d(%s)\n", (unsigned long long)container->plan.uuid, errno, strerror(errno));
+          close(startupSync[1]); thisNeuron->popContainer(container);
+          kill(container->pid, SIGKILL); waitpid(container->pid, nullptr, 0);
+          if (container->pidfd > 0) { close(container->pidfd); container->pidfd = -1; }
+          return false;
+        }
+      }
+      StartupSyncPayload startupPayload;
+      startupPayload.startSignal = 1;
+      startupPayload.idMapPID = useUserNamespace ? container->pid : -1;
+      iovec startupIO = {&startupPayload, sizeof(startupPayload)};
+      msghdr startupMessage = {}; startupMessage.msg_iov = &startupIO; startupMessage.msg_iovlen = 1;
+      alignas(cmsghdr) char startupControl[CMSG_SPACE(sizeof(int))] = {};
+      if (gatewayDirectoryFD >= 0)
+      {
+        startupMessage.msg_control = startupControl; startupMessage.msg_controllen = sizeof(startupControl);
+        cmsghdr *cmsg = CMSG_FIRSTHDR(&startupMessage);
+        cmsg->cmsg_level = SOL_SOCKET; cmsg->cmsg_type = SCM_RIGHTS; cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(cmsg), &gatewayDirectoryFD, sizeof(gatewayDirectoryFD));
+      }
+      ssize_t startupWrite = sendmsg(startupSync[1], &startupMessage, MSG_NOSIGNAL);
+      const int startupWriteErrno = errno;
+      if (gatewayDirectoryFD >= 0) close(gatewayDirectoryFD);
+      close(startupSync[1]);
+      if (startupWrite != ssize_t(sizeof(startupPayload)))
+      {
+        if (failureReport)
+        {
+          failureReport->snprintf<"startup sync write failed for container {itoa}: {}"_ctv>(container->plan.uuid, String(strerror(startupWriteErrno)));
+        }
+        thisNeuron->popContainer(container);
+        kill(container->pid, SIGKILL);
+        waitpid(container->pid, nullptr, 0);
+        if (container->pidfd > 0) { close(container->pidfd); container->pidfd = -1; }
+        return false;
+      }
+
       if (exposeNeuronSocket)
       {
         appendContainerTrace(container,
@@ -13086,20 +14351,6 @@ public:
       if (exposeNeuronSocket)
       {
         seedDynamicData(container);
-      }
-
-      StartupSyncPayload startupPayload;
-      startupPayload.startSignal = 1;
-      startupPayload.idMapPID = useUserNamespace ? container->pid : -1;
-      ssize_t startupWrite = write(startupSync[1], &startupPayload, sizeof(startupPayload));
-      close(startupSync[1]);
-      if (startupWrite != ssize_t(sizeof(startupPayload)))
-      {
-        if (failureReport)
-        {
-          failureReport->snprintf<"startup sync write failed for container {itoa}: {}"_ctv>(container->plan.uuid, String(strerror(errno)));
-        }
-        return false;
       }
 
       String pendingMarkerFailure = {};
@@ -13193,12 +14444,12 @@ public:
     uint64_t deploymentID = plan.config.deploymentID();
     bool systemContainer = plan.isSystemContainer();
     String compressedContainerPath = systemContainer
-                                         ? ContainerStore::systemPathForArtifact(plan.system.artifact.sha256)
+                                         ? ContainerStore::systemPathForArtifact(plan.system.kind, plan.system.artifact.sha256)
                                          : ContainerStore::pathForContainerImage(deploymentID);
     if (systemContainer)
     {
       String systemVerificationFailure = {};
-      if (ContainerStore::systemVerify(plan.system.artifact.sha256, plan.system.artifact.bytes, nullptr, nullptr, &systemVerificationFailure) == false)
+      if (ContainerStore::systemVerify(plan.system.kind, plan.system.artifact.sha256, plan.system.artifact.bytes, nullptr, nullptr, &systemVerificationFailure) == false)
       {
         if (systemVerificationFailure.size() == 0)
         {
@@ -13404,11 +14655,11 @@ public:
         }
         else
         {
-          CoroutineStack *coro = new CoroutineStack();
+          ReplacementWaitStack *coro = new ReplacementWaitStack();
           old->resumeAfterShutdown = coro;
           old->stop();
           co_await coro->suspend();
-          delete coro;
+          coro->finish();
           if (thisNeuron != nullptr &&
               thisNeuron->pendingContainerLaunchIsCurrent(plan.uuid, launchAdmissionGeneration) == false)
           {
@@ -13425,14 +14676,14 @@ public:
         String cgroupDrainFailure = {};
         if (cgroupDrained == false)
         {
-          CoroutineStack *coro = new CoroutineStack();
+          ReplacementWaitStack *coro = new ReplacementWaitStack();
           if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
                 waitForPredecessorCgroupDrain(old, coro, cgroupDrained, &cgroupDrainFailure);
               }))
           {
             co_await coro->suspendAtIndex(suspendIndex);
           }
-          delete coro;
+          coro->finish();
           if (thisNeuron != nullptr &&
               thisNeuron->pendingContainerLaunchIsCurrent(plan.uuid, launchAdmissionGeneration) == false)
           {
@@ -13490,9 +14741,12 @@ public:
 
     Container *container = nullptr;
     String createFailure = {};
-    createContainer(plan, compressedContainerPath, container, &createFailure);
+    co_await createContainer(plan, compressedContainerPath, container, &createFailure, launchAdmissionGeneration);
     if (container == nullptr)
     {
+      if (thisNeuron != nullptr &&
+          !thisNeuron->pendingContainerLaunchIsCurrent(plan.uuid, launchAdmissionGeneration))
+        co_return;
       String report = {};
       report.assign(createFailure.size() > 0 ? createFailure : "container creation failed"_ctv);
       reportSpinContainerFailure(plan, report);

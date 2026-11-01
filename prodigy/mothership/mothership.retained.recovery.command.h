@@ -6,9 +6,11 @@
 // bundle installation, fences, receipt, atomic renames and activation boundary.
 #include <prodigy/mothership/mothership.tidesdb.migration.command.h>
 #include <prodigy/mothership/mothership.retained.recovery.h>
+#include <prodigy/mothership/mothership.cluster.remove.h>
 #include <prodigy/containerstore.h>
 #include <prodigy/wire.h>
 #include <set>
+#include <thread>
 
 template<typename S> void serialize(S&& s, MothershipRetainedRecoveryMachineInput& m) {
   s.value16b(m.machineUUID); s.value4b(m.machineFragment); s.object(m.parameters); s.object(m.observedCreatedAtMs);
@@ -866,10 +868,68 @@ inline bool verifyRetiredConflictingClientLocal(const char *requestPath,const ch
     return true;
   } catch(const std::exception& error) { if(failure)failure->assign(error.what()); return false; }
 }
+struct PopulatedSeedRuntimeRepairRequest {
+  MothershipInitialSeedRuntimeRepairBinding binding;
+  MothershipPopulatedSeedRuntimeRepairProof proof;
+};
+template<typename S> void serialize(S&& s,PopulatedSeedRuntimeRepairRequest& request) {
+  s.object(request.binding);s.object(request.proof);
+}
+// Only digests and non-secret identity/state scalars leave the private decoder.
+// The paired copies retain the exact payload bytes; no caller invents them.
+inline String populatedSeedSnapshotEvidence(const ProdigyPersistentBrainSnapshot& snapshot,
+                                           const MothershipInitialSeedRuntimeRepairBinding& binding) {
+  auto id=[](uint128_t value) { String encoded;encoded.assignItoh(value);return str(encoded); };
+  std::string output="ISRR2_SCOPE "+str(binding.initialSeedScopeSHA256)+" 43 43\n";
+  auto rows=[&](const Vector<BrainReplicatedContainerRuntimeState>& states) {
+    std::vector<const BrainReplicatedContainerRuntimeState *> ordered;
+    for(const auto& state:states)ordered.push_back(&state);
+    std::sort(ordered.begin(),ordered.end(),[](auto a,auto b){return a->plan.uuid<b->plan.uuid;});
+    for(const auto *state:ordered) {
+      String digest;require(prodigyStatefulServingRuntimeDigest(*state,digest),"repair snapshot payload digest failed");
+      output+=id(state->plan.uuid)+" "+id(state->machineUUID)+" "+std::to_string(unsigned(state->plan.state))+" "+
+          std::to_string(unsigned(state->plan.runtimeReady))+" "+std::to_string(state->plan.nShardGroups)+" "+str(digest)+"\n";
+    }
+  };
+  rows(snapshot.masterAuthority.servingRuntimeStates);
+  output+="CANONICAL\n";rows(snapshot.masterAuthority.containerRuntimeStates);
+  for(const auto& [deployment,record]:snapshot.masterAuthority.failedDeployments) {
+    auto copy=record;String bytes,digest;
+    require(BitseryEngine::serialize(bytes,copy) && prodigyComputeSHA256Hex(bytes,digest),"repair failure record digest failed");
+    output+="FAILURE "+std::to_string(deployment)+" "+str(digest)+"\n";
+  }
+  return text(output);
+}
 // Only the staged Mothership invokes this against its private paired copy.
 inline bool prepareLocal(const char *requestPath,const char *statePath,bool verifyOnly,String *failure,const String& previousBundleSHA256={}) {
   try {
     privateFile(requestPath); const std::string path=statePath;pathCheck(path);
+    const auto requestBytes=read(requestPath);
+    if (requestBytes.starts_with("ISRR2\n")) {
+      require(verifyOnly && previousBundleSHA256.empty() && ::getenv("PRODIGY_STATE_SECRETS_DB")==nullptr &&
+              path==(fs::path(requestPath).parent_path()/"state.check10").string(),
+              "populated seed repair verifies only its paired private copy");
+      PopulatedSeedRuntimeRepairRequest request;
+      require(BitseryEngine::deserializeSafe(text(requestBytes.substr(6)),request),"populated seed repair binding invalid");
+      ProdigyPersistentBrainSnapshot snapshot;loadSnapshot(path,snapshot);
+      require(mothershipInitialSeedRuntimeRepairSnapshotValid(snapshot,request.binding,&request.proof),
+              "populated seed repair snapshot admission failed");
+      const auto evidence=fs::path(requestPath).parent_path()/"repair.snapshot-proof";
+      const auto bytes=populatedSeedSnapshotEvidence(snapshot,request.binding);
+      if(fs::exists(evidence)) {privateFile(evidence);require(read(evidence)==str(bytes),"populated seed snapshot proof changed");}
+      else durable(evidence,bytes);
+      return true;
+    }
+    if (requestBytes.starts_with("ISRR1\n")) {
+      require(verifyOnly && previousBundleSHA256.empty() && ::getenv("PRODIGY_STATE_SECRETS_DB")==nullptr &&
+              path==(fs::path(requestPath).parent_path()/"state.check10").string(),
+              "initial seed repair verifies only its paired private copy");
+      MothershipInitialSeedRuntimeRepairBinding binding;
+      require(BitseryEngine::deserializeSafe(text(requestBytes.substr(6)),binding),"initial seed repair binding invalid");
+      ProdigyPersistentBrainSnapshot snapshot; loadSnapshot(path,snapshot);
+      require(mothershipInitialSeedRuntimeRepairSnapshotValid(snapshot,binding),"initial seed repair snapshot admission failed");
+      return true;
+    }
     require(path.ends_with("/state.new10") || (verifyOnly && path=="/var/lib/prodigy/state"),"recovery suboperation refuses an unowned database path");
     require(::getenv("PRODIGY_STATE_SECRETS_DB")==nullptr,"recovery refuses a secrets-path override");
     Request request; MothershipRetainedRecoveryMixedProof proof; uint128_t retiredConflictingClientUUID=0, emptyRetainedInventoryMachineUUID=0;
@@ -1369,10 +1429,442 @@ inline void resumeCompacted(Execution& e,const char *repairBundle) {
   e.activate();
   durable(fs::path(e.plan.operationRoot)/"compaction-resumed",text(binding));
 }
+// Provider credentials and submission stay in Mothership. Preparation freezes
+// the existing durable/live cloud identity projection before any Brain stops;
+// reboot never attempts a topology query against the fenced fleet.
+struct InitialSeedRuntimeRepairHooks {
+  virtual ~InitialSeedRuntimeRepairHooks()=default;
+  virtual bool prepare(Execution&,MothershipInitialSeedRuntimeRepairBinding&,String *failure)=0;
+  virtual bool reboot(Execution&,uint128_t machineUUID,String *failure)=0;
+};
+inline std::string repairJSON(const std::string& value) {
+  String result; prodigyAppendEscapedJSONStringLiteral(result,text(value)); return str(result);
+}
+inline std::string repairID(uint128_t value) { String result; result.assignItoh(value); return str(result); }
+template<typename T> inline std::string repairObjectSHA(T value) {
+  String bytes,hash; require(BitseryEngine::serialize(bytes,value) && prodigyComputeSHA256Hex(bytes,hash),"repair authority digest failed"); return str(hash);
+}
+inline uint64_t repairNumber(simdjson::dom::element value,const char *key) {
+  uint64_t result=0; require(value[key].get_uint64().get(result)==simdjson::SUCCESS && result,"missing repair integer"); return result;
+}
+inline void repairSeal(const fs::path& path,const String& bytes) {
+  if (fs::exists(path)) { privateFile(path); require(read(path)==str(bytes),"immutable repair evidence changed"); }
+  else durable(path,bytes);
+}
+struct InitialSeedRuntimeRepairManifest {
+  MothershipInitialSeedRuntimeRepairBinding binding;
+  bool populatedSeed=false;
+  MothershipPopulatedSeedRuntimeRepairProof populatedProof;
+  std::string successorBundleSHA,successorRuntimeSHA,gatewayArtifactSHA,gatewayExecutableSHA;
+  uint64_t gatewayArtifactBytes=0,gatewayExecutableBytes=0;
+};
+inline InitialSeedRuntimeRepairManifest parseInitialSeedRepairManifest(const std::string& file,Execution& e) {
+  privateFile(file); simdjson::dom::parser parser; simdjson::dom::element doc;
+  auto bytes=read(file); require(parser.parse(bytes).get(doc)==simdjson::SUCCESS,"invalid initial seed repair manifest");
+  bool sameState=false,sameWire=false;
+  const auto predecessor=repairNumber(doc,"predecessorRuntimeRevision"),successor=repairNumber(doc,"successorRuntimeRevision");
+  const bool divergentScope=predecessor==53 && successor==54;
+  const bool replicatedScope=predecessor==54 && successor==55;
+  const bool populatedScope=predecessor==55 && successor==56;
+  require(repairNumber(doc,"schemaVersion")==1 && (divergentScope || replicatedScope || populatedScope) &&
+          doc["stateFormatUnchanged"].get_bool().get(sameState)==simdjson::SUCCESS && sameState &&
+          doc["wireFormatUnchanged"].get_bool().get(sameWire)==simdjson::SUCCESS && sameWire,
+          "repair requires the explicitly approved same-format runtime53 to runtime54 or runtime54 to runtime55 contract");
+  InitialSeedRuntimeRepairManifest m; auto& b=m.binding;
+  b.clusterUUID=uuid(field(doc,"clusterUUID")); b.masterMachineUUID=uuid(field(doc,"masterMachineUUID"));
+  b.initialSeedOperationUUID=uuid(field(doc,"initialSeedOperationUUID")); b.deploymentID=repairNumber(doc,"pendingDeploymentID");
+  b.masterGeneration=repairNumber(doc,"masterAuthorityGeneration"); b.followerGeneration=repairNumber(doc,"followerAuthorityGeneration");
+  b.initialSeedIntentSHA256=text(field(doc,"initialSeedIntentSHA256"));
+  m.successorBundleSHA=field(doc,"expectedNewBundleSHA256"); m.successorRuntimeSHA=field(doc,"expectedNewRuntimeSHA256");
+  m.gatewayArtifactSHA=field(doc,"gatewayArtifactSHA256"); m.gatewayArtifactBytes=repairNumber(doc,"gatewayArtifactBytes");
+  m.gatewayExecutableSHA=field(doc,"gatewayExecutableSHA256"); m.gatewayExecutableBytes=repairNumber(doc,"gatewayExecutableBytes");
+  for (const auto& hash:{m.successorBundleSHA,m.successorRuntimeSHA,m.gatewayArtifactSHA,m.gatewayExecutableSHA,str(b.initialSeedIntentSHA256)})
+    require(prodigyIsSHA256HexDigest(text(hash)),"invalid initial seed repair digest");
+  require(b.clusterUUID==e.plan.clusterUUID && b.masterMachineUUID==e.plan.machines[0].uuid &&
+          b.followerGeneration!=UINT64_MAX &&
+          ((replicatedScope || populatedScope) ? b.masterGeneration==b.followerGeneration : b.masterGeneration==b.followerGeneration+1) &&
+          m.successorBundleSHA==str(e.receipt.approvedBundleSHA256) && m.successorRuntimeSHA==str(e.receipt.newRuntimeSHA256),
+          "repair bundle, frozen master or generation mismatch");
+  for (const auto& machine:e.plan.machines) b.machineUUIDs.push_back(machine.uuid);
+  if(populatedScope) {
+    require(e.plan.oldRuntimeSHA=="7018687562fb4dba5bc45c8d37febc968a23109e739d57c9d617b1e0d8d8da81" &&
+            e.plan.oldBundleSHA=="d6ee8470f4db8017dc8a13ce17879d1b0431a21b8b726c354aadf50ff3299ddd",
+            "populated repair requires the exact installed runtime55 predecessor");
+    for(const auto& machine:e.plan.machines) {
+      const char *mid=machine.uuid==MothershipPopulatedSeedRepair::master ? "30b778da1b2745ea8438931b72d01963" :
+          machine.uuid==MothershipPopulatedSeedRepair::ord0 ? "b8250f81b66f4cfe9c3111316b16a12f" :
+          machine.uuid==MothershipPopulatedSeedRepair::ord2 ? "78c6a43624b94d90a9d3d69a8b4fa80a" : "";
+      require(*mid && machine.linuxID==mid,"populated repair original Linux machine identity differs");
+    }
+    simdjson::dom::element value;
+    require(doc["populatedSeed"].get(value)==simdjson::SUCCESS,"populated repair process proof missing");
+    auto& p=m.populatedProof;p.predecessorRevision=55;p.successorRevision=56;
+    p.pulseMachineUUID=uuid(field(value,"pulseMachineUUID"));p.pulseContainerUUID=uuid(field(value,"pulseContainerUUID"));
+    p.pulsePID=repairNumber(value,"pulsePID");p.pulseStartTicks=repairNumber(value,"pulseStartTicks");
+    p.pulseExecutableSHA256=text(field(value,"pulseExecutableSHA256"));p.pulseExecutableBytes=repairNumber(value,"pulseExecutableBytes");
+    p.parametersSHA256=text(field(value,"pulseParametersSHA256"));
+    const auto parametersPath=field(value,"pulseParametersPath");pathCheck(parametersPath);privateFile(parametersPath,1024*1024);
+    require(digest(parametersPath)==str(p.parametersSHA256),"populated repair parameters digest mismatch");
+    p.startupParameters=text(read(parametersPath));
+    p.storageDevice=repairNumber(value,"pulseStorageDevice");p.storageInode=repairNumber(value,"pulseStorageInode");
+    p.storageUID=repairNumber(value,"pulseStorageUID");p.storageGID=repairNumber(value,"pulseStorageGID");
+    p.bootID=text(field(value,"pulseBootID"));p.linuxMachineID=text(field(value,"pulseLinuxMachineID"));
+    p.mountNamespace=text(field(value,"pulseMountNamespace"));p.networkNamespace=text(field(value,"pulseNetworkNamespace"));
+    p.pidNamespace=text(field(value,"pulsePIDNamespace"));
+    ContainerParameters parameters={};
+    require(mothershipPopulatedSeedRuntimeRepairBindingValid(b,p) &&
+            ProdigyWire::deserializeStartupContainerParameters(p.startupParameters,parameters) &&
+            parameters.uuid==p.pulseContainerUUID && parameters.deploymentID==b.deploymentID,
+            "populated repair process or typed startup identity differs");
+    m.populatedSeed=true;
+  }
+  const auto provenance=field(doc,"gatewayProvenancePath"); pathCheck(provenance); privateFile(provenance);
+  require(digest(provenance)==field(doc,"gatewayProvenanceSHA256"),"gateway package provenance digest mismatch");
+  // This root-private receipt is the explicit artifact-to-executable approval.
+  // Mothership consumes the existing package owner's identities, never extracts
+  // a container artifact or creates a second artifact decoder.
+  simdjson::dom::parser pp; simdjson::dom::element pd; auto provenanceBytes=read(provenance);
+  require(pp.parse(provenanceBytes).get(pd)==simdjson::SUCCESS && field(pd,"builder")=="Discombobulator" &&
+          field(pd,"runtime53QualifiedArtifactSHA256")==m.gatewayArtifactSHA,"gateway package owner mismatch");
+  simdjson::dom::array files; require(pd["files"].get_array().get(files)==simdjson::SUCCESS,"gateway provenance files missing");
+  uint32_t artifacts=0,executables=0;
+  for (auto f:files) {
+    const auto hash=field(f,"sha256"); const auto size=repairNumber(f,"bytes");
+    artifacts+=hash==m.gatewayArtifactSHA && size==m.gatewayArtifactBytes;
+    executables+=hash==m.gatewayExecutableSHA && size==m.gatewayExecutableBytes;
+  }
+  require(artifacts==1 && executables==1,"gateway provenance does not bind the approved artifact and executable");
+  MothershipClusterRegistry registry(text(e.plan.registryRoot+"/clusters")); String why;
+  simdjson::dom::array gateways; require(doc["gateways"].get_array().get(gateways)==simdjson::SUCCESS,"repair gateway bindings absent");
+  std::set<std::pair<uint128_t,uint128_t>> seen;
+  for (auto entry:gateways) {
+    const auto pair=uuid(field(entry,"pairUUID")),machine=uuid(field(entry,"localMachineUUID"));
+    CrossClusterMasqueGatewayAuthority authority;
+    require(e.machines.contains(machine) && seen.emplace(pair,machine).second &&
+            registry.loadCrossClusterMasqueGateway(pair,machine,authority,&why) &&
+            authority.keyGeneration==repairNumber(entry,"keyGeneration") &&
+            authority.pairAuthorityGeneration==repairNumber(entry,"pairAuthorityGeneration") &&
+            authority.generation==repairNumber(entry,"generation") &&
+            authority.localClusterUUID==b.clusterUUID && authority.localMachineUUID==machine &&
+            authority.artifactSHA256==text(m.gatewayArtifactSHA) && authority.artifactBytes==m.gatewayArtifactBytes &&
+            prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(authority) && authority.state==CrossClusterMasqueGatewayState::active,
+            "repair gateway registry authority mismatch");
+    b.gateways.push_back(std::move(authority));
+  }
+  require(b.gateways.size()==6,"repair requires the frozen six gateway authorities");
+  for (auto id:b.machineUUIDs) { uint32_t count=0; for (const auto& g:b.gateways) count+=g.localMachineUUID==id; require(count==2,"repair requires two gateways per member"); }
+  std::sort(b.gateways.begin(),b.gateways.end(),[](const auto& a,const auto& z) {
+    return a.pairUUID<z.pairUUID || (a.pairUUID==z.pairUUID && a.localMachineUUID<z.localMachineUUID);
+  });
+  String authorityBytes;require(BitseryEngine::serialize(authorityBytes,b.gateways),"repair gateway authority serialization failed");
+  const auto sealed=fs::path(e.plan.operationRoot)/"repair-gateway-authorities";
+  require(e.receipt.phase==MothershipTidesDBMigrationPhase::accepted || fs::exists(sealed),"repair gateway authority evidence missing");
+  repairSeal(sealed,authorityBytes);
+  return m;
+}
+inline std::string initialSeedRepairInventoryProgram(const InitialSeedRuntimeRepairManifest& m,uint128_t machine,
+                                                    bool gatewaysPresent=true,bool populatedPresent=false) {
+  std::string config="{\"sha256\":"+repairJSON(m.gatewayExecutableSHA)+",\"bytes\":"+std::to_string(m.gatewayExecutableBytes)+",\"authorities\":[";
+  bool comma=false;
+  for (const auto& authority:m.binding.gateways) if (gatewaysPresent && authority.localMachineUUID==machine) {
+    SystemContainerRuntimePlan plan; plan.kind=SystemContainerKind::crossClusterMasqueGateway;
+    Vector<String> environment;
+    require(prodigyBindCrossClusterMasqueGatewayRuntimePlanAuthority(plan,authority) &&
+            prodigyAppendCrossClusterMasqueGatewayAuthorityEnvironment(plan,environment),"gateway environment authority invalid");
+    if (comma) config+=","; comma=true; config+="[";
+    for (uint32_t i=0;i<environment.size();++i) { if(i)config+=","; config+=repairJSON(str(environment[i])); }
+    config+="]";
+  }
+  config+="],\"pulse\":";
+  if(populatedPresent && m.populatedSeed && machine==m.populatedProof.pulseMachineUUID) {
+    require(!gatewaysPresent,"populated seed repair admits zero observed gateway processes");
+    const auto& p=m.populatedProof;
+    config+="{\"uuid\":"+repairJSON(repairID(p.pulseContainerUUID))+",\"pid\":"+std::to_string(p.pulsePID)+
+        ",\"start\":"+repairJSON(std::to_string(p.pulseStartTicks))+",\"sha256\":"+repairJSON(str(p.pulseExecutableSHA256))+
+        ",\"bytes\":"+std::to_string(p.pulseExecutableBytes)+",\"paramsSHA256\":"+repairJSON(str(p.parametersSHA256))+
+        ",\"paramsBytes\":"+std::to_string(p.startupParameters.size())+",\"bootID\":"+repairJSON(str(p.bootID))+
+        ",\"machineID\":"+repairJSON(str(p.linuxMachineID))+",\"namespaces\":{\"mnt\":"+repairJSON(str(p.mountNamespace))+
+        ",\"net\":"+repairJSON(str(p.networkNamespace))+",\"pid\":"+repairJSON(str(p.pidNamespace))+"},\"storage\":["+
+        std::to_string(p.storageDevice)+","+std::to_string(p.storageInode)+","+std::to_string(p.storageUID)+","+
+        std::to_string(p.storageGID)+"]}";
+  } else config+="null";
+  config+="}";
+  return "python3 - "+quote(config)+R"PY( <<'ISRR_PY'
+import hashlib,json,os,pathlib,re,sys
+cfg=json.loads(sys.argv[1]); expected=[dict(v.split('=',1) for v in a) for a in cfg['authorities']]
+assert len(expected) in (0,2)
+pulse=cfg['pulse']; pulse_seen=False
+if pulse:
+    assert not expected
+    assert pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()==pulse['bootID']
+    assert pathlib.Path('/etc/machine-id').read_text().strip()==pulse['machineID']
+root=pathlib.Path('/sys/fs/cgroup/containers.slice'); rows=[]; matched=set(); seen=set()
+assert not root.is_symlink() and (root.is_dir() or (not expected and not pulse))
+for directory,dirs,files in os.walk(root,followlinks=False):
+    assert all(not pathlib.Path(directory,d).is_symlink() for d in dirs)
+    if 'cgroup.procs' not in files: continue
+    pids=pathlib.Path(directory,'cgroup.procs').read_text().split()
+    if not pids: continue
+    relative=str(pathlib.Path(directory).relative_to(root)); match=re.fullmatch(r'([1-9][0-9]*)\.slice/leaf',relative)
+    assert match and 0<int(match[1])<2**128
+    for pid in pids:
+        assert pid.isdecimal() and int(pid)>1 and pid not in seen; seen.add(pid)
+        proc=pathlib.Path('/proc',pid)
+        start=proc.joinpath('stat').read_text().rsplit(') ',1)[1].split()[19]
+        assert proc.joinpath('cgroup').read_text()==f'0::/containers.slice/{relative}\n'
+        data=proc.joinpath('environ').read_bytes().split(b'\0'); env={}
+        for item in data:
+            if not item: continue
+            key,value=item.split(b'=',1); assert key not in env; env[key]=value
+        if pulse and int(match[1])==int(pulse['uuid'],16):
+            assert not pulse_seen and int(pid)==pulse['pid'] and start==pulse['start']
+            for name,target in pulse['namespaces'].items():
+                assert os.readlink(proc/'ns'/name)==target
+                assert os.readlink(pathlib.Path('/proc/1/ns')/name)!=target
+            storage=pathlib.Path('/containers/storage')/match[1]
+            assert storage.is_dir() and not storage.is_symlink()
+            st=storage.stat(); assert [st.st_dev,st.st_ino,st.st_uid,st.st_gid]==pulse['storage']
+            parameter_fds=[]
+            for fd in (proc/'fd').iterdir():
+                try:
+                    if os.readlink(fd)=='/memfd:container.params (deleted)': parameter_fds.append(fd)
+                except FileNotFoundError: pass
+            assert len(parameter_fds)==1 and env.get(b'PRODIGY_PARAMS_FD')==parameter_fds[0].name.encode()
+            def parameter_digest():
+                with parameter_fds[0].open('rb') as f:
+                    raw=f.read(1024*1024+1)
+                assert len(raw)==pulse['paramsBytes']
+                assert os.readlink(parameter_fds[0])=='/memfd:container.params (deleted)'
+                return hashlib.sha256(raw).hexdigest()
+            assert parameter_digest()==pulse['paramsSHA256']
+            with proc.joinpath('exe').open('rb') as f:
+                executable=hashlib.file_digest(f,'sha256').hexdigest(); executable_bytes=f.tell()
+            assert executable==pulse['sha256'] and executable_bytes==pulse['bytes']
+            assert parameter_digest()==pulse['paramsSHA256']
+            assert proc.joinpath('stat').read_text().rsplit(') ',1)[1].split()[19]==start
+            pulse_seen=True
+            rows.append({'cgroup':relative,'pid':int(pid),'startTicks':start,'exeSHA256':executable,
+                         'parametersSHA256':pulse['paramsSHA256'],'storage':pulse['storage'],'kind':'initialPulse'})
+            continue
+        matches=[i for i,e in enumerate(expected) if all(env.get(k.encode())==v.encode() for k,v in e.items())]
+        assert len(matches)==1 and matches[0] not in matched; matched.add(matches[0])
+        with proc.joinpath('exe').open('rb') as f:
+            digest=hashlib.file_digest(f,'sha256').hexdigest(); size=f.tell()
+        assert digest==cfg['sha256'] and size==cfg['bytes']
+        assert proc.joinpath('stat').read_text().rsplit(') ',1)[1].split()[19]==start
+        rows.append({'cgroup':relative,'pid':int(pid),'startTicks':start,'exeSHA256':digest,'authority':matches[0]})
+assert len(rows)==len(expected)+(1 if pulse else 0) and len(matched)==len(expected) and pulse_seen==bool(pulse)
+print(json.dumps({'bootID':pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+ 'linuxMachineID':pathlib.Path('/etc/machine-id').read_text().strip(),'processes':sorted(rows,key=lambda r:r['cgroup'])},sort_keys=True,separators=(',',':')))
+ISRR_PY
+)PY";
+}
+inline std::string initialSeedRepairPreflightInventoryProgram(const InitialSeedRuntimeRepairManifest& m,uint128_t machine) {
+  if(m.populatedSeed) return initialSeedRepairInventoryProgram(m,machine,false,true);
+  // Manifest admission permits equal generations only for the 54 -> 55 repair.
+  // That already cold-rebooted cohort must be empty; 53 -> 54 retains its two
+  // live gateways per member. Both modes retain all six typed authorities.
+  return initialSeedRepairInventoryProgram(m,machine,m.binding.masterGeneration!=m.binding.followerGeneration);
+}
+inline std::string initialSeedRepairTreeProgram(const std::string& path) {
+  return "python3 - "+quote(path)+R"PY( <<'ISRR_TREE'
+import hashlib,os,pathlib,stat,sys
+root=pathlib.Path(sys.argv[1]); result=hashlib.sha256()
+assert root.is_dir() and not root.is_symlink()
+for directory,dirs,files in os.walk(root,followlinks=False):
+    dirs.sort(); files.sort()
+    for name in ['']+files:
+        path=pathlib.Path(directory,name); s=path.lstat()
+        assert stat.S_ISDIR(s.st_mode) if name=='' else stat.S_ISREG(s.st_mode)
+        result.update(str(path.relative_to(root)).encode()+b'\0'+str(stat.S_IMODE(s.st_mode)).encode()+b'\0')
+        if name:
+            result.update(str(s.st_size).encode()+b'\0')
+            with path.open('rb') as f: result.update(hashlib.file_digest(f,'sha256').digest())
+    assert all(not pathlib.Path(directory,d).is_symlink() for d in dirs)
+print(result.hexdigest())
+ISRR_TREE
+)PY";
+}
+inline std::string initialSeedRepairBootID(Execution& e,uint128_t machine) {
+  String bytes,why;
+  require(e.command(machine,"cat /proc/sys/kernel/random/boot_id",&why,&bytes,10000),"repair boot identity observation unavailable");
+  auto result=str(bytes); if(result.ends_with('\n'))result.pop_back();
+  require(result.size()==36 && result.find_first_not_of("0123456789abcdef-")==std::string::npos,"repair boot identity invalid"); return result;
+}
+inline bool initialSeedRepairMaySubmitReboot(bool dispatched,const std::string& before,const std::string& current) {
+  return !dispatched && !before.empty() && before==current;
+}
+inline void resolveInitialSeedRepairMachine(const MothershipProdigyCluster& cluster,
+                                           MothershipTidesMigration::Machine& machine) {
+  // Created cloud members are registered in the durable topology; the separate
+  // adoption-intent list can be empty. Reuse the existing topology conversion
+  // used by remote cloud runtime repair, without changing adoption resolution.
+  const ClusterMachine *registered=nullptr;
+  for(const auto& candidate:cluster.topology.machines) if(candidate.uuid==machine.uuid) {
+    require(registered==nullptr,"ambiguous repair topology UUID");registered=&candidate;
+  }
+  require(registered && registered->isBrain && registered->source==ClusterMachineSource::created &&
+          registered->backing==ClusterMachineBacking::cloud && !registered->cloud.cloudID.empty(),
+          "repair member is not a registered created cloud Brain");
+  require(str(registered->ssh.address)==machine.address && registered->ssh.port &&
+          str(registered->ssh.user)=="root" && !registered->ssh.hostPublicKeyOpenSSH.empty(),
+          "repair topology SSH authority differs or is incomplete");
+  mothershipPopulateRemoveMachineFromTopology(*registered,machine.registered);
+  machine.registered.uuid=registered->uuid;
+}
+inline bool runInitialSeedRuntimeRepair(const char *file,const char *action,InitialSeedRuntimeRepairHooks& hooks,String *failure=nullptr) {
+  try {
+    const bool prepare=std::strcmp(action,"prepare-initial-seed-runtime-repair")==0;
+    require(prepare || std::strcmp(action,"recover-initial-seed-runtime-repair")==0,"invalid initial seed repair action");
+    Plan plan=parse(file); require(plan.initialSeedRuntimeRepair && plan.schemaVersion==1 &&
+        plan.statePath=="/var/lib/prodigy/state" && plan.secretsPath==plan.statePath+".secrets","initial seed repair paths or mode differ");
+    for(const auto& live:{plan.runtimeRoot,plan.statePath,plan.secretsPath})
+      require(!plan.operationRoot.starts_with(live+"/") && !live.starts_with(plan.operationRoot+"/") && live!=plan.operationRoot,
+              "repair operation root overlaps a live runtime or database");
+    plan.retainedRecovery=true;
+    simdjson::dom::parser parser;simdjson::dom::element doc;auto raw=read(file);
+    require(parser.parse(raw).get(doc)==simdjson::SUCCESS,"invalid repair plan");
+    bool retained=false; require(doc["retainedRecoveryMode"].get_bool().get(retained)==simdjson::SUCCESS && retained,"explicit retained mode required");
+    const auto manifestPath=field(doc,"repairManifestPath"); pathCheck(manifestPath); privateFile(manifestPath);
+    const auto manifestSHA=field(doc,"repairManifestSHA256"); require(digest(manifestPath)==manifestSHA,"repair manifest digest mismatch");
+    Execution e(std::move(plan)); e.initialize();
+    { MothershipClusterRegistry registry(text(e.plan.registryRoot+"/clusters")); String why;
+      require(registry.getClusterByIdentity(text(e.plan.identity),e.cluster,&why),"repair cluster registry unavailable"); }
+    require(e.cluster.clusterUUID==e.plan.clusterUUID && e.cluster.nBrains==3 && e.cluster.topology.machines.size()==3 &&
+            e.cluster.deploymentMode==MothershipClusterDeploymentMode::remote && e.cluster.provider==MothershipClusterProvider::vultr &&
+            str(e.cluster.remoteProdigyPath)==e.plan.runtimeRoot,"repair registered fleet differs");
+    for (auto& machine:e.plan.machines) { resolveInitialSeedRepairMachine(e.cluster,machine); e.machines.emplace(machine.uuid,&machine); }
+    auto manifest=parseInitialSeedRepairManifest(manifestPath,e);
+    repairSeal(fs::path(e.plan.operationRoot)/"repair-manifest.sha256",text(manifestSHA));
+    for (const auto& db:e.receipt.databases) require(!db.swapped,"repair receipt contains a database swap");
+    String why;
+    if(!hooks.prepare(e,manifest.binding,&why)) {
+      if(failure)failure->assign(why.empty() ? "repair provider/member authority preparation failed" : why.c_str());
+      return false;
+    }
+    e.buildArtifactManifest();
+    auto inventory=[&](MothershipTidesMigration::Machine& machine) {
+      String observed; require(e.command(machine.uuid,initialSeedRepairPreflightInventoryProgram(manifest,machine.uuid),&why,&observed,30000),"repair container inventory differs from its admitted gateway-presence mode");
+      const auto path=fs::path(e.plan.operationRoot)/(repairID(machine.uuid)+".gateway-inventory"); repairSeal(path,observed);
+    };
+    if(e.receipt.phase<MothershipTidesDBMigrationPhase::writersQuiesced) {
+      e.stageAndPreflight();
+      for(auto& machine:e.plan.machines) inventory(machine);
+      if(e.receipt.phase<MothershipTidesDBMigrationPhase::preflighted) { e.receipt.phase=MothershipTidesDBMigrationPhase::preflighted; e.persist(e.receipt,nullptr); }
+      e.quiesce();
+    }
+    auto preserved=[&]() {
+      for(const auto& db:e.receipt.databases) {
+        String observed; require(e.command(db.machineUUID,initialSeedRepairTreeProgram(str(db.livePath)),&why,&observed,60000),"repair database byte inventory failed");
+        const auto sealed=fs::path(e.plan.operationRoot)/(repairID(db.machineUUID)+"."+str(db.label)+".tree-sha256");
+        require(e.receipt.phase<MothershipTidesDBMigrationPhase::validated || fs::exists(sealed),"repair byte-preservation evidence missing");
+        repairSeal(sealed,observed);
+      }
+    };
+    if(!e.receipt.activationBoundaryCrossed) {
+      // Original directories are never opened by a database reader. Only the
+      // paired private copies below are decoded, without a save operation.
+      preserved();
+      if(e.receipt.phase<MothershipTidesDBMigrationPhase::validated) {
+        for(auto& db:e.receipt.databases) {
+          require(!e.exists(db,db.retainedV9Path) && !e.exists(db,db.preparedV10Path),"unexpected repair database replacement");
+          if(!e.exists(db,db.copiedV9Path)) require(e.copySource(db,&why),"repair private database copy failed");
+          String copied; require(e.command(db.machineUUID,initialSeedRepairTreeProgram(str(db.copiedV9Path)),&why,&copied,60000) &&
+              str(copied)==read(fs::path(e.plan.operationRoot)/(repairID(db.machineUUID)+"."+str(db.label)+".tree-sha256")),"repair private copy differs from original");
+        }
+        for(auto& machine:e.plan.machines) {
+          auto binding=manifest.binding; binding.localMachineUUID=machine.uuid; String encoded;
+          if(manifest.populatedSeed) {
+            PopulatedSeedRuntimeRepairRequest request;request.binding=binding;request.proof=manifest.populatedProof;
+            require(BitseryEngine::serialize(encoded,request),"populated repair private request serialization failed");
+          } else require(BitseryEngine::serialize(encoded,binding),"repair private request serialization failed");
+          const auto request=e.plan.operationRoot+"/"+repairID(machine.uuid)+".repair-request";
+          repairSeal(request,text(std::string(manifest.populatedSeed ? "ISRR2\n" : "ISRR1\n")+str(encoded)));
+          e.upload(machine,request,e.remoteRoot+"/repair.request");
+          // Database open may maintain metadata. Recreate only these operation-
+          // private verification copies; the retained copies are never opened.
+          const auto check=e.remoteRoot+"/state.check10";
+          e.run(machine.uuid,"rm -rf -- "+quote(check)+" "+quote(check+".secrets")+
+                "; cp -a --reflink=auto -- "+quote(e.remoteRoot+"/state.copy10")+" "+quote(check)+
+                "; cp -a --reflink=auto -- "+quote(e.remoteRoot+"/state.copy10.secrets")+" "+quote(check+".secrets"));
+          e.run(machine.uuid,"LD_LIBRARY_PATH="+quote(e.remoteRuntime+"/lib")+" "+quote(e.remoteRuntime+"/tools/mothership")+
+                " prepareRetainedRecoveryLocal "+quote(e.remoteRoot+"/repair.request")+" "+quote(check)+" verify");
+          if(manifest.populatedSeed) {
+            String exported;
+            require(e.command(machine.uuid,"cat "+quote(e.remoteRoot+"/repair.snapshot-proof"),&why,&exported,30000),
+                    "populated repair snapshot proof export failed");
+            const auto bytes=str(exported);const auto split=bytes.find("CANONICAL\n");
+            require(bytes.starts_with("ISRR2_SCOPE ") && split!=std::string::npos && bytes.size()<65536,
+                    "populated repair snapshot proof malformed");
+            repairSeal(fs::path(e.plan.operationRoot)/(repairID(machine.uuid)+".snapshot-proof"),exported);
+            // Every peer must retain the exact same sealed serving payloads;
+            // their canonical observations and ordinary failure metadata can differ.
+            repairSeal(fs::path(e.plan.operationRoot)/"populated-serving-proof",text(bytes.substr(0,split)));
+          }
+        }
+        preserved(); e.receipt.phase=MothershipTidesDBMigrationPhase::validated; e.persist(e.receipt,nullptr);
+      }
+      if(manifest.populatedSeed) {
+        const auto common=fs::path(e.plan.operationRoot)/"populated-serving-proof";privateFile(common,65536);
+        for(const auto& machine:e.plan.machines) {
+          const auto path=fs::path(e.plan.operationRoot)/(repairID(machine.uuid)+".snapshot-proof");privateFile(path,65536);
+          const auto bytes=read(path);const auto split=bytes.find("CANONICAL\n");
+          require(split!=std::string::npos && read(common)==bytes.substr(0,split),"populated repair snapshot proofs differ");
+        }
+      }
+      if(prepare) return true;
+      // Reentry may follow an uncertain controller exit. Reassert all durable
+      // startup fences through their existing owner before any install/reboot.
+      e.fenceWriters();
+      for(auto& machine:e.plan.machines)
+        e.run(machine.uuid,"test \"$(systemctl show -p MainPID --value prodigy)\" = 0");
+      e.installRuntimes(); preserved();
+      for(auto& machine:e.plan.machines) {
+        const auto prefix=e.plan.operationRoot+"/"+repairID(machine.uuid);
+        privateFile(prefix+".gateway-inventory"); simdjson::dom::parser ip;simdjson::dom::element inv;auto bytes=read(prefix+".gateway-inventory");
+        require(ip.parse(bytes).get(inv)==simdjson::SUCCESS && field(inv,"linuxMachineID")==machine.linuxID,"repair original host identity differs");
+        const auto before=field(inv,"bootID"),dispatched=prefix+".reboot-dispatched",observed=prefix+".reboot-observed";
+        auto boot=initialSeedRepairBootID(e,machine.uuid);
+        if(initialSeedRepairMaySubmitReboot(fs::exists(dispatched),before,boot)) {
+          repairSeal(dispatched,text(e.plan.planSHA+"\n"+before+"\n"));
+          // Persist dispatch before submitting. A timeout is reconciled only by
+          // the pinned host's new boot ID; it never authorizes a second submit.
+          hooks.reboot(e,machine.uuid,&why);
+        }
+        require(fs::exists(dispatched),"repair host rebooted before authorized dispatch");
+        repairSeal(dispatched,text(e.plan.planSHA+"\n"+before+"\n"));
+        const auto deadline=std::chrono::steady_clock::now()+std::chrono::minutes(5);
+        while(boot==before && std::chrono::steady_clock::now()<deadline) {
+          std::this_thread::sleep_for(std::chrono::seconds(2));
+          try { boot=initialSeedRepairBootID(e,machine.uuid); } catch(const std::exception&) {}
+        }
+        require(boot!=before,"repair reboot dispatch uncertain; observe the same host boot ID without resubmitting");
+        repairSeal(observed,text(e.plan.planSHA+"\n"+before+"\n"+boot+"\n"));
+        e.run(machine.uuid,"test \"$(cat "+quote(e.fencePath())+")\" = "+quote(e.plan.planSHA)+
+              "; test \"$(systemctl show -p MainPID --value prodigy)\" = 0; "+e.observeContainers()+"test -z \"$(snapshot_containers)\"");
+        e.run(machine.uuid,initialSeedRepairInventoryProgram(manifest,machine.uuid,false));
+        e.verifyRuntime(machine,e.serviceRuntimeRoot());
+      }
+      preserved();
+    } else require(!prepare,"cannot prepare a repair after activation");
+    e.activate([&]() {
+      require(e.receipt.phase==MothershipTidesDBMigrationPhase::validated,"repair activation requires const snapshot validation");
+      preserved();
+      for(auto& machine:e.plan.machines) {
+        const auto path=e.plan.operationRoot+"/"+repairID(machine.uuid)+".reboot-observed";privateFile(path);
+        const auto boot=initialSeedRepairBootID(e,machine.uuid);
+        require(read(path).ends_with("\n"+boot+"\n"),"repair boot identity changed after observation");
+        e.run(machine.uuid,initialSeedRepairInventoryProgram(manifest,machine.uuid,false));
+      }
+    });
+    return true;
+  } catch(const std::exception& error) { if(failure)failure->assign(error.what()); return false; }
+}
+
 inline bool runFile(const char *file,const char *action,String *failure=nullptr,const char *repairBundle=nullptr,const char *successorFile=nullptr) {
   try {
     require(std::strcmp(action,"recover")==0 || std::strcmp(action,"prepare")==0 || std::strcmp(action,"retire-extras")==0 || std::strcmp(action,"retire-extras-preactivation")==0 || std::strcmp(action,"check-conflicting-client-preactivation")==0 || std::strcmp(action,"retire-conflicting-client-preactivation")==0 || std::strcmp(action,"supersede-preactivation")==0 || std::strcmp(action,"contain-active")==0 || std::strcmp(action,"compact-contained")==0 || std::strcmp(action,"resume-compacted")==0,"invalid retained recovery action");
-    Plan plan=parse(file);plan.retainedRecovery=true;
+    Plan plan=parse(file);require(!plan.initialSeedRuntimeRepair,"initial seed repair requires its explicit action");plan.retainedRecovery=true;
     simdjson::dom::parser parser;simdjson::dom::element doc;auto raw=read(file);require(parser.parse(raw).get(doc)==simdjson::SUCCESS,"invalid recovery plan");
     bool mode=false;require(doc["retainedRecoveryMode"].get_bool().get(mode)==simdjson::SUCCESS && mode,"explicit retained recovery mode required");
     const auto manifestPath=field(doc,"retainedManifestPath"), manifestSHA=field(doc,"retainedManifestSHA256");pathCheck(manifestPath);

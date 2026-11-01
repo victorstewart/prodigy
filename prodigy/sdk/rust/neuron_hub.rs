@@ -721,6 +721,19 @@ pub enum ContainerTopic
    CredentialsRefresh = 12,
    WormholesRefresh = 13,
    RuntimeReady = 14,
+   TaskResult = 15,
+   CousinSessionRequest = 16,
+   CousinSessionCommand = 17,
+   CousinSessionAck = 18,
+   StatefulDataAuthority = 19,
+   CousinCarrierFrame = 20,
+   App6TruthMeshReceipt = 21,
+   StatefulStoreReceipt = 22,
+   StatefulStoreSeedAuthority = 23,
+   NametagQualificationApplicationReceipt = 24,
+   NametagQualificationApplicationCommand = 25,
+   NametagSourceBaselineReceipt = 26,
+   NametagSourceBaselineCommand = 27,
 }
 
 impl ContainerTopic
@@ -744,6 +757,19 @@ impl ContainerTopic
          12 => Ok(Self::CredentialsRefresh),
          13 => Ok(Self::WormholesRefresh),
          14 => Ok(Self::RuntimeReady),
+         15 => Ok(Self::TaskResult),
+         16 => Ok(Self::CousinSessionRequest),
+         17 => Ok(Self::CousinSessionCommand),
+         18 => Ok(Self::CousinSessionAck),
+         19 => Ok(Self::StatefulDataAuthority),
+         20 => Ok(Self::CousinCarrierFrame),
+         21 => Ok(Self::App6TruthMeshReceipt),
+         22 => Ok(Self::StatefulStoreReceipt),
+         23 => Ok(Self::StatefulStoreSeedAuthority),
+         24 => Ok(Self::NametagQualificationApplicationReceipt),
+         25 => Ok(Self::NametagQualificationApplicationCommand),
+         26 => Ok(Self::NametagSourceBaselineReceipt),
+         27 => Ok(Self::NametagSourceBaselineCommand),
          _ => Err(invalid_data(format!("unknown container topic {value}"))),
       }
    }
@@ -1037,7 +1063,19 @@ impl<D: Dispatch> NeuronHub<D> {
          | ContainerTopic::Healthy
          | ContainerTopic::RuntimeReady
          | ContainerTopic::Statistics
+         | ContainerTopic::TaskResult
          | ContainerTopic::ResourceDeltaAck => {}
+         ContainerTopic::CousinSessionRequest
+         | ContainerTopic::CousinSessionAck
+         | ContainerTopic::StatefulDataAuthority
+         | ContainerTopic::CousinCarrierFrame
+         | ContainerTopic::App6TruthMeshReceipt
+         | ContainerTopic::StatefulStoreReceipt
+         | ContainerTopic::StatefulStoreSeedAuthority
+         | ContainerTopic::NametagQualificationApplicationReceipt
+         | ContainerTopic::NametagQualificationApplicationCommand
+         | ContainerTopic::NametagSourceBaselineReceipt
+         | ContainerTopic::NametagSourceBaselineCommand => {}
          ContainerTopic::Stop => {
             self.shutdown_requested = true;
             self.with_dispatch(|dispatch, hub| dispatch.begin_shutdown(hub));
@@ -1082,6 +1120,7 @@ impl<D: Dispatch> NeuronHub<D> {
          ContainerTopic::WormholesRefresh => {
             self.with_dispatch(|dispatch, hub| dispatch.wormholes_refresh(hub, &frame.payload));
          }
+         ContainerTopic::CousinSessionCommand => return Err(invalid_data("unsupported container topic")),
       }
 
       Ok(self.drain_queued_outbound())

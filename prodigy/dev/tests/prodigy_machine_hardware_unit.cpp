@@ -21,6 +21,7 @@ public:
     else
     {
       basics_log("FAIL: %s\n", name);
+      std::fprintf(stderr, "FAIL: %s\n", name);
       failed += 1;
     }
   }
@@ -524,6 +525,65 @@ int main(void)
     suite.expect(prodigyApplyNicDefaultRouteSource(onlinkNics, onlinkDefaults, "[{\"dst\":\"2606:4700:4700::1111\",\"dev\":\"onlink0\",\"src\":\"2001:db8::2\"}]"_ctv, true), "apply_ipv6_onlink_default_route_selected_source");
     suite.expect(onlinkNics[0].subnets[0].internetReachable, "apply_ipv6_onlink_default_route_marks_source");
     suite.expect(onlinkNics[0].subnets[0].gateway.isNull(), "apply_ipv6_onlink_default_route_keeps_gateway_empty");
+    MachineNetworkHardwareProfile onlinkNetwork = {};
+    onlinkNetwork.nics = onlinkNics;
+    onlinkNetwork.captures.push_back(MachineToolCapture {
+        .tool = "ip"_ctv,
+        .phase = "route-show-ipv6"_ctv,
+        .output = "[{\"dst\":\"2001:db8::/64\",\"dev\":\"onlink0\",\"protocol\":\"kernel\"}]"_ctv,
+        .attempted = true,
+        .succeeded = true});
+    suite.expect(
+        prodigyKernelOnLinkIPv6RouteForSubnet(onlinkNetwork, onlinkNetwork.nics[0], onlinkNetwork.nics[0].subnets[0]) == MachineNicSubnetKernelOnLinkRoute::present,
+        "kernel_onlink_ipv6_subnet_from_retained_kernel_route");
+    onlinkNetwork.captures.clear();
+    onlinkNetwork.captures.push_back(MachineToolCapture {
+        .tool = "ip"_ctv, .phase = "route-show-ipv6"_ctv,
+        .output = "[{\"dst\":\"2001:db8::/64\",\"dev\":\"onlink0\",\"protocol\":\"ra\"}]"_ctv,
+        .attempted = true, .succeeded = true});
+    suite.expect(
+        prodigyKernelOnLinkIPv6RouteForSubnet(onlinkNetwork, onlinkNetwork.nics[0], onlinkNetwork.nics[0].subnets[0]) == MachineNicSubnetKernelOnLinkRoute::present,
+        "kernel_onlink_ipv6_subnet_accepts_ra_unicast_route");
+    onlinkNetwork.captures.clear();
+    onlinkNetwork.captures.push_back(MachineToolCapture {
+        .tool = "ip"_ctv, .phase = "route-show-ipv6"_ctv,
+        .output = "[{\"dst\":\"2001:db8::/64\",\"dev\":\"onlink0\",\"protocol\":\"static\",\"type\":\"unicast\"}]"_ctv,
+        .attempted = true, .succeeded = true});
+    suite.expect(
+        prodigyKernelOnLinkIPv6RouteForSubnet(onlinkNetwork, onlinkNetwork.nics[0], onlinkNetwork.nics[0].subnets[0]) == MachineNicSubnetKernelOnLinkRoute::present,
+        "kernel_onlink_ipv6_subnet_accepts_static_unicast_route");
+    onlinkNetwork.captures.clear();
+    onlinkNetwork.captures.push_back(MachineToolCapture {
+        .tool = "ip"_ctv, .phase = "route-show-ipv6"_ctv,
+        .output = "[{\"dst\":\"2001:db8::/64\",\"dev\":\"onlink0\",\"type\":\"blackhole\"}]"_ctv,
+        .attempted = true, .succeeded = true});
+    suite.expect(
+        prodigyKernelOnLinkIPv6RouteForSubnet(onlinkNetwork, onlinkNetwork.nics[0], onlinkNetwork.nics[0].subnets[0]) == MachineNicSubnetKernelOnLinkRoute::absent,
+        "kernel_onlink_ipv6_subnet_rejects_nonunicast_route");
+    onlinkNetwork.captures.clear();
+    onlinkNetwork.captures.push_back(MachineToolCapture {
+        .tool = "ip"_ctv, .phase = "route-show-ipv6"_ctv,
+        .output = "[{\"dst\":\"2001:db8::/64\",\"dev\":\"onlink0\",\"protocol\":\"kernel\",\"gateway\":\"fe80::1\"}]"_ctv,
+        .attempted = true, .succeeded = true});
+    suite.expect(
+        prodigyKernelOnLinkIPv6RouteForSubnet(onlinkNetwork, onlinkNetwork.nics[0], onlinkNetwork.nics[0].subnets[0]) == MachineNicSubnetKernelOnLinkRoute::absent,
+        "kernel_onlink_ipv6_subnet_rejects_gateway_route");
+    onlinkNetwork.captures.clear();
+    onlinkNetwork.captures.push_back(MachineToolCapture {
+        .tool = "ip"_ctv, .phase = "route-show-ipv6"_ctv,
+        .output = "[{\"dst\":\"2001:db8::2/64\",\"dev\":\"onlink0\",\"protocol\":\"kernel\"}]"_ctv,
+        .attempted = true, .succeeded = true});
+    suite.expect(
+        prodigyKernelOnLinkIPv6RouteForSubnet(onlinkNetwork, onlinkNetwork.nics[0], onlinkNetwork.nics[0].subnets[0]) == MachineNicSubnetKernelOnLinkRoute::absent,
+        "kernel_onlink_ipv6_subnet_rejects_noncanonical_prefix");
+    onlinkNetwork.captures.clear();
+    onlinkNetwork.captures.push_back(MachineToolCapture {
+        .tool = "ip"_ctv, .phase = "route-show-ipv6"_ctv,
+        .output = "[{\"dst\":\"2001:db8::/64junk\",\"dev\":\"onlink0\",\"protocol\":\"kernel\"}]"_ctv,
+        .attempted = true, .succeeded = true});
+    suite.expect(
+        prodigyKernelOnLinkIPv6RouteForSubnet(onlinkNetwork, onlinkNetwork.nics[0], onlinkNetwork.nics[0].subnets[0]) == MachineNicSubnetKernelOnLinkRoute::absent,
+        "kernel_onlink_ipv6_subnet_rejects_malformed_prefix_length");
   }
 
   {
@@ -572,13 +632,19 @@ int main(void)
       }
       return false;
     };
-    if (routeGet4 && routeGet4->succeeded && std::any_of(liveDefaults.begin(), liveDefaults.end(), [](const ProdigyNicGatewayMapping& mapping) { return mapping.is6 == false; }))
+    if (routeGet4 && routeGet4->succeeded)
     {
-      suite.expect(hasSelectedSource(false), "collect_nic_subnets_marks_selected_live_ipv4_default_source");
+      const bool exactRouteAuthority = prodigyApplyNicDefaultRouteSource(
+          liveNics, liveDefaults, routeGet4->output, false);
+      suite.expect(exactRouteAuthority == hasSelectedSource(false),
+                   "collect_nic_subnets_ipv4_selected_source_matches_exact_route_authority");
     }
-    if (routeGet6 && routeGet6->succeeded && std::any_of(liveDefaults.begin(), liveDefaults.end(), [](const ProdigyNicGatewayMapping& mapping) { return mapping.is6; }))
+    if (routeGet6 && routeGet6->succeeded)
     {
-      suite.expect(hasSelectedSource(true), "collect_nic_subnets_marks_selected_live_ipv6_default_source");
+      const bool exactRouteAuthority = prodigyApplyNicDefaultRouteSource(
+          liveNics, liveDefaults, routeGet6->output, true);
+      suite.expect(exactRouteAuthority == hasSelectedSource(true),
+                   "collect_nic_subnets_ipv6_selected_source_matches_exact_route_authority");
     }
   }
 

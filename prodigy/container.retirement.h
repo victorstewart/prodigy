@@ -22,7 +22,8 @@ constexpr static uint64_t prodigyContainerRetirementJournalMaximumPayloadBytes =
 enum class ProdigyContainerRetirementKind : uint8_t {
   statefulTopology = 1,
   statelessPairedMigration = 2,
-  statefulPairedMigration = 3
+  statefulPairedMigration = 3,
+  qualificationStatefulCancellation = 4
 };
 
 static inline bool prodigyContainerRetirementIsPaired(ProdigyContainerRetirementKind kind)
@@ -51,6 +52,8 @@ public:
   uint128_t pairedSourceClusterUUID = 0;
   uint128_t pairedTargetClusterUUID = 0;
   uint64_t pairedTargetDeploymentID = 0;
+  uint128_t qualificationOperationUUID = 0;
+  String qualificationPlacementSHA256;
 
   bool sameIdentity(const ProdigyContainerRetirementIntent& other) const
   {
@@ -62,7 +65,9 @@ public:
            pairedOperationID == other.pairedOperationID &&
            pairedSourceClusterUUID == other.pairedSourceClusterUUID &&
            pairedTargetClusterUUID == other.pairedTargetClusterUUID &&
-           pairedTargetDeploymentID == other.pairedTargetDeploymentID;
+           pairedTargetDeploymentID == other.pairedTargetDeploymentID &&
+           qualificationOperationUUID == other.qualificationOperationUUID &&
+           qualificationPlacementSHA256 == other.qualificationPlacementSHA256;
   }
 };
 
@@ -283,6 +288,14 @@ static void prodigySerializeContainerRetirementIntentV2(S&& serializer, ProdigyC
 }
 
 template <typename S>
+static void prodigySerializeContainerRetirementIntentV5(S&& serializer, ProdigyContainerRetirementIntent& intent)
+{
+  prodigySerializeContainerRetirementIntentV2(serializer, intent);
+  serializer.value16b(intent.qualificationOperationUUID);
+  serializer.text1b(intent.qualificationPlacementSHA256, 64);
+}
+
+template <typename S>
 static void serialize(S&& serializer, ProdigyContainerRetirementIntent& intent)
 {
   // Direct intent serialization is retained only for source compatibility.
@@ -296,6 +309,7 @@ public:
   constexpr static uint8_t pairedIntentVersion = 2;
   constexpr static uint8_t currentVersion = 3;
   constexpr static uint8_t statefulVersion = 4;
+  constexpr static uint8_t qualificationVersion = 5;
 
   // Existing stateful callers value-initialize this journal.  They must keep
   // emitting the legacy framing until a dedicated v2 stateless admission has
@@ -324,15 +338,18 @@ static void serialize(S&& serializer, ProdigyContainerRetirementJournal& journal
                          });
   }
   else if (journal.version == ProdigyContainerRetirementJournal::currentVersion ||
-           journal.version == ProdigyContainerRetirementJournal::statefulVersion)
+           journal.version == ProdigyContainerRetirementJournal::statefulVersion ||
+           journal.version == ProdigyContainerRetirementJournal::qualificationVersion)
   {
     serializer.container(journal.intents, prodigyContainerRetirementJournalMaximumEntries,
-                         [](S& serializer, ProdigyContainerRetirementIntent& intent) {
-                           prodigySerializeContainerRetirementIntentV2(serializer, intent);
+                         [&](S& serializer, ProdigyContainerRetirementIntent& intent) {
+                           if (journal.version == ProdigyContainerRetirementJournal::qualificationVersion)
+                             prodigySerializeContainerRetirementIntentV5(serializer, intent);
+                           else prodigySerializeContainerRetirementIntentV2(serializer, intent);
                          });
     serializer.container(journal.pairedSourceFences, prodigyContainerRetirementJournalMaximumEntries,
                          [&](S& serializer, ProdigyPairedSourceRetirementFence& fence) {
-                           if (journal.version == ProdigyContainerRetirementJournal::statefulVersion)
+                           if (journal.version >= ProdigyContainerRetirementJournal::statefulVersion)
                              prodigySerializePairedSourceRetirementFenceV4(serializer, fence);
                            else serializer.object(fence);
                          });
@@ -342,7 +359,7 @@ static void serialize(S&& serializer, ProdigyContainerRetirementJournal& journal
 static bool prodigyContainerRetirementJournalVersionSupported(uint8_t version, uint32_t readerVersion)
 {
   return version >= ProdigyContainerRetirementJournal::legacyVersion &&
-         version <= ProdigyContainerRetirementJournal::statefulVersion &&
+         version <= ProdigyContainerRetirementJournal::qualificationVersion &&
          readerVersion >= version;
 }
 
@@ -359,7 +376,12 @@ static bool prodigyContainerRetirementIntentValid(const ProdigyContainerRetireme
   const bool statefulTopology = intent.kind == ProdigyContainerRetirementKind::statefulTopology;
   const bool statelessPaired = intent.kind == ProdigyContainerRetirementKind::statelessPairedMigration;
   const bool statefulPaired = intent.kind == ProdigyContainerRetirementKind::statefulPairedMigration;
-  if (!statefulTopology && !statelessPaired && !statefulPaired) return false;
+  const bool qualification = intent.kind == ProdigyContainerRetirementKind::qualificationStatefulCancellation;
+  if (!statefulTopology && !statelessPaired && !statefulPaired && !qualification) return false;
+  if (qualification ? (!intent.qualificationOperationUUID || !prodigyIsSHA256HexDigest(intent.qualificationPlacementSHA256) ||
+      intent.topologyOperationID || intent.sourceEpoch || intent.targetEpoch || intent.pairedOperationID ||
+      intent.pairedSourceClusterUUID || intent.pairedTargetClusterUUID || intent.pairedTargetDeploymentID) :
+      (intent.qualificationOperationUUID || !intent.qualificationPlacementSHA256.empty())) return false;
   if (statefulPaired && intent.applicationID != 3 && intent.applicationID != 4) return false;
   if (statefulTopology &&
       (intent.topologyOperationID == 0 || intent.sourceEpoch == 0 || intent.targetEpoch == 0 ||
@@ -379,8 +401,8 @@ static bool prodigyContainerRetirementIntentValid(const ProdigyContainerRetireme
       bootstrap.plan.uuid != intent.containerUUID ||
       bootstrap.plan.config.deploymentID() != intent.deploymentID ||
       bootstrap.plan.config.applicationID != intent.applicationID ||
-      bootstrap.plan.isStateful != (statefulTopology || statefulPaired) ||
-      bootstrap.plan.config.type != ((statefulTopology || statefulPaired) ? ApplicationType::stateful : ApplicationType::stateless) ||
+      bootstrap.plan.isStateful != (statefulTopology || statefulPaired || qualification) ||
+      bootstrap.plan.config.type != ((statefulTopology || statefulPaired || qualification) ? ApplicationType::stateful : ApplicationType::stateless) ||
       (statefulPaired &&
        ((intent.applicationID != 3 && intent.applicationID != 4) ||
         bootstrap.plan.statefulTopology.servingMode != StatefulTopologyServingMode::applicationDataAuthority ||
@@ -506,7 +528,7 @@ static const ProdigyPairedSourceRetirementFence *prodigyFindPairedSourceRetireme
 static bool prodigyValidateContainerRetirementJournal(const ProdigyContainerRetirementJournal& journal)
 {
   if (!prodigyContainerRetirementJournalVersionSupported(
-          journal.version, ProdigyContainerRetirementJournal::statefulVersion) ||
+          journal.version, ProdigyContainerRetirementJournal::qualificationVersion) ||
       (journal.intents.empty() && journal.pairedSourceFences.empty()) ||
       journal.intents.size() > prodigyContainerRetirementJournalMaximumEntries)
   {
@@ -518,7 +540,9 @@ static bool prodigyValidateContainerRetirementJournal(const ProdigyContainerReti
   uint32_t pairedIntentCount = 0;
   for (const ProdigyContainerRetirementIntent& intent : journal.intents)
   {
-    if ((journal.version == ProdigyContainerRetirementJournal::legacyVersion &&
+    if ((journal.version < ProdigyContainerRetirementJournal::qualificationVersion &&
+         (intent.kind == ProdigyContainerRetirementKind::qualificationStatefulCancellation || intent.qualificationOperationUUID || !intent.qualificationPlacementSHA256.empty())) ||
+        (journal.version == ProdigyContainerRetirementJournal::legacyVersion &&
          (intent.kind != ProdigyContainerRetirementKind::statefulTopology || intent.pairedOperationID != 0 ||
           intent.pairedSourceClusterUUID != 0 || intent.pairedTargetClusterUUID != 0 ||
           intent.pairedTargetDeploymentID != 0)) ||

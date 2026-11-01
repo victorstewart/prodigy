@@ -317,7 +317,16 @@ for dropin in "$dropin_directory"/99-tidesdb-migration-????????????????.conf; do
   name=${dropin##*/}; suffix=${name#99-tidesdb-migration-}; suffix=${suffix%.conf};
   case "$suffix" in *[!0123456789abcdef]*) echo 'refusing non-migration drop-in name' >&2; exit 1;; esac;
   test -f "$dropin" && test ! -L "$dropin" && test -O "$dropin" || { echo 'unsafe migration drop-in' >&2; exit 1; };
-  fence=$(sed -n '2{s/^ConditionPathExists=!\(\/.*\/guest\/writers-fenced\)$/\1/p;}' "$dropin");
+  fence=$(sed -n '2{s/^ConditionPathExists=!\(\/.*\/writers-fenced\)$/\1/p;}' "$dropin");
+  case "$fence" in
+    */migration/guest/writers-fenced) ;;
+    /var/lib/prodigy/mothership-local-authority-runtime/*/writers-fenced)
+      operation=${fence#/var/lib/prodigy/mothership-local-authority-runtime/}; operation=${operation%/writers-fenced};
+      case "$operation" in 0x*) operation=${operation#0x};; *) echo 'refusing non-migration drop-in' >&2; exit 1;; esac;
+      test "${#operation}" = 32 || { echo 'refusing non-migration drop-in' >&2; exit 1; };
+      case "$operation" in *[!0123456789abcdef]*) echo 'refusing non-migration drop-in' >&2; exit 1;; esac;;
+    *) echo 'refusing non-migration drop-in' >&2; exit 1;;
+  esac;
   test -n "$fence" && printf '[Unit]\nConditionPathExists=!%s\n' "$fence" | cmp -s - "$dropin" || { echo 'refusing non-migration drop-in' >&2; exit 1; };
   rm -- "$dropin" || { echo 'failed to remove migration drop-in' >&2; exit 1; };
   removed_migration_dropin=1;

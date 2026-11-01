@@ -397,7 +397,7 @@ public:
     }
 
     String config = {};
-    config.snprintf<"Port {itoa}\nListenAddress 127.0.0.1\nHostKey {}\nPidFile {}\nPermitRootLogin yes\nPubkeyAuthentication yes\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nChallengeResponseAuthentication no\nUsePAM no\nStrictModes no\nAuthorizedKeysFile {}\nSubsystem sftp internal-sftp\nLogLevel VERBOSE\n"_ctv>(
+    config.snprintf<"Port {itoa}\nListenAddress 127.0.0.1\nHostKey {}\nPidFile {}\nPermitRootLogin yes\nPubkeyAuthentication yes\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nChallengeResponseAuthentication no\nUsePAM yes\nStrictModes no\nAuthorizedKeysFile {}\nSubsystem sftp internal-sftp\nLogLevel VERBOSE\n"_ctv>(
         uint64_t(port),
         hostKeyPath,
         pidPath,
@@ -750,6 +750,61 @@ int main(void)
                 fd,
                 &failure),
             "blocking_ssh_command_reconnects_after_deadline");
+        String remoteDownloadPath = {};
+        remoteDownloadPath.snprintf<"{}/download-source"_ctv>(sshd.root);
+        String localDownloadPath = {};
+        localDownloadPath.snprintf<"{}/download-destination"_ctv>(sshd.root);
+        String downloadContents = {};
+        downloadContents.assign("secure sftp download payload"_ctv);
+        suite.expect(writeFileWithMode(remoteDownloadPath, downloadContents, 0600),
+                     "sftp_download_writes_private_remote_fixture");
+        const uint64_t expectedDownloadBytes = uint64_t(downloadContents.size());
+        suite.expect(
+            prodigyDownloadRemoteFileFromSSHSession(
+                session, fd, remoteDownloadPath, localDownloadPath, expectedDownloadBytes, &expectedDownloadBytes, &failure, 5'000),
+            "sftp_download_accepts_private_regular_file");
+        String downloadedContents = {};
+        suite.expect(readFile(localDownloadPath, downloadedContents) && downloadedContents.equals(downloadContents),
+                     "sftp_download_preserves_content");
+        struct stat downloadedMetadata = {};
+        String localDownloadPathText = {};
+        localDownloadPathText.assign(localDownloadPath);
+        suite.expect(::stat(localDownloadPathText.c_str(), &downloadedMetadata) == 0 &&
+                         uint64_t(downloadedMetadata.st_size) == expectedDownloadBytes &&
+                         (downloadedMetadata.st_mode & 0777) == 0600,
+                     "sftp_download_creates_private_expected_size_file");
+
+        String remoteSymlinkPath = {};
+        remoteSymlinkPath.snprintf<"{}/download-symlink"_ctv>(sshd.root);
+        String remoteSymlinkPathText = {};
+        remoteSymlinkPathText.assign(remoteSymlinkPath);
+        String remoteDownloadPathText = {};
+        remoteDownloadPathText.assign(remoteDownloadPath);
+        suite.expect(::symlink(remoteDownloadPathText.c_str(), remoteSymlinkPathText.c_str()) == 0,
+                     "sftp_download_creates_remote_symlink_fixture");
+        String rejectedSymlinkPath = {};
+        rejectedSymlinkPath.snprintf<"{}/download-symlink-rejected"_ctv>(sshd.root);
+        suite.expect(
+            prodigyDownloadRemoteFileFromSSHSession(
+                session, fd, remoteSymlinkPath, rejectedSymlinkPath, expectedDownloadBytes, &expectedDownloadBytes, &failure, 5'000) == false,
+            "sftp_download_rejects_remote_symlink");
+        suite.expect(stringContains(failure, "not a regular file") && ::access(rejectedSymlinkPath.c_str(), F_OK) != 0,
+                     "sftp_download_symlink_leaves_no_local_file");
+
+        String remoteOversizePath = {};
+        remoteOversizePath.snprintf<"{}/download-oversize"_ctv>(sshd.root);
+        String oversizedContents = {};
+        oversizedContents.assign("download payload over limit"_ctv);
+        suite.expect(writeFileWithMode(remoteOversizePath, oversizedContents, 0600),
+                     "sftp_download_writes_oversize_remote_fixture");
+        String rejectedOversizePath = {};
+        rejectedOversizePath.snprintf<"{}/download-oversize-rejected"_ctv>(sshd.root);
+        suite.expect(
+            prodigyDownloadRemoteFileFromSSHSession(
+                session, fd, remoteOversizePath, rejectedOversizePath, uint64_t(oversizedContents.size() - 1), nullptr, &failure, 5'000) == false,
+            "sftp_download_rejects_oversize_remote_file");
+        suite.expect(stringContains(failure, "exceeds maximum byte count") && ::access(rejectedOversizePath.c_str(), F_OK) != 0,
+                     "sftp_download_oversize_leaves_no_partial_local_file");
         suite.expect(prodigyRunBlockingSSHCommand(session, fd,
                          "printf 'owned cleanup failure' >&2; exit 7"_ctv,
                          nullptr, &failure, 5'000) == false,
@@ -894,6 +949,85 @@ int main(void)
       prodigyBuildRemoteBootstrapPlan(target, request, topology, runtimeEnvironment, plan, &failure),
       "build_remote_bootstrap_plan");
   suite.expect(failure.size() == 0, "build_remote_bootstrap_plan_clears_failure");
+  suite.expect(plan.recoveryFreshGuestCommand.empty(), "ordinary_bootstrap_has_no_recovery_guard");
+  ProdigyRemoteBootstrapPlan recoveryPlan = plan;
+  prodigyRequireFreshRemoteBootstrapGuest(recoveryPlan);
+  suite.expect(strstr(recoveryPlan.recoveryFreshGuestCommand.c_str(), "systemctl show prodigy.service") != nullptr, "recovery_checks_service");
+  suite.expect(strstr(recoveryPlan.recoveryFreshGuestCommand.c_str(), "/var/lib/prodigy") != nullptr, "recovery_checks_persistent_state");
+  suite.expect(strstr(recoveryPlan.recoveryFreshGuestCommand.c_str(), recoveryPlan.installPaths.installRoot.c_str()) != nullptr, "recovery_checks_install_root");
+  suite.expect(strstr(recoveryPlan.recoveryFreshGuestCommand.c_str(), "pgrep -x prodigy") != nullptr, "recovery_checks_running_process");
+  {
+    char scratch[] = "/tmp/prodigy-fresh-guard-XXXXXX";
+    char *root = ::mkdtemp(scratch);
+    suite.expect(root != nullptr, "recovery_guard_scratch_created");
+    if (root)
+    {
+      std::string base(root);
+      auto stub = [&](const char *name, const char *body) {
+        std::string path = base + "/" + name;
+        FILE *file = ::fopen(path.c_str(), "w");
+        if (!file) return false;
+        bool ok = ::fputs(body, file) >= 0 && ::fclose(file) == 0;
+        return ok && ::chmod(path.c_str(), 0700) == 0;
+      };
+      bool stubs = stub("systemctl", "#!/bin/sh\nprintf '%s\\n' \"$TEST_LOAD_STATE\"\n") &&
+                   stub("pgrep", "#!/bin/sh\nexit \"$TEST_PGREP_STATUS\"\n");
+      suite.expect(stubs, "recovery_guard_stubs_created");
+      ProdigyRemoteBootstrapPlan isolated = {};
+      std::string install = base + "/install";
+      isolated.installPaths.installRoot.assign(install.c_str());
+      isolated.installPaths.installRootTemp.assign((install + ".new").c_str());
+      isolated.installPaths.installRootPrevious.assign((install + ".prev").c_str());
+      isolated.remoteUnitPath.assign((base + "/service").c_str());
+      isolated.remoteStagePayloadPath.assign((base + "/payload").c_str());
+      prodigyRequireFreshRemoteBootstrapGuest(isolated);
+      // Redirect only the fixed state paths into this test's temporary tree.
+      std::string guard(isolated.recoveryFreshGuestCommand.c_str());
+      for (const char *path : {"/var/lib/prodigy", "/containers", "/etc/systemd/system/prodigy.service.d"})
+      {
+        std::string quoted = std::string("'") + path + "'";
+        size_t position = 0;
+        while ((position = guard.find(quoted, position)) != std::string::npos)
+        {
+          std::string replacement = std::string("'") + base + path + "'";
+          guard.replace(position, quoted.size(), replacement);
+          position += replacement.size();
+        }
+      }
+      isolated.recoveryFreshGuestCommand.assign(guard.c_str());
+      auto runGuard = [&](const char *load, const char *processStatus) {
+        pid_t child = ::fork();
+        if (child == 0)
+        {
+          ::setenv("PATH", root, 1);
+          ::setenv("TEST_LOAD_STATE", load, 1);
+          ::setenv("TEST_PGREP_STATUS", processStatus, 1);
+          ::execl("/bin/sh", "sh", "-c", isolated.recoveryFreshGuestCommand.c_str(), nullptr);
+          _exit(127);
+        }
+        int status = 0;
+        return child > 0 && ::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+      };
+      if (stubs)
+      {
+        suite.expect(runGuard("not-found", "1"), "recovery_guard_accepts_fresh_guest");
+        suite.expect(::mkdir(install.c_str(), 0700) == 0, "recovery_guard_make_existing_root");
+        suite.expect(!runGuard("not-found", "1"), "recovery_guard_rejects_existing_root");
+        ::rmdir(install.c_str());
+        suite.expect(::symlink("missing-target", install.c_str()) == 0, "recovery_guard_make_dangling_link");
+        suite.expect(!runGuard("not-found", "1"), "recovery_guard_rejects_dangling_link");
+        ::unlink(install.c_str());
+        std::string containers = base + "/containers";
+        suite.expect(::mkdir(containers.c_str(), 0700) == 0, "recovery_guard_make_containers_root");
+        suite.expect(!runGuard("not-found", "1"), "recovery_guard_rejects_containers_root");
+        ::rmdir(containers.c_str());
+        suite.expect(!runGuard("loaded", "1"), "recovery_guard_rejects_service");
+        suite.expect(!runGuard("not-found", "0"), "recovery_guard_rejects_process");
+        suite.expect(!runGuard("not-found", "2"), "recovery_guard_rejects_ambiguous_process_check");
+      }
+      std::filesystem::remove_all(base);
+    }
+  }
   ProdigyRemoteBootstrapPlan multiBrainPlan = plan;
   suite.expect(plan.acme == request.acme, "plan_acme_config_copied");
   suite.expect(plan.ssh.address.equals("10.0.0.31"_ctv), "plan_uses_private_address_when_ssh_address_missing");

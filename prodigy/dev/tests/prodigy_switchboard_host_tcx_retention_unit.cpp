@@ -13,6 +13,7 @@
 #include <networking/veth.h>
 
 #include <bpf/bpf.h>
+#include <prodigy/neuron/neuron.h>
 #include <switchboard/host.tcx.retention.h>
 
 #include <cstdio>
@@ -31,6 +32,32 @@ public:
     failed += condition ? 0 : 1;
   }
 };
+
+static bool verifiedDisposableKVMBoundary()
+{
+  struct stat markerStat = {};
+  if (::stat("/run/prodigy-disposable-linux", &markerStat) != 0 ||
+      !S_ISREG(markerStat.st_mode) || markerStat.st_uid != 0 ||
+      (markerStat.st_mode & (S_IWGRP | S_IWOTH)) != 0)
+    return false;
+
+  FILE *marker = std::fopen("/run/prodigy-disposable-linux", "r");
+  char markerText[64] = {};
+  size_t markerBytes = marker ? std::fread(markerText, 1, sizeof(markerText), marker) : 0;
+  if (marker) std::fclose(marker);
+  if (markerBytes > 0 && markerText[markerBytes - 1] == '\n') --markerBytes;
+  constexpr const char expectedMarker[] = "prodigy-disposable-linux-v1";
+  if (markerBytes != sizeof(expectedMarker) - 1 ||
+      std::memcmp(markerText, expectedMarker, sizeof(expectedMarker) - 1) != 0)
+    return false;
+
+  FILE *virt = ::popen("/usr/bin/systemd-detect-virt --vm", "r");
+  char virtualization[32] = {};
+  const bool kvm = virt && std::fgets(virtualization, sizeof(virtualization), virt) &&
+                   std::strcmp(virtualization, "kvm\n") == 0;
+  const int virtStatus = virt ? ::pclose(virt) : -1;
+  return kvm && virtStatus == 0;
+}
 
 static bool createPrivateVeth(VethPair& pair)
 {
@@ -56,7 +83,8 @@ static bool attachHostRouters(NetDevice& device, String& ingressObjectPath, Stri
                                         [](struct bpf_object *object, Vector<int>&) {
                                           switchboardConfigureDevelopmentWhiteholeMapAllocation(object);
                                         });
-  if (egress == nullptr || switchboardPinWormholeFlowMaps(egress, device.ifidx) == false) return false;
+  if (egress == nullptr || switchboardPinWormholeFlowMaps(egress, device.ifidx,
+                                                        SwitchboardWormholeMapConsumer::forwarding) == false) return false;
 
   BPFProgram *ingress = device.attachBPF(BPF_TCX_INGRESS, ingressObjectPath, "host_ingress"_ctv,
                                          [&device](struct bpf_object *object, Vector<int>& innerMapFDs) {
@@ -88,10 +116,14 @@ int main(int argc, char **argv)
   TestSuite suite = {};
   struct stat ownNet = {}, initNet = {}, ownMount = {}, initMount = {};
   const char *boundary = std::getenv("PRODIGY_DEV_TEST_BOUNDARY");
-  suite.expect(boundary && std::strcmp(boundary, "apple-container") == 0 &&
+  const bool supportedGuest = boundary &&
+      (std::strcmp(boundary, "apple-container") == 0 ||
+       (std::strcmp(boundary, "disposable-kvm") == 0 && verifiedDisposableKVMBoundary()));
+  suite.expect(supportedGuest &&
                ::stat("/proc/self/ns/net", &ownNet) == 0 && ::stat("/proc/1/ns/net", &initNet) == 0 &&
                ::stat("/proc/self/ns/mnt", &ownMount) == 0 && ::stat("/proc/1/ns/mnt", &initMount) == 0 &&
-               ownNet.st_ino != initNet.st_ino && ownMount.st_ino != initMount.st_ino,
+               (ownNet.st_dev != initNet.st_dev || ownNet.st_ino != initNet.st_ino) &&
+               (ownMount.st_dev != initMount.st_dev || ownMount.st_ino != initMount.st_ino),
                "host_tcx_retention_requires_guest_and_private_namespaces");
   suite.expect(::geteuid() == 0, "host_tcx_retention_requires_privileged_wrapper");
   suite.expect(switchboardHostTCXValidBPFFSRoot("/sys/fs/bpf"_ctv), "host_tcx_retention_requires_private_bpffs");
@@ -135,6 +167,122 @@ int main(int argc, char **argv)
                "host_tcx_retention_retains_exact_live_pair");
   suite.expect(switchboardHostTCXVerifyRetainedPair(pair.host, "/sys/fs/bpf"_ctv, retained),
                "host_tcx_retention_verifies_exact_live_pair");
+
+  // The runtime owner attaches the exact primary program FDs on a second
+  // ifindex; it never creates a second map authority or retention pins.
+  BPFProgram primaryIngress = {}, primaryEgress = {};
+  EthDevice primaryEth = {}, overlayEth = {};
+  primaryEth.setDevice(pair.host.name);
+  overlayEth.setDevice(pair.peer.name);
+  const bool primaryOpen =
+      primaryIngress.loadPreattached(BPF_TCX_INGRESS, pair.host.ifidx, retained.ingress.programID, ingressObjectPath) &&
+      primaryEgress.loadPreattached(BPF_TCX_EGRESS, pair.host.ifidx, retained.egress.programID, egressObjectPath);
+  suite.expect(primaryOpen, "host_tcx_retention_opens_primary_pair_for_shared_overlay_links");
+  String overlayFailure = {};
+  {
+    Switchboard overlayRouting(primaryEth);
+    const bool configured = primaryOpen &&
+        overlayRouting.configurePrivateOverlayHostRouting(overlayEth, &primaryIngress, &primaryEgress, &overlayFailure);
+    suite.expect(configured, "host_tcx_retention_runtime_owner_attaches_shared_programs_on_second_ifindex");
+    BPFProgram::TCXIdentity overlayIngressIdentity = {}, overlayEgressIdentity = {};
+    suite.expect(configured &&
+                 BPFProgram::openTCXIdentity(pair.peer.ifidx, BPF_TCX_INGRESS, retained.ingress.programID, overlayIngressIdentity) &&
+                 BPFProgram::openTCXIdentity(pair.peer.ifidx, BPF_TCX_EGRESS, retained.egress.programID, overlayEgressIdentity),
+                 "host_tcx_retention_runtime_owner_preserves_exact_overlay_identity");
+    const uint32_t overlayIngressLinkID = overlayIngressIdentity.linkID;
+    const uint32_t overlayEgressLinkID = overlayEgressIdentity.linkID;
+    BPFProgram::closeTCXIdentity(overlayIngressIdentity);
+    BPFProgram::closeTCXIdentity(overlayEgressIdentity);
+    suite.expect(configured &&
+                 overlayRouting.configurePrivateOverlayHostRouting(overlayEth, &primaryIngress, &primaryEgress, &overlayFailure) &&
+                 BPFProgram::openTCXIdentity(pair.peer.ifidx, BPF_TCX_INGRESS, retained.ingress.programID, overlayIngressIdentity) &&
+                 BPFProgram::openTCXIdentity(pair.peer.ifidx, BPF_TCX_EGRESS, retained.egress.programID, overlayEgressIdentity) &&
+                 overlayIngressIdentity.linkID == overlayIngressLinkID && overlayEgressIdentity.linkID == overlayEgressLinkID,
+                 "host_tcx_retention_runtime_owner_reconfigure_does_not_stack_overlay_links");
+    BPFProgram::closeTCXIdentity(overlayIngressIdentity);
+    BPFProgram::closeTCXIdentity(overlayEgressIdentity);
+    {
+      Switchboard adoptedOverlayRouting(primaryEth);
+      suite.expect(configured &&
+                   adoptedOverlayRouting.configurePrivateOverlayHostRouting(overlayEth, &primaryIngress, &primaryEgress, &overlayFailure) &&
+                   BPFProgram::openTCXIdentity(pair.peer.ifidx, BPF_TCX_INGRESS, retained.ingress.programID, overlayIngressIdentity) &&
+                   BPFProgram::openTCXIdentity(pair.peer.ifidx, BPF_TCX_EGRESS, retained.egress.programID, overlayEgressIdentity) &&
+                   overlayIngressIdentity.linkID == overlayIngressLinkID && overlayEgressIdentity.linkID == overlayEgressLinkID,
+                   "host_tcx_retention_runtime_owner_adopts_existing_overlay_links");
+      BPFProgram::closeTCXIdentity(overlayIngressIdentity);
+      BPFProgram::closeTCXIdentity(overlayEgressIdentity);
+    }
+    suite.expect(BPFProgram::openTCXIdentity(pair.peer.ifidx, BPF_TCX_INGRESS, retained.ingress.programID, overlayIngressIdentity) &&
+                 BPFProgram::openTCXIdentity(pair.peer.ifidx, BPF_TCX_EGRESS, retained.egress.programID, overlayEgressIdentity) &&
+                 overlayIngressIdentity.linkID == overlayIngressLinkID && overlayEgressIdentity.linkID == overlayEgressLinkID,
+                 "host_tcx_retention_adopted_owner_close_preserves_original_overlay_links");
+    BPFProgram::closeTCXIdentity(overlayIngressIdentity);
+    BPFProgram::closeTCXIdentity(overlayEgressIdentity);
+  BPFProgram overlayEgress = {}, overlayIngress = {};
+  const bool overlayOpened = configured &&
+      overlayEgress.loadPreattached(BPF_TCX_EGRESS, pair.peer.ifidx, retained.egress.programID, egressObjectPath) &&
+      overlayIngress.loadPreattached(BPF_TCX_INGRESS, pair.peer.ifidx, retained.ingress.programID, ingressObjectPath);
+  suite.expect(overlayOpened, "host_tcx_retention_adopts_shared_overlay_programs");
+  suite.expect(overlayOpened && switchboardAliasPinnedWormholeFlowMaps(pair.host.ifidx, pair.peer.ifidx) &&
+               switchboardProgramUsesPinnedWormholeFlowMaps(&overlayEgress, pair.peer.ifidx,
+                                                             SwitchboardWormholeMapConsumer::forwarding),
+               "host_tcx_retention_aliases_primary_overlay_maps_per_ifindex");
+  SwitchboardHostTCXRetentionPair overlayRetained = {};
+  bool overlayRetentionPresent = true;
+  suite.expect(overlayOpened &&
+               switchboardHostTCXReadRetainedPair(pair.peer, "/sys/fs/bpf"_ctv, overlayRetained, overlayRetentionPresent) &&
+               overlayRetentionPresent == false,
+               "host_tcx_retention_runtime_owner_does_not_create_overlay_retention_pins");
+  overlayEgress.close();
+  overlayIngress.close();
+  }
+  BPFProgram::TCXIdentity afterOverlayIngress = {}, afterOverlayEgress = {};
+  suite.expect(BPFProgram::openTCXIdentity(pair.peer.ifidx, BPF_TCX_INGRESS, retained.ingress.programID, afterOverlayIngress) == false &&
+               BPFProgram::openTCXIdentity(pair.peer.ifidx, BPF_TCX_EGRESS, retained.egress.programID, afterOverlayEgress) == false,
+               "host_tcx_retention_runtime_owner_close_releases_overlay_links");
+  BPFProgram::closeTCXIdentity(afterOverlayIngress);
+  BPFProgram::closeTCXIdentity(afterOverlayEgress);
+  primaryIngress.close();
+  primaryEgress.close();
+
+  // Exercise kernel-ID adoption, not the original object which also owns
+  // declared maps that this program does not consume.
+  BPFProgram reopenedEgress = {};
+  suite.expect(reopenedEgress.loadPreattached(BPF_TCX_EGRESS, pair.host.ifidx,
+                                             retained.egress.programID, egressObjectPath),
+               "host_tcx_retention_reopens_exact_egress_program_and_link");
+  bool consumesGrants = false;
+  reopenedEgress.openMap("wh_pair_grants"_ctv, [&](int fd) { consumesGrants = fd >= 0; });
+  suite.expect(!consumesGrants, "host_tcx_retention_host_egress_does_not_consume_grants");
+  suite.expect(!switchboardProgramUsesPinnedWormholeFlowMaps(&reopenedEgress, pair.host.ifidx),
+               "host_tcx_retention_admission_role_still_requires_grants");
+  suite.expect(switchboardProgramUsesPinnedWormholeFlowMaps(&reopenedEgress, pair.host.ifidx,
+                                                          SwitchboardWormholeMapConsumer::forwarding),
+               "host_tcx_retention_reopened_egress_preserves_consumed_maps");
+  suite.expect(switchboardPinWormholeFlowMaps(&reopenedEgress, pair.host.ifidx,
+                                            SwitchboardWormholeMapConsumer::forwarding),
+               "host_tcx_retention_reopened_egress_reuses_authoritative_pins");
+  String grantPin = {};
+  switchboardPairAdmissionGrantPinPath(grantPin, pair.host.ifidx);
+  int grantFD = bpf_obj_get(grantPin.c_str());
+  suite.expect(grantFD >= 0 && ::unlink(grantPin.c_str()) == 0,
+               "host_tcx_retention_temporarily_removes_private_grant_pin");
+  suite.expect(!switchboardPinWormholeFlowMaps(&reopenedEgress, pair.host.ifidx,
+                                             SwitchboardWormholeMapConsumer::forwarding),
+               "host_tcx_retention_reopened_forwarder_cannot_create_missing_grant_authority");
+  int unexpectedGrantFD = bpf_obj_get(grantPin.c_str());
+  suite.expect(unexpectedGrantFD < 0 && errno == ENOENT,
+               "host_tcx_retention_failed_pin_reuse_does_not_create_authority");
+  if (unexpectedGrantFD >= 0) ::close(unexpectedGrantFD);
+  suite.expect(grantFD >= 0 && bpf_obj_pin(grantFD, grantPin.c_str()) == 0,
+               "host_tcx_retention_restores_original_private_grant_pin");
+  if (grantFD >= 0) ::close(grantFD);
+  suite.expect(switchboardPinWormholeFlowMaps(&reopenedEgress, pair.host.ifidx,
+                                            SwitchboardWormholeMapConsumer::forwarding),
+               "host_tcx_retention_reuses_same_pins_after_authority_restored");
+  suite.expect(switchboardHostTCXVerifyRetainedPair(pair.host, "/sys/fs/bpf"_ctv, retained),
+               "host_tcx_retention_reopening_and_pin_reuse_preserve_identity");
+  reopenedEgress.close();
 
   SwitchboardHostTCXRetentionPair wrong = retained;
   wrong.ingress.linkID += 1;

@@ -812,6 +812,7 @@ static void serialize(S&& serializer, ProdigyPersistentLocalBrainState& state)
   }
   constexpr uint64_t pairMarker = 0x5041495250524a31ULL;
   constexpr uint64_t pairEpochMarker = 0x5041495250524a32ULL;
+  constexpr uint64_t pairPrivateDiscoveryMarker = 0x5041495250524a33ULL;
   constexpr uint64_t lifecycleMarker = 0x41454749534c4351ULL;
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
@@ -820,7 +821,8 @@ static void serialize(S&& serializer, ProdigyPersistentLocalBrainState& state)
       const bool emitsPairEpochLayout =
           state.clusterPairControlProjection.protocolVersion >= ProdigyLocalClusterPairControlProjection::version &&
           !state.clusterPairControlProjection.epochStatuses.empty();
-      uint64_t marker = emitsPairEpochLayout ? pairEpochMarker : pairMarker;
+      uint64_t marker = !state.clusterPairControlProjection.privateDiscoveryStatuses.empty() ? pairPrivateDiscoveryMarker :
+          (emitsPairEpochLayout ? pairEpochMarker : pairMarker);
       serializer.value8b(marker);
       if constexpr (requires { serializer.detachPersistentValue(state.clusterPairControlProjection.credentials.front()); })
         for (auto& credential : state.clusterPairControlProjection.credentials)
@@ -845,12 +847,13 @@ static void serialize(S&& serializer, ProdigyPersistentLocalBrainState& state)
     {
       uint64_t marker = 0;
       serializer.value8b(marker);
-      if ((marker == pairMarker || marker == pairEpochMarker) && !pairSeen && !lifecycleSeen)
+      if ((marker == pairMarker || marker == pairEpochMarker || marker == pairPrivateDiscoveryMarker) && !pairSeen && !lifecycleSeen)
       {
         pairSeen = true;
         serializer.object(state.clusterPairControlProjection);
         if ((marker == pairMarker && state.clusterPairControlProjection.protocolVersion != 1) ||
             (marker == pairEpochMarker && state.clusterPairControlProjection.protocolVersion != 2) ||
+            (marker == pairPrivateDiscoveryMarker && state.clusterPairControlProjection.protocolVersion != 3) ||
             !prodigyLocalClusterPairControlProjectionValid(state.clusterPairControlProjection, false))
         { serializer.adapter().error(bitsery::ReaderError::InvalidData); return; }
       }

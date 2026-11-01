@@ -146,7 +146,7 @@ static void serialize(S&& serializer, MothershipProductionCredentialIdentity& va
 // protocol. The application owns the meaning and enforcement of these proofs.
 class MothershipProductionStatefulIntent {
 public:
-  uint32_t contractVersion = 1;
+  uint32_t contractVersion = StatefulDataAuthority::version;
   String contractSHA256;
   String shardManifestSHA256;
   uint128_t datasetUUID = 0;
@@ -161,6 +161,7 @@ public:
   uint64_t fencedCatchupEpoch = 0;
   uint64_t sourceRetainedEpoch = 0;
   uint32_t shardGroup = 0;
+  uint32_t nShardGroups = 0;
   uint128_t previousOperationUUID = 0;
   uint64_t previousAuthorityEpoch = 0;
   Vector<ProdigyStatefulServingAuthorityMember> cohort;
@@ -170,6 +171,52 @@ public:
   Vector<MothershipProductionCredentialIdentity> credentials;
   String targetDeploymentPlan;
 };
+
+// Operator input for a read-only Nametag preparation.  Application facts and
+// lifecycle receipts deliberately have no representation here: those arrive
+// only from authenticated owners after this request has been accepted.
+class MothershipNametagStatefulPreparationRequest {
+public:
+  static constexpr uint32_t version = 3;
+  uint32_t protocolVersion = version;
+  uint128_t operationUUID = 0;
+  uint128_t routeUUID = 0;
+  uint128_t sourceClusterUUID = 0;
+  uint128_t targetClusterUUID = 0;
+  uint64_t sourceDeploymentID = 0;
+  uint32_t shardGroup = UINT32_MAX;
+  String targetDeploymentPlan;
+  Vector<MothershipProductionCredentialIdentity> credentials;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipNametagStatefulPreparationRequest& value)
+{
+  serializer.value4b(value.protocolVersion); serializer.value16b(value.operationUUID);
+  serializer.value16b(value.routeUUID); serializer.value16b(value.sourceClusterUUID);
+  serializer.value16b(value.targetClusterUUID); serializer.value8b(value.sourceDeploymentID);
+  serializer.value4b(value.shardGroup);
+  serializer.text1b(value.targetDeploymentPlan, 1024 * 1024); serializer.container(value.credentials, 256);
+}
+
+static inline bool mothershipNametagStatefulPreparationRequestValid(
+    const MothershipNametagStatefulPreparationRequest& request)
+{
+  if (request.protocolVersion != MothershipNametagStatefulPreparationRequest::version || request.operationUUID == 0 ||
+      request.routeUUID == 0 || request.sourceClusterUUID == 0 || request.targetClusterUUID == 0 ||
+      request.sourceClusterUUID == request.targetClusterUUID || request.sourceDeploymentID == 0 ||
+      request.shardGroup > UINT16_MAX ||
+      request.targetDeploymentPlan.empty()) return false;
+  const MothershipProductionCredentialIdentity *previous = nullptr;
+  for (const auto& credential : request.credentials) {
+    if (credential.clusterUUID == 0 || credential.name.empty() || credential.generation == 0 ||
+        !prodigyIsSHA256HexDigest(credential.applyReceiptSHA256) || (previous &&
+        (credential.clusterUUID < previous->clusterUUID || (credential.clusterUUID == previous->clusterUUID &&
+         !prodigyPersistentStringComesBefore(previous->name, credential.name))))) return false;
+    previous = &credential;
+  }
+  return true;
+}
 
 template <typename S>
 static void serialize(S&& serializer, MothershipProductionStatefulIntent& value)
@@ -189,6 +236,7 @@ static void serialize(S&& serializer, MothershipProductionStatefulIntent& value)
   serializer.value8b(value.fencedCatchupEpoch);
   serializer.value8b(value.sourceRetainedEpoch);
   serializer.value4b(value.shardGroup);
+  serializer.value4b(value.nShardGroups);
   serializer.value16b(value.previousOperationUUID);
   serializer.value8b(value.previousAuthorityEpoch);
   serializer.container(value.cohort, 4096);
@@ -243,7 +291,7 @@ static void serialize(S&& serializer, MothershipProductionStatefulReceipt& value
 class MothershipProductionPairIntent {
 public:
   static constexpr uint32_t version = 6;
-  static constexpr uint32_t statefulVersion = 7;
+  static constexpr uint32_t statefulVersion = 8;
 
   uint32_t protocolVersion = version;
   uint128_t operationUUID = 0;
@@ -370,8 +418,8 @@ static inline bool mothershipProductionPairIntentValid(const MothershipProductio
       source.slots != route.slots || destination.slots != route.slots ||
       source.permissionUUID != route.sourcePermissionUUID || destination.permissionUUID != route.destinationPermissionUUID ||
       (!stateful && source.localDeploymentID == destination.localDeploymentID) ||
-      intent.sourceWorkload.clusterUUID != route.sourceClusterUUID ||
-      intent.targetWorkload.clusterUUID != route.destinationClusterUUID ||
+      (!stateful && (intent.sourceWorkload.clusterUUID != route.sourceClusterUUID ||
+                     intent.targetWorkload.clusterUUID != route.destinationClusterUUID)) ||
       (!stateful && intent.ingressWitnessMachineUUID == intent.selectorMachineUUID) ||
       (!stateful && intent.sourceWorkload.deploymentID == source.localDeploymentID) ||
       (!stateful && intent.targetWorkload.deploymentID == destination.localDeploymentID) ||
@@ -387,8 +435,28 @@ static inline bool mothershipProductionPairIntentValid(const MothershipProductio
   if (stateful)
   {
     const auto& data = intent.stateful;
+    const bool reversed = route.sourceClusterUUID == intent.targetWorkload.clusterUUID &&
+        route.destinationClusterUUID == intent.sourceWorkload.clusterUUID;
+    const auto& routeSourceWorkload = intent.targetWorkload;
+    const auto& routeDestinationWorkload = intent.sourceWorkload;
+    uint16_t routeSlot = 0;
+    // Hot/Cold is the fixed three-group production topology.  Keeping this at
+    // the durable intent owner makes both fresh preparation and resume reject
+    // a differently-cardinalized transfer before any phase can advance.
+    const bool exactShardSlot = data.nShardGroups == 3 &&
+        prodigyCousinServicePermissionSingleSlot(source, routeSlot) &&
+        statefulServiceGroupOwnerForSlot(routeSlot, uint16_t(data.nShardGroups)) == data.shardGroup;
     if ((intent.sourceWorkload.applicationID != 3 && intent.sourceWorkload.applicationID != 4) ||
-        data.contractVersion != 1 || !prodigyIsSHA256HexDigest(data.contractSHA256) ||
+        !reversed ||
+        source.localDeploymentID != routeSourceWorkload.deploymentID ||
+        source.localApplicationID != routeSourceWorkload.applicationID ||
+        source.canonicalPlanSHA256 != routeSourceWorkload.canonicalPlanSHA256 ||
+        source.artifactSHA256 != routeSourceWorkload.artifactSHA256 || source.artifactBytes != routeSourceWorkload.artifactBytes ||
+        destination.localDeploymentID != routeDestinationWorkload.deploymentID ||
+        destination.localApplicationID != routeDestinationWorkload.applicationID ||
+        destination.canonicalPlanSHA256 != routeDestinationWorkload.canonicalPlanSHA256 ||
+        destination.artifactSHA256 != routeDestinationWorkload.artifactSHA256 || destination.artifactBytes != routeDestinationWorkload.artifactBytes ||
+        data.contractVersion != StatefulDataAuthority::version || !prodigyIsSHA256HexDigest(data.contractSHA256) ||
         !prodigyIsSHA256HexDigest(data.shardManifestSHA256) || data.datasetUUID == 0 || data.snapshotUUID == 0 ||
         (!data.snapshotBoundarySHA256.empty() && !prodigyIsSHA256HexDigest(data.snapshotBoundarySHA256)) ||
         (!data.sourceDurableWatermarkSHA256.empty() && !prodigyIsSHA256HexDigest(data.sourceDurableWatermarkSHA256)) || data.sourceFenceEpoch == 0 ||
@@ -397,8 +465,8 @@ static inline bool mothershipProductionPairIntentValid(const MothershipProductio
         (data.previousAuthorityEpoch != 0 && data.snapshotPreparingEpoch <= data.previousAuthorityEpoch) ||
         data.sourceFenceEpoch <= data.initialCatchupEpoch || data.fencedCatchupEpoch <= data.sourceFenceEpoch ||
         data.targetOwnershipEpoch <= data.fencedCatchupEpoch || data.sourceRetainedEpoch <= data.targetOwnershipEpoch ||
-        !route.slots.contains(uint16_t(data.shardGroup)) ||
-        data.shardGroup > UINT16_MAX || data.cohort.size() != 3 || data.targetMachineUUIDs.size() != 3 ||
+        !exactShardSlot || data.shardGroup >= data.nShardGroups || data.shardGroup > UINT16_MAX ||
+        data.cohort.size() != 3 || data.targetMachineUUIDs.size() != 3 ||
         !prodigyIsSHA256HexDigest(data.credentialManifestSHA256) ||
         data.credentialCount != data.credentials.size() || data.credentials.size() > 256)
       return reject("Nametag stateful pair requires Hot/Cold and an exact versioned data, epoch, cohort and credential contract");
@@ -454,9 +522,10 @@ static inline bool mothershipProductionPairIntentValid(const MothershipProductio
         targetPlan.config.containerBlobSHA256 != intent.targetWorkload.artifactSHA256 ||
         targetPlan.config.containerBlobBytes != intent.targetWorkload.artifactBytes ||
         targetPlan.stateful.allMasters || targetPlan.useHostNetworkNamespace || !targetPlan.wormholes.empty() ||
-        !targetPlan.whiteholes.empty() || !targetPlan.horizontalScalers.empty() || !targetPlan.verticalScalers.empty() ||
+        !prodigyCousinAutomaticWhiteholePlanValid(targetPlan.whiteholes) ||
+        !targetPlan.horizontalScalers.empty() || !targetPlan.verticalScalers.empty() ||
         targetPlan.canaryCount != 0)
-      return reject("Nametag target admission requires the exact internal-only deployment and Discombobobulator artifact plan");
+      return reject("Nametag target admission requires the exact outbound IPv6/TCP COUSIN deployment and Discombobulator artifact plan");
   }
   return true;
 }
@@ -538,11 +607,12 @@ static inline bool mothershipProductionStatefulReceiptValid(const MothershipProd
          ? !prodigyStatefulDataAuthorityReceiptStaged(observed.receipt) : !observed.receipt.ready) ||
         data.operationUUID != intent.operationUUID || data.datasetUUID != intent.stateful.datasetUUID ||
         data.snapshotUUID != intent.stateful.snapshotUUID || data.shardGroup != intent.stateful.shardGroup ||
-        data.previousOperationUUID != intent.stateful.previousOperationUUID || data.sourceClusterUUID != intent.route.sourceClusterUUID ||
+        data.nShardGroups != intent.stateful.nShardGroups ||
+        data.previousOperationUUID != intent.stateful.previousOperationUUID || data.sourceClusterUUID != intent.sourceWorkload.clusterUUID ||
         data.previousAuthorityEpoch != intent.stateful.previousAuthorityEpoch ||
-        data.targetClusterUUID != intent.route.destinationClusterUUID ||
-        data.localClusterUUID != (source ? intent.route.sourceClusterUUID : intent.route.destinationClusterUUID) ||
-        data.writeOwnerClusterUUID != ((active || cleanup) ? intent.route.destinationClusterUUID : intent.route.sourceClusterUUID) ||
+        data.targetClusterUUID != intent.targetWorkload.clusterUUID ||
+        data.localClusterUUID != (source ? intent.sourceWorkload.clusterUUID : intent.targetWorkload.clusterUUID) ||
+        data.writeOwnerClusterUUID != ((active || cleanup) ? intent.targetWorkload.clusterUUID : intent.sourceWorkload.clusterUUID) ||
         data.authorityEpoch != (retained ? intent.stateful.sourceRetainedEpoch : (preparing ? intent.stateful.snapshotPreparingEpoch :
           (proof.phase == MothershipProductionPairPhase::catchupVerified ? intent.stateful.initialCatchupEpoch :
            (source ? intent.stateful.sourceFenceEpoch :
@@ -554,10 +624,104 @@ static inline bool mothershipProductionStatefulReceiptValid(const MothershipProd
   return true;
 }
 
+// Separate from production_pairs: preparation is durable evidence, not pair
+// admission. The exact request digest makes retries byte-stable across restart
+// while refusing a different request under the same operation UUID.
+class MothershipNametagStatefulPreparationRecord {
+public:
+  static constexpr uint32_t version = 1;
+  uint32_t protocolVersion = version;
+  String requestSHA256;
+  MothershipProductionPairIntent intent;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipNametagStatefulPreparationRecord& value)
+{
+  serializer.value4b(value.protocolVersion); serializer.text1b(value.requestSHA256, 64); serializer.object(value.intent);
+}
+
+static inline bool mothershipNametagStatefulPreparationRecordValid(
+    const MothershipNametagStatefulPreparationRecord& record)
+{
+  return record.protocolVersion == MothershipNametagStatefulPreparationRecord::version &&
+      prodigyIsSHA256HexDigest(record.requestSHA256) &&
+      record.intent.protocolVersion == MothershipProductionPairIntent::statefulVersion &&
+      mothershipProductionPairIntentValid(record.intent);
+}
+
+static inline bool mothershipSynthesizeNametagStatefulPreparation(
+    const MothershipNametagStatefulPreparationRequest& request, const CousinRouteRecord& route,
+    const ProdigyLocalCousinServicePermission& sourcePermission,
+    const ProdigyLocalCousinServicePermission& destinationPermission,
+    const CousinRouteApplyReceipt& sourceReceipt, const CousinRouteApplyReceipt& destinationReceipt,
+    const MothershipProductionWorkloadIdentity& sourceWorkload,
+    const MothershipProductionWorkloadIdentity& targetWorkload,
+    const StatefulDataAuthorityPreparation& challenge,
+    const Vector<ProdigyStatefulServingAuthorityMember>& cohort,
+    const Vector<StatefulDataAuthorityPreparationMember>& observations,
+    const Vector<uint128_t>& targetMachines, uint128_t mintedDatasetUUID, uint128_t mintedSnapshotUUID,
+    MothershipProductionPairIntent& intent, String *failure = nullptr)
+{
+  if (failure) failure->clear();
+  auto reject = [&](const char *reason) { if (failure) failure->assign(reason); return false; };
+  if (!mothershipNametagStatefulPreparationRequestValid(request) || !cousinRouteCurrentContract(route) ||
+      route.state != CousinRouteState::active || request.routeUUID != route.routeUUID ||
+      request.sourceClusterUUID != sourceWorkload.clusterUUID ||
+      request.targetClusterUUID != targetWorkload.clusterUUID ||
+      request.sourceDeploymentID != sourceWorkload.deploymentID ||
+      route.sourceClusterUUID != targetWorkload.clusterUUID ||
+      route.destinationClusterUUID != sourceWorkload.clusterUUID ||
+      sourceWorkload.applicationID != targetWorkload.applicationID ||
+      (sourceWorkload.applicationID != 3 && sourceWorkload.applicationID != 4) ||
+      request.shardGroup != challenge.shardGroup || challenge.nShardGroups != 3 ||
+      request.shardGroup >= challenge.nShardGroups ||
+      !prodigyStatefulDataAuthorityPreparationMembersAgree(challenge, cohort, observations) ||
+      targetMachines.size() != 3 || !mothershipProductionWorkloadIdentityValid(sourceWorkload, true) ||
+      !mothershipProductionWorkloadIdentityValid(targetWorkload, true))
+    return reject("Nametag preparation requires exact Hot/Cold identities and unanimous source evidence");
+  uint128_t previousMachine = 0;
+  for (uint128_t machine : targetMachines) { if (machine == 0 || machine <= previousMachine) return reject("Nametag preparation target cohort is not canonical"); previousMachine = machine; }
+  const auto& proof = observations.front().preparation;
+  const bool established = proof.hasAuthority;
+  if (established && (proof.datasetUUID == 0 || proof.currentAuthority.localClusterUUID != sourceWorkload.clusterUUID ||
+                      proof.currentAuthority.writeOwnerClusterUUID != sourceWorkload.clusterUUID ||
+                      proof.currentAuthority.mode != StatefulDataAuthorityMode::writeOwner))
+    return reject("Nametag preparation source authority is not the current writer lineage");
+  if (!established && (mintedDatasetUUID == 0 || proof.datasetUUID != 0 || proof.mode != StatefulDataAuthorityMode::writeOwner ||
+                       proof.writeOwnerClusterUUID != sourceWorkload.clusterUUID))
+    return reject("Nametag preparation virgin source evidence is invalid");
+  if (mintedSnapshotUUID == 0) return reject("Nametag preparation cannot mint snapshot identity");
+  const uint64_t baseEpoch = established ? proof.currentAuthority.authorityEpoch : 0;
+  if (baseEpoch > UINT64_MAX - 6) return reject("Nametag preparation authority epoch exhausted");
+  intent = {}; intent.protocolVersion = MothershipProductionPairIntent::statefulVersion; intent.operationUUID = request.operationUUID;
+  intent.route = route; intent.sourcePermission = sourcePermission; intent.destinationPermission = destinationPermission;
+  intent.sourceRouteReceipt = sourceReceipt; intent.destinationRouteReceipt = destinationReceipt;
+  intent.sourceWorkload = sourceWorkload; intent.targetWorkload = targetWorkload;
+  auto& data = intent.stateful;
+  data.contractVersion = proof.contractVersion; data.contractSHA256 = proof.contractSHA256;
+  data.shardManifestSHA256 = proof.shardManifestSHA256; data.datasetUUID = established ? proof.datasetUUID : mintedDatasetUUID;
+  data.snapshotUUID = mintedSnapshotUUID; data.snapshotBoundarySHA256.clear();
+  data.sourceDurableWatermark = proof.durableWatermark; data.sourceDurableWatermarkSHA256 = proof.durableWatermarkSHA256;
+  data.snapshotPreparingEpoch = baseEpoch + 1; data.initialCatchupEpoch = baseEpoch + 2;
+  data.sourceFenceEpoch = baseEpoch + 3; data.fencedCatchupEpoch = baseEpoch + 4;
+  data.targetOwnershipEpoch = baseEpoch + 5; data.sourceRetainedEpoch = baseEpoch + 6;
+  data.shardGroup = challenge.shardGroup; data.nShardGroups = challenge.nShardGroups;
+  data.previousOperationUUID = established ? proof.currentAuthority.operationUUID : 0;
+  data.previousAuthorityEpoch = established ? proof.currentAuthority.authorityEpoch : 0;
+  data.cohort = cohort; data.targetMachineUUIDs = targetMachines; data.credentials = request.credentials;
+  data.credentialCount = data.credentials.size(); data.targetDeploymentPlan = request.targetDeploymentPlan;
+  String credentials; auto copy = data.credentials;
+  if (!BitseryEngine::serialize(credentials, copy) ||
+      !prodigyComputeSHA256Hex(credentials, data.credentialManifestSHA256))
+    return reject("Nametag preparation cannot hash credential manifest");
+  return mothershipProductionPairIntentValid(intent, failure);
+}
+
 class MothershipProductionPairRecord {
 public:
   static constexpr uint32_t version = 2;
-  static constexpr uint32_t statefulVersion = 3;
+  static constexpr uint32_t statefulVersion = 4;
 
   uint32_t protocolVersion = version;
   MothershipProductionPairIntent intent = {};
@@ -794,12 +958,14 @@ static inline bool mothershipProductionPairStatefulCommand(const MothershipProdu
   command.cohort = source ? data.cohort : Vector<ProdigyStatefulServingAuthorityMember>{};
   command.deploymentPlan = source ? String() : data.targetDeploymentPlan;
   authority.operationUUID = intent.operationUUID; authority.previousOperationUUID = data.previousOperationUUID;
+  authority.contractVersion = data.contractVersion;
   authority.previousAuthorityEpoch = data.previousAuthorityEpoch;
   authority.datasetUUID = data.datasetUUID; authority.snapshotUUID = data.snapshotUUID;
-  authority.sourceClusterUUID = intent.route.sourceClusterUUID; authority.targetClusterUUID = intent.route.destinationClusterUUID;
+  authority.sourceClusterUUID = intent.sourceWorkload.clusterUUID; authority.targetClusterUUID = intent.targetWorkload.clusterUUID;
   authority.localClusterUUID = source ? authority.sourceClusterUUID : authority.targetClusterUUID;
   authority.writeOwnerClusterUUID = active || cleanup ? authority.targetClusterUUID : authority.sourceClusterUUID;
-  authority.shardGroup = data.shardGroup; authority.contractSHA256 = data.contractSHA256;
+  authority.shardGroup = data.shardGroup; authority.nShardGroups = data.nShardGroups;
+  authority.contractSHA256 = data.contractSHA256;
   authority.shardManifestSHA256 = data.shardManifestSHA256;
   authority.mode = cleanup ? StatefulDataAuthorityMode::retainedSource : (preparing ? StatefulDataAuthorityMode::snapshotPreparing :
       (source ? StatefulDataAuthorityMode::fenced : (active ? StatefulDataAuthorityMode::writeOwner : StatefulDataAuthorityMode::catchupOnly)));

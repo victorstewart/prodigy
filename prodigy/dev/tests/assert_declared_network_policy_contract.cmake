@@ -158,12 +158,20 @@ endif()
 math(EXPR _finish_restore_length "${_finish_restore_end} - ${_finish_restore_start}")
 string(SUBSTRING "${_containers}" ${_finish_restore_start} ${_finish_restore_length} _finish_restore)
 string(FIND "${_finish_restore}" "primary_program = netdevs.host.loadPreattachedProgram" _finish_primary_load)
-string(FIND "${_finish_restore}" "if (peer_program == nullptr || primary_program == nullptr || wormholeFlowMapsShared() == false)" _finish_wormhole_gate)
+string(FIND "${_finish_restore}" "containerPreattachedProgramState" _finish_primary_query)
+string(FIND "${_finish_restore}" "primaryState != ContainerPreattachedProgramState::absent" _finish_absent_only)
+string(FIND "${_finish_restore}" "attachContainerIngressProgram(netdevs.host, path, tcpFlowMapReused, true)" _finish_primary_repair)
+string(FIND "${_finish_restore}" "switchboardProgramUsesPinnedWormholeFlowMaps(peer_program" _finish_peer_maps)
+string(FIND "${_finish_restore}" "peerPolicyRead" _finish_retained_isolation)
+string(FIND "${_finish_restore}" "if (peer_program == nullptr || primary_program == nullptr || wormholeFlowMapsShared() == false ||" _finish_wormhole_gate)
 string(FIND "${_finish_restore}" "peer_program->setArrayElement(\"lc_subnet\"_ctv" _finish_peer_write)
 string(FIND "${_finish_restore}" "thisNeuron->syncWhiteholeBindingsForContainerPeer(this);" _finish_whitehole_sync)
-if(_finish_primary_load EQUAL -1 OR _finish_wormhole_gate LESS_EQUAL _finish_primary_load OR
+if(_finish_primary_load EQUAL -1 OR _finish_primary_query GREATER_EQUAL _finish_primary_load OR
+   _finish_absent_only LESS_EQUAL _finish_primary_query OR _finish_primary_repair LESS_EQUAL _finish_absent_only OR
+   _finish_peer_maps LESS_EQUAL _finish_absent_only OR _finish_retained_isolation LESS_EQUAL _finish_peer_maps OR
+   _finish_wormhole_gate LESS_EQUAL _finish_primary_repair OR
    _finish_peer_write LESS_EQUAL _finish_wormhole_gate OR _finish_whitehole_sync LESS_EQUAL _finish_wormhole_gate)
-   message(FATAL_ERROR "retained network restoration must validate preattached wormhole maps before map writes or peer synchronization")
+   message(FATAL_ERROR "retained network restoration must repair only an absent primary after validating peer pins and isolation")
 endif()
 
 file(GLOB_RECURSE _ebpf_sources

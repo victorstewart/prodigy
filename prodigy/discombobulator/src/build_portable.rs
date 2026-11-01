@@ -486,6 +486,7 @@ fn output_kind_name(kind: OutputKindArg) -> &'static str {
         OutputKindArg::App => "app",
         OutputKindArg::Base => "base",
         OutputKindArg::MothershipTunnelProvider => "mothership-tunnel-provider",
+        OutputKindArg::CrossClusterMasqueGateway => "cross-cluster-masque-gateway",
     }
 }
 

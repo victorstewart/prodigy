@@ -12,6 +12,8 @@ foreach(REQUIRED IN ITEMS
    "depos_link(prodigy_dns_resolver PRIVATE basics::basics)"
    "set(PRODIGY_CARES_TARGETS"
    "prodigy_mothership_host_runtime_unit"
+   "\"\${PRODIGY_ROOT}/prodigy/dns/DiscombobuFile.in\""
+   "\"\${PRODIGY_DNS_RESOLVER_DISCOMBOBUFILE}\""
    "--kind app"
    "--container-artifact \"\${PRODIGY_DNS_RESOLVER_CONTAINER_ARTIFACT}\""
    "--container-plan \"\${PRODIGY_DNS_RESOLVER_DEPLOYMENT_PLAN}\"")
@@ -20,13 +22,27 @@ foreach(REQUIRED IN ITEMS
       message(FATAL_ERROR "DNS resolver build contract missing: ${REQUIRED}")
    endif()
 endforeach()
+string(FIND "${BUILD}" "OUTPUT \"\${PRODIGY_DNS_RESOLVER_CONTAINER_ARTIFACT}\"" DNS_BUILD_START)
+string(FIND "${BUILD}" "add_custom_target(prodigy_dns_resolver_container" DNS_BUILD_END)
+if (DNS_BUILD_START EQUAL -1 OR DNS_BUILD_END LESS DNS_BUILD_START)
+   message(FATAL_ERROR "DNS resolver artifact build command is missing")
+endif()
+math(EXPR DNS_BUILD_LENGTH "${DNS_BUILD_END} - ${DNS_BUILD_START}")
+string(SUBSTRING "${BUILD}" ${DNS_BUILD_START} ${DNS_BUILD_LENGTH} DNS_BUILD)
+foreach(REQUIRED IN ITEMS "remote add dockerhub docker.io" "--file \"\${PRODIGY_DNS_RESOLVER_DISCOMBOBUFILE}\""
+   "--kind app" "WORKING_DIRECTORY \"\${CMAKE_BINARY_DIR}\"")
+   string(FIND "${DNS_BUILD}" "${REQUIRED}" OFFSET)
+   if (OFFSET EQUAL -1)
+      message(FATAL_ERROR "DNS resolver artifact command missing: ${REQUIRED}")
+   endif()
+endforeach()
 string(FIND "${BUILD}" "target_compile_definitions(prodigy_dns_resolver " DEBUG_OFFSET)
 if (NOT DEBUG_OFFSET EQUAL -1)
    message(FATAL_ERROR "DNS resolver production artifact must not enable diagnostic logging")
 endif()
 
 foreach(REQUIRED IN ITEMS
-   "FROM scratch for @PRODIGY_RESOLVED_TARGET_ARCH@"
+   "FROM @PRODIGY_MASQUE_GATEWAY_RUNTIME_BASE@"
    "COPY {resolver} ./prodigy-dns-resolver /app/prodigy-dns-resolver"
    "SURVIVE /app/prodigy-dns-resolver"
    "EXECUTE [\"/app/prodigy-dns-resolver\"]")
@@ -41,6 +57,10 @@ foreach(FORBIDDEN IN ITEMS ".ebpf.o" "ingress" "egress" "/root/prodigy")
       message(FATAL_ERROR "DNS resolver app artifact contains forbidden payload: ${FORBIDDEN}")
    endif()
 endforeach()
+
+if (DNS_RESOLVER_RECIPE_CONTRACT_ONLY)
+   return()
+endif()
 
 string(JSON APPLICATION_ID GET "${PLAN}" config applicationID)
 string(JSON ARCHITECTURE GET "${PLAN}" config architecture)

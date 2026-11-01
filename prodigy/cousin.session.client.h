@@ -9,6 +9,22 @@
 #include <unistd.h>
 #include <vector>
 
+static inline bool prodigyCousinSessionObservedSourceMatches(const sockaddr_storage& observed, socklen_t length,
+    const ProdigyCousinSessionRecord& session, const IPAddress& authenticatedSourceAddress = {})
+{
+  if (length < sizeof(sockaddr_in6) || observed.ss_family != AF_INET6) return false;
+  const auto& peer = reinterpret_cast<const sockaddr_in6&>(observed);
+  if (peer.sin6_scope_id != 0 || peer.sin6_port == 0) return false;
+  if (session.sourcePermission.transportSourcePolicy == ProdigyCousinTransportSourcePolicy::exact)
+    return ntohs(peer.sin6_port) == session.sourceTCPPort && std::memcmp(&peer.sin6_addr, session.sourceAddress.v6, 16) == 0;
+  IPAddress address = {}; address.is6 = true; std::memcpy(address.v6, &peer.sin6_addr, 16);
+  // This is an exact candidate filter, never authentication. The deferred AEGIS
+  // handshake below still verifies the complete 32-byte PSK and exact context,
+  // container/session identity and live lease before releasing payload bytes.
+  return prodigyCousinSessionTransportSourceValid(session) && prodigyCousinGlobalIPv6AddressValid(authenticatedSourceAddress) &&
+      address.equals(authenticatedSourceAddress) && ntohs(peer.sin6_port) == session.sourceTCPPort;
+}
+
 // Native application credential owner. The NeuronHub callback applies commands
 // here before acknowledging them. No enrollment root is exposed to this owner.
 struct ProdigyCousinSessionLease {
@@ -16,14 +32,31 @@ struct ProdigyCousinSessionLease {
   int64_t deadline = 0;
   bool live = true;
   bool claimed = false;
+  // A carrier FIN/reset/failure consumes this exact generation. A replacement
+  // command must provide a fresh UUID or generation before another stream can
+  // claim it, so a stale peer cannot replay an old open after interruption.
+  bool carrierRetired = false;
   bool current() const { return live && Time::msSinceBoot() < deadline; }
   void revoke() { live = false; OPENSSL_cleanse(command.psk.data(), command.psk.size()); }
+};
+
+// A read-only observation of the very lease guarding a negotiated stream.
+// It cannot extend the lease's lifetime or authorize a replacement stream.
+class ProdigyCousinSessionGuardObservation {
+  friend class ProdigyCousinSessionStream;
+  std::weak_ptr<ProdigyCousinSessionLease> lease;
+  std::weak_ptr<uint8_t> streamLifetime;
+  bool captured = false;
+public:
+  bool valid() const { return captured; }
+  bool current() const { auto owner = lease.lock(); return captured && !streamLifetime.expired() && owner && owner->current(); }
 };
 
 class ProdigyCousinSessionClient;
 class ProdigyCousinSessionStream : public ProdigyTransportTLSStream {
   friend class ProdigyCousinSessionClient;
   std::weak_ptr<ProdigyCousinSessionLease> lease;
+  std::shared_ptr<uint8_t> observationLifetime = std::make_shared<uint8_t>(0);
   uint128_t resolvedSessionUUID = 0;
   int64_t pendingDeadline = 0;
   bool resolving = false;
@@ -48,6 +81,16 @@ public:
     return guard() && ProdigyTransportTLSStream::decryptTransportTLS(bytes) && guard();
   }
   bool isTransportNegotiated() const { return authorized() && ProdigyTransportTLSStream::isTransportNegotiated(); }
+  ProdigyCousinSessionGuardObservation observeNegotiatedGuard() const
+  {
+    ProdigyCousinSessionGuardObservation observation;
+    if (!resolving && isTransportNegotiated()) {
+      observation.lease = lease;
+      observation.streamLifetime = observationLifetime;
+      observation.captured = true;
+    }
+    return observation;
+  }
   uint32_t nBytesToSend() override { return guard() ? ProdigyTransportTLSStream::nBytesToSend() : 0; }
   uint8_t *pBytesToSend() override { return guard() ? ProdigyTransportTLSStream::pBytesToSend() : nullptr; }
   uint64_t queuedSendOutstandingBytes() const override
@@ -73,6 +116,18 @@ class ProdigyCousinSessionClient {
   struct State {
     uint128_t containerUUID = 0;
     std::vector<std::shared_ptr<ProdigyCousinSessionLease>> leases;
+    // Terminal identities live for this authenticated local owner's lifetime.
+    // Never evict one and accidentally make an old generation-1 install fresh.
+    std::vector<uint128_t> retiredSessions;
+    bool retiredCapacityExhausted = false;
+    bool retired(uint128_t session) const
+    { return std::find(retiredSessions.begin(), retiredSessions.end(), session) != retiredSessions.end(); }
+    void retire(uint128_t session)
+    {
+      if (retired(session)) return;
+      if (retiredSessions.size() >= ProdigyCousinSessionMaximumRecords * 16) { retiredCapacityExhausted = true; return; }
+      retiredSessions.push_back(session);
+    }
     ~State() { for (auto& lease : leases) lease->revoke(); }
   };
   std::shared_ptr<State> state;
@@ -97,12 +152,9 @@ class ProdigyCousinSessionClient {
     return session != 0;
   }
   static bool observedSourceMatches(const sockaddr_storage& observed, socklen_t length,
-                                    const ProdigyCousinSessionRecord& session)
+                                    const ProdigyCousinSessionLocalCommand& command)
   {
-    if (length < sizeof(sockaddr_in6) || observed.ss_family != AF_INET6) return false;
-    const auto& peer = reinterpret_cast<const sockaddr_in6&>(observed);
-    return peer.sin6_scope_id == 0 && ntohs(peer.sin6_port) == session.sourceTCPPort &&
-        std::memcmp(&peer.sin6_addr, session.sourceAddress.v6, 16) == 0;
+    return prodigyCousinSessionObservedSourceMatches(observed, length, command.session, command.authenticatedSourceAddress);
   }
 public:
   // The socket owner closes matching live streams when this fires. Guards also
@@ -119,6 +171,7 @@ public:
     for (auto it = state->leases.begin(); it != state->leases.end();) {
       if ((*it)->current()) { ++it; continue; }
       expired.push_back((*it)->command.session.sessionUUID);
+      state->retire((*it)->command.session.sessionUUID);
       (*it)->revoke(); it = state->leases.erase(it);
     }
     for (auto session : expired) if (onSessionClosed) onSessionClosed(session);
@@ -135,9 +188,10 @@ public:
       return lease->command.session.sessionUUID == session.sessionUUID;
     });
     if (command.kind == ProdigyCousinSessionLocalKind::revoke) {
-      if (found == state->leases.end()) return true;
-      if ((*found)->command.localHalf != command.localHalf ||
+      if (found == state->leases.end()) { state->retire(session.sessionUUID); return true; }
+      if ((*found)->command.localHalf != command.localHalf || command.leaseGeneration != (*found)->command.leaseGeneration ||
           !prodigyCousinSessionExact((*found)->command.session, session)) return false;
+      state->retire(session.sessionUUID);
       (*found)->revoke(); state->leases.erase(found);
       if (onSessionClosed) onSessionClosed(session.sessionUUID);
       return true;
@@ -148,17 +202,20 @@ public:
           lease.command.leaseGeneration == UINT64_MAX || command.leaseGeneration != lease.command.leaseGeneration + 1 ||
           command.localHalf != lease.command.localHalf || !prodigyCousinSessionExact(lease.command.session, session) ||
           command.canonicalContext != lease.command.canonicalContext ||
+          command.protocolVersion != lease.command.protocolVersion ||
+          !command.authenticatedSourceAddress.equals(lease.command.authenticatedSourceAddress) ||
           CRYPTO_memcmp(command.psk.data(), lease.command.psk.data(), command.psk.size()) != 0) return false;
       lease.command.leaseGeneration = command.leaseGeneration;
       lease.deadline = Time::msSinceBoot() + command.validForMs;
       return true;
     }
     if (command.kind == ProdigyCousinSessionLocalKind::renew || command.leaseGeneration != 1 ||
-        state->leases.size() >= ProdigyCousinSessionMaximumRecords) return false;
+        state->leases.size() >= ProdigyCousinSessionMaximumRecords || state->retiredCapacityExhausted || state->retired(session.sessionUUID)) return false;
     if (command.localHalf == CousinRouteHalf::source) {
       for (const auto& lease : state->leases)
         if (lease->command.localHalf == CousinRouteHalf::source &&
-            lease->command.session.sourceBindingNonce == session.sourceBindingNonce) return false;
+            lease->command.session.sourceBindingNonce == session.sourceBindingNonce &&
+            prodigyCousinSourcePermissionsConflict(session.sourcePermission, lease->command.session.sourcePermission)) return false;
     }
     auto lease = std::make_shared<ProdigyCousinSessionLease>();
     lease->command = command; lease->deadline = Time::msSinceBoot() + command.validForMs;
@@ -198,6 +255,80 @@ public:
     return prepared;
   }
 
+  // Initialize the same authenticated session codec over an already-connected
+  // AF_UNIX carrier endpoint.  The caller owns that descriptor (normally one
+  // end of Neuron's bounded socketpair); this method deliberately performs no
+  // IPv6 bind, connect, listener, or peer-address check.
+  bool prepareReverseOutbound(uint128_t sessionUUID, ProdigyCousinSessionStream& stream)
+  {
+    expire();
+    if (state->containerUUID == 0 || stream.fd < 0 || stream.isFixedFile || stream.transportEncryptionEnabled()) return false;
+    int domain = 0; socklen_t domainLength = sizeof(domain);
+    int type = 0; socklen_t typeLength = sizeof(type);
+    if (getsockopt(stream.fd, SOL_SOCKET, SO_DOMAIN, &domain, &domainLength) != 0 || domainLength != sizeof(domain) ||
+        getsockopt(stream.fd, SOL_SOCKET, SO_TYPE, &type, &typeLength) != 0 || typeLength != sizeof(type) ||
+        domain != AF_UNIX || type != SOCK_STREAM) return false;
+    auto found = std::find_if(state->leases.begin(), state->leases.end(), [&](const auto& lease) {
+      return lease->command.session.sessionUUID == sessionUUID;
+    });
+    if (found == state->leases.end() || (*found)->claimed || (*found)->carrierRetired || (*found)->command.localHalf != CousinRouteHalf::source ||
+        !prodigyCousinReverseCarrierSessionValid((*found)->command.session)) return false;
+    auto lease = *found; lease->claimed = true; stream.lease = lease; stream.resolving = false;
+    std::weak_ptr<ProdigyCousinSessionLease> weak = lease;
+    const bool prepared = stream.beginTransportAEGISWithPrelude(false, state->containerUUID,
+        prelude(sessionUUID, CousinRouteHalf::source),
+        [weak](const String& peer, std::array<uint8_t, 32>& key, String& context, uint128_t& peerUUID) {
+          auto lease = weak.lock();
+          if (!lease || !lease->current() || peer != prelude(lease->command.session.sessionUUID, CousinRouteHalf::destination)) return false;
+          key = lease->command.psk; context = lease->command.canonicalContext;
+          peerUUID = lease->command.session.destination.containerUUID; return true;
+        });
+    if (prepared) stream.resolvedSessionUUID = sessionUUID;
+    else { lease->claimed = false; stream.lease.reset(); }
+    return prepared;
+  }
+
+  bool prepareReverseInbound(uint128_t sessionUUID, ProdigyCousinSessionStream& stream)
+  {
+    expire();
+    if (state->containerUUID == 0 || stream.fd < 0 || stream.isFixedFile || stream.transportEncryptionEnabled()) return false;
+    int domain = 0; socklen_t domainLength = sizeof(domain);
+    int type = 0; socklen_t typeLength = sizeof(type);
+    if (getsockopt(stream.fd, SOL_SOCKET, SO_DOMAIN, &domain, &domainLength) != 0 || domainLength != sizeof(domain) ||
+        getsockopt(stream.fd, SOL_SOCKET, SO_TYPE, &type, &typeLength) != 0 || typeLength != sizeof(type) ||
+        domain != AF_UNIX || type != SOCK_STREAM) return false;
+    auto found = std::find_if(state->leases.begin(), state->leases.end(), [&](const auto& lease) {
+      return lease->command.session.sessionUUID == sessionUUID;
+    });
+    if (found == state->leases.end() || (*found)->claimed || (*found)->carrierRetired || (*found)->command.localHalf != CousinRouteHalf::destination ||
+        !prodigyCousinReverseCarrierSessionValid((*found)->command.session)) return false;
+    auto lease = *found; lease->claimed = true; stream.lease = lease; stream.resolving = false;
+    std::weak_ptr<ProdigyCousinSessionLease> weak = lease;
+    const bool prepared = stream.beginTransportAEGISWithPrelude(true, state->containerUUID,
+        prelude(sessionUUID, CousinRouteHalf::destination),
+        [weak](const String& peer, std::array<uint8_t, 32>& key, String& context, uint128_t& peerUUID) {
+          auto lease = weak.lock();
+          if (!lease || !lease->current() || peer != prelude(lease->command.session.sessionUUID, CousinRouteHalf::source)) return false;
+          key = lease->command.psk; context = lease->command.canonicalContext;
+          peerUUID = lease->command.session.sourceContainerUUID; return true;
+        });
+    if (prepared) stream.resolvedSessionUUID = sessionUUID;
+    else { lease->claimed = false; stream.lease.reset(); }
+    return prepared;
+  }
+
+  // Release the one-stream claim after an authenticated carrier FIN/reset or
+  // local AF_UNIX failure. This retires the exact carrier generation; a fresh
+  // Brain command (new UUID or generation) is required before reconnecting.
+  bool releaseReverseCarrier(ProdigyCousinSessionStream& stream)
+  {
+    auto lease = stream.lease.lock();
+    if (!lease || !lease->current() || !prodigyCousinReverseCarrierSessionValid(lease->command.session) ||
+        stream.resolvedSessionUUID != lease->command.session.sessionUUID) return false;
+    lease->claimed = false; lease->carrierRetired = true; stream.lease.reset(); stream.observationLifetime.reset(); stream.resolvedSessionUUID = 0;
+    return true;
+  }
+
   // observedPeer must be the accepted peer returned by the socket/Ring owner,
   // never a value decoded from the peer's public lookup hint.
   bool prepareInbound(ProdigyCousinSessionStream& stream, const sockaddr_storage& observedPeer, socklen_t length)
@@ -215,7 +346,7 @@ public:
           for (auto& lease : owner->leases) {
             if (lease->command.session.sessionUUID != sessionUUID) continue;
             if (!lease->current() || lease->claimed || lease->command.localHalf != CousinRouteHalf::destination ||
-                !observedSourceMatches(observedPeer, length, lease->command.session)) return false;
+                !observedSourceMatches(observedPeer, length, lease->command)) return false;
             lease->claimed = true; stream.lease = lease;
             stream.resolvedSessionUUID = sessionUUID; stream.resolving = false;
             key = lease->command.psk; context = lease->command.canonicalContext;

@@ -2,7 +2,10 @@
 
 #include <prodigy/mothership/mothership.virtual.datacenter.h>
 #include <sys/file.h>
+#include <sys/poll.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <signal.h>
 #include <sched.h>
 #include <climits>
@@ -261,6 +264,339 @@ static inline bool mothershipVDCSignal(const MothershipVDCProcessIdentity& expec
   bool okay = mothershipVDCProcessMatches(expected) && ::syscall(SYS_pidfd_send_signal, fd, signal, nullptr, 0) == 0;
   ::close(fd);
   return okay;
+}
+
+static inline bool mothershipVDCWaitForStoppedState(
+    const MothershipVDCProcessIdentity& process, bool stopped, unsigned attempts = 200)
+{
+  for (unsigned attempt = 0; attempt < attempts; ++attempt)
+  {
+    char state = 0;
+    if (mothershipVDCProcessMatches(process, &state) == false) return false;
+    const bool isStopped = state == 'T' || state == 't';
+    if (isStopped == stopped) return true;
+    ::usleep(10000);
+  }
+  return false;
+}
+
+// The capture owner arms this independent child before SIGSTOP.  A clean
+// parent sends a disarm byte only after it has sent SIGCONT and observed the
+// exact process running.  Parent death, channel loss, or a bounded timeout
+// makes the child resume the exact pidfd-bound identity instead.  A timeout is
+// deliberately reported as capture failure: it may have resumed mid-copy.
+class MothershipVDCProcessResumeGuard {
+public:
+  MothershipVDCProcessIdentity process = {};
+  int watchdogSocket = -1;
+  pid_t watchdogPID = -1;
+  int watchdogTimeoutMs = 120'000;
+  bool armed = false;
+
+  explicit MothershipVDCProcessResumeGuard(
+      const MothershipVDCProcessIdentity& identity, int timeoutMs = 120'000)
+      : process(identity), watchdogTimeoutMs(timeoutMs) {}
+
+  MothershipVDCProcessResumeGuard(const MothershipVDCProcessResumeGuard&) = delete;
+  MothershipVDCProcessResumeGuard& operator=(const MothershipVDCProcessResumeGuard&) = delete;
+
+  static void closeWatchdogDescriptors(int keep)
+  {
+#ifdef SYS_close_range
+    if (keep > 3) (void)::syscall(SYS_close_range, 3u, unsigned(keep - 1), 0u);
+    (void)::syscall(SYS_close_range, unsigned(keep + 1), ~0u, 0u);
+#else
+    long maximum = ::sysconf(_SC_OPEN_MAX);
+    if (maximum < 0 || maximum > 65536) maximum = 65536;
+    for (int descriptor = 3; descriptor < maximum; ++descriptor)
+      if (descriptor != keep) (void)::close(descriptor);
+#endif
+    (void)::close(STDIN_FILENO);
+    (void)::close(STDOUT_FILENO);
+    (void)::close(STDERR_FILENO);
+  }
+
+  static void runWatchdog(
+      int descriptor, MothershipVDCProcessIdentity identity, int timeoutMs)
+  {
+    (void)::setsid();
+    closeWatchdogDescriptors(descriptor);
+    struct pollfd event = {};
+    event.fd = descriptor;
+    event.events = POLLIN | POLLHUP;
+    int result = 0;
+    do { result = ::poll(&event, 1, timeoutMs); } while (result < 0 && errno == EINTR);
+    char command = 0;
+    ssize_t received = -1;
+    if (result > 0 && (event.revents & POLLIN))
+      do { received = ::recv(descriptor, &command, 1, 0); } while (received < 0 && errno == EINTR);
+    if (received == 1 && command == 'D')
+    {
+      (void)::close(descriptor);
+      _exit(0);
+    }
+    const bool resumed = mothershipVDCSignal(identity, SIGCONT) &&
+                         mothershipVDCWaitForStoppedState(identity, false);
+    (void)::close(descriptor);
+    _exit(resumed ? 86 : 87);
+  }
+
+  bool arm(String *failure = nullptr)
+  {
+    if (armed || watchdogSocket >= 0 || watchdogPID > 0 ||
+        watchdogTimeoutMs <= 0 || watchdogTimeoutMs > 300'000 ||
+        mothershipVDCProcessMatches(process) == false)
+    {
+      if (failure) failure->assign("cannot arm exact-process capture resume guard"_ctv);
+      return false;
+    }
+    int sockets[2] = {-1, -1};
+    if (::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets) != 0)
+    {
+      if (failure) failure->assign("cannot create capture resume watchdog"_ctv);
+      return false;
+    }
+    pid_t child = ::fork();
+    if (child == 0)
+    {
+      (void)::close(sockets[0]);
+      runWatchdog(sockets[1], process, watchdogTimeoutMs);
+    }
+    (void)::close(sockets[1]);
+    if (child < 0)
+    {
+      (void)::close(sockets[0]);
+      if (failure) failure->assign("cannot fork capture resume watchdog"_ctv);
+      return false;
+    }
+    watchdogSocket = sockets[0];
+    watchdogPID = child;
+    armed = true;
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool freeze(String *failure = nullptr)
+  {
+    if (!arm(failure)) return false;
+    if (!mothershipVDCSignal(process, SIGSTOP) ||
+        !mothershipVDCWaitForStoppedState(process, true))
+    {
+      if (failure) failure->assign("cannot freeze exact Brain for private state capture"_ctv);
+      (void)resume(nullptr);
+      return false;
+    }
+    return true;
+  }
+
+  bool resume(String *failure = nullptr)
+  {
+    if (!armed)
+    {
+      const bool running = mothershipVDCWaitForStoppedState(process, false);
+      if (!running && failure) failure->assign("capture process is not observably running"_ctv);
+      return running;
+    }
+    bool running = mothershipVDCSignal(process, SIGCONT) &&
+                   mothershipVDCWaitForStoppedState(process, false);
+    if (running)
+    {
+      const char command = 'D';
+      running = ::send(watchdogSocket, &command, 1, MSG_NOSIGNAL) == 1;
+    }
+    (void)::close(watchdogSocket);
+    watchdogSocket = -1;
+    int status = 0;
+    pid_t waited = -1;
+    do { waited = ::waitpid(watchdogPID, &status, 0); } while (waited < 0 && errno == EINTR);
+    const bool watchdogDisarmed = waited == watchdogPID && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    watchdogPID = -1;
+    armed = false;
+    // If the watchdog intervened, verify safety but reject this capture: its
+    // consistency boundary may have elapsed while the parent was still copying.
+    const bool safelyRunning = mothershipVDCWaitForStoppedState(process, false);
+    if (!running || !watchdogDisarmed || !safelyRunning)
+    {
+      if (failure)
+      {
+        if (!safelyRunning)
+          failure->assign("exact Brain could not be verified resumed after capture"_ctv);
+        else
+          failure->assign("capture resume watchdog intervened before normal completion"_ctv);
+      }
+      return false;
+    }
+    if (failure) failure->clear();
+    return true;
+  }
+
+  ~MothershipVDCProcessResumeGuard()
+  {
+    if (armed) (void)resume(nullptr);
+  }
+};
+
+static inline bool mothershipVDCPrivateDirectory(const String& path)
+{
+  if (path.empty() || path[0] != '/') return false;
+  String owned = path;
+  struct stat before = {}, opened = {};
+  if (::lstat(owned.c_str(), &before) != 0 || !S_ISDIR(before.st_mode) ||
+      before.st_uid != ::geteuid() || (before.st_mode & 0777) != 0700) return false;
+  int descriptor = ::open(owned.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  const bool valid = descriptor >= 0 && ::fstat(descriptor, &opened) == 0 &&
+      opened.st_dev == before.st_dev && opened.st_ino == before.st_ino &&
+      S_ISDIR(opened.st_mode) && opened.st_uid == ::geteuid() &&
+      (opened.st_mode & 0777) == 0700;
+  if (descriptor >= 0) ::close(descriptor);
+  return valid;
+}
+
+// Copies only directories and regular files into a new private tree.  This is
+// the shared private-state primitive used by both the test-VDC recovery and
+// the remote Brain diagnostic capture; neither caller opens the live DB.
+// Capture only an unambiguous built-in state location in the selected
+// process mount. Caller input never chooses a database pathname.
+static inline bool mothershipVDCBrainCaptureStatePaths(
+    const String& processRoot, String& primary, String& secrets, String *failure = nullptr)
+{
+  uint32_t matches = 0;
+  for (const char *canonical : {"/containers/prodigy.state", defaultProdigyPersistentStateDBPath()})
+  {
+    String candidate = processRoot;
+    candidate.append(String(canonical));
+    String candidateSecrets = candidate;
+    candidateSecrets.append(".secrets"_ctv);
+    struct stat state = {}, secretState = {};
+    const bool stateExists = ::lstat(candidate.c_str(), &state) == 0;
+    const bool secretsExist = ::lstat(candidateSecrets.c_str(), &secretState) == 0;
+    if (!stateExists && !secretsExist) continue;
+    if (!stateExists || !secretsExist || !S_ISDIR(state.st_mode) || !S_ISDIR(secretState.st_mode))
+    {
+      if (failure) failure->assign("canonical Brain state pair is incomplete or unsafe"_ctv);
+      return false;
+    }
+    primary = candidate;
+    secrets = candidateSecrets;
+    ++matches;
+  }
+  if (matches != 1)
+  {
+    if (failure) failure->assign("Brain state path is absent or ambiguous"_ctv);
+    return false;
+  }
+  return true;
+}
+
+static inline bool mothershipVDCCopyPrivateStateTree(
+    const String& source, const String& destination, String *failure = nullptr)
+{
+  bool destinationCreated = false;
+  auto reject = [&](const char *message) {
+    if (destinationCreated)
+    {
+      std::error_code cleanupError;
+      std::filesystem::remove_all(const_cast<String&>(destination).c_str(), cleanupError);
+    }
+    if (failure) failure->assign(message);
+    return false;
+  };
+  String ownedSource = source, ownedDestination = destination;
+  struct stat sourceState = {};
+  if (::lstat(ownedSource.c_str(), &sourceState) != 0 || !S_ISDIR(sourceState.st_mode) ||
+      S_ISLNK(sourceState.st_mode))
+    return reject("private state source or destination is unsafe");
+  if (::mkdir(ownedDestination.c_str(), 0700) != 0)
+    return reject("private state destination already exists or is unavailable");
+  destinationCreated = true;
+  std::error_code error = {};
+  for (std::filesystem::recursive_directory_iterator it(ownedSource.c_str(), error), end;
+       !error && it != end; it.increment(error))
+  {
+    const auto relative = it->path().lexically_relative(ownedSource.c_str());
+    const auto target = std::filesystem::path(ownedDestination.c_str()) / relative;
+    const auto status = it->symlink_status(error);
+    if (error || std::filesystem::is_symlink(status))
+      return reject("private state tree contains a symlink");
+    if (std::filesystem::is_directory(status))
+    {
+      if (::mkdir(target.c_str(), 0700) != 0)
+        return reject("private state directory copy failed");
+    }
+    else if (std::filesystem::is_regular_file(status))
+    {
+      if (!std::filesystem::copy_file(it->path(), target,
+              std::filesystem::copy_options::none, error) || error ||
+          ::chmod(target.c_str(), 0600) != 0)
+        return reject("private state file copy failed");
+    }
+    else return reject("private state tree contains an unsupported entry");
+  }
+  if (error) return reject("private state tree iteration failed");
+  if (failure) failure->clear();
+  return true;
+}
+
+static inline bool mothershipVDCDurableWrite(
+    const String& directory, const char *name, const String& text, String *failure);
+
+class MothershipVDCBrainStateCaptureReceipt {
+public:
+  uint8_t version = 1;
+  uint128_t clusterUUID = 0;
+  uint128_t machineUUID = 0;
+  MothershipVDCProcessIdentity process = {};
+  bool resumed = false;
+  bool captureComplete = false;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipVDCBrainStateCaptureReceipt& receipt)
+{
+  serializer.value1b(receipt.version);
+  serializer.value16b(receipt.clusterUUID);
+  serializer.value16b(receipt.machineUUID);
+  serializer.object(receipt.process);
+  serializer.value1b(receipt.resumed);
+  serializer.value1b(receipt.captureComplete);
+}
+
+static inline bool mothershipVDCBrainStateCaptureReceiptValid(
+    const MothershipVDCBrainStateCaptureReceipt& receipt)
+{
+  return receipt.version == 1 && receipt.clusterUUID != 0 &&
+      receipt.machineUUID != 0 && receipt.process.pid > 1 &&
+      receipt.process.startTime != 0 && receipt.process.mountNamespace != 0 &&
+      receipt.process.networkNamespace != 0 && receipt.process.cgroupNamespace != 0 &&
+      (!receipt.captureComplete || receipt.resumed);
+}
+
+static inline bool mothershipVDCWriteBrainStateCaptureReceipt(
+    const String& directory, const MothershipVDCBrainStateCaptureReceipt& receipt,
+    String *failure = nullptr)
+{
+  if (!mothershipVDCPrivateDirectory(directory) ||
+      !mothershipVDCBrainStateCaptureReceiptValid(receipt))
+  {
+    if (failure) failure->assign("invalid private Brain capture receipt"_ctv);
+    return false;
+  }
+  String bytes = {};
+  auto copy = receipt;
+  BitseryEngine::serialize(bytes, copy);
+  return mothershipVDCDurableWrite(directory, "brain-capture.receipt", bytes, failure);
+}
+
+static inline bool mothershipVDCReadBrainStateCaptureReceipt(
+    const String& directory, MothershipVDCBrainStateCaptureReceipt& receipt)
+{
+  receipt = {};
+  if (!mothershipVDCPrivateDirectory(directory)) return false;
+  String path = {}, bytes = {};
+  mothershipVirtualDatacenterPath(directory, "brain-capture.receipt", path);
+  return mothershipVDCRead(path, bytes, 256) &&
+      BitseryEngine::deserializeSafe(bytes, receipt) &&
+      mothershipVDCBrainStateCaptureReceiptValid(receipt);
 }
 
 static inline bool mothershipVDCDurableWrite(const String& directory, const char *name, const String& text, String *failure)

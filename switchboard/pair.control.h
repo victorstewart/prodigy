@@ -37,6 +37,43 @@ static inline IPAddress switchboardPairControlOutboundSourceAddress(
   return credential.initiator.address;
 }
 
+// Called only after the accepted connection's full credential handshake and
+// record authentication. This projects socket evidence, never peer payload.
+static inline bool switchboardPairControlProjectObservedSessionSource(
+    ProdigyCousinSessionReceipt& receipt, const ProdigyLocalClusterPairControlCredential& credential,
+    const sockaddr_storage& observed, socklen_t observedLength)
+{
+  const auto& session = receipt.control.session;
+  if (session.sourcePermission.transportSourcePolicy != ProdigyCousinTransportSourcePolicy::authenticatedNAT ||
+      session.sourcePermission.localClusterUUID != receipt.remoteEndpoint.clusterUUID) return true;
+  if (receipt.localEndpoint != credential.responder || receipt.remoteEndpoint != credential.initiator ||
+      !clusterPairControlEndpointNATCompatibleOutbound(credential.initiator, credential.responder) ||
+      credential.pairUUID != session.sourcePermission.pairUUID || credential.rootGeneration != session.rootGeneration ||
+      credential.keyEpoch != session.keyEpoch || receipt.remoteEndpoint.nodeUUID != session.sourceNodeUUID ||
+      !switchboardPairControlSafeObservedIPv6Peer(observed, observedLength)) return false;
+  IPAddress address = {}; address.is6 = true;
+  std::memcpy(address.v6, &reinterpret_cast<const sockaddr_in6&>(observed).sin6_addr, 16);
+  if (!prodigyCousinGlobalIPv6AddressValid(address)) return false;
+  receipt.protocolVersion = 2; receipt.authenticatedSourceAddress = address;
+  return true;
+}
+
+// A prepared pair may receive the new wire format; only an active pair may send it.
+// The projection itself is validated when installed, including its credentials.
+static inline bool switchboardPairControlPrivateDiscoveryAllowed(
+    const ProdigyLocalClusterPairControlProjection& projection, uint128_t pairUUID,
+    uint64_t rootGeneration, uint128_t peerClusterUUID, bool outgoing)
+{
+  if (projection.protocolVersion != ProdigyLocalClusterPairControlProjection::privateDiscoveryVersion ||
+      pairUUID == 0 || rootGeneration == 0 || peerClusterUUID == 0) return false;
+  for (const auto& status : projection.privateDiscoveryStatuses)
+    if (status.pairUUID == pairUUID && status.rootGeneration == rootGeneration &&
+        status.peerClusterUUID == peerClusterUUID && status.activationUUID != 0 &&
+        (status.phase == ProdigyPairPrivateDiscoveryPhase::active ||
+         (!outgoing && status.phase == ProdigyPairPrivateDiscoveryPhase::prepared))) return true;
+  return false;
+}
+
 template <typename Socket>
 static inline bool switchboardPairControlBindOutboundSource(
     Socket& socket, const ProdigyLocalClusterPairControlCredential& credential)
@@ -49,8 +86,10 @@ class SwitchboardPairControlRuntime final : public RingInterface {
   static constexpr uint32_t helloBytes = 68;
   static constexpr uint32_t epochRecordBytes = 4 + 8 + ProdigyClusterPairEpochStatusBytes;
   static constexpr uint32_t discoveryRecordHeaderBytes = 4 + 8 + 4;
-  static constexpr uint32_t helloRecordType = 1, epochRecordType = 2, discoveryRecordType = 3, sessionRecordType = 4;
+  static constexpr uint32_t helloRecordType = 1, epochRecordType = 2, discoveryRecordType = 3, sessionRecordType = 4,
+      carrierRecordType = 5;
   static constexpr uint32_t sessionRecordHeaderBytes = 4 + 8 + 4;
+  static constexpr uint32_t carrierRecordHeaderBytes = 4 + 4;
   static constexpr size_t maximumPendingSessionRecords = ProdigyCousinSessionMaximumRecords;
   static constexpr size_t maximumSockets = ProdigyLocalClusterPairControlProjectionMaximumCredentials + 16;
   static constexpr int64_t handshakeTimeoutMs = 10000, idleTimeoutMs = 15000, helloIntervalMs = 3000;
@@ -59,6 +98,18 @@ class SwitchboardPairControlRuntime final : public RingInterface {
     bool closing = false, accepting = false;
   };
   struct Connection : ProdigyTransportTLSStream {
+    struct CarrierFlow {
+      uint128_t sessionUUID = 0;
+      uint64_t leaseGeneration = 0;
+      uint64_t receivedSequence = 0, sentSequence = 0;
+      uint32_t receivedCredits = 0, sentCredits = 0;
+      bool receivedClosed = false, sentClosed = false;
+      bool openedSent = false, openedReceived = false, ackedSent = false, ackedReceived = false;
+    };
+    struct CarrierTombstone {
+      uint128_t sessionUUID = 0;
+      uint64_t leaseGeneration = 0;
+    };
     ProdigyLocalClusterPairControlCredential credential;
     ClusterPairControlEndpoint local, remote;
     sockaddr_storage observedPeer = {};
@@ -70,11 +121,43 @@ class SwitchboardPairControlRuntime final : public RingInterface {
     uint64_t sentSessionSequence = 0, receivedSessionSequence = 0;
     std::vector<String> pendingSessionRecords = {};
     uint32_t pendingSessionBytes = 0;
+    std::vector<String> pendingCarrierRecords = {};
+    uint32_t pendingCarrierBytes = 0;
+    std::vector<CarrierFlow> carrierFlows = {};
+    std::vector<CarrierTombstone> carrierTombstones = {};
     bool remoteDiscoveryPresent = false;
     ProdigyCousinDiscoverySnapshot remoteDiscovery = {};
     int64_t remoteDiscoveryExpiresAt = 0;
     int64_t createdAt = 0, lastReceiveAt = 0, lastHelloAt = 0, lastStatusAt = 0, lastDiscoveryAt = 0;
   };
+  static bool carrierFlowGenerationRetired(Connection& connection, uint128_t sessionUUID, uint64_t leaseGeneration)
+  {
+    auto found = std::find_if(connection.carrierTombstones.begin(), connection.carrierTombstones.end(),
+        [&](const auto& value) { return value.sessionUUID == sessionUUID; });
+    if (found == connection.carrierTombstones.end()) return false;
+    // This is deliberately read-only: an unadmitted newer open may not erase
+    // the replay fence for an older generation.
+    return leaseGeneration <= found->leaseGeneration;
+  }
+  static bool retireCarrierFlowGeneration(Connection& connection, uint128_t sessionUUID, uint64_t leaseGeneration)
+  {
+    auto found = std::find_if(connection.carrierTombstones.begin(), connection.carrierTombstones.end(),
+        [&](const auto& value) { return value.sessionUUID == sessionUUID; });
+    if (found != connection.carrierTombstones.end()) {
+      found->leaseGeneration = std::max(found->leaseGeneration, leaseGeneration); return true;
+    }
+    // Never evict a replay fence. Reconnecting the authenticated carrier is
+    // the only bounded recovery once its tombstone ledger is exhausted.
+    if (connection.carrierTombstones.size() >= ProdigyCousinSessionMaximumRecords) return false;
+    connection.carrierTombstones.push_back({sessionUUID, leaseGeneration});
+    return true;
+  }
+  static bool carrierFlowCanRetire(const Connection& connection, uint128_t sessionUUID)
+  {
+    return std::any_of(connection.carrierTombstones.begin(), connection.carrierTombstones.end(),
+        [&](const auto& value) { return value.sessionUUID == sessionUUID; }) ||
+        connection.carrierTombstones.size() < ProdigyCousinSessionMaximumRecords;
+  }
   struct LocalDiscoveryPublication {
     ProdigyCousinDiscoveryPublication publication = {};
     bool withdrawing = false;
@@ -168,6 +251,96 @@ class SwitchboardPairControlRuntime final : public RingInterface {
     if (!connection.wBuffer.need(record.size())) { retire(connection); return; }
     connection.wBuffer.append(record); Ring::queueSend(&connection);
   }
+  void flushCarrierFrame(Connection& connection)
+  {
+    // Session control (including revoke/reset control) always drains first.
+    if (!approved(connection) || connection.closing || !connection.ready || connection.pendingSend ||
+        connection.wBuffer.outstandingBytes() != 0 || !connection.pendingSessionRecords.empty() ||
+        connection.pendingCarrierRecords.empty()) return;
+    String record = std::move(connection.pendingCarrierRecords.front());
+    connection.pendingCarrierRecords.erase(connection.pendingCarrierRecords.begin());
+    connection.pendingCarrierBytes -= uint32_t(record.size());
+    if (!connection.wBuffer.need(record.size())) { retire(connection); return; }
+    connection.wBuffer.append(record); Ring::queueSend(&connection);
+  }
+  bool receiveCarrierFrame(Connection& connection, const uint8_t *payload, uint32_t payloadBytes)
+  {
+    if (!approved(connection) || !connection.ready || !connection.isTransportNegotiated() ||
+        !connection.tlsPeerVerified || connection.tlsPeerUUID != connection.remote.nodeUUID || payloadBytes == 0 ||
+        payloadBytes > ProdigyCousinCarrierMaximumPayloadBytes + 128) return false;
+    String encoded = {}; ProdigyCousinCarrierFrame frame = {};
+    if (!encoded.reserve(payloadBytes)) return false;
+    encoded.append(payload, payloadBytes);
+    if (!BitseryEngine::deserializeSafe(encoded, frame) || !prodigyCousinCarrierFrameValid(frame)) return false;
+    auto flow = std::find_if(connection.carrierFlows.begin(), connection.carrierFlows.end(), [&](const auto& value) {
+      return value.sessionUUID == frame.sessionUUID;
+    });
+    Connection::CarrierFlow before = {};
+    const bool createdFlow = flow == connection.carrierFlows.end();
+    if (flow == connection.carrierFlows.end()) {
+      // Only an initial open may allocate state. Its advertised window grants
+      // this receiver permission to send; it never authorizes its sender.
+      if (frame.kind != ProdigyCousinCarrierKind::open || frame.sequence != 1 ||
+          carrierFlowGenerationRetired(connection, frame.sessionUUID, frame.leaseGeneration) ||
+          connection.carrierFlows.size() >= ProdigyCousinSessionMaximumRecords) return false;
+      Connection::CarrierFlow created = {};
+      created.sessionUUID = frame.sessionUUID; created.leaseGeneration = frame.leaseGeneration;
+      created.receivedSequence = frame.sequence; created.sentCredits = frame.credits;
+      created.openedReceived = true;
+      connection.carrierFlows.push_back(created);
+    } else {
+      before = *flow;
+      if (flow->leaseGeneration != frame.leaseGeneration || flow->receivedClosed) return false;
+      const bool dataReady = (flow->openedSent && flow->ackedReceived) ||
+          (flow->openedReceived && flow->ackedSent);
+      if (frame.kind == ProdigyCousinCarrierKind::openAck) {
+        // The peer may acknowledge exactly once, on its independent first
+        // sequence number, after this side sent an open.
+        if (!flow->openedSent || flow->ackedReceived || frame.sequence != 1 || flow->receivedSequence != 0) return false;
+        flow->ackedReceived = true;
+        flow->sentCredits = frame.credits;
+        flow->receivedSequence = frame.sequence;
+      } else {
+        if (frame.sequence != flow->receivedSequence + 1) return false;
+        switch (frame.kind) {
+        case ProdigyCousinCarrierKind::data:
+          if (!dataReady || flow->receivedCredits == 0 || frame.credits != flow->receivedCredits - 1) return false;
+          --flow->receivedCredits; break;
+        case ProdigyCousinCarrierKind::window:
+          // A remote window grants this local sender more allowance.
+          if (!dataReady || frame.credits <= flow->sentCredits) return false;
+          flow->sentCredits = frame.credits; break;
+        case ProdigyCousinCarrierKind::fin:
+          if (!dataReady) return false;
+          [[fallthrough]];
+        case ProdigyCousinCarrierKind::reset:
+          flow->receivedClosed = true; break;
+        case ProdigyCousinCarrierKind::open:
+          return false;
+        case ProdigyCousinCarrierKind::openAck: return false;
+        }
+        flow->receivedSequence = frame.sequence;
+      }
+    }
+    connection.lastReceiveAt = Time::msSinceBoot();
+    if (!onCarrierFrame || !onCarrierFrame(connection.local, connection.remote, connection.connectionID, frame)) {
+      if (createdFlow) connection.carrierFlows.pop_back(); else *flow = before;
+      return false;
+    }
+    // A reset permits a fresh authenticated open for the next lease generation.
+    // A graceful flow is reusable only once both halves have closed.
+    flow = std::find_if(connection.carrierFlows.begin(), connection.carrierFlows.end(), [&](const auto& value) {
+      return value.sessionUUID == frame.sessionUUID;
+    });
+    if (flow != connection.carrierFlows.end() &&
+        (frame.kind == ProdigyCousinCarrierKind::reset || (flow->receivedClosed && flow->sentClosed))) {
+      if (!retireCarrierFlowGeneration(connection, flow->sessionUUID, flow->leaseGeneration)) {
+        retire(connection); return false;
+      }
+      connection.carrierFlows.erase(flow);
+    }
+    return true;
+  }
   bool receiveSessionControl(Connection& connection, const uint8_t *payload, uint32_t payloadBytes)
   {
     const uint8_t *cursor = payload, *end = payload + payloadBytes;
@@ -191,6 +364,8 @@ class SwitchboardPairControlRuntime final : public RingInterface {
       receipt.localEndpoint = connection.local; receipt.remoteEndpoint = connection.remote;
       receipt.projectionGeneration = projection.committedAuthorityGeneration;
       receipt.connectionID = connection.connectionID; receipt.sequence = sequence; receipt.control = std::move(control);
+      if (!switchboardPairControlProjectObservedSessionSource(receipt, connection.credential,
+            connection.observedPeer, connection.observedPeerLength) || !prodigyCousinSessionReceiptValid(receipt)) return false;
       onSessionControl(receipt);
     }
     return true;
@@ -206,6 +381,15 @@ class SwitchboardPairControlRuntime final : public RingInterface {
     if (!publication) return;
     String payload = {};
     auto snapshot = publication->publication.snapshot;
+    if (snapshot.protocolVersion == ProdigyCousinDiscoverySnapshot::privateContainerVersion &&
+        !switchboardPairControlPrivateDiscoveryAllowed(projection, connection.credential.pairUUID,
+            connection.credential.rootGeneration, connection.remote.clusterUUID, true)) {
+      Vector<ProdigyCousinCounterpart> external = {};
+      for (const auto& record : snapshot.records)
+        if (record.routablePrefixUUID != 0) external.push_back(record);
+      snapshot.records = std::move(external);
+      snapshot.protocolVersion = ProdigyCousinDiscoverySnapshot::version;
+    }
     BitseryEngine::serialize(payload, snapshot);
     if (payload.size() == 0 || payload.size() > ProdigyCousinDiscoveryMaximumBytes ||
         connection.sentDiscoverySequence == UINT64_MAX ||
@@ -238,7 +422,10 @@ class SwitchboardPairControlRuntime final : public RingInterface {
     if (!encoded.reserve(encodedBytes)) return false;
     encoded.append(cursor, encodedBytes);
     if (!BitseryEngine::deserializeSafe(encoded, snapshot) || !prodigyCousinDiscoverySnapshotValid(snapshot) ||
-        !discoveryMatchesConnection(snapshot, connection, false)) return false;
+        !discoveryMatchesConnection(snapshot, connection, false) ||
+        (snapshot.protocolVersion == ProdigyCousinDiscoverySnapshot::privateContainerVersion &&
+         !switchboardPairControlPrivateDiscoveryAllowed(projection, connection.credential.pairUUID,
+             connection.credential.rootGeneration, connection.remote.clusterUUID, false))) return false;
     connection.receivedDiscoverySequence = sequence;
     connection.lastReceiveAt = Time::msSinceBoot();
     connection.remoteDiscovery = snapshot;
@@ -272,6 +459,8 @@ class SwitchboardPairControlRuntime final : public RingInterface {
     emitDiscoveryWithdrawal(connection);
     emitSessionDisconnect(connection);
     connection.pendingSessionRecords.clear(); connection.pendingSessionBytes = 0;
+    connection.pendingCarrierRecords.clear(); connection.pendingCarrierBytes = 0;
+    connection.carrierFlows.clear(); connection.carrierTombstones.clear();
     connection.closing = true; connection.ready = false;
     Ring::queueClose(&connection);
   }
@@ -488,7 +677,7 @@ class SwitchboardPairControlRuntime final : public RingInterface {
       queueHello(*connection, now);
       queueEpochStatus(*connection, now);
       queueDiscoverySnapshot(*connection, now);
-      flushSessionControl(*connection);
+      flushSessionControl(*connection); flushCarrierFrame(*connection);
     }
     for (const auto& credential : projection.credentials)
     {
@@ -504,6 +693,8 @@ public:
   std::function<void(const ProdigyClusterPairEpochReceipt&)> onEpochStatus;
   std::function<void(const ProdigyCousinDiscoveryReceipt&)> onDiscoverySnapshot;
   std::function<void(const ProdigyCousinSessionReceipt&)> onSessionControl;
+  std::function<bool(const ClusterPairControlEndpoint&, const ClusterPairControlEndpoint&, uint64_t,
+                     const ProdigyCousinCarrierFrame&)> onCarrierFrame;
 
   bool sendSessionControl(const ProdigyCousinSessionPublication& publication)
   {
@@ -530,6 +721,96 @@ public:
     if (record.size() != sessionRecordHeaderBytes + encoded.size()) return false;
     selected->pendingSessionBytes += uint32_t(record.size()); selected->pendingSessionRecords.push_back(std::move(record));
     flushSessionControl(*selected); return true;
+  }
+
+  bool sendCarrierFrame(const ProdigyCousinSessionRecord& session,
+                        const ClusterPairControlEndpoint& local, const ClusterPairControlEndpoint& remote,
+                        uint64_t localConnectionID, const ProdigyCousinCarrierFrame& frame)
+  {
+    if (stopping || !prodigyCousinReverseCarrierSessionValid(session) || !prodigyCousinCarrierFrameValid(frame) ||
+        frame.sessionUUID != session.sessionUUID ||
+        !((local == session.sourceCarrier && remote == session.destinationCarrier) ||
+          (local == session.destinationCarrier && remote == session.sourceCarrier))) return false;
+    Connection *selected = nullptr;
+    for (auto& candidate : connections) {
+      if (candidate->closing || !candidate->ready || candidate->connectionID != localConnectionID ||
+          candidate->local != local || candidate->remote != remote) continue;
+      if (selected) return false; selected = candidate.get();
+    }
+    if (!selected || !approved(*selected)) return false;
+    auto flow = std::find_if(selected->carrierFlows.begin(), selected->carrierFlows.end(), [&](const auto& value) {
+      return value.sessionUUID == frame.sessionUUID;
+    });
+    Connection::CarrierFlow updated = {};
+    bool installFlow = false, eraseFlow = false;
+    if (flow == selected->carrierFlows.end()) {
+      if ((frame.kind != ProdigyCousinCarrierKind::open && frame.kind != ProdigyCousinCarrierKind::openAck) ||
+          selected->carrierFlows.size() >= ProdigyCousinSessionMaximumRecords) return false;
+      if (frame.kind != ProdigyCousinCarrierKind::open || frame.sequence != 1 ||
+          carrierFlowGenerationRetired(*selected, frame.sessionUUID, frame.leaseGeneration)) return false;
+      updated.sessionUUID = frame.sessionUUID; updated.leaseGeneration = frame.leaseGeneration;
+      updated.sentSequence = frame.sequence; updated.receivedCredits = frame.credits;
+      updated.openedSent = true;
+      installFlow = true;
+    } else {
+      if (flow->leaseGeneration != frame.leaseGeneration || flow->sentClosed) return false;
+      updated = *flow;
+      const bool dataReady = (updated.openedSent && updated.ackedReceived) ||
+          (updated.openedReceived && updated.ackedSent);
+      if (frame.kind == ProdigyCousinCarrierKind::openAck) {
+        if (!updated.openedReceived || updated.ackedSent || frame.sequence != 1 || updated.sentSequence != 0) return false;
+        updated.ackedSent = true;
+        updated.receivedCredits = frame.credits;
+        updated.sentSequence = frame.sequence;
+      } else {
+        if (frame.sequence != updated.sentSequence + 1) return false;
+        switch (frame.kind) {
+        case ProdigyCousinCarrierKind::data:
+          if (!dataReady || updated.sentCredits == 0 || frame.credits != updated.sentCredits - 1) return false;
+          --updated.sentCredits; break;
+        case ProdigyCousinCarrierKind::window:
+          // A local window grants the peer receive allowance, not this sender.
+          if (!dataReady || frame.credits <= updated.receivedCredits) return false;
+          updated.receivedCredits = frame.credits; break;
+        case ProdigyCousinCarrierKind::fin:
+          if (!dataReady) return false;
+          [[fallthrough]];
+        case ProdigyCousinCarrierKind::reset:
+          updated.sentClosed = true; break;
+        case ProdigyCousinCarrierKind::open:
+          return false;
+        case ProdigyCousinCarrierKind::openAck: return false;
+        }
+        updated.sentSequence = frame.sequence;
+      }
+      eraseFlow = frame.kind == ProdigyCousinCarrierKind::reset ||
+          (updated.receivedClosed && updated.sentClosed);
+    }
+    if (eraseFlow && !carrierFlowCanRetire(*selected, flow->sessionUUID)) {
+      retire(*selected); return false;
+    }
+    String encoded = {}; auto copy = frame;
+    if (!BitseryEngine::serialize(encoded, copy) || encoded.empty() ||
+        encoded.size() > ProdigyCousinCarrierMaximumPayloadBytes + 128 ||
+        selected->pendingCarrierRecords.size() >= maximumPendingSessionRecords ||
+        encoded.size() > UINT32_MAX - carrierRecordHeaderBytes ||
+        selected->pendingCarrierBytes > maximumPendingSessionRecords *
+            (ProdigyCousinCarrierMaximumPayloadBytes + carrierRecordHeaderBytes + 128) - encoded.size() - carrierRecordHeaderBytes)
+      return false;
+    String record = {}; if (!record.reserve(carrierRecordHeaderBytes + encoded.size())) return false;
+    clusterPairControlAppendU32BE(record, carrierRecordType);
+    clusterPairControlAppendU32BE(record, uint32_t(encoded.size())); record.append(encoded.data(), encoded.size());
+    if (record.size() != carrierRecordHeaderBytes + encoded.size()) return false;
+    selected->pendingCarrierBytes += uint32_t(record.size()); selected->pendingCarrierRecords.push_back(std::move(record));
+    // Commit flow state only after every serialization and bounded-queue check
+    // succeeded. A rejected enqueue must be safely retryable with the same frame.
+    if (installFlow) selected->carrierFlows.push_back(updated);
+    else if (eraseFlow) {
+      if (!retireCarrierFlowGeneration(*selected, flow->sessionUUID, flow->leaseGeneration)) { retire(*selected); return false; }
+      selected->carrierFlows.erase(flow);
+    }
+    else *flow = updated;
+    flushSessionControl(*selected); flushCarrierFrame(*selected); return true;
   }
 
   bool installDiscoverySnapshot(const ProdigyCousinDiscoveryPublication& publication)
@@ -669,13 +950,24 @@ public:
             encodedBytes > ProdigyCousinSessionMaximumBytes || encodedBytes > UINT32_MAX - sessionRecordHeaderBytes) { retire(*connection); return; }
         bytes = sessionRecordHeaderBytes + encodedBytes;
       }
+      else if (type == carrierRecordType)
+      {
+        if (connection->rBuffer.outstandingBytes() < carrierRecordHeaderBytes) break;
+        const uint8_t *cursor = frame; uint32_t encodedBytes = 0;
+        if (!clusterPairControlReadU32BE(cursor, terminal, encodedBytes) || encodedBytes == 0 ||
+            encodedBytes > ProdigyCousinCarrierMaximumPayloadBytes + 128 ||
+            encodedBytes > UINT32_MAX - carrierRecordHeaderBytes) { retire(*connection); return; }
+        bytes = carrierRecordHeaderBytes + encodedBytes;
+      }
       if (bytes == 0) { retire(*connection); return; }
       if (connection->rBuffer.outstandingBytes() < bytes) break;
       const uint8_t *record = connection->rBuffer.pHead();
       if ((type == helloRecordType && !receiveHello(*connection, record)) ||
           (type == epochRecordType && !receiveEpochStatus(*connection, record + sizeof(uint32_t))) ||
           (type == discoveryRecordType && !receiveDiscoverySnapshot(*connection, record + sizeof(uint32_t), bytes - sizeof(uint32_t))) ||
-          (type == sessionRecordType && !receiveSessionControl(*connection, record + sizeof(uint32_t), bytes - sizeof(uint32_t))))
+          (type == sessionRecordType && !receiveSessionControl(*connection, record + sizeof(uint32_t), bytes - sizeof(uint32_t))) ||
+          (type == carrierRecordType && !receiveCarrierFrame(*connection, record + carrierRecordHeaderBytes,
+                                                               bytes - carrierRecordHeaderBytes)))
       { retire(*connection); return; }
       connection->rBuffer.consume(bytes, true);
     }
@@ -683,7 +975,7 @@ public:
     queueHello(*connection, now);
     queueEpochStatus(*connection, now);
     queueDiscoverySnapshot(*connection, now);
-    flushSessionControl(*connection);
+    flushSessionControl(*connection); flushCarrierFrame(*connection);
     if (connection->closing) return;
     if (connection->needsTransportTLSSendKick()) Ring::queueSend(connection);
     Ring::queueRecv(connection);
@@ -700,7 +992,7 @@ public:
     queueHello(*connection, now);
     queueEpochStatus(*connection, now);
     queueDiscoverySnapshot(*connection, now);
-    flushSessionControl(*connection);
+    flushSessionControl(*connection); flushCarrierFrame(*connection);
     if (!connection->closing && (connection->needsTransportTLSSendKick() || connection->wBuffer.outstandingBytes()))
       Ring::queueSend(connection);
   }

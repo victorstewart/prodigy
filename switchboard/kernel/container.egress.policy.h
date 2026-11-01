@@ -59,6 +59,14 @@ __attribute__((__always_inline__)) static inline bool containerDeclaredInternalE
   flow.port16[0] = tcp->source;
   flow.port16[1] = tcp->dest;
   flow.proto = IPPROTO_TCP;
+  // Exact authenticated session grants share the normal flow owner; they
+  // never broaden subscription authority to every source port at a peer.
+  if (switchboardCrossSiteContainerFlow(ip6h->saddr.s6_addr, ip6h->daddr.s6_addr))
+  {
+    return containerTCPFlowHasBoundAuthorization(&flow) &&
+        (containerTCPFlowCurrent(&flow, tcp->fin, tcp->rst) ||
+         (tcp->rst == 0 && containerAuthorizeTCPFlow(&flow)));
+  }
   if (tcp->syn && tcp->ack == 0)
   {
     struct container_service_peer target = {};

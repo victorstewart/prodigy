@@ -2336,6 +2336,7 @@ int main(void)
 
   {
     TestBrain brain = {};
+    brain.brainConfig.datacenterFragment = 1;
     NoopBrainIaaS iaas = {};
     brain.iaas = &iaas;
 
@@ -2421,7 +2422,7 @@ int main(void)
     suite.expect(config.hostedIngressRoutes.size() == 1, "build_overlay_routing_config_machine_adds_remote_hosted_ingress_route");
     if (config.machineRoutes.size() == 1)
     {
-      suite.expect(config.machineRoutes[0].machineFragment == remote.fragment, "build_overlay_routing_config_machine_route_fragment");
+      suite.expect(config.machineRoutes[0].machineFragment == switchboardMakeOverlayMachineIdentity(1, remote.fragment), "build_overlay_routing_config_machine_route_identity");
       suite.expect(config.machineRoutes[0].nextHop.equals(IPAddress("fd00:10::20", true)), "build_overlay_routing_config_machine_route_next_hop");
       suite.expect(config.machineRoutes[0].sourceAddress.equals(IPAddress("fd00:10::10", true)), "build_overlay_routing_config_machine_route_source");
       suite.expect(config.machineRoutes[0].useGatewayMAC == false, "build_overlay_routing_config_machine_route_prefers_direct_mac");
@@ -2429,7 +2430,7 @@ int main(void)
     }
     if (config.hostedIngressRoutes.size() == 1)
     {
-      suite.expect(config.hostedIngressRoutes[0].machineFragment == remote.fragment, "build_overlay_routing_config_machine_hosted_ingress_fragment");
+      suite.expect(config.hostedIngressRoutes[0].machineFragment == switchboardMakeOverlayMachineIdentity(1, remote.fragment), "build_overlay_routing_config_machine_hosted_ingress_identity");
       suite.expect(config.hostedIngressRoutes[0].prefix.equals(IPPrefix("2001:db8:100::c", true, 128)), "build_overlay_routing_config_machine_hosted_ingress_prefix");
     }
 
@@ -2446,7 +2447,7 @@ int main(void)
       uint8_t *args = message->args;
       Message::extractToStringView(args, payload);
       SwitchboardOverlayRoutingConfig decoded = {};
-      if (BitseryEngine::deserializeSafe(payload, decoded) && decoded.containerNetworkViaOverlay && decoded.overlaySubnets.size() == 1 && decoded.machineRoutes.size() == 1 && decoded.machineRoutes[0].machineFragment == remote.fragment && decoded.hostedIngressRoutes.size() == 1 && decoded.hostedIngressRoutes[0].machineFragment == remote.fragment)
+      if (BitseryEngine::deserializeSafe(payload, decoded) && decoded.containerNetworkViaOverlay && decoded.overlaySubnets.size() == 1 && decoded.machineRoutes.size() == 1 && decoded.machineRoutes[0].machineFragment == switchboardMakeOverlayMachineIdentity(1, remote.fragment) && decoded.hostedIngressRoutes.size() == 1 && decoded.hostedIngressRoutes[0].machineFragment == switchboardMakeOverlayMachineIdentity(1, remote.fragment))
       {
         sawOverlayConfig = true;
       }
@@ -2458,6 +2459,7 @@ int main(void)
 
   {
     TestBrain brain = {};
+    brain.brainConfig.datacenterFragment = 1;
     NoopBrainIaaS iaas = {};
     brain.iaas = &iaas;
 
@@ -2509,6 +2511,7 @@ int main(void)
 
   {
     TestBrain brain = {};
+    brain.brainConfig.datacenterFragment = 1;
     NoopBrainIaaS iaas = {};
     brain.iaas = &iaas;
 
@@ -2560,6 +2563,7 @@ int main(void)
 
   {
     TestBrain brain = {};
+    brain.brainConfig.datacenterFragment = 1;
     NoopBrainIaaS iaas = {};
     brain.iaas = &iaas;
 
@@ -2604,6 +2608,65 @@ int main(void)
 
   {
     TestBrain brain = {};
+    brain.brainConfig.datacenterFragment = 1;
+    NoopBrainIaaS iaas = {};
+    brain.iaas = &iaas;
+    Machine local = {}, remote = {};
+    local.uuid = uint128_t(0x9911); local.fragment = 0x11;
+    remote.uuid = uint128_t(0x9922); remote.fragment = 0x22;
+    ClusterMachinePeerAddress localPublic = {}, remotePublic = {};
+    localPublic.address.assign("2001:db8:10::10"_ctv); localPublic.cidr = 64;
+    remotePublic.address.assign("2001:db8:20::20"_ctv); remotePublic.cidr = 64;
+    local.peerAddresses.push_back(localPublic);
+    remote.peerAddresses.push_back(remotePublic);
+    IPAddress overlay = {};
+    overlay.is6 = true;
+    std::memcpy(overlay.v6, container_network_subnet6.value, sizeof(container_network_subnet6.value));
+    overlay.v6[15] = 1;
+    String overlayText = {};
+    suite.expect(ClusterMachine::renderIPAddressLiteral(overlay, overlayText), "overlay_inventory_test_address_rendered");
+    ClusterMachinePeerAddress overlayPeer = {};
+    overlayPeer.address = overlayText; overlayPeer.cidr = 120;
+    remote.peerAddresses.push_back(overlayPeer);
+    MachineNicHardwareProfile overlayNIC = {};
+    MachineNicSubnetHardwareProfile overlaySubnet = {};
+    overlaySubnet.address = overlay;
+    overlaySubnet.subnet.network = overlay;
+    overlaySubnet.subnet.cidr = 120;
+    overlayNIC.subnets.push_back(overlaySubnet);
+    remote.hardware.network.nics.push_back(overlayNIC);
+    brain.machines.insert(&local);
+    brain.machines.insert(&remote);
+    SwitchboardOverlayRoutingConfig config = {};
+    suite.expect(brain.testBuildSwitchboardOverlayRoutingConfig(&local, config) &&
+                     config.machineRoutes.size() == 1 &&
+                     config.machineRoutes[0].nextHop.equals(IPAddress("2001:db8:20::20", true)) &&
+                     config.machineRoutes[0].sourceAddress.equals(IPAddress("2001:db8:10::10", true)),
+                 "overlay_inventory_never_selected_as_outer_destination");
+    suite.expect(config.hostedIngressRoutes.empty(), "overlay_peer_public_address_is_not_implicitly_hosted");
+    DistributableExternalSubnet explicitHosted = {};
+    explicitHosted.machineUUID = remote.uuid;
+    explicitHosted.ingressScope = RoutableIngressScope::singleMachine;
+    explicitHosted.usage = ExternalSubnetUsage::wormholes;
+    explicitHosted.subnet = IPPrefix("2001:db8:20::20", true, 128);
+    brain.brainConfig.distributableExternalSubnets.push_back(explicitHosted);
+    config = {};
+    suite.expect(brain.testBuildSwitchboardOverlayRoutingConfig(&local, config) &&
+                     config.hostedIngressRoutes.size() == 1 &&
+                     config.hostedIngressRoutes[0].prefix.equals(explicitHosted.subnet) &&
+                     config.hostedIngressRoutes[0].machineFragment == switchboardMakeOverlayMachineIdentity(1, remote.fragment),
+                 "overlay_explicit_hosted_prefix_survives_underlay_overlap");
+    brain.brainConfig.distributableExternalSubnets.clear();
+    remote.peerAddresses.clear();
+    remote.peerAddresses.push_back(overlayPeer);
+    config = {};
+    suite.expect(brain.testBuildSwitchboardOverlayRoutingConfig(&local, config) && config.machineRoutes.empty(),
+                 "overlay_inventory_without_underlay_has_no_recursive_route");
+  }
+
+  {
+    TestBrain brain = {};
+    brain.brainConfig.datacenterFragment = 1;
     NoopBrainIaaS iaas = {};
     brain.iaas = &iaas;
 
@@ -2645,6 +2708,7 @@ int main(void)
 
   {
     TestBrain brain = {};
+    brain.brainConfig.datacenterFragment = 1;
     NoopBrainIaaS iaas = {};
     brain.iaas = &iaas;
 
@@ -2689,6 +2753,123 @@ int main(void)
 
   {
     TestBrain brain = {};
+    brain.brainConfig.datacenterFragment = 1;
+    NoopBrainIaaS iaas = {};
+    brain.iaas = &iaas;
+
+    Machine local = {}, remote = {};
+    local.uuid = uint128_t(0x9465); local.fragment = 0x55;
+    remote.uuid = uint128_t(0x9466); remote.fragment = 0x56;
+    ClusterMachinePeerAddress localPeer = {}, remotePeer = {};
+    localPeer.address.assign("fd00:30::10"_ctv); localPeer.cidr = 64;
+    remotePeer.address.assign("fd00:30::20"_ctv); remotePeer.cidr = 64;
+    local.peerAddresses.push_back(localPeer);
+    remote.peerAddresses.push_back(remotePeer);
+    local.hardware.inventoryComplete = remote.hardware.inventoryComplete = true;
+    local.hardware.cpu.logicalCores = remote.hardware.cpu.logicalCores = 4;
+    local.hardware.memory.totalMB = remote.hardware.memory.totalMB = 4096;
+    local.hardware.network.nics.push_back(makeNic("bond0", "5e:b7:78:2a:48:7b", "fd00:30::10/64"));
+    local.hardware.network.captures.push_back(MachineToolCapture {
+        .tool = "ip"_ctv,
+        .phase = "route-show-ipv6"_ctv,
+        .output = "[]"_ctv,
+        .attempted = true,
+        .succeeded = true});
+    remote.hardware.network.nics.push_back(makeNic("bond0", "fa:6d:18:7d:9f:5e", "fd00:30::20/64"));
+    brain.machines.insert(&local);
+    brain.machines.insert(&remote);
+
+    SwitchboardOverlayRoutingConfig config = {};
+    suite.expect(brain.testBuildSwitchboardOverlayRoutingConfig(&local, config), "build_overlay_routing_config_accepts_routed_same_prefix_peer");
+    suite.expect(config.machineRoutes.size() == 1, "build_overlay_routing_config_routed_same_prefix_builds_route");
+    if (config.machineRoutes.size() == 1)
+    {
+      suite.expect(config.machineRoutes[0].useGatewayMAC, "build_overlay_routing_config_routed_same_prefix_never_uses_peer_mac");
+      suite.expect(config.machineRoutes[0].nextHopMAC.size() == 0, "build_overlay_routing_config_routed_same_prefix_keeps_peer_mac_empty");
+    }
+  }
+
+  {
+    TestBrain brain = {};
+    brain.brainConfig.datacenterFragment = 1;
+    NoopBrainIaaS iaas = {};
+    brain.iaas = &iaas;
+
+    Machine local = {}, remote = {};
+    local.uuid = uint128_t(0x9467); local.fragment = 0x57;
+    remote.uuid = uint128_t(0x9468); remote.fragment = 0x58;
+    ClusterMachinePeerAddress localPeer = {}, remotePeer = {};
+    localPeer.address.assign("fd00:31::10"_ctv); localPeer.cidr = 64;
+    remotePeer.address.assign("fd00:31::20"_ctv); remotePeer.cidr = 64;
+    remotePeer.gateway.assign("fe80::1"_ctv);
+    local.peerAddresses.push_back(localPeer);
+    remote.peerAddresses.push_back(remotePeer);
+    local.hardware.inventoryComplete = remote.hardware.inventoryComplete = true;
+    local.hardware.cpu.logicalCores = remote.hardware.cpu.logicalCores = 4;
+    local.hardware.memory.totalMB = remote.hardware.memory.totalMB = 4096;
+    local.hardware.network.nics.push_back(makeNic("bond0", "5e:b7:78:2a:48:7b", "fd00:31::10/64"));
+    local.hardware.network.captures.push_back(MachineToolCapture {
+        .tool = "ip"_ctv,
+        .phase = "route-show-ipv6"_ctv,
+        .output = "[{\"dst\":\"fd00:31::/64\",\"dev\":\"bond0\",\"protocol\":\"kernel\"}]"_ctv,
+        .attempted = true,
+        .succeeded = true});
+    remote.hardware.network.nics.push_back(makeNic("bond0", "fa:6d:18:7d:9f:5e", "fd00:31::20/64"));
+    brain.machines.insert(&local);
+    brain.machines.insert(&remote);
+
+    SwitchboardOverlayRoutingConfig config = {};
+    suite.expect(brain.testBuildSwitchboardOverlayRoutingConfig(&local, config), "build_overlay_routing_config_accepts_onlink_peer_with_default_gateway");
+    suite.expect(config.machineRoutes.size() == 1, "build_overlay_routing_config_onlink_gateway_builds_route");
+    if (config.machineRoutes.size() == 1)
+    {
+      suite.expect(config.machineRoutes[0].useGatewayMAC == false, "build_overlay_routing_config_onlink_gateway_uses_peer_mac");
+      suite.expect(config.machineRoutes[0].nextHopMAC == "fa:6d:18:7d:9f:5e"_ctv, "build_overlay_routing_config_onlink_gateway_preserves_peer_mac");
+    }
+  }
+
+  {
+    TestBrain brain = {};
+    brain.brainConfig.datacenterFragment = 1;
+    NoopBrainIaaS iaas = {};
+    brain.iaas = &iaas;
+
+    Machine local = {}, remote = {};
+    local.uuid = uint128_t(0x9469); local.fragment = 0x59;
+    remote.uuid = uint128_t(0x9470); remote.fragment = 0x5a;
+    for (auto *machine : {&local, &remote})
+    {
+      machine->hardware.inventoryComplete = true;
+      machine->hardware.cpu.logicalCores = 4;
+      machine->hardware.memory.totalMB = 4096;
+    }
+    local.hardware.network.nics.push_back(makeNic("wan0", "5e:b7:78:2a:48:7b", "fec0::10/64"));
+    local.hardware.network.nics.push_back(makeNic("lan0", "5e:b7:78:2a:48:7c", "fc00:59::10/64"));
+    remote.hardware.network.nics.push_back(makeNic("wan0", "fa:6d:18:7d:9f:5e", "fec0::20/64"));
+    remote.hardware.network.nics.push_back(makeNic("lan0", "fa:6d:18:7d:9f:5f", "fc00:59::20/64"));
+    local.hardware.network.captures.push_back(MachineToolCapture {
+        .tool = "ip"_ctv,
+        .phase = "route-show-ipv6"_ctv,
+        .output = "[{\"dst\":\"fec0::/64\",\"dev\":\"wan0\",\"protocol\":\"ra\"},{\"dst\":\"fc00:59::/64\",\"dev\":\"lan0\",\"protocol\":\"ra\"}]"_ctv,
+        .attempted = true,
+        .succeeded = true});
+    brain.machines.insert(&local);
+    brain.machines.insert(&remote);
+
+    SwitchboardOverlayRoutingConfig config = {};
+    suite.expect(brain.testBuildSwitchboardOverlayRoutingConfig(&local, config), "build_overlay_routing_config_accepts_ra_onlink_candidates");
+    suite.expect(config.machineRoutes.size() == 1, "build_overlay_routing_config_ra_onlink_builds_route");
+    if (config.machineRoutes.size() == 1)
+    {
+      suite.expect(config.machineRoutes[0].nextHop.equals(IPAddress("fc00:59::20", true)), "build_overlay_routing_config_private_ula_outranks_fec0_ra_candidate");
+      suite.expect(config.machineRoutes[0].sourceAddress.equals(IPAddress("fc00:59::10", true)), "build_overlay_routing_config_private_ula_selects_matching_source");
+      suite.expect(config.machineRoutes[0].useGatewayMAC == false && config.machineRoutes[0].nextHopMAC == "fa:6d:18:7d:9f:5f"_ctv, "build_overlay_routing_config_private_ula_uses_peer_mac");
+    }
+  }
+
+  {
+    TestBrain brain = {};
+    brain.brainConfig.datacenterFragment = 1;
     NoopBrainIaaS iaas = {};
     brain.iaas = &iaas;
 

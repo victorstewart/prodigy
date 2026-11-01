@@ -154,6 +154,13 @@ static inline bool mothershipBuildClusterAddMachinesRequest(const MothershipProd
   {
     ClusterMachine requestedMachine = {};
     mothershipFillAdoptedClusterMachine(desiredMachine, requestedMachine);
+    if (requestedMachine.uuid != 0 &&
+        (std::count_if(topology.machines.begin(), topology.machines.end(),
+            [&](const auto& machine) { return machine.uuid == requestedMachine.uuid; }) > 1 ||
+         std::count_if(cluster.machines.begin(), cluster.machines.end(),
+            [&](const auto& machine) { return machine.uuid == requestedMachine.uuid; }) > 1)) {
+      if (failure) failure->assign("adopted machine UUID is ambiguous"_ctv); request = {}; return false;
+    }
 
     bool alreadyPresent = false;
     for (const ClusterMachine& existingMachine : topology.machines)
@@ -161,6 +168,47 @@ static inline bool mothershipBuildClusterAddMachinesRequest(const MothershipProd
       if (existingMachine.sameIdentityAs(requestedMachine))
       {
         alreadyPresent = true;
+        if (requestedMachine.uuid != 0 && existingMachine.uuid == requestedMachine.uuid)
+        {
+          ClusterMachine unchanged = requestedMachine;
+          unchanged.addresses = existingMachine.addresses;
+          if (mothershipCanUpdateAdoptedMachineRack(existingMachine, unchanged))
+          {
+            ClusterMachine update = existingMachine;
+            if (update.peerAddresses.empty()) prodigyCollectClusterMachinePeerAddresses(existingMachine, update.peerAddresses);
+            bool added = false;
+            for (const auto *declared : {&requestedMachine.addresses.privateAddresses, &requestedMachine.addresses.publicAddresses})
+              for (const auto& address : *declared)
+              {
+                IPAddress parsed = {};
+                if (!ClusterMachine::parseIPAddressLiteral(address.address, parsed)) { request = {}; return false; }
+                const bool present = mothershipDeclaredAddressesMatchTopology({address},
+                    declared == &requestedMachine.addresses.privateAddresses ? existingMachine.addresses.privateAddresses : existingMachine.addresses.publicAddresses);
+                if (present) continue;
+                if (existingMachine.peerAddressMatches(parsed)) {
+                  if (failure) failure->assign("adopted address addition changes an existing endpoint"_ctv); request = {}; return false;
+                }
+                if (!parsed.is6) { if (failure) failure->assign("adopted address addition requires IPv6"_ctv); request = {}; return false; }
+                for (const auto& other : topology.machines)
+                  if (other.uuid != existingMachine.uuid && other.peerAddressMatches(parsed)) {
+                    if (failure) failure->assign("adopted address addition conflicts with another machine"_ctv); request = {}; return false;
+                  }
+                for (const auto& other : request.adoptedMachines)
+                  if (other.uuid != existingMachine.uuid && other.peerAddressMatches(parsed)) {
+                    if (failure) failure->assign("adopted address addition conflicts with another machine"_ctv); request = {}; return false;
+                  }
+                auto& destination = declared == &requestedMachine.addresses.privateAddresses ? update.addresses.privateAddresses : update.addresses.publicAddresses;
+                prodigyAppendUniqueClusterMachineAddress(destination, address);
+                prodigyAppendUniqueClusterMachinePeerAddress(update.peerAddresses, {address.address, address.cidr, address.gateway});
+                added = true;
+              }
+            if (added) {
+              if (requestedMachine.rackUUID != 0) update.rackUUID = requestedMachine.rackUUID;
+              request.adoptedMachines.push_back(std::move(update));
+              break;
+            }
+          }
+        }
         if (requestedMachine.uuid != 0 &&
             existingMachine.uuid == requestedMachine.uuid &&
             mothershipCanUpdateAdoptedMachineRack(existingMachine, requestedMachine) == false)

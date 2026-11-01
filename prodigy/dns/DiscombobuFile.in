@@ -1,4 +1,4 @@
-FROM scratch for @PRODIGY_RESOLVED_TARGET_ARCH@
+FROM @PRODIGY_MASQUE_GATEWAY_RUNTIME_BASE@
 COPY {resolver} ./prodigy-dns-resolver /app/prodigy-dns-resolver
 SURVIVE /app/prodigy-dns-resolver
 EXECUTE ["/app/prodigy-dns-resolver"]

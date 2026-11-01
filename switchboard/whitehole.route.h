@@ -287,12 +287,19 @@ static inline bool switchboardPinnedWormholeFlowMapsCompatible(uint32_t ifindex)
   return compatible;
 }
 
+// Packet admission consumes grants; established-flow forwarding consumes the
+// flow and route proofs. Reopened kernel programs expose only maps they use,
+// whereas a freshly loaded object also exposes its unused declarations.
+enum class SwitchboardWormholeMapConsumer : uint8_t { pairAdmission, forwarding };
+
 template <typename Program>
-static inline bool switchboardProgramHasCompatibleWormholeFlowMaps(Program *program)
+static inline bool switchboardProgramHasCompatibleWormholeFlowMaps(
+    Program *program,
+    SwitchboardWormholeMapConsumer consumer = SwitchboardWormholeMapConsumer::pairAdmission)
 {
   bool established = false;
   bool pending = false;
-  bool grants = false;
+  bool grants = consumer == SwitchboardWormholeMapConsumer::forwarding;
   bool routes = false;
   if (program)
   {
@@ -302,9 +309,10 @@ static inline bool switchboardProgramHasCompatibleWormholeFlowMaps(Program *prog
     program->openMap("wh_pending"_ctv, [&](int mapFD) -> void {
       pending = switchboardWormholePendingFlowMapCompatibleFD(mapFD);
     });
-    program->openMap("wh_pair_grants"_ctv, [&](int mapFD) -> void {
-      grants = switchboardPairAdmissionGrantMapCompatibleFD(mapFD);
-    });
+    if (!grants)
+      program->openMap("wh_pair_grants"_ctv, [&](int mapFD) -> void {
+        grants = switchboardPairAdmissionGrantMapCompatibleFD(mapFD);
+      });
     program->openMap("wh_pair_routes"_ctv, [&](int mapFD) -> void {
       routes = switchboardPairAdmissionRouteMapCompatibleFD(mapFD);
     });
@@ -555,6 +563,29 @@ static inline bool switchboardPinProgramMap(Program *program, uint32_t ifindex, 
   return pinned;
 }
 
+// A second host interface may share a program but must never create a second
+// authority map set. Alias only an already-pinned source map; an existing
+// destination pin is acceptable solely when it names that exact map.
+static inline bool switchboardAliasPinnedProgramMap(uint32_t sourceIfindex, uint32_t destinationIfindex,
+                                                     void (*pinPath)(String&, uint32_t))
+{
+  if (sourceIfindex == 0 || destinationIfindex == 0 || sourceIfindex == destinationIfindex) return false;
+  String sourcePath = {}, destinationPath = {};
+  pinPath(sourcePath, sourceIfindex);
+  pinPath(destinationPath, destinationIfindex);
+  int sourceFD = bpf_obj_get(sourcePath.c_str());
+  if (sourceFD < 0) return false;
+  const uint32_t sourceID = switchboardKernelMapID(sourceFD);
+  int destinationFD = bpf_obj_get(destinationPath.c_str());
+  const uint32_t destinationID = switchboardKernelMapID(destinationFD);
+  const bool matched = sourceID != 0 &&
+      ((destinationFD >= 0 && destinationID == sourceID) ||
+       (destinationFD < 0 && errno == ENOENT && bpf_obj_pin(sourceFD, destinationPath.c_str()) == 0));
+  if (destinationFD >= 0) ::close(destinationFD);
+  ::close(sourceFD);
+  return matched;
+}
+
 static inline bool switchboardReusePinnedProgramMap(struct bpf_object *obj, uint32_t ifindex, const char *mapName, void (*pinPath)(String&, uint32_t), Vector<int>& inner_map_fds)
 {
   if (obj == nullptr || ifindex == 0)
@@ -628,7 +659,26 @@ static inline bool switchboardProgramUsesPinnedMap(Program *program,
 template <typename Program>
 static inline bool switchboardPinWhiteholeReplyFlowMap(Program *program, uint32_t ifindex)
 {
-  return switchboardPinProgramMap(program, ifindex, "white_replies", switchboardWhiteholeReplyFlowPinPath);
+  if (program == nullptr || ifindex == 0) return false;
+  String path = {};
+  switchboardWhiteholeReplyFlowPinPath(path, ifindex);
+  int existingFD = bpf_obj_get(path.c_str());
+  if (existingFD >= 0) {
+    ::close(existingFD);
+    return switchboardProgramUsesPinnedMap(program, ifindex, "white_replies", switchboardWhiteholeReplyFlowPinPath);
+  }
+  if (errno != ENOENT) return false;
+  bool pinned = false;
+  program->openMap("white_replies"_ctv, [&](int mapFD) -> void {
+    if (mapFD >= 0) pinned = bpf_obj_pin(mapFD, path.c_str()) == 0;
+  });
+  return pinned;
+}
+
+template <typename Program>
+static inline bool switchboardProgramUsesPinnedWhiteholeReplyFlowMap(Program *program, uint32_t ifindex)
+{
+  return switchboardProgramUsesPinnedMap(program, ifindex, "white_replies", switchboardWhiteholeReplyFlowPinPath);
 }
 
 static inline bool switchboardReusePinnedWhiteholeReplyFlowMap(struct bpf_object *obj, uint32_t ifindex, Vector<int>& inner_map_fds)
@@ -636,13 +686,48 @@ static inline bool switchboardReusePinnedWhiteholeReplyFlowMap(struct bpf_object
   return switchboardReusePinnedProgramMap(obj, ifindex, "white_replies", switchboardWhiteholeReplyFlowPinPath, inner_map_fds);
 }
 template <typename Program>
-static inline bool switchboardPinWormholeFlowMaps(Program *program, uint32_t ifindex)
+static inline bool switchboardProgramUsesPinnedWormholeFlowMaps(
+    Program *program, uint32_t ifindex,
+    SwitchboardWormholeMapConsumer consumer = SwitchboardWormholeMapConsumer::pairAdmission)
 {
+  return switchboardProgramHasCompatibleWormholeFlowMaps(program, consumer) &&
+         switchboardProgramUsesPinnedMap(program, ifindex, "wh_flows", switchboardWormholeFlowPinPath) &&
+         switchboardProgramUsesPinnedMap(program, ifindex, "wh_pending", switchboardWormholePendingFlowPinPath) &&
+         (consumer == SwitchboardWormholeMapConsumer::forwarding ||
+          switchboardProgramUsesPinnedMap(program, ifindex, "wh_pair_grants", switchboardPairAdmissionGrantPinPath)) &&
+         switchboardProgramUsesPinnedMap(program, ifindex, "wh_pair_routes", switchboardPairAdmissionRoutePinPath);
+}
+
+template <typename Program>
+static inline bool switchboardPinWormholeFlowMaps(
+    Program *program, uint32_t ifindex,
+    SwitchboardWormholeMapConsumer consumer = SwitchboardWormholeMapConsumer::pairAdmission)
+{
+  if (program && consumer == SwitchboardWormholeMapConsumer::forwarding)
+  {
+    bool hasGrantMap = false;
+    program->openMap("wh_pair_grants"_ctv, [&](int mapFD) { hasGrantMap = mapFD >= 0; });
+    if (!hasGrantMap)
+    {
+      // A retained forwarding program cannot create the grant authority it
+      // does not consume. Reuse only a complete, compatible existing pin set.
+      return switchboardPinnedWormholeFlowMapsCompatible(ifindex) &&
+             switchboardProgramUsesPinnedWormholeFlowMaps(program, ifindex, consumer);
+    }
+  }
   return switchboardProgramHasCompatibleWormholeFlowMaps(program) &&
          switchboardPinProgramMap(program, ifindex, "wh_flows", switchboardWormholeFlowPinPath) &&
          switchboardPinProgramMap(program, ifindex, "wh_pending", switchboardWormholePendingFlowPinPath) &&
          switchboardPinProgramMap(program, ifindex, "wh_pair_grants", switchboardPairAdmissionGrantPinPath) &&
          switchboardPinProgramMap(program, ifindex, "wh_pair_routes", switchboardPairAdmissionRoutePinPath);
+}
+
+static inline bool switchboardAliasPinnedWormholeFlowMaps(uint32_t sourceIfindex, uint32_t destinationIfindex)
+{
+  return switchboardAliasPinnedProgramMap(sourceIfindex, destinationIfindex, switchboardWormholeFlowPinPath) &&
+         switchboardAliasPinnedProgramMap(sourceIfindex, destinationIfindex, switchboardWormholePendingFlowPinPath) &&
+         switchboardAliasPinnedProgramMap(sourceIfindex, destinationIfindex, switchboardPairAdmissionGrantPinPath) &&
+         switchboardAliasPinnedProgramMap(sourceIfindex, destinationIfindex, switchboardPairAdmissionRoutePinPath);
 }
 
 static inline bool switchboardReusePinnedWormholeFlowMaps(struct bpf_object *obj, uint32_t ifindex, Vector<int>& inner_map_fds)
@@ -655,14 +740,4 @@ static inline bool switchboardReusePinnedWormholeFlowMaps(struct bpf_object *obj
          switchboardReusePinnedProgramMap(obj, ifindex, "wh_pending", switchboardWormholePendingFlowPinPath, inner_map_fds) &&
          switchboardReusePinnedProgramMap(obj, ifindex, "wh_pair_grants", switchboardPairAdmissionGrantPinPath, inner_map_fds) &&
          switchboardReusePinnedProgramMap(obj, ifindex, "wh_pair_routes", switchboardPairAdmissionRoutePinPath, inner_map_fds);
-}
-
-template <typename Program>
-static inline bool switchboardProgramUsesPinnedWormholeFlowMaps(Program *program, uint32_t ifindex)
-{
-  return switchboardProgramHasCompatibleWormholeFlowMaps(program) &&
-         switchboardProgramUsesPinnedMap(program, ifindex, "wh_flows", switchboardWormholeFlowPinPath) &&
-         switchboardProgramUsesPinnedMap(program, ifindex, "wh_pending", switchboardWormholePendingFlowPinPath) &&
-         switchboardProgramUsesPinnedMap(program, ifindex, "wh_pair_grants", switchboardPairAdmissionGrantPinPath) &&
-         switchboardProgramUsesPinnedMap(program, ifindex, "wh_pair_routes", switchboardPairAdmissionRoutePinPath);
 }

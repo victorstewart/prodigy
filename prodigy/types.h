@@ -20,6 +20,7 @@
 #include <prodigy/biphasal.key.h>
 #include <prodigy/server.state.h>
 #include <prodigy/sha256.digest.h>
+#include <macros/datacenter.h>
 #include <switchboard/common/constants.h>
 
 #ifndef PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
@@ -65,7 +66,44 @@ static void serialize(S&& serializer, CancelDeploymentRequest& request)
   serializer.text1b(request.operationID, 36);
   serializer.text1b(request.reason, 512);
 }
-
+// Explicit qualification-only cancellation scope. The old wire request stays
+// unchanged; this envelope is decoded separately on the same operation topic.
+struct ProdigyQualificationCancellationMember {
+  uint128_t containerUUID = 0, machineUUID = 0;
+};
+template <typename S> static void serialize(S&& s, ProdigyQualificationCancellationMember& v) {
+  s.value16b(v.containerUUID); s.value16b(v.machineUUID);
+}
+struct ProdigyQualificationStatefulCancellation {
+  static constexpr uint32_t version = 0x51435301; // QCS v1
+  uint32_t protocolVersion = version;
+  CancelDeploymentRequest request;
+  uint128_t qualificationRunUUID = 0, successorOperationUUID = 0, sourceClusterUUID = 0;
+  uint64_t executionGeneration = 0;
+  int64_t deadlineAtMilliseconds = 0;
+  String placementIntentSHA256, successorPlanSHA256, successorArtifactSHA256;
+  Vector<ProdigyQualificationCancellationMember> members;
+};
+template <typename S> static void serialize(S&& s, ProdigyQualificationStatefulCancellation& v) {
+  s.value4b(v.protocolVersion); s.object(v.request); s.value16b(v.qualificationRunUUID);
+  s.value16b(v.successorOperationUUID); s.value16b(v.sourceClusterUUID); s.value8b(v.executionGeneration);
+  s.value8b(v.deadlineAtMilliseconds); s.text1b(v.placementIntentSHA256, 64);
+  s.text1b(v.successorPlanSHA256, 64); s.text1b(v.successorArtifactSHA256, 64); s.container(v.members, 24);
+}
+static inline bool prodigyQualificationStatefulCancellationValid(const ProdigyQualificationStatefulCancellation& v) {
+  if (v.protocolVersion != v.version || !v.qualificationRunUUID || !v.successorOperationUUID || !v.sourceClusterUUID ||
+      !v.executionGeneration || v.deadlineAtMilliseconds <= 0 || v.request.applicationName.empty() ||
+      !v.request.applicationID || !v.request.activeVersionID || v.request.successorVersionID <= v.request.activeVersionID ||
+      v.request.activeVersionID >= (uint64_t(1) << 48) || v.request.successorVersionID >= (uint64_t(1) << 48) ||
+      v.request.operationID.size() != 36 || v.request.reason.empty() || v.members.empty() || v.members.size() > 24 ||
+      !prodigyIsSHA256HexDigest(v.placementIntentSHA256) || !prodigyIsSHA256HexDigest(v.successorPlanSHA256) ||
+      !prodigyIsSHA256HexDigest(v.successorArtifactSHA256)) return false;
+  for (size_t i = 0; i < v.members.size(); ++i) {
+    if (!v.members[i].containerUUID || !v.members[i].machineUUID) return false;
+    for (size_t j = 0; j < i; ++j) if (v.members[i].containerUUID == v.members[j].containerUUID) return false;
+  }
+  return true;
+}
 class CancelDeploymentResponse : public MothershipResponse {
 public:
   CancelDeploymentResult result = CancelDeploymentResult::rejected;
@@ -397,6 +435,18 @@ struct SystemContainerRuntimePlan {
   SystemContainerKind kind = SystemContainerKind::none;
   SystemContainerArtifactRef artifact;
   SystemContainerEgressPolicy egress;
+  // Filled only by the selected Neuron immediately before a typed gateway
+  // launch; these values never travel as a general system-container API.
+  String gatewayReadinessSocket, gatewayLaunchToken, gatewayRecoverySocket, gatewayRecoveryToken, gatewayRole, gatewayRoutes;
+  String gatewayEndpoint, gatewayLocalIdentity, gatewayPeerIdentity, gatewayPeerTrust;
+  // Exact TUN owned by this gateway authority.  The child must use the same
+  // interface that Neuron binds private BGP to; accepting a CLI-selected name
+  // would let readiness describe one path while BGP used another.
+  String gatewayTunnelInterface;
+  // Typed references to the committed gateway authority. Keep UUIDs numeric
+  // until launch so the child receives canonical hexadecimal, not CLI text.
+  uint128_t gatewayPairUUID = 0, gatewayLocalClusterUUID = 0, gatewayLocalMachineUUID = 0;
+  uint64_t gatewayKeyEpoch = 0, gatewayAuthorityGeneration = 0, gatewayGeneration = 0;
 
   bool configured(void) const
   {
@@ -404,19 +454,63 @@ struct SystemContainerRuntimePlan {
   }
 };
 
+// Neutral, credential-free identity for one private-BGP delivery.  It lives
+// with the shared wire structs because Brain, Neuron, and lifecycle records
+// all need the exact same scope without importing Vault behavior.
+class ProdigyPairPrivateBGPSecretScope {
+public:
+  uint128_t pairUUID = 0;
+  uint128_t operationUUID = 0;
+  uint64_t keyEpoch = 0;
+  uint8_t tunnelSlot = 0;
+  uint128_t clusterUUID = 0;
+  uint128_t machineUUID = 0;
+  uint64_t authorityGeneration = 0;
+  uint64_t gatewayGeneration = 0;
+};
+template <typename S> static void serialize(S&& s, ProdigyPairPrivateBGPSecretScope& scope)
+{ s.value16b(scope.pairUUID); s.value16b(scope.operationUUID); s.value8b(scope.keyEpoch); s.value1b(scope.tunnelSlot);
+  s.value16b(scope.clusterUUID); s.value16b(scope.machineUUID); s.value8b(scope.authorityGeneration); s.value8b(scope.gatewayGeneration); }
+
+
 template <typename S>
 static void serialize(S&& serializer, SystemContainerRuntimePlan& plan)
 {
   serializer.value1b(plan.kind);
   serializer.object(plan.artifact);
   serializer.object(plan.egress);
+  serializer.text1b(plan.gatewayReadinessSocket, 255);
+  serializer.text1b(plan.gatewayLaunchToken, 128);
+  serializer.text1b(plan.gatewayRole, 16);
+  serializer.text1b(plan.gatewayRoutes, 512);
+  serializer.text1b(plan.gatewayEndpoint, 128);
+  serializer.text1b(plan.gatewayLocalIdentity, 64);
+  serializer.text1b(plan.gatewayPeerIdentity, 64);
+  serializer.text1b(plan.gatewayPeerTrust, 64);
+  serializer.text1b(plan.gatewayTunnelInterface, 15);
+  serializer.value16b(plan.gatewayPairUUID);
+  serializer.value16b(plan.gatewayLocalClusterUUID);
+  serializer.value16b(plan.gatewayLocalMachineUUID);
+  serializer.value8b(plan.gatewayKeyEpoch);
+  serializer.value8b(plan.gatewayAuthorityGeneration);
+  serializer.value8b(plan.gatewayGeneration);
 }
+
+// The gateway ledger and the corresponding reconciliation inventory share one
+// cardinality limit: every advertised artifact must be justified by an active
+// authority record.
+constexpr uint32_t ProdigyCrossClusterMasqueGatewayAuthorityMaximumRecords = 256;
 
 class BrainReconcileStateRequest {
 public:
 
+  static constexpr uint32_t maximumCrossClusterMasqueGatewayArtifacts = 256;
   Vector<uint64_t> deploymentIDs;
   SystemContainerArtifactRef systemArtifact;
+  // The tunnel-provider artifact predates the multi-gateway ledger and keeps
+  // its dedicated field. MASQUE gateway artifacts are a deduplicated
+  // inventory because one Brain can own multiple active authorities.
+  Vector<SystemContainerArtifactRef> crossClusterMasqueGatewayArtifacts;
 };
 
 template <typename S>
@@ -424,6 +518,9 @@ static void serialize(S&& serializer, BrainReconcileStateRequest& request)
 {
   serializer.object(request.deploymentIDs);
   serializer.object(request.systemArtifact);
+  serializer.container(request.crossClusterMasqueGatewayArtifacts,
+      BrainReconcileStateRequest::maximumCrossClusterMasqueGatewayArtifacts,
+      [](auto& nested, SystemContainerArtifactRef& artifact) { nested.object(artifact); });
 }
 
 static inline const char *machineCpuArchitectureName(MachineCpuArchitecture architecture)
@@ -970,15 +1067,21 @@ static void serialize(S&& serializer, RoutableSubnetRegistryReport& payload)
 class SwitchboardOverlayMachineRoute {
 public:
 
+  // For overlay routes this is { datacenterFragment:8, machineFragment:24 }.
+  // The field name is retained for the wire format and existing map layout.
   uint32_t machineFragment = 0;
   IPAddress nextHop = {};
   IPAddress sourceAddress = {};
   bool useGatewayMAC = false;
   String nextHopMAC;
+  // A nonzero value selects host-local netkit delivery instead of NIC egress.
+  // Only the two allocator-reserved MASQUE gateway fragments are valid for
+  // cross-cluster private-site fallbacks.
+  uint8_t localContainerRedirectFragment = 0;
 
   bool operator==(const SwitchboardOverlayMachineRoute& other) const
   {
-    return machineFragment == other.machineFragment && nextHop.equals(other.nextHop) && sourceAddress.equals(other.sourceAddress) && useGatewayMAC == other.useGatewayMAC && nextHopMAC.equals(other.nextHopMAC);
+    return machineFragment == other.machineFragment && nextHop.equals(other.nextHop) && sourceAddress.equals(other.sourceAddress) && useGatewayMAC == other.useGatewayMAC && nextHopMAC.equals(other.nextHopMAC) && localContainerRedirectFragment == other.localContainerRedirectFragment;
   }
 
   bool operator!=(const SwitchboardOverlayMachineRoute& other) const
@@ -995,12 +1098,14 @@ static void serialize(S&& serializer, SwitchboardOverlayMachineRoute& route)
   serializer.object(route.sourceAddress);
   serializer.value1b(route.useGatewayMAC);
   serializer.text1b(route.nextHopMAC, UINT32_MAX);
+  serializer.value1b(route.localContainerRedirectFragment);
 }
 
 class SwitchboardOverlayHostedIngressRoute {
 public:
 
   IPPrefix prefix;
+  // Same full overlay identity as SwitchboardOverlayMachineRoute.
   uint32_t machineFragment = 0;
 
   bool operator==(const SwitchboardOverlayHostedIngressRoute& other) const
@@ -4114,7 +4219,8 @@ enum class StatefulTopologyServingMode : uint8_t {
   catchupOnly,
   drainOnly,
   // Explicit versioned tail. Existing topology encodings remain unchanged.
-  applicationDataAuthority
+  applicationDataAuthority,
+  allMastersSeedBootstrap
 };
 
 enum class StatefulDataAuthorityMode : uint8_t {
@@ -4130,7 +4236,11 @@ enum class StatefulDataAuthorityMode : uint8_t {
 // neither reconstructs that map nor infers a write fence from healthy replicas.
 class StatefulDataAuthority {
 public:
-  uint32_t contractVersion = 1;
+  // Version one is the exact legacy authority wire. Version two appends the
+  // immutable shard-group cardinality without changing any v1 byte offset.
+  static constexpr uint32_t legacyContractVersion = 1;
+  static constexpr uint32_t version = 2;
+  uint32_t contractVersion = version;
   uint128_t operationUUID = 0;
   uint128_t previousOperationUUID = 0;
   uint64_t previousAuthorityEpoch = 0;
@@ -4142,6 +4252,9 @@ public:
   uint128_t writeOwnerClusterUUID = 0;
   uint64_t authorityEpoch = 0;
   uint32_t shardGroup = 0;
+  // The immutable global cardinality used by jump-hash ownership.  A paired
+  // migration moves one group, but its target must retain this full topology.
+  uint32_t nShardGroups = 0;
   StatefulDataAuthorityMode mode = StatefulDataAuthorityMode::catchupOnly;
   String contractSHA256;
   String shardManifestSHA256;
@@ -4169,16 +4282,23 @@ static void serialize(S&& serializer, StatefulDataAuthority& authority)
   serializer.text1b(authority.shardManifestSHA256, 64);
   serializer.text1b(authority.snapshotBoundarySHA256, 64);
   serializer.text1b(authority.requiredAppliedWatermarkSHA256, 64);
+  if (authority.contractVersion >= StatefulDataAuthority::version)
+    serializer.value4b(authority.nShardGroups);
 }
 
 static inline bool prodigyStatefulDataAuthorityValid(const StatefulDataAuthority& authority)
 {
-  if (authority.contractVersion != 1 || authority.operationUUID == 0 ||
+  if ((authority.contractVersion != StatefulDataAuthority::legacyContractVersion &&
+       authority.contractVersion != StatefulDataAuthority::version) ||
+      authority.operationUUID == 0 ||
       authority.datasetUUID == 0 || authority.snapshotUUID == 0 ||
       ((authority.previousOperationUUID == 0) != (authority.previousAuthorityEpoch == 0)) ||
       (authority.previousAuthorityEpoch != 0 && authority.authorityEpoch <= authority.previousAuthorityEpoch) ||
       authority.sourceClusterUUID == 0 || authority.targetClusterUUID == 0 ||
       authority.sourceClusterUUID == authority.targetClusterUUID || authority.authorityEpoch == 0 ||
+      (authority.contractVersion == StatefulDataAuthority::legacyContractVersion
+        ? authority.nShardGroups != 0
+        : (authority.nShardGroups == 0 || authority.shardGroup >= authority.nShardGroups)) ||
       (authority.localClusterUUID != authority.sourceClusterUUID && authority.localClusterUUID != authority.targetClusterUUID) ||
       (authority.writeOwnerClusterUUID != authority.sourceClusterUUID && authority.writeOwnerClusterUUID != authority.targetClusterUUID) ||
       !prodigyIsSHA256HexDigest(authority.contractSHA256) ||
@@ -4234,8 +4354,10 @@ static inline bool prodigyStatefulDataAuthorityCanAdvance(const StatefulDataAuth
 {
   if (!prodigyStatefulDataAuthorityValid(previous) || !prodigyStatefulDataAuthorityValid(next)) return false;
   if (prodigyStatefulDataAuthorityEqual(previous, next)) return true;
-  if (next.authorityEpoch <= previous.authorityEpoch || next.contractSHA256 != previous.contractSHA256 ||
+  if (next.contractVersion != previous.contractVersion || next.authorityEpoch <= previous.authorityEpoch ||
+      next.contractSHA256 != previous.contractSHA256 ||
       next.shardManifestSHA256 != previous.shardManifestSHA256 || next.shardGroup != previous.shardGroup ||
+      next.nShardGroups != previous.nShardGroups ||
       next.datasetUUID != previous.datasetUUID || next.localClusterUUID != previous.localClusterUUID) return false;
   if (next.operationUUID != previous.operationUUID) {
     if (next.previousOperationUUID != previous.operationUUID ||
@@ -4332,8 +4454,55 @@ enum class StatefulWorkerTopologyUpgradePhase : uint8_t {
   none,
   greenBootstrap,
   blueDraining,
-  applicationDataAuthority
+  applicationDataAuthority,
+  allMastersSeedBootstrap,
+  initialAllMastersSeedBootstrap
 };
+
+class ProdigyAllMastersSeedBootstrap {
+public:
+  uint128_t sourceClusterUUID = 0;
+  uint128_t targetClusterUUID = 0;
+  uint64_t targetDeploymentID = 0;
+  uint128_t qualificationRunUUID = 0;
+  uint128_t successorOperationUUID = 0;
+  uint32_t shardGroup = 0;
+  uint64_t expectedSeedGeneration = 0;
+
+  bool operator==(const ProdigyAllMastersSeedBootstrap& o) const {
+    return sourceClusterUUID == o.sourceClusterUUID && targetClusterUUID == o.targetClusterUUID &&
+        targetDeploymentID == o.targetDeploymentID && qualificationRunUUID == o.qualificationRunUUID &&
+        successorOperationUUID == o.successorOperationUUID && shardGroup == o.shardGroup &&
+        expectedSeedGeneration == o.expectedSeedGeneration;
+  }
+};
+
+template <typename S>
+static void serialize(S&& s, ProdigyAllMastersSeedBootstrap& v)
+{
+  s.value16b(v.sourceClusterUUID); s.value16b(v.targetClusterUUID);
+  s.value8b(v.targetDeploymentID); s.value16b(v.qualificationRunUUID);
+  s.value16b(v.successorOperationUUID); s.value4b(v.shardGroup);
+  s.value8b(v.expectedSeedGeneration);
+}
+
+// Initial remote seeding has no predecessor or cancellation.  This is a
+// distinct wire scope so legacy qualified-successor records remain unchanged.
+static constexpr uint64_t ProdigyInitialAllMastersSeedBootstrapCapability = 524288;
+class ProdigyInitialAllMastersSeedBootstrapScope {
+public:
+  ProdigyAllMastersSeedBootstrap bootstrap;
+  uint128_t baselineOperationUUID = 0;
+  uint32_t nShardGroups = 0;
+  String planSHA256;
+  String artifactSHA256;
+  uint64_t artifactBytes = 0;
+};
+template <typename S>
+static void serialize(S&& s, ProdigyInitialAllMastersSeedBootstrapScope& v) {
+  s.object(v.bootstrap); s.value16b(v.baselineOperationUUID); s.value4b(v.nShardGroups);
+  s.text1b(v.planSHA256, 64); s.text1b(v.artifactSHA256, 64); s.value8b(v.artifactBytes);
+}
 
 class StatefulTopology {
 public:
@@ -4347,6 +4516,7 @@ public:
   uint32_t targetEpoch = 0;
   StatefulTopologyBridgeMode bridgeMode = StatefulTopologyBridgeMode::none;
   StatefulDataAuthority dataAuthority;
+  ProdigyAllMastersSeedBootstrap allMastersSeedBootstrap;
 
   bool configured(void) const
   {
@@ -4367,6 +4537,17 @@ static void serialize(S&& serializer, StatefulTopology& topology)
   serializer.value1b(topology.bridgeMode);
   if (topology.servingMode == StatefulTopologyServingMode::applicationDataAuthority)
     serializer.object(topology.dataAuthority);
+  if (topology.servingMode == StatefulTopologyServingMode::allMastersSeedBootstrap)
+    serializer.object(topology.allMastersSeedBootstrap);
+}
+
+static inline bool prodigyStatefulTopologyIsAllMastersSeedBootstrap(const StatefulTopology& topology)
+{
+  const auto& v = topology.allMastersSeedBootstrap;
+  return topology.servingMode == StatefulTopologyServingMode::allMastersSeedBootstrap &&
+      v.sourceClusterUUID != 0 && v.targetClusterUUID != 0 && v.sourceClusterUUID != v.targetClusterUUID &&
+      v.targetDeploymentID != 0 && v.qualificationRunUUID != 0 && v.successorOperationUUID != 0 &&
+      v.shardGroup == topology.shardGroup && v.expectedSeedGeneration != 0;
 }
 
 static inline void prodigyPopulateDefaultStatefulTopology(StatefulTopology& topology, uint32_t shardGroup, const ApplicationConfig& config)
@@ -4407,7 +4588,8 @@ static inline bool prodigyStatefulTopologyServesClients(const StatefulTopology& 
          (topology.dataAuthority.mode == StatefulDataAuthorityMode::retainedSource &&
           topology.dataAuthority.writeOwnerClusterUUID == topology.dataAuthority.localClusterUUID) ||
          topology.dataAuthority.mode == StatefulDataAuthorityMode::snapshotPreparing);
-  return (topology.servingMode == StatefulTopologyServingMode::serve);
+  return topology.servingMode == StatefulTopologyServingMode::serve ||
+      prodigyStatefulTopologyIsAllMastersSeedBootstrap(topology);
 }
 
 static inline bool prodigyStatefulTopologyShouldAdvertiseBridge(const StatefulTopology& topology)
@@ -4574,6 +4756,9 @@ public:
   String requestPlanSHA256;
   String ownershipReadyReceiptSHA256;
   bool sourceRetired = false;
+  ProdigyAllMastersSeedBootstrap allMastersSeedBootstrap;
+  ProdigyQualificationStatefulCancellation qualificationCancellation;
+  ProdigyInitialAllMastersSeedBootstrapScope initialAllMastersSeedBootstrap;
 
   bool operator==(const ProdigyStatefulServingAuthority& other) const
   {
@@ -4586,6 +4771,13 @@ public:
           admittedPlanSHA256 != other.admittedPlanSHA256 || requestPlanSHA256 != other.requestPlanSHA256 ||
           ownershipReadyReceiptSHA256 != other.ownershipReadyReceiptSHA256 ||
           sourceRetired != other.sourceRetired)) ||
+        (phase == StatefulWorkerTopologyUpgradePhase::allMastersSeedBootstrap &&
+         (!(allMastersSeedBootstrap == other.allMastersSeedBootstrap) ||
+          ![&]() { String a, b; auto x = qualificationCancellation, y = other.qualificationCancellation;
+            BitseryEngine::serialize(a, x); BitseryEngine::serialize(b, y); return a == b; }())) ||
+        (phase == StatefulWorkerTopologyUpgradePhase::initialAllMastersSeedBootstrap &&
+         ![&]() { String a, b; auto x = initialAllMastersSeedBootstrap, y = other.initialAllMastersSeedBootstrap;
+           return BitseryEngine::serialize(a, x) && BitseryEngine::serialize(b, y) && a == b; }()) ||
         members.size() != other.members.size()) return false;
     for (uint32_t i = 0; i < members.size(); ++i) if (members[i] != other.members[i]) return false;
     return true;
@@ -4609,6 +4801,12 @@ static void serialize(S&& serializer, ProdigyStatefulServingAuthority& authority
     serializer.text1b(authority.ownershipReadyReceiptSHA256, 64);
     serializer.value1b(authority.sourceRetired);
   }
+  if (authority.phase == StatefulWorkerTopologyUpgradePhase::allMastersSeedBootstrap) {
+    serializer.object(authority.allMastersSeedBootstrap);
+    serializer.object(authority.qualificationCancellation);
+  }
+  if (authority.phase == StatefulWorkerTopologyUpgradePhase::initialAllMastersSeedBootstrap)
+    serializer.object(authority.initialAllMastersSeedBootstrap);
 }
 
 // Legacy topology decisions cover the deployment's remaining shard groups;
@@ -4617,16 +4815,29 @@ static void serialize(S&& serializer, ProdigyStatefulServingAuthority& authority
 static inline bool prodigyStatefulServingAuthoritySameScope(
     const ProdigyStatefulServingAuthority& a, const ProdigyStatefulServingAuthority& b)
 {
+  if (a.deploymentID != b.deploymentID) return false;
   const bool aa = a.phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority;
   const bool ba = b.phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority;
-  return a.deploymentID == b.deploymentID && aa == ba && (!aa || a.dataAuthority.shardGroup == b.dataAuthority.shardGroup);
+  const bool ab = a.phase == StatefulWorkerTopologyUpgradePhase::allMastersSeedBootstrap || a.phase == StatefulWorkerTopologyUpgradePhase::initialAllMastersSeedBootstrap;
+  const bool bb = b.phase == StatefulWorkerTopologyUpgradePhase::allMastersSeedBootstrap || b.phase == StatefulWorkerTopologyUpgradePhase::initialAllMastersSeedBootstrap;
+  if (aa != ba || ab != bb) return false;
+  if (aa)
+    return a.dataAuthority.shardGroup == b.dataAuthority.shardGroup;
+  if (ab)
+    return (a.phase == StatefulWorkerTopologyUpgradePhase::initialAllMastersSeedBootstrap ? a.initialAllMastersSeedBootstrap.bootstrap.shardGroup : a.allMastersSeedBootstrap.shardGroup) ==
+           (b.phase == StatefulWorkerTopologyUpgradePhase::initialAllMastersSeedBootstrap ? b.initialAllMastersSeedBootstrap.bootstrap.shardGroup : b.allMastersSeedBootstrap.shardGroup);
+  return true;
 }
 
 static inline bool prodigyStatefulServingAuthorityMatchesShard(
     const ProdigyStatefulServingAuthority& authority, uint64_t deploymentID, uint32_t shardGroup)
 {
   return authority.deploymentID == deploymentID &&
-      (authority.phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority
+      (authority.phase == StatefulWorkerTopologyUpgradePhase::initialAllMastersSeedBootstrap
+       ? authority.initialAllMastersSeedBootstrap.bootstrap.shardGroup == shardGroup
+       : authority.phase == StatefulWorkerTopologyUpgradePhase::allMastersSeedBootstrap
+       ? authority.allMastersSeedBootstrap.shardGroup == shardGroup
+       : authority.phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority
        ? authority.dataAuthority.shardGroup == shardGroup
        : std::any_of(authority.members.begin(), authority.members.end(), [&](const auto& member) {
            return member.shardGroup == shardGroup;
@@ -4645,6 +4856,145 @@ static void serialize(S&& serializer, StatefulDataAuthorityMemberReceipt& value)
 {
   serializer.value16b(value.containerUUID); serializer.value16b(value.machineUUID);
   serializer.object(value.receipt);
+}
+
+// Read-only application declaration on the existing stateful-authority topic.
+// Version three is distinct from authority receipts' leading v1/v2.
+// The authenticated container socket supplies container/machine identity; the
+// application echoes only this challenge and the selected deployment scope.
+class StatefulDataAuthorityPreparation {
+public:
+  static constexpr uint32_t currentVersion = 3;
+  uint32_t version = currentVersion;
+  bool response = false;
+  uint128_t requestUUID = 0;
+  uint128_t memberRequestUUID = 0; // Brain-minted anew for each process incarnation.
+  uint128_t clusterUUID = 0;
+  uint16_t applicationID = 0;
+  uint64_t deploymentID = 0;
+  uint32_t shardGroup = 0;
+  uint32_t nShardGroups = 0;
+  uint32_t contractVersion = StatefulDataAuthority::version;
+  String contractSHA256;
+  String shardManifestSHA256;
+  uint128_t datasetUUID = 0; // Unknown only before the first admitted authority.
+  bool hasAuthority = false;
+  StatefulDataAuthority currentAuthority;
+  StatefulDataAuthorityMode mode = StatefulDataAuthorityMode::retainedSource;
+  uint128_t writeOwnerClusterUUID = 0;
+  bool hasDurableWatermark = false;
+  uint64_t durableWatermark = 0;
+  String durableWatermarkSHA256;
+  bool supported = false;
+  String failure;
+};
+
+template <typename S>
+static void serialize(S&& serializer, StatefulDataAuthorityPreparation& value)
+{
+  serializer.value4b(value.version); serializer.value1b(value.response);
+  serializer.value16b(value.requestUUID); serializer.value16b(value.memberRequestUUID); serializer.value16b(value.clusterUUID);
+  serializer.value2b(value.applicationID); serializer.value8b(value.deploymentID);
+  serializer.value4b(value.shardGroup); serializer.value4b(value.nShardGroups);
+  serializer.value4b(value.contractVersion); serializer.text1b(value.contractSHA256, 64);
+  serializer.text1b(value.shardManifestSHA256, 64); serializer.value16b(value.datasetUUID);
+  serializer.value1b(value.hasAuthority); serializer.object(value.currentAuthority);
+  serializer.value1b(value.mode); serializer.value16b(value.writeOwnerClusterUUID);
+  serializer.value1b(value.hasDurableWatermark); serializer.value8b(value.durableWatermark);
+  serializer.text1b(value.durableWatermarkSHA256, 64); serializer.value1b(value.supported);
+  serializer.text1b(value.failure, 1024);
+}
+
+static inline bool prodigyStatefulDataAuthorityPreparationContextEqual(
+    const StatefulDataAuthorityPreparation& a, const StatefulDataAuthorityPreparation& b)
+{
+  return a.version == b.version && a.requestUUID == b.requestUUID && a.memberRequestUUID == b.memberRequestUUID && a.clusterUUID == b.clusterUUID &&
+      a.applicationID == b.applicationID && a.deploymentID == b.deploymentID &&
+      a.shardGroup == b.shardGroup && a.nShardGroups == b.nShardGroups;
+}
+
+static inline bool prodigyStatefulDataAuthorityPreparationValid(const StatefulDataAuthorityPreparation& value)
+{
+  StatefulDataAuthority empty;
+  if (value.version != StatefulDataAuthorityPreparation::currentVersion ||
+      value.requestUUID == 0 || value.clusterUUID == 0 ||
+      (value.applicationID != 3 && value.applicationID != 4) ||
+      uint16_t(value.deploymentID >> 48) != value.applicationID || value.nShardGroups == 0 ||
+      value.shardGroup >= value.nShardGroups || value.shardGroup > UINT16_MAX ||
+      value.contractVersion != StatefulDataAuthority::version || value.failure.size() > 1024) return false;
+  if (value.response && value.memberRequestUUID == 0) return false;
+  if (!value.response || !value.supported)
+    return !value.hasAuthority && prodigyStatefulDataAuthorityEqual(value.currentAuthority, empty) &&
+        value.contractSHA256.empty() && value.shardManifestSHA256.empty() && value.datasetUUID == 0 &&
+        value.mode == StatefulDataAuthorityMode::retainedSource && value.writeOwnerClusterUUID == 0 &&
+        !value.hasDurableWatermark && value.durableWatermark == 0 && value.durableWatermarkSHA256.empty() &&
+        (value.response ? !value.failure.empty() : (!value.supported && value.failure.empty()));
+  if (!value.failure.empty() || !prodigyIsSHA256HexDigest(value.contractSHA256) ||
+      !prodigyIsSHA256HexDigest(value.shardManifestSHA256) || value.writeOwnerClusterUUID == 0 ||
+      (value.mode != StatefulDataAuthorityMode::writeOwner && value.mode != StatefulDataAuthorityMode::retainedSource &&
+       value.mode != StatefulDataAuthorityMode::catchupOnly && value.mode != StatefulDataAuthorityMode::fenced &&
+       value.mode != StatefulDataAuthorityMode::snapshotPreparing) ||
+      (value.hasDurableWatermark ? !prodigyIsSHA256HexDigest(value.durableWatermarkSHA256) :
+          (value.durableWatermark != 0 || !value.durableWatermarkSHA256.empty()))) return false;
+  if (!value.hasAuthority)
+    return value.datasetUUID == 0 && prodigyStatefulDataAuthorityEqual(value.currentAuthority, empty) &&
+        value.mode == StatefulDataAuthorityMode::writeOwner && value.writeOwnerClusterUUID == value.clusterUUID;
+  return prodigyStatefulDataAuthorityValid(value.currentAuthority) &&
+      value.currentAuthority.contractVersion == value.contractVersion &&
+      value.currentAuthority.localClusterUUID == value.clusterUUID &&
+      value.currentAuthority.shardGroup == value.shardGroup &&
+      value.currentAuthority.nShardGroups == value.nShardGroups &&
+      value.currentAuthority.datasetUUID == value.datasetUUID &&
+      value.currentAuthority.contractSHA256 == value.contractSHA256 &&
+      value.currentAuthority.shardManifestSHA256 == value.shardManifestSHA256 &&
+      value.currentAuthority.mode == value.mode && value.currentAuthority.writeOwnerClusterUUID == value.writeOwnerClusterUUID;
+}
+
+class StatefulDataAuthorityPreparationMember {
+public:
+  ProdigyStatefulServingAuthorityMember member;
+  StatefulDataAuthorityPreparation preparation;
+};
+
+template <typename S>
+static void serialize(S&& serializer, StatefulDataAuthorityPreparationMember& value)
+{ serializer.object(value.member); serializer.object(value.preparation); }
+
+// A preparation is evidence, not coordinator-owned data.  Each member has a
+// distinct Brain challenge, but every application-owned fact must agree
+// exactly before a later operation may bind the observed cohort.  Keeping this
+// check next to the wire contract makes both Brain and a future Mothership
+// preparer fail closed on a missing, reordered, replayed, or divergent proof.
+static inline bool prodigyStatefulDataAuthorityPreparationMembersAgree(
+    const StatefulDataAuthorityPreparation& request,
+    const Vector<ProdigyStatefulServingAuthorityMember>& cohort,
+    const Vector<StatefulDataAuthorityPreparationMember>& observations)
+{
+  if (!prodigyStatefulDataAuthorityPreparationValid(request) || request.response ||
+      request.memberRequestUUID != 0 || cohort.size() != 3 || observations.size() != 3) return false;
+  const StatefulDataAuthorityPreparation *first = nullptr;
+  uint128_t previousContainerUUID = 0;
+  for (uint32_t index = 0; index < observations.size(); ++index) {
+    const auto& observed = observations[index];
+    const auto& proof = observed.preparation;
+    if (observed.member != cohort[index] || observed.member.containerUUID <= previousContainerUUID ||
+        !proof.response || !proof.supported || !proof.hasDurableWatermark ||
+        !prodigyStatefulDataAuthorityPreparationValid(proof) ||
+        proof.requestUUID != request.requestUUID || proof.clusterUUID != request.clusterUUID ||
+        proof.applicationID != request.applicationID || proof.deploymentID != request.deploymentID ||
+        proof.shardGroup != request.shardGroup || proof.nShardGroups != request.nShardGroups)
+      return false;
+    previousContainerUUID = observed.member.containerUUID;
+    if (!first) { first = &proof; continue; }
+    if (proof.contractVersion != first->contractVersion || proof.contractSHA256 != first->contractSHA256 ||
+        proof.shardManifestSHA256 != first->shardManifestSHA256 || proof.datasetUUID != first->datasetUUID ||
+        proof.hasAuthority != first->hasAuthority || !prodigyStatefulDataAuthorityEqual(proof.currentAuthority, first->currentAuthority) ||
+        proof.mode != first->mode || proof.writeOwnerClusterUUID != first->writeOwnerClusterUUID ||
+        proof.hasDurableWatermark != first->hasDurableWatermark || proof.durableWatermark != first->durableWatermark ||
+        proof.durableWatermarkSHA256 != first->durableWatermarkSHA256)
+      return false;
+  }
+  return first != nullptr;
 }
 
 // One request/response payload on one authenticated Mothership topic. Direction
@@ -4669,7 +5019,55 @@ public:
   bool ready = false;
   String failure;
   Vector<StatefulDataAuthorityMemberReceipt> receipts;
+  bool preparationQuery = false;
+  StatefulDataAuthorityPreparation preparation;
+  Vector<StatefulDataAuthorityPreparationMember> preparationMembers;
 };
+
+class ProdigyInitialAllMastersSeedBootstrapOperation {
+public:
+  static constexpr uint32_t version = 0x51425302;
+  uint32_t protocolVersion = version;
+  bool query = false;
+  uint64_t expectedAuthorityGeneration = 0;
+  uint128_t expectedMasterUUID = 0;
+  int64_t expectedMasterBootNs = 0;
+  ProdigyInitialAllMastersSeedBootstrapScope scope;
+  String deploymentPlan;
+  bool accepted = false;
+  bool ready = false;
+  String failure;
+};
+template <typename S>
+static void serialize(S&& s, ProdigyInitialAllMastersSeedBootstrapOperation& v) {
+  s.value4b(v.protocolVersion); s.value1b(v.query); s.value8b(v.expectedAuthorityGeneration);
+  s.value16b(v.expectedMasterUUID); s.value8b(v.expectedMasterBootNs); s.object(v.scope);
+  s.text1b(v.deploymentPlan, 1024 * 1024); s.value1b(v.accepted); s.value1b(v.ready); s.text1b(v.failure, 4096);
+}
+
+class ProdigyAllMastersSeedBootstrapOperation {
+public:
+  static constexpr uint32_t version = 0x51425301;
+  uint32_t protocolVersion = version;
+  bool query = false;
+  uint64_t expectedAuthorityGeneration = 0;
+  uint128_t expectedMasterUUID = 0;
+  int64_t expectedMasterBootNs = 0;
+  ProdigyQualificationStatefulCancellation qualificationCancellation;
+  ProdigyAllMastersSeedBootstrap bootstrap;
+  String deploymentPlan;
+  bool accepted = false;
+  bool ready = false;
+  String failure;
+};
+
+template <typename S>
+static void serialize(S&& s, ProdigyAllMastersSeedBootstrapOperation& v) {
+  s.value4b(v.protocolVersion); s.value1b(v.query); s.value8b(v.expectedAuthorityGeneration);
+  s.value16b(v.expectedMasterUUID); s.value8b(v.expectedMasterBootNs);
+  s.object(v.qualificationCancellation); s.object(v.bootstrap); s.text1b(v.deploymentPlan, 1024 * 1024);
+  s.value1b(v.accepted); s.value1b(v.ready); s.text1b(v.failure, 4096);
+}
 
 template <typename S>
 static void serialize(S&& serializer, StatefulDataAuthorityOperation& value)
@@ -4682,6 +5080,10 @@ static void serialize(S&& serializer, StatefulDataAuthorityOperation& value)
   serializer.text1b(value.deploymentPlan, 1024 * 1024);
   serializer.value1b(value.supported); serializer.value1b(value.accepted); serializer.value1b(value.ready);
   serializer.text1b(value.failure, 4096); serializer.container(value.receipts, 4096);
+  if (value.version >= 2) {
+    serializer.value1b(value.preparationQuery); serializer.object(value.preparation);
+    serializer.container(value.preparationMembers, 3);
+  }
 }
 
 class ProdigyDeferredStatefulScaleIntent {
@@ -5163,6 +5565,1798 @@ public:
   }
 };
 
+enum class DeploymentIdentityStoreKind : uint8_t {
+  unknown = 0, kv = 1, graph = 2, truth = 3
+};
+enum class ProdigyStatefulStoreSourceCutAction : uint8_t { prepare = 1, query = 2, release = 3 };
+enum class ProdigyStatefulStoreSourceCutScope : uint8_t { fullShardGroup = 1 };
+
+class ProdigyStatefulStoreSourceCut {
+public:
+  static constexpr uint32_t version = 1;
+  uint32_t protocolVersion = version;
+  ProdigyStatefulStoreSourceCutAction action = ProdigyStatefulStoreSourceCutAction::prepare;
+  bool response = false;
+  uint128_t operationUUID = 0, requestUUID = 0, memberRequestUUID = 0;
+  uint128_t sourceClusterUUID = 0;
+  uint64_t sourceDeploymentID = 0;
+  uint128_t sourceContainerUUID = 0;
+  uint16_t applicationID = 0;
+  DeploymentIdentityStoreKind storeKind = DeploymentIdentityStoreKind::unknown;
+  uint32_t shardGroup = UINT32_MAX, nShardGroups = 0;
+  ProdigyStatefulStoreSourceCutScope scope = ProdigyStatefulStoreSourceCutScope::fullShardGroup;
+  int64_t retainUntilMilliseconds = 0;
+  uint128_t cutUUID = 0;
+  uint64_t cutGeneration = 0;
+  String contentSHA256, headsSHA256;
+  bool ready = false, released = false;
+  String failure;
+};
+template <typename S> static void serialize(S&& s, ProdigyStatefulStoreSourceCut& v) {
+  s.value4b(v.protocolVersion); s.value1b(v.action); s.value1b(v.response);
+  s.value16b(v.operationUUID); s.value16b(v.requestUUID); s.value16b(v.memberRequestUUID);
+  s.value16b(v.sourceClusterUUID); s.value8b(v.sourceDeploymentID); s.value16b(v.sourceContainerUUID);
+  s.value2b(v.applicationID); s.value1b(v.storeKind); s.value4b(v.shardGroup); s.value4b(v.nShardGroups);
+  s.value1b(v.scope); s.value8b(v.retainUntilMilliseconds); s.value16b(v.cutUUID); s.value8b(v.cutGeneration);
+  s.text1b(v.contentSHA256, 64); s.text1b(v.headsSHA256, 64); s.value1b(v.ready); s.value1b(v.released);
+  s.text1b(v.failure, 1024);
+}
+static inline bool prodigyStatefulStoreSourceCutValid(const ProdigyStatefulStoreSourceCut& v) {
+  const bool kind = ((v.applicationID == 2 || v.applicationID == 5) && v.storeKind == DeploymentIdentityStoreKind::graph) ||
+      ((v.applicationID == 3 || v.applicationID == 4) && v.storeKind == DeploymentIdentityStoreKind::kv);
+  if (v.protocolVersion != v.version || !kind || v.operationUUID == 0 || v.requestUUID == 0 ||
+      v.sourceClusterUUID == 0 || v.sourceContainerUUID == 0 || v.sourceDeploymentID == 0 ||
+      uint16_t(v.sourceDeploymentID >> 48) != v.applicationID || v.nShardGroups == 0 || v.shardGroup >= v.nShardGroups ||
+      v.scope != ProdigyStatefulStoreSourceCutScope::fullShardGroup || v.retainUntilMilliseconds <= 0 ||
+      v.failure.size() > 1024 || (v.cutUUID == 0) != (v.cutGeneration == 0)) return false;
+  if (v.action != ProdigyStatefulStoreSourceCutAction::prepare && v.action != ProdigyStatefulStoreSourceCutAction::query &&
+      v.action != ProdigyStatefulStoreSourceCutAction::release) return false;
+  if (!v.response) return !v.ready && !v.released && v.failure.empty() && v.contentSHA256.empty() && v.headsSHA256.empty() &&
+      (v.action == ProdigyStatefulStoreSourceCutAction::prepare ? v.cutUUID == 0 : v.cutUUID != 0);
+  if (v.memberRequestUUID == 0 && (v.failure.empty() || v.action != ProdigyStatefulStoreSourceCutAction::prepare)) return false;
+  if (!v.failure.empty()) return !v.ready && !v.released && v.contentSHA256.empty() && v.headsSHA256.empty() &&
+      (v.action == ProdigyStatefulStoreSourceCutAction::prepare ? v.cutUUID == 0 : v.cutUUID != 0);
+  if (v.action == ProdigyStatefulStoreSourceCutAction::release)
+    return v.cutUUID != 0 && !v.ready && v.contentSHA256.empty() && v.headsSHA256.empty();
+  if (v.released || (v.action == ProdigyStatefulStoreSourceCutAction::query && v.cutUUID == 0)) return false;
+  if (v.ready) return v.cutUUID != 0 && prodigyIsSHA256HexDigest(v.contentSHA256) && prodigyIsSHA256HexDigest(v.headsSHA256);
+  return v.contentSHA256.empty() && v.headsSHA256.empty() &&
+      (v.action != ProdigyStatefulStoreSourceCutAction::prepare || v.cutUUID == 0);
+}
+static inline bool prodigyStatefulStoreSourceCutContextEqual(const ProdigyStatefulStoreSourceCut& a, const ProdigyStatefulStoreSourceCut& b) {
+  return a.protocolVersion == b.protocolVersion && a.action == b.action && a.operationUUID == b.operationUUID &&
+      a.requestUUID == b.requestUUID && a.memberRequestUUID == b.memberRequestUUID && a.sourceClusterUUID == b.sourceClusterUUID &&
+      a.sourceDeploymentID == b.sourceDeploymentID && a.sourceContainerUUID == b.sourceContainerUUID && a.applicationID == b.applicationID &&
+      a.storeKind == b.storeKind && a.shardGroup == b.shardGroup && a.nShardGroups == b.nShardGroups && a.scope == b.scope &&
+      a.retainUntilMilliseconds == b.retainUntilMilliseconds;
+}
+static inline bool prodigyStatefulStoreSourceCutResponseMatches(const ProdigyStatefulStoreSourceCut& request, const ProdigyStatefulStoreSourceCut& response) {
+  return !request.response && response.response && prodigyStatefulStoreSourceCutValid(request) &&
+      prodigyStatefulStoreSourceCutValid(response) && prodigyStatefulStoreSourceCutContextEqual(request, response) &&
+      (request.action == ProdigyStatefulStoreSourceCutAction::prepare ||
+       (request.cutUUID == response.cutUUID && request.cutGeneration == response.cutGeneration));
+}
+
+enum class ProdigyStatefulStoreReceiptState : uint8_t { active = 1, withdrawn = 2 };
+
+// The persisted all-masters placement is projected as this bounded desired
+// authority.  It is neither a receipt nor an alternative placement record:
+// Mothership copies it only from its durable registry row and every hop
+// binds it to the target process before delivery.
+class ProdigyStatefulStoreSeedAuthority {
+public:
+  static constexpr uint32_t version = 3;
+  static constexpr uint32_t sourceCutVersion = 4;
+  static constexpr uint32_t qualificationSeedFaultVersion = 5;
+  uint32_t protocolVersion = version;
+  uint64_t authorityGeneration = 0;
+  uint128_t operationUUID = 0;
+  uint16_t applicationID = 0;
+  DeploymentIdentityStoreKind storeKind = DeploymentIdentityStoreKind::unknown;
+  uint32_t shardGroup = UINT32_MAX;
+  uint32_t nShardGroups = 0;
+  uint128_t targetClusterUUID = 0;
+  uint64_t targetDeploymentID = 0;
+  uint128_t targetContainerUUID = 0;
+  uint128_t sourceClusterUUID = 0;
+  uint64_t sourceDeploymentID = 0;
+  uint128_t sourceContainerUUID = 0;
+  uint64_t seedGeneration = 0;
+  String fixtureSHA256;
+  String expectedCatchupWatermarkSHA256;
+  // v3 appends the exact native EWR source boundary. These fields are not a
+  // caller fixture and must be echoed by the target's native receipt.
+  String sourceContentWatermarkSHA256;
+  String sourceCatchupWatermarkSHA256;
+  // v4 binds the immutable, retained native source cut and baseline provenance.
+  uint128_t sourceBaselineOperationUUID = 0;
+  uint128_t sourceRequestUUID = 0;
+  uint128_t sourceMemberRequestUUID = 0;
+  uint128_t seedRouteUUID = 0;
+  uint128_t cutUUID = 0;
+  uint64_t cutGeneration = 0;
+  ProdigyStatefulStoreSourceCutScope sourceCutScope = ProdigyStatefulStoreSourceCutScope::fullShardGroup;
+  uint64_t retainUntilMilliseconds = 0;
+  // A qualification seed must be armed on the exact target before its
+  // automatically driven protected session is permitted to activate.
+  uint128_t qualificationRunUUID = 0, qualificationChallengeUUID = 0;
+  uint64_t qualificationExecutionGeneration = 0;
+  int64_t qualificationDeadlineAtMilliseconds = 0;
+};
+static inline bool prodigyStatefulStoreSeedAuthorityHasSourceCut(uint32_t version) {
+  return version == ProdigyStatefulStoreSeedAuthority::sourceCutVersion ||
+      version == ProdigyStatefulStoreSeedAuthority::qualificationSeedFaultVersion;
+}
+template <typename S> static void serialize(S&& s, ProdigyStatefulStoreSeedAuthority& value) {
+  s.value4b(value.protocolVersion); s.value8b(value.authorityGeneration); s.value16b(value.operationUUID);
+  s.value2b(value.applicationID); s.value1b(value.storeKind); s.value4b(value.shardGroup); s.value4b(value.nShardGroups);
+  s.value16b(value.targetClusterUUID); s.value8b(value.targetDeploymentID); s.value16b(value.targetContainerUUID);
+  s.value16b(value.sourceClusterUUID); s.value8b(value.sourceDeploymentID); s.value16b(value.sourceContainerUUID);
+  s.value8b(value.seedGeneration); s.text1b(value.fixtureSHA256, 64); s.text1b(value.expectedCatchupWatermarkSHA256, 64);
+  if (value.protocolVersion >= 3) { s.text1b(value.sourceContentWatermarkSHA256, 64); s.text1b(value.sourceCatchupWatermarkSHA256, 64); }
+  if (value.protocolVersion >= 4) {
+    s.value16b(value.sourceBaselineOperationUUID); s.value16b(value.sourceRequestUUID);
+    s.value16b(value.sourceMemberRequestUUID); s.value16b(value.seedRouteUUID); s.value16b(value.cutUUID); s.value8b(value.cutGeneration);
+    s.value1b(value.sourceCutScope); s.value8b(value.retainUntilMilliseconds);
+  }
+  if (value.protocolVersion >= ProdigyStatefulStoreSeedAuthority::qualificationSeedFaultVersion) {
+    s.value16b(value.qualificationRunUUID); s.value16b(value.qualificationChallengeUUID);
+    s.value8b(value.qualificationExecutionGeneration); s.value8b(value.qualificationDeadlineAtMilliseconds);
+  }
+}
+static inline bool prodigyStatefulStoreSeedAuthorityValid(const ProdigyStatefulStoreSeedAuthority& value) {
+  return (value.protocolVersion == ProdigyStatefulStoreSeedAuthority::version || prodigyStatefulStoreSeedAuthorityHasSourceCut(value.protocolVersion)) && value.authorityGeneration != 0 &&
+      value.operationUUID != 0 && value.applicationID != 0 && value.storeKind != DeploymentIdentityStoreKind::unknown &&
+      value.shardGroup < value.nShardGroups && value.targetClusterUUID != 0 && value.targetDeploymentID != 0 &&
+      value.targetContainerUUID != 0 && value.sourceClusterUUID != 0 && value.sourceDeploymentID != 0 &&
+      value.sourceContainerUUID != 0 && value.seedGeneration != 0 && prodigyIsSHA256HexDigest(value.fixtureSHA256) &&
+      (prodigyStatefulStoreSeedAuthorityHasSourceCut(value.protocolVersion) ? value.expectedCatchupWatermarkSHA256.empty() :
+       prodigyIsSHA256HexDigest(value.expectedCatchupWatermarkSHA256)) &&
+      prodigyIsSHA256HexDigest(value.sourceContentWatermarkSHA256) && prodigyIsSHA256HexDigest(value.sourceCatchupWatermarkSHA256) &&
+      (!prodigyStatefulStoreSeedAuthorityHasSourceCut(value.protocolVersion) ||
+       (value.sourceBaselineOperationUUID != 0 && value.sourceRequestUUID != 0 && value.sourceMemberRequestUUID != 0 &&
+        value.seedRouteUUID != 0 && value.cutUUID != 0 && value.cutGeneration != 0 && value.sourceCutScope == ProdigyStatefulStoreSourceCutScope::fullShardGroup &&
+        value.retainUntilMilliseconds != 0)) &&
+      (value.protocolVersion == ProdigyStatefulStoreSeedAuthority::qualificationSeedFaultVersion ?
+       (value.storeKind == DeploymentIdentityStoreKind::kv && value.qualificationRunUUID != 0 && value.qualificationChallengeUUID != 0 && value.qualificationExecutionGeneration != 0 &&
+        value.qualificationDeadlineAtMilliseconds > 0 && uint64_t(value.qualificationDeadlineAtMilliseconds) <= value.retainUntilMilliseconds) :
+       (value.qualificationRunUUID == 0 && value.qualificationChallengeUUID == 0 && value.qualificationExecutionGeneration == 0 &&
+        value.qualificationDeadlineAtMilliseconds == 0));
+}
+
+// Native store observation relayed through the existing container -> Neuron
+// -> Brain receipt channel.  It is deliberately an observation, not launch
+// authority: every field is emitted by the store after its own apply/session
+// boundary has committed it.  Missing fields make the receipt invalid.
+class ProdigyStatefulStoreReceipt {
+public:
+  static constexpr uint32_t version = 3;
+  static constexpr uint32_t sourceCutVersion = 4;
+  uint32_t protocolVersion = version;
+  ProdigyStatefulStoreReceiptState state = ProdigyStatefulStoreReceiptState::active;
+  uint128_t localContainerUUID = 0;
+  uint128_t localClusterUUID = 0;
+  uint64_t deploymentID = 0;
+  DeploymentIdentityStoreKind storeKind = DeploymentIdentityStoreKind::unknown;
+  uint32_t shardGroup = UINT32_MAX;
+  uint32_t nShardGroups = 0;
+  bool writable = false;
+  uint128_t siblingSessionUUID = 0;
+  uint64_t siblingSessionGeneration = 0;
+  bool siblingSessionHealthy = false;
+  uint128_t seededFromClusterUUID = 0;
+  uint128_t seededFromContainerUUID = 0;
+  uint64_t seedGeneration = 0;
+  String seedFixtureSHA256;
+  String appliedWatermarkSHA256;
+  // v3 is the native source boundary accepted with a remote seed authority.
+  // It must not be inferred from the seed fixture or identity.
+  String sourceContentWatermarkSHA256;
+  String sourceCatchupWatermarkSHA256;
+  // The native target hashes the committed snapshot before queued replay. It
+  // then proves its committed heads dominate the transferred cut vector after
+  // replay; no hash equality establishes head dominance.
+  uint128_t operationUUID = 0;
+  uint128_t sourceBaselineOperationUUID = 0;
+  uint128_t sourceRequestUUID = 0;
+  uint128_t sourceMemberRequestUUID = 0;
+  uint128_t seedRouteUUID = 0;
+  uint64_t sourceDeploymentID = 0;
+  uint128_t cutUUID = 0;
+  uint64_t cutGeneration = 0;
+  ProdigyStatefulStoreSourceCutScope sourceCutScope = ProdigyStatefulStoreSourceCutScope::fullShardGroup;
+  uint64_t retainUntilMilliseconds = 0;
+  String materializedContentSHA256;
+  String materializedHeadsSHA256;
+  bool cutMaterialized = false;
+  bool committedHeadsDominateCut = false;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyStatefulStoreReceipt& value)
+{
+  serializer.value4b(value.protocolVersion); serializer.value1b(value.state);
+  serializer.value16b(value.localContainerUUID); serializer.value16b(value.localClusterUUID);
+  serializer.value8b(value.deploymentID); serializer.value1b(value.storeKind);
+  serializer.value4b(value.shardGroup); serializer.value4b(value.nShardGroups); serializer.value1b(value.writable);
+  serializer.value16b(value.siblingSessionUUID); serializer.value8b(value.siblingSessionGeneration);
+  serializer.value1b(value.siblingSessionHealthy); serializer.value16b(value.seededFromClusterUUID);
+  serializer.value16b(value.seededFromContainerUUID); serializer.value8b(value.seedGeneration);
+  serializer.text1b(value.seedFixtureSHA256, 64); serializer.text1b(value.appliedWatermarkSHA256, 64);
+  if (value.protocolVersion >= 3) {
+    serializer.text1b(value.sourceContentWatermarkSHA256, 64);
+    serializer.text1b(value.sourceCatchupWatermarkSHA256, 64);
+  }
+  if (value.protocolVersion >= 4) {
+    serializer.value16b(value.operationUUID); serializer.value16b(value.sourceBaselineOperationUUID);
+    serializer.value16b(value.sourceRequestUUID); serializer.value16b(value.sourceMemberRequestUUID);
+    serializer.value16b(value.seedRouteUUID); serializer.value8b(value.sourceDeploymentID); serializer.value16b(value.cutUUID); serializer.value8b(value.cutGeneration);
+    serializer.value1b(value.sourceCutScope); serializer.value8b(value.retainUntilMilliseconds);
+    serializer.text1b(value.materializedContentSHA256, 64); serializer.text1b(value.materializedHeadsSHA256, 64);
+    serializer.value1b(value.cutMaterialized); serializer.value1b(value.committedHeadsDominateCut);
+  }
+}
+
+static inline bool prodigyStatefulStoreReceiptValid(const ProdigyStatefulStoreReceipt& value)
+{
+  return (value.protocolVersion == ProdigyStatefulStoreReceipt::version || value.protocolVersion == ProdigyStatefulStoreReceipt::sourceCutVersion) &&
+      (value.state == ProdigyStatefulStoreReceiptState::active || value.state == ProdigyStatefulStoreReceiptState::withdrawn) &&
+      value.localContainerUUID != 0 && value.localClusterUUID != 0 && value.deploymentID != 0 &&
+      value.storeKind != DeploymentIdentityStoreKind::unknown && value.shardGroup < value.nShardGroups && value.writable &&
+      value.siblingSessionUUID != 0 && value.siblingSessionGeneration != 0 &&
+      (value.state == ProdigyStatefulStoreReceiptState::active ? value.siblingSessionHealthy : !value.siblingSessionHealthy) &&
+      value.seededFromClusterUUID != 0 && value.seededFromContainerUUID != 0 && value.seedGeneration != 0 &&
+      prodigyIsSHA256HexDigest(value.seedFixtureSHA256) && prodigyIsSHA256HexDigest(value.appliedWatermarkSHA256) &&
+      prodigyIsSHA256HexDigest(value.sourceContentWatermarkSHA256) && prodigyIsSHA256HexDigest(value.sourceCatchupWatermarkSHA256) &&
+      (value.protocolVersion != ProdigyStatefulStoreReceipt::sourceCutVersion ||
+       (value.operationUUID != 0 && value.sourceBaselineOperationUUID != 0 && value.sourceRequestUUID != 0 &&
+        value.sourceMemberRequestUUID != 0 && value.seedRouteUUID != 0 && value.sourceDeploymentID != 0 && value.cutUUID != 0 && value.cutGeneration != 0 &&
+        value.sourceCutScope == ProdigyStatefulStoreSourceCutScope::fullShardGroup && value.retainUntilMilliseconds != 0 &&
+        prodigyIsSHA256HexDigest(value.materializedContentSHA256) && prodigyIsSHA256HexDigest(value.materializedHeadsSHA256) &&
+        value.cutMaterialized && value.committedHeadsDominateCut));
+}
+
+// A native proof is usable only for the exact durable authority that requested it.
+static inline bool prodigyStatefulStoreReceiptMatchesSourceCutAuthority(
+    const ProdigyStatefulStoreReceipt& receipt, const ProdigyStatefulStoreSeedAuthority& authority)
+{
+  return receipt.protocolVersion == ProdigyStatefulStoreReceipt::sourceCutVersion &&
+      prodigyStatefulStoreSeedAuthorityHasSourceCut(authority.protocolVersion) &&
+      prodigyStatefulStoreReceiptValid(receipt) && prodigyStatefulStoreSeedAuthorityValid(authority) &&
+      receipt.operationUUID == authority.operationUUID && receipt.sourceBaselineOperationUUID == authority.sourceBaselineOperationUUID &&
+      receipt.sourceRequestUUID == authority.sourceRequestUUID && receipt.sourceMemberRequestUUID == authority.sourceMemberRequestUUID &&
+      receipt.seedRouteUUID == authority.seedRouteUUID &&
+      receipt.localClusterUUID == authority.targetClusterUUID && receipt.deploymentID == authority.targetDeploymentID &&
+      receipt.localContainerUUID == authority.targetContainerUUID && receipt.storeKind == authority.storeKind &&
+      receipt.shardGroup == authority.shardGroup && receipt.nShardGroups == authority.nShardGroups &&
+      receipt.seededFromClusterUUID == authority.sourceClusterUUID && receipt.sourceDeploymentID == authority.sourceDeploymentID &&
+      receipt.seededFromContainerUUID == authority.sourceContainerUUID && receipt.seedGeneration == authority.seedGeneration &&
+      receipt.cutUUID == authority.cutUUID && receipt.cutGeneration == authority.cutGeneration &&
+      receipt.sourceCutScope == authority.sourceCutScope && receipt.retainUntilMilliseconds == authority.retainUntilMilliseconds &&
+      receipt.seedFixtureSHA256 == authority.fixtureSHA256 &&
+      receipt.sourceContentWatermarkSHA256 == authority.sourceContentWatermarkSHA256 &&
+      receipt.sourceCatchupWatermarkSHA256 == authority.sourceCatchupWatermarkSHA256 &&
+      receipt.materializedContentSHA256 == authority.sourceContentWatermarkSHA256 &&
+      receipt.materializedHeadsSHA256 == authority.sourceCatchupWatermarkSHA256;
+}
+
+// Authenticated recovery context. The prior receipt is an expectation only;
+// the target must independently re-emit its own still-live materialization.
+class ProdigyStatefulStoreProofRecovery {
+public:
+  ProdigyStatefulStoreSeedAuthority authority = {};
+  ProdigyStatefulStoreReceipt expected = {};
+  uint128_t nonce = 0;
+  bool response = false;
+  bool accepted = false;
+};
+template <typename S> static void serialize(S&& serializer, ProdigyStatefulStoreProofRecovery& value) {
+  serializer.object(value.authority); serializer.object(value.expected); serializer.value16b(value.nonce);
+  serializer.value1b(value.response); serializer.value1b(value.accepted);
+}
+static inline bool prodigyStatefulStoreProofRecoveryValid(const ProdigyStatefulStoreProofRecovery& value) {
+  return value.nonce != 0 && (value.response || !value.accepted) && value.expected.state == ProdigyStatefulStoreReceiptState::active &&
+      prodigyStatefulStoreReceiptMatchesSourceCutAuthority(value.expected, value.authority);
+}
+
+// Qualification work is named by its exact fault/workload contract.  These
+// enums deliberately do not contain an "any" value: an old generic payload is
+// not a safe substitute for a row-specific experiment.
+enum class ProdigyNametagQualificationWorkload : uint8_t {
+  sequentialUserKeys = 1, handoffFence, multiWriterKVGraph, truthClaim,
+  localWriter, siteLocalWrites, seedCatchup, brainCatchup, permissionRecovery,
+  cousinRoute, masqueBGP, graphKVReplay, radarMutation, pulseMatrix,
+  truthWriterFence, mothershipResume,
+};
+enum class ProdigyNametagQualificationFault : uint8_t {
+  none = 1, secondStreamHandoff, concurrentWriter, truthPartition,
+  localWriterIsolation, sitePartition, seedInterruption, brainHardReboot,
+  permissionRevoke, cousinSessionLoss, masqueSessionLoss, ewrOrdPathLoss,
+  replayReorder, directedMutation, fixedMatrixDuplicate, secondTruthWriter,
+  mothershipRestart,
+};
+enum class ProdigyNametagQualificationTarget : uint8_t {
+  allSites = 1, localSiteWriters, ewrTruthWriter, ewrOrdPath, ordSeedCohort,
+  ordBrain, ewrPermission, ewrOrdCousinRoute, allApp11Probes, mothership,
+  sitePaths, ewrOrdPaths,
+};
+enum class ProdigyNametagQualificationSite : uint8_t { ewr = 1, ord = 2, lan = 3, all = 4 };
+enum class ProdigyNametagQualificationStore : uint8_t {
+  none = 0, hot = 1, cold = 2, radar = 3, pulse = 4, truth = 5, graphKV = 6,
+};
+enum class ProdigyNametagQualificationWitness : uint8_t {
+  orderedUserKeyDigest = 1, handoffFenceHeld, commutativeKVGraphDigest,
+  uniqueEwrTruthWinner, perSiteWriterIsolation, siteLocalWritesRecovered,
+  seedCatchupResumed, brainCatchupWatermark, permissionReinstallSession,
+  cousinRouteReconnected, masqueBGPRestored, ewrOrdPathRestored,
+  graphKVReplayOrdered, radarDirectedMutationDigest, pulseMatrixDeduplicated,
+  secondTruthWriterFenced, mothershipDurableResume,
+};
+
+// Row sixteen has one mutating EWR participant and two read-only observers.
+// Keep that distinction typed on the App11 receipt so the global join cannot
+// mistake three local handoff attempts for one globally fenced session.
+enum class ProdigyNametagQualificationParticipantRole : uint8_t {
+  none = 0, ewrSessionFence = 1, truthObserver = 2,
+};
+
+enum class ProdigyNametagQualificationRow : uint8_t {
+  sequentialUserKeyWrites = 1, secondStreamHandoffFence, sharedKeyCommutativeWrites,
+  truthClaimPartition, localWriterIsolation, sitePartitionLocalWrites,
+  seedInterruptionResume, brainHardRebootCatchup, permissionRevokeReinstall,
+  cousinRouteSessionReconnect, masqueSessionLossBgpRecovery, ewrOrdPathLoss,
+  graphKvReplayReorder, radarDirectedMutations, pulseFixedMatrixDedup,
+  secondTruthWriterFencing, mothershipRestartResume,
+};
+
+class ProdigyNametagQualificationDescriptor {
+public:
+  static constexpr uint32_t version = 1;
+  uint32_t protocolVersion = version;
+  ProdigyNametagQualificationWorkload workload = ProdigyNametagQualificationWorkload::sequentialUserKeys;
+  ProdigyNametagQualificationFault fault = ProdigyNametagQualificationFault::none;
+  ProdigyNametagQualificationTarget target = ProdigyNametagQualificationTarget::allSites;
+  ProdigyNametagQualificationSite targetSite = ProdigyNametagQualificationSite::all;
+  ProdigyNametagQualificationSite peerSite = ProdigyNametagQualificationSite::all;
+  uint8_t pathSlot = UINT8_MAX;
+  ProdigyNametagQualificationStore store = ProdigyNametagQualificationStore::none;
+  ProdigyNametagQualificationWitness expectedWitness =
+      ProdigyNametagQualificationWitness::orderedUserKeyDigest;
+};
+template <typename S>
+static void serialize(S&& serializer, ProdigyNametagQualificationDescriptor& descriptor)
+{
+  serializer.value4b(descriptor.protocolVersion); serializer.value1b(descriptor.workload);
+  serializer.value1b(descriptor.fault); serializer.value1b(descriptor.target);
+  serializer.value1b(descriptor.targetSite); serializer.value1b(descriptor.peerSite);
+  serializer.value1b(descriptor.pathSlot); serializer.value1b(descriptor.store);
+  serializer.value1b(descriptor.expectedWitness);
+}
+static inline bool prodigyNametagQualificationDescriptorValid(
+    const ProdigyNametagQualificationDescriptor& descriptor)
+{
+  return descriptor.protocolVersion == ProdigyNametagQualificationDescriptor::version &&
+      uint8_t(descriptor.workload) >= 1 && uint8_t(descriptor.workload) <= 16 &&
+      uint8_t(descriptor.fault) >= 1 && uint8_t(descriptor.fault) <= 17 &&
+      uint8_t(descriptor.target) >= 1 && uint8_t(descriptor.target) <= 12 &&
+      uint8_t(descriptor.targetSite) >= 1 && uint8_t(descriptor.targetSite) <= 4 &&
+      uint8_t(descriptor.peerSite) >= 1 && uint8_t(descriptor.peerSite) <= 4 &&
+      uint8_t(descriptor.store) <= 6 && uint8_t(descriptor.expectedWitness) >= 1 &&
+      uint8_t(descriptor.expectedWitness) <= 17 &&
+      ((descriptor.target == ProdigyNametagQualificationTarget::ewrOrdPath ||
+        descriptor.target == ProdigyNametagQualificationTarget::ewrOrdCousinRoute) ?
+          (descriptor.targetSite == ProdigyNametagQualificationSite::ewr &&
+           descriptor.peerSite == ProdigyNametagQualificationSite::ord && descriptor.pathSlot < 3) :
+          descriptor.pathSlot == UINT8_MAX) &&
+      (descriptor.target != ProdigyNametagQualificationTarget::sitePaths ||
+          (descriptor.targetSite != ProdigyNametagQualificationSite::all &&
+           descriptor.peerSite == ProdigyNametagQualificationSite::all)) &&
+      (descriptor.target != ProdigyNametagQualificationTarget::ewrOrdPaths ||
+          (descriptor.targetSite == ProdigyNametagQualificationSite::ewr &&
+           descriptor.peerSite == ProdigyNametagQualificationSite::ord)) &&
+      (descriptor.target == ProdigyNametagQualificationTarget::ewrTruthWriter ?
+          (descriptor.targetSite == ProdigyNametagQualificationSite::ewr &&
+           descriptor.store == ProdigyNametagQualificationStore::truth) : true) &&
+      (descriptor.target == ProdigyNametagQualificationTarget::ordSeedCohort ||
+       descriptor.target == ProdigyNametagQualificationTarget::ordBrain ?
+          descriptor.targetSite == ProdigyNametagQualificationSite::ord : true);
+}
+static inline bool prodigyNametagQualificationDescriptorEqual(
+    const ProdigyNametagQualificationDescriptor& left,
+    const ProdigyNametagQualificationDescriptor& right)
+{
+  return left.protocolVersion == right.protocolVersion && left.workload == right.workload &&
+      left.fault == right.fault && left.target == right.target && left.targetSite == right.targetSite &&
+      left.peerSite == right.peerSite && left.pathSlot == right.pathSlot && left.store == right.store &&
+      left.expectedWitness == right.expectedWitness;
+}
+
+// This is the protocol-owned row mapping used by every participant.  Keeping
+// it beside the wire types prevents Mothership and App11 from accepting two
+// different experiments for the same row number.
+static constexpr ProdigyNametagQualificationDescriptor prodigyNametagQualificationDescriptor(
+    ProdigyNametagQualificationRow row)
+{
+  using Workload = ProdigyNametagQualificationWorkload;
+  using Fault = ProdigyNametagQualificationFault;
+  using Target = ProdigyNametagQualificationTarget;
+  using Site = ProdigyNametagQualificationSite;
+  using Store = ProdigyNametagQualificationStore;
+  using Witness = ProdigyNametagQualificationWitness;
+  switch (row) {
+    case ProdigyNametagQualificationRow::sequentialUserKeyWrites:
+      return {1, Workload::sequentialUserKeys, Fault::none, Target::allApp11Probes, Site::all, Site::all, UINT8_MAX, Store::hot, Witness::orderedUserKeyDigest};
+    case ProdigyNametagQualificationRow::secondStreamHandoffFence:
+      return {1, Workload::handoffFence, Fault::secondStreamHandoff, Target::allApp11Probes, Site::all, Site::all, UINT8_MAX, Store::none, Witness::handoffFenceHeld};
+    case ProdigyNametagQualificationRow::sharedKeyCommutativeWrites:
+      return {1, Workload::multiWriterKVGraph, Fault::concurrentWriter, Target::allApp11Probes, Site::all, Site::all, UINT8_MAX, Store::graphKV, Witness::commutativeKVGraphDigest};
+    case ProdigyNametagQualificationRow::truthClaimPartition:
+      return {1, Workload::truthClaim, Fault::truthPartition, Target::ewrTruthWriter, Site::ewr, Site::ord, UINT8_MAX, Store::truth, Witness::uniqueEwrTruthWinner};
+    case ProdigyNametagQualificationRow::localWriterIsolation:
+      return {1, Workload::localWriter, Fault::localWriterIsolation, Target::localSiteWriters, Site::all, Site::all, UINT8_MAX, Store::hot, Witness::perSiteWriterIsolation};
+    case ProdigyNametagQualificationRow::sitePartitionLocalWrites:
+      return {1, Workload::siteLocalWrites, Fault::sitePartition, Target::sitePaths, Site::ord, Site::all, UINT8_MAX, Store::none, Witness::siteLocalWritesRecovered};
+    case ProdigyNametagQualificationRow::seedInterruptionResume:
+      return {1, Workload::seedCatchup, Fault::seedInterruption, Target::ordSeedCohort, Site::ord, Site::ewr, UINT8_MAX, Store::cold, Witness::seedCatchupResumed};
+    case ProdigyNametagQualificationRow::brainHardRebootCatchup:
+      return {1, Workload::brainCatchup, Fault::brainHardReboot, Target::ordBrain, Site::ord, Site::all, UINT8_MAX, Store::none, Witness::brainCatchupWatermark};
+    case ProdigyNametagQualificationRow::permissionRevokeReinstall:
+      return {1, Workload::permissionRecovery, Fault::permissionRevoke, Target::ewrPermission, Site::ewr, Site::ord, UINT8_MAX, Store::none, Witness::permissionReinstallSession};
+    case ProdigyNametagQualificationRow::cousinRouteSessionReconnect:
+      return {1, Workload::cousinRoute, Fault::cousinSessionLoss, Target::ewrOrdCousinRoute, Site::ewr, Site::ord, 0, Store::none, Witness::cousinRouteReconnected};
+    case ProdigyNametagQualificationRow::masqueSessionLossBgpRecovery:
+      return {1, Workload::masqueBGP, Fault::masqueSessionLoss, Target::sitePaths, Site::ord, Site::all, UINT8_MAX, Store::none, Witness::masqueBGPRestored};
+    case ProdigyNametagQualificationRow::ewrOrdPathLoss:
+      return {1, Workload::masqueBGP, Fault::ewrOrdPathLoss, Target::ewrOrdPaths, Site::ewr, Site::ord, UINT8_MAX, Store::none, Witness::ewrOrdPathRestored};
+    case ProdigyNametagQualificationRow::graphKvReplayReorder:
+      return {1, Workload::graphKVReplay, Fault::replayReorder, Target::allApp11Probes, Site::all, Site::all, UINT8_MAX, Store::graphKV, Witness::graphKVReplayOrdered};
+    case ProdigyNametagQualificationRow::radarDirectedMutations:
+      return {1, Workload::radarMutation, Fault::directedMutation, Target::allApp11Probes, Site::all, Site::all, UINT8_MAX, Store::radar, Witness::radarDirectedMutationDigest};
+    case ProdigyNametagQualificationRow::pulseFixedMatrixDedup:
+      return {1, Workload::pulseMatrix, Fault::fixedMatrixDuplicate, Target::allApp11Probes, Site::all, Site::all, UINT8_MAX, Store::pulse, Witness::pulseMatrixDeduplicated};
+    case ProdigyNametagQualificationRow::secondTruthWriterFencing:
+      return {1, Workload::truthWriterFence, Fault::secondTruthWriter, Target::ewrTruthWriter, Site::ewr, Site::ord, UINT8_MAX, Store::truth, Witness::secondTruthWriterFenced};
+    case ProdigyNametagQualificationRow::mothershipRestartResume:
+      return {1, Workload::mothershipResume, Fault::mothershipRestart, Target::mothership, Site::all, Site::all, UINT8_MAX, Store::none, Witness::mothershipDurableResume};
+  }
+  return {};
+}
+
+static inline bool prodigyNametagQualificationRowDescriptorValid(
+    uint8_t row, const ProdigyNametagQualificationDescriptor& descriptor)
+{
+  return row >= uint8_t(ProdigyNametagQualificationRow::sequentialUserKeyWrites) &&
+      row <= uint8_t(ProdigyNametagQualificationRow::mothershipRestartResume) &&
+      prodigyNametagQualificationDescriptorEqual(
+          descriptor, prodigyNametagQualificationDescriptor(ProdigyNametagQualificationRow(row)));
+}
+
+// A bounded application-owned qualification observation.  This is not by
+// itself a five-store or healthy-topology receipt: Brain must join it with the
+// exact native store, Truth-carrier, and topology evidence for the same durable
+// qualification intent.  Keeping that distinction in the type name prevents
+// an application ACK from being promoted into database convergence proof.
+// Rows nine and ten use one phased qualification operation.  Session and
+// socket observations are supplied by the native session owner, never inferred
+// from route authority or a command acknowledgement.
+enum class ProdigyNametagQualificationCousinStage : uint8_t { none = 0, arm = 1, faultObserved = 2, final = 3 };
+class ProdigyNametagQualificationCousinSession {
+public:
+  uint128_t pairUUID = 0, routeUUID = 0, sourcePermissionUUID = 0, destinationPermissionUUID = 0;
+  uint128_t sourceClusterUUID = 0, destinationClusterUUID = 0;
+  uint64_t sourceDeploymentID = 0, destinationDeploymentID = 0;
+  uint128_t sourceContainerUUID = 0, destinationContainerUUID = 0;
+  uint128_t sessionUUID = 0, successorRouteUUID = 0, successorSourcePermissionUUID = 0, successorSessionUUID = 0;
+  uint64_t sessionGeneration = 0, successorSessionGeneration = 0;
+  uint64_t routeGeneration = 0, sourcePermissionAuthorityGeneration = 0;
+  uint64_t successorRouteGeneration = 0, successorPermissionAuthorityGeneration = 0;
+  bool transportClosedOrUnsendable = false, healthy = false;
+};
+template <typename S>
+static void serialize(S&& s, ProdigyNametagQualificationCousinSession& v) {
+  s.value16b(v.pairUUID); s.value16b(v.routeUUID); s.value16b(v.sourcePermissionUUID); s.value16b(v.destinationPermissionUUID);
+  s.value16b(v.sourceClusterUUID); s.value16b(v.destinationClusterUUID);
+  s.value8b(v.sourceDeploymentID); s.value8b(v.destinationDeploymentID);
+  s.value16b(v.sourceContainerUUID); s.value16b(v.destinationContainerUUID);
+  s.value16b(v.sessionUUID); s.value8b(v.sessionGeneration);
+  s.value16b(v.successorRouteUUID); s.value16b(v.successorSourcePermissionUUID);
+  s.value16b(v.successorSessionUUID); s.value8b(v.successorSessionGeneration);
+  s.value8b(v.routeGeneration); s.value8b(v.sourcePermissionAuthorityGeneration);
+  s.value8b(v.successorRouteGeneration); s.value8b(v.successorPermissionAuthorityGeneration);
+  s.value1b(v.transportClosedOrUnsendable); s.value1b(v.healthy);
+}
+static inline bool prodigyNametagQualificationCousinSessionIdentityValid(const ProdigyNametagQualificationCousinSession& v) {
+  return v.pairUUID && v.routeUUID && v.sourcePermissionUUID && v.destinationPermissionUUID &&
+      v.sourceClusterUUID && v.destinationClusterUUID && v.sourceClusterUUID != v.destinationClusterUUID &&
+      v.sourceDeploymentID && v.destinationDeploymentID && v.sourceContainerUUID && v.destinationContainerUUID &&
+      v.sessionUUID && v.sessionGeneration && v.successorRouteUUID && v.successorSourcePermissionUUID &&
+      v.routeGeneration && v.sourcePermissionAuthorityGeneration && v.successorRouteGeneration;
+}
+// One native stateful container owns each transport observation.  In
+// particular, an App11 process cannot attest to another process's socket.
+// One envelope covers one route so routes with different owners remain distinct.
+class ProdigyNametagQualificationCousinTransport {
+public:
+  // Version 4 distinguishes this shared envelope on the existing
+  // Mothership qualification topic from the site request versions 2 and 3.
+  static constexpr uint32_t version = 4;
+  uint32_t protocolVersion = version;
+  uint128_t runUUID = 0;
+  uint128_t memberRequestUUID = 0;
+  uint64_t executionGeneration = 0;
+  int64_t deadlineAtMilliseconds = 0;
+  ProdigyNametagQualificationCousinStage stage = ProdigyNametagQualificationCousinStage::none;
+  ProdigyNametagQualificationCousinSession session = {};
+  bool response = false, ready = false;
+  String failure = {};
+};
+template <typename S>
+static void serialize(S&& s, ProdigyNametagQualificationCousinTransport& value) {
+  s.value4b(value.protocolVersion); s.value16b(value.runUUID); s.value16b(value.memberRequestUUID); s.value8b(value.executionGeneration);
+  s.value8b(value.deadlineAtMilliseconds); s.value1b(value.stage); s.object(value.session);
+  s.value1b(value.response); s.value1b(value.ready); s.text1b(value.failure, 1024);
+}
+static inline bool prodigyNametagQualificationCousinTransportValid(
+    const ProdigyNametagQualificationCousinTransport& value) {
+  const auto& s = value.session;
+  if (value.protocolVersion != ProdigyNametagQualificationCousinTransport::version || !value.runUUID || !value.memberRequestUUID ||
+      !value.executionGeneration || value.deadlineAtMilliseconds <= 0 ||
+      value.stage < ProdigyNametagQualificationCousinStage::arm ||
+      value.stage > ProdigyNametagQualificationCousinStage::final ||
+      !prodigyNametagQualificationCousinSessionIdentityValid(s) ||
+      (!value.response && (value.ready || !value.failure.empty())) ||
+      (value.ready && (!value.response || !value.failure.empty()))) return false;
+  if (!value.response || !value.ready)
+    return !s.transportClosedOrUnsendable && !s.healthy && !s.successorSessionUUID &&
+        !s.successorSessionGeneration;
+  if (value.stage == ProdigyNametagQualificationCousinStage::arm)
+    return s.healthy && !s.transportClosedOrUnsendable && !s.successorSessionUUID && !s.successorSessionGeneration;
+  if (value.stage == ProdigyNametagQualificationCousinStage::faultObserved)
+    return !s.healthy && s.transportClosedOrUnsendable && !s.successorSessionUUID && !s.successorSessionGeneration;
+  return s.healthy && s.transportClosedOrUnsendable && s.successorSessionUUID && s.successorSessionGeneration &&
+      s.successorPermissionAuthorityGeneration &&
+      (s.successorSessionUUID != s.sessionUUID || s.successorSessionGeneration != s.sessionGeneration);
+}
+// Initial arm identifies a commissioned route; only the current Brain may
+// resolve and challenge the native session.  Subsequent requests use the
+// fully bound form above and never silently replace that challenge.
+static inline bool prodigyNametagQualificationCousinTransportInitialArmValid(
+    const ProdigyNametagQualificationCousinTransport& value) {
+  const auto& s = value.session;
+  return value.protocolVersion == ProdigyNametagQualificationCousinTransport::version && value.runUUID &&
+      !value.memberRequestUUID && value.executionGeneration && value.deadlineAtMilliseconds > 0 &&
+      value.stage == ProdigyNametagQualificationCousinStage::arm && !value.response && !value.ready &&
+      value.failure.empty() && s.pairUUID && s.routeUUID && s.sourcePermissionUUID && s.destinationPermissionUUID &&
+      s.sourceClusterUUID && s.destinationClusterUUID && s.sourceClusterUUID != s.destinationClusterUUID &&
+      s.sourceDeploymentID && s.destinationDeploymentID && !s.sourceContainerUUID && !s.destinationContainerUUID &&
+      !s.sessionUUID && !s.sessionGeneration && s.successorRouteUUID && s.successorSourcePermissionUUID &&
+      s.routeGeneration && s.sourcePermissionAuthorityGeneration && s.successorRouteGeneration &&
+      !s.successorPermissionAuthorityGeneration && !s.successorSessionUUID && !s.successorSessionGeneration &&
+      !s.transportClosedOrUnsendable && !s.healthy;
+}
+static inline bool prodigyNametagQualificationCousinTransportResponseMatches(
+    const ProdigyNametagQualificationCousinTransport& request,
+    const ProdigyNametagQualificationCousinTransport& response) {
+  if (request.response || !response.response || !prodigyNametagQualificationCousinTransportValid(request) ||
+      !prodigyNametagQualificationCousinTransportValid(response)) return false;
+  auto left = request, right = response;
+  right.response = right.ready = false; right.failure.clear();
+  right.session.transportClosedOrUnsendable = right.session.healthy = false;
+  right.session.successorSessionUUID = 0; right.session.successorSessionGeneration = 0;
+  String a = {}, b = {};
+  return BitseryEngine::serialize(a, left) && BitseryEngine::serialize(b, right) && a == b;
+}
+
+enum class ProdigyNametagQualificationReplayStage : uint8_t { none = 0, prearm = 1, arm = 2, replay = 3, query = 4, release = 5 };
+enum class ProdigyNametagQualificationReplayStore : uint8_t { none = 0, kv = 1, graph = 2 };
+static inline uint16_t prodigyNametagQualificationReplayApplicationID(ProdigyNametagQualificationReplayStore store) {
+  return store == ProdigyNametagQualificationReplayStore::kv ? MeshRegistry::Hot::applicationID :
+      store == ProdigyNametagQualificationReplayStore::graph ? MeshRegistry::Pulse::applicationID : 0;
+}
+// A single advertiser can serve several subscribers on the same route. Pick
+// one exact session deterministically without treating those sessions as ambiguous.
+static inline bool prodigyNametagQualificationReplaySessionLess(
+    uint128_t source, uint128_t target, uint128_t session,
+    uint128_t otherSource, uint128_t otherTarget, uint128_t otherSession) {
+  return source != otherSource ? source < otherSource :
+      target != otherTarget ? target < otherTarget : session < otherSession;
+}
+// KV advertiser-to-subscriber delivery reverses the route's local halves;
+// graph sibling traffic is bidirectional and selects the source half.
+static inline CousinRouteHalf prodigyNametagQualificationReplayLocalHalf(
+    ProdigyNametagQualificationReplayStore store, bool targetSide) {
+  const bool sourceHalf = (store == ProdigyNametagQualificationReplayStore::kv) ? targetSide : !targetSide;
+  return sourceHalf ? CousinRouteHalf::source : CousinRouteHalf::destination;
+}
+
+// One workload name owner for Mothership and App11. KV routing uses exactly
+// the normal first-16-byte slot hash; observation reuses the injection run.
+static inline bool prodigyNametagQualificationReplayWorkloadName(uint128_t runUUID,
+    ProdigyNametagQualificationReplayStore store, uint32_t group, String& name) {
+  name.clear();
+  if (!runUUID || (store != ProdigyNametagQualificationReplayStore::kv &&
+      store != ProdigyNametagQualificationReplayStore::graph) ||
+      group >= (store == ProdigyNametagQualificationReplayStore::kv ? 3u : 1u)) return false;
+  for (uint32_t candidate = 0; candidate < 262144; ++candidate) {
+    String identity("nametag.native-replay.v1", Copy::yes);
+    const uint8_t storeID = uint8_t(store);
+    identity.append(reinterpret_cast<const uint8_t*>(&runUUID), sizeof(runUUID));
+    identity.append(storeID);
+    identity.append(reinterpret_cast<const uint8_t*>(&group), sizeof(group));
+    identity.append(reinterpret_cast<const uint8_t*>(&candidate), sizeof(candidate));
+    if (!prodigyComputeSHA256Hex(identity, name)) return false;
+    if (store == ProdigyNametagQualificationReplayStore::graph ||
+        statefulServiceGroupOwnerForSlot(jump_consistent_hash(name.data(), 16), 3) == group) return true;
+  }
+  name.clear(); return false;
+}
+
+// One authenticated native source/target stream and one bounded row-13 run.
+// Frame IDs and observations originate at the native replication owners.
+class ProdigyNametagQualificationReplay {
+public:
+  static constexpr uint32_t version = 10;
+  uint32_t protocolVersion = version;
+  uint128_t runUUID = 0, challengeUUID = 0;
+  uint64_t executionGeneration = 0;
+  int64_t deadlineAtMilliseconds = 0;
+  uint8_t direction = 0;
+  ProdigyNametagQualificationReplayStage stage = ProdigyNametagQualificationReplayStage::none;
+  ProdigyNametagQualificationReplayStore store = ProdigyNametagQualificationReplayStore::none;
+  uint16_t applicationID = 0;
+  uint32_t shardGroup = 0;
+  uint128_t sourceAddress = 0;
+  String workloadName = {};
+  ProdigyNametagQualificationCousinSession session = {};
+  bool targetSide = false;
+  uint128_t originUUID = 0;
+  uint64_t committedID = 0, olderCommittedID = 0, delayedID = 0, catchupID = 0;
+  bool response = false, ready = false, duplicateRejected = false, staleRejected = false, delayedApplied = false, delayedRejected = false, catchupApplied = false;
+  String failure = {};
+};
+template <typename S> static void serialize(S&& s, ProdigyNametagQualificationReplay& v) {
+  s.value4b(v.protocolVersion); s.value16b(v.runUUID); s.value16b(v.challengeUUID); s.value8b(v.executionGeneration);
+  s.value8b(v.deadlineAtMilliseconds); s.value1b(v.direction); s.value1b(v.stage); s.value1b(v.store); s.value2b(v.applicationID);
+  s.value4b(v.shardGroup); s.value16b(v.sourceAddress); s.text1b(v.workloadName, 128); s.object(v.session); s.value1b(v.targetSide); s.value16b(v.originUUID); s.value8b(v.committedID);
+  s.value8b(v.olderCommittedID); s.value8b(v.delayedID); s.value8b(v.catchupID); s.value1b(v.response); s.value1b(v.ready);
+  s.value1b(v.duplicateRejected); s.value1b(v.staleRejected); s.value1b(v.delayedApplied); s.value1b(v.delayedRejected); s.value1b(v.catchupApplied); s.text1b(v.failure, 1024);
+}
+static inline bool prodigyNametagQualificationReplayValid(const ProdigyNametagQualificationReplay& v) {
+  const auto& s = v.session;
+  if (v.protocolVersion != v.version || !v.runUUID || !v.challengeUUID || !v.executionGeneration ||
+      v.deadlineAtMilliseconds <= 0 || v.direction != 1 || v.stage < ProdigyNametagQualificationReplayStage::prearm ||
+      v.stage > ProdigyNametagQualificationReplayStage::release ||
+      v.store < ProdigyNametagQualificationReplayStore::kv || v.store > ProdigyNametagQualificationReplayStore::graph ||
+      !v.applicationID || !v.sourceAddress || v.workloadName.empty() || v.workloadName.size() > 128 || !s.pairUUID || !s.routeUUID || !s.sourcePermissionUUID || !s.destinationPermissionUUID ||
+      !s.sourceClusterUUID || !s.destinationClusterUUID || s.sourceClusterUUID == s.destinationClusterUUID ||
+      !s.sourceDeploymentID || !s.destinationDeploymentID || !s.sourceContainerUUID || !s.destinationContainerUUID ||
+      !s.sessionUUID || !s.sessionGeneration || !s.routeGeneration || !s.sourcePermissionAuthorityGeneration ||
+      (!v.response && (v.ready || !v.failure.empty() || v.duplicateRejected || v.staleRejected || v.delayedApplied || v.delayedRejected || v.catchupApplied)) ||
+      (v.ready && (!v.response || !v.failure.empty()))) return false;
+  const bool hasIDs = v.originUUID && v.committedID && v.olderCommittedID && v.delayedID &&
+        v.olderCommittedID < v.delayedID && v.delayedID < v.committedID &&
+        (v.store == ProdigyNametagQualificationReplayStore::kv ? v.catchupID == 0 : v.catchupID > v.committedID);
+  const bool noIDs = !v.originUUID && !v.committedID && !v.olderCommittedID && !v.delayedID && !v.catchupID;
+  const bool noObservations = !v.duplicateRejected && !v.staleRejected && !v.delayedApplied && !v.delayedRejected && !v.catchupApplied;
+  if (!v.targetSide && v.stage == ProdigyNametagQualificationReplayStage::prearm) return false;
+  if (v.targetSide ? (v.stage == ProdigyNametagQualificationReplayStage::prearm ? !noIDs :
+      v.stage == ProdigyNametagQualificationReplayStage::release ? (!noIDs && !hasIDs) : !hasIDs) : (!v.response ? !noIDs : ((v.ready && v.stage == ProdigyNametagQualificationReplayStage::query) ? !hasIDs : !noIDs))) return false;
+  if (!v.targetSide || !v.ready || v.stage != ProdigyNametagQualificationReplayStage::query) return noObservations;
+  return v.duplicateRejected && v.staleRejected &&
+      (v.store == ProdigyNametagQualificationReplayStore::kv ? (v.delayedApplied && !v.delayedRejected && !v.catchupApplied) :
+                                                                (!v.delayedApplied && v.delayedRejected && v.catchupApplied));
+}
+// Release may traverse the authenticated relay briefly after its deadline.
+// Brain and the native owner still require the exact installed challenge.
+static inline bool prodigyNametagQualificationReplayRelayTimely(
+    const ProdigyNametagQualificationReplay& value, int64_t now) {
+  return value.deadlineAtMilliseconds > now ||
+      (value.stage == ProdigyNametagQualificationReplayStage::release &&
+       value.deadlineAtMilliseconds > 0 && now - value.deadlineAtMilliseconds <= 60000);
+}
+static inline bool prodigyNametagQualificationReplayExpiredReleaseMatches(
+    const ProdigyNametagQualificationReplay& request, const ProdigyNametagQualificationReplay& installedRequest,
+    bool installed, uint64_t installedEpoch, uint64_t currentEpoch, int64_t now) {
+  if (!installed || !currentEpoch || installedEpoch != currentEpoch || request.response ||
+      request.stage != ProdigyNametagQualificationReplayStage::release || request.deadlineAtMilliseconds > now ||
+      !prodigyNametagQualificationReplayRelayTimely(request, now) || !prodigyNametagQualificationReplayValid(request)) return false;
+  auto expected = installedRequest; expected.stage = request.stage;
+  auto actual = request; String a = {}, b = {};
+  return BitseryEngine::serialize(a, expected) && BitseryEngine::serialize(b, actual) && a == b;
+}
+static inline bool prodigyNametagQualificationReplayResponseMatches(
+    const ProdigyNametagQualificationReplay& request, const ProdigyNametagQualificationReplay& response) {
+  if (request.response || !response.response || !prodigyNametagQualificationReplayValid(request) ||
+      !prodigyNametagQualificationReplayValid(response)) return false;
+  auto a = request, b = response;
+  b.response = b.ready = false; b.failure.clear();
+  if (!request.targetSide) { b.originUUID = 0; b.committedID = b.olderCommittedID = b.delayedID = b.catchupID = 0; }
+  b.duplicateRejected = b.staleRejected = b.delayedApplied = b.delayedRejected = b.catchupApplied = false;
+  String left = {}, right = {};
+  return BitseryEngine::serialize(left, a) && BitseryEngine::serialize(right, b) && left == right;
+}
+
+// The source Brain resolves the live session and container before Mothership
+// persists the resulting challenge; authority alone is not a transport proof.
+static inline bool prodigyNametagQualificationReplayInitialValid(const ProdigyNametagQualificationReplay& request) {
+  if (request.response || request.targetSide || request.stage != ProdigyNametagQualificationReplayStage::arm ||
+      request.challengeUUID || request.sourceAddress || request.session.sourceContainerUUID ||
+      request.session.destinationContainerUUID || request.session.sessionUUID || request.session.sessionGeneration) return false;
+  auto populated = request;
+  populated.challengeUUID = 1; populated.sourceAddress = 1;
+  populated.session.sourceContainerUUID = 1; populated.session.destinationContainerUUID = 2;
+  populated.session.sessionUUID = 3; populated.session.sessionGeneration = 1;
+  return prodigyNametagQualificationReplayValid(populated);
+}
+static inline bool prodigyNametagQualificationReplayResolutionMatches(
+    const ProdigyNametagQualificationReplay& request, const ProdigyNametagQualificationReplay& response) {
+  if (!prodigyNametagQualificationReplayInitialValid(request) || !response.response || response.ready ||
+      !response.failure.empty() || !prodigyNametagQualificationReplayValid(response)) return false;
+  auto expected = request, observed = response;
+  observed.response = false; observed.challengeUUID = 0; observed.sourceAddress = 0;
+  observed.session.sourceContainerUUID = observed.session.destinationContainerUUID = 0;
+  observed.session.sessionUUID = 0; observed.session.sessionGeneration = 0;
+  String a = {}, b = {};
+  return BitseryEngine::serialize(a, expected) && BitseryEngine::serialize(b, observed) && a == b;
+}
+
+// Seed interruption is bound to one accepted authority and one native stream.
+// A held response is evidence only after the worker has applied snapshot data.
+// Exact current machine OS boot identity; Neuron reads the kernel boot ID.
+struct ProdigyNametagQualificationMachineBoot {
+  static constexpr uint32_t version = 15;
+  uint32_t protocolVersion = version;
+  uint128_t runUUID = 0, challengeUUID = 0, clusterUUID = 0, machineUUID = 0;
+  uint64_t executionGeneration = 0;
+  int64_t deadlineAtMilliseconds = 0;
+  bool response = false, ready = false;
+  String bootID, failure;
+};
+template <typename S> static void serialize(S&& s, ProdigyNametagQualificationMachineBoot& v) {
+  s.value4b(v.protocolVersion); s.value16b(v.runUUID); s.value16b(v.challengeUUID);
+  s.value16b(v.clusterUUID); s.value16b(v.machineUUID); s.value8b(v.executionGeneration);
+  s.value8b(v.deadlineAtMilliseconds); s.value1b(v.response); s.value1b(v.ready);
+  s.text1b(v.bootID, 36); s.text1b(v.failure, 256);
+}
+static inline bool prodigyNametagQualificationMachineBootValid(const ProdigyNametagQualificationMachineBoot& v) {
+  if (v.protocolVersion != v.version || !v.runUUID || !v.challengeUUID || !v.clusterUUID || !v.machineUUID ||
+      !v.executionGeneration || v.deadlineAtMilliseconds <= 0 || v.failure.size() > 256 ||
+      (!v.response && (v.ready || !v.bootID.empty() || !v.failure.empty())) ||
+      (v.ready && (!v.response || !v.failure.empty() || v.bootID.size() != 36)) ||
+      (!v.ready && !v.bootID.empty())) return false;
+  if (v.ready) for (uint32_t i = 0; i < 36; ++i) {
+    const char c = v.bootID[i];
+    if (i == 8 || i == 13 || i == 18 || i == 23) { if (c != '-') return false; }
+    else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+  }
+  return true;
+}
+static inline bool prodigyNametagQualificationMachineBootMatches(
+    const ProdigyNametagQualificationMachineBoot& request, const ProdigyNametagQualificationMachineBoot& response) {
+  if (request.response || !response.response || !prodigyNametagQualificationMachineBootValid(request) ||
+      !prodigyNametagQualificationMachineBootValid(response)) return false;
+  auto expected = request, actual = response; actual.response = actual.ready = false; actual.bootID.clear(); actual.failure.clear();
+  String a, b; return BitseryEngine::serialize(a, expected) && BitseryEngine::serialize(b, actual) && a == b;
+}
+
+enum class ProdigyNametagQualificationSeedFaultStage : uint8_t { none = 0, arm = 1, query = 2, release = 3 };
+class ProdigyNametagQualificationSeedFault {
+public:
+  static constexpr uint32_t version = 14;
+  uint32_t protocolVersion = version;
+  uint128_t runUUID = 0, challengeUUID = 0;
+  uint64_t executionGeneration = 0;
+  int64_t deadlineAtMilliseconds = 0;
+  ProdigyNametagQualificationSeedFaultStage stage = ProdigyNametagQualificationSeedFaultStage::none;
+  ProdigyStatefulStoreSeedAuthority authority = {};
+  bool response = false, ready = false, held = false;
+  uint128_t sessionUUID = 0;
+  uint64_t sessionGeneration = 0, appliedFrames = 0;
+  String failure;
+};
+template <typename S> static void serialize(S&& s, ProdigyNametagQualificationSeedFault& v) {
+  s.value4b(v.protocolVersion); s.value16b(v.runUUID); s.value16b(v.challengeUUID);
+  s.value8b(v.executionGeneration); s.value8b(v.deadlineAtMilliseconds); s.value1b(v.stage);
+  s.object(v.authority); s.value1b(v.response); s.value1b(v.ready); s.value1b(v.held);
+  s.value16b(v.sessionUUID); s.value8b(v.sessionGeneration); s.value8b(v.appliedFrames); s.text1b(v.failure, 1024);
+}
+static inline bool prodigyNametagQualificationSeedFaultValid(const ProdigyNametagQualificationSeedFault& v) {
+  if (v.protocolVersion != v.version || !v.runUUID || !v.challengeUUID || !v.executionGeneration ||
+      v.deadlineAtMilliseconds <= 0 || v.stage < ProdigyNametagQualificationSeedFaultStage::arm ||
+      v.stage > ProdigyNametagQualificationSeedFaultStage::release ||
+      !prodigyStatefulStoreSeedAuthorityValid(v.authority) ||
+      v.authority.protocolVersion != ProdigyStatefulStoreSeedAuthority::qualificationSeedFaultVersion ||
+      v.runUUID != v.authority.qualificationRunUUID || v.challengeUUID != v.authority.qualificationChallengeUUID ||
+      v.executionGeneration != v.authority.qualificationExecutionGeneration ||
+      v.deadlineAtMilliseconds != v.authority.qualificationDeadlineAtMilliseconds ||
+      v.deadlineAtMilliseconds > v.authority.retainUntilMilliseconds ||
+      (!v.response && (v.ready || v.held || v.sessionUUID || v.sessionGeneration || v.appliedFrames || !v.failure.empty())) ||
+      (v.ready && (!v.response || !v.failure.empty())) ||
+      (v.held && (!v.ready || v.stage != ProdigyNametagQualificationSeedFaultStage::query ||
+                  !v.sessionUUID || !v.sessionGeneration || !v.appliedFrames))) return false;
+  return v.held || (!v.sessionUUID && !v.sessionGeneration && !v.appliedFrames);
+}
+static inline bool prodigyNametagQualificationSeedFaultResponseMatches(
+    const ProdigyNametagQualificationSeedFault& request, const ProdigyNametagQualificationSeedFault& response) {
+  if (request.response || !response.response || !prodigyNametagQualificationSeedFaultValid(request) ||
+      !prodigyNametagQualificationSeedFaultValid(response)) return false;
+  auto expected = request, observed = response;
+  observed.response = observed.ready = observed.held = false;
+  observed.sessionUUID = 0; observed.sessionGeneration = observed.appliedFrames = 0; observed.failure.clear();
+  String a, b;
+  return BitseryEngine::serialize(a, expected) && BitseryEngine::serialize(b, observed) && a == b;
+}
+
+// Row 5 names one live container and the two other writers in the same
+// shard group. The challenge is minted by Brain and pinned before a cut.
+enum class ProdigyNametagQualificationWriterIsolationStage : uint8_t {
+  none = 0, arm = 1, isolate = 2, query = 3, release = 4
+};
+class ProdigyNametagQualificationWriterIsolation {
+public:
+  static constexpr uint32_t version = 11;
+  uint32_t protocolVersion = version;
+  uint128_t runUUID = 0, challengeUUID = 0, clusterUUID = 0;
+  uint64_t executionGeneration = 0, deploymentID = 0;
+  int64_t deadlineAtMilliseconds = 0;
+  ProdigyNametagQualificationWriterIsolationStage stage = ProdigyNametagQualificationWriterIsolationStage::none;
+  uint16_t applicationID = 0;
+  uint32_t shardGroup = 0, validForMilliseconds = 0;
+  uint128_t targetContainerUUID = 0, targetMachineUUID = 0, targetAddress = 0;
+  std::array<uint128_t, 2> survivorContainerUUIDs = {}, survivorAddresses = {};
+  bool response = false, ready = false, isolated = false;
+  String failure = {};
+};
+template <typename S> static void serialize(S&& s, ProdigyNametagQualificationWriterIsolation& v) {
+  s.value4b(v.protocolVersion); s.value16b(v.runUUID); s.value16b(v.challengeUUID); s.value16b(v.clusterUUID);
+  s.value8b(v.executionGeneration); s.value8b(v.deploymentID); s.value8b(v.deadlineAtMilliseconds);
+  s.value1b(v.stage); s.value2b(v.applicationID); s.value4b(v.shardGroup); s.value4b(v.validForMilliseconds);
+  s.value16b(v.targetContainerUUID); s.value16b(v.targetMachineUUID); s.value16b(v.targetAddress);
+  for (auto& value : v.survivorContainerUUIDs) s.value16b(value);
+  for (auto& value : v.survivorAddresses) s.value16b(value);
+  s.value1b(v.response); s.value1b(v.ready); s.value1b(v.isolated); s.text1b(v.failure, 1024);
+}
+static inline bool prodigyNametagQualificationWriterIsolationValid(const ProdigyNametagQualificationWriterIsolation& v) {
+  if (v.protocolVersion != v.version || !v.runUUID || !v.challengeUUID || !v.clusterUUID || !v.executionGeneration ||
+      !v.deploymentID || v.deadlineAtMilliseconds <= 0 || v.stage < ProdigyNametagQualificationWriterIsolationStage::arm ||
+      v.stage > ProdigyNametagQualificationWriterIsolationStage::release || (v.applicationID != 3 && v.applicationID != 4) ||
+      !v.validForMilliseconds || v.validForMilliseconds > 60000 || !v.targetContainerUUID || !v.targetMachineUUID ||
+      !v.targetAddress || !v.survivorContainerUUIDs[0] || !v.survivorContainerUUIDs[1] ||
+      !v.survivorAddresses[0] || !v.survivorAddresses[1] ||
+      v.targetContainerUUID == v.survivorContainerUUIDs[0] || v.targetContainerUUID == v.survivorContainerUUIDs[1] ||
+      v.survivorContainerUUIDs[0] == v.survivorContainerUUIDs[1] || v.targetAddress == v.survivorAddresses[0] ||
+      v.targetAddress == v.survivorAddresses[1] || v.survivorAddresses[0] == v.survivorAddresses[1] ||
+      (!v.response && (v.ready || v.isolated || !v.failure.empty())) ||
+      (v.ready && (!v.response || !v.failure.empty()))) return false;
+  return !v.isolated || (v.response && v.ready && (v.stage == ProdigyNametagQualificationWriterIsolationStage::isolate ||
+                                                   v.stage == ProdigyNametagQualificationWriterIsolationStage::query));
+}
+static inline bool prodigyNametagQualificationWriterIsolationResponseMatches(
+    const ProdigyNametagQualificationWriterIsolation& request, const ProdigyNametagQualificationWriterIsolation& response) {
+  if (request.response || !response.response || !prodigyNametagQualificationWriterIsolationValid(request) ||
+      !prodigyNametagQualificationWriterIsolationValid(response)) return false;
+  auto left = request, right = response; right.response = right.ready = right.isolated = false; right.failure.clear();
+  String a = {}, b = {};
+  return BitseryEngine::serialize(a, left) && BitseryEngine::serialize(b, right) && a == b;
+}
+
+static inline bool prodigyNametagQualificationWriterIsolationInitialArmValid(
+    const ProdigyNametagQualificationWriterIsolation& request) {
+  if (request.response || request.stage != ProdigyNametagQualificationWriterIsolationStage::arm ||
+      request.challengeUUID || request.targetContainerUUID || request.targetMachineUUID || request.targetAddress ||
+      request.survivorContainerUUIDs[0] || request.survivorContainerUUIDs[1] ||
+      request.survivorAddresses[0] || request.survivorAddresses[1]) return false;
+  auto populated = request; populated.challengeUUID = 1; populated.targetContainerUUID = 2;
+  populated.targetMachineUUID = 3; populated.targetAddress = 4;
+  populated.survivorContainerUUIDs = {5, 6}; populated.survivorAddresses = {7, 8};
+  return prodigyNametagQualificationWriterIsolationValid(populated);
+}
+
+enum class ProdigyNametagQualificationRestartStage : uint8_t { none = 0, beforeRestart = 1, afterRestart = 2 };
+enum class ProdigyNametagQualificationWriterStage : uint8_t { none = 0, arm = 1, survivorWrites = 2, final = 3 };
+
+enum class ProdigyNametagQualificationPathStage : uint8_t {
+  none = 0, localWork = 1, partitionRead = 2, final = 3
+};
+static inline bool prodigyNametagQualificationPathRow(uint8_t row) {
+  return row == uint8_t(ProdigyNametagQualificationRow::sitePartitionLocalWrites) ||
+      row == uint8_t(ProdigyNametagQualificationRow::masqueSessionLossBgpRecovery) ||
+      row == uint8_t(ProdigyNametagQualificationRow::ewrOrdPathLoss);
+}
+static inline bool prodigyNametagQualificationPathStageValid(
+    uint8_t row, uint8_t direction, ProdigyNametagQualificationPathStage stage, uint8_t batch,
+    int64_t expiresAt, int64_t startedAt, int64_t convergenceDeadline) {
+  return prodigyNametagQualificationPathRow(row) &&
+      batch <= (row == uint8_t(ProdigyNametagQualificationRow::masqueSessionLossBgpRecovery) ? 1 : 0) &&
+      expiresAt > 0 && (direction == 1 ? expiresAt > startedAt && expiresAt <= convergenceDeadline : true) &&
+      ((direction == 1 && (stage == ProdigyNametagQualificationPathStage::localWork ||
+                           stage == ProdigyNametagQualificationPathStage::final ||
+                           (stage == ProdigyNametagQualificationPathStage::partitionRead &&
+                            row == uint8_t(ProdigyNametagQualificationRow::ewrOrdPathLoss)))) ||
+       (direction == 2 && stage == ProdigyNametagQualificationPathStage::final));
+}
+
+// One bounded partition runs three normal identity-domain contests.  The
+// controller joins explicit application responses with native path evidence.
+enum class ProdigyNametagQualificationClaimStage : uint8_t {
+  none = 0, prepare = 1, arm = 2, contend = 3, settle = 4, final = 5
+};
+struct ProdigyNametagQualificationClaimResult {
+  bool observed = false, accepted = false;
+};
+template <typename S> static void serialize(S&& s, ProdigyNametagQualificationClaimResult& v) {
+  s.value1b(v.observed); s.value1b(v.accepted);
+}
+static inline bool prodigyNametagQualificationClaimStageValid(
+    uint8_t row, uint8_t direction, ProdigyNametagQualificationClaimStage stage,
+    int64_t expiresAt, int64_t startedAt, int64_t convergenceDeadline) {
+  if (row != uint8_t(ProdigyNametagQualificationRow::truthClaimPartition) ||
+      stage < ProdigyNametagQualificationClaimStage::prepare ||
+      stage > ProdigyNametagQualificationClaimStage::final ||
+      (direction != 1 && direction != 2) ||
+      (direction == 2 && stage != ProdigyNametagQualificationClaimStage::final)) return false;
+  if (stage == ProdigyNametagQualificationClaimStage::prepare ||
+      stage == ProdigyNametagQualificationClaimStage::arm) return expiresAt == 0;
+  return expiresAt > 0 && (direction == 2 ||
+      (expiresAt > startedAt && expiresAt <= convergenceDeadline));
+}
+
+enum class ProdigyNametagQualificationReplayWorkStage : uint8_t { none = 0, prepare = 1, workload = 2, final = 3 };
+
+static constexpr bool prodigyNametagQualificationSeedReadbackRow(uint8_t row) {
+  return row == uint8_t(ProdigyNametagQualificationRow::seedInterruptionResume) ||
+      row == uint8_t(ProdigyNametagQualificationRow::brainHardRebootCatchup);
+}
+
+class ProdigyNametagQualificationApplicationReceipt {
+public:
+  // v5 replaces broad pass flags with a typed witness and participant role.
+  static constexpr uint32_t version = 5;
+  static constexpr uint32_t cousinStageVersion = 6;
+  static constexpr uint32_t restartStageVersion = 7;
+  static constexpr uint32_t replayStageVersion = 8;
+  static constexpr uint32_t pathStageVersion = 9;
+  static constexpr uint32_t writerStageVersion = 10;
+  static constexpr uint32_t claimStageVersion = 12;
+  static constexpr uint32_t seedReadbackVersion = 13;
+  uint32_t protocolVersion = version;
+  uint128_t runUUID = 0;
+  uint8_t row = 0;
+  uint8_t direction = 0;
+  uint64_t executionGeneration = 0;
+  String rowID;
+  ProdigyNametagQualificationDescriptor descriptor;
+  uint128_t localClusterUUID = 0;
+  uint64_t deploymentID = 0;
+  uint128_t localContainerUUID = 0;
+  int64_t startedAtMilliseconds = 0;
+  int64_t deadlineAtMilliseconds = 0;
+  int64_t convergenceDeadlineAtMilliseconds = 0;
+  int64_t observedAtMilliseconds = 0;
+  ProdigyNametagQualificationWitness witnessedResult =
+      ProdigyNametagQualificationWitness::orderedUserKeyDigest;
+  ProdigyNametagQualificationParticipantRole participantRole =
+      ProdigyNametagQualificationParticipantRole::none;
+  // Optional for rows other than sixteen.  Row sixteen's global join requires
+  // the EWR fence and both observers to report this exact post-state digest.
+  String joinedWitnessDigest;
+  String canonicalWitnessReceipt;
+  String witnessDigest;
+  ProdigyNametagQualificationCousinStage cousinStage = ProdigyNametagQualificationCousinStage::none;
+  Vector<ProdigyNametagQualificationCousinSession> cousinSessions;
+  ProdigyNametagQualificationRestartStage restartStage = ProdigyNametagQualificationRestartStage::none;
+  ProdigyNametagQualificationReplayWorkStage replayStage = ProdigyNametagQualificationReplayWorkStage::none;
+  ProdigyNametagQualificationPathStage pathStage = ProdigyNametagQualificationPathStage::none;
+  uint8_t pathBatch = 0;
+  int64_t pathFaultExpiresAtMilliseconds = 0;
+  ProdigyNametagQualificationWriterStage writerStage = ProdigyNametagQualificationWriterStage::none;
+  uint128_t writerChallengeUUID = 0;
+  ProdigyNametagQualificationClaimStage claimStage = ProdigyNametagQualificationClaimStage::none;
+  int64_t claimFaultExpiresAtMilliseconds = 0;
+  std::array<ProdigyNametagQualificationClaimResult, 3> claimResults = {};
+  std::array<uint128_t, 3> claimWinnerSites = {};
+  String seedControlWitnessDigest, seedBaselineReadbackSHA256;
+  // Compatibility-only in-memory fields for the not-yet-migrated execution
+  // owner. They are deliberately outside v5 serialization and validation, so
+  // an old broad-pass payload cannot become a qualification receipt.
+  String canonicalApplicationReceipt, canonicalDataDigest, hotDigest, coldDigest, radarDigest, pulseDigest;
+  String truthDigest, conflictWinnerDigest;
+  uint128_t conflictWinnerClusterUUID = 0;
+  bool perUserIsolation = false, sessionFence = false, truthClaimUniqueness = false;
+  bool radarMutationAccepted = false, pulseMutationAccepted = false, pass = false;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyNametagQualificationApplicationReceipt& receipt)
+{
+  serializer.value4b(receipt.protocolVersion); serializer.value16b(receipt.runUUID);
+  serializer.value1b(receipt.row); serializer.value1b(receipt.direction); serializer.value8b(receipt.executionGeneration);
+  serializer.text1b(receipt.rowID, 128); serializer.object(receipt.descriptor);
+  serializer.value16b(receipt.localClusterUUID); serializer.value8b(receipt.deploymentID);
+  serializer.value16b(receipt.localContainerUUID); serializer.value8b(receipt.startedAtMilliseconds);
+  serializer.value8b(receipt.deadlineAtMilliseconds); serializer.value8b(receipt.convergenceDeadlineAtMilliseconds);
+  serializer.value8b(receipt.observedAtMilliseconds); serializer.value1b(receipt.witnessedResult);
+  serializer.value1b(receipt.participantRole); serializer.text1b(receipt.joinedWitnessDigest, 64);
+  serializer.text1b(receipt.canonicalWitnessReceipt, 8192); serializer.text1b(receipt.witnessDigest, 64);
+  if (receipt.protocolVersion >= 6) { serializer.value1b(receipt.cousinStage); serializer.container(receipt.cousinSessions, 2); }
+  if (receipt.protocolVersion >= 7) serializer.value1b(receipt.restartStage);
+  if (receipt.protocolVersion >= 8) serializer.value1b(receipt.replayStage);
+  if (receipt.protocolVersion >= 9) { serializer.value1b(receipt.pathStage); serializer.value1b(receipt.pathBatch);
+    serializer.value8b(receipt.pathFaultExpiresAtMilliseconds); }
+  if (receipt.protocolVersion >= 10) { serializer.value1b(receipt.writerStage); serializer.value16b(receipt.writerChallengeUUID); }
+  if (receipt.protocolVersion >= 12) {
+    serializer.value1b(receipt.claimStage); serializer.value8b(receipt.claimFaultExpiresAtMilliseconds);
+    for (auto& site : receipt.claimWinnerSites) serializer.value16b(site);
+    for (auto& result : receipt.claimResults) serializer.object(result);
+  }
+  if (receipt.protocolVersion >= 13) {
+    serializer.text1b(receipt.seedControlWitnessDigest, 64); serializer.text1b(receipt.seedBaselineReadbackSHA256, 64);
+  }
+}
+
+static inline bool prodigyNametagQualificationApplicationReceiptValid(
+    const ProdigyNametagQualificationApplicationReceipt& receipt)
+{
+  const bool cousinRow = receipt.row == uint8_t(ProdigyNametagQualificationRow::permissionRevokeReinstall) ||
+      receipt.row == uint8_t(ProdigyNametagQualificationRow::cousinRouteSessionReconnect);
+  const bool cousinProof = receipt.protocolVersion == ProdigyNametagQualificationApplicationReceipt::cousinStageVersion &&
+      cousinRow && (receipt.cousinStage == ProdigyNametagQualificationCousinStage::faultObserved ||
+                    receipt.cousinStage == ProdigyNametagQualificationCousinStage::final) &&
+      receipt.cousinSessions.empty() && prodigyIsSHA256HexDigest(receipt.joinedWitnessDigest);
+  const bool restartProof = receipt.protocolVersion == ProdigyNametagQualificationApplicationReceipt::restartStageVersion &&
+      receipt.row == uint8_t(ProdigyNametagQualificationRow::mothershipRestartResume) &&
+      (receipt.restartStage == ProdigyNametagQualificationRestartStage::beforeRestart ||
+       receipt.restartStage == ProdigyNametagQualificationRestartStage::afterRestart) &&
+      receipt.cousinStage == ProdigyNametagQualificationCousinStage::none && receipt.cousinSessions.empty() &&
+      prodigyIsSHA256HexDigest(receipt.joinedWitnessDigest) &&
+      (receipt.direction == 1 || receipt.restartStage == ProdigyNametagQualificationRestartStage::afterRestart);
+  const bool pathProof = receipt.protocolVersion == ProdigyNametagQualificationApplicationReceipt::pathStageVersion &&
+      receipt.cousinStage == ProdigyNametagQualificationCousinStage::none && receipt.cousinSessions.empty() &&
+      receipt.restartStage == ProdigyNametagQualificationRestartStage::none &&
+      prodigyIsSHA256HexDigest(receipt.joinedWitnessDigest) &&
+      prodigyNametagQualificationPathStageValid(receipt.row, receipt.direction, receipt.pathStage, receipt.pathBatch,
+          receipt.pathFaultExpiresAtMilliseconds, receipt.startedAtMilliseconds, receipt.convergenceDeadlineAtMilliseconds) &&
+      (receipt.pathStage == ProdigyNametagQualificationPathStage::final ||
+       receipt.observedAtMilliseconds < receipt.pathFaultExpiresAtMilliseconds);
+  const bool writerProof = receipt.protocolVersion == ProdigyNametagQualificationApplicationReceipt::writerStageVersion &&
+      receipt.row == uint8_t(ProdigyNametagQualificationRow::localWriterIsolation) && receipt.writerChallengeUUID &&
+      receipt.writerStage >= ProdigyNametagQualificationWriterStage::arm &&
+      receipt.writerStage <= ProdigyNametagQualificationWriterStage::final &&
+      (receipt.direction == 1 || receipt.writerStage == ProdigyNametagQualificationWriterStage::final) &&
+      receipt.cousinStage == ProdigyNametagQualificationCousinStage::none && receipt.cousinSessions.empty() &&
+      receipt.restartStage == ProdigyNametagQualificationRestartStage::none &&
+      receipt.pathStage == ProdigyNametagQualificationPathStage::none && receipt.pathBatch == 0 &&
+      !receipt.pathFaultExpiresAtMilliseconds && prodigyIsSHA256HexDigest(receipt.joinedWitnessDigest);
+  const bool replayProof = receipt.protocolVersion == ProdigyNametagQualificationApplicationReceipt::replayStageVersion &&
+      receipt.row == uint8_t(ProdigyNametagQualificationRow::graphKvReplayReorder) &&
+      (receipt.replayStage == ProdigyNametagQualificationReplayWorkStage::workload ||
+       receipt.replayStage == ProdigyNametagQualificationReplayWorkStage::final) &&
+      (receipt.direction == 1 || receipt.replayStage == ProdigyNametagQualificationReplayWorkStage::final) &&
+      receipt.cousinStage == ProdigyNametagQualificationCousinStage::none && receipt.cousinSessions.empty() &&
+      receipt.restartStage == ProdigyNametagQualificationRestartStage::none &&
+      receipt.pathStage == ProdigyNametagQualificationPathStage::none && !receipt.pathBatch && !receipt.pathFaultExpiresAtMilliseconds &&
+      receipt.writerStage == ProdigyNametagQualificationWriterStage::none && !receipt.writerChallengeUUID &&
+      prodigyIsSHA256HexDigest(receipt.joinedWitnessDigest);
+  const bool claimProof = receipt.protocolVersion == ProdigyNametagQualificationApplicationReceipt::claimStageVersion &&
+      prodigyNametagQualificationClaimStageValid(receipt.row, receipt.direction, receipt.claimStage,
+          receipt.claimFaultExpiresAtMilliseconds, receipt.startedAtMilliseconds, receipt.convergenceDeadlineAtMilliseconds) &&
+      std::all_of(receipt.claimWinnerSites.begin(), receipt.claimWinnerSites.end(), [&](uint128_t site) {
+        return receipt.claimStage >= ProdigyNametagQualificationClaimStage::settle ? site != 0 : site == 0;
+      }) && prodigyIsSHA256HexDigest(receipt.joinedWitnessDigest) &&
+      (receipt.claimStage != ProdigyNametagQualificationClaimStage::contend ||
+       receipt.observedAtMilliseconds < receipt.claimFaultExpiresAtMilliseconds) &&
+      std::all_of(receipt.claimResults.begin(), receipt.claimResults.end(), [&](const auto& result) {
+        return receipt.claimStage == ProdigyNametagQualificationClaimStage::contend ?
+            (!result.accepted || result.observed) : (!result.accepted && !result.observed);
+      });
+  const bool seedReadbackProof = receipt.protocolVersion == ProdigyNametagQualificationApplicationReceipt::seedReadbackVersion &&
+      prodigyNametagQualificationSeedReadbackRow(receipt.row) &&
+      prodigyIsSHA256HexDigest(receipt.seedControlWitnessDigest) &&
+      prodigyIsSHA256HexDigest(receipt.seedBaselineReadbackSHA256) && prodigyIsSHA256HexDigest(receipt.joinedWitnessDigest);
+  const bool knownVersion = receipt.protocolVersion == ProdigyNametagQualificationApplicationReceipt::version || cousinProof || restartProof ||
+      replayProof || pathProof || writerProof || claimProof || seedReadbackProof;
+  // Each extension has one wire owner.  A valid version cannot smuggle fields
+  // belonging to a different experiment through the common envelope.
+  const bool extensionsValid =
+      (receipt.protocolVersion == ProdigyNametagQualificationApplicationReceipt::seedReadbackVersion ||
+       (receipt.seedControlWitnessDigest.empty() && receipt.seedBaselineReadbackSHA256.empty())) &&
+      (receipt.protocolVersion == ProdigyNametagQualificationApplicationReceipt::cousinStageVersion ||
+       (receipt.cousinStage == ProdigyNametagQualificationCousinStage::none && receipt.cousinSessions.empty())) &&
+      (receipt.protocolVersion == ProdigyNametagQualificationApplicationReceipt::restartStageVersion ||
+       receipt.restartStage == ProdigyNametagQualificationRestartStage::none) &&
+      (receipt.protocolVersion == ProdigyNametagQualificationApplicationReceipt::replayStageVersion ||
+       receipt.replayStage == ProdigyNametagQualificationReplayWorkStage::none) &&
+      (receipt.protocolVersion == ProdigyNametagQualificationApplicationReceipt::pathStageVersion ||
+       (receipt.pathStage == ProdigyNametagQualificationPathStage::none && !receipt.pathBatch && !receipt.pathFaultExpiresAtMilliseconds)) &&
+      (receipt.protocolVersion == ProdigyNametagQualificationApplicationReceipt::writerStageVersion ||
+       receipt.writerStage == ProdigyNametagQualificationWriterStage::none) &&
+      (receipt.protocolVersion == ProdigyNametagQualificationApplicationReceipt::claimStageVersion ||
+       (receipt.claimStage == ProdigyNametagQualificationClaimStage::none && !receipt.claimFaultExpiresAtMilliseconds &&
+        std::all_of(receipt.claimWinnerSites.begin(), receipt.claimWinnerSites.end(), [](uint128_t site) { return site == 0; }))) &&
+      (receipt.protocolVersion == ProdigyNametagQualificationApplicationReceipt::writerStageVersion || !receipt.writerChallengeUUID) &&
+      (receipt.protocolVersion == ProdigyNametagQualificationApplicationReceipt::claimStageVersion ||
+       std::all_of(receipt.claimResults.begin(), receipt.claimResults.end(), [](const auto& result) {
+         return !result.observed && !result.accepted;
+       }));
+  return knownVersion && extensionsValid &&
+      (!prodigyNametagQualificationSeedReadbackRow(receipt.row) || seedReadbackProof) &&
+      (receipt.row != uint8_t(ProdigyNametagQualificationRow::truthClaimPartition) ||
+       receipt.protocolVersion == ProdigyNametagQualificationApplicationReceipt::claimStageVersion) &&
+      receipt.runUUID != 0 && receipt.row >= 1 && receipt.row <= 17 && receipt.executionGeneration != 0 &&
+      (receipt.direction == 1 || receipt.direction == 2) && !receipt.rowID.empty() && receipt.rowID.size() <= 128 &&
+      receipt.localClusterUUID != 0 && receipt.deploymentID != 0 && receipt.localContainerUUID != 0 &&
+      receipt.startedAtMilliseconds > 0 && receipt.deadlineAtMilliseconds > receipt.startedAtMilliseconds &&
+      receipt.convergenceDeadlineAtMilliseconds >= receipt.startedAtMilliseconds &&
+      receipt.convergenceDeadlineAtMilliseconds <= receipt.deadlineAtMilliseconds &&
+      receipt.observedAtMilliseconds >= receipt.startedAtMilliseconds &&
+      receipt.observedAtMilliseconds <= receipt.convergenceDeadlineAtMilliseconds &&
+      prodigyNametagQualificationDescriptorValid(receipt.descriptor) &&
+      prodigyNametagQualificationRowDescriptorValid(receipt.row, receipt.descriptor) &&
+      receipt.witnessedResult == receipt.descriptor.expectedWitness &&
+      uint8_t(receipt.participantRole) <= uint8_t(ProdigyNametagQualificationParticipantRole::truthObserver) &&
+      (receipt.joinedWitnessDigest.empty() || prodigyIsSHA256HexDigest(receipt.joinedWitnessDigest)) &&
+      !receipt.canonicalWitnessReceipt.empty() && receipt.canonicalWitnessReceipt.size() <= 8192 &&
+      prodigyIsSHA256HexDigest(receipt.witnessDigest);
+}
+
+class ProdigyNametagQualificationApp6Route {
+public:
+  uint128_t clusterUUID = 0, containerUUID = 0;
+  uint64_t deploymentID = 0;
+  uint8_t ipv6[16] = {};
+  uint16_t port = 0;
+  Vector<String> cids;
+  String cidFixtureSHA256;
+};
+template <typename S>
+static void serialize(S&& s, ProdigyNametagQualificationApp6Route& v) {
+  s.value16b(v.clusterUUID); s.value8b(v.deploymentID); s.value16b(v.containerUUID);
+  for (auto& byte : v.ipv6) s.value1b(byte);
+  s.value2b(v.port); s.container(v.cids, 16, [](auto& nested, String& cid) { nested.text1b(cid, 20); });
+  s.text1b(v.cidFixtureSHA256, 64);
+}
+static inline bool prodigyNametagQualificationApp6RoutesValid(const Vector<ProdigyNametagQualificationApp6Route>& routes) {
+  if (routes.size() != 2 || routes[0].clusterUUID == routes[1].clusterUUID ||
+      routes[0].containerUUID == routes[1].containerUUID ||
+      (memcmp(routes[0].ipv6, routes[1].ipv6, 16) == 0 && routes[0].port == routes[1].port)) return false;
+  for (size_t i = 0; i < routes.size(); ++i) {
+    const auto& r = routes[i];
+    if (!r.clusterUUID || !r.containerUUID || ApplicationConfig::extractApplicationID(r.deploymentID) != 6 ||
+        !r.port || std::all_of(std::begin(r.ipv6), std::end(r.ipv6), [](uint8_t b) { return b == 0; }) ||
+        r.cids.size() < 2 || r.cids.size() > 16 || !prodigyIsSHA256HexDigest(r.cidFixtureSHA256)) return false;
+    for (size_t j = 0; j < r.cids.size(); ++j) {
+      if (r.cids[j].empty() || r.cids[j].size() > 20) return false;
+      for (size_t k = 0; k <= i; ++k)
+        for (size_t n = 0; n < (k == i ? j : routes[k].cids.size()); ++n)
+          if (r.cids[j] == routes[k].cids[n]) return false;
+    }
+  }
+  return true;
+}
+
+// Brain sends this bounded command to the exact live App11 probe container.
+// Runtime environment variables cannot represent 34 independently durable
+// operations on one persistent deployment, so every execution is explicitly
+// fenced by the immutable qualification tuple and its absolute time bounds.
+class ProdigyNametagQualificationApplicationCommand {
+public:
+  // v4 binds row sixteen observation to one already-persisted injection
+  // receipt. The binding is deliberately absent for every other command.
+  // App11 must not infer
+  // membership from its local environment or from a partial receipt set.
+  static constexpr uint32_t version = 5;
+  static constexpr uint32_t cousinStageVersion = 6;
+  static constexpr uint32_t restartStageVersion = 7;
+  static constexpr uint32_t replayStageVersion = 8;
+  static constexpr uint32_t pathStageVersion = 9;
+  static constexpr uint32_t writerStageVersion = 10;
+  static constexpr uint32_t claimStageVersion = 12;
+  static constexpr uint32_t seedReadbackVersion = 13;
+  uint32_t protocolVersion = version;
+  uint128_t runUUID = 0;
+  uint8_t row = 0;
+  uint8_t direction = 0;
+  uint64_t executionGeneration = 0;
+  String rowID;
+  ProdigyNametagQualificationDescriptor descriptor;
+  uint128_t localClusterUUID = 0;
+  Vector<uint128_t> canonicalClusterUUIDs;
+  uint64_t deploymentID = 0;
+  int64_t startedAtMilliseconds = 0;
+  int64_t deadlineAtMilliseconds = 0;
+  int64_t convergenceDeadlineAtMilliseconds = 0;
+  uint128_t priorInjectionRunUUID = 0;
+  String priorInjectionReceiptDigest;
+  Vector<ProdigyNametagQualificationApp6Route> app6Routes;
+  ProdigyNametagQualificationCousinStage cousinStage = ProdigyNametagQualificationCousinStage::none;
+  Vector<ProdigyNametagQualificationCousinSession> cousinSessions;
+  ProdigyNametagQualificationRestartStage restartStage = ProdigyNametagQualificationRestartStage::none;
+  ProdigyNametagQualificationReplayWorkStage replayStage = ProdigyNametagQualificationReplayWorkStage::none;
+  Vector<ProdigyNametagQualificationReplay> replaySources;
+  ProdigyNametagQualificationPathStage pathStage = ProdigyNametagQualificationPathStage::none;
+  uint8_t pathBatch = 0;
+  int64_t pathFaultExpiresAtMilliseconds = 0;
+  ProdigyNametagQualificationWriterStage writerStage = ProdigyNametagQualificationWriterStage::none;
+  ProdigyNametagQualificationWriterIsolation writerIsolation = {};
+  ProdigyNametagQualificationClaimStage claimStage = ProdigyNametagQualificationClaimStage::none;
+  int64_t claimFaultExpiresAtMilliseconds = 0;
+  std::array<uint128_t, 3> claimWinnerSites = {};
+  // Readback names the existing immutable baseline. The control digest is
+  // supplied and verified by Mothership; App11 only verifies the data.
+  uint128_t seedBaselineOperationUUID = 0;
+  std::array<uint64_t, 5> seedStoreDeploymentIDs = {}; // Hot, Cold, Radar, Pulse, Truth.
+  String seedControlWitnessDigest, seedBaselineFixtureSHA256, seedBaselineReadbackSHA256;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyNametagQualificationApplicationCommand& command)
+{
+  serializer.value4b(command.protocolVersion); serializer.value16b(command.runUUID);
+  serializer.value1b(command.row); serializer.value1b(command.direction); serializer.value8b(command.executionGeneration);
+  serializer.text1b(command.rowID, 128); serializer.object(command.descriptor);
+  serializer.value16b(command.localClusterUUID); serializer.value8b(command.deploymentID);
+  serializer.value8b(command.startedAtMilliseconds); serializer.value8b(command.deadlineAtMilliseconds);
+  serializer.value8b(command.convergenceDeadlineAtMilliseconds);
+  serializer.container(command.canonicalClusterUUIDs, 3,
+      [](auto& nested, uint128_t& clusterUUID) { nested.value16b(clusterUUID); });
+  if (command.protocolVersion >= 4) {
+    serializer.value16b(command.priorInjectionRunUUID);
+    serializer.text1b(command.priorInjectionReceiptDigest, 64);
+  }
+  if (command.protocolVersion >= 5) serializer.container(command.app6Routes, 2);
+  if (command.protocolVersion >= 6) { serializer.value1b(command.cousinStage); serializer.container(command.cousinSessions, 2); }
+  if (command.protocolVersion >= 7) serializer.value1b(command.restartStage);
+  if (command.protocolVersion >= 8) { serializer.value1b(command.replayStage); serializer.container(command.replaySources, 2); }
+  if (command.protocolVersion >= 9) { serializer.value1b(command.pathStage); serializer.value1b(command.pathBatch);
+    serializer.value8b(command.pathFaultExpiresAtMilliseconds); }
+  if (command.protocolVersion >= 10) { serializer.value1b(command.writerStage); serializer.object(command.writerIsolation); }
+  if (command.protocolVersion >= 12) {
+    serializer.value1b(command.claimStage); serializer.value8b(command.claimFaultExpiresAtMilliseconds);
+    for (auto& site : command.claimWinnerSites) serializer.value16b(site);
+  }
+  if (command.protocolVersion >= 13) {
+    serializer.value16b(command.seedBaselineOperationUUID);
+    for (auto& deployment : command.seedStoreDeploymentIDs) serializer.value8b(deployment);
+    serializer.text1b(command.seedControlWitnessDigest, 64);
+    serializer.text1b(command.seedBaselineFixtureSHA256, 64); serializer.text1b(command.seedBaselineReadbackSHA256, 64);
+  }
+}
+
+static inline bool prodigyNametagQualificationApplicationCommandValid(
+    const ProdigyNametagQualificationApplicationCommand& command)
+{
+  const bool cousinRow = command.row == uint8_t(ProdigyNametagQualificationRow::permissionRevokeReinstall) ||
+      command.row == uint8_t(ProdigyNametagQualificationRow::cousinRouteSessionReconnect);
+  const bool cousinCommand = command.protocolVersion == ProdigyNametagQualificationApplicationCommand::cousinStageVersion &&
+      cousinRow && command.canonicalClusterUUIDs.size() == 3 &&
+      ((command.direction == 1 && (command.cousinStage == ProdigyNametagQualificationCousinStage::faultObserved ||
+                                    command.cousinStage == ProdigyNametagQualificationCousinStage::final)) ||
+       (command.direction == 2 && command.cousinStage == ProdigyNametagQualificationCousinStage::final)) && command.cousinSessions.empty();
+  const bool restartCommand = command.protocolVersion == ProdigyNametagQualificationApplicationCommand::restartStageVersion &&
+      command.row == uint8_t(ProdigyNametagQualificationRow::mothershipRestartResume) &&
+      command.cousinStage == ProdigyNametagQualificationCousinStage::none && command.cousinSessions.empty() &&
+      ((command.direction == 1 && (command.restartStage == ProdigyNametagQualificationRestartStage::beforeRestart ||
+                                    command.restartStage == ProdigyNametagQualificationRestartStage::afterRestart)) ||
+       (command.direction == 2 && command.restartStage == ProdigyNametagQualificationRestartStage::afterRestart));
+  const bool pathCommand = command.protocolVersion == ProdigyNametagQualificationApplicationCommand::pathStageVersion &&
+      command.cousinStage == ProdigyNametagQualificationCousinStage::none && command.cousinSessions.empty() &&
+      command.restartStage == ProdigyNametagQualificationRestartStage::none &&
+      prodigyNametagQualificationPathStageValid(command.row, command.direction, command.pathStage, command.pathBatch,
+          command.pathFaultExpiresAtMilliseconds, command.startedAtMilliseconds, command.convergenceDeadlineAtMilliseconds);
+  const bool writerCommand = command.protocolVersion == ProdigyNametagQualificationApplicationCommand::writerStageVersion &&
+      command.row == uint8_t(ProdigyNametagQualificationRow::localWriterIsolation) &&
+      command.writerStage >= ProdigyNametagQualificationWriterStage::arm &&
+      command.writerStage <= ProdigyNametagQualificationWriterStage::final &&
+      (command.direction == 1 || command.writerStage == ProdigyNametagQualificationWriterStage::final) &&
+      command.cousinStage == ProdigyNametagQualificationCousinStage::none && command.cousinSessions.empty() &&
+      command.restartStage == ProdigyNametagQualificationRestartStage::none &&
+      command.pathStage == ProdigyNametagQualificationPathStage::none && command.pathBatch == 0 &&
+      !command.pathFaultExpiresAtMilliseconds && prodigyNametagQualificationWriterIsolationValid(command.writerIsolation) &&
+      !command.writerIsolation.response && command.writerIsolation.stage == ProdigyNametagQualificationWriterIsolationStage::arm &&
+      command.writerIsolation.runUUID == command.runUUID &&
+      (command.writerStage == ProdigyNametagQualificationWriterStage::final ||
+       command.writerIsolation.clusterUUID == command.localClusterUUID) &&
+      (command.direction == 2 || (command.writerIsolation.executionGeneration == command.executionGeneration &&
+       command.writerIsolation.deadlineAtMilliseconds == command.deadlineAtMilliseconds));
+  const bool replayCommand = command.protocolVersion == ProdigyNametagQualificationApplicationCommand::replayStageVersion &&
+      command.row == uint8_t(ProdigyNametagQualificationRow::graphKvReplayReorder) &&
+      (command.replayStage == ProdigyNametagQualificationReplayWorkStage::prepare ||
+       command.replayStage == ProdigyNametagQualificationReplayWorkStage::workload ||
+       command.replayStage == ProdigyNametagQualificationReplayWorkStage::final) &&
+      (command.direction == 1 || command.replayStage == ProdigyNametagQualificationReplayWorkStage::final) &&
+      command.cousinStage == ProdigyNametagQualificationCousinStage::none && command.cousinSessions.empty() &&
+      command.restartStage == ProdigyNametagQualificationRestartStage::none &&
+      command.pathStage == ProdigyNametagQualificationPathStage::none && !command.pathBatch && !command.pathFaultExpiresAtMilliseconds &&
+      command.writerStage == ProdigyNametagQualificationWriterStage::none &&
+      (command.replayStage != ProdigyNametagQualificationReplayWorkStage::workload ? command.replaySources.empty() :
+       (command.replaySources.size() == 2 &&
+        command.replaySources[0].store == ProdigyNametagQualificationReplayStore::kv &&
+        command.replaySources[1].store == ProdigyNametagQualificationReplayStore::graph &&
+        command.replaySources[0].challengeUUID != command.replaySources[1].challengeUUID &&
+        std::all_of(command.replaySources.begin(), command.replaySources.end(), [&](const auto& source) {
+          return prodigyNametagQualificationReplayValid(source) && !source.response && !source.targetSide &&
+              source.stage == ProdigyNametagQualificationReplayStage::arm && source.runUUID == command.runUUID &&
+              source.executionGeneration == command.executionGeneration && source.direction == command.direction &&
+              source.deadlineAtMilliseconds > command.startedAtMilliseconds &&
+              source.deadlineAtMilliseconds <= command.deadlineAtMilliseconds &&
+              (prodigyNametagQualificationReplayLocalHalf(source.store, false) == CousinRouteHalf::source ?
+               source.session.sourceClusterUUID : source.session.destinationClusterUUID) == command.localClusterUUID;
+        })));
+  const bool claimCommand = command.protocolVersion == ProdigyNametagQualificationApplicationCommand::claimStageVersion &&
+      prodigyNametagQualificationClaimStageValid(command.row, command.direction, command.claimStage,
+          command.claimFaultExpiresAtMilliseconds, command.startedAtMilliseconds, command.convergenceDeadlineAtMilliseconds) &&
+      std::all_of(command.claimWinnerSites.begin(), command.claimWinnerSites.end(), [&](uint128_t site) {
+        return command.claimStage >= ProdigyNametagQualificationClaimStage::settle ? site != 0 : site == 0;
+      }) && (command.claimStage < ProdigyNametagQualificationClaimStage::settle ||
+      std::all_of(command.claimWinnerSites.begin(), command.claimWinnerSites.end(), [&](uint128_t site) {
+        return std::count(command.canonicalClusterUUIDs.begin(), command.canonicalClusterUUIDs.end(), site) == 1;
+      }));
+  const bool seedReadbackCommand = command.protocolVersion == ProdigyNametagQualificationApplicationCommand::seedReadbackVersion &&
+      prodigyNametagQualificationSeedReadbackRow(command.row) && command.seedBaselineOperationUUID &&
+      prodigyIsSHA256HexDigest(command.seedControlWitnessDigest) && prodigyIsSHA256HexDigest(command.seedBaselineFixtureSHA256) &&
+      prodigyIsSHA256HexDigest(command.seedBaselineReadbackSHA256) &&
+      ApplicationConfig::extractApplicationID(command.seedStoreDeploymentIDs[0]) == MeshRegistry::Hot::applicationID &&
+      ApplicationConfig::extractApplicationID(command.seedStoreDeploymentIDs[1]) == MeshRegistry::Cold::applicationID &&
+      ApplicationConfig::extractApplicationID(command.seedStoreDeploymentIDs[2]) == MeshRegistry::Radar::applicationID &&
+      ApplicationConfig::extractApplicationID(command.seedStoreDeploymentIDs[3]) == MeshRegistry::Pulse::applicationID &&
+      ApplicationConfig::extractApplicationID(command.seedStoreDeploymentIDs[4]) == MeshRegistry::Truth::applicationID;
+  const bool knownVersion = (command.protocolVersion == ProdigyNametagQualificationApplicationCommand::version || command.protocolVersion == 4) || cousinCommand || restartCommand ||
+      replayCommand || pathCommand || writerCommand || claimCommand || seedReadbackCommand;
+  // Each extension has one wire owner.  A valid version cannot smuggle fields
+  // belonging to a different experiment through the common envelope.
+  const bool extensionsValid =
+      (command.protocolVersion == ProdigyNametagQualificationApplicationCommand::seedReadbackVersion ||
+       (!command.seedBaselineOperationUUID && command.seedControlWitnessDigest.empty() &&
+        command.seedBaselineFixtureSHA256.empty() && command.seedBaselineReadbackSHA256.empty() &&
+        std::all_of(command.seedStoreDeploymentIDs.begin(), command.seedStoreDeploymentIDs.end(), [](uint64_t id) { return id == 0; }))) &&
+      (command.protocolVersion == ProdigyNametagQualificationApplicationCommand::cousinStageVersion ||
+       (command.cousinStage == ProdigyNametagQualificationCousinStage::none && command.cousinSessions.empty())) &&
+      (command.protocolVersion == ProdigyNametagQualificationApplicationCommand::restartStageVersion ||
+       command.restartStage == ProdigyNametagQualificationRestartStage::none) &&
+      (command.protocolVersion == ProdigyNametagQualificationApplicationCommand::replayStageVersion ||
+       command.replayStage == ProdigyNametagQualificationReplayWorkStage::none) &&
+      (command.protocolVersion == ProdigyNametagQualificationApplicationCommand::pathStageVersion ||
+       (command.pathStage == ProdigyNametagQualificationPathStage::none && !command.pathBatch && !command.pathFaultExpiresAtMilliseconds)) &&
+      (command.protocolVersion == ProdigyNametagQualificationApplicationCommand::writerStageVersion ||
+       command.writerStage == ProdigyNametagQualificationWriterStage::none) &&
+      (command.protocolVersion == ProdigyNametagQualificationApplicationCommand::claimStageVersion ||
+       (command.claimStage == ProdigyNametagQualificationClaimStage::none && !command.claimFaultExpiresAtMilliseconds &&
+        std::all_of(command.claimWinnerSites.begin(), command.claimWinnerSites.end(), [](uint128_t site) { return site == 0; })));
+  return knownVersion && extensionsValid &&
+      (!prodigyNametagQualificationSeedReadbackRow(command.row) || seedReadbackCommand) &&
+      (command.row != uint8_t(ProdigyNametagQualificationRow::truthClaimPartition) ||
+       command.protocolVersion == ProdigyNametagQualificationApplicationCommand::claimStageVersion) &&
+      (command.protocolVersion == ProdigyNametagQualificationApplicationCommand::replayStageVersion || command.replaySources.empty()) &&
+      command.runUUID != 0 && command.row >= 1 && command.row <= 17 && command.executionGeneration != 0 &&
+      (command.direction == 1 || command.direction == 2) && !command.rowID.empty() && command.rowID.size() <= 128 &&
+      prodigyNametagQualificationDescriptorValid(command.descriptor) &&
+      prodigyNametagQualificationRowDescriptorValid(command.row, command.descriptor) &&
+      command.localClusterUUID != 0 &&
+      command.canonicalClusterUUIDs.size() == 3 && command.deploymentID != 0 &&
+      ApplicationConfig::extractApplicationID(command.deploymentID) == 11 &&
+      command.startedAtMilliseconds > 0 && command.deadlineAtMilliseconds > command.startedAtMilliseconds &&
+      command.convergenceDeadlineAtMilliseconds >= command.startedAtMilliseconds &&
+      command.convergenceDeadlineAtMilliseconds <= command.deadlineAtMilliseconds &&
+      std::count(command.canonicalClusterUUIDs.begin(), command.canonicalClusterUUIDs.end(),
+                 command.localClusterUUID) == 1 &&
+      std::all_of(command.canonicalClusterUUIDs.begin(), command.canonicalClusterUUIDs.end(),
+                  [](uint128_t clusterUUID) { return clusterUUID != 0; }) &&
+      command.canonicalClusterUUIDs[0] != command.canonicalClusterUUIDs[1] &&
+      command.canonicalClusterUUIDs[0] != command.canonicalClusterUUIDs[2] &&
+      command.canonicalClusterUUIDs[1] != command.canonicalClusterUUIDs[2] &&
+      ((command.row == uint8_t(ProdigyNametagQualificationRow::secondStreamHandoffFence) ||
+        command.row == uint8_t(ProdigyNametagQualificationRow::truthClaimPartition)) ?
+          (command.protocolVersion >= 5 && prodigyNametagQualificationApp6RoutesValid(command.app6Routes) &&
+           command.app6Routes[0].clusterUUID == command.localClusterUUID &&
+           (command.row != uint8_t(ProdigyNametagQualificationRow::truthClaimPartition) || command.app6Routes[0].cids.size() >= 6) &&
+           std::count(command.canonicalClusterUUIDs.begin(), command.canonicalClusterUUIDs.end(), command.app6Routes[0].clusterUUID) == 1 &&
+           std::count(command.canonicalClusterUUIDs.begin(), command.canonicalClusterUUIDs.end(), command.app6Routes[1].clusterUUID) == 1) :
+          command.app6Routes.empty()) &&
+      (((command.row == uint8_t(ProdigyNametagQualificationRow::secondTruthWriterFencing) ||
+         command.row == uint8_t(ProdigyNametagQualificationRow::mothershipRestartResume) || cousinRow ||
+         prodigyNametagQualificationPathRow(command.row) || prodigyNametagQualificationSeedReadbackRow(command.row) ||
+         command.row == uint8_t(ProdigyNametagQualificationRow::truthClaimPartition) ||
+         command.row == uint8_t(ProdigyNametagQualificationRow::localWriterIsolation)) &&
+        command.direction == 2) ?
+          (command.priorInjectionRunUUID == command.runUUID &&
+           prodigyIsSHA256HexDigest(command.priorInjectionReceiptDigest)) :
+          (command.priorInjectionRunUUID == 0 && command.priorInjectionReceiptDigest.empty()));
+}
+
+// This joins a fresh five-store read to an independently persisted native
+// fault witness. It is never evidence of a reboot or seed fault by itself.
+static inline bool prodigyNametagQualificationSeedReadbackReceiptMatchesCommand(
+    const ProdigyNametagQualificationApplicationCommand& command,
+    const ProdigyNametagQualificationApplicationReceipt& receipt)
+{
+  return prodigyNametagQualificationApplicationCommandValid(command) &&
+      command.protocolVersion == ProdigyNametagQualificationApplicationCommand::seedReadbackVersion &&
+      prodigyNametagQualificationApplicationReceiptValid(receipt) &&
+      receipt.protocolVersion == ProdigyNametagQualificationApplicationReceipt::seedReadbackVersion &&
+      receipt.runUUID == command.runUUID && receipt.row == command.row && receipt.direction == command.direction &&
+      receipt.executionGeneration == command.executionGeneration && receipt.rowID == command.rowID &&
+      prodigyNametagQualificationDescriptorEqual(receipt.descriptor, command.descriptor) &&
+      receipt.localClusterUUID == command.localClusterUUID && receipt.deploymentID == command.deploymentID &&
+      receipt.startedAtMilliseconds == command.startedAtMilliseconds && receipt.deadlineAtMilliseconds == command.deadlineAtMilliseconds &&
+      receipt.convergenceDeadlineAtMilliseconds == command.convergenceDeadlineAtMilliseconds &&
+      receipt.seedControlWitnessDigest == command.seedControlWitnessDigest &&
+      receipt.seedBaselineReadbackSHA256 == command.seedBaselineReadbackSHA256;
+}
+
+// App11 reports only its own local work or convergence observation. Native
+// transport evidence is authenticated and joined independently.
+static inline bool prodigyNametagQualificationReplayReceiptMatchesCommand(
+    const ProdigyNametagQualificationApplicationCommand& command,
+    const ProdigyNametagQualificationApplicationReceipt& receipt)
+{
+  return prodigyNametagQualificationApplicationCommandValid(command) &&
+      command.protocolVersion == ProdigyNametagQualificationApplicationCommand::replayStageVersion &&
+      prodigyNametagQualificationApplicationReceiptValid(receipt) &&
+      receipt.protocolVersion == ProdigyNametagQualificationApplicationReceipt::replayStageVersion &&
+      receipt.runUUID == command.runUUID && receipt.row == command.row && receipt.direction == command.direction &&
+      receipt.executionGeneration == command.executionGeneration && receipt.rowID == command.rowID &&
+      prodigyNametagQualificationDescriptorEqual(receipt.descriptor, command.descriptor) &&
+      receipt.localClusterUUID == command.localClusterUUID && receipt.deploymentID == command.deploymentID &&
+      receipt.startedAtMilliseconds == command.startedAtMilliseconds && receipt.deadlineAtMilliseconds == command.deadlineAtMilliseconds &&
+      receipt.convergenceDeadlineAtMilliseconds == command.convergenceDeadlineAtMilliseconds && receipt.replayStage == command.replayStage;
+}
+
+static inline bool prodigyNametagQualificationCousinReceiptMatchesCommand(
+    const ProdigyNametagQualificationApplicationCommand& command,
+    const ProdigyNametagQualificationApplicationReceipt& receipt)
+{
+  return prodigyNametagQualificationApplicationCommandValid(command) &&
+      command.protocolVersion == ProdigyNametagQualificationApplicationCommand::cousinStageVersion &&
+      prodigyNametagQualificationApplicationReceiptValid(receipt) &&
+      receipt.protocolVersion == ProdigyNametagQualificationApplicationReceipt::cousinStageVersion &&
+      receipt.runUUID == command.runUUID && receipt.row == command.row && receipt.direction == command.direction &&
+      receipt.executionGeneration == command.executionGeneration && receipt.rowID == command.rowID &&
+      prodigyNametagQualificationDescriptorEqual(receipt.descriptor, command.descriptor) &&
+      receipt.localClusterUUID == command.localClusterUUID && receipt.deploymentID == command.deploymentID &&
+      receipt.startedAtMilliseconds == command.startedAtMilliseconds && receipt.deadlineAtMilliseconds == command.deadlineAtMilliseconds &&
+      receipt.convergenceDeadlineAtMilliseconds == command.convergenceDeadlineAtMilliseconds &&
+      receipt.cousinStage == command.cousinStage && receipt.cousinSessions.empty();
+}
+
+static inline bool prodigyNametagQualificationWriterReceiptMatchesCommand(
+    const ProdigyNametagQualificationApplicationCommand& command,
+    const ProdigyNametagQualificationApplicationReceipt& receipt)
+{
+  return prodigyNametagQualificationApplicationCommandValid(command) &&
+      command.protocolVersion == ProdigyNametagQualificationApplicationCommand::writerStageVersion &&
+      prodigyNametagQualificationApplicationReceiptValid(receipt) &&
+      receipt.protocolVersion == ProdigyNametagQualificationApplicationReceipt::writerStageVersion &&
+      receipt.runUUID == command.runUUID && receipt.row == command.row && receipt.direction == command.direction &&
+      receipt.executionGeneration == command.executionGeneration && receipt.rowID == command.rowID &&
+      prodigyNametagQualificationDescriptorEqual(receipt.descriptor, command.descriptor) &&
+      receipt.localClusterUUID == command.localClusterUUID && receipt.deploymentID == command.deploymentID &&
+      receipt.startedAtMilliseconds == command.startedAtMilliseconds && receipt.deadlineAtMilliseconds == command.deadlineAtMilliseconds &&
+      receipt.convergenceDeadlineAtMilliseconds == command.convergenceDeadlineAtMilliseconds &&
+      receipt.writerStage == command.writerStage && receipt.writerChallengeUUID == command.writerIsolation.challengeUUID;
+}
+
+static inline bool prodigyNametagQualificationRestartReceiptMatchesCommand(
+    const ProdigyNametagQualificationApplicationCommand& command,
+    const ProdigyNametagQualificationApplicationReceipt& receipt)
+{
+  return prodigyNametagQualificationApplicationCommandValid(command) &&
+      command.protocolVersion == ProdigyNametagQualificationApplicationCommand::restartStageVersion &&
+      prodigyNametagQualificationApplicationReceiptValid(receipt) &&
+      receipt.protocolVersion == ProdigyNametagQualificationApplicationReceipt::restartStageVersion &&
+      receipt.runUUID == command.runUUID && receipt.row == command.row && receipt.direction == command.direction &&
+      receipt.executionGeneration == command.executionGeneration && receipt.rowID == command.rowID &&
+      prodigyNametagQualificationDescriptorEqual(receipt.descriptor, command.descriptor) &&
+      receipt.localClusterUUID == command.localClusterUUID && receipt.deploymentID == command.deploymentID &&
+      receipt.startedAtMilliseconds == command.startedAtMilliseconds && receipt.deadlineAtMilliseconds == command.deadlineAtMilliseconds &&
+      receipt.convergenceDeadlineAtMilliseconds == command.convergenceDeadlineAtMilliseconds &&
+      receipt.restartStage == command.restartStage && receipt.cousinSessions.empty();
+}
+
+static inline bool prodigyNametagQualificationPathReceiptMatchesCommand(
+    const ProdigyNametagQualificationApplicationCommand& command,
+    const ProdigyNametagQualificationApplicationReceipt& receipt)
+{
+  return prodigyNametagQualificationApplicationCommandValid(command) &&
+      command.protocolVersion == ProdigyNametagQualificationApplicationCommand::pathStageVersion &&
+      prodigyNametagQualificationApplicationReceiptValid(receipt) &&
+      receipt.protocolVersion == ProdigyNametagQualificationApplicationReceipt::pathStageVersion &&
+      receipt.runUUID == command.runUUID && receipt.row == command.row && receipt.direction == command.direction &&
+      receipt.executionGeneration == command.executionGeneration && receipt.rowID == command.rowID &&
+      prodigyNametagQualificationDescriptorEqual(receipt.descriptor, command.descriptor) &&
+      receipt.localClusterUUID == command.localClusterUUID && receipt.deploymentID == command.deploymentID &&
+      receipt.startedAtMilliseconds == command.startedAtMilliseconds && receipt.deadlineAtMilliseconds == command.deadlineAtMilliseconds &&
+      receipt.convergenceDeadlineAtMilliseconds == command.convergenceDeadlineAtMilliseconds &&
+      receipt.pathStage == command.pathStage && receipt.pathBatch == command.pathBatch &&
+      receipt.pathFaultExpiresAtMilliseconds == command.pathFaultExpiresAtMilliseconds;
+}
+
+static inline bool prodigyNametagQualificationClaimReceiptMatchesCommand(
+    const ProdigyNametagQualificationApplicationCommand& command,
+    const ProdigyNametagQualificationApplicationReceipt& receipt)
+{
+  return prodigyNametagQualificationApplicationCommandValid(command) &&
+      command.protocolVersion == ProdigyNametagQualificationApplicationCommand::claimStageVersion &&
+      prodigyNametagQualificationApplicationReceiptValid(receipt) &&
+      receipt.protocolVersion == ProdigyNametagQualificationApplicationReceipt::claimStageVersion &&
+      receipt.runUUID == command.runUUID && receipt.row == command.row && receipt.direction == command.direction &&
+      receipt.executionGeneration == command.executionGeneration && receipt.rowID == command.rowID &&
+      prodigyNametagQualificationDescriptorEqual(receipt.descriptor, command.descriptor) &&
+      receipt.localClusterUUID == command.localClusterUUID && receipt.deploymentID == command.deploymentID &&
+      receipt.startedAtMilliseconds == command.startedAtMilliseconds && receipt.deadlineAtMilliseconds == command.deadlineAtMilliseconds &&
+      receipt.convergenceDeadlineAtMilliseconds == command.convergenceDeadlineAtMilliseconds &&
+      receipt.claimStage == command.claimStage && receipt.claimFaultExpiresAtMilliseconds == command.claimFaultExpiresAtMilliseconds &&
+      receipt.claimWinnerSites == command.claimWinnerSites;
+}
+
+// The qualification probe and App6 exchange this bounded barrier through
+// their authenticated Neuron/Brain carriers. It never carries credentials.
+enum class ProdigyNametagHandoffBarrierAction : uint8_t { arm = 1, query = 2, release = 3 };
+class ProdigyNametagHandoffBarrier {
+public:
+  static constexpr uint32_t version = 1;
+  uint32_t protocolVersion = version;
+  ProdigyNametagHandoffBarrierAction action = ProdigyNametagHandoffBarrierAction::arm;
+  bool response = false, configured = false, paused = false, notificationHeld = false, released = false;
+  uint128_t runUUID = 0, nonce = 0, clusterUUID = 0;
+  uint8_t direction = 0;
+  uint64_t executionGeneration = 0, probeDeploymentID = 0, appDeploymentID = 0;
+  uint128_t probeContainerUUID = 0, appContainerUUID = 0;
+  uint64_t accountToken = 0, applicationGeneration = 0, registrationContext = 0, operationID = 0;
+  uint128_t applicationInstance = 0;
+  int64_t deadlineMilliseconds = 0;
+};
+template <typename S>
+static void serialize(S&& s, ProdigyNametagHandoffBarrier& v) {
+  s.value4b(v.protocolVersion); s.value1b(v.action); s.value1b(v.response);
+  s.value1b(v.configured); s.value1b(v.paused); s.value1b(v.notificationHeld); s.value1b(v.released);
+  s.value16b(v.runUUID); s.value16b(v.nonce); s.value16b(v.clusterUUID); s.value1b(v.direction);
+  s.value8b(v.executionGeneration); s.value8b(v.probeDeploymentID); s.value8b(v.appDeploymentID);
+  s.value16b(v.probeContainerUUID); s.value16b(v.appContainerUUID); s.value8b(v.accountToken);
+  s.value16b(v.applicationInstance); s.value8b(v.applicationGeneration); s.value8b(v.registrationContext);
+  s.value8b(v.operationID); s.value8b(v.deadlineMilliseconds);
+}
+static inline bool prodigyNametagHandoffBarrierValid(const ProdigyNametagHandoffBarrier& v) {
+  return v.protocolVersion == ProdigyNametagHandoffBarrier::version &&
+      uint8_t(v.action) >= 1 && uint8_t(v.action) <= 3 && v.runUUID && v.nonce && v.clusterUUID &&
+      (v.direction == 1 || v.direction == 2) && v.executionGeneration &&
+      ApplicationConfig::extractApplicationID(v.probeDeploymentID) == 11 &&
+      ((v.appDeploymentID == 0 && !v.response && v.action == ProdigyNametagHandoffBarrierAction::arm) ||
+       ApplicationConfig::extractApplicationID(v.appDeploymentID) == 6) &&
+      v.probeContainerUUID && v.appContainerUUID && v.accountToken && v.applicationInstance &&
+      v.appContainerUUID == v.applicationInstance &&
+      v.applicationGeneration && v.registrationContext && v.operationID && v.deadlineMilliseconds > 0 &&
+      (v.response || (!v.configured && !v.paused && !v.notificationHeld && !v.released)) &&
+      (!v.paused || v.configured) && (!v.notificationHeld || v.paused) && (!v.released || v.response);
+}
+
+// This is a single-site source-population control operation, not row eighteen
+// of the qualification matrix.  The App11 namespace is derived from the
+// operation and immutable manifest digest; the caller never supplies one.
+enum class ProdigyNametagSourceBaselineAction : uint8_t { execute = 1, query = 2 };
+class ProdigyNametagSourceBaselineCommand {
+public:
+  static constexpr uint32_t version = 1;
+  uint32_t protocolVersion = version;
+  ProdigyNametagSourceBaselineAction action = ProdigyNametagSourceBaselineAction::execute;
+  uint128_t operationUUID = 0, ewrClusterUUID = 0;
+  // The entire EWR input tuple is carried through the App11 operation.  This
+  // is deliberately independent of the later all-masters record: source
+  // population is the prerequisite that creates its source data.
+  uint64_t probeDeploymentID = 0, hotDeploymentID = 0, coldDeploymentID = 0;
+  uint64_t radarDeploymentID = 0, pulseDeploymentID = 0, truthDeploymentID = 0;
+  String fixtureManifestSHA256;
+  int64_t deadlineAtMilliseconds = 0;
+};
+template <typename S>
+static void serialize(S&& serializer, ProdigyNametagSourceBaselineCommand& value)
+{ serializer.value4b(value.protocolVersion); serializer.value1b(value.action); serializer.value16b(value.operationUUID);
+  serializer.value16b(value.ewrClusterUUID); serializer.value8b(value.probeDeploymentID);
+  serializer.value8b(value.hotDeploymentID); serializer.value8b(value.coldDeploymentID); serializer.value8b(value.radarDeploymentID);
+  serializer.value8b(value.pulseDeploymentID); serializer.value8b(value.truthDeploymentID);
+  serializer.text1b(value.fixtureManifestSHA256, 64); serializer.value8b(value.deadlineAtMilliseconds); }
+static inline bool prodigyNametagSourceBaselineCommandValid(const ProdigyNametagSourceBaselineCommand& value)
+{ return value.protocolVersion == ProdigyNametagSourceBaselineCommand::version &&
+      (value.action == ProdigyNametagSourceBaselineAction::execute || value.action == ProdigyNametagSourceBaselineAction::query) &&
+      value.operationUUID != 0 && value.ewrClusterUUID != 0 && value.probeDeploymentID != 0 &&
+      value.hotDeploymentID != 0 && value.coldDeploymentID != 0 && value.radarDeploymentID != 0 &&
+      value.pulseDeploymentID != 0 && value.truthDeploymentID != 0 &&
+      ApplicationConfig::extractApplicationID(value.probeDeploymentID) == 11 &&
+      ApplicationConfig::extractApplicationID(value.hotDeploymentID) == MeshRegistry::Hot::applicationID &&
+      ApplicationConfig::extractApplicationID(value.coldDeploymentID) == MeshRegistry::Cold::applicationID &&
+      ApplicationConfig::extractApplicationID(value.radarDeploymentID) == MeshRegistry::Radar::applicationID &&
+      ApplicationConfig::extractApplicationID(value.pulseDeploymentID) == MeshRegistry::Pulse::applicationID &&
+      ApplicationConfig::extractApplicationID(value.truthDeploymentID) == MeshRegistry::Truth::applicationID &&
+      prodigyIsSHA256HexDigest(value.fixtureManifestSHA256) && value.deadlineAtMilliseconds > 0; }
+
+class ProdigyNametagSourceBaselineStoreDigest {
+public:
+  uint16_t applicationID = 0;
+  uint32_t shardGroup = UINT32_MAX;
+  String digest;
+};
+template <typename S>
+static void serialize(S&& serializer, ProdigyNametagSourceBaselineStoreDigest& value)
+{ serializer.value2b(value.applicationID); serializer.value4b(value.shardGroup); serializer.text1b(value.digest, 64); }
+static inline bool prodigyNametagSourceBaselineStoreDigestsValid(
+    const Vector<ProdigyNametagSourceBaselineStoreDigest>& values)
+{
+  if (values.size() != 9) return false;
+  for (const auto& value : values) {
+    const bool expected = (value.applicationID == MeshRegistry::Hot::applicationID && value.shardGroup < 3) ||
+        (value.applicationID == MeshRegistry::Cold::applicationID && value.shardGroup < 3) ||
+        ((value.applicationID == MeshRegistry::Pulse::applicationID || value.applicationID == MeshRegistry::Radar::applicationID ||
+          value.applicationID == MeshRegistry::Truth::applicationID) && value.shardGroup == 0);
+    if (!expected || !prodigyIsSHA256HexDigest(value.digest)) return false;
+    for (const auto& prior : values)
+      if (&prior != &value && prior.applicationID == value.applicationID && prior.shardGroup == value.shardGroup) return false;
+  }
+  return true;
+}
+class ProdigyNametagSourceBaselineReceipt {
+public:
+  static constexpr uint32_t version = 1;
+  uint32_t protocolVersion = version;
+  uint128_t operationUUID = 0, ewrClusterUUID = 0, localContainerUUID = 0;
+  uint64_t probeDeploymentID = 0;
+  String fixtureManifestSHA256, canonicalReadbackDigest;
+  int64_t deadlineAtMilliseconds = 0, observedAtMilliseconds = 0;
+  Vector<ProdigyNametagSourceBaselineStoreDigest> storeDigests;
+};
+template <typename S>
+static void serialize(S&& serializer, ProdigyNametagSourceBaselineReceipt& value)
+{ serializer.value4b(value.protocolVersion); serializer.value16b(value.operationUUID); serializer.value16b(value.ewrClusterUUID);
+  serializer.value16b(value.localContainerUUID); serializer.value8b(value.probeDeploymentID);
+  serializer.text1b(value.fixtureManifestSHA256, 64); serializer.text1b(value.canonicalReadbackDigest, 64);
+  serializer.value8b(value.deadlineAtMilliseconds); serializer.value8b(value.observedAtMilliseconds);
+  serializer.container(value.storeDigests, 9); }
+static inline bool prodigyNametagSourceBaselineReceiptValid(const ProdigyNametagSourceBaselineReceipt& value)
+{ return value.protocolVersion == ProdigyNametagSourceBaselineReceipt::version && value.operationUUID != 0 &&
+      value.ewrClusterUUID != 0 && value.localContainerUUID != 0 && value.probeDeploymentID != 0 &&
+      ApplicationConfig::extractApplicationID(value.probeDeploymentID) == 11 &&
+      prodigyIsSHA256HexDigest(value.fixtureManifestSHA256) && prodigyIsSHA256HexDigest(value.canonicalReadbackDigest) &&
+      value.deadlineAtMilliseconds > 0 && value.observedAtMilliseconds > 0 &&
+      value.observedAtMilliseconds <= value.deadlineAtMilliseconds &&
+      prodigyNametagSourceBaselineStoreDigestsValid(value.storeDigests); }
+
+static inline bool prodigyNametagSourceBaselineReceiptEmpty(const ProdigyNametagSourceBaselineReceipt& value)
+{
+  return value.operationUUID == 0 && value.ewrClusterUUID == 0 && value.localContainerUUID == 0 &&
+      value.probeDeploymentID == 0 && value.fixtureManifestSHA256.empty() && value.canonicalReadbackDigest.empty() &&
+      value.deadlineAtMilliseconds == 0 && value.observedAtMilliseconds == 0 && value.storeDigests.empty();
+}
+
+// Execute and query differ only in the direction they travel.  The operation
+// tuple itself must match exactly at every replay/cache boundary.
+static inline bool prodigyNametagSourceBaselineCommandSameOperation(
+    const ProdigyNametagSourceBaselineCommand& left, const ProdigyNametagSourceBaselineCommand& right)
+{
+  return left.protocolVersion == right.protocolVersion && left.operationUUID == right.operationUUID &&
+      left.ewrClusterUUID == right.ewrClusterUUID && left.probeDeploymentID == right.probeDeploymentID &&
+      left.hotDeploymentID == right.hotDeploymentID && left.coldDeploymentID == right.coldDeploymentID &&
+      left.radarDeploymentID == right.radarDeploymentID && left.pulseDeploymentID == right.pulseDeploymentID &&
+      left.truthDeploymentID == right.truthDeploymentID && left.fixtureManifestSHA256 == right.fixtureManifestSHA256 &&
+      left.deadlineAtMilliseconds == right.deadlineAtMilliseconds;
+}
+
+// One topic and one payload serve both directions.  Direction is the role;
+// splitting command and receipt topics would create a second control plane.
+enum class ProdigyNametagSourceBaselineDirection : uint8_t { execute = 1, query = 2, receipt = 3 };
+class ProdigyNametagSourceBaselineEnvelope {
+public:
+  static constexpr uint32_t version = 1;
+  uint32_t protocolVersion = version;
+  ProdigyNametagSourceBaselineDirection direction = ProdigyNametagSourceBaselineDirection::execute;
+  ProdigyNametagSourceBaselineCommand command;
+  ProdigyNametagSourceBaselineReceipt receipt;
+};
+template <typename S>
+static void serialize(S&& serializer, ProdigyNametagSourceBaselineEnvelope& value)
+{ serializer.value4b(value.protocolVersion); serializer.value1b(value.direction); serializer.object(value.command); serializer.object(value.receipt); }
+static inline bool prodigyNametagSourceBaselineEnvelopeValid(const ProdigyNametagSourceBaselineEnvelope& value)
+{
+  if (value.protocolVersion != ProdigyNametagSourceBaselineEnvelope::version) return false;
+  if (value.direction == ProdigyNametagSourceBaselineDirection::execute)
+    return prodigyNametagSourceBaselineCommandValid(value.command) &&
+        value.command.action == ProdigyNametagSourceBaselineAction::execute &&
+        prodigyNametagSourceBaselineReceiptEmpty(value.receipt);
+  if (value.direction == ProdigyNametagSourceBaselineDirection::query)
+    return prodigyNametagSourceBaselineCommandValid(value.command) &&
+        value.command.action == ProdigyNametagSourceBaselineAction::query &&
+        prodigyNametagSourceBaselineReceiptEmpty(value.receipt);
+  return value.direction == ProdigyNametagSourceBaselineDirection::receipt &&
+      prodigyNametagSourceBaselineCommandValid(value.command) &&
+      prodigyNametagSourceBaselineReceiptValid(value.receipt) &&
+      value.receipt.operationUUID == value.command.operationUUID &&
+      value.receipt.ewrClusterUUID == value.command.ewrClusterUUID &&
+      value.receipt.probeDeploymentID == value.command.probeDeploymentID &&
+      value.receipt.fixtureManifestSHA256 == value.command.fixtureManifestSHA256 &&
+      value.receipt.deadlineAtMilliseconds == value.command.deadlineAtMilliseconds;
+}
+
+// A bounded, live projection of one stateful member.  This deliberately
+// references the existing COUSIN and data-authority evidence rather than
+// creating an admission/claim record for an observation endpoint.
+class DeploymentIdentityStatefulMember {
+public:
+  DeploymentIdentityStoreKind storeKind = DeploymentIdentityStoreKind::unknown;
+  uint32_t shardGroup = UINT32_MAX;
+  uint128_t replicaUUID = 0;
+  uint128_t clusterUUID = 0;
+  uint128_t machineUUID = 0;
+  uint128_t containerUUID = 0;
+  bool writable = false;
+  bool clientServing = false;
+  bool allMasters = false;
+  uint128_t siblingSessionUUID = 0;
+  uint64_t siblingSessionGeneration = 0;
+  bool siblingSessionHealthy = false;
+  uint128_t seededFromClusterUUID = 0;
+  uint128_t seededFromContainerUUID = 0;
+  String seedCatchupSHA256;
+  uint64_t seedCatchupGeneration = 0;
+  String replayWatermarkSHA256;
+  String catchupWatermarkSHA256;
+  // v4 DeploymentIdentityReport appends these direct native store values.
+  // Unlike the historic seed/catch-up fields, neither may be reconstructed
+  // from authority metadata by a coordinator.
+  String sourceContentWatermarkSHA256;
+  String sourceCatchupWatermarkSHA256;
+  // v5 carries the authenticated native receipt, not an inferred projection.
+  ProdigyStatefulStoreReceipt nativeSourceCutReceipt = {.protocolVersion = 0};
+};
+
+template <typename S>
+static void serialize(S&& serializer, DeploymentIdentityStatefulMember& member)
+{
+  serializer.value1b(member.storeKind); serializer.value4b(member.shardGroup);
+  serializer.value16b(member.replicaUUID); serializer.value16b(member.clusterUUID);
+  serializer.value16b(member.machineUUID); serializer.value16b(member.containerUUID);
+  serializer.value1b(member.writable); serializer.value1b(member.clientServing); serializer.value1b(member.allMasters);
+  serializer.value16b(member.siblingSessionUUID); serializer.value8b(member.siblingSessionGeneration);
+  serializer.value1b(member.siblingSessionHealthy); serializer.value16b(member.seededFromClusterUUID);
+  serializer.value16b(member.seededFromContainerUUID); serializer.text1b(member.seedCatchupSHA256, 64);
+  serializer.value8b(member.seedCatchupGeneration); serializer.text1b(member.replayWatermarkSHA256, 64);
+  serializer.text1b(member.catchupWatermarkSHA256, 64);
+}
+
+template <typename S>
+static void serializeDeploymentIdentityStatefulMemberV4(S&& serializer, DeploymentIdentityStatefulMember& member)
+{
+  serialize(serializer, member);
+  serializer.text1b(member.sourceContentWatermarkSHA256, 64);
+  serializer.text1b(member.sourceCatchupWatermarkSHA256, 64);
+}
+
+// app6's persistent Truth mesh observation.  Each entry is emitted by the
+// existing Neuron/application report path after an authenticated reconnect;
+// it is intentionally not a credential or session claim.
+class DeploymentIdentityApp6TruthMeshReceipt {
+public:
+  uint128_t localClusterUUID = 0;
+  uint128_t remoteClusterUUID = 0;
+  uint128_t truthWriterContainerUUID = 0;
+  uint128_t sessionUUID = 0;
+  uint64_t commandGeneration = 0;
+  uint64_t reconnectGeneration = 0;
+  String lastSuccessfulRequestWatermarkSHA256;
+  uint128_t reverseCarrierUUID = 0;
+  bool healthy = false;
+  uint128_t localApplicationContainerUUID = 0;
+  uint128_t routeUUID = 0;
+  uint64_t routeGeneration = 0;
+  uint8_t observationVersion = 1;
+};
+
+template <typename S>
+static void serialize(S&& serializer, DeploymentIdentityApp6TruthMeshReceipt& receipt)
+{
+  serializer.value16b(receipt.localClusterUUID); serializer.value16b(receipt.remoteClusterUUID);
+  serializer.value16b(receipt.truthWriterContainerUUID); serializer.value16b(receipt.sessionUUID);
+  serializer.value8b(receipt.commandGeneration); serializer.value8b(receipt.reconnectGeneration);
+  serializer.text1b(receipt.lastSuccessfulRequestWatermarkSHA256, 64); serializer.value16b(receipt.reverseCarrierUUID);
+  serializer.value1b(receipt.healthy);
+}
+
 // Read-only, versioned observed deployment identity.  It is not a durable
 // admission receipt: it describes the current live or persisted authority
 // view, and a coordinator must not infer a launch or retirement authorization
@@ -5194,7 +7388,28 @@ public:
   uint16_t observedEndpointPort = 0;
   uint128_t observedEndpointMachineUUID = 0;
   bool profileEligible = false;
+  uint32_t selectedShardGroup = UINT32_MAX;
+  uint32_t nShardGroups = 0;
+  bool statefulCohortReady = false;
+  String normalizedDeploymentPlan;
+  Vector<ProdigyStatefulServingAuthorityMember> statefulCohort;
+  // ContainerPlan is defined below; these are its existing private runtime
+  // record bytes, not another plan codec. Only the authenticated observer sees
+  // them, and the canonical serving owner computes each matching digest.
+  Vector<String> statefulCohortRuntimeStates;
+  String statefulCohortFailure;
+  // v3: exact, per-replica stateful evidence. v4 appends authenticated native
+  // source-boundary values. The cap covers the largest
+  // supported deployment observation while keeping a hostile pull bounded.
+  Vector<DeploymentIdentityStatefulMember> statefulRuntimeCohort;
+  bool statefulRuntimeCohortConverged = false;
+  Vector<DeploymentIdentityApp6TruthMeshReceipt> app6TruthMeshReceipts;
 };
+
+// Supported versions are additive; consumers still enforce the minimum
+// version containing the fields on which their specific decision depends.
+static inline bool prodigyDeploymentIdentityReportVersionSupported(uint32_t version, uint32_t minimum = 1)
+{ return minimum >= 1 && minimum <= 6 && version >= minimum && version <= 6; }
 
 template <typename S>
 static void serialize(S&& serializer, DeploymentIdentityReport& report)
@@ -5224,6 +7439,29 @@ static void serialize(S&& serializer, DeploymentIdentityReport& report)
   serializer.value2b(report.observedEndpointPort);
   serializer.value16b(report.observedEndpointMachineUUID);
   serializer.value1b(report.profileEligible);
+  if (report.version >= 2) {
+    serializer.value4b(report.selectedShardGroup); serializer.value4b(report.nShardGroups);
+    serializer.value1b(report.statefulCohortReady); serializer.text1b(report.normalizedDeploymentPlan, 1024 * 1024);
+    serializer.container(report.statefulCohort, 3);
+    serializer.container(report.statefulCohortRuntimeStates, 3, [](auto& nested, String& bytes) { nested.text1b(bytes, 1024 * 1024); });
+    serializer.text1b(report.statefulCohortFailure, 1024);
+  }
+  if (report.version >= 3) {
+    serializer.container(report.statefulRuntimeCohort, 64, [&](auto& nested, DeploymentIdentityStatefulMember& member) {
+      if (report.version >= 4) serializeDeploymentIdentityStatefulMemberV4(nested, member);
+      else serialize(nested, member);
+      if (report.version >= 5) nested.object(member.nativeSourceCutReceipt);
+    });
+    serializer.value1b(report.statefulRuntimeCohortConverged);
+    serializer.container(report.app6TruthMeshReceipts, 3, [&](auto& nested, DeploymentIdentityApp6TruthMeshReceipt& receipt) {
+      serialize(nested, receipt);
+      if (report.version >= 6) {
+        nested.value1b(receipt.observationVersion);
+        nested.value16b(receipt.localApplicationContainerUUID);
+        nested.value16b(receipt.routeUUID); nested.value8b(receipt.routeGeneration);
+      }
+    });
+  }
 }
 
 template <typename S>
@@ -6006,6 +8244,21 @@ static inline void prodigyStripMachineHardwareCapturesForClusterReport(MachineHa
   {
     gpu.captures.clear();
   }
+}
+
+static inline void prodigyStripMachineHardwareCapturesForBrainTransport(MachineHardwareProfile& hardware)
+{
+  Vector<MachineToolCapture> kernelIPv6Routes = {};
+  for (const MachineToolCapture& capture : hardware.network.captures)
+  {
+    if (capture.tool.equal("ip"_ctv) && capture.phase.equal("route-show-ipv6"_ctv) && capture.succeeded)
+    {
+      kernelIPv6Routes.push_back(capture);
+    }
+  }
+
+  prodigyStripMachineHardwareCapturesForClusterReport(hardware);
+  hardware.network.captures = std::move(kernelIPv6Routes);
 }
 
 static inline void prodigyStripMachineHardwareCapturesFromClusterTopology(ClusterTopology& topology)
@@ -8435,6 +10688,79 @@ static inline bool prodigyStatelessDeploymentAdmissionsValid(
   return true;
 }
 
+// Immutable proof that a completed stateless successor retired one exact
+// admitted predecessor. Plans and admission receipts remain independently owned.
+class ProdigyStatelessDeploymentRetirement {
+public:
+  uint64_t predecessorDeploymentID = 0;
+  uint64_t successorDeploymentID = 0;
+  String predecessorPlanSHA256;
+  String successorPlanSHA256;
+  uint64_t completedAuthorityGeneration = 0;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyStatelessDeploymentRetirement& retirement)
+{
+  serializer.value8b(retirement.predecessorDeploymentID);
+  serializer.value8b(retirement.successorDeploymentID);
+  serializer.text1b(retirement.predecessorPlanSHA256, 64);
+  serializer.text1b(retirement.successorPlanSHA256, 64);
+  serializer.value8b(retirement.completedAuthorityGeneration);
+}
+
+static inline bool prodigyStatelessDeploymentRetirementsEqual(
+    const Vector<ProdigyStatelessDeploymentRetirement>& a,
+    const Vector<ProdigyStatelessDeploymentRetirement>& b)
+{
+  if (a.size() != b.size()) return false;
+  for (uint32_t i = 0; i < a.size(); ++i)
+    if (a[i].predecessorDeploymentID != b[i].predecessorDeploymentID ||
+        a[i].successorDeploymentID != b[i].successorDeploymentID ||
+        !a[i].predecessorPlanSHA256.equals(b[i].predecessorPlanSHA256) ||
+        !a[i].successorPlanSHA256.equals(b[i].successorPlanSHA256) ||
+        a[i].completedAuthorityGeneration != b[i].completedAuthorityGeneration) return false;
+  return true;
+}
+
+// The predecessor must be bound to its immutable admission. A successor
+// without an admission is legal; its exact plan must be checked by the Brain
+// against the authoritative plan store before accepting the transition.
+static inline bool prodigyStatelessDeploymentRetirementsValid(
+    const Vector<ProdigyStatelessDeploymentRetirement>& retirements,
+    const Vector<ProdigyStatelessDeploymentAdmission>& admissions, uint64_t generation)
+{
+  if (retirements.size() > 4096) return false;
+  for (uint32_t i = 0; i < retirements.size(); ++i)
+  {
+    const auto& r = retirements[i];
+    const uint16_t app = ApplicationConfig::extractApplicationID(r.predecessorDeploymentID);
+    if (!r.predecessorDeploymentID || !r.successorDeploymentID ||
+        r.successorDeploymentID <= r.predecessorDeploymentID || !app ||
+        app != ApplicationConfig::extractApplicationID(r.successorDeploymentID) ||
+        !prodigyIsSHA256HexDigest(r.predecessorPlanSHA256) ||
+        !prodigyIsSHA256HexDigest(r.successorPlanSHA256) ||
+        !r.completedAuthorityGeneration || r.completedAuthorityGeneration > generation) return false;
+    bool predecessorFound = false;
+    for (const auto& admission : admissions)
+    {
+      if (admission.deploymentID == r.predecessorDeploymentID)
+      {
+        if (predecessorFound || !admission.normalizedPlanSHA256.equals(r.predecessorPlanSHA256) ||
+            admission.acceptedAuthorityGeneration >= r.completedAuthorityGeneration) return false;
+        predecessorFound = true;
+      }
+      if (admission.deploymentID == r.successorDeploymentID &&
+          (!admission.normalizedPlanSHA256.equals(r.successorPlanSHA256) ||
+           admission.acceptedAuthorityGeneration >= r.completedAuthorityGeneration)) return false;
+    }
+    if (!predecessorFound) return false;
+    for (uint32_t earlier = 0; earlier < i; ++earlier)
+      if (retirements[earlier].predecessorDeploymentID == r.predecessorDeploymentID) return false;
+  }
+  return true;
+}
+
 class ProdigyStatelessDeploymentAdmissionRequest {
 public:
   uint8_t version = 1;
@@ -8609,6 +10935,450 @@ static inline bool prodigyCousinRoutesEqual(const Vector<CousinRouteRecord>& lhs
   return true;
 }
 
+enum class CrossClusterMasqueGatewayState : uint8_t { active = 1, withdrawn = 2 };
+enum class CrossClusterMasqueGatewayRole : uint8_t { listener = 1, connector = 2 };
+
+static inline IPPrefix prodigyContainerDatacenterSitePrefix(uint8_t datacenterFragment)
+{
+  IPPrefix prefix = {};
+  static constexpr uint8_t containerNetworkPrefix[11] = CONTAINER_NETWORK_SUBNET6;
+  std::memcpy(prefix.network.v6, containerNetworkPrefix, sizeof(containerNetworkPrefix));
+  prefix.network.v6[11] = datacenterFragment;
+  prefix.network.is6 = true;
+  prefix.cidr = 96;
+  return prefix;
+}
+
+static inline bool prodigyContainerDatacenterSitePrefixValid(const IPPrefix& prefix, uint8_t datacenterFragment)
+{
+  return datacenterFragment != 0 && prefix.network.is6 && prefix.cidr == 96 &&
+      prefix.equals(prefix.canonicalized()) && prefix.equals(prodigyContainerDatacenterSitePrefix(datacenterFragment));
+}
+
+class CrossClusterMasqueGatewayAuthority {
+public:
+  static constexpr uint32_t version = 3;
+  uint32_t protocolVersion = version;
+  uint128_t pairUUID = 0, pairOperationUUID = 0;
+  uint128_t localClusterUUID = 0, peerClusterUUID = 0;
+  uint128_t localMachineUUID = 0, peerMachineUUID = 0;
+  uint8_t localDatacenterFragment = 0, peerDatacenterFragment = 0;
+  IPPrefix localSitePrefix = {}, peerSitePrefix = {};
+  String artifactSHA256, localIdentitySHA256, peerIdentitySHA256, peerTrustSHA256;
+  uint64_t artifactBytes = 0, generation = 0, pairAuthorityGeneration = 0, keyGeneration = 0;
+  IPAddress listenerPublicUDPEndpoint = {};
+  uint16_t listenerPublicUDPPort = 0;
+  // Mothership-derived private BGP tuple.  None of these are CLI-selected:
+  // the /127 is deterministic for the enrolled pair/slot and the credential
+  // reference is minted by the credential owner for this key generation.
+  // gatewaySlot identifies the durable local host slot; tunnelSlot identifies
+  // one path within a site pair.  A host can therefore carry one authority to
+  // each remote site without sharing a BGP interface.
+  uint8_t tunnelSlot = 0;
+  String privateTunnelInterface;
+  IPAddress privateTunnelLocalIPv6 = {}, privateTunnelPeerIPv6 = {};
+  uint16_t privateLocalASN = 0, privatePeerASN = 0;
+  uint32_t privateLocalBGPID = 0, privatePeerBGPID = 0;
+  String privateSessionCredentialSHA256;
+  CrossClusterMasqueGatewayRole localRole = CrossClusterMasqueGatewayRole::listener;
+  CrossClusterMasqueGatewayState state = CrossClusterMasqueGatewayState::active;
+  uint8_t gatewaySlot = 0;
+};
+template <typename S> static void serialize(S&& s, CrossClusterMasqueGatewayAuthority& r) {
+  s.value4b(r.protocolVersion); s.value16b(r.pairUUID); s.value16b(r.pairOperationUUID); s.value16b(r.localClusterUUID); s.value16b(r.peerClusterUUID); s.value16b(r.localMachineUUID); s.value16b(r.peerMachineUUID);
+  s.value1b(r.localDatacenterFragment); s.value1b(r.peerDatacenterFragment); s.object(r.localSitePrefix); s.object(r.peerSitePrefix); s.text1b(r.artifactSHA256, 64); s.value8b(r.artifactBytes); s.object(r.listenerPublicUDPEndpoint); s.value2b(r.listenerPublicUDPPort); s.value1b(r.tunnelSlot); s.text1b(r.privateTunnelInterface, 15); s.object(r.privateTunnelLocalIPv6); s.object(r.privateTunnelPeerIPv6); s.value2b(r.privateLocalASN); s.value2b(r.privatePeerASN); s.value4b(r.privateLocalBGPID); s.value4b(r.privatePeerBGPID); s.text1b(r.privateSessionCredentialSHA256, 64); s.text1b(r.localIdentitySHA256, 64); s.text1b(r.peerIdentitySHA256, 64); s.text1b(r.peerTrustSHA256, 64); s.value8b(r.generation); s.value8b(r.pairAuthorityGeneration); s.value8b(r.keyGeneration); s.value1b(r.localRole); s.value1b(r.state);
+  // Version three append: old records cannot silently acquire a host slot.
+  s.value1b(r.gatewaySlot);
+}
+
+enum class ProdigyCrossClusterPathFaultDirection : uint8_t { localToPeer = 1, peerToLocal = 2 };
+enum class ProdigyCrossClusterPathFaultGatewayLifecyclePhase : uint8_t { prepared = 1, suspended = 2, restored = 3, restoreNeeded = 4 };
+class ProdigyCrossClusterPathFaultRequest { public: static constexpr uint32_t version = 1; static constexpr uint32_t leaseVersion = 2; uint32_t protocolVersion = version; uint128_t operationUUID = 0; CrossClusterMasqueGatewayAuthority authority; ProdigyCrossClusterPathFaultDirection direction = ProdigyCrossClusterPathFaultDirection::localToPeer; ProdigyPairPrivateBGPSecretScope scope; String flowIdentity; uint64_t expiresAtMilliseconds = 0; };
+template <typename S> static void serialize(S&& s, ProdigyCrossClusterPathFaultRequest& value) { s.value4b(value.protocolVersion); s.value16b(value.operationUUID); s.object(value.authority); s.value1b(value.direction); s.object(value.scope); s.text1b(value.flowIdentity, 256); if (value.protocolVersion >= ProdigyCrossClusterPathFaultRequest::leaseVersion) s.value8b(value.expiresAtMilliseconds); }
+class ProdigyCrossClusterPathFaultGatewayLifecycleRecord { public: static constexpr uint32_t version = 1; uint32_t protocolVersion = version; ProdigyCrossClusterPathFaultRequest request; SystemContainerRuntimePlan admittedPlan; uint128_t retiringContainerUUID = 0; uint128_t replacementContainerUUID = 0; uint64_t admittedLaunchGeneration = 0; ProdigyCrossClusterPathFaultGatewayLifecyclePhase phase = ProdigyCrossClusterPathFaultGatewayLifecyclePhase::prepared; };
+template <typename S> static void serialize(S&& s, ProdigyCrossClusterPathFaultGatewayLifecycleRecord& value) { s.value4b(value.protocolVersion); s.object(value.request); s.object(value.admittedPlan); s.value16b(value.retiringContainerUUID); s.value16b(value.replacementContainerUUID); s.value8b(value.admittedLaunchGeneration); s.value1b(value.phase); }
+
+// Ephemeral readiness is carried independently of the durable gateway
+// authority.  It lives with the authority schema because Brain and Neuron
+// both retain the same receipt, while route helpers merely consume it.
+class ProdigyCrossClusterMasqueGatewayReadiness {
+public:
+  uint128_t pairUUID = 0;
+  uint128_t localClusterUUID = 0;
+  uint128_t localMachineUUID = 0;
+  uint64_t keyEpoch = 0;
+  uint64_t authorityGeneration = 0;
+  uint64_t gatewayGeneration = 0;
+  bool authenticatedMasqueQUICReady = false;
+};
+
+template <typename S> static void serialize(S&& s, ProdigyCrossClusterMasqueGatewayReadiness& r) {
+  s.value16b(r.pairUUID); s.value16b(r.localClusterUUID); s.value16b(r.localMachineUUID);
+  s.value8b(r.keyEpoch); s.value8b(r.authorityGeneration); s.value8b(r.gatewayGeneration);
+  s.value1b(r.authenticatedMasqueQUICReady);
+}
+
+static inline bool prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(const CrossClusterMasqueGatewayAuthority& a)
+{
+  return a.protocolVersion == CrossClusterMasqueGatewayAuthority::version && a.pairUUID != 0 && a.pairOperationUUID != 0 &&
+      a.localClusterUUID != 0 && a.peerClusterUUID != 0 && a.localClusterUUID != a.peerClusterUUID &&
+      a.localMachineUUID != 0 && a.peerMachineUUID != 0 && a.localMachineUUID != a.peerMachineUUID &&
+      a.localDatacenterFragment != 0 && a.peerDatacenterFragment != 0 && a.localDatacenterFragment != a.peerDatacenterFragment &&
+      prodigyContainerDatacenterSitePrefixValid(a.localSitePrefix, a.localDatacenterFragment) &&
+      prodigyContainerDatacenterSitePrefixValid(a.peerSitePrefix, a.peerDatacenterFragment) && !a.localSitePrefix.equals(a.peerSitePrefix) &&
+      prodigyIsSHA256HexDigest(a.artifactSHA256) && a.artifactBytes != 0 && !a.listenerPublicUDPEndpoint.isNull() && a.listenerPublicUDPPort != 0 &&
+      a.tunnelSlot < 3 && a.gatewaySlot < 3 && a.privateTunnelInterface.size() != 0 && a.privateTunnelInterface.size() <= 15 &&
+      a.privateTunnelLocalIPv6.is6 && a.privateTunnelPeerIPv6.is6 && !a.privateTunnelLocalIPv6.isNull() && !a.privateTunnelPeerIPv6.isNull() && !a.privateTunnelLocalIPv6.equals(a.privateTunnelPeerIPv6) &&
+      a.privateLocalASN != 0 && a.privatePeerASN != 0 && a.privateLocalBGPID != 0 && a.privatePeerBGPID != 0 && prodigyIsSHA256HexDigest(a.privateSessionCredentialSHA256) &&
+      prodigyIsSHA256HexDigest(a.localIdentitySHA256) && prodigyIsSHA256HexDigest(a.peerIdentitySHA256) &&
+      prodigyIsSHA256HexDigest(a.peerTrustSHA256) && a.generation != 0 && a.pairAuthorityGeneration != 0 && a.keyGeneration != 0 &&
+      (a.localRole == CrossClusterMasqueGatewayRole::listener || a.localRole == CrossClusterMasqueGatewayRole::connector) &&
+      (a.state == CrossClusterMasqueGatewayState::active || a.state == CrossClusterMasqueGatewayState::withdrawn);
+}
+
+// Derive the non-secret private BGP tuple from the immutable pair and selected
+// host identities. Registry owns credential minting; Brain and Neuron use this
+// same derivation only to reject an authority that claims a peer replacement
+// without the tuple that follows from that peer.
+static inline bool prodigyDeriveCrossClusterMasquePrivateBGPTuple(
+    CrossClusterMasqueGatewayAuthority& authority)
+{
+  if (authority.pairUUID == 0 || authority.localMachineUUID == 0 || authority.peerMachineUUID == 0 ||
+      authority.localMachineUUID == authority.peerMachineUUID || authority.keyGeneration == 0 ||
+      authority.gatewaySlot >= 3 || authority.tunnelSlot >= 3) return false;
+  const uint128_t orderedLow = std::min(authority.localMachineUUID, authority.peerMachineUUID);
+  const uint128_t orderedHigh = std::max(authority.localMachineUUID, authority.peerMachineUUID);
+  String interfaceScope = {}, interfaceHash = {}, slot = {};
+  interfaceScope.assignItoh(authority.pairUUID); interfaceScope.append("/"_ctv);
+  slot.assignItoa(authority.tunnelSlot); interfaceScope.append(slot);
+  if (!prodigyComputeSHA256Hex(interfaceScope, interfaceHash)) return false;
+  // Pair-scoped and reciprocal. The full scope is hashed because a Linux
+  // interface name has a 15-byte limit; topology validation rejects any
+  // collision for a host which carries two pair-distinct paths.
+  authority.privateTunnelInterface.assign("mtbgp"_ctv);
+  authority.privateTunnelInterface.append(interfaceHash.substr(0, 10, Copy::no));
+  // fd5a:4d53 is reserved for authenticated MASQUE site links; a /127 is
+  // selected from the pair UUID and tunnelSlot. gatewaySlot identifies the
+  // durable local host while tunnelSlot identifies its path.
+  IPAddress first = {}, second = {};
+  first.is6 = second.is6 = true;
+  const uint64_t pair = uint64_t(authority.pairUUID);
+  first.v6[0] = second.v6[0] = 0xfd; first.v6[1] = second.v6[1] = 0x5a;
+  first.v6[2] = second.v6[2] = 0x4d; first.v6[3] = second.v6[3] = 0x53;
+  for (uint32_t i = 0; i < 8; ++i) first.v6[4 + i] = second.v6[4 + i] = uint8_t(pair >> ((7 - i) * 8));
+  first.v6[12] = second.v6[12] = authority.tunnelSlot;
+  first.v6[15] = 0; second.v6[15] = 1;
+  const bool localFirst = authority.localMachineUUID < authority.peerMachineUUID;
+  authority.privateTunnelLocalIPv6 = localFirst ? first : second;
+  authority.privateTunnelPeerIPv6 = localFirst ? second : first;
+  const uint16_t lowASN = uint16_t(42000 + (uint64_t(orderedLow) % 20000));
+  const uint16_t highASN = uint16_t(42000 + (uint64_t(orderedHigh) % 20000));
+  authority.privateLocalASN = localFirst ? lowASN : highASN;
+  authority.privatePeerASN = localFirst ? highASN : lowASN;
+  authority.privateLocalBGPID = uint32_t(uint64_t(authority.localMachineUUID)) | 1u;
+  authority.privatePeerBGPID = uint32_t(uint64_t(authority.peerMachineUUID)) | 1u;
+  // Credential material is deliberately not derivable from public IDs.
+  authority.privateSessionCredentialSHA256.clear();
+  return true;
+}
+
+static inline bool prodigyCrossClusterMasqueGatewayPrivateBGPTupleMatches(
+    const CrossClusterMasqueGatewayAuthority& authority)
+{
+  auto expected = authority;
+  if (!prodigyDeriveCrossClusterMasquePrivateBGPTuple(expected)) return false;
+  return authority.privateTunnelInterface == expected.privateTunnelInterface &&
+      authority.privateTunnelLocalIPv6.equals(expected.privateTunnelLocalIPv6) &&
+      authority.privateTunnelPeerIPv6.equals(expected.privateTunnelPeerIPv6) &&
+      authority.privateLocalASN == expected.privateLocalASN &&
+      authority.privatePeerASN == expected.privatePeerASN &&
+      authority.privateLocalBGPID == expected.privateLocalBGPID &&
+      authority.privatePeerBGPID == expected.privatePeerBGPID;
+}
+
+// The selected Neuron binds these launch-only fields directly from its current
+// committed authority after admitting the typed system-container plan. They do
+// not accept caller-rendered identity strings.
+static inline bool prodigyBindCrossClusterMasqueGatewayRuntimePlanAuthority(
+    SystemContainerRuntimePlan& plan, const CrossClusterMasqueGatewayAuthority& authority)
+{
+  if (plan.kind != SystemContainerKind::crossClusterMasqueGateway ||
+      !prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(authority) ||
+      authority.state != CrossClusterMasqueGatewayState::active)
+  {
+    return false;
+  }
+  plan.gatewayPairUUID = authority.pairUUID;
+  plan.gatewayLocalClusterUUID = authority.localClusterUUID;
+  plan.gatewayLocalMachineUUID = authority.localMachineUUID;
+  plan.gatewayKeyEpoch = authority.keyGeneration;
+  plan.gatewayAuthorityGeneration = authority.pairAuthorityGeneration;
+  plan.gatewayGeneration = authority.generation;
+  plan.gatewayTunnelInterface.assign(authority.privateTunnelInterface);
+  return true;
+}
+
+static inline bool prodigyCrossClusterMasqueGatewayRuntimePlanAuthorityConfigured(
+    const SystemContainerRuntimePlan& plan)
+{
+  return plan.kind == SystemContainerKind::crossClusterMasqueGateway &&
+      plan.gatewayPairUUID != 0 && plan.gatewayLocalClusterUUID != 0 &&
+      plan.gatewayLocalMachineUUID != 0 && plan.gatewayKeyEpoch != 0 &&
+      plan.gatewayAuthorityGeneration != 0 && plan.gatewayGeneration != 0 &&
+      plan.gatewayTunnelInterface.size() != 0 && plan.gatewayTunnelInterface.size() <= 15;
+}
+
+// Render numeric plan references only at the exec boundary. This keeps the
+// fields bounded. Rust's u128::from_str_radix(value, 16) consumes digits, not
+// the 0x-prefixed spelling used by Mothership's public CLI.
+static inline bool prodigyAppendCrossClusterMasqueGatewayAuthorityEnvironment(
+    const SystemContainerRuntimePlan& plan, Vector<String>& environment)
+{
+  if (!prodigyCrossClusterMasqueGatewayRuntimePlanAuthorityConfigured(plan)) return false;
+  auto append = [&environment](StringType auto&& key, const String& value) {
+    String assignment = {};
+    assignment.assign(key);
+    assignment.append(value);
+    environment.push_back(std::move(assignment));
+  };
+  String pairUUID = {}, localClusterUUID = {}, localMachineUUID = {};
+  String keyEpoch = {}, authorityGeneration = {}, gatewayGeneration = {};
+  pairUUID.assignItoh(plan.gatewayPairUUID);
+  localClusterUUID.assignItoh(plan.gatewayLocalClusterUUID);
+  localMachineUUID.assignItoh(plan.gatewayLocalMachineUUID);
+  keyEpoch.assignItoa(plan.gatewayKeyEpoch);
+  authorityGeneration.assignItoa(plan.gatewayAuthorityGeneration);
+  gatewayGeneration.assignItoa(plan.gatewayGeneration);
+  append("PRODIGY_MASQUE_PAIR_UUID="_ctv, pairUUID.substr(2, pairUUID.size() - 2, Copy::no));
+  append("PRODIGY_MASQUE_LOCAL_CLUSTER_UUID="_ctv, localClusterUUID.substr(2, localClusterUUID.size() - 2, Copy::no));
+  append("PRODIGY_MASQUE_LOCAL_MACHINE_UUID="_ctv, localMachineUUID.substr(2, localMachineUUID.size() - 2, Copy::no));
+  append("PRODIGY_MASQUE_KEY_EPOCH="_ctv, keyEpoch);
+  append("PRODIGY_MASQUE_AUTHORITY_GENERATION="_ctv, authorityGeneration);
+  append("PRODIGY_MASQUE_GATEWAY_GENERATION="_ctv, gatewayGeneration);
+  append("PRODIGY_MASQUE_TUN_INTERFACE="_ctv, plan.gatewayTunnelInterface);
+  return true;
+}
+static inline bool prodigyCrossClusterMasqueGatewayAuthorityScopeMatches(
+    const CrossClusterMasqueGatewayAuthority& a,
+    const CrossClusterMasqueGatewayAuthority& b,
+    bool allowCredentialRotation = false)
+{
+  return a.pairUUID == b.pairUUID && a.pairOperationUUID == b.pairOperationUUID &&
+      a.localClusterUUID == b.localClusterUUID && a.peerClusterUUID == b.peerClusterUUID &&
+      a.localMachineUUID == b.localMachineUUID && a.peerMachineUUID == b.peerMachineUUID &&
+      a.localDatacenterFragment == b.localDatacenterFragment &&
+      a.peerDatacenterFragment == b.peerDatacenterFragment &&
+      a.localSitePrefix.equals(b.localSitePrefix) && a.peerSitePrefix.equals(b.peerSitePrefix) &&
+      a.tunnelSlot == b.tunnelSlot && a.gatewaySlot == b.gatewaySlot && a.privateTunnelInterface == b.privateTunnelInterface &&
+      a.privateTunnelLocalIPv6.equals(b.privateTunnelLocalIPv6) && a.privateTunnelPeerIPv6.equals(b.privateTunnelPeerIPv6) &&
+      a.privateLocalASN == b.privateLocalASN && a.privatePeerASN == b.privatePeerASN &&
+      a.privateLocalBGPID == b.privateLocalBGPID && a.privatePeerBGPID == b.privatePeerBGPID &&
+      (allowCredentialRotation || a.privateSessionCredentialSHA256 == b.privateSessionCredentialSHA256) &&
+      a.localRole == b.localRole;
+}
+static inline bool prodigyCrossClusterMasqueGatewayAuthorityCanAdvance(
+    const CrossClusterMasqueGatewayAuthority& previous,
+    const CrossClusterMasqueGatewayAuthority& next)
+{
+  const bool reactivation = previous.state == CrossClusterMasqueGatewayState::withdrawn &&
+      next.state == CrossClusterMasqueGatewayState::active;
+  const bool peerReplacement = reactivation && previous.peerMachineUUID != next.peerMachineUUID &&
+      previous.pairUUID == next.pairUUID && previous.pairOperationUUID == next.pairOperationUUID &&
+      previous.localClusterUUID == next.localClusterUUID && previous.peerClusterUUID == next.peerClusterUUID &&
+      previous.localMachineUUID == next.localMachineUUID &&
+      previous.localDatacenterFragment == next.localDatacenterFragment &&
+      previous.peerDatacenterFragment == next.peerDatacenterFragment &&
+      previous.localSitePrefix.equals(next.localSitePrefix) && previous.peerSitePrefix.equals(next.peerSitePrefix) &&
+      previous.tunnelSlot == next.tunnelSlot && previous.gatewaySlot == next.gatewaySlot &&
+      previous.localRole == next.localRole &&
+      previous.pairAuthorityGeneration == next.pairAuthorityGeneration &&
+      previous.keyGeneration == next.keyGeneration &&
+      previous.privateSessionCredentialSHA256 != next.privateSessionCredentialSHA256 &&
+      prodigyCrossClusterMasqueGatewayPrivateBGPTupleMatches(next);
+  if (!prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(previous) ||
+      !prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(next) ||
+      (!prodigyCrossClusterMasqueGatewayAuthorityScopeMatches(previous, next, reactivation) && !peerReplacement) ||
+      (previous.state != CrossClusterMasqueGatewayState::active && !reactivation) ||
+      next.generation <= previous.generation ||
+      next.pairAuthorityGeneration < previous.pairAuthorityGeneration ||
+      next.keyGeneration < previous.keyGeneration)
+  {
+    return false;
+  }
+  return next.state == CrossClusterMasqueGatewayState::active ||
+      next.state == CrossClusterMasqueGatewayState::withdrawn;
+}
+static inline bool prodigyCrossClusterMasqueGatewayAuthoritiesValid(const Vector<CrossClusterMasqueGatewayAuthority>& records, uint128_t localClusterUUID)
+{
+  if (records.size() > ProdigyCrossClusterMasqueGatewayAuthorityMaximumRecords) return false;
+  uint128_t previousPair = 0, previousMachine = 0;
+  for (uint32_t i = 0; i < records.size(); ++i) {
+    const auto& r = records[i];
+    if (!prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(r) || (localClusterUUID != 0 && r.localClusterUUID != localClusterUUID) ||
+        (i != 0 && (r.pairUUID < previousPair || (r.pairUUID == previousPair && r.localMachineUUID <= previousMachine)))) return false;
+    previousPair = r.pairUUID; previousMachine = r.localMachineUUID;
+    // Withdrawal tombstones retain their exact generation and pair history,
+    // but no longer claim one of the two live gateway slots.  Brain keeps the
+    // process slot fenced until authenticated inventory or the terminal kill
+    // acknowledgement proves that the withdrawn runtime is absent.
+    if (r.state != CrossClusterMasqueGatewayState::active) continue;
+    uint32_t machineAuthorities = 0;
+    for (uint32_t other = 0; other < records.size(); ++other) {
+      if (other == i) continue;
+      const auto& candidate = records[other];
+      if (candidate.localMachineUUID != r.localMachineUUID ||
+          candidate.state != CrossClusterMasqueGatewayState::active) continue;
+      if (candidate.pairUUID == r.pairUUID || candidate.privateTunnelInterface == r.privateTunnelInterface) return false;
+      ++machineAuthorities;
+    }
+    if (machineAuthorities >= 2) return false;
+  }
+  return true;
+}
+static inline bool prodigyCrossClusterMasqueGatewayAuthoritiesEqual(const Vector<CrossClusterMasqueGatewayAuthority>& lhs, const Vector<CrossClusterMasqueGatewayAuthority>& rhs)
+{
+  if (lhs.size() != rhs.size()) return false;
+  for (uint32_t i = 0; i < lhs.size(); ++i) { String a, b; auto ac = lhs[i], bc = rhs[i]; BitseryEngine::serialize(a, ac); BitseryEngine::serialize(b, bc); if (a != b) return false; }
+  return true;
+}
+
+// The durable ledger is sorted by pair UUID and retains withdrawal
+// tombstones. Ranking the supplied set keeps an existing process on its
+// reserved fragment while a withdrawn runtime is still terminally fenced.
+// Brain supplies its machine-local effective set after that fence; the raw
+// durable ledger deliberately does not reclaim or renumber a slot by itself.
+static inline uint8_t prodigyCrossClusterMasqueGatewayRuntimeFragment(
+    const Vector<CrossClusterMasqueGatewayAuthority>& records,
+    uint128_t pairUUID,
+    uint128_t localMachineUUID)
+{
+  if (pairUUID == 0 || localMachineUUID == 0) return 0;
+  uint8_t rank = 0;
+  bool found = false;
+  for (const auto& record : records)
+  {
+    if (record.localMachineUUID != localMachineUUID) continue;
+    if (record.pairUUID == pairUUID) found = true;
+    else if (record.pairUUID < pairUUID) ++rank;
+  }
+  if (!found || rank > 1) return 0;
+  return rank == 0 ? prodigyCrossClusterMasqueGatewayRuntimeFragmentFirst :
+      prodigyCrossClusterMasqueGatewayRuntimeFragmentSecond;
+}
+
+static inline SystemContainerEgressPolicy prodigyCrossClusterMasqueGatewayEgressPolicy(
+    const CrossClusterMasqueGatewayAuthority& authority)
+{
+  SystemContainerEgressPolicy policy = {};
+  policy.port = authority.listenerPublicUDPPort;
+  policy.protocol = IPPROTO_UDP;
+  policy.peerIsIPv6 = authority.listenerPublicUDPEndpoint.is6;
+  policy.allowIngressFromPeer =
+      authority.localRole == CrossClusterMasqueGatewayRole::listener;
+  if (policy.peerIsIPv6)
+    std::memcpy(policy.address6, authority.listenerPublicUDPEndpoint.v6,
+                sizeof(policy.address6));
+  else
+    policy.address4 = ntohl(authority.listenerPublicUDPEndpoint.v4);
+  return policy;
+}
+
+// The public listener is an ordinary single-target UDP portal.  Its only
+// authority is the current, registry-validated listener endpoint.
+static inline bool prodigyCrossClusterMasqueGatewayWormholes(
+    const CrossClusterMasqueGatewayAuthority& authority, Vector<Wormhole>& result)
+{
+  result.clear();
+  if (!prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(authority) ||
+      authority.state != CrossClusterMasqueGatewayState::active) return false;
+  if (authority.localRole == CrossClusterMasqueGatewayRole::connector) return true;
+  Wormhole endpoint = {};
+  endpoint.externalAddress = authority.listenerPublicUDPEndpoint;
+  endpoint.externalPort = authority.listenerPublicUDPPort;
+  endpoint.containerPort = authority.listenerPublicUDPPort;
+  endpoint.layer4 = IPPROTO_UDP;
+  endpoint.isQuic = false; // Route by tuple, not by the application QUIC CID.
+  result.push_back(std::move(endpoint));
+  return true;
+}
+
+static inline bool prodigyCrossClusterMasqueGatewayWormholesMatch(
+    const CrossClusterMasqueGatewayAuthority& authority, const Vector<Wormhole>& actual)
+{
+  Vector<Wormhole> expected = {};
+  String expectedBytes = {}, actualBytes = {};
+  auto copy = actual;
+  return prodigyCrossClusterMasqueGatewayWormholes(authority, expected) &&
+      BitseryEngine::serialize(expectedBytes, expected) &&
+      BitseryEngine::serialize(actualBytes, copy) && expectedBytes == actualBytes;
+}
+
+static inline bool prodigyCrossClusterMasqueGatewayWhiteholesValid(
+    const CrossClusterMasqueGatewayAuthority& authority, const Vector<Whitehole>& whiteholes)
+{
+  if (!prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(authority) ||
+      authority.state != CrossClusterMasqueGatewayState::active) return false;
+  if (authority.localRole == CrossClusterMasqueGatewayRole::listener) return whiteholes.empty();
+  if (whiteholes.size() != 1 || !resolvedWhiteholesValid(whiteholes)) return false;
+  const Whitehole& source = whiteholes[0];
+  return source.transport == ExternalAddressTransport::quic &&
+      source.source == ExternalAddressSource::hostPublicAddress &&
+      source.address.is6 == authority.listenerPublicUDPEndpoint.is6;
+}
+
+// This is a Brain-to-selected-Neuron control projection, not another durable
+// ledger.  The empty snapshot is deliberately valid so a removed/stale record
+// withdraws the local /96 rather than surviving a control reconnect.
+class ProdigyCrossClusterMasqueGatewayAuthorityProjection {
+public:
+  static constexpr uint32_t version = 1;
+  uint32_t protocolVersion = version;
+  Vector<CrossClusterMasqueGatewayAuthority> authorities;
+};
+template <typename S> static void serialize(S&& s, ProdigyCrossClusterMasqueGatewayAuthorityProjection& p) {
+  s.value4b(p.protocolVersion);
+  s.container(p.authorities, ProdigyCrossClusterMasqueGatewayAuthorityMaximumRecords,
+      [](auto& nested, CrossClusterMasqueGatewayAuthority& authority) { nested.object(authority); });
+}
+static inline bool prodigyCrossClusterMasqueGatewayAuthorityProjectionValid(
+    const ProdigyCrossClusterMasqueGatewayAuthorityProjection& projection,
+    uint128_t localClusterUUID)
+{
+  return projection.protocolVersion == ProdigyCrossClusterMasqueGatewayAuthorityProjection::version &&
+      prodigyCrossClusterMasqueGatewayAuthoritiesValid(projection.authorities, localClusterUUID);
+}
+
+static inline bool prodigyCrossClusterMasqueGatewayAuthorityProjectionValidForMachine(
+    const ProdigyCrossClusterMasqueGatewayAuthorityProjection& projection,
+    uint128_t localClusterUUID, uint128_t localMachineUUID)
+{
+  if (localMachineUUID == 0 || projection.authorities.size() > 2 ||
+      !prodigyCrossClusterMasqueGatewayAuthorityProjectionValid(projection, localClusterUUID)) return false;
+  for (const auto& authority : projection.authorities)
+    if (authority.localMachineUUID != localMachineUUID) return false;
+  return true;
+}
+
+class ProdigyCrossClusterMasqueGatewayAuthorityRequest {
+public:
+  static constexpr uint32_t version = 1;
+  uint32_t protocolVersion = version;
+  CrossClusterMasqueGatewayAuthority authority;
+};
+template <typename S> static void serialize(S&& s, ProdigyCrossClusterMasqueGatewayAuthorityRequest& r) { s.value4b(r.protocolVersion); s.object(r.authority); }
+class ProdigyCrossClusterMasqueGatewayAuthorityQuery {
+public:
+  static constexpr uint32_t version = 1;
+  uint32_t protocolVersion = version; uint128_t pairUUID = 0, localMachineUUID = 0;
+};
+template <typename S> static void serialize(S&& s, ProdigyCrossClusterMasqueGatewayAuthorityQuery& q) { s.value4b(q.protocolVersion); s.value16b(q.pairUUID); s.value16b(q.localMachineUUID); }
+class ProdigyCrossClusterMasqueGatewayAuthorityResponse : public MothershipResponse {
+public:
+  uint128_t localClusterUUID = 0; uint64_t currentAuthorityGeneration = 0; bool found = false, qualified = false;
+  CrossClusterMasqueGatewayAuthority authority;
+};
+template <typename S> static void serialize(S&& s, ProdigyCrossClusterMasqueGatewayAuthorityResponse& r) { s.value1b(r.success); s.text1b(r.failure, 4096); s.value16b(r.localClusterUUID); s.value8b(r.currentAuthorityGeneration); s.value1b(r.found); s.value1b(r.qualified); s.object(r.authority); }
+
 class ProdigyMasterAuthorityRuntimeState {
 public:
 
@@ -8643,6 +11413,7 @@ public:
   // from positional DeploymentPlan bytes.
   Vector<ProdigyDeploymentPlacementPolicy> deploymentPlacementPolicies;
   Vector<ProdigyStatelessDeploymentAdmission> statelessDeploymentAdmissions;
+  Vector<ProdigyStatelessDeploymentRetirement> statelessDeploymentRetirements;
   // Zero is the pre-v21 unlimited follower behavior. Explicit requests use
   // one or two and persist their durable transition/readiness checkpoints.
   uint8_t updateSelfFollowerConcurrency = 0;
@@ -8663,6 +11434,9 @@ public:
   // Version-eighteen replicated route authority.  These are canonical public
   // authorization records, not route-application receipts or secret material.
   Vector<CousinRouteRecord> cousinRoutes;
+  // Version-twenty append-only local gateway authority ledger. Tombstones are
+  // newer records, never erasures, so replay cannot resurrect a gateway.
+  Vector<CrossClusterMasqueGatewayAuthority> crossClusterMasqueGatewayAuthorities;
   // Never serialized in this public runtime record. Persistence extracts it to
   // ProdigyPersistentBrainSnapshotSecrets before writing the snapshot.
   ProdigyTransportCredentialAuthorityRoot transportCredentialAuthorityRoot;
@@ -8672,6 +11446,7 @@ public:
     if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || nextPendingElasticAddressOperationID != other.nextPendingElasticAddressOperationID || nextDNSIntentRevision != other.nextDNSIntentRevision || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || pendingAddMachinesProvisioningIntents.size() != other.pendingAddMachinesProvisioningIntents.size() || pendingAutonomousProvisioningOperations.size() != other.pendingAutonomousProvisioningOperations.size() || pendingElasticAddressAssignments.size() != other.pendingElasticAddressAssignments.size() || pendingElasticAddressReleases.size() != other.pendingElasticAddressReleases.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || statefulServingAuthorities.size() != other.statefulServingAuthorities.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || materializedStatefulRecoveryOperations.size() != other.materializedStatefulRecoveryOperations.size() || materializedStatefulRecoveryRetries.size() != other.materializedStatefulRecoveryRetries.size() || apiCredentialExpiryNotices.size() != other.apiCredentialExpiryNotices.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || taskExecutions.size() != other.taskExecutions.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf || updateSelfFollowerConcurrency != other.updateSelfFollowerConcurrency || updateSelfFollowerTransitionIssuedPeerKeys != other.updateSelfFollowerTransitionIssuedPeerKeys || updateSelfFollowerReadyPeerKeys != other.updateSelfFollowerReadyPeerKeys ||
         prodigyDeploymentPlacementPoliciesEqual(deploymentPlacementPolicies, other.deploymentPlacementPolicies) == false ||
         prodigyStatelessDeploymentAdmissionsEqual(statelessDeploymentAdmissions, other.statelessDeploymentAdmissions) == false ||
+        prodigyStatelessDeploymentRetirementsEqual(statelessDeploymentRetirements, other.statelessDeploymentRetirements) == false ||
         prodigyClusterPairEnrollmentsEqual(clusterPairEnrollments, other.clusterPairEnrollments) == false ||
         clusterPairEnrollmentOperations.size() != other.clusterPairEnrollmentOperations.size() ||
         prodigyLocalCousinServicePermissionsEqual(localCousinServicePermissions, other.localCousinServicePermissions) == false ||
@@ -8679,6 +11454,7 @@ public:
         transportCredentialEnrollments != other.transportCredentialEnrollments ||
         transportCredentialEnrollmentOperations.size() != other.transportCredentialEnrollmentOperations.size() ||
         prodigyCousinRoutesEqual(cousinRoutes, other.cousinRoutes) == false ||
+        prodigyCrossClusterMasqueGatewayAuthoritiesEqual(crossClusterMasqueGatewayAuthorities, other.crossClusterMasqueGatewayAuthorities) == false ||
         transportCredentialAuthorityRoot.authorityEpoch != other.transportCredentialAuthorityRoot.authorityEpoch ||
         transportCredentialAuthorityRoot.keyEpoch != other.transportCredentialAuthorityRoot.keyEpoch ||
         transportCredentialAuthorityRoot.authorityGeneration != other.transportCredentialAuthorityRoot.authorityGeneration ||
@@ -9339,26 +12115,32 @@ static inline bool prodigyBuildCousinWormholeDesiredState(
   state = {};
   SwitchboardWormholeDesiredState desired = {};
   desired.wormholes = wormholes;
-  if (isStateful && cousinService != 0)
+  if (isStateful)
   {
-    const auto cousin = advertisements.find(cousinService);
-    if (cousin != advertisements.end())
+    for (const auto& [protectedService, definition] : advertisements)
     {
+      const uint16_t app = cousinRouteServiceApplicationID(protectedService);
+      // Retained database listeners and sharded database clients are private
+      // authenticated services, not public application endpoints.
+      const bool shardedClient = (app == 3 || app == 4) &&
+          MeshServices::convertShardToPrefix(protectedService) == prodigyCousinClientAuthorityPrefix(app);
+      if (protectedService != cousinService && app != 2 && app != 5 && app != 10 && !shardedClient) continue;
       // The definition controls first publication, even before the service's
       // active lifecycle state. Waiting for healthy would expose an open port.
-      const uint16_t port = cousin->second.port;
+      const uint16_t port = definition.port;
       if (port == 0 && !wormholes.empty()) return false;
       bool exposed = false;
       for (const Wormhole& wormhole : wormholes)
         if (wormhole.containerPort == port) exposed = true;
       if (exposed)
       {
-        if (cousin->second.service != cousinService) return false;
+        if (definition.service != protectedService) return false;
         for (const auto& [service, advertisement] : advertisements)
-          if (service != cousinService && advertisement.port == port) return false;
+          if (service != protectedService && advertisement.port == port) return false;
         desired.pairAdmissionTCPPorts.push_back(port);
       }
     }
+    std::sort(desired.pairAdmissionTCPPorts.begin(), desired.pairAdmissionTCPPorts.end());
   }
   if (!prodigyWormholeDesiredStateValid(desired, requireResolvedAddresses)) return false;
   state = std::move(desired);
@@ -9423,6 +12205,10 @@ public:
   bool isStateful = false;
   StatefulMeshRoles statefulMeshRoles;
   StatefulTopology statefulTopology;
+
+  // Append-only seed authority. A zero protocolVersion is the explicit
+  // absence until a remote seed is scheduled, including initial all-master boot.
+  ProdigyStatefulStoreSeedAuthority statefulStoreSeedAuthority = {.protocolVersion = 0};
   uint64_t declaredStatefulClientService = 0;
   uint16_t declaredStatefulClientPort = 0;
 
@@ -9797,9 +12583,10 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   // canonical machine-to-container-network-fragment registry; version 18
   // appends canonical replicated COUSIN route authority records; version 19
   // appends durable managed-machine create intent outside the legacy pending
-  // add-machines record.
+  // add-machines record. Version 20 appends the Mothership-created local
+  // MASQUE gateway authority ledger.
   // Older readers reject before consuming either newer operation layout.
-  constexpr uint64_t explicitVersion = 19;
+  constexpr uint64_t explicitVersion = 21;
   using Serializer = std::remove_cv_t<std::remove_reference_t<S>>;
   if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
     state.transportCredentialAuthorityRoot = {};
@@ -9822,6 +12609,8 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   bool hasMachineFragmentAssignments = false;
   bool hasCousinRoutes = false;
   bool hasPendingAddMachinesProvisioningIntents = false;
+  bool hasCrossClusterMasqueGatewayAuthorities = false;
+  bool hasStatelessDeploymentRetirements = false;
 
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
@@ -9858,6 +12647,9 @@ static void prodigySerializeMasterAuthorityRuntimeState(
     hasMachineFragmentAssignments = state.machineFragmentAssignments.empty() == false;
     hasCousinRoutes = state.cousinRoutes.empty() == false;
     hasPendingAddMachinesProvisioningIntents = state.pendingAddMachinesProvisioningIntents.empty() == false;
+    hasStatelessDeploymentRetirements = !state.statelessDeploymentRetirements.empty();
+    hasCrossClusterMasqueGatewayAuthorities = !state.crossClusterMasqueGatewayAuthorities.empty() || hasStatelessDeploymentRetirements;
+    if (hasCrossClusterMasqueGatewayAuthorities) hasPendingAddMachinesProvisioningIntents = true;
     // Version nineteen is cumulative through the v18 route container.
     if (hasPendingAddMachinesProvisioningIntents) hasCousinRoutes = true;
     // Version eighteen is cumulative through the version-seventeen fragment
@@ -9906,10 +12698,26 @@ static void prodigySerializeMasterAuthorityRuntimeState(
           [](const auto& operation) { return operation.protocolVersion >= 2; });
       const bool hasPairEpochOperations = std::any_of(state.clusterPairEnrollmentOperations.begin(), state.clusterPairEnrollmentOperations.end(),
           [](const auto& operation) { return operation.protocolVersion >= 3; });
-      uint64_t version = hasPendingAddMachinesProvisioningIntents ? 19 : (hasCousinRoutes ? 18 : (hasMachineFragmentAssignments ? 17 : (hasTransportCredentialLifecycleOperations ? 16 : (hasLocalCousinServicePermissions ? 15 : (hasClusterPairEnrollmentOperations ? (hasPairEpochOperations ? 14 : (hasPairRevocationOperations ? 13 : 12)) : (hasTransportCredentialEnrollments ? 11 : (hasClusterPairEnrollments ? 10 : (hasExplicitUpdateSelfFollowerConcurrency ? 9 : (hasStatelessDeploymentAdmissions ? 8 : (hasStatefulServingAuthorities ? 7 : (hasDeploymentPlacementPolicies ? 6 :
-                         (hasContainerRuntimeStates ? 5 :
-                         (hasMaterializedStatefulRecoveryRetries ? 4 :
-                          (hasAllMachineRecoveryWitnesses ? 3 : (hasApiCredentialExpiryNotices ? 2 : 1)))))))))))))));
+      uint64_t version = 1;
+      if (hasApiCredentialExpiryNotices) version = 2;
+      if (hasAllMachineRecoveryWitnesses) version = 3;
+      if (hasMaterializedStatefulRecoveryRetries) version = 4;
+      if (hasContainerRuntimeStates) version = 5;
+      if (hasDeploymentPlacementPolicies) version = 6;
+      if (hasStatefulServingAuthorities) version = 7;
+      if (hasStatelessDeploymentAdmissions) version = 8;
+      if (hasExplicitUpdateSelfFollowerConcurrency) version = 9;
+      if (hasClusterPairEnrollments) version = 10;
+      if (hasTransportCredentialEnrollments) version = 11;
+      if (hasClusterPairEnrollmentOperations) version = hasPairRevocationOperations ? 13 : 12;
+      if (hasPairEpochOperations) version = 14;
+      if (hasLocalCousinServicePermissions) version = 15;
+      if (hasTransportCredentialLifecycleOperations) version = 16;
+      if (hasMachineFragmentAssignments) version = 17;
+      if (hasCousinRoutes) version = 18;
+      if (hasPendingAddMachinesProvisioningIntents) version = 19;
+      if (hasCrossClusterMasqueGatewayAuthorities) version = 20;
+      if (hasStatelessDeploymentRetirements) version = 21;
       serializer.value8b(version);
     }
     serializer.value8b(state.generation);
@@ -9957,6 +12765,8 @@ static void prodigySerializeMasterAuthorityRuntimeState(
       hasMachineFragmentAssignments = version >= 17;
       hasCousinRoutes = version >= 18;
       hasPendingAddMachinesProvisioningIntents = version >= 19;
+      hasCrossClusterMasqueGatewayAuthorities = version >= 20;
+      hasStatelessDeploymentRetirements = version >= 21;
     }
   }
 
@@ -10189,6 +12999,31 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   {
     state.pendingAddMachinesProvisioningIntents.clear();
   }
+  if (hasCrossClusterMasqueGatewayAuthorities)
+  {
+    serializer.container(state.crossClusterMasqueGatewayAuthorities,
+        ProdigyCrossClusterMasqueGatewayAuthorityMaximumRecords,
+        [](auto& nested, CrossClusterMasqueGatewayAuthority& authority) { nested.object(authority); });
+    if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
+      if (!prodigyCrossClusterMasqueGatewayAuthoritiesValid(state.crossClusterMasqueGatewayAuthorities, 0))
+        serializer.adapter().error(bitsery::ReaderError::InvalidData);
+  }
+  else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
+  {
+    state.crossClusterMasqueGatewayAuthorities.clear();
+  }
+  if (hasStatelessDeploymentRetirements)
+  {
+    serializer.container(state.statelessDeploymentRetirements, 4096);
+    if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
+      if (!prodigyStatelessDeploymentRetirementsValid(state.statelessDeploymentRetirements,
+                                                       state.statelessDeploymentAdmissions, state.generation))
+        serializer.adapter().error(bitsery::ReaderError::InvalidData);
+  }
+  else if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
+  {
+    state.statelessDeploymentRetirements.clear();
+  }
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
   {
     if (!prodigyPendingAddMachinesProvisioningIntentsValid(
@@ -10275,6 +13110,186 @@ static void serialize(S&& serializer, DeploymentPlan& plan)
   serializer.object(plan.tlsIssuancePolicy);
   serializer.value1b(plan.hasApiCredentialPolicy);
   serializer.object(plan.apiCredentialPolicy);
+}
+
+// Validate both exact declarations against the authority's retained plan map.
+// The runtime-state decoder checks the predecessor admission; this check is
+// required when the enclosing authority package supplies its plan map.
+static inline bool prodigyStatelessDeploymentRetirementsMatchPlans(
+    const Vector<ProdigyStatelessDeploymentRetirement>& retirements,
+    const bytell_hash_map<uint64_t, DeploymentPlan>& plans)
+{
+  for (const auto& retirement : retirements)
+  {
+    auto predecessor = plans.find(retirement.predecessorDeploymentID);
+    auto successor = plans.find(retirement.successorDeploymentID);
+    if (predecessor == plans.end() || successor == plans.end()) return false;
+    for (const auto& candidate : {std::pair<const DeploymentPlan *, const String *>
+             {&predecessor->second, &retirement.predecessorPlanSHA256},
+             {&successor->second, &retirement.successorPlanSHA256}})
+    {
+      if (candidate.first->isStateful || candidate.first->config.type != ApplicationType::stateless) return false;
+      DeploymentPlan plan = *candidate.first;
+      String bytes = {}, digest = {};
+      if (!BitseryEngine::serialize(bytes, plan) || !prodigyComputeSHA256Hex(bytes, digest) ||
+          !digest.equals(*candidate.second)) return false;
+    }
+    if (predecessor->second.config.deploymentID() != retirement.predecessorDeploymentID ||
+        successor->second.config.deploymentID() != retirement.successorDeploymentID) return false;
+  }
+  return true;
+}
+
+static inline bool prodigyCousinAutomaticWhiteholePlanValid(const Vector<Whitehole>& whiteholes)
+{
+  return whiteholes.size() == 1 && whiteholeDeclarationValid(whiteholes[0]) &&
+      whiteholes[0].family == ExternalAddressFamily::ipv6 && whiteholes[0].transport == ExternalAddressTransport::tcp;
+}
+
+static inline bool prodigyCousinProtectedWormholePlanValid(const DeploymentPlan& plan)
+{
+  if (!plan.isStateful || plan.useHostNetworkNamespace || plan.wormholes.size() != 1 ||
+      !plan.whiteholes.empty()) return false;
+  const Wormhole& wormhole = plan.wormholes.front();
+  if (wormhole.layer4 != IPPROTO_TCP || wormhole.isQuic || wormhole.externalPort == 0 ||
+      wormhole.externalPort != wormhole.containerPort) return false;
+  bytell_hash_map<uint64_t, Advertisement> advertisements;
+  for (const auto& advertisement : plan.advertisements)
+    advertisements.emplace(advertisement.service, advertisement);
+  SwitchboardWormholeDesiredState desired;
+  const uint64_t cousin = StatefulMeshRoles::forShardGroup(
+      plan.stateful, plan.config.applicationID, 0).cousin;
+  return cousin != 0 && prodigyBuildCousinWormholeDesiredState(
+      plan.wormholes, true, cousin, advertisements, desired, false) &&
+      prodigyWormholeRequiresPairAdmission(desired, wormhole.containerPort, wormhole.layer4);
+}
+
+static inline bool prodigyCousinSourceContainerStateEligible(
+    const ProdigyLocalCousinServicePermission& permission, ContainerState state,
+    bool runtimeReady, const StatefulTopology& topology)
+{
+  if (!runtimeReady) return false;
+  if (state == ContainerState::healthy) return true;
+  if (permission.protocolVersion != ProdigyLocalCousinServicePermission::purposeVersion ||
+      (state != ContainerState::scheduled && state != ContainerState::crashedRestarting)) return false;
+  if (permission.purpose == ProdigyCousinServicePurpose::clientAuthority)
+    return permission.localHalf == CousinRouteHalf::source;
+  if (permission.purpose != ProdigyCousinServicePurpose::sibling &&
+      permission.purpose != ProdigyCousinServicePurpose::seeding) return false;
+  return topology.servingMode == StatefulTopologyServingMode::catchupOnly ||
+      (topology.servingMode == StatefulTopologyServingMode::applicationDataAuthority &&
+       prodigyStatefulDataAuthorityValid(topology.dataAuthority) && !prodigyStatefulTopologyServesClients(topology));
+}
+
+static inline uint64_t prodigyCousinPermissionServiceForRoles(
+    const ProdigyLocalCousinServicePermission& permission, const StatefulMeshRoles& roles)
+{
+  switch (permission.purpose) {
+    case ProdigyCousinServicePurpose::statefulCousin: return roles.cousin;
+    case ProdigyCousinServicePurpose::clientAuthority:
+      return permission.localHalf == CousinRouteHalf::source ?
+          MeshServices::constrainPrefixToGroup(permission.localCousinServicePrefix, 0) : roles.client;
+    case ProdigyCousinServicePurpose::sibling: return roles.sibling;
+    case ProdigyCousinServicePurpose::seeding: return roles.seeding;
+  }
+  return 0;
+}
+
+static inline bool prodigyCousinSourceSubscriptionMatches(
+    const ProdigyLocalCousinServicePermission& permission, uint64_t sourceService,
+    const bytell_hash_map<uint64_t, Subscription>& subscriptions, ContainerState state)
+{
+  if (permission.purpose == ProdigyCousinServicePurpose::statefulCousin) return true;
+  uint32_t matches = 0;
+  for (const auto& [key, subscription] : subscriptions) {
+    const bool selected = permission.purpose == ProdigyCousinServicePurpose::clientAuthority ?
+        (key == permission.peerCousinServicePrefix || key == permission.authorizedService) : key == sourceService;
+    if (selected && key == subscription.service && serviceBlueprintActiveAtContainerState(subscription, state)) ++matches;
+  }
+  return matches == 1;
+}
+
+static inline bool prodigyCousinPermissionPlanServiceMatches(
+    const ProdigyLocalCousinServicePermission& permission, const DeploymentPlan& plan)
+{
+  if (plan.config.applicationID != permission.localApplicationID ||
+      plan.config.deploymentID() != permission.localDeploymentID ||
+      plan.config.containerBlobSHA256 != permission.artifactSHA256 || plan.config.containerBlobBytes != permission.artifactBytes) return false;
+  // Legacy records predate purpose-bound route services.  They retain their
+  // original deployment-identity and stateful cousin-prefix contract; only v3
+  // permissions opt into the service and endpoint topology checks below.
+  if (permission.protocolVersion < ProdigyLocalCousinServicePermission::purposeVersion)
+    return plan.isStateful && plan.stateful.cousinPrefix == permission.localCousinServicePrefix;
+  const bool automatic = permission.purpose != ProdigyCousinServicePurpose::statefulCousin;
+  const bool source = permission.localHalf == CousinRouteHalf::source;
+  if (!automatic) {
+    if (!plan.isStateful || plan.stateful.cousinPrefix != permission.localCousinServicePrefix ||
+        plan.useHostNetworkNamespace) return false;
+    // A private route derives both endpoints from the current container
+    // identity. Permission admission alone never authorizes a session: the
+    // private route, gateway, discovery and exact service are checked later.
+    if (plan.wormholes.empty() && plan.whiteholes.empty()) return true;
+    return source ? (plan.wormholes.empty() && prodigyCousinAutomaticWhiteholePlanValid(plan.whiteholes))
+                  : prodigyCousinProtectedWormholePlanValid(plan);
+  }
+  if (plan.useHostNetworkNamespace) return false;
+  if (source && !plan.whiteholes.empty() && !prodigyCousinAutomaticWhiteholePlanValid(plan.whiteholes)) {
+    if (permission.purpose != ProdigyCousinServicePurpose::clientAuthority ||
+        !std::all_of(plan.whiteholes.begin(), plan.whiteholes.end(), [](const Whitehole& whitehole) {
+          return whiteholeDeclarationValid(whitehole) && whitehole.transport == ExternalAddressTransport::quic;
+        })) return false;
+  }
+  if (permission.purpose == ProdigyCousinServicePurpose::clientAuthority && source) {
+    if (plan.isStateful || plan.config.type != ApplicationType::stateless ||
+        (plan.config.applicationID != 6 && plan.config.applicationID != 11)) return false;
+    uint32_t matches = 0;
+    for (const auto& subscription : plan.subscriptions)
+      if (subscription.service == permission.peerCousinServicePrefix &&
+          serviceBlueprintActiveAtContainerState(subscription, ContainerState::healthy)) ++matches;
+    return matches == 1;
+  }
+  const bool shardedClient = permission.purpose == ProdigyCousinServicePurpose::clientAuthority &&
+      (plan.config.applicationID == 3 || plan.config.applicationID == 4);
+  const bool shardedSeed = permission.purpose == ProdigyCousinServicePurpose::seeding &&
+      (plan.config.applicationID == 3 || plan.config.applicationID == 4);
+  if (!plan.isStateful || plan.config.type != ApplicationType::stateful ||
+      (!shardedClient && !shardedSeed && !plan.stateful.neverShard) ||
+      ((shardedClient || shardedSeed) && permission.destinationShardGroups > 1 && plan.stateful.neverShard)) return false;
+  const uint16_t group = source && !shardedSeed ? 0 : permission.destinationShardGroup;
+  const auto roles = StatefulMeshRoles::forShardGroup(plan.stateful, plan.config.applicationID, group);
+  const uint64_t service = prodigyCousinPermissionServiceForRoles(permission, roles);
+  if (service == 0 || !roles.hasDistinctServices() ||
+      service != MeshServices::constrainPrefixToGroup(permission.localCousinServicePrefix, group)) return false;
+  return !automatic || permission.purpose == ProdigyCousinServicePurpose::clientAuthority || service != roles.client;
+}
+
+// Neuron cannot reproduce a full DeploymentPlan digest from its materialized
+// ContainerPlan. Brain owns that digest; Neuron independently checks every
+// local identity/service it can prove before projecting an authenticated lease.
+static inline bool prodigyCousinPermissionContainerPlanMatches(
+    const ProdigyLocalCousinServicePermission& permission, const ContainerPlan& plan, uint64_t service,
+    bool privateSession = false)
+{
+  if (plan.config.deploymentID() != permission.localDeploymentID || plan.config.applicationID != permission.localApplicationID ||
+      plan.config.containerBlobSHA256 != permission.artifactSHA256 || plan.config.containerBlobBytes != permission.artifactBytes) return false;
+  if (permission.purpose == ProdigyCousinServicePurpose::statefulCousin)
+    return plan.isStateful && service == plan.statefulMeshRoles.cousin;
+  const uint32_t groups = plan.isStateful ? plan.nShardGroups : 1;
+  const uint32_t group = plan.isStateful ? plan.shardGroup : 0;
+  if (!prodigyCousinServicePermissionGroupValid(permission, group, groups) ||
+      service != prodigyCousinPermissionServiceForRoles(permission, plan.statefulMeshRoles)) return false;
+  if (permission.localHalf == CousinRouteHalf::source ?
+      !prodigyCousinSourceContainerStateEligible(permission, plan.state, plan.runtimeReady, plan.statefulTopology) :
+      (plan.state != ContainerState::healthy || !plan.runtimeReady || !prodigyStatefulTopologyServesClients(plan.statefulTopology))) return false;
+  if (permission.localHalf == CousinRouteHalf::source &&
+      !prodigyCousinSourceSubscriptionMatches(permission, service, plan.subscriptions, plan.state)) return false;
+  if (permission.purpose == ProdigyCousinServicePurpose::clientAuthority && permission.localHalf == CousinRouteHalf::source) {
+    if (plan.isStateful || plan.config.type != ApplicationType::stateless ||
+        (!privateSession && !plan.whiteholes.empty() && !prodigyCousinAutomaticWhiteholePlanValid(plan.whiteholes))) return false;
+    return true; // The shared subscription check above admits only this exact peer prefix/shard.
+  }
+  return plan.isStateful && plan.config.type == ApplicationType::stateful && plan.statefulMeshRoles.hasDistinctServices() &&
+      (permission.purpose == ProdigyCousinServicePurpose::clientAuthority || service != plan.statefulMeshRoles.client);
 }
 
 // Public, topology-free half of the P6 target profile.  Brain still resolves
@@ -10364,6 +13379,14 @@ static void serialize(S&& serializer, FailedDeploymentOperatorCancellationPayloa
   serializer.value8b(record.completedAtMs);
 }
 
+struct FailedDeploymentQualificationCancellationPayload {
+  FailedDeploymentOperatorCancellationPayload base;
+  ProdigyQualificationStatefulCancellation scope;
+};
+template <typename S> static void serialize(S&& s, FailedDeploymentQualificationCancellationPayload& v) {
+  s.object(v.base); s.object(v.scope);
+}
+
 class FailedDeploymentRecord {
 public:
 
@@ -10379,6 +13402,8 @@ public:
   CancelDeploymentPhase cancellationPhase = CancelDeploymentPhase::none;
   uint64_t cancellationGeneration = 0;
   int64_t cancellationCompletedAtMs = 0;
+  bool hasQualificationCancellation = false;
+  ProdigyQualificationStatefulCancellation qualificationCancellation = {};
 };
 
 class DeploymentCancellationAcknowledgement {
@@ -10407,6 +13432,8 @@ static void serialize(S&& serializer, FailedDeploymentRecord& record)
   // the entire master-authority package.
   constexpr static char structuredPrefix[] = "PRODIGY_FAILED_DEPLOYMENT_REPORT_V1\0";
   constexpr static uint64_t structuredPrefixBytes = sizeof(structuredPrefix) - 1;
+  constexpr static char qualificationPrefix[] = "PRODIGY_OPERATOR_CANCEL_QUALIFICATION_V1\0";
+  constexpr static uint64_t qualificationPrefixBytes = sizeof(qualificationPrefix) - 1;
   constexpr static char cancellationPrefix[] = "PRODIGY_OPERATOR_CANCEL_V1\0";
   constexpr static uint64_t cancellationPrefixBytes = sizeof(cancellationPrefix) - 1;
   using Serializer = std::remove_cv_t<std::remove_reference_t<S>>;
@@ -10424,6 +13451,7 @@ static void serialize(S&& serializer, FailedDeploymentRecord& record)
     if (record.hasOperatorCancellation)
     {
       serializer.detachPersistentValue(record.operationID);
+      if (record.hasQualificationCancellation) serializer.detachPersistentValue(record.qualificationCancellation);
     }
     return;
   }
@@ -10446,8 +13474,15 @@ static void serialize(S&& serializer, FailedDeploymentRecord& record)
       payload.completedAtMs = record.cancellationCompletedAtMs;
 
       String serializedPayload = {};
-      BitseryEngine::serialize(serializedPayload, payload);
-      encoded.append(cancellationPrefix, cancellationPrefixBytes);
+      if (record.hasQualificationCancellation) {
+        FailedDeploymentQualificationCancellationPayload qualified = {};
+        qualified.base = std::move(payload); qualified.scope = record.qualificationCancellation;
+        BitseryEngine::serialize(serializedPayload, qualified);
+        encoded.append(qualificationPrefix, qualificationPrefixBytes);
+      } else {
+        BitseryEngine::serialize(serializedPayload, payload);
+        encoded.append(cancellationPrefix, cancellationPrefixBytes);
+      }
       encoded.append(serializedPayload);
     }
     else if (record.hasTerminalReport)
@@ -10475,11 +13510,20 @@ static void serialize(S&& serializer, FailedDeploymentRecord& record)
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
   {
     record = {};
-    if (encoded.size() >= cancellationPrefixBytes && memcmp(encoded.data(), cancellationPrefix, cancellationPrefixBytes) == 0)
+    const bool qualified = encoded.size() >= qualificationPrefixBytes && memcmp(encoded.data(), qualificationPrefix, qualificationPrefixBytes) == 0;
+    if (qualified || (encoded.size() >= cancellationPrefixBytes && memcmp(encoded.data(), cancellationPrefix, cancellationPrefixBytes) == 0))
     {
-      String serializedPayload = encoded.substr(cancellationPrefixBytes, encoded.size() - cancellationPrefixBytes, Copy::no);
+      const uint64_t prefixBytes = qualified ? qualificationPrefixBytes : cancellationPrefixBytes;
+      String serializedPayload = encoded.substr(prefixBytes, encoded.size() - prefixBytes, Copy::no);
       FailedDeploymentOperatorCancellationPayload payload = {};
-      if (BitseryEngine::deserializeSafe(serializedPayload, payload) &&
+      FailedDeploymentQualificationCancellationPayload qualification = {};
+      const bool decoded = qualified ? BitseryEngine::deserializeSafe(serializedPayload, qualification) : BitseryEngine::deserializeSafe(serializedPayload, payload);
+      if (qualified) payload = qualification.base;
+      if (decoded && (!qualified || (prodigyQualificationStatefulCancellationValid(qualification.scope) &&
+          qualification.scope.request.operationID == payload.operationID &&
+          qualification.scope.request.applicationID == payload.failure.applicationID &&
+          ((uint64_t(qualification.scope.request.applicationID) << 48) | qualification.scope.request.activeVersionID) == payload.failure.deploymentID &&
+          ((uint64_t(qualification.scope.request.applicationID) << 48) | qualification.scope.request.successorVersionID) == payload.successorDeploymentID)) &&
           prodigyCanonicalOperationUUID(payload.operationID) &&
           payload.failure.applicationID != 0 && payload.failure.deploymentID != 0 &&
           payload.successorDeploymentID != 0 &&
@@ -10502,6 +13546,7 @@ static void serialize(S&& serializer, FailedDeploymentRecord& record)
         record.cancellationPhase = payload.phase;
         record.cancellationGeneration = payload.durableGeneration;
         record.cancellationCompletedAtMs = payload.completedAtMs;
+        if (qualified) { record.hasQualificationCancellation = true; record.qualificationCancellation = std::move(qualification.scope); }
         return;
       }
     }
@@ -10746,6 +13791,11 @@ public:
   StatefulTopology statefulTopology;
 
   Vector<uint64_t> flags;
+
+  // Appended after the legacy payload tail. A zero protocolVersion means no
+  // startup authority was supplied, including initial all-master boot and
+  // legacy producers without the appended tail.
+  ProdigyStatefulStoreSeedAuthority statefulStoreSeedAuthority = {.protocolVersion = 0};
 };
 
 // A private listener declaration is carried to the process without publishing
@@ -10807,6 +13857,17 @@ static void serialize(S&& serializer, ContainerParameters& params)
   serializer.object(params.credentialBundle);
   serializer.object(params.statefulMeshRoles);
   serializer.object(params.statefulTopology);
-
   serializer.container8b(params.flags, UINT32_MAX);
+
+  // Bitsery startup payloads predate this authority.  Only consume the
+  // append-only tail when it is present so retained launches remain readable.
+  if constexpr (requires { serializer.adapter().isCompletedSuccessfully(); })
+  {
+    if (!serializer.adapter().isCompletedSuccessfully()) serializer.object(params.statefulStoreSeedAuthority);
+    else params.statefulStoreSeedAuthority = {.protocolVersion = 0};
+  }
+  else
+  {
+    serializer.object(params.statefulStoreSeedAuthority);
+  }
 }

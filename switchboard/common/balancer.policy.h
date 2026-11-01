@@ -14,7 +14,7 @@ __attribute__((__always_inline__)) static inline bool switchboardBalancerPassesI
   // control, and path-MTU signaling. Cross-machine Switchboard overlay packets
   // must also reach the TC host-ingress program for decapsulation. The balancer
   // only owns native TCP/UDP service ingress.
-  return nextHeader == IPPROTO_ICMPV6 || nextHeader == IPPROTO_IPIP || nextHeader == IPPROTO_IPV6;
+  return nextHeader == IPPROTO_ICMPV6 || nextHeader == IPPROTO_IPIP || nextHeader == IPPROTO_IPV6 || nextHeader == IPPROTO_GRE;
 }
 
 __attribute__((__always_inline__)) static inline bool switchboardQuicV1PacketTypeAllowsHashFallback(__u8 packetType)

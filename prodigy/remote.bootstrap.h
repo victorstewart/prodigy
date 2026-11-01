@@ -1232,6 +1232,298 @@ static inline bool prodigyUploadLocalFileToSSHSession(LIBSSH2_SESSION *session, 
   return success;
 }
 
+// expectedByteCount is optional; maximumByteCount is deliberately mandatory so
+// callers must bound data accepted from a remote machine.
+static inline bool prodigyDownloadRemoteFileFromSSHSession(
+    LIBSSH2_SESSION *session,
+    int fd,
+    const String& remotePath,
+    const String& localPath,
+    uint64_t maximumByteCount,
+    const uint64_t *expectedByteCount = nullptr,
+    String *failure = nullptr,
+    int timeoutMs = 120'000)
+{
+  if (failure)
+  {
+    failure->clear();
+  }
+
+  if (session == nullptr || fd < 0)
+  {
+    if (failure)
+    {
+      failure->assign("cannot download with an invalid ssh session"_ctv);
+    }
+    return false;
+  }
+
+  const ProdigySSHDeadline deadline = prodigySSHDeadlineAfter(timeoutMs);
+  String remotePathText = {};
+  remotePathText.assign(remotePath);
+  String localPathText = {};
+  localPathText.assign(localPath);
+
+  auto waitForRetry = [&](const char *phase) -> bool {
+    int remainingMs = 0;
+    if (prodigySSHDeadlineRemaining(deadline, remainingMs) == false ||
+        prodigyWaitForBlockingSSHSessionIO(session, fd, remainingMs) == false)
+    {
+      if (failure && failure->size() == 0)
+      {
+        String phaseText = {};
+        phaseText.assign(phase);
+        failure->snprintf<"timed out while {} remote file {}"_ctv>(phaseText, remotePath);
+      }
+      return false;
+    }
+    return true;
+  };
+
+  LIBSSH2_SFTP *sftp = nullptr;
+  while (sftp == nullptr)
+  {
+    sftp = libssh2_sftp_init(session);
+    if (sftp != nullptr)
+    {
+      break;
+    }
+    if (libssh2_session_last_errno(session) != LIBSSH2_ERROR_EAGAIN || waitForRetry("initializing sftp for") == false)
+    {
+      if (failure && failure->size() == 0)
+      {
+        failure->snprintf<"failed to initialize sftp for remote file {} sessionErr={itoa}"_ctv>(remotePath, int64_t(libssh2_session_last_errno(session)));
+      }
+      return false;
+    }
+  }
+
+  LIBSSH2_SFTP_ATTRIBUTES attributes = {};
+  int lstatResult = 0;
+  while (true)
+  {
+    lstatResult = libssh2_sftp_stat_ex(sftp, remotePathText.c_str(), static_cast<unsigned int>(remotePathText.size()), LIBSSH2_SFTP_LSTAT, &attributes);
+    if (lstatResult != LIBSSH2_ERROR_EAGAIN)
+    {
+      break;
+    }
+    if (waitForRetry("lstat'ing") == false)
+    {
+      (void)libssh2_sftp_shutdown(sftp);
+      return false;
+    }
+  }
+
+  if (lstatResult != 0 ||
+      (attributes.flags & (LIBSSH2_SFTP_ATTR_SIZE | LIBSSH2_SFTP_ATTR_PERMISSIONS)) != (LIBSSH2_SFTP_ATTR_SIZE | LIBSSH2_SFTP_ATTR_PERMISSIONS) ||
+      (attributes.permissions & LIBSSH2_SFTP_S_IFMT) != LIBSSH2_SFTP_S_IFREG ||
+      (attributes.permissions & 0077) != 0 ||
+      attributes.filesize > maximumByteCount ||
+      (expectedByteCount != nullptr && attributes.filesize != *expectedByteCount))
+  {
+    if (failure)
+    {
+      if (lstatResult != 0)
+      {
+        failure->snprintf<"failed to lstat remote file {} result={itoa} sftpErr={itoa}"_ctv>(remotePath, int64_t(lstatResult), uint64_t(libssh2_sftp_last_error(sftp)));
+      }
+      else if ((attributes.permissions & LIBSSH2_SFTP_S_IFMT) != LIBSSH2_SFTP_S_IFREG)
+      {
+        failure->snprintf<"remote file {} is not a regular file"_ctv>(remotePath);
+      }
+      else if ((attributes.permissions & 0077) != 0)
+      {
+        failure->snprintf<"remote file {} is not private"_ctv>(remotePath);
+      }
+      else if (attributes.filesize > maximumByteCount)
+      {
+        failure->snprintf<"remote file {} exceeds maximum byte count {itoa}"_ctv>(remotePath, maximumByteCount);
+      }
+      else if (expectedByteCount != nullptr && attributes.filesize != *expectedByteCount)
+      {
+        failure->snprintf<"remote file {} has unexpected byte count expected={itoa} actual={itoa}"_ctv>(remotePath, *expectedByteCount, attributes.filesize);
+      }
+      else
+      {
+        failure->snprintf<"remote file {} has incomplete lstat attributes"_ctv>(remotePath);
+      }
+    }
+    (void)libssh2_sftp_shutdown(sftp);
+    return false;
+  }
+
+  LIBSSH2_SFTP_HANDLE *handle = nullptr;
+  while (handle == nullptr)
+  {
+    handle = libssh2_sftp_open(sftp, remotePathText.c_str(), LIBSSH2_FXF_READ, 0);
+    if (handle != nullptr)
+    {
+      break;
+    }
+    if (libssh2_session_last_errno(session) != LIBSSH2_ERROR_EAGAIN || waitForRetry("opening") == false)
+    {
+      if (failure && failure->size() == 0)
+      {
+        failure->snprintf<"failed to open remote file {} sessionErr={itoa} sftpErr={itoa}"_ctv>(remotePath, int64_t(libssh2_session_last_errno(session)), uint64_t(libssh2_sftp_last_error(sftp)));
+      }
+      (void)libssh2_sftp_shutdown(sftp);
+      return false;
+    }
+  }
+
+  LIBSSH2_SFTP_ATTRIBUTES openedAttributes = {};
+  int fstatResult = 0;
+  while (true)
+  {
+    fstatResult = libssh2_sftp_fstat(handle, &openedAttributes);
+    if (fstatResult != LIBSSH2_ERROR_EAGAIN)
+    {
+      break;
+    }
+    if (waitForRetry("fstat'ing") == false)
+    {
+      (void)libssh2_sftp_close(handle);
+      (void)libssh2_sftp_shutdown(sftp);
+      return false;
+    }
+  }
+
+  if (fstatResult != 0 ||
+      (openedAttributes.flags & (LIBSSH2_SFTP_ATTR_SIZE | LIBSSH2_SFTP_ATTR_PERMISSIONS)) != (LIBSSH2_SFTP_ATTR_SIZE | LIBSSH2_SFTP_ATTR_PERMISSIONS) ||
+      (openedAttributes.permissions & LIBSSH2_SFTP_S_IFMT) != LIBSSH2_SFTP_S_IFREG ||
+      (openedAttributes.permissions & 0077) != 0 ||
+      openedAttributes.filesize != attributes.filesize)
+  {
+    if (failure)
+    {
+      if (fstatResult != 0)
+      {
+        failure->snprintf<"failed to fstat opened remote file {} result={itoa} sftpErr={itoa}"_ctv>(remotePath, int64_t(fstatResult), uint64_t(libssh2_sftp_last_error(sftp)));
+      }
+      else
+      {
+        failure->snprintf<"opened remote file {} changed type, permissions, or size after lstat"_ctv>(remotePath);
+      }
+    }
+    (void)libssh2_sftp_close(handle);
+    (void)libssh2_sftp_shutdown(sftp);
+    return false;
+  }
+
+  int localFd = ::open(localPathText.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+  if (localFd < 0)
+  {
+    if (failure)
+    {
+      failure->snprintf<"failed to securely create local file {} errno={itoa}"_ctv>(localPath, int64_t(errno));
+    }
+    (void)libssh2_sftp_close(handle);
+    (void)libssh2_sftp_shutdown(sftp);
+    return false;
+  }
+
+  bool success = true;
+  uint64_t downloadedBytes = 0;
+  ssize_t lastReadResult = 0;
+  int localWriteError = 0;
+  char buffer[64_KB];
+  while (success)
+  {
+    ssize_t readResult = libssh2_sftp_read(handle, buffer, sizeof(buffer));
+    if (readResult == LIBSSH2_ERROR_EAGAIN)
+    {
+      if (waitForRetry("reading") == false)
+      {
+        lastReadResult = readResult;
+        success = false;
+      }
+      continue;
+    }
+    if (readResult < 0)
+    {
+      lastReadResult = readResult;
+      success = false;
+      break;
+    }
+    if (readResult == 0)
+    {
+      break;
+    }
+
+    const size_t readBytes = size_t(readResult);
+    if (readBytes > maximumByteCount - downloadedBytes)
+    {
+      lastReadResult = readResult;
+      success = false;
+      if (failure)
+      {
+        failure->snprintf<"remote file {} exceeded maximum byte count {itoa} while reading"_ctv>(remotePath, maximumByteCount);
+      }
+      break;
+    }
+
+    size_t written = 0;
+    while (written < readBytes)
+    {
+      ssize_t writeResult = ::write(localFd, buffer + written, readBytes - written);
+      if (writeResult > 0)
+      {
+        written += size_t(writeResult);
+        continue;
+      }
+      if (writeResult < 0 && errno == EINTR)
+      {
+        continue;
+      }
+      localWriteError = writeResult < 0 ? errno : EIO;
+      success = false;
+      break;
+    }
+    downloadedBytes += readBytes;
+  }
+
+  if (success && expectedByteCount != nullptr && downloadedBytes != *expectedByteCount)
+  {
+    success = false;
+    if (failure)
+    {
+      failure->snprintf<"remote file {} changed size while downloading expected={itoa} actual={itoa}"_ctv>(remotePath, *expectedByteCount, downloadedBytes);
+    }
+  }
+  if (success && downloadedBytes != attributes.filesize)
+  {
+    success = false;
+    if (failure)
+    {
+      failure->snprintf<"remote file {} changed size while downloading expected={itoa} actual={itoa}"_ctv>(remotePath, attributes.filesize, downloadedBytes);
+    }
+  }
+  if (success && ::fsync(localFd) != 0)
+  {
+    localWriteError = errno;
+    success = false;
+  }
+
+  const int closeResult = ::close(localFd);
+  if (success && closeResult != 0)
+  {
+    localWriteError = errno;
+    success = false;
+  }
+  (void)libssh2_sftp_close(handle);
+  (void)libssh2_sftp_shutdown(sftp);
+
+  if (success == false)
+  {
+    (void)::unlink(localPathText.c_str());
+    if (failure && failure->size() == 0)
+    {
+      failure->snprintf<"failed to download remote file {} readResult={itoa} localWriteErr={itoa} sessionErr={itoa}"_ctv>(remotePath, int64_t(lastReadResult), int64_t(localWriteError), int64_t(libssh2_session_last_errno(session)));
+    }
+  }
+  return success;
+}
+
 class ProdigyRemoteBootstrapPlan {
 public:
 
@@ -1252,6 +1544,7 @@ public:
   String remoteBootJSONPath;
   String mkdirCommand;
   String installCommand;
+  String recoveryFreshGuestCommand;
   String stopCommand;
   String systemdUnit;
   String remoteTransportTLSJSONPath;
@@ -2732,6 +3025,13 @@ public:
       prodigyLogRemoteBootstrapStep("ok", "resolve-bundle", prepared.plan, &bundleDetail);
       phase = Phase::running;
 
+      if (!prepared.plan.recoveryFreshGuestCommand.empty())
+      {
+        suspendIndex = nextSuspendIndex();
+        runCommandStep("recovery-fresh-guest", prepared.plan.recoveryFreshGuestCommand);
+        if (suspendIndex < nextSuspendIndex()) co_await suspendAtIndex(suspendIndex);
+        if (done) co_return;
+      }
       suspendIndex = nextSuspendIndex();
       uploadFileStep("upload-stage-payload", prepared.localStagePayloadPath, prepared.plan.remoteStagePayloadPath, 0600);
       if (suspendIndex < nextSuspendIndex())
@@ -3142,6 +3442,12 @@ static inline bool prodigyExecutePreparedRemoteBootstrapPlanBlocking(ProdigyPrep
   bundleDetail.snprintf<"localBundle={} bytes={itoa} sha256={}"_ctv>(prepared.plan.localBundlePath, prepared.bundleBytes, prepared.bundleSHA256);
   prodigyLogRemoteBootstrapStep("ok", "resolve-bundle", prepared.plan, &bundleDetail);
 
+  if (!prepared.plan.recoveryFreshGuestCommand.empty() &&
+      !prodigyRunBlockingSSHCommand(session, fd, prepared.plan.recoveryFreshGuestCommand, failure, 120'000))
+  {
+    return fail("recovery-fresh-guest", session, fd);
+  }
+
   String uploadDetail = {};
   uploadDetail.snprintf<"local={} remote={} bytes={itoa} mode={itoa}"_ctv>(
       prepared.localStagePayloadPath,
@@ -3166,6 +3472,29 @@ static inline bool prodigyExecutePreparedRemoteBootstrapPlanBlocking(ProdigyPrep
   prodigyCloseBlockingSSHSession(session, fd);
   cleanup();
   return true;
+}
+
+// Recovery is permitted only before any Prodigy installation or persistent state exists.
+static inline void prodigyRequireFreshRemoteBootstrapGuest(ProdigyRemoteBootstrapPlan& plan)
+{
+  String& command = plan.recoveryFreshGuestCommand;
+  command.assign("set -eu; test \"$(systemctl show prodigy.service --property=LoadState --value)\" = not-found; "_ctv);
+  for (const String *path : {&plan.installPaths.installRoot, &plan.installPaths.installRootTemp,
+                             &plan.installPaths.installRootPrevious, &plan.remoteUnitPath,
+                             &plan.remoteStagePayloadPath})
+  {
+    command.append("test ! -e "_ctv); prodigyAppendShellSingleQuoted(command, *path);
+    command.append("; test ! -L "_ctv); prodigyAppendShellSingleQuoted(command, *path);
+    command.append("; "_ctv);
+  }
+  for (const char *suffix : {"/var/lib/prodigy", "/containers", "/etc/systemd/system/prodigy.service.d"})
+  {
+    String path = {}; path.assign(suffix);
+    command.append("test ! -e "_ctv); prodigyAppendShellSingleQuoted(command, path);
+    command.append("; test ! -L "_ctv); prodigyAppendShellSingleQuoted(command, path);
+    command.append("; "_ctv);
+  }
+  command.append("if pgrep -x prodigy >/dev/null 2>&1; then exit 1; else test $? -eq 1; fi"_ctv);
 }
 
 static inline bool prodigyExecuteRemoteBootstrapPlan(const ProdigyRemoteBootstrapPlan& plan, String *failure = nullptr)

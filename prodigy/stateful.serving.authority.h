@@ -116,8 +116,39 @@ static inline bool prodigyValidateStatefulServingAuthority(
   if (authority.deploymentID == 0 || authority.applicationID == 0 || authority.revision == 0 ||
       authority.revision > generation || authority.targetConfig.deploymentID() != authority.deploymentID ||
       authority.targetConfig.applicationID != authority.applicationID ||
-      uint8_t(authority.phase) > uint8_t(StatefulWorkerTopologyUpgradePhase::applicationDataAuthority)) return false;
+      uint8_t(authority.phase) > uint8_t(StatefulWorkerTopologyUpgradePhase::initialAllMastersSeedBootstrap)) return false;
   const bool application = authority.phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority;
+  const bool initial = authority.phase == StatefulWorkerTopologyUpgradePhase::initialAllMastersSeedBootstrap;
+  const bool bootstrap = authority.phase == StatefulWorkerTopologyUpgradePhase::allMastersSeedBootstrap || initial;
+  if (initial) {
+    const auto& scope = authority.initialAllMastersSeedBootstrap;
+    StatefulTopology topology; topology.servingMode = StatefulTopologyServingMode::allMastersSeedBootstrap;
+    topology.shardGroup = scope.bootstrap.shardGroup; topology.allMastersSeedBootstrap = scope.bootstrap;
+    if (!authority.allMasters || authority.applicationID < 2 || authority.applicationID > 5 ||
+        !prodigyStatefulTopologyIsAllMastersSeedBootstrap(topology) || scope.baselineOperationUUID == 0 ||
+        scope.bootstrap.targetDeploymentID != authority.deploymentID || scope.nShardGroups == 0 || scope.nShardGroups > UINT16_MAX ||
+        ((authority.applicationID == 2 || authority.applicationID == 5) && scope.nShardGroups != 1) ||
+        scope.bootstrap.shardGroup >= scope.nShardGroups || !prodigyIsSHA256HexDigest(scope.planSHA256) ||
+        !prodigyIsSHA256HexDigest(scope.artifactSHA256) || scope.artifactSHA256 != authority.targetConfig.containerBlobSHA256 ||
+        scope.artifactBytes == 0 || scope.artifactBytes != authority.targetConfig.containerBlobBytes || authority.members.size() > 3) return false;
+  }
+  if (bootstrap && !initial) {
+    StatefulTopology topology; topology.servingMode = StatefulTopologyServingMode::allMastersSeedBootstrap;
+    topology.shardGroup = authority.allMastersSeedBootstrap.shardGroup;
+    topology.allMastersSeedBootstrap = authority.allMastersSeedBootstrap;
+    const auto& scope = authority.qualificationCancellation;
+    if (!authority.allMasters || authority.applicationID < 2 || authority.applicationID > 5 ||
+        !prodigyStatefulTopologyIsAllMastersSeedBootstrap(topology) ||
+        !prodigyQualificationStatefulCancellationValid(scope) ||
+        scope.sourceClusterUUID != authority.allMastersSeedBootstrap.sourceClusterUUID ||
+        scope.qualificationRunUUID != authority.allMastersSeedBootstrap.qualificationRunUUID ||
+        scope.successorOperationUUID != authority.allMastersSeedBootstrap.successorOperationUUID ||
+        authority.allMastersSeedBootstrap.targetDeploymentID != authority.deploymentID ||
+        scope.request.applicationID != authority.applicationID ||
+        scope.request.successorVersionID != (authority.deploymentID & ((uint64_t(1) << 48) - 1)) ||
+        scope.members.size() % 3 != 0 || authority.allMastersSeedBootstrap.shardGroup >= scope.members.size() / 3 ||
+        authority.members.size() > 3) return false;
+  }
   if (application &&
       ((authority.applicationID != 3 && authority.applicationID != 4) || authority.allMasters ||
        !prodigyStatefulDataAuthorityValid(authority.dataAuthority) || !prodigyIsSHA256HexDigest(authority.pairIntentSHA256) ||
@@ -132,15 +163,15 @@ static inline bool prodigyValidateStatefulServingAuthority(
 
   if ((authority.phase == StatefulWorkerTopologyUpgradePhase::none &&
        (authority.operationID == 0 || authority.sourceEpoch == 0 || authority.targetEpoch == 0)) ||
-      (!application && authority.phase != StatefulWorkerTopologyUpgradePhase::none &&
+      (!application && !bootstrap && authority.phase != StatefulWorkerTopologyUpgradePhase::none &&
        (authority.operationID == 0 || authority.sourceEpoch == 0 || authority.targetEpoch == 0 ||
         authority.sourceEpoch == authority.targetEpoch))) return false;
   if (payload.size() != authority.members.size()) return false;
   if (authority.sourceRetired && (!application ||
       (!prodigyStatefulDataAuthoritySourceNonwriter(authority.dataAuthority) && authority.dataAuthority.mode != StatefulDataAuthorityMode::catchupOnly) ||
       !authority.members.empty())) return false;
-  if (authority.members.empty()) return application &&
-      (authority.dataAuthority.mode == StatefulDataAuthorityMode::catchupOnly || authority.sourceRetired);
+  if (authority.members.empty()) return bootstrap || (application &&
+      (authority.dataAuthority.mode == StatefulDataAuthorityMode::catchupOnly || authority.sourceRetired));
 
   const ProdigyStatefulServingAuthorityMember *previous = nullptr;
   bytell_hash_set<uint128_t> memberUUIDs = {};
@@ -185,6 +216,16 @@ static inline bool prodigyValidateStatefulServingAuthority(
         prodigyStatefulServingApplicationConfigEqual(plan.config, authority.targetConfig) == false) return false;
     const StatefulTopology& topology = plan.statefulTopology;
     if (topology.shardGroup != member->shardGroup) return false;
+    if (bootstrap) {
+      const auto& binding = initial ? authority.initialAllMastersSeedBootstrap.bootstrap : authority.allMastersSeedBootstrap;
+      // Bootstrap listeners use their serialized client advertisement. Private
+      // listener declarations belong to applicationDataAuthority plans only.
+      if (member->isSource || member->shardGroup != binding.shardGroup ||
+          !prodigyStatefulTopologyIsAllMastersSeedBootstrap(topology) ||
+          !(topology.allMastersSeedBootstrap == binding) ||
+          !advertised || plan.advertisements.at(plan.statefulMeshRoles.client).port < 1024) return false;
+      continue;
+    }
     if (application) {
       const bool source = authority.dataAuthority.localClusterUUID == authority.dataAuthority.sourceClusterUUID;
       if (member->isSource != source || member->shardGroup != authority.dataAuthority.shardGroup ||
@@ -226,7 +267,10 @@ static inline bool prodigyValidateStatefulServingAuthority(
   {
     const uint32_t sources = sourceCounts[shard], targets = targetCounts[shard];
     const uint32_t clients = authority.allMasters ? 3u : 1u;
-    if (application) {
+    if (bootstrap) {
+      if (sources != 0 || targets > 3) return false;
+    }
+    else if (application) {
       const bool source = authority.dataAuthority.localClusterUUID == authority.dataAuthority.sourceClusterUUID;
       const bool serving = authority.dataAuthority.mode == StatefulDataAuthorityMode::writeOwner ||
           (authority.dataAuthority.mode == StatefulDataAuthorityMode::retainedSource &&

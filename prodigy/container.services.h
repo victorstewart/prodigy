@@ -165,8 +165,9 @@ static inline bool prodigyBuildContainerServiceDefinitions(
   auto addAdvertisement = [&](uint64_t service, ContainerState startAt) {
     definitions.advertisements.emplace_back(service, startAt, ContainerState::destroying, 0);
   };
-  auto addSubscription = [&](uint64_t service, ContainerState startAt, ContainerState stopAt) {
-    definitions.subscriptions.emplace_back(service, startAt, stopAt, SubscriptionNature::all);
+  auto addSubscription = [&](uint64_t service, ContainerState startAt, ContainerState stopAt,
+                             SubscriptionNature nature = SubscriptionNature::all) {
+    definitions.subscriptions.emplace_back(service, startAt, stopAt, nature);
   };
   addAdvertisement(context.roles.sibling, ContainerState::scheduled);
   addAdvertisement(context.roles.seeding, ContainerState::healthy);
@@ -182,15 +183,23 @@ static inline bool prodigyBuildContainerServiceDefinitions(
   addSubscription(context.roles.sibling, ContainerState::scheduled, ContainerState::destroying);
   if (context.roles.topologyBridge != 0 && prodigyStatefulTopologyShouldSubscribeBridge(context.topology))
     addSubscription(context.roles.topologyBridge, ContainerState::scheduled, ContainerState::destroying);
-  if (context.seedingAlways)
-    addSubscription(context.roles.seeding, ContainerState::scheduled, ContainerState::destroying);
+  // Bootstrap starts with an empty store, then pulls its authorized source cut
+  // after ordinary readiness. Keep that direct remote route available without
+  // creating local legacy-seeding fan-out among bootstrap replicas.
+  const bool allMastersBootstrap = prodigyStatefulTopologyIsAllMastersSeedBootstrap(context.topology);
+  const bool seedingRequired = context.seedingAlways || allMastersBootstrap;
+  const SubscriptionNature seedingNature =
+      allMastersBootstrap && context.dataStrategy == DataStrategy::genesis && !context.seedingAlways
+          ? SubscriptionNature::none : SubscriptionNature::all;
+  if (seedingRequired)
+    addSubscription(context.roles.seeding, ContainerState::scheduled, ContainerState::destroying, seedingNature);
   switch (context.dataStrategy) {
     case DataStrategy::genesis:
     case DataStrategy::none:
       break;
     case DataStrategy::changelog: // Keep seeding available for a full recovery.
     case DataStrategy::seeding:
-      if (!context.seedingAlways)
+      if (!seedingRequired)
         addSubscription(context.roles.seeding, ContainerState::scheduled, ContainerState::destroying);
       break;
     case DataStrategy::sharding:

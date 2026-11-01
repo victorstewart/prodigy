@@ -24,13 +24,15 @@ static inline bool mothershipParseLocalCousinPermissionJSON(
     "permissionUUID", "pairUUID", "logicalWorkloadUUID", "logicalServiceUUID",
     "localClusterUUID", "peerClusterUUID", "localHalf", "localApplicationID",
     "peerApplicationID", "localCousinServicePrefix", "peerCousinServicePrefix",
-    "slots", "localDeploymentID", "canonicalPlanSHA256", "artifactSHA256", "artifactBytes"
+    "slots", "localDeploymentID", "canonicalPlanSHA256", "artifactSHA256", "artifactBytes",
+    "protocolVersion", "purpose", "peerDeploymentID", "peerCanonicalPlanSHA256", "peerArtifactSHA256",
+    "peerArtifactBytes", "authorizedService", "transportSourcePolicy", "destinationShardGroup", "destinationShardGroups"
   };
   uint32_t seen = 0;
   for (auto field : document.get_object()) {
     uint32_t index = 0;
-    while (index < 16 && names[index] != field.key) ++index;
-    if (index == 16 || (seen & (uint32_t(1) << index))) return reject();
+    while (index < 26 && names[index] != field.key) ++index;
+    if (index == 26 || (seen & (uint32_t(1) << index))) return reject();
     seen |= uint32_t(1) << index;
     if (index <= 5) {
       std::string_view value;
@@ -58,14 +60,30 @@ static inline bool mothershipParseLocalCousinPermissionJSON(
         permission.slots.insert(uint16_t(slot));
       }
       if (count == 0) return reject();
-    } else if (index == 13 || index == 14) {
+    } else if (index == 17 || index == 23) {
+      std::string_view value;
+      if (field.value.get(value) != simdjson::SUCCESS) return reject();
+      if (index == 17) {
+        if (value == "stateful-cousin") permission.purpose = ProdigyCousinServicePurpose::statefulCousin;
+        else if (value == "client-authority") permission.purpose = ProdigyCousinServicePurpose::clientAuthority;
+        else if (value == "sibling") permission.purpose = ProdigyCousinServicePurpose::sibling;
+        else if (value == "seeding") permission.purpose = ProdigyCousinServicePurpose::seeding;
+        else return reject();
+      } else {
+        if (value == "exact") permission.transportSourcePolicy = ProdigyCousinTransportSourcePolicy::exact;
+        else if (value == "authenticated-NAT") permission.transportSourcePolicy = ProdigyCousinTransportSourcePolicy::authenticatedNAT;
+        else return reject();
+      }
+    } else if (index == 13 || index == 14 || index == 19 || index == 20) {
       std::string_view value;
       if (field.value.get(value) != simdjson::SUCCESS || value.size() != 64) return reject();
       String text; text.setInvariant(value.data(), value.size());
-      (index == 13 ? permission.canonicalPlanSHA256 : permission.artifactSHA256).assign(text);
+      String *targets[] = {&permission.canonicalPlanSHA256, &permission.artifactSHA256,
+        &permission.peerCanonicalPlanSHA256, &permission.peerArtifactSHA256};
+      targets[index == 13 ? 0 : index == 14 ? 1 : index == 19 ? 2 : 3]->assign(text);
     } else {
       uint64_t value = 0;
-      if (field.value.get(value) != simdjson::SUCCESS || value == 0) return reject();
+      if (field.value.get(value) != simdjson::SUCCESS || (value == 0 && index < 24)) return reject();
       if (index == 7 || index == 8) {
         if (value > UINT16_MAX) return reject();
         (index == 7 ? permission.localApplicationID : permission.peerApplicationID) = uint16_t(value);
@@ -73,10 +91,23 @@ static inline bool mothershipParseLocalCousinPermissionJSON(
       else if (index == 10) permission.peerCousinServicePrefix = value;
       else if (index == 12) permission.localDeploymentID = value;
       else if (index == 15) permission.artifactBytes = value;
+      else if (index == 16) {
+        if (value != ProdigyLocalCousinServicePermission::purposeVersion) return reject();
+        permission.protocolVersion = uint32_t(value);
+      }
+      else if (index == 18) permission.peerDeploymentID = value;
+      else if (index == 21) permission.peerArtifactBytes = value;
+      else if (index == 22) permission.authorizedService = value;
+      else if (index == 24 || index == 25) {
+        if (value > UINT16_MAX) return reject();
+        (index == 24 ? permission.destinationShardGroup : permission.destinationShardGroups) = uint16_t(value);
+      }
     }
   }
   permission.generation = 1;
   permission.state = ProdigyLocalCousinServicePermissionState::active;
-  if (seen != 0xffff || !prodigyLocalCousinServicePermissionValid(permission, false)) return reject();
+  if ((seen != 0xffff && seen != 0x3ffffff) ||
+      (seen == 0x3ffffff && permission.protocolVersion != ProdigyLocalCousinServicePermission::purposeVersion) ||
+      !prodigyLocalCousinServicePermissionValid(permission, false)) return reject();
   return true;
 }

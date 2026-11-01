@@ -1,4 +1,5 @@
 #include <prodigy/containerstore.h>
+#include <prodigy/artifact.io.h>
 #include <prodigy/container.device.map.h>
 #include <prodigy/iaas/iaas.h>
 #include <prodigy/machine.hardware.types.h>
@@ -156,6 +157,15 @@ public:
     {
       return false;
     }
+    if (admissionGeneration != containerLaunchControlGeneration)
+    {
+      // The old worker owns its private cgroup/rootfs until its scope has
+      // completed cleanup.  Keep the UUID reserved after that drain so an
+      // authenticated replacement replay can start only once it is safe.
+      found->second = 0;
+      pendingContainerLaunchDrained(uuid);
+      return true;
+    }
     pendingContainerLaunchPlans.erase(uuid);
     pendingContainerLaunchGenerations.erase(found);
     return true;
@@ -164,6 +174,26 @@ public:
   bool isPendingContainerLaunch(uint128_t uuid) const
   {
     return pendingContainerLaunchPlans.contains(uuid);
+  }
+
+  bool pendingContainerLaunchIsDrained(uint128_t uuid) const
+  {
+    auto found = pendingContainerLaunchGenerations.find(uuid);
+    return found != pendingContainerLaunchGenerations.end() && found->second == 0 &&
+           pendingContainerLaunchPlans.contains(uuid);
+  }
+
+  bool rebindPendingContainerLaunchForStateUploadRestore(uint128_t uuid,
+                                                         uint64_t admissionGeneration)
+  {
+    auto found = pendingContainerLaunchGenerations.find(uuid);
+    if (admissionGeneration == 0 || found == pendingContainerLaunchGenerations.end() ||
+        found->second != admissionGeneration || pendingContainerLaunchPlans.contains(uuid) == false)
+    {
+      return false;
+    }
+    found->second = containerLaunchControlGeneration;
+    return true;
   }
 
   bool pendingContainerLaunchIsCurrent(uint128_t uuid, uint64_t admissionGeneration) const
@@ -199,20 +229,48 @@ public:
     return terminalContainerLaunchUUIDs.contains(uuid);
   }
 
-  void resetContainerLaunchControlGeneration(void)
+  void resetContainerLaunchControlGeneration(bool preservePendingLaunches = false)
   {
     containerLaunchControlGeneration += 1;
     if (containerLaunchControlGeneration == 0)
     {
       containerLaunchControlGeneration = 1;
     }
-    pendingContainerLaunchPlans.clear();
-    pendingContainerLaunchGenerations.clear();
-    terminalContainerLaunchUUIDs.clear();
+    if (preservePendingLaunches == false)
+    {
+      pendingContainerLaunchPlans.clear();
+      pendingContainerLaunchGenerations.clear();
+      terminalContainerLaunchUUIDs.clear();
+    }
+  }
+
+  // The old worker has drained its cgroup/rootfs cleanup.  Only the
+  // authenticated replacement state-upload path may release this reservation
+  // and issue the canonical replay.
+  bool handoffDrainedPendingContainerLaunchForAuthenticatedReplay(uint128_t uuid)
+  {
+    auto found = pendingContainerLaunchGenerations.find(uuid);
+    if (found == pendingContainerLaunchGenerations.end() || found->second != 0 ||
+        terminalContainerLaunchUUIDs.contains(uuid))
+    {
+      return false;
+    }
+    pendingContainerLaunchPlans.erase(uuid);
+    pendingContainerLaunchGenerations.erase(found);
+    return true;
   }
 
   virtual void pushContainer(Container *container) = 0;
   virtual void popContainer(Container *container) = 0;
+  virtual void pendingContainerLaunchDrained(uint128_t) {}
+  // Called in the isolated child immediately before exec. Secrets are resolved
+  // from the live, exact-scope Vault cache, never from a serialized plan.
+  virtual bool prepareCrossClusterMasqueGatewayExec(const ContainerPlan&,
+      Vector<String>&, Vector<int32_t>&, String *failure = nullptr)
+  {
+    if (failure) failure->assign("MASQUE launch credentials are unavailable"_ctv);
+    return false;
+  }
   virtual bool ensureHostNetworkingReady(String *failureReport = nullptr) = 0;
 
   virtual void downloadContainer(CoroutineStack *coro, uint64_t deploymentID) = 0;
@@ -297,6 +355,11 @@ public:
 
   virtual void ensureDeferredHardwareInventoryProgress(void)
   {
+  }
+
+  virtual ProdigyArtifactIO *containerArtifactIO(void)
+  {
+    return nullptr;
   }
 
   virtual bool quiesceArtifactIOForBundleExec(void)

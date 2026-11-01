@@ -80,7 +80,14 @@ fn remote_add_upsert_replaces_host_and_prefix() {
 
     let first_add = Command::new(binary)
         .current_dir(temp.path())
-        .args(["remote", "add", "dockerhub", "docker.io", "--prefix", "library"])
+        .args([
+            "remote",
+            "add",
+            "dockerhub",
+            "docker.io",
+            "--prefix",
+            "library",
+        ])
         .output()
         .unwrap();
     assert!(

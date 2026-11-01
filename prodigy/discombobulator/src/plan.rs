@@ -11,6 +11,7 @@ pub enum OutputKind {
     App,
     Base,
     MothershipTunnelProvider,
+    CrossClusterMasqueGateway,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -243,6 +244,7 @@ pub fn resolve_build_spec(
     if let Some(label) = match output_kind {
         OutputKind::App => Some("app"),
         OutputKind::MothershipTunnelProvider => Some("mothership tunnel provider"),
+        OutputKind::CrossClusterMasqueGateway => Some("cross-cluster MASQUE gateway"),
         OutputKind::Base => None,
     } {
         if execute.is_none() {

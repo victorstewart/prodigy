@@ -44,6 +44,12 @@ public:
   bool collectOptionalBenchmarks = true;
 };
 
+enum class MachineNicSubnetKernelOnLinkRoute : uint8_t {
+  unknown = 0,
+  absent = 1,
+  present = 2
+};
+
 static inline int64_t prodigyMonotonicNs(void)
 {
   struct timespec ts = {};
@@ -444,7 +450,7 @@ static inline bool prodigyResolveSystemToolPath(const String& toolName, String& 
   prodigyAppendMachineHardwareShellSingleQuoted(command, inner);
 
   String output = {};
-  if (prodigyRunBlockingLocalCommandCaptureStdout(command, output) == false)
+  if (prodigyRunBlockingLocalCommandCaptureStdout(command, output, nullptr, nullptr) == false)
   {
     return false;
   }
@@ -555,7 +561,7 @@ static inline bool prodigyResolveOfficialSpeedtestCommand(String& toolCommand)
   prodigyAppendMachineHardwareShellSingleQuoted(versionCommand, inner);
 
   String versionOutput = {};
-  if (prodigyRunBlockingLocalCommandCaptureStdout(versionCommand, versionOutput) == false || prodigyStringContains(versionOutput, "Speedtest by Ookla") == false)
+  if (prodigyRunBlockingLocalCommandCaptureStdout(versionCommand, versionOutput, nullptr, nullptr) == false || prodigyStringContains(versionOutput, "Speedtest by Ookla") == false)
   {
     return false;
   }
@@ -2536,7 +2542,7 @@ static inline void prodigyCollectPciDescriptions(Vector<ProdigyPciDescription>& 
   prodigyAppendMachineHardwareShellSingleQuoted(command, "if command -v lspci >/dev/null 2>&1; then lspci -D -mm; else exit 127; fi"_ctv);
 
   String output = {};
-  if ((captures && prodigyRunRecordedLocalCommand("lspci"_ctv, "inventory"_ctv, command, *captures, output) == false) || (captures == nullptr && prodigyRunBlockingLocalCommandCaptureStdout(command, output) == false))
+  if ((captures && prodigyRunRecordedLocalCommand("lspci"_ctv, "inventory"_ctv, command, *captures, output) == false) || (captures == nullptr && prodigyRunBlockingLocalCommandCaptureStdout(command, output, nullptr, nullptr) == false))
   {
     return;
   }
@@ -2899,6 +2905,99 @@ static inline bool prodigyPopulateNicSubnetsFromJSON(Vector<MachineNicHardwarePr
   return true;
 }
 
+static inline MachineNicSubnetKernelOnLinkRoute prodigyKernelOnLinkIPv6RouteForSubnet(
+    const MachineNetworkHardwareProfile& network,
+    const MachineNicHardwareProfile& nic,
+    const MachineNicSubnetHardwareProfile& subnet)
+{
+  if (subnet.address.is6 == false)
+  {
+    return MachineNicSubnetKernelOnLinkRoute::absent;
+  }
+
+  bool capturedRouteTable = false;
+  for (const MachineToolCapture& capture : network.captures)
+  {
+    if (capture.tool.equal("ip"_ctv) == false || capture.phase.equal("route-show-ipv6"_ctv) == false || capture.succeeded == false)
+    {
+      continue;
+    }
+
+    simdjson::dom::parser routeParser;
+    simdjson::dom::element routeDoc;
+    if (routeParser.parse(capture.output.data(), capture.output.size()).get(routeDoc) ||
+        routeDoc.type() != simdjson::dom::element_type::ARRAY)
+    {
+      continue;
+    }
+    capturedRouteTable = true;
+
+    for (simdjson::dom::element route : routeDoc.get_array())
+    {
+      String ifname = {};
+      String destination = {};
+      String routeType = {};
+      simdjson::dom::element value;
+      if (route["dev"].get(value) == simdjson::SUCCESS && value.type() == simdjson::dom::element_type::STRING)
+      {
+        ifname.assign(value.get_c_str());
+      }
+      if (route["dst"].get(value) == simdjson::SUCCESS && value.type() == simdjson::dom::element_type::STRING)
+      {
+        destination.assign(value.get_c_str());
+      }
+      if (route["type"].get(value) == simdjson::SUCCESS && value.type() == simdjson::dom::element_type::STRING)
+      {
+        routeType.assign(value.get_c_str());
+      }
+
+      // `ip -j route` omits type for ordinary unicast routes. A connected
+      // prefix can be installed by kernel, RA, or static configuration, so
+      // protocol is provenance rather than reachability.
+      simdjson::dom::element gateway;
+      if (ifname.size() == 0 || destination.size() == 0 ||
+          (routeType.size() > 0 && routeType.equal("unicast"_ctv) == false) ||
+          route["gateway"].get(gateway) == simdjson::SUCCESS)
+      {
+        continue;
+      }
+
+      const char *slash = std::strrchr(destination.c_str(), '/');
+      if (slash == nullptr)
+      {
+        continue;
+      }
+
+      String networkText = {};
+      networkText.assign(destination.c_str(), uint64_t(slash - destination.c_str()));
+      IPPrefix routePrefix = {};
+      if (prodigyParseIPAddressLiteral(networkText, routePrefix.network) == false || routePrefix.network.is6 == false)
+      {
+        continue;
+      }
+      char *prefixEnd = nullptr;
+      errno = 0;
+      const unsigned long prefixLength = std::strtoul(slash + 1, &prefixEnd, 10);
+      if (prefixEnd == slash + 1 || *prefixEnd != '\0' || errno != 0 || prefixLength > 128)
+      {
+        continue;
+      }
+      routePrefix.cidr = uint8_t(prefixLength);
+      if (routePrefix.equals(routePrefix.canonicalized()) == false)
+      {
+        continue;
+      }
+
+      if (nic.name.equals(ifname) && subnet.subnet.equals(routePrefix))
+      {
+        return MachineNicSubnetKernelOnLinkRoute::present;
+      }
+    }
+  }
+
+  return capturedRouteTable ? MachineNicSubnetKernelOnLinkRoute::absent : MachineNicSubnetKernelOnLinkRoute::unknown;
+}
+
 static inline bool prodigyApplyNicDefaultRouteSource(
     Vector<MachineNicHardwareProfile>& nics,
     const Vector<ProdigyNicGatewayMapping>& defaultGateways,
@@ -3097,7 +3196,6 @@ static inline bool prodigyCollectNicSubnets(Vector<MachineNicHardwareProfile>& n
   {
     return false;
   }
-
   auto collectDefaultRouteSource = [&](bool is6, const String& destination, const String& phase) -> void {
     String inner = {};
     inner.append("ip -j "_ctv);

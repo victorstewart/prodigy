@@ -280,6 +280,14 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
     case MothershipTopic::statefulDataAuthority:
       return consumeVariableBounded(cursor, terminal, 2 * 1024 * 1024) &&
              (cursor == terminal || consumeVariable(cursor, terminal)) && cursor == terminal;
+    case MothershipTopic::statefulStoreProofRecovery:
+    case MothershipTopic::statefulStoreSourceCut:
+      return consumeVariableBounded(cursor, terminal, 4096) && cursor == terminal;
+    case MothershipTopic::applyNametagAllMastersSeedAuthority:
+      return consumeVariableBounded(cursor, terminal, 4096) && cursor == terminal;
+    case MothershipTopic::nametagQualification:
+    case MothershipTopic::crossClusterPathFault:
+      return consumeVariableBounded(cursor, terminal, 4096) && cursor == terminal;
     case MothershipTopic::configure:
     case MothershipTopic::upsertMachineSchemas:
     case MothershipTopic::deltaMachineBudget:
@@ -394,9 +402,22 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
     case MothershipTopic::pullTransportCredentialLifecycle:
     case MothershipTopic::commitCousinRoute:
     case MothershipTopic::pullCousinRoute:
+    case MothershipTopic::pullCrossClusterMasqueGatewayAuthority:
+    case MothershipTopic::pullCrossClusterMasqueGatewayReadiness:
+    case MothershipTopic::pullCrossClusterPrivateBGPWithdrawalReceipt:
       {
         String encoded;
         return extractVariableStringView(cursor, terminal, encoded) && encoded.size() <= 4096 && cursor == terminal;
+      }
+    case MothershipTopic::commitCrossClusterMasqueGatewayAuthority:
+      {
+        String encoded;
+        // The first argument remains the small typed authority request.  The
+        // second is the verified Discombobulator artifact bound to that same
+        // commit.  The enclosing control-frame limit is the artifact bound.
+        return extractVariableStringView(cursor, terminal, encoded) &&
+            encoded.size() <= 4096 && consumeVariable(cursor, terminal) &&
+            cursor == terminal;
       }
     case MothershipTopic::pullUpgradeAdmissionReport:
       {
@@ -500,7 +521,14 @@ static bool validateBrainPayload(uint16_t rawTopic, uint8_t *args, uint8_t *term
       }
     case BrainTopic::replicateSystemContainerArtifact:
       {
+        uint8_t rawKind = 0;
         uint64_t bytes = 0;
+        if (extractFixed(cursor, terminal, rawKind) == false ||
+            (rawKind != uint8_t(SystemContainerKind::mothershipTunnelProvider) &&
+             rawKind != uint8_t(SystemContainerKind::crossClusterMasqueGateway)))
+        {
+          return false;
+        }
         if (consumeVariable(cursor, terminal) == false)
         {
           return false;
@@ -738,6 +766,19 @@ static bool validateNeuronPayloadForBrain(uint16_t rawTopic, uint8_t *args, uint
 
   switch (NeuronTopic(rawTopic))
   {
+    case NeuronTopic::nametagQualificationMachineBoot:
+      return consumeVariableBounded(cursor, terminal, 1024) && cursor == terminal;
+    case NeuronTopic::crossClusterPathFault:
+      return consumeVariableBounded(cursor, terminal, 4096) && cursor == terminal;
+    case NeuronTopic::crossClusterMasqueGatewayReadinessReceipt:
+      { String encoded = {}; return extractVariableStringView(cursor, terminal, encoded) && encoded.size() <= 512 && cursor == terminal; }
+    case NeuronTopic::crossClusterPrivateBGPReadinessReceipt:
+      { String encoded = {}; return extractVariableStringView(cursor, terminal, encoded) && encoded.size() <= 1024 && cursor == terminal; }
+    case NeuronTopic::nametagQualificationWriterIsolation:
+    case NeuronTopic::nametagQualificationCousinTransport:
+    case NeuronTopic::nametagQualificationReplay:
+    case NeuronTopic::nametagQualificationSeedFault:
+    case NeuronTopic::statefulStoreSourceCut:
     case NeuronTopic::statefulDataAuthority:
       {
         uint128_t containerUUID = 0;
@@ -753,6 +794,12 @@ static bool validateNeuronPayloadForBrain(uint16_t rawTopic, uint8_t *args, uint
       }
     case NeuronTopic::cousinSessionControlReceipt:
     case NeuronTopic::cousinAdmissionAck:
+    case NeuronTopic::app6TruthMeshReceipt:
+    case NeuronTopic::statefulStoreReceipt:
+    case NeuronTopic::statefulStoreProofRecovery:
+    case NeuronTopic::nametagQualificationApplicationReceipt:
+    case NeuronTopic::nametagHandoffBarrier:
+    case NeuronTopic::nametagSourceBaseline:
       return consumeVariableBounded(cursor, terminal, ProdigyCousinSessionMaximumBytes) && cursor == terminal;
     case NeuronTopic::registration:
       {
@@ -790,13 +837,17 @@ static bool validateNeuronPayloadForBrain(uint16_t rawTopic, uint8_t *args, uint
         if (cursor == terminal) return true;
         uint8_t pairProjectionVersion = 0;
         if (!extractFixed(cursor, terminal, pairProjectionVersion) ||
-            (pairProjectionVersion != 1 && pairProjectionVersion != 2)) return false;
+            (pairProjectionVersion != 1 && pairProjectionVersion != 2 && pairProjectionVersion != 3)) return false;
         if (cursor == terminal) return true;
         uint8_t cousinDiscoveryVersion = 0;
         if (!extractFixed(cursor, terminal, cousinDiscoveryVersion) || cousinDiscoveryVersion != 1) return false;
         if (cursor == terminal) return true;
         uint8_t lifecycleVersion = 0;
-        return extractFixed(cursor, terminal, lifecycleVersion) && lifecycleVersion == 1 && cursor == terminal;
+        if (!extractFixed(cursor, terminal, lifecycleVersion) || lifecycleVersion != 1) return false;
+        if (cursor == terminal) return true;
+        uint8_t cousinPurposeVersion = 0;
+        return extractFixed(cursor, terminal, cousinPurposeVersion) &&
+            (cousinPurposeVersion == 2 || cousinPurposeVersion == 3) && cursor == terminal;
       }
     case NeuronTopic::transportCredentialPeersAck:
     case NeuronTopic::transportCredentialLifecycleAck:
@@ -807,6 +858,17 @@ static bool validateNeuronPayloadForBrain(uint16_t rawTopic, uint8_t *args, uint
         uint8_t accepted = 0;
         return extractFixed(cursor, terminal, nonce) && nonce != 0 &&
             extractFixed(cursor, terminal, generation) && generation != 0 &&
+            extractFixed(cursor, terminal, accepted) && accepted <= 1 && cursor == terminal;
+      }
+    case NeuronTopic::crossClusterPrivateBGPSecretRevocationAck:
+      {
+        uint128_t pair = 0, operation = 0, cluster = 0, machine = 0;
+        uint64_t epoch = 0, authorityGeneration = 0, gatewayGeneration = 0;
+        uint8_t slot = 0, accepted = 0;
+        return extractFixed(cursor, terminal, pair) && pair != 0 && extractFixed(cursor, terminal, operation) && operation != 0 &&
+            extractFixed(cursor, terminal, epoch) && epoch != 0 && extractFixed(cursor, terminal, slot) && slot < 3 &&
+            extractFixed(cursor, terminal, cluster) && cluster != 0 && extractFixed(cursor, terminal, machine) && machine != 0 &&
+            extractFixed(cursor, terminal, authorityGeneration) && authorityGeneration != 0 && extractFixed(cursor, terminal, gatewayGeneration) && gatewayGeneration != 0 &&
             extractFixed(cursor, terminal, accepted) && accepted <= 1 && cursor == terminal;
       }
     case NeuronTopic::clusterPairEpochStatus:
@@ -1013,6 +1075,61 @@ static bool validateNeuronPayloadForNeuron(uint16_t rawTopic, uint8_t *args, uin
 
   switch (NeuronTopic(rawTopic))
   {
+    case NeuronTopic::nametagQualificationMachineBoot:
+      return consumeVariableBounded(cursor, terminal, 1024) && cursor == terminal;
+    case NeuronTopic::crossClusterPathFault:
+      return consumeVariableBounded(cursor, terminal, 4096) && cursor == terminal;
+    case NeuronTopic::crossClusterMasqueGatewayAuthoritySnapshot:
+      return consumeVariableBounded(cursor, terminal, 262144) && cursor == terminal;
+    case NeuronTopic::nametagQualificationApplicationCommand:
+    case NeuronTopic::nametagHandoffBarrier:
+    case NeuronTopic::nametagSourceBaseline:
+      {
+        uint128_t containerUUID = 0;
+        return extractFixed(cursor, terminal, containerUUID) && containerUUID != 0 &&
+            consumeVariableBounded(cursor, terminal, ProdigyCousinSessionMaximumBytes) && cursor == terminal;
+      }
+    case NeuronTopic::statefulStoreProofRecovery:
+    case NeuronTopic::statefulStoreSeedAuthority:
+      {
+        uint128_t containerUUID = 0;
+        return extractFixed(cursor, terminal, containerUUID) && containerUUID != 0 &&
+            consumeVariableBounded(cursor, terminal, 4096) && cursor == terminal;
+      }
+    case NeuronTopic::crossClusterPrivateBGPSecretDelivery:
+      {
+        // Scope (pair/op/epoch/slot/cluster/machine/generations), followed by
+        // the 32-byte transient credential and ephemeral gateway mTLS bundle.
+        // This is accepted only over the already-authenticated Brain ->
+        // selected Neuron control stream.
+        uint128_t pair = 0, operation = 0, cluster = 0, machine = 0;
+        uint64_t epoch = 0, authorityGeneration = 0, gatewayGeneration = 0;
+        uint8_t slot = 0; String credential = {}, rootCert = {}, localCert = {}, localKey = {}, peerCertDERHex = {};
+        return extractFixed(cursor, terminal, pair) && pair != 0 && extractFixed(cursor, terminal, operation) && operation != 0 &&
+            extractFixed(cursor, terminal, epoch) && epoch != 0 && extractFixed(cursor, terminal, slot) && slot < 3 &&
+            extractFixed(cursor, terminal, cluster) && cluster != 0 && extractFixed(cursor, terminal, machine) && machine != 0 &&
+            extractFixed(cursor, terminal, authorityGeneration) && authorityGeneration != 0 && extractFixed(cursor, terminal, gatewayGeneration) && gatewayGeneration != 0 &&
+            extractVariableStringView(cursor, terminal, credential) && credential.size() == 32 &&
+            extractVariableStringView(cursor, terminal, rootCert) && rootCert.size() != 0 && rootCert.size() <= 4096 &&
+            extractVariableStringView(cursor, terminal, localCert) && localCert.size() != 0 && localCert.size() <= 4096 &&
+            extractVariableStringView(cursor, terminal, localKey) && localKey.size() != 0 && localKey.size() <= 4096 &&
+            extractVariableStringView(cursor, terminal, peerCertDERHex) && peerCertDERHex.size() != 0 && peerCertDERHex.size() <= 4096 &&
+            cursor == terminal;
+      }
+    case NeuronTopic::withdrawCrossClusterPrivateBGPSecret:
+      {
+        uint128_t pair = 0, operation = 0, cluster = 0, machine = 0;
+        uint64_t epoch = 0, authorityGeneration = 0, gatewayGeneration = 0; uint8_t slot = 0;
+        return extractFixed(cursor, terminal, pair) && pair != 0 && extractFixed(cursor, terminal, operation) && operation != 0 &&
+            extractFixed(cursor, terminal, epoch) && epoch != 0 && extractFixed(cursor, terminal, slot) && slot < 3 &&
+            extractFixed(cursor, terminal, cluster) && cluster != 0 && extractFixed(cursor, terminal, machine) && machine != 0 &&
+            extractFixed(cursor, terminal, authorityGeneration) && authorityGeneration != 0 && extractFixed(cursor, terminal, gatewayGeneration) && gatewayGeneration != 0 && cursor == terminal;
+      }
+    case NeuronTopic::nametagQualificationWriterIsolation:
+    case NeuronTopic::nametagQualificationCousinTransport:
+    case NeuronTopic::nametagQualificationReplay:
+    case NeuronTopic::nametagQualificationSeedFault:
+    case NeuronTopic::statefulStoreSourceCut:
     case NeuronTopic::statefulDataAuthority:
       {
         uint128_t containerUUID = 0;
@@ -1353,11 +1470,23 @@ static bool validateContainerPayloadForNeuron(uint16_t rawTopic, uint8_t *args, 
 
   switch (ContainerTopic(rawTopic))
   {
+    case ContainerTopic::nametagQualificationCousinTransport:
+    case ContainerTopic::nametagQualificationReplay:
+    case ContainerTopic::nametagQualificationSeedFault:
+    case ContainerTopic::statefulStoreSourceCut:
     case ContainerTopic::statefulDataAuthority:
+      return consumeVariableBounded(cursor, terminal, 4096) && cursor == terminal;
+    case ContainerTopic::statefulStoreProofRecovery:
+    case ContainerTopic::statefulStoreSeedAuthority:
       return consumeVariableBounded(cursor, terminal, 4096) && cursor == terminal;
     case ContainerTopic::cousinSessionRequest:
     case ContainerTopic::cousinSessionAck:
+    case ContainerTopic::nametagSourceBaseline:
+    case ContainerTopic::nametagQualificationApplicationReceipt:
+    case ContainerTopic::nametagHandoffBarrier:
       return consumeVariableBounded(cursor, terminal, ProdigyCousinSessionMaximumBytes) && cursor == terminal;
+    case ContainerTopic::cousinCarrierFrame:
+      return consumeVariableBounded(cursor, terminal, ProdigyCousinCarrierMaximumPayloadBytes + 128) && cursor == terminal;
     case ContainerTopic::ping:
     case ContainerTopic::pong:
     case ContainerTopic::healthy:
@@ -1412,10 +1541,25 @@ static bool validateContainerPayloadForHub(uint16_t rawTopic, uint8_t *args, uin
 
   switch (ContainerTopic(rawTopic))
   {
+    case ContainerTopic::nametagQualificationCousinTransport:
+    case ContainerTopic::nametagQualificationReplay:
+    case ContainerTopic::nametagQualificationSeedFault:
+    case ContainerTopic::statefulStoreSourceCut:
     case ContainerTopic::statefulDataAuthority:
       return consumeVariableBounded(cursor, terminal, 4096) && cursor == terminal;
+    case ContainerTopic::statefulStoreSeedAuthority:
+      return consumeVariableBounded(cursor, terminal, 4096) && cursor == terminal;
     case ContainerTopic::cousinSessionCommand:
+    case ContainerTopic::app6TruthMeshReceipt:
+    case ContainerTopic::statefulStoreReceipt:
+    case ContainerTopic::statefulStoreProofRecovery:
+    case ContainerTopic::nametagQualificationApplicationReceipt:
+    case ContainerTopic::nametagQualificationApplicationCommand:
+    case ContainerTopic::nametagHandoffBarrier:
+    case ContainerTopic::nametagSourceBaseline:
       return consumeVariableBounded(cursor, terminal, ProdigyCousinSessionMaximumBytes) && cursor == terminal;
+    case ContainerTopic::cousinCarrierFrame:
+      return consumeVariableBounded(cursor, terminal, ProdigyCousinCarrierMaximumPayloadBytes + 128) && cursor == terminal;
     case ContainerTopic::none:
     case ContainerTopic::ping:
     case ContainerTopic::pong:

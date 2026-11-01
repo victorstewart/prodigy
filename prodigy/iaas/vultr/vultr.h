@@ -33,6 +33,8 @@ constexpr static inline uint32_t vultrMachineProvisioningUnchangedPollSleepMs = 
 constexpr static inline uint32_t vultrMachineProvisioningTimeoutMs = 600'000u;
 constexpr static inline uint32_t vultrManagedVPCDeleteMaxAttempts = 30u;
 constexpr static inline uint32_t vultrManagedVPCDeleteRetryMs = 2'000u;
+constexpr static inline uint32_t vultrMachineDeleteMaxAttempts = 30u;
+constexpr static inline uint32_t vultrMachineDeleteRetryMs = 2'000u;
 
 static inline bool vultrVerifiedResourceNotFound(MultiCurlClient::Status status, long statusCode)
 {
@@ -215,6 +217,11 @@ static inline void vultrAccumulateMachineIDsByLabel(simdjson::dom::element doc,
     }
     ++matchCount;
   }
+}
+
+static inline bool vultrRecoverySeedIdentityMatches(const String& expectedID, uint32_t matches, const String& recoveredID)
+{
+  return expectedID.empty() || (matches == 1 && recoveredID == expectedID);
 }
 
 static inline bool vultrBuildProvisioningMachineIdentity(const String& clusterUUID,
@@ -961,6 +968,7 @@ private:
   String bootstrapSSHPublicKey;
   Vault::SSHKeyPackage bootstrapSSHHostKeyPackage;
   String provisioningClusterUUIDTagValue;
+  String recoveryExpectedSeedID;
   uint64_t provisioningOperationID = 0;
   uint32_t provisioningInstructionIndex = 0;
   BrainIaaSMachineProvisioningProgressReporter provisioningProgress;
@@ -1039,6 +1047,8 @@ private:
 
 public:
 
+  void configureRecoveryExpectedSeedID(const String& id) { recoveryExpectedSeedID = id; }
+
   enum class MachineProvisioningPollPhase : uint8_t {
     waitingForActiveBeforeVPCAttach = 0,
     waitingForVPCPrivateIP = 1,
@@ -1113,7 +1123,8 @@ private:
                                VultrHttpTransport::getTimeout));
       if (VultrHttpTransport::succeeded(response) == false)
       {
-        error.assign("vultr plans lookup failed"_ctv);
+        error.snprintf<"vultr plans lookup failed status={itoa} curl={itoa} http={itoa}"_ctv>(
+            uint32_t(response.status), uint32_t(response.curlCode), uint32_t(response.statusCode));
         co_return false;
       }
 
@@ -2466,6 +2477,19 @@ public:
       co_return;
     }
 
+    if (!recoveryExpectedSeedID.empty())
+    {
+      if (count != 1 || config.slug.empty())
+      { error.assign("vultr recovery requires exactly one named seed"_ctv); co_return; }
+      String label = {}, hostname = {}, recovered = {}, lookupFailure = {};
+      uint32_t matches = 0;
+      if (!vultrBuildProvisioningMachineIdentity(provisioningClusterUUIDTagValue, provisioningOperationID,
+              provisioningInstructionIndex, config.slug, config.kind, isBrain, 0, label, hostname) ||
+          !co_await findMachineIDByLabelAcrossInventory(coro, config.kind, label, recovered, matches, lookupFailure))
+      { error = std::move(lookupFailure); if (error.empty()) error.assign("vultr recovery identity lookup failed"_ctv); co_return; }
+      if (!vultrRecoverySeedIdentityMatches(recoveryExpectedSeedID, matches, recovered))
+      { error.assign("vultr recovery seed identity missing or mismatched"_ctv); co_return; }
+    }
     String url = {};
     url.snprintf<"https://api.vultr.com/v2/{}"_ctv>(String(resourcePath(config.kind)));
     String managedVPCID = {};
@@ -2510,6 +2534,12 @@ public:
       uint32_t requestedStorageMB = 0;
       bool managedVPCRequestedAtCreate = false;
     };
+
+    if (!recoveryExpectedSeedID.empty() && count != 1)
+    {
+      error.assign("vultr recovery requires exactly one seed"_ctv);
+      co_return;
+    }
 
     Vector<PendingCreateSubmission> submissions;
     Vector<MultiCurlClient::Request> requests;
@@ -2591,6 +2621,11 @@ public:
               labelMatches, inventoryFailure))
       {
         error = std::move(inventoryFailure);
+        co_return;
+      }
+      if (!vultrRecoverySeedIdentityMatches(recoveryExpectedSeedID, labelMatches, submission.recoveredID))
+      {
+        error.assign("vultr recovery seed identity missing or mismatched"_ctv);
         co_return;
       }
       if (labelMatches == 1)
@@ -2718,6 +2753,7 @@ public:
         delete machine;
       }
       readyMachines.clear();
+      if (!recoveryExpectedSeedID.empty()) co_return;
       Vector<String> labels;
       for (const PendingMachineProvisioning& pending : pendingMachines)
       {
@@ -2986,8 +3022,6 @@ public:
       co_return;
     }
     Vector<String> vmLabels = {};
-    bool sawVerifiedNotFound = false;
-    bool sawUnexpectedFailure = false;
     for (MachineConfig::MachineKind kind : {MachineConfig::MachineKind::bareMetal, MachineConfig::MachineKind::vm})
     {
       String detailResponse;
@@ -2997,66 +3031,67 @@ public:
       {
         if (vultrVerifiedResourceNotFound(detailStatus, detailStatusCode))
         {
-          sawVerifiedNotFound = true;
+          continue;
         }
-        else
-        {
-          sawUnexpectedFailure = true;
-        }
-        continue;
+        failure.assign("vultr machine deletion failed"_ctv);
+        co_return;
       }
-      if (kind == MachineConfig::MachineKind::vm)
+      auto validDetail = [&](const String& body, String *label) {
+        simdjson::dom::parser parser; simdjson::dom::element doc = {}, detail = {};
+        String id = {};
+        if (parser.parse(reinterpret_cast<const char *>(body.data()), body.size()).get(doc) ||
+            !extractResourceObject(doc, kind, detail) ||
+            prodigyJSONString(detail["id"], id) != simdjson::SUCCESS || id != cloudID) return false;
+        if (label) (void)vultrExtractResourceLabel(detail, *label);
+        return true;
+      };
+      String label = {};
+      if (!validDetail(detailResponse, kind == MachineConfig::MachineKind::vm ? &label : nullptr))
       {
-        simdjson::dom::parser parser;
-        simdjson::dom::element doc = {};
-        if (!parser.parse(detailResponse.c_str(), detailResponse.size()).get(doc))
-        {
-          simdjson::dom::element detail = {};
-          if (extractResourceObject(doc, kind, detail))
-          {
-            String label = {};
-            if (vultrExtractResourceLabel(detail, label))
-            {
-              vmLabels.push_back(std::move(label));
-            }
-          }
-        }
+        failure.assign("vultr machine deletion received invalid machine detail"_ctv);
+        co_return;
       }
+      if (!label.empty()) vmLabels.push_back(std::move(label));
       String url;
       url.snprintf<"https://api.vultr.com/v2/{}/{}"_ctv>(String(resourcePath(kind)), cloudID);
       MultiCurlClient::Result response = co_await client.send(
           coro, client.request(MultiCurlClient::Method::delete_, url));
-      if (VultrHttpTransport::succeeded(response))
+      if (!VultrHttpTransport::succeeded(response) &&
+          !vultrVerifiedResourceNotFound(response.status, response.statusCode))
       {
-        if (vmLabels.empty() == false)
-        {
-          String blockFailure = {};
-          if (co_await destroyBootBlocksForMachineLabels(coro, vmLabels, blockFailure) == false)
-          {
-            failure = std::move(blockFailure);
-          }
-        }
+        failure.assign("vultr machine deletion failed"_ctv);
         co_return;
       }
-      if (vultrVerifiedResourceNotFound(response.status, response.statusCode))
+      bool verifiedAbsent = false;
+      for (uint32_t attempt = 0; attempt < vultrMachineDeleteMaxAttempts; ++attempt)
       {
-        if (vmLabels.empty() == false)
+        detailResponse.clear(); detailStatus = MultiCurlClient::Status::initializationFailure; detailStatusCode = 0;
+        if (!(co_await fetchMachineDetail(coro, cloudID, kind, detailResponse, &detailStatus, &detailStatusCode)))
         {
-          String blockFailure = {};
-          if (co_await destroyBootBlocksForMachineLabels(coro, vmLabels, blockFailure) == false)
-          {
-            failure = std::move(blockFailure);
-          }
+          if (vultrVerifiedResourceNotFound(detailStatus, detailStatusCode)) { verifiedAbsent = true; break; }
+          failure.assign("vultr machine deletion verification failed"_ctv);
+          co_return;
         }
+        if (!validDetail(detailResponse, nullptr)) {
+          failure.assign("vultr machine deletion received invalid machine detail"_ctv);
+          co_return;
+        }
+        if (attempt + 1 < vultrMachineDeleteMaxAttempts &&
+            !(co_await client.wait(coro, std::chrono::milliseconds(vultrMachineDeleteRetryMs)))) {
+          failure.assign("vultr machine deletion verification interrupted"_ctv);
+          co_return;
+        }
+      }
+      if (!verifiedAbsent) {
+        failure.assign("timed out waiting for vultr machine deletion"_ctv);
         co_return;
       }
-      sawUnexpectedFailure = true;
+      if (!vmLabels.empty()) {
+        if (!(co_await destroyBootBlocksForMachineLabels(coro, vmLabels, failure))) co_return;
+        vmLabels.clear();
+      }
     }
-    if (sawVerifiedNotFound && sawUnexpectedFailure == false)
-    {
-      co_return;
-    }
-    failure.assign("vultr machine deletion failed"_ctv);
+    co_return;
   }
 
 private:

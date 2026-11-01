@@ -1,5 +1,7 @@
 #pragma once
 
+#include <prodigy/pair.private.bgp.secret.h>
+
 #include <services/bitsery.h>
 #include <services/crypto.h>
 #include <services/filesystem.h>
@@ -105,13 +107,19 @@ public:
   bool statefulServingAuthorityCapabilityAcknowledged = false;
   bool statefulDataAuthorityCapabilityAcknowledged = false;
   bool statelessDeploymentAdmissionCapabilityAcknowledged = false;
+  bool statelessDeploymentRetirementCapabilityAcknowledged = false;
   bool pairedSourceRetirementCapabilityAcknowledged = false;
+  bool qualificationCancellationCapabilityAcknowledged = false;
+  bool allMastersSeedBootstrapCapabilityAcknowledged = false;
+  bool initialAllMastersSeedBootstrapCapabilityAcknowledged = false;
   bool clusterPairEnrollmentCapabilityAcknowledged = false;
   bool clusterPairOperationsCapabilityAcknowledged = false;
   bool clusterPairRevocationCapabilityAcknowledged = false;
   bool clusterPairEpochRotationCapabilityAcknowledged = false;
+  bool clusterPairPrivateDiscoveryCapabilityAcknowledged = false;
   bool localCousinServicePermissionCapabilityAcknowledged = false;
   bool localCousinServicePermissionBaselineCapabilityAcknowledged = false;
+  bool localCousinServicePurposeCapabilityAcknowledged = false;
   bool cousinRouteCapabilityAcknowledged = false;
   bool transportCredentialLifecycleCapabilityAcknowledged = false;
   bool authorityElectionCapabilityAcknowledged = false;
@@ -208,13 +216,19 @@ public:
     statefulServingAuthorityCapabilityAcknowledged = false;
     statefulDataAuthorityCapabilityAcknowledged = false;
     statelessDeploymentAdmissionCapabilityAcknowledged = false;
+    statelessDeploymentRetirementCapabilityAcknowledged = false;
     pairedSourceRetirementCapabilityAcknowledged = false;
+    qualificationCancellationCapabilityAcknowledged = false;
+    allMastersSeedBootstrapCapabilityAcknowledged = false;
+    initialAllMastersSeedBootstrapCapabilityAcknowledged = false;
     clusterPairEnrollmentCapabilityAcknowledged = false;
     clusterPairOperationsCapabilityAcknowledged = false;
     clusterPairRevocationCapabilityAcknowledged = false;
     clusterPairEpochRotationCapabilityAcknowledged = false;
+    clusterPairPrivateDiscoveryCapabilityAcknowledged = false;
     localCousinServicePermissionCapabilityAcknowledged = false;
     localCousinServicePermissionBaselineCapabilityAcknowledged = false;
+    localCousinServicePurposeCapabilityAcknowledged = false;
     cousinRouteCapabilityAcknowledged = false;
     transportCredentialLifecycleCapabilityAcknowledged = false;
     authorityElectionCapabilityAcknowledged = false;
@@ -576,7 +590,6 @@ public:
   bytell_hash_map<uint128_t, ContainerView *> containers;
   bytell_hash_map<uint64_t, ApplicationDeployment *> deployments;
   bytell_hash_map<uint16_t, ApplicationDeployment *> deploymentsByApp; // when not master we only fill this
-
   // these are were non master brains store deployment plans
   bytell_hash_map<uint64_t, DeploymentPlan> deploymentPlans;
   Vector<ProdigyStatefulWorkerTopologyUpgradeOperation> statefulWorkerTopologyUpgradeRuntimeState;
@@ -672,6 +685,8 @@ public:
   virtual void pushSpinApplicationProgressToMothership(ApplicationDeployment *deployment, const String& message) = 0;
   virtual void spinApplicationFailed(ApplicationDeployment *deployment, const String& message) = 0;
   virtual void spinApplicationFin(ApplicationDeployment *deployment) = 0;
+  virtual bool prepareStatelessDeploymentRetirement(ApplicationDeployment *) { return true; }
+  virtual void cleanupStatelessRetiredArtifact(uint64_t deploymentID) { ContainerStore::destroy(deploymentID); }
   virtual void operatorCancellationContainersTerminated(ApplicationDeployment *deployment)
   {
     (void)deployment;
@@ -764,6 +779,11 @@ public:
     return true;
   }
 
+  virtual bool canInitializeMachineConfigCapacity(void) const
+  {
+    return true;
+  }
+
   // Receipts that can launch a process must be bound to the authority that
   // requested them.  Startup/test owners have one stable authority; Brain
   // overrides this with its elected master epoch.
@@ -805,6 +825,8 @@ public:
   virtual bool statefulServingDecisionExists(uint64_t) const { return false; }
   virtual bool statefulServingRecoveryReady() const { return true; }
   virtual bool desiredStatefulDataAuthority(uint64_t, StatefulDataAuthority&, uint32_t = UINT32_MAX) const { return false; }
+  virtual bool desiredAllMastersSeedBootstrap(uint64_t, uint32_t, ProdigyAllMastersSeedBootstrap&) const { return false; }
+  virtual bool allMastersSeedBootstrapAwaitingCancellation(uint64_t) const { return false; }
   virtual bool statefulCatchupCompensationFenced(uint64_t, uint32_t, uint128_t) const { return false; }
   virtual bool desiredStatefulReplicaCount(uint64_t, uint32_t, uint32_t&) const { return false; }
   virtual uint32_t desiredStatefulShardGroupCount(uint64_t) const { return 0; }
@@ -866,6 +888,10 @@ protected:
   {
     if (neuron == nullptr || neuron->fd < 0)
     {
+      PRODIGY_DEBUG_LOG(
+          "prodigy debug neuron-control-install-fail reason=missing-process-fd neuron=%p fd=%d\n",
+          static_cast<void *>(neuron), neuron ? neuron->fd : -1);
+      PRODIGY_DEBUG_FLUSH();
       return false;
     }
 
@@ -876,11 +902,22 @@ protected:
 
     if (neuron->daddrLen == 0)
     {
+      PRODIGY_DEBUG_LOG(
+          "prodigy debug neuron-control-install-fail reason=missing-destination uuid=%llu fd=%d saddrLen=%u daddrLen=%u\n",
+          (unsigned long long)(neuron->machine ? neuron->machine->uuid : 0),
+          neuron->fd, unsigned(neuron->saddrLen), unsigned(neuron->daddrLen));
+      PRODIGY_DEBUG_FLUSH();
       return false;
     }
 
     if (Ring::bindSourceAddressBeforeFixedFileInstall(neuron) == false)
     {
+      const int bindErrno = errno;
+      PRODIGY_DEBUG_LOG(
+          "prodigy debug neuron-control-install-fail reason=bind-source uuid=%llu fd=%d saddrLen=%u daddrLen=%u errno=%d\n",
+          (unsigned long long)(neuron->machine ? neuron->machine->uuid : 0),
+          neuron->fd, unsigned(neuron->saddrLen), unsigned(neuron->daddrLen), bindErrno);
+      PRODIGY_DEBUG_FLUSH();
       return false;
     }
 
@@ -893,6 +930,12 @@ protected:
     int slot = Ring::adoptProcessFDIntoFixedFileSlot(processFD);
     if (slot < 0)
     {
+      const int adoptErrno = errno;
+      PRODIGY_DEBUG_LOG(
+          "prodigy debug neuron-control-install-fail reason=adopt-fixed-file uuid=%llu fd=%d saddrLen=%u daddrLen=%u errno=%d\n",
+          (unsigned long long)(neuron->machine ? neuron->machine->uuid : 0),
+          processFD, unsigned(neuron->saddrLen), unsigned(neuron->daddrLen), adoptErrno);
+      PRODIGY_DEBUG_FLUSH();
       ::close(processFD);
       return false;
     }
@@ -1125,7 +1168,10 @@ public:
       racks[machine->rackUUID] = rack;
     }
 
-    if (auto configIt = brainConfig.configBySlug.find(machine->slug); configIt != brainConfig.configBySlug.end())
+    // Inventory can fill bootstrap hints, but must not rewrite a configuration
+    // already covered by a master-authority generation.
+    if (auto configIt = brainConfig.configBySlug.find(machine->slug);
+        canInitializeMachineConfigCapacity() && configIt != brainConfig.configBySlug.end())
     {
       MachineConfig& config = configIt->second;
       if (config.nLogicalCores == 0)
@@ -1510,9 +1556,13 @@ public:
     }
   }
 
-  bool queueBrainSystemContainerArtifactReplicationToPeer(BrainView *brain, const String& sha256, uint64_t bytes, const String& blob)
+  bool queueBrainSystemContainerArtifactReplicationToPeer(SystemContainerKind kind, BrainView *brain, const String& sha256, uint64_t bytes, const String& blob)
   {
-    const uint64_t appendBytes = (uint64_t(sha256.size()) + uint64_t(blob.size()) + brainPeerReplicationFrameHeadroomBytes);
+    if (kind != SystemContainerKind::mothershipTunnelProvider && kind != SystemContainerKind::crossClusterMasqueGateway)
+    {
+      return false;
+    }
+    const uint64_t appendBytes = (uint64_t(sizeof(uint8_t)) + uint64_t(sha256.size()) + uint64_t(blob.size()) + brainPeerReplicationFrameHeadroomBytes);
     if (brain != nullptr && brain->version < ProdigyBinaryVersion)
     {
       return false;
@@ -1528,7 +1578,7 @@ public:
     }
 
     String frame;
-    Message::construct(frame, BrainTopic::replicateSystemContainerArtifact, sha256, bytes, blob);
+    Message::construct(frame, BrainTopic::replicateSystemContainerArtifact, uint8_t(kind), sha256, bytes, blob);
     String failure;
     if (brain->queueArtifactMessage(std::move(frame), &failure) == false)
     {
@@ -1539,7 +1589,7 @@ public:
     return true;
   }
 
-  void queueBrainSystemContainerArtifactReplication(const String& sha256, uint64_t bytes, const String& blob)
+  void queueBrainSystemContainerArtifactReplication(SystemContainerKind kind, const String& sha256, uint64_t bytes, const String& blob)
   {
     for (BrainView *brain : brains)
     {
@@ -1547,7 +1597,7 @@ public:
       {
         continue;
       }
-      (void)queueBrainSystemContainerArtifactReplicationToPeer(brain, sha256, bytes, blob);
+      (void)queueBrainSystemContainerArtifactReplicationToPeer(kind, brain, sha256, bytes, blob);
     }
   }
 
@@ -1589,6 +1639,16 @@ public:
   static bool neuronControlSocketArmed(const Machine *machine);
   static bool neuronControlStreamActive(const Machine *machine);
   void sendNeuronRuntimeEnvironmentConfig(void);
+  virtual void sendNeuronCrossClusterMasqueGatewayAuthority(Machine *machine)
+  {
+    (void)machine;
+  }
+  virtual void appendNeuronCrossClusterMasqueGatewayWhiteholes(Machine *machine)
+  {
+    (void)machine;
+  }
+  void sendNeuronCrossClusterMasqueGatewayAuthorities(void);
+  bool sendNeuronCrossClusterPrivateBGPSecret(Machine *machine, ProdigyPairPrivateBGPSecretDeliveryResponse& response);
   void sendNeuronSwitchboardRoutableSubnets(void);
   void sendNeuronSwitchboardHostedIngressPrefixes(void);
   void sendNeuronSwitchboardHostedIngressPrefixes(Machine *machine);
@@ -1606,6 +1666,7 @@ public:
   void sendNeuronOpenSwitchboardWormholes(ContainerView *container, const Vector<Wormhole>& wormholes);
   void sendNeuronRefreshContainerWormholes(ContainerView *container, const Vector<Wormhole>& wormholes);
   void sendNeuronCloseSwitchboardWormholesToContainer(ContainerView *container);
+  void appendNeuronOpenSwitchboardWhiteholes(Machine *machine, uint32_t containerID, const Vector<Whitehole>& whiteholes);
   void sendNeuronOpenSwitchboardWhiteholes(ContainerView *container, const Vector<Whitehole>& whiteholes);
   void sendNeuronCloseSwitchboardWhiteholesToContainer(ContainerView *container);
 };

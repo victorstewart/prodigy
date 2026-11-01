@@ -1,6 +1,6 @@
 #pragma once
 
-#include <networking/includes.h>
+#include <basics/includes.h>
 #include <services/bitsery.h>
 #include <networking/ip.h>
 #include <types/types.containers.h>

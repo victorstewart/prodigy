@@ -4,6 +4,9 @@
 #endif
 #include <switchboard/common/checksum.h>
 #include <switchboard/common/public.destination.h>
+#include <switchboard/common/local_container_subnet.h>
+#include <switchboard/common/gateway.injection.h>
+#include <switchboard/kernel/l4.ports.h>
 #include <switchboard/kernel/container.ingress.policy.h>
 #include <switchboard/kernel/wormhole.flow.h>
 
@@ -35,6 +38,7 @@ int ct_ingress(struct __sk_buff *skb)
     has_host_ethernet = true;
   }
 
+  bool masqueGatewayInjection = false;
   if (protocol == BE_ETH_P_IPV6)
   {
     struct ipv6hdr *ipv6h = (struct ipv6hdr *)l3_data;
@@ -44,6 +48,10 @@ int ct_ingress(struct __sk_buff *skb)
       return NETKIT_DROP;
     }
 
+    __u32 zeroidx = 0;
+    struct local_container_subnet6 *localSubnet = bpf_map_lookup_elem(&lc_subnet, &zeroidx);
+    masqueGatewayInjection = switchboardMasqueGatewayInjectionOuterValid(
+        skb->mark, ipv6h->nexthdr, ipv6h->saddr.s6_addr, ipv6h->daddr.s6_addr, localSubnet);
     if (ipv6h->nexthdr == IPPROTO_IPIP || ipv6h->nexthdr == IPPROTO_IPV6) // we encapsulated 4 in 6 || 6 in 6
     {
       __u64 decap_flags = switchboardAdjustRoomPreserveOffloadFlags() | (ipv6h->nexthdr == IPPROTO_IPV6
@@ -121,14 +129,44 @@ int ct_ingress(struct __sk_buff *skb)
   {
     return NETKIT_DROP;
   }
-  if (networkMode == CONTAINER_NETWORK_DECLARED_ONLY && protocol == BE_ETH_P_IPV6)
+  if (networkMode == CONTAINER_NETWORK_DESTINATION_ALLOWLIST && !masqueGatewayInjection)
+  {
+    struct switchboard_l4_ports l4 = {};
+    if (protocol == BE_ETH_P_IP)
+    {
+      struct iphdr *iph = (struct iphdr *)l3_data;
+      if (switchboard_unfragmented_ipv4(iph, data_end) == false || iph->protocol != IPPROTO_UDP ||
+          switchboard_parse_l4_ports((void *)(iph + 1), data_end, iph->protocol,
+                                     0, &l4) == false ||
+          !(containerSystemIngressAllow4(iph->saddr, iph->protocol, l4.source, 1) ||
+            (publicWormholeIngress && containerSystemIngressAllow4(0, iph->protocol, l4.dest, 2))))
+        return NETKIT_DROP;
+    }
+    else if (protocol == BE_ETH_P_IPV6)
+    {
+      struct ipv6hdr *ip6h = (struct ipv6hdr *)l3_data;
+      if ((void *)(ip6h + 1) > data_end || ip6h->nexthdr != IPPROTO_UDP ||
+          switchboard_parse_l4_ports((void *)(ip6h + 1), data_end, ip6h->nexthdr,
+                                     0, &l4) == false ||
+          !(containerSystemIngressAllow6(ip6h->saddr.s6_addr, ip6h->nexthdr, l4.source, 1) ||
+            (publicWormholeIngress && containerSystemIngressAllow6((const __u8[16]){}, ip6h->nexthdr, l4.dest, 2))))
+        return NETKIT_DROP;
+    }
+    else return NETKIT_DROP;
+  }
+  if (protocol == BE_ETH_P_IPV6)
   {
     struct ipv6hdr *ip6h = (struct ipv6hdr *)l3_data;
     if ((void *)(ip6h + 1) > data_end)
     {
       return NETKIT_DROP;
     }
-    if (switchboardContainerDestinationIPv6(ip6h->daddr.s6_addr))
+    // The selected local gateway forwards this packet; the final container
+    // enforces its endpoint authorization after tunnel delivery.
+    if (!masqueGatewayInjection &&
+        (networkMode == CONTAINER_NETWORK_DECLARED_ONLY ||
+         switchboardCrossSiteContainerFlow(ip6h->saddr.s6_addr, ip6h->daddr.s6_addr)) &&
+        switchboardContainerDestinationIPv6(ip6h->daddr.s6_addr))
     {
       struct tcphdr *tcp = (struct tcphdr *)(ip6h + 1);
       if (ip6h->nexthdr != IPPROTO_TCP || (void *)(tcp + 1) > data_end ||

@@ -759,6 +759,25 @@ static String renderClusterUUIDHex(uint128_t clusterUUID)
 
 int main(void)
 {
+  {
+    MothershipProdigyCluster cluster = {};
+    cluster.clusterUUID = 123;
+    cluster.deploymentMode = MothershipClusterDeploymentMode::remote;
+    cluster.provider = MothershipClusterProvider::vultr;
+    if (!mothershipCanResumeVultrSeedCreation(cluster, 123) ||
+        mothershipCanResumeVultrSeedCreation(cluster, 124)) return 1;
+    cluster.environmentConfigured = true;
+    if (mothershipCanResumeVultrSeedCreation(cluster, 123)) return 1;
+    cluster.environmentConfigured = false;
+    cluster.topology.machines.emplace_back();
+    if (mothershipCanResumeVultrSeedCreation(cluster, 123)) return 1;
+    cluster.topology.machines.clear();
+    cluster.deploymentMode = MothershipClusterDeploymentMode::local;
+    if (mothershipCanResumeVultrSeedCreation(cluster, 123)) return 1;
+    cluster.deploymentMode = MothershipClusterDeploymentMode::test;
+    if (mothershipCanResumeVultrSeedCreation(cluster, 123)) return 1;
+  }
+
   TestSuite suite;
 
   char scratch[] = "/tmp/nametag-mothership-cluster-create-XXXXXX";
@@ -1455,6 +1474,28 @@ int main(void)
                                                         ClusterCreateCall::configure,
                                                         ClusterCreateCall::destroyCreatedSeed}),
                  "create_test_failure_call_sequence");
+  }
+
+  {
+    MothershipProdigyCluster cluster = {};
+    cluster.name = "test-recovered-seed-bootstrap-failure"_ctv;
+    cluster.clusterUUID = 0x7777;
+    cluster.deploymentMode = MothershipClusterDeploymentMode::test;
+    cluster.nBrains = 1;
+    cluster.test.specified = true;
+    cluster.test.workspaceRoot = "/tmp/test-recovered-seed-bootstrap-failure"_ctv;
+    cluster.test.machineCount = 1;
+    cluster.controls.push_back(makeUnixControl("/run/prodigy/test-recovered-seed-bootstrap-failure.sock"_ctv));
+
+    FakeClusterCreateHooks hooks = {};
+    hooks.failBootstrapRemoteSeed = true;
+    String failure = {};
+    const bool ok = mothershipStandUpCluster(cluster, nullptr, hooks, nullptr, &failure, nullptr, true);
+    suite.expect(!ok && failure.equals("bootstrap remote seed failed"_ctv), "recovered_seed_bootstrap_failure_propagates");
+    suite.expect(hooks.createSeedCalls == 1 && hooks.remoteBootstrapCalls == 1 && hooks.destroyCreatedSeedCalls == 0,
+                 "recovered_seed_bootstrap_failure_preserves_seed");
+    suite.expect(equalCallSequence(hooks.callSequence, {ClusterCreateCall::createSeed, ClusterCreateCall::remoteBootstrap}),
+                 "recovered_seed_bootstrap_failure_call_sequence");
   }
 
   {

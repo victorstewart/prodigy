@@ -17,6 +17,8 @@
 #include <sys/syscall.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <spawn.h>
 #include <time.h>
 #include <unistd.h>
@@ -41,6 +43,8 @@
 #include <prodigy/brain/base.h>
 #include <prodigy/brain/timing.knobs.h>
 #include <prodigy/neuron/bgp.runtime.h>
+#include <prodigy/neuron/private.tunnel.bgp.runtime.h>
+#include <prodigy/neuron/masque.gateway.launch.h>
 #include <prodigy/neuron/containers.h>
 #include <prodigy/bundle.artifact.h>
 #include <prodigy/artifact.io.h>
@@ -49,6 +53,7 @@
 #include <prodigy/netdev.detect.h>
 #include <prodigy/transport.artifact.h>
 #include <prodigy/cluster.pair.projection.h>
+#include <prodigy/cross.cluster.mesh.route.h>
 #include <prodigy/cousin.discovery.h>
 #include <prodigy/cousin.session.h>
 #include <switchboard/overlay.route.h>
@@ -86,6 +91,286 @@ public:
 
 class Neuron : public NeuronBase, public RingInterface {
 protected:
+
+  // This is deliberately a local receipt cache, not a second authority
+  // ledger. Mothership/Brain supplies the durable authority and the typed
+  // system-container plan; Switchboard supplies the authenticated data-plane
+  // observation. A changed authority invalidates the old receipt before any
+  // /96 can remain originated.
+  struct CrossClusterMasqueGatewayRuntime {
+    struct PendingLaunch {
+      ContainerPlan plan;
+      uint64_t controlGeneration = 0;
+      uint128_t replaceContainerUUID = 0;
+      NeuronContainerMetricPolicy metricPolicy;
+      RetainedContainerStorageSource retainedSource;
+    };
+    // A physical gateway can terminate two independent pair authorities, but
+    // they must never share credentials, readiness, or a BGP lifecycle.
+    // `pairUUID` is the lifecycle key; gatewaySlot is an admission bound.
+    static constexpr uint8_t maximumAuthoritiesPerMachine = 2;
+    CrossClusterMasqueGatewayAuthority authority = {};
+    ProdigyCrossClusterMasqueGatewayReadiness readiness = {};
+    uint128_t systemContainerUUID = 0;
+    String readinessLaunchToken;
+    String recoveryLaunchToken;
+    bool systemPlanAdmitted = false;
+    bool sitePrefixAdvertised = false;
+    SwitchboardOverlayMachineRoute privateBGPFallback = {};
+    bool privateBGPFallbackInstalled = false;
+    bool privateBGPFallbackProgrammed = false;
+    std::unique_ptr<NeuronPrivateTunnelBGPRuntime> privateTunnelBGP;
+    ProdigyCrossClusterPathFaultRequest faultLease = {};
+    ProdigyCrossClusterPathFaultRequest completedFaultLease = {};
+    bool faultLeaseActive = false, faultResumeAcknowledged = false;
+    uint64_t faultMonotonicDeadlineNs = 0;
+    // Volatile Vault delivery only. Neither this material nor the deferred
+    // launch frame is serialized into a Brain snapshot or container plan.
+    std::unique_ptr<ProdigyPairPrivateBGPSecretDeliveryResponse> gatewayBootstrap;
+    std::unique_ptr<PendingLaunch> pendingLaunch;
+
+    void revokeReadiness(void)
+    {
+      readiness = {};
+    }
+
+    bool authorityMatches(const CrossClusterMasqueGatewayAuthority& candidate) const
+    {
+      if (authority.pairUUID == 0 || candidate.generation != authority.generation)
+      {
+        return false;
+      }
+      String expected = {};
+      String observed = {};
+      auto expectedCopy = authority;
+      auto observedCopy = candidate;
+      return BitseryEngine::serialize(expected, expectedCopy) &&
+          BitseryEngine::serialize(observed, observedCopy) && expected == observed;
+    }
+  };
+
+  // This local Unix stream is intentionally not a NeuronHub stream: gateway
+  // health is an observation made after mTLS/routing, not a control command.
+  class CrossClusterMasqueGatewayReadinessListener final : public SocketBase {
+  public:
+    struct PeerIdentity {
+      pid_t pid = -1;
+      uint64_t startTime = 0;
+      String cgroupLeaf = {};
+      uint64_t netnsDevice = 0, netnsInode = 0;
+      bool operator==(const PeerIdentity& rhs) const
+      { return pid == rhs.pid && startTime == rhs.startTime && cgroupLeaf == rhs.cgroupLeaf && netnsDevice == rhs.netnsDevice && netnsInode == rhs.netnsInode; }
+    };
+    using PeerIdentityCapture = std::function<bool(pid_t, PeerIdentity&)>;
+    static constexpr uint32_t maximumFrameBytes = 512;
+    uint128_t containerUUID = 0;
+    String path;
+    String expectedCgroup;
+    uint32_t expectedHostID = 0;
+    bool recovery = false;
+    uint64_t recoveryEpoch = 0;
+    ProdigyGatewayLocalTuple recoveryTuple = {};
+    String recoveryToken = {};
+    PeerIdentity retainedIdentity = {};
+    PeerIdentityCapture capturePeerIdentity = capturePeerIdentityFromProc;
+
+    static bool capturePeerIdentityFromProc(pid_t pid, PeerIdentity& identity)
+    {
+      identity = {};
+      if (pid <= 0) return false;
+      String stat = {}, cgroup = {}, proc = {};
+      proc.snprintf<"/proc/{itoa}/stat"_ctv>(uint64_t(pid));
+      Filesystem::openReadAtClose(-1, proc, stat, 4096);
+      proc.snprintf<"/proc/{itoa}/cgroup"_ctv>(uint64_t(pid));
+      Filesystem::openReadAtClose(-1, proc, cgroup, 512);
+      if (stat.empty() || cgroup.empty()) return false;
+      const char *closing = strrchr(stat.c_str(), ')');
+      if (closing == nullptr || closing[1] != ' ') return false;
+      // starttime is field 22; the post-comm tail begins at field 3.
+      const char *cursor = closing + 2;
+      for (uint32_t field = 3; field < 22; ++field) {
+        cursor = strchr(cursor, ' '); if (cursor == nullptr) return false; ++cursor;
+      }
+      char *end = nullptr; errno = 0;
+      const unsigned long long start = strtoull(cursor, &end, 10);
+      if (errno || end == cursor || start == 0) return false;
+      const char *prefix = "0::";
+      if (strncmp(cgroup.c_str(), prefix, 3) != 0) return false;
+      const char *newline = strchr(cgroup.c_str(), '\n');
+      if (newline == nullptr || newline[1] != '\0' || newline == cgroup.c_str() + 3) return false;
+      proc.snprintf<"/proc/{itoa}/ns/net"_ctv>(uint64_t(pid));
+      struct stat netns = {};
+      if (::stat(proc.c_str(), &netns) != 0 || netns.st_dev == 0 || netns.st_ino == 0) return false;
+      identity.pid = pid; identity.startTime = uint64_t(start);
+      identity.cgroupLeaf.assign(cgroup.c_str() + 3, uint32_t(newline - (cgroup.c_str() + 3)));
+      identity.netnsDevice = uint64_t(netns.st_dev); identity.netnsInode = uint64_t(netns.st_ino);
+      return true;
+    }
+
+    void closeListener(void)
+    {
+      if (fd >= 0)
+      {
+        (void)::close(fd);
+        fd = -1;
+      }
+    }
+
+    void reset(void) override
+    {
+      SocketBase::reset();
+      containerUUID = 0;
+      path.clear();
+      expectedCgroup.clear();
+      recovery = false; recoveryEpoch = 0; recoveryTuple = {}; recoveryToken.clear(); retainedIdentity = {};
+    }
+
+    bool peerCgroupMatches(pid_t peerPID) const
+    {
+      if (peerPID <= 0 || expectedCgroup.size() == 0) return false;
+      String proc = {};
+      proc.snprintf<"/proc/{itoa}/cgroup"_ctv>(uint64_t(peerPID));
+      String actual = {};
+      Filesystem::openReadAtClose(-1, proc, actual, 512);
+      if (actual.size() == 0) return false;
+      String expected = {};
+      expected.assign("0::"_ctv);
+      expected.append(expectedCgroup);
+      expected.append("\n"_ctv);
+      return actual.equal(expected);
+    }
+
+    bool openFor(const Container& container, String *failure = nullptr)
+    {
+      closeListener();
+      containerUUID = container.plan.uuid;
+      expectedHostID = container.executionHostID;
+      if (container.runtimePath.empty() ||
+          !Container::gatewayReadinessSocketPath(container.plan.uuid, container.plan.system.gatewayLaunchToken, path) ||
+          path != container.plan.system.gatewayReadinessSocket) return false;
+      prodigyContainerCgroupProcLeafSuffix(container.name, expectedCgroup);
+      if (path.size() >= sizeof(sockaddr_un::sun_path)) return false;
+      fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+      if (fd < 0) return false;
+      (void)unlink(path.c_str());
+      sockaddr_un address = {};
+      address.sun_family = AF_UNIX;
+      memcpy(address.sun_path, path.data(), path.size());
+      const socklen_t length = socklen_t(offsetof(sockaddr_un, sun_path) + path.size() + 1);
+      if (::bind(fd, reinterpret_cast<sockaddr *>(&address), length) != 0 ||
+          ::chown(path.c_str(), uid_t(expectedHostID), gid_t(expectedHostID)) != 0 ||
+          ::chmod(path.c_str(), 0600) != 0 || ::listen(fd, 4) != 0)
+      {
+        if (failure) failure->assign("cross-cluster MASQUE readiness listener bind failed"_ctv);
+        closeListener();
+        (void)unlink(path.c_str());
+        return false;
+      }
+      return true;
+    }
+
+    bool openForRecovery(const Container& container, const String& socket, const String& token,
+                         const ProdigyGatewayLocalTuple& tuple, uint64_t epoch, String *failure = nullptr)
+    {
+      if (!prodigyGatewayLocalTupleValid(tuple) || !ContainerManager::gatewayRecoveryTokenValid(token) ||
+          socket.empty() || container.pid <= 0 || !capturePeerIdentity(container.pid, retainedIdentity)) return false;
+      closeListener(); containerUUID = container.plan.uuid; expectedHostID = container.executionHostID;
+      path.assign(socket); recovery = true; recoveryEpoch = epoch; recoveryTuple = tuple; recoveryToken.assign(token);
+      prodigyContainerCgroupProcLeafSuffix(container.name, expectedCgroup);
+      if (retainedIdentity.cgroupLeaf != expectedCgroup || path.size() >= sizeof(sockaddr_un::sun_path)) return false;
+      fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0); if (fd < 0) return false;
+      (void)unlink(path.c_str()); sockaddr_un address = {}; address.sun_family = AF_UNIX;
+      memcpy(address.sun_path, path.data(), path.size());
+      const socklen_t length = socklen_t(offsetof(sockaddr_un, sun_path) + path.size() + 1);
+      if (::bind(fd, reinterpret_cast<sockaddr *>(&address), length) != 0 ||
+          ::chown(path.c_str(), uid_t(expectedHostID), gid_t(expectedHostID)) != 0 ||
+          ::chmod(path.c_str(), 0600) != 0 || ::listen(fd, 4) != 0) {
+        if (failure) failure->assign("cross-cluster MASQUE recovery listener bind failed"_ctv);
+        closeListener(); (void)unlink(path.c_str()); return false;
+      }
+      return true;
+    }
+
+    void teardown(void)
+    {
+      closeListener();
+      if (path.size()) (void)unlink(path.c_str());
+      path.clear(); expectedCgroup.clear(); containerUUID = 0; recovery = false; recoveryEpoch = 0; recoveryTuple = {}; recoveryToken.clear(); retainedIdentity = {};
+    }
+
+    // The accepted stream itself is the readiness lease.  Neuron retains it
+    // after the initial record so EOF is an immediate withdrawal rather than
+    // a one-shot startup observation that can remain cached after path loss.
+    bool acceptCarrier(int& stream, pid_t& peerPID)
+    {
+      stream = -1;
+      peerPID = -1;
+      stream = accept4(fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+      if (stream < 0) return false;
+#ifdef SO_PEERCRED
+      ucred peer = {};
+      socklen_t peerLength = sizeof(peer);
+      PeerIdentity observed = {};
+      const bool credentialsOK = getsockopt(stream, SOL_SOCKET, SO_PEERCRED, &peer, &peerLength) == 0 &&
+          peerLength >= sizeof(peer) && Container::gatewayReadinessPeerIDsMatch(expectedHostID, peer.uid, peer.gid) &&
+          peerCgroupMatches(peer.pid) && (!recovery || (capturePeerIdentity(peer.pid, observed) && observed == retainedIdentity));
+      peerPID = credentialsOK ? peer.pid : -1;
+#else
+      const bool credentialsOK = false;
+#endif
+      if (!credentialsOK)
+      {
+        (void)::close(stream);
+        stream = -1;
+        return false;
+      }
+      return true;
+    }
+  };
+
+  class CrossClusterMasqueGatewayReadinessCarrier final : public StreamBase, public SocketBase {
+  public:
+    uint128_t containerUUID = 0;
+    pid_t peerPID = -1;
+    bool receiptAccepted = false;
+    bool recovery = false;
+    uint64_t recoveryEpoch = 0;
+    ProdigyGatewayLocalTuple recoveryTuple = {};
+    String recoveryToken = {};
+    uint8_t recoveryNonce[16] = {};
+    CrossClusterMasqueGatewayReadinessListener::PeerIdentity retainedIdentity = {};
+    CrossClusterMasqueGatewayReadinessListener::PeerIdentityCapture capturePeerIdentity =
+        CrossClusterMasqueGatewayReadinessListener::capturePeerIdentityFromProc;
+    ProdigyGatewayLocalCarrierMode localMode = ProdigyGatewayLocalCarrierMode::undecided;
+    ProdigyGatewayLocalCarrierPhase localPhase = ProdigyGatewayLocalCarrierPhase::initial;
+    // The local carrier owns at most one in-flight gateway frame and one
+    // exact lease. Neither is an assertion that the dataplane is ready.
+    ProdigyCrossClusterPathFaultControl faultControl = {};
+    ProdigyCrossClusterPathFaultGatewayControlPayload faultFrame = {};
+    bool faultFramePending = false;
+    bool faultWaitingDown = false, faultWaitingRestore = false;
+    uint64_t faultDeadlineNs = 0;
+
+    CrossClusterMasqueGatewayReadinessCarrier()
+    {
+      rBuffer.reserve(CrossClusterMasqueGatewayReadinessListener::maximumFrameBytes);
+    }
+
+    void reset(void) override
+    {
+      StreamBase::reset();
+      SocketBase::reset();
+      containerUUID = 0;
+      peerPID = -1;
+      receiptAccepted = false;
+      recovery = false; recoveryEpoch = 0; recoveryTuple = {}; recoveryToken.clear(); memset(recoveryNonce, 0, sizeof(recoveryNonce));
+      retainedIdentity = {}; capturePeerIdentity = CrossClusterMasqueGatewayReadinessListener::capturePeerIdentityFromProc;
+      localMode = ProdigyGatewayLocalCarrierMode::undecided; localPhase = ProdigyGatewayLocalCarrierPhase::initial;
+      faultControl = {}; faultFrame = {};
+      faultFramePending = false; faultWaitingDown = false; faultWaitingRestore = false; faultDeadlineNs = 0;
+      rBuffer.reserve(CrossClusterMasqueGatewayReadinessListener::maximumFrameBytes);
+    }
+  };
 
   class OSUpdateProcess : public SocketBase {
   public:
@@ -127,13 +412,24 @@ protected:
 
   NeuronIaaS *iaas;
   std::unique_ptr<NeuronBGPRuntime> bgp;
+  // Separate from `bgp`: this contains only authenticated MASQUE tunnel BGP
+  // desired state and can never add a provider peer or provider announcement.
+  Vector<CrossClusterMasqueGatewayRuntime> crossClusterMasqueGatewayRuntimes;
+  // Keep listener addresses stable while they are registered with Ring.
+  Vector<std::unique_ptr<CrossClusterMasqueGatewayReadinessListener>> crossClusterMasqueGatewayReadinessListeners;
+  // One held Unix stream per live gateway session.  Its lifetime, not merely
+  // receipt arrival, is the local proof that MASQUE still owns the route.
+  Vector<std::unique_ptr<CrossClusterMasqueGatewayReadinessCarrier>> crossClusterMasqueGatewayReadinessCarriers;
+  bytell_hash_map<uint128_t, CrossClusterMasqueGatewayReadinessCarrier *> activeCrossClusterMasqueGatewayReadinessCarriers;
   std::unique_ptr<Switchboard> switchboard;
   std::unique_ptr<EthDevice> additionalIngressEth;
+  std::unique_ptr<EthDevice> privateOverlayEth;
   SwitchboardOverlayRoutingConfig overlayRoutingConfig;
   ProdigyOverlayPresenceMirror<switchboard_overlay_prefix4_key> installedIngressOverlayPrefixes4;
   ProdigyOverlayPresenceMirror<switchboard_overlay_prefix6_key> installedIngressOverlayPrefixes6;
   ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route> installedIngressOverlayRouteKeysFull;
   ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route> installedIngressOverlayRouteKeysLow8;
+  ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_site_route_set> installedIngressOverlaySiteRouteSets;
   ProdigyOverlayValueMirror<switchboard_overlay_prefix4_key, switchboard_overlay_hosted_ingress_route4> installedIngressHostedIngressRouteKeys4;
   ProdigyOverlayValueMirror<switchboard_overlay_prefix6_key, switchboard_overlay_hosted_ingress_route6> installedIngressHostedIngressRouteKeys6;
   ProdigyOverlayPresenceMirror<switchboard_overlay_ingress_peer4_key> installedIngressOverlayPeers4;
@@ -142,12 +438,14 @@ protected:
   ProdigyOverlayPresenceMirror<switchboard_overlay_prefix6_key> installedEgressOverlayPrefixes6;
   ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route> installedOverlayRouteKeysFull;
   ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route> installedOverlayRouteKeysLow8;
+  ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_site_route_set> installedOverlaySiteRouteSets;
   ProdigyOverlayValueMirror<switchboard_overlay_prefix4_key, switchboard_overlay_hosted_ingress_route4> installedHostedIngressRouteKeys4;
   ProdigyOverlayValueMirror<switchboard_overlay_prefix6_key, switchboard_overlay_hosted_ingress_route6> installedHostedIngressRouteKeys6;
   ProdigyOverlayPresenceMirror<switchboard_overlay_prefix4_key> installedBalancerOverlayPrefixes4;
   ProdigyOverlayPresenceMirror<switchboard_overlay_prefix6_key> installedBalancerOverlayPrefixes6;
   ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route> installedBalancerOverlayRouteKeysFull;
   ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route> installedBalancerOverlayRouteKeysLow8;
+  ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_site_route_set> installedBalancerOverlaySiteRouteSets;
   ProdigyOverlayValueMirror<switchboard_overlay_prefix4_key, switchboard_overlay_hosted_ingress_route4> installedBalancerHostedIngressRouteKeys4;
   ProdigyOverlayValueMirror<switchboard_overlay_prefix6_key, switchboard_overlay_hosted_ingress_route6> installedBalancerHostedIngressRouteKeys6;
   ProdigyOverlayValueMirror<portal_definition, switchboard_whitehole_binding> installedIngressWhiteholeBindingKeys;
@@ -175,6 +473,14 @@ protected:
     bool terminalRetirementPending = false;
     uint64_t launchAdmissionGeneration = 0;
     String planIdentity = {};
+    String boundGatewayRecoveryToken = {};
+    bool gatewayRecoveryTokenBound = false;
+    // Unlike a retained-process restore, this candidate has no surviving PID
+    // after an OS reboot. It stays under the same state-upload owner until the
+    // exact authority and bootstrap can perform an ordinary cold restart.
+    bool coldRestart = false;
+    // Exact retained plans keep their adopted network while readiness rebinds.
+    bool networkRestored = false;
     std::unique_ptr<CoroutineGenerator<uint8_t>> runner;
 
     ~StateUploadRestoreOperation()
@@ -210,11 +516,23 @@ protected:
   std::unique_ptr<BGPConfigurationRefreshOperation> bgpConfigurationRefresh;
   uint64_t runtimeEnvironmentGeneration = 0;
   TimeoutPacket bgpIPv6ReadinessRetryTick;
+  TimeoutPacket crossClusterPathFaultTick;
+  bool crossClusterPathFaultTickQueued = false;
   bool bgpIPv6ReadinessRetryQueued = false;
   uint32_t bgpIPv6ReadinessRetryAttempts = 0;
   uint64_t bgpIPv6ReadinessRetryPendingGeneration = 0;
   bytell_hash_map<uint128_t, std::unique_ptr<StateUploadRestoreOperation>> pendingStateUploadRestores;
   constexpr static uint32_t maximumPendingStateUploadRestores = 64;
+  // An authenticated state upload may arrive while the prior control
+  // generation still owns artifact/cgroup cleanup for this UUID. Keep its
+  // canonical replay beside the existing pending-launch owner until that
+  // owner signals its final drain callback.
+  struct PendingContainerLaunchReplay final {
+    ContainerPlan plan;
+    NeuronContainerMetricPolicy metricPolicy;
+    String identity;
+  };
+  bytell_hash_map<uint128_t, PendingContainerLaunchReplay> pendingContainerLaunchReplays;
   uint64_t stateUploadRestoreEpoch = 0;
   uint32_t stateUploadRestoreRemaining = 0;
   bool stateUploadRestoreReplyPending = false;
@@ -768,8 +1086,9 @@ protected:
     return &overlayRoutingConfig;
   }
 
-  void syncContainerOverlayRoutingPrograms(void)
+  bool syncContainerOverlayRoutingPrograms(void)
   {
+    bool converged = true;
     for (const auto& [uuid, container] : containers)
     {
       (void)uuid;
@@ -778,53 +1097,74 @@ protected:
         continue;
       }
 
-      container->syncPeerOverlayRoutingProgram();
+      converged = container->syncPeerOverlayRoutingProgram() && converged;
     }
+    return converged;
   }
 
-  void syncSwitchboardBalancerOverlayRoutingProgram(void)
+  bool syncSwitchboardBalancerOverlayRoutingProgram(void)
   {
     if (switchboard == nullptr)
     {
-      return;
+      return false;
     }
 
-    prodigySyncOverlayEgressRoutingProgram(switchboard->boundaryRouterProgram(),
-                                           overlayRoutingConfig,
-                                           installedBalancerOverlayPrefixes4,
-                                           installedBalancerOverlayPrefixes6,
-                                           installedBalancerOverlayRouteKeysFull,
-                                           installedBalancerOverlayRouteKeysLow8,
-                                           installedBalancerHostedIngressRouteKeys4,
-                                           installedBalancerHostedIngressRouteKeys6);
+    return prodigySyncOverlayEgressRoutingProgram(switchboard->boundaryRouterProgram(),
+                                                  overlayRoutingConfig,
+                                                  installedBalancerOverlayPrefixes4,
+                                                  installedBalancerOverlayPrefixes6,
+                                                  installedBalancerOverlayRouteKeysFull,
+                                                  installedBalancerOverlayRouteKeysLow8,
+                                                  installedBalancerOverlaySiteRouteSets,
+                                                  installedBalancerHostedIngressRouteKeys4,
+                                                  installedBalancerHostedIngressRouteKeys6);
   }
 
-  void syncOverlayRoutingPrograms(void)
+  bool syncOverlayRoutingPrograms(void)
   {
-    prodigySyncOverlayEgressRoutingProgram(tcx_ingress_program,
+    bool converged = prodigySyncOverlayEgressRoutingProgram(tcx_ingress_program,
                                            overlayRoutingConfig,
                                            installedIngressOverlayPrefixes4,
                                            installedIngressOverlayPrefixes6,
                                            installedIngressOverlayRouteKeysFull,
                                            installedIngressOverlayRouteKeysLow8,
+                                           installedIngressOverlaySiteRouteSets,
                                            installedIngressHostedIngressRouteKeys4,
-                                           installedIngressHostedIngressRouteKeys6);
-    prodigySyncOverlayIngressPeers(tcx_ingress_program,
-                                   overlayRoutingConfig,
-                                   installedIngressOverlayPeers4,
-                                   installedIngressOverlayPeers6);
+                                           installedIngressHostedIngressRouteKeys6,
+                                           true);
+    converged = prodigySyncOverlayIngressPeers(tcx_ingress_program,
+                                               overlayRoutingConfig,
+                                               installedIngressOverlayPeers4,
+                                               installedIngressOverlayPeers6) && converged;
 
-    prodigySyncOverlayEgressRoutingProgram(tcx_egress_program,
+    converged = prodigySyncOverlayEgressRoutingProgram(tcx_egress_program,
                                            overlayRoutingConfig,
                                            installedEgressOverlayPrefixes4,
                                            installedEgressOverlayPrefixes6,
                                            installedOverlayRouteKeysFull,
                                            installedOverlayRouteKeysLow8,
+                                           installedOverlaySiteRouteSets,
                                            installedHostedIngressRouteKeys4,
-                                           installedHostedIngressRouteKeys6);
+                                           installedHostedIngressRouteKeys6) && converged;
 
-    syncSwitchboardBalancerOverlayRoutingProgram();
-    syncContainerOverlayRoutingPrograms();
+    converged = syncSwitchboardBalancerOverlayRoutingProgram() && converged;
+    converged = syncContainerOverlayRoutingPrograms() && converged;
+    return converged;
+  }
+
+  bool crossClusterPrivateBGPFallbackProgrammed(
+      const SwitchboardOverlayMachineRoute& route) const
+  {
+    if (!prodigyOverlaySiteRouteMirrorContains(installedIngressOverlaySiteRouteSets, route) ||
+        !prodigyOverlaySiteRouteMirrorContains(installedOverlaySiteRouteSets, route) ||
+        !prodigyOverlaySiteRouteMirrorContains(installedBalancerOverlaySiteRouteSets, route)) return false;
+    for (const auto& [uuid, container] : containers)
+    {
+      (void)uuid;
+      if (container == nullptr || container->plan.useHostNetworkNamespace) continue;
+      if (!container->peerOverlaySiteRouteInstalled(route)) return false;
+    }
+    return true;
   }
 
   void collectWhiteholeBindings(Vector<std::pair<portal_definition, switchboard_whitehole_binding>>& desiredBindings)
@@ -1077,7 +1417,13 @@ protected:
 
   void resetContainerLaunchControlForBrainReplacement(void)
   {
-    resetContainerLaunchControlGeneration();
+    // Keep ordinary pending plans visible until the replacement stream has
+    // authenticated and replayed them. Their old generation remains fenced,
+    // and explicit terminal kills remain terminal across this handoff.
+    resetContainerLaunchControlGeneration(true);
+    // A replay is authorized by one exact Brain-control stream. The next
+    // replacement must authenticate and supply it again.
+    pendingContainerLaunchReplays.clear();
     // Retained-process restoration owns an already-live process, so preserve
     // that exact owner while invalidating ordinary queued launches. The
     // operation still needs a new authenticated state upload before its
@@ -1090,16 +1436,93 @@ protected:
       {
         if (operation->terminalRetirementPending)
         {
-          operation->launchAdmissionGeneration = 0;
+          const bool rebound = rebindPendingContainerLaunchForStateUploadRestore(
+              operation->container->plan.uuid, operation->launchAdmissionGeneration);
+          operation->launchAdmissionGeneration =
+              rebound ? containerLaunchControlGeneration : 0;
           (void)retireContainerLaunch(operation->container->plan.uuid);
         }
         else
         {
-          operation->launchAdmissionGeneration =
-              beginPendingContainerLaunch(operation->container->plan);
+          // This retained-process operation already owns the exact pending
+          // claim. Rebind that claim to the replacement control generation;
+          // it must continue through admitRepeatedStateUploadRestore rather
+          // than be treated as an ordinary artifact replay.
+          if (!rebindPendingContainerLaunchForStateUploadRestore(
+                  operation->container->plan.uuid, operation->launchAdmissionGeneration))
+          {
+            operation->launchAdmissionGeneration =
+                beginPendingContainerLaunch(operation->container->plan);
+          }
+          else
+          {
+            operation->launchAdmissionGeneration = containerLaunchControlGeneration;
+          }
         }
       }
     }
+  }
+
+  bool queuePendingContainerLaunchReplay(ContainerPlan plan,
+                                         NeuronContainerMetricPolicy metricPolicy)
+  {
+    auto pending = pendingContainerLaunchPlans.find(plan.uuid);
+    if (pending == pendingContainerLaunchPlans.end())
+    {
+      return false;
+    }
+    String pendingIdentity = {};
+    if (!BitseryEngine::serialize(pendingIdentity, pending->second))
+    {
+      return false;
+    }
+    String replayIdentity = {};
+    NeuronContainerBootstrap bootstrap = {};
+    bootstrap.plan = plan;
+    bootstrap.metricPolicy = metricPolicy;
+    if (!BitseryEngine::serialize(replayIdentity, bootstrap) || replayIdentity.size() == 0)
+    {
+      return false;
+    }
+    String suppliedPlanIdentity = {};
+    if (!BitseryEngine::serialize(suppliedPlanIdentity, plan) || suppliedPlanIdentity != pendingIdentity)
+    {
+      return false;
+    }
+    auto existing = pendingContainerLaunchReplays.find(plan.uuid);
+    if (existing != pendingContainerLaunchReplays.end())
+    {
+      return existing->second.identity == replayIdentity;
+    }
+    PendingContainerLaunchReplay replay = {};
+    replay.plan = std::move(plan);
+    replay.metricPolicy = metricPolicy;
+    replay.identity = std::move(replayIdentity);
+    const uint128_t uuid = replay.plan.uuid;
+    pendingContainerLaunchReplays.insert_or_assign(uuid, std::move(replay));
+    return true;
+  }
+
+  void resumeDrainedPendingContainerLaunchReplay(uint128_t uuid)
+  {
+    auto found = pendingContainerLaunchReplays.find(uuid);
+    if (found == pendingContainerLaunchReplays.end())
+    {
+      return;
+    }
+    PendingContainerLaunchReplay replay = std::move(found->second);
+    pendingContainerLaunchReplays.erase(found);
+    if (isContainerLaunchRetired(uuid) ||
+        !handoffDrainedPendingContainerLaunchForAuthenticatedReplay(uuid))
+    {
+      return;
+    }
+    launchContainerFromBrain(std::move(replay.plan), 0, replay.metricPolicy);
+  }
+
+  void pendingContainerLaunchDrained(uint128_t uuid) override
+  {
+    resumeDrainedPendingContainerLaunchReplay(uuid);
   }
 
   void retireBrainControlStream(NeuronBrainControlStream *stream, const char *reason = nullptr)
@@ -1305,10 +1728,10 @@ protected:
   static void serializeMachineHardwareProfileForBrainTransport(const MachineHardwareProfile& hardware, String& serialized)
   {
     MachineHardwareProfile transportHardware = hardware;
-    // The brain only needs the structured hardware inventory for readiness
-    // and scheduling. Large per-tool captures stay local so the initial
-    // neuron-control frame does not balloon into multi-megabyte transport.
-    prodigyStripMachineHardwareCapturesForClusterReport(transportHardware);
+    // The brain needs one bounded kernel-route capture to distinguish an
+    // on-link IPv6 prefix from a routed one. Other large tool captures stay
+    // local so the initial neuron-control frame remains compact.
+    prodigyStripMachineHardwareCapturesForBrainTransport(transportHardware);
     serialized.clear();
     BitseryEngine::serialize(serialized, transportHardware);
   }
@@ -1421,7 +1844,7 @@ protected:
     // before it advances the next worker.
     if (controlTransportCredentials.enabled)
       Message::construct(outbound, NeuronTopic::registration, bootTimeMs, kernel, osID, osVersionID,
-                         haveFragments(), installedBundleDigest, uint8_t(1), uint8_t(2), uint8_t(1), uint8_t(1));
+                         haveFragments(), installedBundleDigest, uint8_t(1), uint8_t(3), uint8_t(1), uint8_t(1), uint8_t(3));
     else
       Message::construct(outbound, NeuronTopic::registration, bootTimeMs, kernel, osID, osVersionID,
                          haveFragments(), installedBundleDigest);
@@ -2709,8 +3132,18 @@ protected:
       return false;
     }
 
+    bool gatewayListener = false;
+    if (container->plan.system.kind == SystemContainerKind::crossClusterMasqueGateway)
+    {
+      const auto *runtime = crossClusterMasqueGatewayRuntimeForContainer(container->plan.uuid);
+      if (runtime == nullptr || !runtime->systemPlanAdmitted ||
+          !admitCrossClusterMasqueGatewaySystemPlan(container->plan) ||
+          !prodigyCrossClusterMasqueGatewayWormholesMatch(runtime->authority, desired.wormholes) ||
+          !desired.pairAdmissionTCPPorts.empty()) return false;
+      gatewayListener = runtime->authority.localRole == CrossClusterMasqueGatewayRole::listener;
+    }
     activeSwitchboard->setLocalContainerSubnet(lcsubnet6);
-    SwitchboardWormholeOperationStatus status = activeSwitchboard->openWormholes(containerID, desired);
+    SwitchboardWormholeOperationStatus status = activeSwitchboard->openWormholes(containerID, desired, gatewayListener);
     if (status != SwitchboardWormholeOperationStatus::applied)
     {
       basics_log("neuron wormhole refresh failed containerID=%u count=%u\n",
@@ -2796,6 +3229,802 @@ protected:
     return bgp.get();
   }
 
+  CrossClusterMasqueGatewayRuntime *crossClusterMasqueGatewayRuntimeForPair(uint128_t pairUUID)
+  {
+    if (pairUUID == 0) return nullptr;
+    for (auto& runtime : crossClusterMasqueGatewayRuntimes)
+      if (runtime.authority.pairUUID == pairUUID) return &runtime;
+    return nullptr;
+  }
+
+  CrossClusterMasqueGatewayRuntime *crossClusterMasqueGatewayRuntimeForContainer(uint128_t containerUUID)
+  {
+    if (containerUUID == 0) return nullptr;
+    for (auto& runtime : crossClusterMasqueGatewayRuntimes)
+      if (runtime.systemContainerUUID == containerUUID) return &runtime;
+    return nullptr;
+  }
+
+  CrossClusterMasqueGatewayReadinessListener *crossClusterMasqueGatewayListenerForContainer(uint128_t containerUUID)
+  {
+    for (const auto& listener : crossClusterMasqueGatewayReadinessListeners)
+      if (listener != nullptr && listener->containerUUID == containerUUID) return listener.get();
+    return nullptr;
+  }
+
+  CrossClusterMasqueGatewayReadinessCarrier *crossClusterMasqueGatewayCarrierForContainer(uint128_t containerUUID)
+  {
+    const auto found = activeCrossClusterMasqueGatewayReadinessCarriers.find(containerUUID);
+    return found == activeCrossClusterMasqueGatewayReadinessCarriers.end() ? nullptr : found->second;
+  }
+
+  void scheduleCrossClusterPathFaultTick()
+  {
+    if (crossClusterPathFaultTickQueued) return;
+    crossClusterPathFaultTick.clear(); crossClusterPathFaultTick.originator = this;
+    crossClusterPathFaultTick.setTimeoutMs(250); crossClusterPathFaultTickQueued = true;
+    Ring::queueTimeout(&crossClusterPathFaultTick);
+  }
+
+  // Admission is against the retained full authority, not against the compact
+  // gateway frame. Queueing is not a successful pause: the response must be
+  // joined with the gateway's observed session state and private BGP owner.
+  bool queueCrossClusterPathFaultGatewayControl(const ProdigyCrossClusterPathFaultControl& control)
+  {
+    if (!prodigyCrossClusterPathFaultControlValid(control) || control.response) return false;
+    auto *runtime = crossClusterMasqueGatewayRuntimeForPair(control.request.authority.pairUUID);
+    if (runtime == nullptr || !runtime->systemPlanAdmitted ||
+        !runtime->authorityMatches(control.request.authority) || !runtime->privateTunnelBGP) return false;
+    auto *carrier = crossClusterMasqueGatewayCarrierForContainer(runtime->systemContainerUUID);
+    const auto container = containers.find(runtime->systemContainerUUID);
+    if (!carrier || !carrier->receiptAccepted || carrier->fd < 0 || carrier->faultFramePending ||
+        carrier->faultWaitingDown || carrier->faultWaitingRestore ||
+        carrier->pendingSend || container == containers.end() || !container->second ||
+        container->second->pid != carrier->peerPID || container->second->pendingDestroy) return false;
+    struct timespec now = {};
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec < 0) return false;
+    const uint64_t nowMs = uint64_t(now.tv_sec) * 1000 + uint64_t(now.tv_nsec) / 1000000;
+    if (control.request.expiresAtMilliseconds <= nowMs ||
+        control.request.expiresAtMilliseconds - nowMs > 60000) return false;
+    if (runtime->faultLeaseActive) {
+      if (!prodigyCrossClusterPathFaultRequestEqual(runtime->faultLease, control.request)) return false;
+    } else if (control.action != ProdigyCrossClusterPathFaultGatewayAction::pause ||
+               !runtime->readiness.authenticatedMasqueQUICReady) return false;
+    ProdigyCrossClusterPathFaultGatewayControlPayload frame = {};
+    String encoded = {};
+    if (!prodigyCrossClusterPathFaultGatewayLeasePayload(control.request, control.action, frame) ||
+        !prodigyEncodeCrossClusterPathFaultGatewayControlFrame(frame, encoded)) return false;
+    if (!runtime->faultLeaseActive) {
+      const uint64_t nowNs = monotonicNowNs(); if (!nowNs) return false;
+      if (!runtime->privateTunnelBGP->beginCrossClusterPathFault(control.request, runtime->authority.localIdentitySHA256)) return false;
+      runtime->faultMonotonicDeadlineNs = nowNs + (control.request.expiresAtMilliseconds - nowMs) * 1000000ULL;
+      runtime->completedFaultLease = {};
+    }
+    runtime->faultLease = control.request; runtime->faultLeaseActive = true;
+    carrier->faultDeadlineNs = runtime->faultMonotonicDeadlineNs;
+    carrier->faultControl = control; carrier->faultFrame = frame; carrier->faultFramePending = true;
+    if (control.action == ProdigyCrossClusterPathFaultGatewayAction::pause)
+      (void)revokeCrossClusterMasqueGatewayReadiness(carrier->containerUUID);
+    if (carrier->localMode == ProdigyGatewayLocalCarrierMode::v2) {
+      ProdigyGatewayLocalControlFrame local = {};
+      local.direction = ProdigyGatewayLocalDirection::neuronToGateway;
+      local.kind = ProdigyGatewayLocalKind::pathFault; local.pathFault = frame;
+      if (!prodigyGatewayLocalControlFrameAllowedForSend(carrier->localPhase, local) ||
+          !prodigyEncodeGatewayLocalControlFrame(local, encoded)) return false;
+    }
+    carrier->wBuffer.append(encoded); Ring::queueSend(carrier);
+    scheduleCrossClusterPathFaultTick();
+    return true;
+  }
+
+  void finishCrossClusterPathFaultGatewayControl(
+      CrossClusterMasqueGatewayReadinessCarrier *carrier,
+      const ProdigyCrossClusterPathFaultGatewayControlPayload& response)
+  {
+    if (!carrier || !carrier->faultFramePending) return;
+    auto result = carrier->faultControl;
+    result.response = true; result.accepted = false;
+    result.sessionReady = response.authenticatedReady; result.bgpReady = false;
+    auto *runtime = crossClusterMasqueGatewayRuntimeForContainer(carrier->containerUUID);
+    if (runtime && runtime->privateTunnelBGP && !response.accepted && result.action == ProdigyCrossClusterPathFaultGatewayAction::pause) {
+      auto acceptedResponse = response; acceptedResponse.accepted = true;
+      if (prodigyCrossClusterPathFaultGatewayLeaseResponseMatches(carrier->faultFrame, acceptedResponse)) {
+        // The gateway rejected the pause. Its next authenticated readiness
+        // frame permits the BGP owner to restore without waiting for expiry.
+        runtime->faultResumeAcknowledged = true;
+      }
+    }
+    if (runtime && runtime->authorityMatches(result.request.authority) && runtime->privateTunnelBGP &&
+        prodigyCrossClusterPathFaultGatewayLeaseResponseMatches(carrier->faultFrame, response)) {
+      struct ObservedSession final : ProdigyCrossClusterPathFaultSessionControl {
+        bool ready;
+        explicit ObservedSession(bool value) : ready(value) {}
+        bool pause(const ProdigyCrossClusterPathFaultRequest&) override { return true; }
+        bool query(const ProdigyCrossClusterPathFaultRequest&, bool& value) override { value = ready; return true; }
+        bool resume(const ProdigyCrossClusterPathFaultRequest&) override { return true; }
+      } observed(response.authenticatedReady);
+      if (result.action == ProdigyCrossClusterPathFaultGatewayAction::pause) {
+        result.accepted = runtime->privateTunnelBGP->pauseCrossClusterPathFault(
+            result.request, runtime->authority.localIdentitySHA256, observed);
+        // The exact lease is retained and BGP withdrawn even if QUIC cleanup
+        // is still in flight. A later query must establish the down state.
+        (void)revokeCrossClusterMasqueGatewayReadiness(carrier->containerUUID);
+        carrier->faultWaitingDown = !result.accepted &&
+            runtime->privateTunnelBGP->hasCrossClusterPathFault(result.request);
+      } else if (result.action == ProdigyCrossClusterPathFaultGatewayAction::query) {
+        bool sessionReady = false, bgpReady = false;
+        result.accepted = runtime->privateTunnelBGP->queryCrossClusterPathFault(
+            result.request, runtime->authority.localIdentitySHA256, observed, sessionReady, bgpReady);
+        result.sessionReady = sessionReady; result.bgpReady = bgpReady;
+      } else if (result.action == ProdigyCrossClusterPathFaultGatewayAction::resume) {
+        // Acceptance only releases the gateway fence. Fresh authenticated
+        // readiness and BGP establishment are observed independently.
+        runtime->faultResumeAcknowledged = true;
+        carrier->faultWaitingRestore = true;
+      }
+    }
+    carrier->faultFramePending = false;
+    if (carrier->faultWaitingDown || carrier->faultWaitingRestore) {
+      scheduleCrossClusterPathFaultTick(); return;
+    }
+    if (brain && brain->fd >= 0) {
+      String encoded = {}; if (BitseryEngine::serialize(encoded, result)) {
+        Message::construct(brain->wBuffer, NeuronTopic::crossClusterPathFault, encoded); Ring::queueSend(brain);
+      }
+    }
+  }
+
+  void closeCrossClusterMasqueGatewayCarriers(uint128_t containerUUID)
+  {
+    activeCrossClusterMasqueGatewayReadinessCarriers.erase(containerUUID);
+    for (const auto& carrier : crossClusterMasqueGatewayReadinessCarriers)
+    {
+      if (carrier != nullptr && carrier->containerUUID == containerUUID)
+        queueCloseIfActive(carrier.get());
+    }
+  }
+
+  void removeCrossClusterMasqueGatewayListener(uint128_t containerUUID)
+  {
+    closeCrossClusterMasqueGatewayCarriers(containerUUID);
+    for (auto it = crossClusterMasqueGatewayReadinessListeners.begin();
+         it != crossClusterMasqueGatewayReadinessListeners.end(); ++it)
+    {
+      if (*it != nullptr && (*it)->containerUUID == containerUUID)
+      {
+        RingDispatcher::eraseMultiplexee(it->get());
+        (*it)->teardown();
+        crossClusterMasqueGatewayReadinessListeners.erase(it);
+        return;
+      }
+    }
+  }
+
+  // The authority arrives over the existing authenticated control path. It
+  // does not launch anything itself: Mothership owns lifecycle intent and the
+  // active Brain projects the typed plan through the ordinary Neuron launcher.
+  // Acceptance is independent of BGP readiness: a valid first snapshot must
+  // remain installed while the gateway awaits its plan, TLS bootstrap and
+  // authenticated QUIC receipt. Reconciliation still withdraws unusable paths.
+  bool reconcileCrossClusterMasqueGatewayAuthority(
+      const CrossClusterMasqueGatewayAuthority& authority, bool fromAuthorityProjection = false)
+  {
+    if (!prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(authority) ||
+        authority.localMachineUUID != uuid)
+    {
+      return false;
+    }
+
+    auto *runtime = crossClusterMasqueGatewayRuntimeForPair(authority.pairUUID);
+    if (runtime != nullptr)
+    {
+      if (runtime->authorityMatches(authority))
+      {
+        // Switchboard reset removes process-local portals while the exact
+        // admitted gateway can remain alive. Authority replay owns restoring
+        // those endpoints; generic application route replay excludes gateways.
+        const auto found = containers.find(runtime->systemContainerUUID);
+        if (authority.state == CrossClusterMasqueGatewayState::active &&
+            authority.localRole == CrossClusterMasqueGatewayRole::listener && runtime->systemPlanAdmitted &&
+            found != containers.end() && found->second != nullptr && found->second->pid > 0 &&
+            found->second->plan.uuid == runtime->systemContainerUUID &&
+            !found->second->pendingDestroy && !found->second->killedOnPurpose &&
+            !isContainerLaunchRetired(runtime->systemContainerUUID))
+        {
+          SwitchboardWormholeDesiredState desired = {};
+          if (!buildContainerWormholeDesiredState(found->second->plan, found->second->plan.wormholes, desired) ||
+              !applyContainerSwitchboardWormholes(found->second, desired)) return false;
+        }
+        (void)reconcileCrossClusterMasqueGatewayBGP(*runtime);
+        if (!fromAuthorityProjection) retrySettledStateUploadGatewayRecoveries();
+        return true;
+      }
+      if (!prodigyCrossClusterMasqueGatewayAuthorityCanAdvance(runtime->authority, authority))
+      {
+        return false;
+      }
+    }
+    // A fresh Neuron receives the current authoritative control-stream snapshot,
+    // which can already be at a later generation. Direct non-snapshot callers
+    // still need the initial generation; existing pairs retain advance checks.
+    else if (!fromAuthorityProjection && authority.state == CrossClusterMasqueGatewayState::active && authority.generation != 1)
+    {
+      return false;
+    }
+
+    if (runtime == nullptr)
+    {
+      for (auto& candidate : crossClusterMasqueGatewayRuntimes)
+        if (candidate.authority.pairUUID == 0) { runtime = &candidate; break; }
+      if (runtime == nullptr && crossClusterMasqueGatewayRuntimes.size() >=
+          CrossClusterMasqueGatewayRuntime::maximumAuthoritiesPerMachine) return false;
+      if (runtime == nullptr)
+      {
+        crossClusterMasqueGatewayRuntimes.emplace_back();
+        runtime = &crossClusterMasqueGatewayRuntimes.back();
+      }
+    }
+
+    // Withdraw the old endpoint before advancing its authority generation.
+    if (runtime->systemContainerUUID != 0)
+    {
+      if (auto it = containers.find(runtime->systemContainerUUID); it != containers.end() && it->second != nullptr)
+        ensureSwitchboard()->closeWormholesToContainer(generateLocalContainerID(it->second->plan.fragment));
+      removeCrossClusterMasqueGatewayListener(runtime->systemContainerUUID);
+    }
+    runtime->gatewayBootstrap.reset();
+    runtime->pendingLaunch.reset();
+    runtime->faultLease = {}; runtime->completedFaultLease = {};
+    runtime->faultLeaseActive = false; runtime->faultResumeAcknowledged = false;
+    runtime->faultMonotonicDeadlineNs = 0;
+    runtime->authority = authority;
+    runtime->revokeReadiness();
+    runtime->readinessLaunchToken.clear();
+    runtime->systemContainerUUID = 0;
+    runtime->systemPlanAdmitted = false;
+    (void)reconcileCrossClusterMasqueGatewayBGP(*runtime);
+    if (!fromAuthorityProjection) retrySettledStateUploadGatewayRecoveries();
+    return true;
+  }
+
+  // A Brain snapshot is authoritative for this Neuron only.  It may contain
+  // the two independent remote-site pairs assigned to this physical host;
+  // accepting a record selected for another machine would turn control-plane
+  // fanout into a gateway launch primitive.  Absence actively withdraws any
+  // locally originated /96.
+  bool reconcileCrossClusterMasqueGatewayAuthorityProjection(
+      const ProdigyCrossClusterMasqueGatewayAuthorityProjection& projection)
+  {
+    if (!prodigyCrossClusterMasqueGatewayAuthorityProjectionValid(
+            projection, controlTransportCredentials.self.clusterUUID))
+    {
+      return false;
+    }
+
+    Vector<const CrossClusterMasqueGatewayAuthority *> selected = {};
+    for (const auto& authority : projection.authorities)
+    {
+      if (authority.localMachineUUID != uuid) continue;
+      if (selected.size() >= CrossClusterMasqueGatewayRuntime::maximumAuthoritiesPerMachine) return false;
+      for (const auto *existing : selected)
+        if (existing->pairUUID == authority.pairUUID ||
+            existing->privateTunnelInterface == authority.privateTunnelInterface)
+          return false;
+      selected.push_back(&authority);
+    }
+    // Validate the whole desired snapshot before mutating any live pair.
+    for (const auto *authority : selected)
+      if (!prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(*authority)) return false;
+    uint32_t newPairs = 0;
+    for (const auto *authority : selected)
+    {
+      auto *runtime = crossClusterMasqueGatewayRuntimeForPair(authority->pairUUID);
+      if (runtime == nullptr)
+      {
+        ++newPairs;
+        continue;
+      }
+      if (!runtime->authorityMatches(*authority) &&
+          !prodigyCrossClusterMasqueGatewayAuthorityCanAdvance(runtime->authority, *authority))
+        return false;
+    }
+    if (newPairs > CrossClusterMasqueGatewayRuntime::maximumAuthoritiesPerMachine ||
+        selected.size() > CrossClusterMasqueGatewayRuntime::maximumAuthoritiesPerMachine)
+      return false;
+    // Retire absent pairs only after the complete replacement snapshot has
+    // passed its advance/slot checks, leaving capacity for a two-pair swap.
+    for (auto& runtime : crossClusterMasqueGatewayRuntimes)
+    {
+      bool retained = false;
+      for (const auto *authority : selected) if (authority->pairUUID == runtime.authority.pairUUID) retained = true;
+      if (retained) continue;
+      runtime.gatewayBootstrap.reset();
+      runtime.pendingLaunch.reset();
+      runtime.faultLease = {}; runtime.completedFaultLease = {};
+      runtime.faultLeaseActive = false; runtime.faultResumeAcknowledged = false;
+      runtime.faultMonotonicDeadlineNs = 0;
+      runtime.revokeReadiness();
+      runtime.readinessLaunchToken.clear();
+      runtime.systemPlanAdmitted = false;
+      if (runtime.privateTunnelBGP) runtime.privateTunnelBGP->withdrawAll();
+      runtime.sitePrefixAdvertised = false;
+      if (auto it = containers.find(runtime.systemContainerUUID); it != containers.end() && it->second != nullptr)
+        ensureSwitchboard()->closeWormholesToContainer(generateLocalContainerID(it->second->plan.fragment));
+      removeCrossClusterMasqueGatewayListener(runtime.systemContainerUUID);
+      runtime.systemContainerUUID = 0;
+      runtime.authority = {};
+    }
+    for (const auto *authority : selected)
+      if (!reconcileCrossClusterMasqueGatewayAuthority(*authority, true)) return false;
+
+    for (auto& runtime : crossClusterMasqueGatewayRuntimes)
+    {
+      bool retained = false;
+      for (const auto *authority : selected) if (authority->pairUUID == runtime.authority.pairUUID) retained = true;
+      if (retained) continue;
+      runtime.gatewayBootstrap.reset();
+      runtime.pendingLaunch.reset();
+      runtime.revokeReadiness();
+      runtime.readinessLaunchToken.clear();
+      runtime.systemPlanAdmitted = false;
+      if (runtime.privateTunnelBGP) runtime.privateTunnelBGP->withdrawAll();
+      runtime.sitePrefixAdvertised = false;
+      removeCrossClusterMasqueGatewayListener(runtime.systemContainerUUID);
+      runtime.systemContainerUUID = 0;
+      runtime.authority = {};
+    }
+    reconcileCrossClusterPrivateBGPSwitchboardFallback();
+    // stateUpload can arrive before the typed gateway authority. The retained
+    // process remains fenced in that ordering; the completed authoritative
+    // snapshot is the event that makes an exact local record retryable.
+    retrySettledStateUploadGatewayRecoveries();
+    return true;
+  }
+
+  // Generic spin dispatch calls this before handing a typed gateway plan to
+  // ContainerManager. The plan must be the exact current Mothership authority
+  // artifact; an arbitrary system plan cannot manufacture gateway readiness.
+  bool admitCrossClusterMasqueGatewaySystemPlan(const ContainerPlan& plan)
+  {
+    const auto *runtime = crossClusterMasqueGatewayRuntimeForPair(plan.system.gatewayPairUUID);
+    Vector<CrossClusterMasqueGatewayAuthority> projectedAuthorities = {};
+    for (const auto& candidate : crossClusterMasqueGatewayRuntimes)
+      if (candidate.authority.pairUUID != 0)
+        projectedAuthorities.push_back(candidate.authority);
+    const uint8_t expectedFragment = runtime == nullptr ? 0 :
+        prodigyCrossClusterMasqueGatewayRuntimeFragment(
+            projectedAuthorities, runtime->authority.pairUUID,
+            runtime->authority.localMachineUUID);
+    if (plan.system.kind != SystemContainerKind::crossClusterMasqueGateway ||
+        runtime == nullptr || !prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(runtime->authority) ||
+        runtime->authority.state != CrossClusterMasqueGatewayState::active ||
+        runtime->authority.localMachineUUID != uuid || plan.uuid == 0 ||
+        !plan.restartOnFailure || plan.useHostNetworkNamespace ||
+        plan.config.capabilities.size() != 1 || !plan.config.capabilities.contains(CAP_NET_ADMIN) ||
+        plan.fragment != expectedFragment ||
+        !prodigyCrossClusterMasqueGatewayRuntimeFragmentValid(plan.fragment) ||
+        !plan.system.artifact.sha256.equal(runtime->authority.artifactSHA256) ||
+        plan.system.artifact.bytes != runtime->authority.artifactBytes ||
+        plan.system.gatewayLocalClusterUUID != runtime->authority.localClusterUUID ||
+        plan.system.gatewayLocalMachineUUID != runtime->authority.localMachineUUID ||
+        plan.system.gatewayKeyEpoch != runtime->authority.keyGeneration ||
+        plan.system.gatewayAuthorityGeneration != runtime->authority.pairAuthorityGeneration ||
+        plan.system.gatewayGeneration != runtime->authority.generation ||
+        !plan.system.gatewayTunnelInterface.equal(runtime->authority.privateTunnelInterface) ||
+        !prodigyCrossClusterMasqueGatewayWormholesMatch(runtime->authority, plan.wormholes) ||
+        !prodigyCrossClusterMasqueGatewayWhiteholesValid(runtime->authority, plan.whiteholes))
+    {
+      return false;
+    }
+    // The data-plane process gets no ambient network authority.  Its one
+    // underlay peer is the endpoint in the signed gateway authority. A
+    // listener receives only packets routed through its exclusive publication;
+    // a connector accepts the exact endpoint's replies. Any old plan fails before ContainerManager can
+    // create a network namespace.
+    const auto& egress = plan.system.egress;
+    const auto& endpoint = runtime->authority.listenerPublicUDPEndpoint;
+    if (!egress.configured() || egress.protocol != IPPROTO_UDP ||
+        egress.port != runtime->authority.listenerPublicUDPPort ||
+        egress.peerIsIPv6 != endpoint.is6 ||
+        egress.allowIngressFromPeer !=
+            (runtime->authority.localRole == CrossClusterMasqueGatewayRole::listener))
+    {
+      return false;
+    }
+    if (endpoint.is6)
+    {
+      if (std::memcmp(egress.address6, endpoint.v6, sizeof(egress.address6)) != 0) return false;
+    }
+    else if (htonl(egress.address4) != endpoint.v4)
+    {
+      return false;
+    }
+    return true;
+  }
+
+  bool queueCurrentGatewayReadiness(const CrossClusterMasqueGatewayRuntime& runtime)
+  {
+    if (!runtime.systemPlanAdmitted || runtime.systemContainerUUID == 0 ||
+        runtime.authority.state != CrossClusterMasqueGatewayState::active ||
+        !runtime.readiness.authenticatedMasqueQUICReady ||
+        !prodigyCrossClusterMasqueGatewayReadinessMatches(runtime.authority, runtime.readiness) ||
+        brain == nullptr || !streamIsActive(brain)) return false;
+    String encoded = {};
+    if (!BitseryEngine::serialize(encoded, runtime.readiness)) return false;
+    Message::construct(brain->wBuffer, NeuronTopic::crossClusterMasqueGatewayReadinessReceipt, encoded);
+    Vault::secureClearString(encoded);
+    return true;
+  }
+
+  // Brain readiness observations are scoped to its current Neuron stream and
+  // are not replicated. Re-attest the retained live lease after its inventory
+  // so a replacement master can bind this evidence to the new control stream.
+  void replayCurrentGatewayReadinessAfterStateUpload()
+  {
+    for (const auto& runtime : crossClusterMasqueGatewayRuntimes)
+    {
+      const auto found = containers.find(runtime.systemContainerUUID);
+      auto *carrier = crossClusterMasqueGatewayCarrierForContainer(runtime.systemContainerUUID);
+      if (runtime.faultLeaseActive || found == containers.end() || !found->second ||
+          found->second->pendingDestroy || found->second->pid <= 0 || !carrier ||
+          !carrier->receiptAccepted || !streamIsActive(carrier) ||
+          carrier->faultFramePending || carrier->faultWaitingDown || carrier->faultWaitingRestore ||
+          carrier->peerPID != found->second->pid) continue;
+      (void)queueCurrentGatewayReadiness(runtime);
+    }
+  }
+
+  // Switchboard calls this only after its selected gateway has authenticated
+  // the MASQUE/QUIC data path. The receipt is bound to the live plan plus all
+  // authority generations, so replacement, key rotation, or withdrawal
+  // immediately revokes the old origin eligibility.
+  bool recordCrossClusterMasqueGatewayReadiness(
+      uint128_t systemContainerUUID,
+      const ProdigyCrossClusterMasqueGatewayReadiness& readiness)
+  {
+    auto *runtime = crossClusterMasqueGatewayRuntimeForContainer(systemContainerUUID);
+    if (runtime == nullptr || !runtime->systemPlanAdmitted || systemContainerUUID == 0 ||
+        systemContainerUUID != runtime->systemContainerUUID ||
+        !prodigyCrossClusterMasqueGatewayReadinessMatches(runtime->authority, readiness) ||
+        !readiness.authenticatedMasqueQUICReady)
+    {
+      return false;
+    }
+    runtime->readiness = readiness;
+    if (runtime->faultLeaseActive && !restoreExpiredCrossClusterPathFault(*runtime)) {
+      const uint64_t nowNs = monotonicNowNs();
+      if (!runtime->faultResumeAcknowledged && (!nowNs || nowNs < runtime->faultMonotonicDeadlineNs)) {
+        runtime->revokeReadiness(); return false;
+      }
+      scheduleCrossClusterPathFaultTick(); return true;
+    }
+    if (queueCurrentGatewayReadiness(*runtime)) Ring::queueSend(brain);
+    // The private BGP secret is intentionally delivered only after
+    // Mothership observes this MASQUE receipt.  A missing secret can make the
+    // routing reconciliation fail here without invalidating the authenticated
+    // underlay lease that was just accepted.
+    (void)reconcileCrossClusterMasqueGatewayBGP(*runtime);
+    return true;
+  }
+
+  bool restoreExpiredCrossClusterPathFault(CrossClusterMasqueGatewayRuntime& runtime)
+  {
+    if (!runtime.faultLeaseActive || !runtime.privateTunnelBGP ||
+        !runtime.readiness.authenticatedMasqueQUICReady) return false;
+    const uint64_t nowNs = monotonicNowNs();
+    if (!runtime.faultResumeAcknowledged && (!nowNs || nowNs < runtime.faultMonotonicDeadlineNs)) return false;
+    const auto found = containers.find(runtime.systemContainerUUID);
+    if (found == containers.end() || !found->second || found->second->pid <= 0 || found->second->pendingDestroy) return false;
+    if (runtime.privateTunnelBGP->hasCrossClusterPathFault(runtime.faultLease)) {
+      String path = {}; path.snprintf<"/proc/{itoa}/ns/net"_ctv>(uint64_t(found->second->pid));
+      const int fd = Filesystem::openFileAt(-1, path, O_RDONLY | O_CLOEXEC);
+      if (fd < 0) return false;
+      struct RestoredSession final : ProdigyCrossClusterPathFaultSessionControl {
+        bool pause(const ProdigyCrossClusterPathFaultRequest&) override { return false; }
+        bool query(const ProdigyCrossClusterPathFaultRequest&, bool& ready) override { ready = true; return true; }
+        bool resume(const ProdigyCrossClusterPathFaultRequest&) override { return true; }
+      } observed;
+      const bool restored = runtime.privateTunnelBGP->resumeCrossClusterPathFault(
+          runtime.faultLease, runtime.authority.localIdentitySHA256, observed, runtime.readiness, fd);
+      ::close(fd); if (!restored) return false;
+    }
+    runtime.faultLeaseActive = false; runtime.faultResumeAcknowledged = false;
+    runtime.completedFaultLease = runtime.faultLease; runtime.faultLease = {}; runtime.faultMonotonicDeadlineNs = 0;
+    return true;
+  }
+
+  void serviceCrossClusterPathFaultTick()
+  {
+    const uint64_t nowNs = monotonicNowNs(); bool reschedule = false;
+    for (auto& runtime : crossClusterMasqueGatewayRuntimes) {
+      auto *carrier = crossClusterMasqueGatewayCarrierForContainer(runtime.systemContainerUUID);
+      const bool beforeDeadline = runtime.faultLeaseActive && nowNs && nowNs < runtime.faultMonotonicDeadlineNs;
+      if (runtime.faultLeaseActive && runtime.readiness.authenticatedMasqueQUICReady &&
+          (runtime.faultResumeAcknowledged || !beforeDeadline)) {
+        auto readiness = runtime.readiness;
+        if (restoreExpiredCrossClusterPathFault(runtime))
+          (void)recordCrossClusterMasqueGatewayReadiness(runtime.systemContainerUUID, readiness);
+      }
+      if (!carrier) { if (beforeDeadline) reschedule = true; continue; }
+      if (runtime.faultLeaseActive && !beforeDeadline && carrier->faultFramePending) {
+        auto response = carrier->faultControl; response.response = true; response.accepted = false;
+        response.sessionReady = false; response.bgpReady = false;
+        carrier->faultFramePending = false; carrier->faultWaitingDown = false; carrier->faultWaitingRestore = false;
+        String encoded = {}; if (brain && brain->fd >= 0 && BitseryEngine::serialize(encoded, response)) {
+          Message::construct(brain->wBuffer, NeuronTopic::crossClusterPathFault, encoded); Ring::queueSend(brain);
+        }
+        // If the frame was never acknowledged, force a fresh authenticated
+        // gateway session rather than trusting the pre-fault readiness.
+        queueCloseIfActive(carrier);
+        continue;
+      }
+      if (carrier->faultWaitingDown && !carrier->faultFramePending && !carrier->pendingSend && beforeDeadline) {
+        ProdigyCrossClusterPathFaultGatewayControlPayload query = {}; String encoded = {};
+        if (prodigyCrossClusterPathFaultGatewayLeasePayload(runtime.faultLease,
+                ProdigyCrossClusterPathFaultGatewayAction::query, query) &&
+            prodigyEncodeCrossClusterPathFaultGatewayControlFrame(query, encoded)) {
+          carrier->faultFrame = query; carrier->faultFramePending = true;
+          carrier->wBuffer.append(encoded); Ring::queueSend(carrier);
+        }
+      }
+      if (carrier->faultWaitingDown && !beforeDeadline && !carrier->faultFramePending) {
+        auto response = carrier->faultControl; response.response = true; response.accepted = false;
+        response.sessionReady = false; response.bgpReady = false; carrier->faultWaitingDown = false;
+        String encoded = {}; if (brain && brain->fd >= 0 && BitseryEngine::serialize(encoded, response)) {
+          Message::construct(brain->wBuffer, NeuronTopic::crossClusterPathFault, encoded); Ring::queueSend(brain);
+        }
+      }
+      if (carrier->faultWaitingRestore && !runtime.faultLeaseActive && runtime.privateTunnelBGP &&
+          runtime.privateTunnelBGP->desiredPaths().size() == 1 &&
+          prodigyCrossClusterPrivateTunnelBGPPathUsable(runtime.privateTunnelBGP->desiredPaths()[0]) &&
+          prodigyCrossClusterMasqueGatewayReady(runtime.authority, &runtime.readiness)) {
+        auto response = carrier->faultControl; response.response = true; response.accepted = true;
+        response.sessionReady = true; response.bgpReady = true; carrier->faultWaitingRestore = false;
+        String encoded = {}; if (brain && brain->fd >= 0 && BitseryEngine::serialize(encoded, response)) {
+          Message::construct(brain->wBuffer, NeuronTopic::crossClusterPathFault, encoded); Ring::queueSend(brain);
+        }
+      }
+      if (carrier->faultWaitingRestore && nowNs && nowNs >= carrier->faultDeadlineNs) {
+        auto response = carrier->faultControl; response.response = true; response.accepted = false;
+        response.sessionReady = false; response.bgpReady = false; carrier->faultWaitingRestore = false;
+        String encoded = {}; if (brain && brain->fd >= 0 && BitseryEngine::serialize(encoded, response)) {
+          Message::construct(brain->wBuffer, NeuronTopic::crossClusterPathFault, encoded); Ring::queueSend(brain);
+        }
+      }
+      if (beforeDeadline || (runtime.readiness.authenticatedMasqueQUICReady && runtime.faultLeaseActive) ||
+          (!runtime.faultLeaseActive && carrier->faultWaitingRestore)) reschedule = true;
+    }
+    if (reschedule) scheduleCrossClusterPathFaultTick();
+  }
+
+  // Called only by the task-owned readiness socket after it has obtained the
+  // peer credentials.  The pid/container check prevents a sibling process in
+  // the mount namespace from replaying a valid launch token.
+  bool recordCrossClusterMasqueGatewayLocalReceipt(
+      uint128_t systemContainerUUID, pid_t peerPID,
+      const ProdigyCrossClusterMasqueGatewayLocalReceipt& receipt)
+  {
+    auto *runtime = crossClusterMasqueGatewayRuntimeForContainer(systemContainerUUID);
+    const auto found = containers.find(systemContainerUUID);
+    if (found == containers.end() || found->second == nullptr ||
+        found->second->plan.system.kind != SystemContainerKind::crossClusterMasqueGateway ||
+        found->second->pid != peerPID || !receipt.ready ||
+        runtime == nullptr || !prodigyCrossClusterMasqueGatewayLocalReceiptValid(
+            runtime->authority, runtime->readinessLaunchToken, receipt))
+    {
+      (void)revokeCrossClusterMasqueGatewayReadiness(systemContainerUUID);
+      return false;
+    }
+    return recordCrossClusterMasqueGatewayReadiness(systemContainerUUID, receipt.readiness);
+  }
+
+  // A gateway exit, stream loss, or explicit Switchboard revocation uses the
+  // same fail-closed path as an authority update.
+  bool revokeCrossClusterMasqueGatewayReadiness(uint128_t systemContainerUUID)
+  {
+    auto *runtime = crossClusterMasqueGatewayRuntimeForContainer(systemContainerUUID);
+    if (runtime == nullptr || systemContainerUUID == 0 || systemContainerUUID != runtime->systemContainerUUID)
+    {
+      return false;
+    }
+    runtime->revokeReadiness();
+    return reconcileCrossClusterMasqueGatewayBGP(*runtime);
+  }
+
+  // This is called by the authenticated, generation-bound Vault delivery
+  // handler.  It intentionally accepts the move-only response rather than a
+  // serializable control object, so the BGP credential cannot enter Brain
+  // state or a replayable authority snapshot.
+  bool installCrossClusterPrivateBGPSecret(ProdigyPairPrivateBGPSecretDeliveryResponse& response)
+  {
+    auto *runtime = crossClusterMasqueGatewayRuntimeForPair(response.scope.pairUUID);
+    if (!response.accepted || runtime == nullptr) return false;
+    const auto& authority = runtime->authority;
+    if (authority.state != CrossClusterMasqueGatewayState::active ||
+        response.scope.pairUUID != authority.pairUUID || response.scope.operationUUID != authority.pairOperationUUID ||
+        response.scope.keyEpoch != authority.keyGeneration || response.scope.tunnelSlot != authority.tunnelSlot ||
+        response.scope.clusterUUID != authority.localClusterUUID || response.scope.machineUUID != authority.localMachineUUID ||
+        response.scope.authorityGeneration != authority.pairAuthorityGeneration || response.scope.gatewayGeneration != authority.generation)
+      return false;
+    if (!prodigyPairPrivateGatewayTLSMaterialMatchesAuthority(authority,
+            response.gatewayRootCertPem, response.localLeafCertPem, response.localLeafKeyPem,
+            response.peerLeafCertDERHex)) return false;
+    auto bootstrap = std::make_unique<ProdigyPairPrivateBGPSecretDeliveryResponse>();
+    bootstrap->scope = response.scope;
+    bootstrap->accepted = true;
+    // The receiver extracts views into a control frame. Own the bytes before
+    // that frame is consumed; moving a String view would retain a dangling key.
+    bootstrap->gatewayRootCertPem.assign(response.gatewayRootCertPem.data(), response.gatewayRootCertPem.size());
+    bootstrap->localLeafCertPem.assign(response.localLeafCertPem.data(), response.localLeafCertPem.size());
+    bootstrap->localLeafKeyPem.assign(response.localLeafKeyPem.data(), response.localLeafKeyPem.size());
+    bootstrap->peerLeafCertDERHex.assign(response.peerLeafCertDERHex.data(), response.peerLeafCertDERHex.size());
+    runtime->gatewayBootstrap = std::move(bootstrap);
+    // The ordinary Brain launch may beat the bootstrap RPC. Retain only that
+    // admitted frame and resume through the same launcher after authentication.
+    auto pending = std::move(runtime->pendingLaunch);
+    if (pending && pending->controlGeneration == containerLaunchControlGeneration &&
+        !isContainerLaunchRetired(pending->plan.uuid))
+      launchContainerFromBrain(std::move(pending->plan), pending->replaceContainerUUID,
+                               pending->metricPolicy, std::move(pending->retainedSource));
+    retrySettledStateUploadGatewayRecoveries();
+    if (!runtime->readiness.authenticatedMasqueQUICReady ||
+        !prodigyCrossClusterMasqueGatewayReadinessMatches(authority, runtime->readiness))
+      return true; // Mothership redelivers after the authenticated QUIC receipt.
+    if (!runtime->privateTunnelBGP) {
+      runtime->privateTunnelBGP = std::make_unique<NeuronPrivateTunnelBGPRuntime>();
+      runtime->privateTunnelBGP->setPathChangedObserver([](void *context) {
+        static_cast<Neuron *>(context)->reconcileCrossClusterPrivateBGPSwitchboardFallback();
+      }, this);
+    }
+    if (!runtime->privateTunnelBGP->installDeliveredSecret(response)) return false;
+    return reconcileCrossClusterMasqueGatewayBGP(*runtime);
+  }
+
+  bool prepareCrossClusterMasqueGatewayExec(const ContainerPlan& plan,
+      Vector<String>& arguments, Vector<int32_t>& descriptors, String *failure = nullptr) override
+  {
+    auto *runtime = crossClusterMasqueGatewayRuntimeForPair(plan.system.gatewayPairUUID);
+    if (runtime == nullptr || !runtime->gatewayBootstrap ||
+        !admitCrossClusterMasqueGatewaySystemPlan(plan) || runtime->systemContainerUUID != plan.uuid)
+    {
+      if (failure) failure->assign("MASQUE launch is missing its exact-scope Vault bootstrap"_ctv);
+      return false;
+    }
+    const auto& bootstrap = *runtime->gatewayBootstrap;
+    return prodigyBuildMasqueGatewayExecArguments(runtime->authority,
+        bootstrap.gatewayRootCertPem, bootstrap.localLeafCertPem,
+        bootstrap.localLeafKeyPem, bootstrap.peerLeafCertDERHex, arguments, descriptors, failure);
+  }
+
+  bool reconcileCrossClusterMasqueGatewayBGP(CrossClusterMasqueGatewayRuntime& runtime)
+  {
+    // A projected authority refresh must not republish BGP while an exact
+    // fault lease is pending; restoration is driven by a fresh readiness
+    // receipt after resume or expiry.
+    if (runtime.faultLeaseActive) { runtime.sitePrefixAdvertised = false; return false; }
+    if (!prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(runtime.authority))
+    {
+      if (runtime.privateTunnelBGP) runtime.privateTunnelBGP->withdrawAll();
+      runtime.sitePrefixAdvertised = false;
+      return false;
+    }
+
+    const auto *readiness = runtime.readiness.authenticatedMasqueQUICReady ?
+        &runtime.readiness : nullptr;
+    if (!runtime.privateTunnelBGP) {
+      runtime.privateTunnelBGP = std::make_unique<NeuronPrivateTunnelBGPRuntime>();
+      runtime.privateTunnelBGP->setPathChangedObserver([](void *context) {
+        static_cast<Neuron *>(context)->reconcileCrossClusterPrivateBGPSwitchboardFallback();
+      }, this);
+    }
+    ProdigyCrossClusterPrivateTunnelBGPDesiredState desired = {};
+    desired.pairUUID = runtime.authority.pairUUID;
+    desired.pairOperationUUID = runtime.authority.pairOperationUUID;
+    desired.localMachineUUID = runtime.authority.localMachineUUID;
+    desired.peerMachineUUID = runtime.authority.peerMachineUUID;
+    desired.keyEpoch = runtime.authority.keyGeneration;
+    desired.authorityGeneration = runtime.authority.pairAuthorityGeneration;
+    desired.gatewayGeneration = runtime.authority.generation;
+    desired.gatewaySlot = runtime.authority.gatewaySlot;
+    desired.localSitePrefix = runtime.authority.localSitePrefix;
+    desired.peerSitePrefix = runtime.authority.peerSitePrefix;
+    desired.tunnelInterface = runtime.authority.privateTunnelInterface;
+    desired.localInsideIPv6 = runtime.authority.privateTunnelLocalIPv6;
+    desired.peerInsideIPv6 = runtime.authority.privateTunnelPeerIPv6;
+    desired.localASN = runtime.authority.privateLocalASN;
+    desired.peerASN = runtime.authority.privatePeerASN;
+    desired.localBGPID = runtime.authority.privateLocalBGPID;
+    // The authority's SHA-256 is only a public reference.  The runtime
+    // replaces this empty field exclusively from the Vault delivery cache.
+    desired.sessionKey.clear();
+    desired.masqueReady = readiness != nullptr;
+    int gatewayNetworkNamespaceFD = -1;
+    // Switchboard outer delivery terminates at the gateway container's
+    // deterministic /128.  Its source is the host's local container /120
+    // address; the private /127 below stays scoped to the gateway TUN/BGP
+    // socket and is never a host-routable outer endpoint.
+    const auto container = containers.find(runtime.systemContainerUUID);
+    if (container != containers.end() && container->second != nullptr &&
+        !container->second->pendingDestroy &&
+        container->second->plan.system.kind == SystemContainerKind::crossClusterMasqueGateway)
+    {
+      const IPPrefix expectedGatewayAddress = generateAddress(
+          container_network_subnet6, container->second->plan.fragment, 128);
+      const bool gatewayAddressAssigned = std::any_of(
+          container->second->plan.addresses.begin(), container->second->plan.addresses.end(),
+          [&](const IPPrefix& address) { return address.cidr == 128 && address.network.equals(expectedGatewayAddress.network); });
+      if (gatewayAddressAssigned)
+      {
+        desired.localGatewayInjectionIPv6 = expectedGatewayAddress.network;
+        desired.localGatewaySourceIPv6 = generateAddress(container_network_subnet6, 0, 120).network;
+        desired.localGatewayInjectionFragment = container->second->plan.fragment;
+      }
+    }
+    if (readiness != nullptr)
+    {
+      if (container != containers.end() && container->second != nullptr &&
+          container->second->pid > 0 && !container->second->pendingDestroy &&
+          container->second->plan.system.kind == SystemContainerKind::crossClusterMasqueGateway)
+      {
+        String namespacePath = {};
+        namespacePath.snprintf<"/proc/{itoa}/ns/net"_ctv>(uint64_t(container->second->pid));
+        gatewayNetworkNamespaceFD = Filesystem::openFileAt(
+            -1, namespacePath, O_RDONLY | O_CLOEXEC);
+      }
+    }
+    const bool reconciled = runtime.privateTunnelBGP->reconcile(
+        runtime.authority, readiness, &desired, gatewayNetworkNamespaceFD);
+    if (gatewayNetworkNamespaceFD >= 0) ::close(gatewayNetworkNamespaceFD);
+    runtime.sitePrefixAdvertised = reconciled &&
+        runtime.privateTunnelBGP->desiredPaths().size() == 1 &&
+        runtime.privateTunnelBGP->desiredPaths()[0].localPrefixAnnounced;
+    return reconciled;
+  }
+
+  void reconcileCrossClusterPrivateBGPSwitchboardFallback(void)
+  {
+    bool needsBoundaryRouter = false;
+    for (auto& runtime : crossClusterMasqueGatewayRuntimes) {
+      if (runtime.privateBGPFallbackInstalled) {
+        auto found = std::find_if(overlayRoutingConfig.machineRoutes.begin(), overlayRoutingConfig.machineRoutes.end(),
+            [&](const auto& route) { return route == runtime.privateBGPFallback; });
+        if (found != overlayRoutingConfig.machineRoutes.end()) overlayRoutingConfig.machineRoutes.erase(found);
+        runtime.privateBGPFallback = {}; runtime.privateBGPFallbackInstalled = false;
+      }
+      runtime.privateBGPFallbackProgrammed = false;
+      if (!runtime.privateTunnelBGP || runtime.privateTunnelBGP->desiredPaths().size() != 1) continue;
+      SwitchboardOverlayMachineRoute route = {};
+      if (prodigyBuildCrossClusterPrivateTunnelSwitchboardFallback(runtime.authority,
+              runtime.privateTunnelBGP->desiredPaths()[0], route)) {
+        overlayRoutingConfig.machineRoutes.push_back(route);
+        runtime.privateBGPFallback = route;
+        runtime.privateBGPFallbackInstalled = true;
+        needsBoundaryRouter = true;
+      }
+    }
+    bool boundaryReady = true;
+    if (needsBoundaryRouter) boundaryReady = ensureSwitchboard()->setPrivateBGPBoundaryConsumer(true);
+    else if (switchboard) boundaryReady = switchboard->setPrivateBGPBoundaryConsumer(false);
+    const bool routingConverged = syncOverlayRoutingPrograms() && boundaryReady;
+    for (auto& runtime : crossClusterMasqueGatewayRuntimes) {
+      runtime.privateBGPFallbackProgrammed = routingConverged && runtime.privateBGPFallbackInstalled &&
+          crossClusterPrivateBGPFallbackProgrammed(runtime.privateBGPFallback);
+      if (!prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(runtime.authority) ||
+          runtime.authority.state != CrossClusterMasqueGatewayState::active) continue;
+      const ProdigyCrossClusterPrivateTunnelBGPPath *path = nullptr;
+      if (runtime.privateTunnelBGP && runtime.privateTunnelBGP->desiredPaths().size() == 1)
+        path = &runtime.privateTunnelBGP->desiredPaths()[0];
+      ProdigyCrossClusterPrivateBGPReadiness receipt = {};
+      if (!prodigyObserveCrossClusterPrivateBGPReadiness(
+              runtime.authority, path, runtime.privateBGPFallbackProgrammed, receipt)) continue;
+      if (brain && brain->fd >= 0) {
+        String encoded = {}; auto copy = receipt; BitseryEngine::serialize(encoded, copy);
+        Message::construct(brain->wBuffer, NeuronTopic::crossClusterPrivateBGPReadinessReceipt, encoded);
+        Vault::secureClearString(encoded); Ring::queueSend(brain);
+      }
+    }
+  }
+
   // we don't run this until after the brain sends us our fragment and any container plans, because we use
   // haveFragments as a test of whether it was a spurious connection break or a neuron crash/update or machine crash/update
   void setupNetworking(String *failureReport = nullptr)
@@ -2832,12 +4061,25 @@ protected:
         basics_log("setupNetworking retained TCX admitted ifidx=%d ingressLink=%u egressLink=%u\n",
                      eth.ifidx, retainedHostTCX.ingress.linkID, retainedHostTCX.egress.linkID);
       bool reuseWormholeFlowMaps = switchboardPinnedWormholeFlowMapsCompatible(eth.ifidx);
+      String whiteholeReplyPinPath = {};
+      switchboardWhiteholeReplyFlowPinPath(whiteholeReplyPinPath, eth.ifidx);
+      int whiteholeReplyFD = bpf_obj_get(whiteholeReplyPinPath.c_str());
+      const bool reuseWhiteholeReplyMap = whiteholeReplyFD >= 0;
+      if (whiteholeReplyFD >= 0) ::close(whiteholeReplyFD);
+      else if (errno != ENOENT) {
+        if (failureReport) failureReport->assign("cannot open pinned whitehole reply flow map"_ctv);
+        std::fprintf(stderr, "setupNetworking cannot open pinned whitehole reply flow map ifidx=%d errno=%d\n", eth.ifidx, errno);
+        return;
+      }
       tcx_egress_program = eth.loadPreattachedProgram(BPF_TCX_EGRESS, hostEgressPath);
       if (tcx_egress_program)
       {
-        if (switchboardProgramHasCompatibleWormholeFlowMaps(tcx_egress_program) == false ||
+        if ((reuseWhiteholeReplyMap && !switchboardProgramUsesPinnedWhiteholeReplyFlowMap(tcx_egress_program, eth.ifidx)) ||
+            switchboardProgramHasCompatibleWormholeFlowMaps(tcx_egress_program,
+                                                           SwitchboardWormholeMapConsumer::forwarding) == false ||
             (reuseWormholeFlowMaps &&
-             switchboardProgramUsesPinnedWormholeFlowMaps(tcx_egress_program, eth.ifidx) == false))
+             switchboardProgramUsesPinnedWormholeFlowMaps(tcx_egress_program, eth.ifidx,
+                                                         SwitchboardWormholeMapConsumer::forwarding) == false))
         {
           basics_log("setupNetworking detaching stale host egress without authoritative wormhole flow maps path=%s ifidx=%d\n",
                      hostEgressPath.c_str(), eth.ifidx);
@@ -2862,18 +4104,23 @@ protected:
           return;
         }
         bool mapsReused = reuseWormholeFlowMaps == false;
+        bool whiteholeMapReused = !reuseWhiteholeReplyMap;
         tcx_egress_program = eth.attachBPF(BPF_TCX_EGRESS, hostEgressPath, "host_egress"_ctv,
                                            [&](struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
                                              switchboardConfigureDevelopmentWhiteholeMapAllocation(obj);
+                                             if (reuseWhiteholeReplyMap)
+                                               whiteholeMapReused = switchboardReusePinnedWhiteholeReplyFlowMap(obj, eth.ifidx, inner_map_fds);
                                              if (reuseWormholeFlowMaps)
                                              {
                                                mapsReused = switchboardReusePinnedWormholeFlowMaps(obj, eth.ifidx, inner_map_fds);
                                              }
                                            });
         if (tcx_egress_program &&
-            (mapsReused == false ||
+            (mapsReused == false || whiteholeMapReused == false ||
+             (reuseWhiteholeReplyMap && !switchboardProgramUsesPinnedWhiteholeReplyFlowMap(tcx_egress_program, eth.ifidx)) ||
              (reuseWormholeFlowMaps &&
-              switchboardProgramUsesPinnedWormholeFlowMaps(tcx_egress_program, eth.ifidx) == false)))
+              switchboardProgramUsesPinnedWormholeFlowMaps(tcx_egress_program, eth.ifidx,
+                                                          SwitchboardWormholeMapConsumer::forwarding) == false)))
         {
           basics_log("setupNetworking detaching host egress that failed authoritative wormhole map reuse path=%s ifidx=%d\n",
                      hostEgressPath.c_str(), eth.ifidx);
@@ -2907,7 +4154,8 @@ protected:
       if (tcx_egress_program)
       {
         whiteholeReplyFlowPinned = switchboardPinWhiteholeReplyFlowMap(tcx_egress_program, eth.ifidx);
-        wormholeFlowPinned = switchboardPinWormholeFlowMaps(tcx_egress_program, eth.ifidx);
+        wormholeFlowPinned = switchboardPinWormholeFlowMaps(tcx_egress_program, eth.ifidx,
+                                                         SwitchboardWormholeMapConsumer::forwarding);
         if (whiteholeReplyFlowPinned == false)
         {
           basics_log("setupNetworking failed to pin host whitehole reply flow map ifidx=%d\n",
@@ -2926,6 +4174,8 @@ protected:
                    eth.ifidx);
         std::fprintf(stderr, "setupNetworking shared flow map pinning failed ifidx=%d whiteholeReply=%d wormhole=%d\n",
                      eth.ifidx, int(whiteholeReplyFlowPinned), int(wormholeFlowPinned));
+        if (failureReport) failureReport->assign("host router shared flow map pinning failed"_ctv);
+        return;
       }
       else
       {
@@ -2937,6 +4187,7 @@ protected:
             hasPortalMaps = mapFD >= 0;
           });
           if (hasPortalMaps == false ||
+              !switchboardProgramUsesPinnedWhiteholeReplyFlowMap(tcx_ingress_program, eth.ifidx) ||
               switchboardProgramUsesPinnedWormholeFlowMaps(tcx_ingress_program, eth.ifidx) == false)
           {
             basics_log("setupNetworking detaching stale host ingress with incompatible maps path=%s ifidx=%d\n",
@@ -2980,7 +4231,8 @@ protected:
                                                 (void)switchboardReusePinnedWormholeFlowMaps(obj, eth.ifidx, inner_map_fds);
                                               });
           if (tcx_ingress_program &&
-              switchboardProgramUsesPinnedWormholeFlowMaps(tcx_ingress_program, eth.ifidx) == false)
+              (!switchboardProgramUsesPinnedWhiteholeReplyFlowMap(tcx_ingress_program, eth.ifidx) ||
+               switchboardProgramUsesPinnedWormholeFlowMaps(tcx_ingress_program, eth.ifidx) == false))
           {
             basics_log("setupNetworking detaching host ingress without shared wormhole flow map path=%s ifidx=%d\n",
                        hostIngressPath.c_str(), eth.ifidx);
@@ -3029,7 +4281,8 @@ protected:
       tcx_egress_program->setArrayElement("mac_map"_ctv, 0, eth.mac);
       tcx_egress_program->setArrayElement("gw_mac_map"_ctv, 0, eth.gateway_mac);
       (void)switchboardPinWhiteholeReplyFlowMap(tcx_egress_program, eth.ifidx);
-      (void)switchboardPinWormholeFlowMaps(tcx_egress_program, eth.ifidx);
+      (void)switchboardPinWormholeFlowMaps(tcx_egress_program, eth.ifidx,
+                                        SwitchboardWormholeMapConsumer::forwarding);
       ensureWormholeFlowGCTickQueued();
     }
 
@@ -3059,6 +4312,14 @@ protected:
     syncWhiteholeBindingsProgram();
     syncOverlayRoutingPrograms();
 
+    String privateOverlayFailure = {};
+    if (ensurePrivateOverlayHostRoutingReady(&privateOverlayFailure) == false)
+    {
+      if (failureReport && failureReport->empty()) failureReport->assign(privateOverlayFailure);
+      std::fprintf(stderr, "neuron private overlay host routing setup failed reason=%s\n", privateOverlayFailure.c_str());
+      return;
+    }
+
     // Retained recovery invokes setupNetworking directly before it restores any
     // container network. Consume the optional, root-owned ingress selection
     // here too, rather than relying on a later container setup to attach it.
@@ -3073,6 +4334,66 @@ protected:
                    additionalIngressFailure.c_str());
       std::fflush(stderr);
     }
+  }
+
+  bool ensurePrivateOverlayHostRoutingReady(String *failureReport = nullptr)
+  {
+    String device = {};
+    if (prodigyResolveOptionalPrivateOverlayDevice(device, failureReport) == false) return false;
+    if (device.empty())
+    {
+      if (privateOverlayEth)
+      {
+        if (failureReport) failureReport->assign("private overlay selection removed while attached"_ctv);
+        return false;
+      }
+      return true;
+    }
+    if (tcx_ingress_program == nullptr || tcx_egress_program == nullptr)
+    {
+      if (failureReport) failureReport->assign("private overlay requires host routing programs"_ctv);
+      return false;
+    }
+    if (!privateOverlayEth) privateOverlayEth = std::make_unique<EthDevice>();
+    privateOverlayEth->setDevice(device);
+    if (device == "lo"_ctv || privateOverlayEth->ifidx == 0 || privateOverlayEth->ifidx == eth.ifidx)
+    {
+      if (failureReport) failureReport->assign("private overlay is not a distinct physical interface"_ctv);
+      return false;
+    }
+    auto readDecimal = [&](const char *suffix, unsigned long& value) -> bool {
+      String path = {}; path.assign("/sys/class/net/"_ctv); path.append(device); path.append(suffix);
+      char text[32] = {}; int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+      const ssize_t bytes = fd >= 0 ? ::read(fd, text, sizeof(text) - 1) : -1;
+      if (fd >= 0) ::close(fd);
+      char *end = nullptr; value = bytes > 0 ? ::strtoul(text, &end, 10) : 0;
+      return bytes > 0 && end != text && (*end == '\n' || *end == '\0');
+    };
+    unsigned long type = 0, iflink = 0;
+    if (!readDecimal("/type", type) || !readDecimal("/iflink", iflink) || type != 1 || iflink != privateOverlayEth->ifidx)
+    {
+      if (failureReport) failureReport->assign("private overlay does not prove a physical Ethernet interface"_ctv);
+      return false;
+    }
+    SwitchboardHostTCXRetentionPair retained = {}; bool retainedPresent = false;
+    if (switchboardHostTCXReadRetainedPair(*privateOverlayEth, "/sys/fs/bpf"_ctv, retained, retainedPresent) == false ||
+        (retainedPresent && (!switchboardHostTCXVerifyRetainedPair(*privateOverlayEth, "/sys/fs/bpf"_ctv, retained) ||
+                             retained.ingress.programID != Switchboard::kernelProgramID(tcx_ingress_program) ||
+                             retained.egress.programID != Switchboard::kernelProgramID(tcx_egress_program))))
+    {
+      if (failureReport) failureReport->assign("private overlay retained TCX identity invalid"_ctv);
+      return false;
+    }
+    if (!switchboardPinWhiteholeReplyFlowMap(tcx_egress_program, privateOverlayEth->ifidx) ||
+        !switchboardAliasPinnedWormholeFlowMaps(eth.ifidx, privateOverlayEth->ifidx) ||
+        !ensureSwitchboard()->configurePrivateOverlayHostRouting(*privateOverlayEth, tcx_ingress_program, tcx_egress_program, failureReport))
+      return false;
+    if (retainedPresent && !switchboardHostTCXVerifyRetainedPair(*privateOverlayEth, "/sys/fs/bpf"_ctv, retained))
+    {
+      if (failureReport) failureReport->assign("private overlay retained TCX identity changed"_ctv);
+      return false;
+    }
+    return true;
   }
 
   bool ensureAdditionalIngressReady(String *failureReport = nullptr)
@@ -3175,7 +4496,7 @@ protected:
 
     if (tcx_ingress_program && tcx_egress_program)
     {
-      return ensureAdditionalIngressReady(failureReport);
+      return ensurePrivateOverlayHostRoutingReady(failureReport) && ensureAdditionalIngressReady(failureReport);
     }
 
     if (haveFragments() == false)
@@ -3235,7 +4556,7 @@ protected:
       return false;
     }
 
-    return ensureAdditionalIngressReady(failureReport);
+    return ensurePrivateOverlayHostRoutingReady(failureReport) && ensureAdditionalIngressReady(failureReport);
   }
 
 public:
@@ -3268,6 +4589,10 @@ public:
     uint128_t sessionUUID = 0;
     uint64_t leaseGeneration = 0;
     uint128_t containerUUID = 0;
+    uint64_t carrierConnectionID = 0;
+    uint64_t carrierGeneration = 0;
+    CousinRouteHalf localHalf = CousinRouteHalf::source;
+    ProdigyCousinSessionRecord session = {};
     uint64_t controlGeneration = 0;
     uint128_t controlPeerUUID = 0;
     ProdigyCousinSessionLocalKind kind = ProdigyCousinSessionLocalKind::install;
@@ -3275,6 +4600,35 @@ public:
     int64_t expiresAtMs = 0;
   };
   Vector<CousinSessionLocalPending> cousinSessionLocalPendings = {};
+
+  struct CousinCarrierDeliveryPending {
+    uint128_t containerUUID = 0;
+    uint128_t sessionUUID = 0;
+    uint64_t leaseGeneration = 0;
+    String serialized = {};
+  };
+  // Pair control commits a frame only after it is admitted here. This bounded
+  // queue is the sole backpressure bridge from its authenticated record stream
+  // to a busy AF_UNIX container; no accepted carrier record is silently lost.
+  Vector<CousinCarrierDeliveryPending> cousinCarrierDeliveries = {};
+  uint32_t cousinCarrierDeliveryBytes = 0;
+  static constexpr uint32_t cousinCarrierDeliveryMaximumRecords =
+      ProdigyCousinSessionMaximumRecords * ProdigyCousinCarrierMaximumCredits;
+  static constexpr uint32_t cousinCarrierDeliveryMaximumBytes = cousinCarrierDeliveryMaximumRecords *
+      (ProdigyCousinCarrierMaximumPayloadBytes + 128);
+
+  void discardCousinCarrierDeliveries(uint128_t containerUUID, uint128_t sessionUUID = 0,
+                                      uint64_t leaseGeneration = 0)
+  {
+    for (auto it = cousinCarrierDeliveries.begin(); it != cousinCarrierDeliveries.end();) {
+      if (it->containerUUID != containerUUID ||
+          (sessionUUID != 0 && (it->sessionUUID != sessionUUID || it->leaseGeneration != leaseGeneration))) {
+        ++it; continue;
+      }
+      cousinCarrierDeliveryBytes -= uint32_t(it->serialized.size());
+      it = cousinCarrierDeliveries.erase(it);
+    }
+  }
 
   struct CousinAdmissionInstalled {
     uint128_t sessionUUID = 0;
@@ -3287,6 +4641,8 @@ public:
     uint64_t keyEpoch = 0;
     String digest = {};
     int64_t expiresAtMs = 0;
+    uint128_t privateContainerUUID = 0;
+    ProdigyCousinSessionRecord privateSession = {};
   };
   Vector<CousinAdmissionInstalled> cousinAdmissionInstalled = {};
 
@@ -3317,6 +4673,10 @@ public:
     };
     pairControlRuntime->onSessionControl = [this](const ProdigyCousinSessionReceipt& receipt) {
       forwardCousinSessionControlReceipt(receipt);
+    };
+    pairControlRuntime->onCarrierFrame = [this](const ClusterPairControlEndpoint& local,
+        const ClusterPairControlEndpoint& remote, uint64_t connectionID, const ProdigyCousinCarrierFrame& frame) {
+      return forwardCousinCarrierFrame(local, remote, connectionID, frame);
     };
     // The saved projection fences rollback, but may have been revoked while
     // this node was offline. Only a fresh durable current-master projection
@@ -3377,6 +4737,56 @@ public:
     flushCousinSessionControlReceipts();
   }
 
+  void flushCousinCarrierDeliveries(Container *container)
+  {
+    if (!container || !streamIsActive(container) || container->pendingSend || container->wBuffer.outstandingBytes() != 0) return;
+    auto pending = std::find_if(cousinCarrierDeliveries.begin(), cousinCarrierDeliveries.end(),
+        [&](const auto& value) { return value.containerUUID == container->plan.uuid; });
+    if (pending == cousinCarrierDeliveries.end()) return;
+    // Session/revoke control is written directly to wBuffer and therefore has
+    // priority over this idle-only carrier drain.
+    Message::construct(container->wBuffer, ContainerTopic::cousinCarrierFrame, pending->serialized);
+    cousinCarrierDeliveryBytes -= uint32_t(pending->serialized.size());
+    cousinCarrierDeliveries.erase(pending);
+    Ring::queueSend(container);
+  }
+
+  bool forwardCousinCarrierFrame(const ClusterPairControlEndpoint& local,
+                                 const ClusterPairControlEndpoint& remote, uint64_t connectionID,
+                                 const ProdigyCousinCarrierFrame& frame)
+  {
+    if (!pairControlRuntime || connectionID == 0 || !prodigyCousinCarrierFrameValid(frame)) return false;
+    pruneCousinSessionEphemeralState(Time::msSinceBoot());
+    auto pending = std::find_if(cousinSessionLocalPendings.begin(), cousinSessionLocalPendings.end(),
+        [&](const auto& value) {
+          if (!value.acknowledged || value.sessionUUID != frame.sessionUUID ||
+              value.carrierGeneration != frame.leaseGeneration ||
+              value.carrierConnectionID != connectionID ||
+              !prodigyCousinReverseCarrierSessionValid(value.session)) return false;
+          const auto& expectedLocal = value.localHalf == CousinRouteHalf::source ?
+              value.session.sourceCarrier : value.session.destinationCarrier;
+          const auto& expectedRemote = value.localHalf == CousinRouteHalf::source ?
+              value.session.destinationCarrier : value.session.sourceCarrier;
+          return local == expectedLocal && remote == expectedRemote;
+        });
+    if (pending == cousinSessionLocalPendings.end()) return false;
+    auto container = containers.find(pending->containerUUID);
+    if (container == containers.end() || !container->second || !streamIsActive(container->second)) return false;
+    if (frame.kind == ProdigyCousinCarrierKind::reset)
+      discardCousinCarrierDeliveries(pending->containerUUID, frame.sessionUUID, frame.leaseGeneration);
+    String encoded = {}; auto copy = frame;
+    if (!BitseryEngine::serialize(encoded, copy) || encoded.size() > ProdigyCousinCarrierMaximumPayloadBytes + 128 ||
+        cousinCarrierDeliveries.size() >= cousinCarrierDeliveryMaximumRecords ||
+        encoded.size() > cousinCarrierDeliveryMaximumBytes - cousinCarrierDeliveryBytes) return false;
+    cousinCarrierDeliveryBytes += uint32_t(encoded.size());
+    cousinCarrierDeliveries.push_back({pending->containerUUID, frame.sessionUUID, frame.leaseGeneration, std::move(encoded)});
+    flushCousinCarrierDeliveries(container->second);
+    // A reset is a terminal carrier-flow event.  Remove only this exact local
+    // ephemeral authorization; a later Brain renewal must re-install it.
+    if (frame.kind == ProdigyCousinCarrierKind::reset) cousinSessionLocalPendings.erase(pending);
+    return true;
+  }
+
   void receiveCousinSessionControl(const ProdigyCousinSessionPublication& publication)
   {
     NeuronBrainControlStream *stream = brain;
@@ -3410,12 +4820,14 @@ public:
       // its own still-live owner record; installs and activations are one-shot.
       if (existing != cousinSessionLocalPendings.end()) {
         const bool exactRenewal = command.kind == ProdigyCousinSessionLocalKind::renew &&
-            command.leaseGeneration == existing->leaseGeneration + 1;
+            command.leaseGeneration == existing->leaseGeneration + 1 &&
+            command.localHalf == existing->localHalf && prodigyCousinSessionExact(command.session, existing->session);
         // Cleanup may race a partially delivered renewal: a newer generation
         // only removes this exact retained session and cannot grant authority.
         const bool exactRevocation = command.kind == ProdigyCousinSessionLocalKind::revoke &&
             command.leaseGeneration >= existing->leaseGeneration;
-        if ((!exactRenewal && !exactRevocation) || existing->containerUUID != containerUUID) return;
+        if ((!exactRenewal && !exactRevocation) || existing->containerUUID != containerUUID ||
+            (exactRenewal && existing->carrierGeneration != command.carrierGeneration)) return;
       } else if ((command.kind == ProdigyCousinSessionLocalKind::install ||
                   command.kind == ProdigyCousinSessionLocalKind::activate) && command.leaseGeneration != 1) return;
       else if (cousinSessionLocalPendings.size() >= ProdigyCousinSessionMaximumRecords &&
@@ -3423,14 +4835,26 @@ public:
     }
     String serialized = {}; auto copy = command;
     if (!BitseryEngine::serialize(serialized, copy) || serialized.size() > ProdigyCousinSessionMaximumBytes) return;
+    if (command.kind != ProdigyCousinSessionLocalKind::reject &&
+        command.localHalf == CousinRouteHalf::source &&
+        prodigyCousinSessionUsesPrivateContainerEndpoints(command.session)) {
+      const bool revoke = command.kind == ProdigyCousinSessionLocalKind::revoke;
+      const uint64_t nowNs = monotonicNowNs();
+      const uint64_t lifetime = uint64_t(command.validForMs) * 1000000ULL;
+      if (!nowNs || (!revoke && (!lifetime || command.validForMs > ProdigyCousinSessionLeaseMs ||
+                                UINT64_MAX - nowNs < lifetime)) ||
+          !container->applyPrivateSessionTCPFlow(command.session, command.localHalf,
+                                                revoke ? 0 : nowNs + lifetime, revoke)) return;
+    }
     Message::construct(container->wBuffer, ContainerTopic::cousinSessionCommand, serialized);
     Ring::queueSend(container);
     if (command.kind != ProdigyCousinSessionLocalKind::reject) {
       // Revocation has no lease by design, but its local acknowledgement must
       // remain admissible long enough to reach the same authenticated Brain.
       const uint32_t acknowledgementWindow = command.validForMs ? command.validForMs : ProdigyCousinSessionPendingMs;
-      CousinSessionLocalPending pending = {command.session.sessionUUID, command.leaseGeneration, containerUUID, generation,
-          peerUUID, command.kind, false, Time::msSinceBoot() + int64_t(acknowledgementWindow)};
+      CousinSessionLocalPending pending = {command.session.sessionUUID, command.leaseGeneration, containerUUID,
+          command.carrierConnectionID, command.carrierGeneration, command.localHalf, command.session, generation, peerUUID, command.kind, false,
+          Time::msSinceBoot() + int64_t(acknowledgementWindow)};
       if (existing != cousinSessionLocalPendings.end()) *existing = pending;
       else cousinSessionLocalPendings.push_back(std::move(pending));
     }
@@ -3455,6 +4879,15 @@ public:
   {
     if (!prodigyCousinSessionLocalCommandValid(command) || !controlTransportCredentials.enabled) return false;
     const uint32_t containerID = generateLocalContainerID(container.plan.fragment);
+    const bool source = command.localHalf == CousinRouteHalf::source;
+    const auto& permission = source ? command.session.sourcePermission : command.session.destination.permission;
+    if (command.kind != ProdigyCousinSessionLocalKind::revoke &&
+        !prodigyCousinPermissionContainerPlanMatches(permission, container.plan,
+            source ? command.session.sourceService : command.session.destination.service,
+            prodigyCousinSessionUsesPrivateContainerEndpoints(command.session))) return false;
+    if (prodigyCousinSessionUsesPrivateContainerEndpoints(command.session))
+      return privateCousinEndpointMatchesContainer(command.session, command.localHalf, container,
+          command.kind != ProdigyCousinSessionLocalKind::revoke);
     if (command.localHalf == CousinRouteHalf::source) {
       const Whitehole *whitehole = cousinSessionSourceWhitehole(container, command.session.sourceBindingNonce);
       return command.session.sourceContainerUUID == container.plan.uuid &&
@@ -3479,8 +4912,55 @@ public:
     return matches == 1;
   }
 
+  bool privateCousinEndpointMatchesContainer(const ProdigyCousinSessionRecord& session,
+                                             CousinRouteHalf half, const Container& container,
+                                             bool requireCurrentPlan = true) const
+  {
+    if (!prodigyCousinSessionRecordValid(session) ||
+        !prodigyCousinSessionUsesPrivateContainerEndpoints(session) ||
+        !cousinRouteHalfValid(half)) return false;
+    const bool source = half == CousinRouteHalf::source;
+    const auto& permission = source ? session.sourcePermission : session.destination.permission;
+    const uint64_t service = source ? session.sourceService : session.destination.service;
+    const IPAddress& address = source ? session.sourceAddress : session.destination.publicAddress;
+    if ((source ? session.sourceContainerUUID : session.destination.containerUUID) != container.plan.uuid ||
+        (source ? session.sourceContainerID : session.destination.containerID) !=
+            generateLocalContainerID(container.plan.fragment) ||
+        (source ? session.sourceNodeUUID : session.destination.nodeUUID) != controlTransportCredentials.self.nodeUUID ||
+        permission.localClusterUUID != controlTransportCredentials.self.clusterUUID) return false;
+    // Revocation narrows an exact session token even after its former service
+    // is removed from the current plan.
+    if (!requireCurrentPlan) return true;
+    if (!prodigyValidateContainerPlanMeshIdentity(container.plan, lcsubnet6) ||
+        !prodigyCousinPermissionContainerPlanMatches(permission, container.plan, service, true)) return false;
+    uint32_t addresses = 0;
+    for (const auto& candidate : container.plan.addresses)
+      if (candidate.cidr == 128 && candidate.network.equals(address)) ++addresses;
+    if (addresses != 1) return false;
+    if (source) return true;
+    const auto advertised = container.plan.advertisements.find(service);
+    return advertised != container.plan.advertisements.end() &&
+        advertised->second.port == session.destination.servicePort &&
+        session.destination.publicTCPPort == session.destination.servicePort &&
+        serviceBlueprintActiveAtContainerState(advertised->second, container.plan.state);
+  }
+
+  bool clearPrivateCousinFlow(const CousinSessionLocalPending& pending)
+  {
+    if (pending.localHalf != CousinRouteHalf::source ||
+        !prodigyCousinSessionUsesPrivateContainerEndpoints(pending.session)) return true;
+    auto found = containers.find(pending.containerUUID);
+    return found == containers.end() || !found->second ||
+        found->second->applyPrivateSessionTCPFlow(pending.session, pending.localHalf, 0, true);
+  }
+
   bool clearCousinAdmissionGrant(const CousinAdmissionInstalled& installed)
   {
+    if (installed.privateContainerUUID != 0) {
+      auto found = containers.find(installed.privateContainerUUID);
+      return found == containers.end() || !found->second ||
+          found->second->applyPrivateSessionTCPFlow(installed.privateSession, CousinRouteHalf::destination, 0, true);
+    }
     if (!tcx_egress_program) return false;
     switchboard_pair_admission_route_policy revoked = {};
     revoked.route_generation = 1; revoked.root_generation = installed.rootGeneration;
@@ -3492,15 +4972,34 @@ public:
         installed.routeKey, installed.rootGeneration, installed.keyEpoch);
   }
 
+  void clearPrivateCousinAdmissionsForContainer(uint128_t containerUUID)
+  {
+    for (auto it = cousinAdmissionInstalled.begin(); it != cousinAdmissionInstalled.end();) {
+      if (it->privateContainerUUID != containerUUID) { ++it; continue; }
+      if (!clearCousinAdmissionGrant(*it))
+        basics_log("neuron private session cleanup deferred to bounded kernel expiry\n");
+      it = cousinAdmissionInstalled.erase(it);
+    }
+  }
+
   void forwardCousinAdmissionResetInvalidation(const CousinAdmissionInstalled& installed)
   {
     NeuronBrainControlStream *stream = brain;
     const uint64_t generation = stream ? stream->ioGeneration : 0;
     const uint128_t peerUUID = stream ? stream->tlsPeerUUID : 0;
+    const bool privateContainer = installed.privateContainerUUID != 0;
+    const bool revisionValid = privateContainer ?
+        (prodigyCousinSessionRecordValid(installed.privateSession) &&
+         prodigyCousinSessionUsesPrivateContainerEndpoints(installed.privateSession) &&
+         installed.privateSession.sessionUUID == installed.sessionUUID &&
+         installed.privateSession.destination.containerUUID == installed.privateContainerUUID &&
+         installed.privateSession.destination.containerID == installed.destinationContainerID &&
+         installed.destinationWormholeRevision.empty()) :
+        prodigyIsSHA256HexDigest(installed.destinationWormholeRevision);
     if (installed.expiresAtMs <= Time::msSinceBoot() || installed.destinationContainerID == 0 ||
-        !prodigyIsSHA256HexDigest(installed.destinationWormholeRevision) ||
-        !cousinSessionCarrierCurrent(stream, generation, peerUUID)) return;
+        !revisionValid || !cousinSessionCarrierCurrent(stream, generation, peerUUID)) return;
     ProdigyCousinAdmissionAck acknowledgement = {};
+    if (privateContainer) acknowledgement.protocolVersion = ProdigyCousinAdmissionAck::privateContainerVersion;
     acknowledgement.leaseGeneration = installed.leaseGeneration;
     acknowledgement.sessionUUID = installed.sessionUUID;
     acknowledgement.containerID = installed.destinationContainerID;
@@ -3539,7 +5038,11 @@ public:
   void pruneCousinSessionEphemeralState(int64_t now)
   {
     for (auto it = cousinSessionLocalPendings.begin(); it != cousinSessionLocalPendings.end();) {
-      if (it->expiresAtMs <= now) it = cousinSessionLocalPendings.erase(it); else ++it;
+      if (it->expiresAtMs <= now) {
+        (void)clearPrivateCousinFlow(*it);
+        discardCousinCarrierDeliveries(it->containerUUID, it->sessionUUID, it->carrierGeneration);
+        it = cousinSessionLocalPendings.erase(it);
+      } else ++it;
     }
     for (auto it = cousinAdmissionInstalled.begin(); it != cousinAdmissionInstalled.end();) {
       if (it->expiresAtMs > now) { ++it; continue; }
@@ -3573,9 +5076,22 @@ public:
     if (!BitseryEngine::serialize(serialized, copy) || serialized.size() > ProdigyCousinSessionMaximumBytes) return;
     Message::construct(stream->wBuffer, NeuronTopic::cousinSessionAck, container->plan.uuid, serialized);
     Ring::queueSend(stream);
-    if (ack.kind == ProdigyCousinSessionLocalKind::revoke || !ack.success)
+    if (ack.kind == ProdigyCousinSessionLocalKind::revoke || !ack.success) {
+      (void)clearPrivateCousinFlow(*pending);
+      if (pending->localHalf == CousinRouteHalf::destination &&
+          prodigyCousinSessionUsesPrivateContainerEndpoints(pending->session)) {
+        for (auto it = cousinAdmissionInstalled.begin(); it != cousinAdmissionInstalled.end();) {
+          if (it->privateContainerUUID != pending->containerUUID || it->sessionUUID != pending->sessionUUID ||
+              it->leaseGeneration > pending->leaseGeneration ||
+              !prodigyCousinSessionExact(it->privateSession, pending->session)) { ++it; continue; }
+          if (!clearCousinAdmissionGrant(*it))
+            basics_log("neuron private session failure cleanup deferred to bounded kernel expiry\n");
+          it = cousinAdmissionInstalled.erase(it);
+        }
+      }
+      discardCousinCarrierDeliveries(pending->containerUUID, pending->sessionUUID, pending->carrierGeneration);
       cousinSessionLocalPendings.erase(pending);
-    else pending->acknowledged = true;
+    } else pending->acknowledged = true;
   }
 
   bool installCousinAdmissionCommand(const ProdigyCousinAdmissionCommand& command,
@@ -3588,7 +5104,13 @@ public:
     acknowledgement.leaseGeneration = command.leaseGeneration;
     acknowledgement.containerID = command.session.destination.containerID;
     acknowledgement.wormholeRevision = command.session.destination.wormholeRevision;
-    if (!prodigyCousinAdmissionCommandValid(command) || !switchboard || !tcx_egress_program) return false;
+    if (prodigyCousinSessionUsesPrivateContainerEndpoints(command.session)) {
+      acknowledgement.protocolVersion = ProdigyCousinAdmissionAck::privateContainerVersion;
+      return installPrivateCousinAdmissionCommand(command, acknowledgement);
+    }
+    if (!prodigyCousinAdmissionCommandValid(command) ||
+        command.session.transport == ProdigyCousinSessionTransport::reverseCarrier ||
+        !switchboard || !tcx_egress_program) return false;
     const uint64_t nowNs = monotonicNowNs();
     // Revocations intentionally carry no lease; their tombstone is immediately
     // authoritative. Active/renewed routes remain capped by the session lease.
@@ -3626,6 +5148,12 @@ public:
     }
     String digest = {};
     if (!prodigyCousinSessionDigest(command.session, digest)) return false;
+    if (command.protocolVersion == 2) {
+      String sourceBytes = {}, bound = {}; auto address = command.authenticatedSourceAddress;
+      if (!BitseryEngine::serialize(sourceBytes, address)) return false;
+      bound.append(digest); bound.append(sourceBytes);
+      if (!prodigyComputeSHA256Hex(bound, digest)) return false;
+    }
     pruneCousinSessionEphemeralState(Time::msSinceBoot());
     existing = std::find_if(cousinAdmissionInstalled.begin(), cousinAdmissionInstalled.end(),
         [&](const auto& value) { return value.sessionUUID == command.session.sessionUUID; });
@@ -3645,7 +5173,8 @@ public:
         return false;
       }
       switchboard_pair_admission_grant_key key = {}; key.portal_slot = portalSlot;
-      std::memcpy(key.flow.srcv6, command.session.sourceAddress.v6, sizeof(key.flow.srcv6));
+      const auto& sourceAddress = command.protocolVersion == 2 ? command.authenticatedSourceAddress : command.session.sourceAddress;
+      std::memcpy(key.flow.srcv6, sourceAddress.v6, sizeof(key.flow.srcv6));
       std::memcpy(key.flow.dstv6, command.session.destination.publicAddress.v6, sizeof(key.flow.dstv6));
       key.flow.port16[0] = htons(command.session.sourceTCPPort);
       key.flow.port16[1] = htons(command.session.destination.publicTCPPort); key.flow.proto = IPPROTO_TCP;
@@ -3669,6 +5198,49 @@ public:
     } else { existing->leaseGeneration = command.leaseGeneration; existing->expiresAtMs = Time::msSinceBoot() + command.validForMs; }
     acknowledgement.containerID = command.session.destination.containerID;
     acknowledgement.wormholeRevision = command.session.destination.wormholeRevision;
+    acknowledgement.success = true;
+    return true;
+  }
+
+  bool installPrivateCousinAdmissionCommand(const ProdigyCousinAdmissionCommand& command,
+                                             ProdigyCousinAdmissionAck& acknowledgement)
+  {
+    if (!prodigyCousinAdmissionCommandValid(command) ||
+        !prodigyCousinSessionUsesPrivateContainerEndpoints(command.session)) return false;
+    auto container = containers.find(command.session.destination.containerUUID);
+    if (container == containers.end() || !container->second || !streamIsActive(container->second) ||
+        !privateCousinEndpointMatchesContainer(command.session, CousinRouteHalf::destination,
+                                               *container->second, !command.revoke))
+      return false;
+    auto existing = std::find_if(cousinAdmissionInstalled.begin(), cousinAdmissionInstalled.end(),
+        [&](const auto& value) { return value.sessionUUID == command.session.sessionUUID; });
+    if (existing != cousinAdmissionInstalled.end() &&
+        (existing->privateContainerUUID != container->first ||
+         !prodigyCousinSessionExact(existing->privateSession, command.session) ||
+         (command.revoke ? command.leaseGeneration < existing->leaseGeneration :
+                          command.leaseGeneration != existing->leaseGeneration + 1))) return false;
+    if (existing == cousinAdmissionInstalled.end() && !command.revoke &&
+        (command.leaseGeneration != 1 || cousinAdmissionInstalled.size() >= ProdigyCousinSessionMaximumRecords))
+      return false;
+    const uint64_t nowNs = monotonicNowNs(), lifetime = uint64_t(command.validForMs) * 1000000ULL;
+    if (!nowNs || (!command.revoke && (!lifetime || command.validForMs > ProdigyCousinSessionLeaseMs ||
+                                     UINT64_MAX - nowNs < lifetime))) return false;
+    if (!container->second->applyPrivateSessionTCPFlow(command.session, CousinRouteHalf::destination,
+                                                      command.revoke ? 0 : nowNs + lifetime, command.revoke))
+      return false;
+    if (command.revoke) {
+      if (existing != cousinAdmissionInstalled.end()) cousinAdmissionInstalled.erase(existing);
+      acknowledgement.revoked = true; acknowledgement.success = true; return true;
+    }
+    CousinAdmissionInstalled installed = {};
+    installed.sessionUUID = command.session.sessionUUID; installed.leaseGeneration = command.leaseGeneration;
+    installed.destinationContainerID = command.session.destination.containerID;
+    installed.destinationWormholeRevision = command.session.destination.wormholeRevision;
+    installed.rootGeneration = command.session.rootGeneration; installed.keyEpoch = command.session.keyEpoch;
+    installed.expiresAtMs = Time::msSinceBoot() + command.validForMs;
+    installed.privateContainerUUID = container->first; installed.privateSession = command.session;
+    if (existing == cousinAdmissionInstalled.end()) cousinAdmissionInstalled.push_back(std::move(installed));
+    else *existing = std::move(installed);
     acknowledgement.success = true;
     return true;
   }
@@ -3762,22 +5334,51 @@ public:
 
   bool controlPeerAuthorizedByBootstrap(uint128_t peerUUID, const ProdigyTransportCredentialBootstrap& bootstrap) const
   {
-    if (!brain || brain->tlsPeerUUID != peerUUID ||
-        !bootstrap.currentlyAuthorizes(peerUUID, ProdigyTransportCredentialNodeRole::brain)) return false;
+    const bool hasBrain = brain != nullptr;
+    const bool tlsPeerMatchesStream = hasBrain && brain->tlsPeerUUID == peerUUID;
+    const bool enrollmentAuthorized = tlsPeerMatchesStream &&
+        bootstrap.currentlyAuthorizes(peerUUID, ProdigyTransportCredentialNodeRole::brain);
+    if (!enrollmentAuthorized)
+    {
+      PRODIGY_DEBUG_LOG(
+          "neuron brain credential-authorize reject reason=stream-or-enrollment hasBrain=%d peerMatchesStream=%d bootstrapEnabled=%d selfValid=%d enrollmentAuthorized=%d peerCount=%u\n",
+          int(hasBrain), int(tlsPeerMatchesStream), int(bootstrap.enabled), int(bootstrap.self.valid()),
+          int(enrollmentAuthorized), unsigned(bootstrap.authorizedPeers.size()));
+      PRODIGY_DEBUG_FLUSH();
+      return false;
+    }
     const String *localBytes = nullptr, *peerBytes = nullptr;
     ProdigyTransportCredentialPrelude local, peer;
     const auto& self = bootstrap.self;
-    if (!brain->authenticatedTransportAEGISPreludes(localBytes, peerBytes) ||
-        !prodigyParseTransportCredentialPrelude(*localBytes, local) ||
-        local.operationUUID != self.operationUUID || local.nodeUUID != self.nodeUUID || local.role != self.role ||
-        local.authorityEpoch != self.authorityEpoch || local.keyEpoch != self.keyEpoch ||
-        local.authorityGeneration != self.authorityGeneration ||
-        !prodigyParseTransportCredentialPrelude(*peerBytes, peer) ||
-        peer.nodeUUID != peerUUID || peer.role != ProdigyTransportCredentialNodeRole::brain) return false;
-    return std::count_if(bootstrap.authorizedPeers.begin(),
+    const bool authenticatedPreludes = brain->authenticatedTransportAEGISPreludes(localBytes, peerBytes);
+    const bool localParsed = authenticatedPreludes && localBytes != nullptr &&
+        prodigyParseTransportCredentialPrelude(*localBytes, local);
+    const bool localMatchesSelf = localParsed && local.operationUUID == self.operationUUID &&
+        local.nodeUUID == self.nodeUUID && local.role == self.role &&
+        local.authorityEpoch == self.authorityEpoch && local.keyEpoch == self.keyEpoch &&
+        local.authorityGeneration == self.authorityGeneration;
+    const bool peerParsed = authenticatedPreludes && peerBytes != nullptr &&
+        prodigyParseTransportCredentialPrelude(*peerBytes, peer);
+    const bool preludePeerMatchesStream = peerParsed && peer.nodeUUID == peerUUID &&
+        peer.role == ProdigyTransportCredentialNodeRole::brain;
+    const uint32_t peerEnrollmentMatches = localMatchesSelf && preludePeerMatchesStream ? uint32_t(std::count_if(bootstrap.authorizedPeers.begin(),
         bootstrap.authorizedPeers.end(), [&](const auto& entry) {
           return prodigyTransportCredentialPreludeMatches(peer, entry);
-        }) == 1;
+        })) : 0;
+    const bool authorized = localMatchesSelf && preludePeerMatchesStream && peerEnrollmentMatches == 1;
+    if (!authorized)
+    {
+      PRODIGY_DEBUG_LOG(
+          "neuron brain credential-authorize reject reason=prelude authenticated=%d localBytes=%d peerBytes=%d localParsed=%d localMatchesSelf=%d peerParsed=%d peerMatchesStream=%d peerEnrollmentMatches=%u selfRole=%u localRole=%u peerRole=%u selfAuthorityEpoch=%llu localAuthorityEpoch=%llu selfKeyEpoch=%llu localKeyEpoch=%llu selfAuthorityGeneration=%llu localAuthorityGeneration=%llu\n",
+          int(authenticatedPreludes), int(localBytes != nullptr), int(peerBytes != nullptr), int(localParsed),
+          int(localMatchesSelf), int(peerParsed), int(preludePeerMatchesStream), unsigned(peerEnrollmentMatches),
+          unsigned(self.role), unsigned(local.role), unsigned(peer.role),
+          (unsigned long long)self.authorityEpoch, (unsigned long long)local.authorityEpoch,
+          (unsigned long long)self.keyEpoch, (unsigned long long)local.keyEpoch,
+          (unsigned long long)self.authorityGeneration, (unsigned long long)local.authorityGeneration);
+      PRODIGY_DEBUG_FLUSH();
+    }
+    return authorized;
   }
 
   bool controlPeerCurrentlyAuthorized(uint128_t peerUUID) const
@@ -4950,10 +6551,91 @@ public:
 
           break;
         }
+      case ContainerTopic::nametagQualificationSeedFault:
+        {
+          String encoded = {}; Message::extractToStringView(args, encoded);
+          ProdigyNametagQualificationSeedFault witness = {};
+          NeuronBrainControlStream *stream = brain;
+          if (args != terminal || !stream || !BitseryEngine::deserializeSafe(encoded, witness) ||
+              !witness.response || !prodigyNametagQualificationSeedFaultValid(witness) ||
+              witness.deadlineAtMilliseconds <= Time::now<TimeResolution::ms>() ||
+              witness.authority.targetContainerUUID != container->plan.uuid ||
+              witness.authority.targetDeploymentID != container->plan.config.deploymentID() ||
+              witness.authority.targetClusterUUID != controlTransportCredentials.self.clusterUUID ||
+              witness.authority.applicationID != container->plan.config.applicationID ||
+              !controlPeerCurrentlyAuthorized(stream->tlsPeerUUID) ||
+              !transportPeerProjectionControlCurrent(stream, stream->ioGeneration, stream->tlsPeerUUID)) break;
+          Message::construct(stream->wBuffer, NeuronTopic::nametagQualificationSeedFault, container->plan.uuid, encoded);
+          if (streamIsActive(stream)) Ring::queueSend(stream);
+          break;
+        }
+      case ContainerTopic::nametagQualificationReplay:
+        {
+          String encoded = {}; Message::extractToStringView(args, encoded);
+          ProdigyNametagQualificationReplay witness = {};
+          NeuronBrainControlStream *stream = brain;
+          if (args != terminal || !stream || !BitseryEngine::deserializeSafe(encoded, witness) ||
+              !witness.response || !prodigyNametagQualificationReplayValid(witness) ||
+              !prodigyNametagQualificationReplayRelayTimely(witness, Time::now<TimeResolution::ms>()) ||
+              (prodigyNametagQualificationReplayLocalHalf(witness.store, witness.targetSide) == CousinRouteHalf::source ? witness.session.sourceContainerUUID : witness.session.destinationContainerUUID) != container->plan.uuid ||
+              (prodigyNametagQualificationReplayLocalHalf(witness.store, witness.targetSide) == CousinRouteHalf::source ? witness.session.sourceDeploymentID : witness.session.destinationDeploymentID) != container->plan.config.deploymentID() ||
+              (prodigyNametagQualificationReplayLocalHalf(witness.store, witness.targetSide) == CousinRouteHalf::source ? witness.session.sourceClusterUUID : witness.session.destinationClusterUUID) != controlTransportCredentials.self.clusterUUID ||
+              !controlPeerCurrentlyAuthorized(stream->tlsPeerUUID) ||
+              !transportPeerProjectionControlCurrent(stream, stream->ioGeneration, stream->tlsPeerUUID)) break;
+          Message::construct(stream->wBuffer, NeuronTopic::nametagQualificationReplay, container->plan.uuid, encoded);
+          if (streamIsActive(stream)) Ring::queueSend(stream);
+          break;
+        }
+      case ContainerTopic::nametagQualificationCousinTransport:
+        {
+          String encoded = {}; Message::extractToStringView(args, encoded);
+          ProdigyNametagQualificationCousinTransport witness = {};
+          NeuronBrainControlStream *stream = brain;
+          if (args != terminal || !stream || !BitseryEngine::deserializeSafe(encoded, witness) ||
+              !witness.response || !prodigyNametagQualificationCousinTransportValid(witness) ||
+              witness.deadlineAtMilliseconds <= Time::now<TimeResolution::ms>() ||
+              witness.session.sourceContainerUUID != container->plan.uuid ||
+              witness.session.sourceDeploymentID != container->plan.config.deploymentID() ||
+              witness.session.sourceClusterUUID != controlTransportCredentials.self.clusterUUID ||
+              !controlPeerCurrentlyAuthorized(stream->tlsPeerUUID) ||
+              !transportPeerProjectionControlCurrent(stream, stream->ioGeneration, stream->tlsPeerUUID)) break;
+          Message::construct(stream->wBuffer, NeuronTopic::nametagQualificationCousinTransport, container->plan.uuid, encoded);
+          if (streamIsActive(stream)) Ring::queueSend(stream);
+          break;
+        }
+      case ContainerTopic::statefulStoreSourceCut:
+        {
+          String encoded = {}; Message::extractToStringView(args, encoded);
+          ProdigyStatefulStoreSourceCut cut = {};
+          NeuronBrainControlStream *stream = brain;
+          if (args != terminal || !stream || !BitseryEngine::deserializeSafe(encoded, cut) ||
+              !cut.response || !prodigyStatefulStoreSourceCutValid(cut) ||
+              cut.sourceContainerUUID != container->plan.uuid ||
+              cut.sourceDeploymentID != container->plan.config.deploymentID() ||
+              cut.applicationID != container->plan.config.applicationID ||
+              cut.shardGroup != container->plan.shardGroup || cut.nShardGroups != container->plan.nShardGroups ||
+              cut.sourceClusterUUID != controlTransportCredentials.self.clusterUUID ||
+              !controlPeerCurrentlyAuthorized(stream->tlsPeerUUID) ||
+              !transportPeerProjectionControlCurrent(stream, stream->ioGeneration, stream->tlsPeerUUID)) break;
+          Message::construct(stream->wBuffer, NeuronTopic::statefulStoreSourceCut, container->plan.uuid, encoded);
+          Ring::queueSend(stream);
+          break;
+        }
       case ContainerTopic::statefulDataAuthority:
         {
           String encoded;
           Message::extractToStringView(args, encoded);
+          StatefulDataAuthorityPreparation preparation;
+          if (args == terminal && brain && BitseryEngine::deserializeSafe(encoded, preparation) &&
+              preparation.response && prodigyStatefulDataAuthorityPreparationValid(preparation)) {
+            if (container->plan.config.deploymentID() != preparation.deploymentID ||
+                container->plan.config.applicationID != preparation.applicationID ||
+                container->plan.shardGroup != preparation.shardGroup || container->plan.nShardGroups != preparation.nShardGroups ||
+                !prodigyStatefulDataAuthorityPreparationContextEqual(preparation, container->statefulPreparationRequest)) break;
+            Message::construct(brain->wBuffer, NeuronTopic::statefulDataAuthority, container->plan.uuid, encoded);
+            Ring::queueSend(brain);
+            break;
+          }
           StatefulDataAuthorityReceipt receipt;
           if (args != terminal || !brain ||
               !BitseryEngine::deserializeSafe(encoded, receipt) ||
@@ -5052,6 +6734,128 @@ public:
           ProdigyCousinSessionLocalAck acknowledgement = {};
           if (args == terminal && BitseryEngine::deserializeSafe(serialized, acknowledgement))
             forwardCousinSessionLocalAck(container, acknowledgement);
+          break;
+        }
+      case ContainerTopic::app6TruthMeshReceipt:
+        {
+          String encoded = {}; Message::extractToStringView(args, encoded);
+          ProdigyApp6TruthMeshReceipt receipt = {};
+          NeuronBrainControlStream *stream = brain;
+          if (args != terminal || !stream || container->plan.config.applicationID != MeshRegistry::Nametag::applicationID ||
+              !BitseryEngine::deserializeSafe(encoded, receipt) || !prodigyApp6TruthMeshReceiptValid(receipt) ||
+              receipt.localApplicationContainerUUID != container->plan.uuid ||
+              receipt.localClusterUUID != controlTransportCredentials.self.clusterUUID ||
+              !cousinSessionCarrierCurrent(stream, stream->ioGeneration, stream->tlsPeerUUID)) break;
+          Message::construct(stream->wBuffer, NeuronTopic::app6TruthMeshReceipt, encoded);
+          Ring::queueSend(stream);
+          break;
+        }
+      case ContainerTopic::statefulStoreProofRecovery:
+        {
+          String encoded = {}; Message::extractToStringView(args, encoded);
+          ProdigyStatefulStoreProofRecovery response = {};
+          NeuronBrainControlStream *stream = brain;
+          if (args != terminal || !stream || !BitseryEngine::deserializeSafe(encoded, response) ||
+              !response.response || !prodigyStatefulStoreProofRecoveryValid(response) ||
+              response.authority.targetContainerUUID != container->plan.uuid ||
+              response.authority.targetDeploymentID != container->plan.config.deploymentID() ||
+              response.authority.targetClusterUUID != controlTransportCredentials.self.clusterUUID ||
+              !cousinSessionCarrierCurrent(stream, stream->ioGeneration, stream->tlsPeerUUID)) break;
+          Message::construct(stream->wBuffer, NeuronTopic::statefulStoreProofRecovery, encoded);
+          Ring::queueSend(stream);
+          break;
+        }
+      case ContainerTopic::statefulStoreReceipt:
+        {
+          String encoded = {}; Message::extractToStringView(args, encoded);
+          ProdigyStatefulStoreReceipt receipt = {};
+          NeuronBrainControlStream *stream = brain;
+          // Bind the observation to the local control socket.  The Brain
+          // independently fences its cache to this Neuron incarnation.
+          if (args != terminal || !stream || !BitseryEngine::deserializeSafe(encoded, receipt) ||
+              !prodigyStatefulStoreReceiptValid(receipt) || receipt.localContainerUUID != container->plan.uuid ||
+              receipt.deploymentID != container->plan.config.deploymentID() ||
+              receipt.localClusterUUID != controlTransportCredentials.self.clusterUUID ||
+              !cousinSessionCarrierCurrent(stream, stream->ioGeneration, stream->tlsPeerUUID)) break;
+          Message::construct(stream->wBuffer, NeuronTopic::statefulStoreReceipt, encoded);
+          Ring::queueSend(stream);
+          break;
+        }
+      case ContainerTopic::nametagHandoffBarrier:
+        {
+          String encoded = {}; Message::extractToStringView(args, encoded);
+          ProdigyNametagHandoffBarrier barrier = {}; NeuronBrainControlStream *stream = brain;
+          if (args != terminal || !stream || !BitseryEngine::deserializeSafe(encoded, barrier) ||
+              !prodigyNametagHandoffBarrierValid(barrier) || barrier.clusterUUID != controlTransportCredentials.self.clusterUUID ||
+              barrier.deadlineMilliseconds <= Time::now<TimeResolution::ms>() ||
+              (barrier.response ? (container->plan.config.applicationID != 6 ||
+                  barrier.appContainerUUID != container->plan.uuid || barrier.appDeploymentID != container->plan.config.deploymentID()) :
+                 (container->plan.config.applicationID != 11 || barrier.probeContainerUUID != container->plan.uuid ||
+                  barrier.probeDeploymentID != container->plan.config.deploymentID()))) break;
+          Message::construct(stream->wBuffer, NeuronTopic::nametagHandoffBarrier, encoded);
+          if (streamIsActive(stream)) Ring::queueSend(stream);
+          break;
+        }
+      case ContainerTopic::nametagQualificationApplicationReceipt:
+        {
+          // The container control socket supplies the local container identity;
+          // never let receipt payload choose which local deployment reported.
+          // Brain performs the durable run/row/deadline join after this relay.
+          String encoded = {}; Message::extractToStringView(args, encoded);
+          ProdigyNametagQualificationApplicationReceipt receipt = {};
+          NeuronBrainControlStream *stream = brain;
+          if (args != terminal || !stream || !BitseryEngine::deserializeSafe(encoded, receipt) ||
+              !prodigyNametagQualificationApplicationReceiptValid(receipt) ||
+              receipt.localContainerUUID != container->plan.uuid ||
+              receipt.deploymentID != container->plan.config.deploymentID() ||
+              receipt.localClusterUUID != controlTransportCredentials.self.clusterUUID ||
+              container->plan.config.applicationID != 11) break;
+          Message::construct(stream->wBuffer, NeuronTopic::nametagQualificationApplicationReceipt, encoded);
+          if (streamIsActive(stream)) Ring::queueSend(stream);
+          break;
+        }
+      case ContainerTopic::nametagSourceBaseline:
+        {
+          String encoded = {}; Message::extractToStringView(args, encoded);
+          ProdigyNametagSourceBaselineEnvelope envelope = {}; NeuronBrainControlStream *stream = brain;
+          if (args != terminal || !stream || !BitseryEngine::deserializeSafe(encoded, envelope) ||
+              !prodigyNametagSourceBaselineEnvelopeValid(envelope) ||
+              envelope.direction != ProdigyNametagSourceBaselineDirection::receipt ||
+              envelope.receipt.localContainerUUID != container->plan.uuid ||
+              envelope.receipt.probeDeploymentID != container->plan.config.deploymentID() ||
+              envelope.receipt.ewrClusterUUID != controlTransportCredentials.self.clusterUUID ||
+              container->plan.config.applicationID != 11) break;
+          Message::construct(stream->wBuffer, NeuronTopic::nametagSourceBaseline, encoded);
+          if (streamIsActive(stream)) Ring::queueSend(stream);
+          break;
+        }
+      case ContainerTopic::cousinCarrierFrame:
+        {
+          String serialized = {}; Message::extractToStringView(args, serialized);
+          ProdigyCousinCarrierFrame frame = {};
+          if (args != terminal || !BitseryEngine::deserializeSafe(serialized, frame) ||
+              !prodigyCousinCarrierFrameValid(frame) || !pairControlRuntime) break;
+          pruneCousinSessionEphemeralState(Time::msSinceBoot());
+          auto pending = std::find_if(cousinSessionLocalPendings.begin(), cousinSessionLocalPendings.end(),
+              [&](const auto& value) {
+                return value.acknowledged && value.containerUUID == container->plan.uuid &&
+                    value.sessionUUID == frame.sessionUUID && value.carrierGeneration == frame.leaseGeneration &&
+                    prodigyCousinReverseCarrierSessionValid(value.session);
+              });
+          if (pending == cousinSessionLocalPendings.end()) break;
+          const auto& local = pending->localHalf == CousinRouteHalf::source ?
+              pending->session.sourceCarrier : pending->session.destinationCarrier;
+          const auto& remote = pending->localHalf == CousinRouteHalf::source ?
+              pending->session.destinationCarrier : pending->session.sourceCarrier;
+          const bool sent = pairControlRuntime->sendCarrierFrame(pending->session, local, remote,
+              pending->carrierConnectionID, frame);
+          // A failed reset has not reached the authenticated flow and must not
+          // silently withdraw the exact local authorization. On success, drop
+          // queued inbound data before retiring just this session.
+          if (sent && frame.kind == ProdigyCousinCarrierKind::reset) {
+            discardCousinCarrierDeliveries(pending->containerUUID, pending->sessionUUID, pending->carrierGeneration);
+            cousinSessionLocalPendings.erase(pending);
+          }
           break;
         }
       default:
@@ -5288,6 +7092,11 @@ public:
   virtual bool quiesceProcessForBundleExec(void)
   {
     return true;
+  }
+
+  ProdigyArtifactIO *containerArtifactIO(void) override
+  {
+    return artifactIO.get();
   }
 
   bool quiesceArtifactIOForBundleExec(void) override
@@ -5560,6 +7369,58 @@ public:
         }, failure);
   }
 
+  bool prepareCrossClusterMasqueGatewayLaunch(ContainerPlan& plan,
+                                               CrossClusterMasqueGatewayRuntime& runtime,
+                                               const String& recoveryToken,
+                                               bool replaceLaunch)
+  {
+    if (!ContainerManager::gatewayRecoveryTokenValid(recoveryToken)) return false;
+    if (replaceLaunch)
+    {
+      runtime.revokeReadiness();
+      if (auto it = containers.find(runtime.systemContainerUUID);
+          it != containers.end() && it->second != nullptr)
+      {
+        ensureSwitchboard()->closeWormholesToContainer(generateLocalContainerID(it->second->plan.fragment));
+      }
+      removeCrossClusterMasqueGatewayListener(runtime.systemContainerUUID);
+      runtime.readinessLaunchToken.assignItoh(Random::generateNumberWithNBits<128, uint128_t>());
+      runtime.recoveryLaunchToken.assign(recoveryToken);
+      runtime.systemContainerUUID = plan.uuid;
+      runtime.systemPlanAdmitted = true;
+      (void)reconcileCrossClusterMasqueGatewayBGP(runtime);
+    }
+    else
+    {
+      runtime.recoveryLaunchToken.assign(recoveryToken);
+    }
+
+    // These are launch-scoped authority references, not a NeuronHub payload.
+    // The pinned process can only report on this exact launch.
+    if (!Container::gatewayReadinessSocketPath(plan.uuid, runtime.readinessLaunchToken,
+                                                plan.system.gatewayReadinessSocket)) return false;
+    plan.system.gatewayLaunchToken.assign(runtime.readinessLaunchToken);
+    if (!ContainerManager::gatewayRecoverySocketPath(plan.uuid, plan.system.gatewayRecoverySocket)) return false;
+    plan.system.gatewayRecoveryToken.assign(runtime.recoveryLaunchToken);
+    if (runtime.authority.localRole == CrossClusterMasqueGatewayRole::listener)
+      plan.system.gatewayRole.assign("listener"_ctv);
+    else
+      plan.system.gatewayRole.assign("connector"_ctv);
+    String routeText = {};
+    if (!ClusterMachine::renderIPAddressLiteral(runtime.authority.localSitePrefix.network, routeText)) return false;
+    routeText.append("/"_ctv);
+    String cidrText = {};
+    cidrText.assignItoa(runtime.authority.localSitePrefix.cidr);
+    routeText.append(cidrText);
+    plan.system.gatewayRoutes.assign(routeText);
+    if (!ClusterMachine::renderIPAddressLiteral(runtime.authority.listenerPublicUDPEndpoint,
+                                                 plan.system.gatewayEndpoint)) return false;
+    plan.system.gatewayLocalIdentity.assign(runtime.authority.localIdentitySHA256);
+    plan.system.gatewayPeerIdentity.assign(runtime.authority.peerIdentitySHA256);
+    plan.system.gatewayPeerTrust.assign(runtime.authority.peerTrustSHA256);
+    return prodigyBindCrossClusterMasqueGatewayRuntimePlanAuthority(plan.system, runtime.authority);
+  }
+
   // Both ordinary Brain spin commands and an authenticated fresh
   // state-upload replay enter through this boundary. Tests can observe their
   // identity without changing the production launch sequencing.
@@ -5568,6 +7429,38 @@ public:
                                         NeuronContainerMetricPolicy metricPolicy,
                                         RetainedContainerStorageSource retainedSource = {})
   {
+    if (plan.system.kind == SystemContainerKind::crossClusterMasqueGateway)
+    {
+      if (!admitCrossClusterMasqueGatewaySystemPlan(plan))
+      {
+        basics_log("neuron rejected cross-cluster MASQUE gateway system plan uuid=%llu\n",
+                   (unsigned long long)plan.uuid);
+        return;
+      }
+      auto *runtime = crossClusterMasqueGatewayRuntimeForPair(plan.system.gatewayPairUUID);
+      if (runtime == nullptr) return;
+      if (!runtime->gatewayBootstrap)
+      {
+        auto pending = std::make_unique<CrossClusterMasqueGatewayRuntime::PendingLaunch>();
+        pending->plan = std::move(plan);
+        pending->controlGeneration = containerLaunchControlGeneration;
+        pending->replaceContainerUUID = replaceContainerUUID;
+        pending->metricPolicy = metricPolicy;
+        pending->retainedSource = std::move(retainedSource);
+        runtime->pendingLaunch = std::move(pending);
+        return;
+      }
+      // stateUpload-local strings are deliberately ignored. Only a record in
+      // the verified per-container runtime directory may restore this token.
+      String recoveredToken = {};
+      const bool recoveredRecord = ContainerManager::readGatewayRecoveryRecord(plan, recoveredToken);
+      const bool replaceLaunch = runtime->systemContainerUUID != plan.uuid;
+      if (!recoveredRecord && replaceLaunch)
+        ContainerManager::generateGatewayRecoveryToken(recoveredToken);
+      if (!recoveredRecord && !replaceLaunch)
+        recoveredToken.assign(runtime->recoveryLaunchToken);
+      if (!prepareCrossClusterMasqueGatewayLaunch(plan, *runtime, recoveredToken, replaceLaunch)) return;
+    }
     ContainerManager::spinContainer(std::move(plan), replaceContainerUUID, metricPolicy, retainedSource);
   }
 
@@ -5606,7 +7499,32 @@ protected:
     String inventoryFailure;
     if (!liveContainerInventoryComplete(inventoryFailure))
     {
-      basics_log("neuron stateUpload withheld: %s\n", inventoryFailure.c_str());
+      // This is a safety boundary: an empty or partial upload would let the
+      // Brain schedule alongside an unaccounted retained process.  basics_log
+      // is compiled out when BASICS_DEBUG is disabled, so retain this rare
+      // production diagnostic for recovery operators.
+      std::fprintf(stderr,
+                   "neuron stateUpload withheld reason=%s trackedContainers=%zu pendingLaunches=%zu pendingRestores=%zu\n",
+                   inventoryFailure.c_str(), size_t(containers.size()), size_t(pendingContainerLaunchPlans.size()),
+                   size_t(pendingStateUploadRestores.size()));
+      std::fflush(stderr);
+#if PRODIGY_DEBUG
+      for (const auto& [uuid, container] : containers)
+      {
+        PRODIGY_DEBUG_LOG(
+            "neuron stateUpload withheld tracked uuid=%016llx%016llx pid=%d pendingDestroy=%d\n",
+            (unsigned long long)(uuid >> 64), (unsigned long long)uuid,
+            container ? int(container->pid) : -1, int(container && container->pendingDestroy));
+      }
+      for (const auto& [uuid, plan] : pendingContainerLaunchPlans)
+      {
+        PRODIGY_DEBUG_LOG(
+            "neuron stateUpload withheld pending uuid=%016llx%016llx deploymentID=%llu\n",
+            (unsigned long long)(uuid >> 64), (unsigned long long)uuid,
+            (unsigned long long)plan.config.deploymentID());
+      }
+      PRODIGY_DEBUG_FLUSH();
+#endif
       return;
     }
 
@@ -5627,6 +7545,7 @@ protected:
       Message::appendValue(brain->wBuffer, serializedPlan);
     }
     Message::finish(brain->wBuffer, headerOffset);
+    replayCurrentGatewayReadinessAfterStateUpload();
     if (streamIsActive(brain)) Ring::queueSend(brain);
   }
 
@@ -5639,6 +7558,102 @@ protected:
            brain == operation.stream && brain != nullptr &&
            brain->ioGeneration == operation.streamGeneration && streamIsActive(brain) &&
            containers.contains(containerUUID) == false;
+  }
+
+  static ProdigyGatewayLocalTuple gatewayRecoveryTuple(const CrossClusterMasqueGatewayAuthority& authority)
+  {
+    ProdigyGatewayLocalTuple tuple = {};
+    tuple.pairUUID = authority.pairUUID; tuple.localClusterUUID = authority.localClusterUUID;
+    tuple.localMachineUUID = authority.localMachineUUID; tuple.keyEpoch = authority.keyGeneration;
+    tuple.authorityGeneration = authority.pairAuthorityGeneration; tuple.gatewayGeneration = authority.generation;
+    return tuple;
+  }
+
+  virtual bool captureRetainedGatewayPeerIdentity(
+      pid_t pid, CrossClusterMasqueGatewayReadinessListener::PeerIdentity& identity)
+  {
+    return CrossClusterMasqueGatewayReadinessListener::capturePeerIdentityFromProc(pid, identity);
+  }
+
+  bool armRetainedGatewayRecoveryListener(StateUploadRestoreOperation& operation, uint128_t containerUUID)
+  {
+    if (!operation.container || !operation.networkRestored ||
+        !operation.gatewayRecoveryTokenBound || operation.boundGatewayRecoveryToken.empty() ||
+        operation.container->plan.system.gatewayRecoverySocket.empty() ||
+        operation.container->plan.system.gatewayRecoveryToken != operation.boundGatewayRecoveryToken ||
+        operation.container->pidfd < 0) return false;
+    String canonicalSocket = {};
+    if (!ContainerManager::gatewayRecoverySocketPath(containerUUID, canonicalSocket) ||
+        canonicalSocket != operation.container->plan.system.gatewayRecoverySocket) return false;
+    auto *runtime = crossClusterMasqueGatewayRuntimeForPair(operation.container->plan.system.gatewayPairUUID);
+    if (!runtime || !admitCrossClusterMasqueGatewaySystemPlan(operation.container->plan) ||
+        (runtime->systemContainerUUID != 0 && runtime->systemContainerUUID != containerUUID) ||
+        runtime->systemPlanAdmitted != (runtime->systemContainerUUID != 0)) return false;
+    const auto tuple = gatewayRecoveryTuple(runtime->authority);
+    if (auto *existing = crossClusterMasqueGatewayListenerForContainer(containerUUID))
+    {
+      CrossClusterMasqueGatewayReadinessListener::PeerIdentity observed = {};
+      const auto& retained = existing->recoveryTuple;
+      return runtime->systemPlanAdmitted && existing->recovery && existing->fd >= 0 &&
+          existing->recoveryEpoch == operation.epoch && existing->path == canonicalSocket &&
+          existing->recoveryToken == operation.boundGatewayRecoveryToken &&
+          retained.pairUUID == tuple.pairUUID && retained.localClusterUUID == tuple.localClusterUUID &&
+          retained.localMachineUUID == tuple.localMachineUUID && retained.keyEpoch == tuple.keyEpoch &&
+          retained.authorityGeneration == tuple.authorityGeneration && retained.gatewayGeneration == tuple.gatewayGeneration &&
+          captureRetainedGatewayPeerIdentity(operation.container->pid, observed) && observed == existing->retainedIdentity;
+    }
+    auto listener = std::make_unique<CrossClusterMasqueGatewayReadinessListener>();
+    listener->capturePeerIdentity = [this](pid_t pid, CrossClusterMasqueGatewayReadinessListener::PeerIdentity& identity) {
+      return captureRetainedGatewayPeerIdentity(pid, identity);
+    };
+    if (!listener->openForRecovery(*operation.container, canonicalSocket,
+                                   operation.boundGatewayRecoveryToken, tuple, operation.epoch)) return false;
+    // A fresh runtime has authority but no ordinary launch. Bind only this
+    // validated retained process, after its durable token and peer identity
+    // have earned the recovery listener. A different live owner is never replaced.
+    if (runtime->systemContainerUUID == 0)
+    {
+      runtime->systemContainerUUID = containerUUID;
+      runtime->systemPlanAdmitted = true;
+      runtime->revokeReadiness();
+    }
+    RingDispatcher::installMultiplexee(listener.get(), this);
+    Ring::queuePollProcessFD(listener.get(), listener->fd, false, POLLIN);
+    crossClusterMasqueGatewayReadinessListeners.push_back(std::move(listener));
+    return true;
+  }
+
+  bool publishRestoredStateUploadContainer(StateUploadRestoreOperation& operation,
+                                           uint128_t containerUUID, uint64_t epoch)
+  {
+    if (operation.container == nullptr || operation.terminalRetirementPending || containers.contains(containerUUID) ||
+        operation.epoch != epoch || operation.container->pendingDestroy) return false;
+    finishPendingContainerLaunch(containerUUID, operation.launchAdmissionGeneration);
+    Container *container = operation.container.release();
+    if (container == nullptr) return false;
+    if (container->plan.system.kind != SystemContainerKind::crossClusterMasqueGateway)
+    {
+      container->assignNeuronListenerPath();
+      if (container->neuronListenerPath.size() == 0) { String empty = {}; reportContainerFailed(container->plan.uuid, 0, 0, empty, false); ContainerManager::destroyContainer(container); return false; }
+      container->setSocketPath(container->neuronListenerPath.c_str());
+    }
+    // `pushContainer` remains the sole publication owner. Its gateway branch
+    // preserves the established recovery listener/carrier, so this handoff
+    // cannot create a second lease or re-enter a launch listener.
+    pushContainer(container); noteTaskAttemptRunning(container->plan); queueRestoredStateUploadContainerWaitid(container);
+    if (container->exposesNeuronSocket()) Ring::queueConnect(container);
+    operation.settled = true;
+    if (!stateUploadRestoresPending() && !retainedStateUploadCandidatesPending() && epoch == stateUploadRestoreEpoch)
+    {
+      stateUploadRestoreReplyPending = false;
+      queueNeuronStateUpload();
+    }
+    return true;
+  }
+
+  virtual void queueRestoredStateUploadContainerWaitid(Container *container)
+  {
+    ContainerManager::queueContainerWaitid(container);
   }
 
   bool finishStateUploadRestore(uint128_t containerUUID, uint64_t epoch, bool restored, String failure)
@@ -5702,33 +7717,48 @@ protected:
     }
 
     if (stateUploadRestoreRemaining > 0) --stateUploadRestoreRemaining;
-    finishPendingContainerLaunch(containerUUID, operation->launchAdmissionGeneration);
-    container = operation->container.release();
-    if (container != nullptr)
-    {
-      container->assignNeuronListenerPath();
-      if (container->neuronListenerPath.size() == 0)
-      {
-        String empty = {};
-        reportContainerFailed(container->plan.uuid, 0, 0, empty, false);
-        ContainerManager::destroyContainer(container);
-      }
-      else
-      {
-        container->setSocketPath(container->neuronListenerPath.c_str());
-        pushContainer(container);
-        noteTaskAttemptRunning(container->plan);
-        ContainerManager::queueContainerWaitid(container);
-        Ring::queueConnect(container);
-      }
-    }
-    operation->settled = true;
+    operation->networkRestored = true;
 
-    if (!stateUploadRestoresPending() && stateUploadRestoreReplyPending && epoch == stateUploadRestoreEpoch)
+    if (container != nullptr &&
+        container->plan.system.kind == SystemContainerKind::crossClusterMasqueGateway)
     {
+      // A gateway deliberately has no NeuronHub socket. Its launch readiness
+      // listener is detached into the process mount namespace and the current
+      // artifact accepts its FD only on the one-shot startup channel. Do not
+      // turn a retained gateway into a generic container here: that would
+      // trust checkpoint-local socket/token state or publish without a fresh,
+      // authenticated readiness receipt. Keep the exact process and launch
+      // fence for an authoritative retry once the artifact can acknowledge a
+      // post-exec readiness rebind.
+      // The new host routing programs begin empty after exec, whereas the
+      // retained gateway's egress program may still have learned reply flows.
+      // Replay the durable plan binding before the rebind so peer replies can
+      // reach the exact retained netkit; this does not publish the container
+      // or assert readiness.
+      if (container->plan.whiteholes.empty() == false)
+      {
+        openWhiteholesForLocalContainer(container->plan.fragment,
+                                        container->plan.whiteholes);
+      }
+      auto *runtime = crossClusterMasqueGatewayRuntimeForPair(
+          container->plan.system.gatewayPairUUID);
+      if (runtime != nullptr && runtime->systemContainerUUID == containerUUID)
+      {
+        (void)revokeCrossClusterMasqueGatewayReadiness(containerUUID);
+      }
+      if (!armRetainedGatewayRecoveryListener(*operation, containerUUID))
+      {
+        basics_log("restoreContainer retained MASQUE gateway recovery listener remains fenced uuid=%llu pid=%d\n",
+                   (unsigned long long)containerUUID, int(container->pid));
+      }
+      else basics_log("restoreContainer retained MASQUE gateway awaits authenticated readiness rebind uuid=%llu pid=%d\n",
+                      (unsigned long long)containerUUID, int(container->pid));
       stateUploadRestoreReplyPending = false;
-      queueNeuronStateUpload();
+      operation->settled = true;
+      return false;
     }
+
+    (void)publishRestoredStateUploadContainer(*operation, containerUUID, epoch);
     return false;
   }
 
@@ -5748,7 +7778,7 @@ protected:
         return found != pendingStateUploadRestores.end() && found->second != nullptr &&
                found->second->epoch == epoch && stateUploadRestoreCurrent(*found->second, containerUUID);
       };
-      const bool restored = co_await restoreStateUploadNetworkAsync(
+      const bool restored = operation->networkRestored || co_await restoreStateUploadNetworkAsync(
           operation->container.get(), &operation->coro, &failure, std::move(current));
       if (lifetime.expired()) co_return;
       if (!finishStateUploadRestore(containerUUID, epoch, restored, std::move(failure))) break;
@@ -5895,9 +7925,223 @@ protected:
 
   bool stateUploadRestoresPending(void) const { return stateUploadRestoreRemaining != 0; }
 
+  virtual bool readGatewayRecoveryRecordForStateUpload(const ContainerPlan& plan, String& token)
+  {
+    return ContainerManager::readGatewayRecoveryRecord(plan, token);
+  }
+
+  bool gatewayRecoveryRecordAbsentForColdStateUpload(const ContainerPlan& plan) const
+  {
+    String path = {};
+    if (!Container::gatewayReadinessDirectoryPath(plan.uuid, path)) return false;
+    path.append("/masque-gateway-recovery.v1"_ctv);
+    struct stat record = {};
+    return lstat(path.c_str(), &record) != 0 && errno == ENOENT;
+  }
+
+  bool bindColdStateUploadGatewayRecovery(ContainerPlan& plan)
+  {
+    if (!admitCrossClusterMasqueGatewaySystemPlan(plan)) return false;
+    auto *runtime = crossClusterMasqueGatewayRuntimeForPair(plan.system.gatewayPairUUID);
+    if (runtime == nullptr || !runtime->gatewayBootstrap ||
+        (runtime->systemContainerUUID != 0 && runtime->systemContainerUUID != plan.uuid) ||
+        runtime->systemPlanAdmitted != (runtime->systemContainerUUID != 0)) return false;
+
+    plan.system.gatewayRecoverySocket.clear();
+    plan.system.gatewayRecoveryToken.clear();
+    String token = {};
+    if (!readGatewayRecoveryRecordForStateUpload(plan, token))
+    {
+      // An extant malformed record remains a hard fence. The secure writer
+      // also refuses replacement if one appears after this absence check.
+      if (!gatewayRecoveryRecordAbsentForColdStateUpload(plan)) return false;
+      ContainerManager::generateGatewayRecoveryToken(token);
+    }
+    return prepareCrossClusterMasqueGatewayLaunch(plan, *runtime, token, true);
+  }
+
+  bool beginColdStateUploadGatewayRestore(std::unique_ptr<Container> container, uint64_t epoch)
+  {
+    if (container == nullptr) return false;
+    const uint64_t admission = beginPendingContainerLaunch(container->plan);
+    if (pendingStateUploadRestores.size() >= maximumPendingStateUploadRestores || admission == 0)
+    {
+      finishPendingContainerLaunch(container->plan.uuid, admission);
+      return false;
+    }
+    const uint128_t uuid = container->plan.uuid;
+    auto operation = std::make_unique<StateUploadRestoreOperation>();
+    operation->container = std::move(container);
+    operation->fragment = lcsubnet6;
+    operation->epoch = epoch;
+    operation->stream = brain;
+    operation->streamGeneration = brain ? brain->ioGeneration : 0;
+    operation->requestedStream = operation->stream;
+    operation->requestedGeneration = operation->streamGeneration;
+    operation->launchAdmissionGeneration = admission;
+    operation->coldRestart = true;
+    operation->settled = true;
+    ContainerPlan canonical = operation->container->plan;
+    canonical.system.gatewayRecoverySocket.clear();
+    canonical.system.gatewayRecoveryToken.clear();
+    if (!BitseryEngine::serialize(operation->planIdentity, canonical))
+    {
+      finishPendingContainerLaunch(uuid, admission);
+      return false;
+    }
+    pendingStateUploadRestores.insert_or_assign(uuid, std::move(operation));
+    return true;
+  }
+
+  void finishColdStateUploadGatewayRestore(uint128_t uuid, bool restart)
+  {
+    auto found = pendingStateUploadRestores.find(uuid);
+    if (found == pendingStateUploadRestores.end() || found->second == nullptr) return;
+    StateUploadRestoreOperation& pending = *found->second;
+    if (pending.container == nullptr) return;
+    bool restarted = false;
+    if (!restart)
+    {
+      if (!retireContainerLaunch(uuid))
+      {
+        if (brain) { brain->commandsRejected = true; queueCloseIfActive(brain); }
+        return;
+      }
+    }
+    else
+    {
+      Container *raw = pending.container.release();
+      restarted = ContainerManager::restartContainer(raw);
+      if (!restarted && !retireContainerLaunch(uuid))
+      {
+        if (brain) { brain->commandsRejected = true; queueCloseIfActive(brain); }
+        return;
+      }
+    }
+    std::unique_ptr<StateUploadRestoreOperation> operation = std::move(found->second);
+    pendingStateUploadRestores.erase(found);
+    finishPendingContainerLaunch(uuid, operation->launchAdmissionGeneration);
+    std::unique_ptr<Container> container = std::move(operation->container);
+    if (!restart)
+      ContainerManager::cleanupContainerAfterFailedCreate(container.release(), true, false);
+    String empty = {};
+    reportContainerFailed(uuid, 0, 0, empty, restarted);
+    if (!stateUploadRestoresPending() && !retainedStateUploadCandidatesPending() && stateUploadRestoreReplyPending)
+    {
+      stateUploadRestoreReplyPending = false;
+      queueNeuronStateUpload();
+    }
+  }
+
+  void resumeColdStateUploadGatewayRestore(uint128_t uuid)
+  {
+    auto found = pendingStateUploadRestores.find(uuid);
+    if (found == pendingStateUploadRestores.end() || found->second == nullptr) return;
+    StateUploadRestoreOperation& operation = *found->second;
+    if (!operation.coldRestart || operation.container == nullptr || operation.terminalRetirementPending ||
+        !stateUploadRestoreCurrent(operation, uuid)) return;
+    const auto *runtime = crossClusterMasqueGatewayRuntimeForPair(operation.container->plan.system.gatewayPairUUID);
+    if (runtime == nullptr || runtime->authority.state != CrossClusterMasqueGatewayState::active ||
+        !runtime->gatewayBootstrap) return;
+    if (!bindColdStateUploadGatewayRecovery(operation.container->plan))
+    {
+      finishColdStateUploadGatewayRestore(uuid, false);
+      return;
+    }
+    finishColdStateUploadGatewayRestore(uuid, true);
+  }
+
+  bool retainedStateUploadCandidatesPending(void) const
+  {
+    for (const auto& [uuid, operation] : pendingStateUploadRestores)
+      if (operation != nullptr && operation->container != nullptr) return true;
+    return false;
+  }
+
   uint64_t currentStateUploadRestoreRound(void)
   {
-    return stateUploadRestoresPending() ? stateUploadRestoreEpoch : ++stateUploadRestoreEpoch;
+    // Awaiting a gateway receipt is still the same restoration round.
+    // Authority replay must not invalidate its already-issued challenge.
+    return stateUploadRestoresPending() || retainedStateUploadCandidatesPending()
+        ? stateUploadRestoreEpoch : ++stateUploadRestoreEpoch;
+  }
+
+  void retrySettledStateUploadGatewayRecoveries(void)
+  {
+    if (brain == nullptr || !streamIsActive(brain)) return;
+    Vector<uint128_t> candidates = {};
+    for (const auto& [uuid, operation] : pendingStateUploadRestores)
+    {
+      if (operation == nullptr || !operation->settled || operation->terminalRetirementPending ||
+          operation->container == nullptr || operation->container->pendingDestroy ||
+          operation->container->plan.system.kind != SystemContainerKind::crossClusterMasqueGateway)
+        continue;
+      const auto *runtime = crossClusterMasqueGatewayRuntimeForPair(
+          operation->container->plan.system.gatewayPairUUID);
+      if (operation->coldRestart || (runtime != nullptr && runtime->authority.pairUUID != 0)) candidates.push_back(uuid);
+    }
+    if (candidates.empty()) return;
+    const uint64_t epoch = currentStateUploadRestoreRound();
+    for (uint128_t uuid : candidates)
+    {
+      auto found = pendingStateUploadRestores.find(uuid);
+      if (found == pendingStateUploadRestores.end() || found->second == nullptr ||
+          found->second->container == nullptr) continue;
+      if (found->second->coldRestart)
+      {
+        const auto *runtime = crossClusterMasqueGatewayRuntimeForPair(
+            found->second->container->plan.system.gatewayPairUUID);
+        if (runtime == nullptr)
+          continue;
+        if (runtime->authority.state != CrossClusterMasqueGatewayState::active)
+          (void)retirePendingStateUploadRestore(uuid);
+        else
+          resumeColdStateUploadGatewayRestore(uuid);
+        continue;
+      }
+      NeuronContainerMetricPolicy metrics = {};
+      metrics.scalingDimensionsMask = found->second->container->neuronScalingDimensionsMask;
+      metrics.metricsCadenceMs = found->second->container->neuronMetricsCadenceMs;
+      if (!admitRepeatedStateUploadRestore(found->second->container->plan, metrics, epoch))
+      {
+        basics_log("retained MASQUE gateway authority retry remains fenced uuid=%llu\n",
+                   (unsigned long long)uuid);
+      }
+    }
+  }
+
+  bool hydrateStateUploadGatewayRecovery(ContainerPlan& plan, String& canonicalIdentity, String& token)
+  {
+    if (!admitCrossClusterMasqueGatewaySystemPlan(plan)) return false;
+    token.clear(); String socket = {};
+    if (!readGatewayRecoveryRecordForStateUpload(plan, token) ||
+        !ContainerManager::gatewayRecoverySocketPath(plan.uuid, socket) ||
+        !ContainerManager::gatewayRecoveryTokenValid(token)) return false;
+    plan.system.gatewayRecoverySocket.assign(socket);
+    plan.system.gatewayRecoveryToken.assign(token);
+    ContainerPlan canonical = plan;
+    canonical.system.gatewayRecoverySocket.clear();
+    canonical.system.gatewayRecoveryToken.clear();
+    canonicalIdentity.clear();
+    return BitseryEngine::serialize(canonicalIdentity, canonical);
+  }
+
+  void fenceStateUploadGatewayRecovery(StateUploadRestoreOperation& operation)
+  {
+    if (!operation.settled && stateUploadRestoreRemaining > 0) --stateUploadRestoreRemaining;
+    operation.coro.cancelSuspended();
+    operation.runner.reset();
+    operation.stream = nullptr;
+    operation.requestedStream = nullptr;
+    operation.streamGeneration = 0;
+    operation.requestedGeneration = 0;
+    if (operation.container != nullptr)
+    {
+      operation.container->plan.system.gatewayRecoverySocket.clear();
+      operation.container->plan.system.gatewayRecoveryToken.clear();
+    }
+    operation.settled = true;
+    stateUploadRestoreReplyPending = false;
   }
 
   bool admitRepeatedStateUploadRestore(const ContainerPlan& plan,
@@ -5906,14 +8150,56 @@ protected:
     auto found = pendingStateUploadRestores.find(plan.uuid);
     if (found == pendingStateUploadRestores.end()) return true; // Existing launch owner.
     StateUploadRestoreOperation& operation = *found->second;
-    String identity;
-    BitseryEngine::serialize(identity, plan);
+    ContainerPlan admittedPlan = plan;
+    String identity, token;
+    if (operation.coldRestart)
+    {
+      admittedPlan.system.gatewayRecoverySocket.clear();
+      admittedPlan.system.gatewayRecoveryToken.clear();
+      if (!BitseryEngine::serialize(identity, admittedPlan) || !operation.container ||
+          identity != operation.planIdentity ||
+          memcmp(&operation.fragment, &lcsubnet6, sizeof(lcsubnet6)) != 0) return false;
+      operation.container->neuronScalingDimensionsMask = metrics.scalingDimensionsMask;
+      operation.container->neuronMetricsCadenceMs = metrics.metricsCadenceMs;
+      operation.container->plan = std::move(admittedPlan);
+      operation.stream = brain;
+      operation.streamGeneration = brain ? brain->ioGeneration : 0;
+      operation.requestedStream = operation.stream;
+      operation.requestedGeneration = operation.streamGeneration;
+      operation.epoch = epoch;
+      // The complete validated stateUpload batch resumes this candidate.
+      return true;
+    }
+    if (plan.system.kind == SystemContainerKind::crossClusterMasqueGateway)
+    {
+      if (!hydrateStateUploadGatewayRecovery(admittedPlan, identity, token))
+      {
+        fenceStateUploadGatewayRecovery(operation);
+        return true;
+      }
+    }
+    else if (!BitseryEngine::serialize(identity, admittedPlan)) return false;
     if (!operation.container || identity != operation.planIdentity ||
         memcmp(&operation.fragment, &lcsubnet6, sizeof(lcsubnet6)) != 0) return false;
+    if (plan.system.kind == SystemContainerKind::crossClusterMasqueGateway &&
+        operation.gatewayRecoveryTokenBound && token != operation.boundGatewayRecoveryToken)
+    {
+      fenceStateUploadGatewayRecovery(operation);
+      return true;
+    }
     operation.container->neuronScalingDimensionsMask = metrics.scalingDimensionsMask;
     operation.container->neuronMetricsCadenceMs = metrics.metricsCadenceMs;
     operation.requestedStream = brain;
     operation.requestedGeneration = brain ? brain->ioGeneration : 0;
+    if (plan.system.kind == SystemContainerKind::crossClusterMasqueGateway)
+    {
+      operation.container->plan = std::move(admittedPlan);
+      if (!operation.gatewayRecoveryTokenBound)
+      {
+        operation.boundGatewayRecoveryToken.assign(token);
+        operation.gatewayRecoveryTokenBound = true;
+      }
+    }
     if (operation.settled) resumeStateUploadRestore(operation, plan.uuid, epoch);
     return true;
   }
@@ -5933,9 +8219,44 @@ protected:
     auto operation = std::make_unique<StateUploadRestoreOperation>();
     operation->container = std::move(container);
     operation->launchAdmissionGeneration = launchAdmissionGeneration;
-    BitseryEngine::serialize(operation->planIdentity, operation->container->plan);
+    // A gateway can be fenced before its first asynchronous restore starts
+    // (for example, while its authority or durable record is still absent).
+    // Preserve the admitting Neuron fragment so a later exact retry is not
+    // mistaken for a cross-fragment stateUpload.
+    operation->fragment = lcsubnet6;
+    operation->epoch = epoch;
+    ContainerPlan canonicalPlan = operation->container->plan;
+    if (canonicalPlan.system.kind == SystemContainerKind::crossClusterMasqueGateway)
+    {
+      canonicalPlan.system.gatewayRecoverySocket.clear();
+      canonicalPlan.system.gatewayRecoveryToken.clear();
+    }
+    if (!BitseryEngine::serialize(operation->planIdentity, canonicalPlan))
+    {
+      finishPendingContainerLaunch(containerUUID, launchAdmissionGeneration);
+      return false;
+    }
     pendingStateUploadRestores.insert_or_assign(containerUUID, std::move(operation));
-    resumeStateUploadRestore(*pendingStateUploadRestores.find(containerUUID)->second, containerUUID, epoch);
+    StateUploadRestoreOperation& retainedOperation = *pendingStateUploadRestores.find(containerUUID)->second;
+    if (retainedOperation.container->plan.system.kind == SystemContainerKind::crossClusterMasqueGateway)
+    {
+      String identity = {}, token = {};
+      if (!hydrateStateUploadGatewayRecovery(retainedOperation.container->plan, identity, token))
+      {
+        // The checkpoint carries no durable recovery token/socket. Keep the
+        // retained process fenced until exact local recovery evidence exists.
+        retainedOperation.settled = true;
+        return true;
+      }
+      if (identity != retainedOperation.planIdentity)
+      {
+        retainedOperation.settled = true;
+        return true;
+      }
+      retainedOperation.boundGatewayRecoveryToken.assign(token);
+      retainedOperation.gatewayRecoveryTokenBound = true;
+    }
+    resumeStateUploadRestore(retainedOperation, containerUUID, epoch);
     return true;
   }
 
@@ -5948,6 +8269,20 @@ protected:
     }
 
     StateUploadRestoreOperation *pending = found->second.get();
+    if (pending->coldRestart)
+    {
+      std::unique_ptr<StateUploadRestoreOperation> operation = std::move(found->second);
+      pendingStateUploadRestores.erase(found);
+      finishPendingContainerLaunch(containerUUID, operation->launchAdmissionGeneration);
+      if (operation->container != nullptr)
+        ContainerManager::cleanupContainerAfterFailedCreate(operation->container.release(), true, false);
+      if (!stateUploadRestoresPending() && !retainedStateUploadCandidatesPending() && stateUploadRestoreReplyPending)
+      {
+        stateUploadRestoreReplyPending = false;
+        queueNeuronStateUpload();
+      }
+      return true;
+    }
     if (pending->container != nullptr && pending->container->pid > 0 &&
         pending->container->pidfd < 0)
     {
@@ -6033,14 +8368,24 @@ public:
   {
     if (brain != nullptr && brain->commandsRejected)
     {
+      PRODIGY_DEBUG_LOG("neuron brain control reject reason=commands-rejected topic=%u\n", unsigned(message->topic));
+      PRODIGY_DEBUG_FLUSH();
       return;
     }
-    if (controlTransportCredentials.enabled &&
-        (!brain || (!controlPeerCurrentlyAuthorized(brain->tlsPeerUUID) &&
-         !((NeuronTopic(message->topic) == NeuronTopic::transportCredentialLifecycle ||
-            NeuronTopic(message->topic) == NeuronTopic::registration) &&
-           transportLifecycleControlAuthorized(brain->tlsPeerUUID)))))
+    const NeuronTopic topic = NeuronTopic(message->topic);
+    const bool permitsLifecycleBootstrap = topic == NeuronTopic::transportCredentialLifecycle ||
+        topic == NeuronTopic::registration;
+    const bool currentlyAuthorized = controlTransportCredentials.enabled && brain != nullptr &&
+        controlPeerCurrentlyAuthorized(brain->tlsPeerUUID);
+    const bool lifecycleAuthorized = controlTransportCredentials.enabled && brain != nullptr && !currentlyAuthorized && permitsLifecycleBootstrap &&
+        transportLifecycleControlAuthorized(brain->tlsPeerUUID);
+    if (controlTransportCredentials.enabled && (!brain || (!currentlyAuthorized && !lifecycleAuthorized)))
     {
+      PRODIGY_DEBUG_LOG(
+          "neuron brain control reject reason=credential-gate topic=%u hasBrain=%d permitsLifecycleBootstrap=%d currentlyAuthorized=%d lifecycleAuthorized=%d lifecycleCandidate=%d\n",
+          unsigned(message->topic), int(brain != nullptr), int(permitsLifecycleBootstrap), int(currentlyAuthorized),
+          int(lifecycleAuthorized), int(brain != nullptr && brain->transportLifecycleCandidate));
+      PRODIGY_DEBUG_FLUSH();
       if (brain) { brain->rBuffer.clear(); queueCloseIfActive(brain); }
       return;
     }
@@ -6049,6 +8394,11 @@ public:
 
     if (ProdigyIngressValidation::validateNeuronPayloadForNeuron(message->topic, args, terminal) == false)
     {
+      PRODIGY_DEBUG_LOG(
+          "neuron brain control reject reason=invalid-payload topic=%u argsBytes=%llu emptyPayload=%d\n",
+          unsigned(message->topic),
+          (unsigned long long)(terminal >= args ? terminal - args : 0), int(args == terminal));
+      PRODIGY_DEBUG_FLUSH();
       if (brain)
       {
         brain->rBuffer.clear();
@@ -6059,6 +8409,94 @@ public:
 
     switch (NeuronTopic(message->topic))
     {
+      case NeuronTopic::crossClusterPrivateBGPSecretDelivery:
+        {
+          ProdigyPairPrivateBGPSecretDeliveryResponse response = {};
+          Message::extractArg<ArgumentNature::fixed>(args, response.scope.pairUUID);
+          Message::extractArg<ArgumentNature::fixed>(args, response.scope.operationUUID);
+          Message::extractArg<ArgumentNature::fixed>(args, response.scope.keyEpoch);
+          Message::extractArg<ArgumentNature::fixed>(args, response.scope.tunnelSlot);
+          Message::extractArg<ArgumentNature::fixed>(args, response.scope.clusterUUID);
+          Message::extractArg<ArgumentNature::fixed>(args, response.scope.machineUUID);
+          Message::extractArg<ArgumentNature::fixed>(args, response.scope.authorityGeneration);
+          Message::extractArg<ArgumentNature::fixed>(args, response.scope.gatewayGeneration);
+          Message::extractToStringView(args, response.credential);
+          Message::extractToStringView(args, response.gatewayRootCertPem);
+          Message::extractToStringView(args, response.localLeafCertPem);
+          Message::extractToStringView(args, response.localLeafKeyPem);
+          Message::extractToStringView(args, response.peerLeafCertDERHex);
+          response.accepted = args == terminal && response.scope.machineUUID == uuid &&
+              response.scope.clusterUUID == controlTransportCredentials.self.clusterUUID;
+          (void)(response.accepted && installCrossClusterPrivateBGPSecret(response));
+          break;
+        }
+      case NeuronTopic::withdrawCrossClusterPrivateBGPSecret:
+        {
+          ProdigyPairPrivateBGPSecretScope scope = {};
+          Message::extractArg<ArgumentNature::fixed>(args, scope.pairUUID); Message::extractArg<ArgumentNature::fixed>(args, scope.operationUUID);
+          Message::extractArg<ArgumentNature::fixed>(args, scope.keyEpoch); Message::extractArg<ArgumentNature::fixed>(args, scope.tunnelSlot);
+          Message::extractArg<ArgumentNature::fixed>(args, scope.clusterUUID); Message::extractArg<ArgumentNature::fixed>(args, scope.machineUUID);
+          Message::extractArg<ArgumentNature::fixed>(args, scope.authorityGeneration); Message::extractArg<ArgumentNature::fixed>(args, scope.gatewayGeneration);
+          auto *runtime = crossClusterMasqueGatewayRuntimeForPair(scope.pairUUID);
+          bool acknowledged = false;
+          if (args == terminal && scope.machineUUID == uuid &&
+              scope.clusterUUID == controlTransportCredentials.self.clusterUUID && runtime != nullptr)
+          {
+            if (runtime->gatewayBootstrap &&
+                prodigyPairPrivateBGPSecretScopeEqual(runtime->gatewayBootstrap->scope, scope))
+            {
+              runtime->gatewayBootstrap.reset();
+              runtime->pendingLaunch.reset();
+              acknowledged = true;
+            }
+            if (runtime->privateTunnelBGP && runtime->privateTunnelBGP->withdrawDeliveredSecret(scope))
+              acknowledged = true;
+          }
+          if (brain && brain->fd >= 0) { Message::construct(brain->wBuffer, NeuronTopic::crossClusterPrivateBGPSecretRevocationAck,
+              scope.pairUUID, scope.operationUUID, scope.keyEpoch, scope.tunnelSlot, scope.clusterUUID, scope.machineUUID,
+              scope.authorityGeneration, scope.gatewayGeneration, uint8_t(acknowledged)); Ring::queueSend(brain); }
+          break;
+        }
+      case NeuronTopic::crossClusterMasqueGatewayAuthoritySnapshot:
+        {
+          String encoded = {};
+          Message::extractToStringView(args, encoded);
+          ProdigyCrossClusterMasqueGatewayAuthorityProjection projection = {};
+          if (args != terminal || !BitseryEngine::deserializeSafe(encoded, projection) ||
+              !reconcileCrossClusterMasqueGatewayAuthorityProjection(projection))
+          { if (brain) queueCloseIfActive(brain); }
+          break;
+        }
+      case NeuronTopic::crossClusterPathFault:
+        {
+          String encoded = {}; Message::extractToStringView(args, encoded);
+          ProdigyCrossClusterPathFaultControl control = {};
+          if (args != terminal || !BitseryEngine::deserializeSafe(encoded, control) ||
+              !prodigyCrossClusterPathFaultControlValid(control) || control.response) {
+            if (brain) queueCloseIfActive(brain); break;
+          }
+          auto *runtime = crossClusterMasqueGatewayRuntimeForPair(control.request.authority.pairUUID);
+          if (runtime && !runtime->faultLeaseActive && runtime->authorityMatches(control.request.authority) &&
+              control.action != ProdigyCrossClusterPathFaultGatewayAction::pause &&
+              prodigyCrossClusterPathFaultRequestEqual(runtime->completedFaultLease, control.request)) {
+            control.response = true;
+            control.sessionReady = prodigyCrossClusterMasqueGatewayReady(runtime->authority, &runtime->readiness);
+            control.bgpReady = runtime->privateTunnelBGP && runtime->privateTunnelBGP->desiredPaths().size() == 1 &&
+                prodigyCrossClusterPrivateTunnelBGPPathUsable(runtime->privateTunnelBGP->desiredPaths()[0]);
+            control.accepted = control.sessionReady && control.bgpReady;
+            encoded.clear(); if (brain && brain->fd >= 0 && BitseryEngine::serialize(encoded, control)) {
+              Message::construct(brain->wBuffer, NeuronTopic::crossClusterPathFault, encoded); Ring::queueSend(brain);
+            }
+            break;
+          }
+          if (!queueCrossClusterPathFaultGatewayControl(control) && brain && brain->fd >= 0) {
+            control.response = true; control.accepted = false; control.sessionReady = false; control.bgpReady = false;
+            encoded.clear(); if (BitseryEngine::serialize(encoded, control)) {
+              Message::construct(brain->wBuffer, NeuronTopic::crossClusterPathFault, encoded); Ring::queueSend(brain);
+            }
+          }
+          break;
+        }
       case NeuronTopic::transportCredentialLifecycle:
         {
           uint128_t nonce = 0;
@@ -6120,12 +8558,274 @@ public:
           receiveCousinSessionLocalCommand(containerUUID, command);
           break;
         }
+      case NeuronTopic::nametagHandoffBarrier:
+        {
+          uint128_t containerUUID = 0; String encoded = {};
+          Message::extractArg<ArgumentNature::fixed>(args, containerUUID); Message::extractToStringView(args, encoded);
+          ProdigyNametagHandoffBarrier barrier = {}; auto live = containers.find(containerUUID);
+          if (args != terminal || live == containers.end() || !live->second || live->second->pendingDestroy ||
+              !live->second->plan.runtimeReady || !BitseryEngine::deserializeSafe(encoded, barrier) ||
+              !prodigyNametagHandoffBarrierValid(barrier) || barrier.clusterUUID != controlTransportCredentials.self.clusterUUID ||
+              barrier.deadlineMilliseconds <= Time::now<TimeResolution::ms>() ||
+              (barrier.response ? (containerUUID != barrier.probeContainerUUID || live->second->plan.config.applicationID != 11 ||
+                  barrier.probeDeploymentID != live->second->plan.config.deploymentID()) :
+                 (containerUUID != barrier.appContainerUUID || live->second->plan.config.applicationID != 6 ||
+                  barrier.appDeploymentID != live->second->plan.config.deploymentID()))) {
+            if (brain) queueCloseIfActive(brain); break;
+          }
+          Message::construct(live->second->wBuffer, ContainerTopic::nametagHandoffBarrier, encoded);
+          if (streamIsActive(live->second)) Ring::queueSend(live->second);
+          break;
+        }
+      case NeuronTopic::nametagQualificationApplicationCommand:
+        {
+          // The Brain sender frames the immutable execution tuple as
+          // { exactContainerUUID, serializedCommand }.  This Neuron does not
+          // reinterpret or enrich it; its role is solely to bind the command
+          // to the currently authenticated local App11 control socket.
+          uint128_t containerUUID = 0;
+          String encoded = {};
+          Message::extractArg<ArgumentNature::fixed>(args, containerUUID);
+          Message::extractToStringView(args, encoded);
+          ProdigyNametagQualificationApplicationCommand command = {};
+          auto live = containers.find(containerUUID);
+          if (args != terminal || live == containers.end() || live->second == nullptr ||
+              live->second->pendingDestroy || !live->second->plan.runtimeReady ||
+              !BitseryEngine::deserializeSafe(encoded, command) ||
+              !prodigyNametagQualificationApplicationCommandValid(command) ||
+              command.localClusterUUID != controlTransportCredentials.self.clusterUUID ||
+              command.deploymentID != live->second->plan.config.deploymentID() ||
+              live->second->plan.config.applicationID != 11)
+          {
+            if (brain) queueCloseIfActive(brain);
+            break;
+          }
+          Message::construct(live->second->wBuffer,
+                             ContainerTopic::nametagQualificationApplicationCommand, encoded);
+          if (streamIsActive(live->second)) Ring::queueSend(live->second);
+          break;
+        }
+      case NeuronTopic::nametagSourceBaseline:
+        {
+          uint128_t containerUUID = 0; String encoded = {};
+          Message::extractArg<ArgumentNature::fixed>(args, containerUUID); Message::extractToStringView(args, encoded);
+          ProdigyNametagSourceBaselineEnvelope envelope = {}; auto live = containers.find(containerUUID);
+          if (args != terminal || live == containers.end() || live->second == nullptr || live->second->pendingDestroy ||
+              !live->second->plan.runtimeReady || !BitseryEngine::deserializeSafe(encoded, envelope) ||
+              !prodigyNametagSourceBaselineEnvelopeValid(envelope) ||
+              (envelope.direction != ProdigyNametagSourceBaselineDirection::execute && envelope.direction != ProdigyNametagSourceBaselineDirection::query) ||
+              envelope.command.ewrClusterUUID != controlTransportCredentials.self.clusterUUID ||
+              envelope.command.probeDeploymentID != live->second->plan.config.deploymentID() ||
+              live->second->plan.config.applicationID != 11) { if (brain) queueCloseIfActive(brain); break; }
+          Message::construct(live->second->wBuffer, ContainerTopic::nametagSourceBaseline, encoded);
+          if (streamIsActive(live->second)) Ring::queueSend(live->second);
+          break;
+        }
+      case NeuronTopic::nametagQualificationMachineBoot:
+        {
+          String encoded = {}; Message::extractToStringView(args, encoded);
+          ProdigyNametagQualificationMachineBoot request = {};
+          if (args != terminal || !brain || !controlTransportCredentials.enabled ||
+              !controlPeerCurrentlyAuthorized(brain->tlsPeerUUID) || !BitseryEngine::deserializeSafe(encoded, request) || request.response ||
+              !prodigyNametagQualificationMachineBootValid(request) || request.machineUUID != uuid ||
+              request.clusterUUID != controlTransportCredentials.self.clusterUUID ||
+              request.deadlineAtMilliseconds <= Time::now<TimeResolution::ms>()) { if (brain) queueCloseIfActive(brain); break; }
+          auto response = request; response.response = true;
+          char boot[38] = {}; int fd = ::open("/proc/sys/kernel/random/boot_id", O_RDONLY | O_CLOEXEC);
+          const ssize_t count = fd < 0 ? -1 : ::read(fd, boot, sizeof(boot)); if (fd >= 0) ::close(fd);
+          if (count == 37 && boot[36] == '\n') { response.bootID.assign(boot, 36); response.ready = true; }
+          if (!response.ready || !prodigyNametagQualificationMachineBootValid(response)) {
+            response.bootID.clear(); response.ready = false; response.failure.assign("kernel boot identity unavailable"_ctv);
+          }
+          String reply; if (!BitseryEngine::serialize(reply, response)) break;
+          Message::construct(brain->wBuffer, NeuronTopic::nametagQualificationMachineBoot, reply);
+          Ring::queueSend(brain); break;
+        }
+      case NeuronTopic::nametagQualificationSeedFault:
+        {
+          uint128_t uuid = 0; String encoded = {};
+          Message::extractArg<ArgumentNature::fixed>(args, uuid); Message::extractToStringView(args, encoded);
+          ProdigyNametagQualificationSeedFault witness = {}; auto live = containers.find(uuid);
+          NeuronBrainControlStream *stream = brain;
+          if (args != terminal || !stream || !controlPeerCurrentlyAuthorized(stream->tlsPeerUUID) ||
+              !transportPeerProjectionControlCurrent(stream, stream->ioGeneration, stream->tlsPeerUUID) ||
+              live == containers.end() || !live->second || live->second->pendingDestroy || !live->second->plan.runtimeReady ||
+              !BitseryEngine::deserializeSafe(encoded, witness) || witness.response ||
+              !prodigyNametagQualificationSeedFaultValid(witness) || witness.deadlineAtMilliseconds <= Time::now<TimeResolution::ms>() ||
+              witness.authority.targetContainerUUID != uuid ||
+              witness.authority.targetClusterUUID != controlTransportCredentials.self.clusterUUID ||
+              witness.authority.targetDeploymentID != live->second->plan.config.deploymentID() ||
+              witness.authority.applicationID != live->second->plan.config.applicationID) break;
+          Message::construct(live->second->wBuffer, ContainerTopic::nametagQualificationSeedFault, encoded);
+          if (streamIsActive(live->second)) Ring::queueSend(live->second);
+          break;
+        }
+      case NeuronTopic::nametagQualificationReplay:
+        {
+          uint128_t uuid = 0; String encoded = {};
+          Message::extractArg<ArgumentNature::fixed>(args, uuid); Message::extractToStringView(args, encoded);
+          ProdigyNametagQualificationReplay witness = {}; auto live = containers.find(uuid);
+          NeuronBrainControlStream *stream = brain;
+          if (args != terminal || !stream || !controlPeerCurrentlyAuthorized(stream->tlsPeerUUID) ||
+              !transportPeerProjectionControlCurrent(stream, stream->ioGeneration, stream->tlsPeerUUID) ||
+              live == containers.end() || !live->second || live->second->pendingDestroy || !live->second->plan.runtimeReady ||
+              !BitseryEngine::deserializeSafe(encoded, witness) || witness.response ||
+              !prodigyNametagQualificationReplayValid(witness) || !prodigyNametagQualificationReplayRelayTimely(witness, Time::now<TimeResolution::ms>()) ||
+              (prodigyNametagQualificationReplayLocalHalf(witness.store, witness.targetSide) == CousinRouteHalf::source ? witness.session.sourceContainerUUID : witness.session.destinationContainerUUID) != uuid ||
+              (prodigyNametagQualificationReplayLocalHalf(witness.store, witness.targetSide) == CousinRouteHalf::source ? witness.session.sourceClusterUUID : witness.session.destinationClusterUUID) != controlTransportCredentials.self.clusterUUID ||
+              (prodigyNametagQualificationReplayLocalHalf(witness.store, witness.targetSide) == CousinRouteHalf::source ? witness.session.sourceDeploymentID : witness.session.destinationDeploymentID) != live->second->plan.config.deploymentID()) break;
+          Message::construct(live->second->wBuffer, ContainerTopic::nametagQualificationReplay, encoded);
+          if (streamIsActive(live->second)) Ring::queueSend(live->second);
+          break;
+        }
+      case NeuronTopic::nametagQualificationWriterIsolation:
+        {
+          uint128_t uuid = 0; String encoded = {};
+          Message::extractArg<ArgumentNature::fixed>(args, uuid); Message::extractToStringView(args, encoded);
+          ProdigyNametagQualificationWriterIsolation request = {}; auto found = containers.find(uuid);
+          NeuronBrainControlStream *stream = brain;
+          if (args != terminal || !stream || !controlPeerCurrentlyAuthorized(stream->tlsPeerUUID) ||
+              !transportPeerProjectionControlCurrent(stream, stream->ioGeneration, stream->tlsPeerUUID) ||
+              found == containers.end() || !found->second || found->second->pendingDestroy ||
+              !BitseryEngine::deserializeSafe(encoded, request) || request.response ||
+              !prodigyNametagQualificationWriterIsolationValid(request)) break;
+          const int64_t wallNow = Time::now<TimeResolution::ms>();
+          if (request.deadlineAtMilliseconds <= wallNow &&
+              (request.stage != ProdigyNametagQualificationWriterIsolationStage::release ||
+               wallNow - request.deadlineAtMilliseconds > 60000)) break;
+          Container *target = found->second;
+          if (request.clusterUUID != controlTransportCredentials.self.clusterUUID ||
+              request.targetMachineUUID != controlTransportCredentials.self.nodeUUID || request.targetContainerUUID != uuid ||
+              request.deploymentID != target->plan.config.deploymentID() ||
+              request.applicationID != target->plan.config.applicationID || request.shardGroup != target->plan.shardGroup ||
+              !target->plan.isStateful || !target->plan.runtimeReady || target->plan.state != ContainerState::healthy ||
+              target->plan.useHostNetworkNamespace || !prodigyValidateContainerPlanMeshIdentity(target->plan, lcsubnet6)) break;
+          uint32_t matchingAddresses = 0;
+          for (const auto& address : target->plan.addresses) {
+            uint128_t value = 0;
+            if (!address.network.is6 || address.cidr != 128) continue;
+            std::memcpy(&value, address.network.v6, sizeof(value));
+            if (value == request.targetAddress) ++matchingAddresses;
+          }
+          if (matchingAddresses != 1 || !Container::containerNetworkPolicyMapCompatible(target->peer_program) ||
+              !Container::containerNetworkPolicyMapCompatible(target->primary_program)) break;
+          const uint64_t now = monotonicNowNs(); if (!now) break;
+          auto response = request; response.response = true;
+          auto sameArm = [&]() {
+            auto left = target->qualificationIsolationArm, right = request;
+            right.stage = ProdigyNametagQualificationWriterIsolationStage::arm;
+            String a = {}, b = {};
+            return BitseryEngine::serialize(a, left) && BitseryEngine::serialize(b, right) && a == b;
+          };
+          if (request.stage == ProdigyNametagQualificationWriterIsolationStage::arm) {
+            uint128_t existingOwner = 0; uint64_t existingDeadline = 0;
+            if (!target->qualificationIsolationState(existingOwner, existingDeadline)) break;
+            // After an owner restart, an unexpired kernel lease remains effective;
+            // its lost in-memory context must not be replaced or prolonged.
+            if (existingDeadline > now && (!target->qualificationIsolationArm.challengeUUID ||
+                                           existingOwner != request.challengeUUID)) break;
+            if ((target->qualificationIsolationDeadlineNs && target->qualificationIsolationDeadlineNs <= now) ||
+                (target->qualificationIsolationArm.challengeUUID && existingDeadline <= now &&
+                 target->qualificationIsolationArm.deadlineAtMilliseconds <= Time::now<TimeResolution::ms>())) {
+              target->qualificationIsolationArm = {}; target->qualificationIsolationDeadlineNs = 0;
+            }
+            if (target->qualificationIsolationArm.challengeUUID && !sameArm()) break;
+            target->qualificationIsolationArm = request; response.ready = true;
+          } else {
+            if (!sameArm()) break;
+            if (request.stage == ProdigyNametagQualificationWriterIsolationStage::isolate) {
+              if (!target->qualificationIsolationDeadlineNs) {
+                const int64_t remaining = request.deadlineAtMilliseconds - Time::now<TimeResolution::ms>();
+                if (remaining <= 0) break;
+                const uint64_t remainingMs = uint64_t(remaining);
+                const uint64_t durationMs = std::min<uint64_t>(request.validForMilliseconds, remainingMs);
+                if (!durationMs) break;
+                target->qualificationIsolationDeadlineNs = now + durationMs * 1'000'000ULL;
+              }
+              if (!target->applyQualificationIsolation(request.challengeUUID, now,
+                                                       target->qualificationIsolationDeadlineNs, false)) break;
+              bool active = false;
+              if (!target->qualificationIsolationActive(request.challengeUUID, now, active) || !active) break;
+              response.ready = response.isolated = true;
+            } else if (request.stage == ProdigyNametagQualificationWriterIsolationStage::query) {
+              bool active = false;
+              if (!target->qualificationIsolationActive(request.challengeUUID, now, active)) break;
+              response.ready = true; response.isolated = active;
+            } else if (request.stage == ProdigyNametagQualificationWriterIsolationStage::release) {
+              uint128_t owner = 0; uint64_t deadline = 0;
+              if (!target->qualificationIsolationState(owner, deadline)) break;
+              if (owner == request.challengeUUID) {
+                if (!target->applyQualificationIsolation(request.challengeUUID, now, 0, true)) break;
+              } else if (deadline > now) break;
+              target->qualificationIsolationArm = {}; target->qualificationIsolationDeadlineNs = 0;
+              response.ready = true;
+            } else break;
+          }
+          String reply = {};
+          if (!prodigyNametagQualificationWriterIsolationValid(response) || !BitseryEngine::serialize(reply, response)) break;
+          Message::construct(stream->wBuffer, NeuronTopic::nametagQualificationWriterIsolation, uuid, reply);
+          if (streamIsActive(stream)) Ring::queueSend(stream);
+          break;
+        }
+      case NeuronTopic::nametagQualificationCousinTransport:
+        {
+          uint128_t uuid = 0; String encoded = {};
+          Message::extractArg<ArgumentNature::fixed>(args, uuid); Message::extractToStringView(args, encoded);
+          ProdigyNametagQualificationCousinTransport witness = {}; auto live = containers.find(uuid);
+          NeuronBrainControlStream *stream = brain;
+          if (args != terminal || !stream || !controlPeerCurrentlyAuthorized(stream->tlsPeerUUID) ||
+              !transportPeerProjectionControlCurrent(stream, stream->ioGeneration, stream->tlsPeerUUID) ||
+              live == containers.end() || !live->second || live->second->pendingDestroy || !live->second->plan.runtimeReady ||
+              !BitseryEngine::deserializeSafe(encoded, witness) || witness.response ||
+              !prodigyNametagQualificationCousinTransportValid(witness) ||
+              witness.deadlineAtMilliseconds <= Time::now<TimeResolution::ms>() ||
+              witness.session.sourceContainerUUID != uuid ||
+              witness.session.sourceClusterUUID != controlTransportCredentials.self.clusterUUID ||
+              witness.session.sourceDeploymentID != live->second->plan.config.deploymentID()) break;
+          Message::construct(live->second->wBuffer, ContainerTopic::nametagQualificationCousinTransport, encoded);
+          if (streamIsActive(live->second)) Ring::queueSend(live->second);
+          break;
+        }
+      case NeuronTopic::statefulStoreSourceCut:
+        {
+          uint128_t uuid = 0; String encoded = {};
+          Message::extractArg<ArgumentNature::fixed>(args, uuid); Message::extractToStringView(args, encoded);
+          ProdigyStatefulStoreSourceCut cut = {}; auto live = containers.find(uuid);
+          NeuronBrainControlStream *stream = brain;
+          if (args != terminal || !stream || !controlPeerCurrentlyAuthorized(stream->tlsPeerUUID) ||
+              !transportPeerProjectionControlCurrent(stream, stream->ioGeneration, stream->tlsPeerUUID) ||
+              live == containers.end() || !live->second || live->second->pendingDestroy ||
+              !BitseryEngine::deserializeSafe(encoded, cut) || cut.response || cut.memberRequestUUID == 0 ||
+              !prodigyStatefulStoreSourceCutValid(cut) || cut.sourceContainerUUID != uuid ||
+              cut.sourceClusterUUID != controlTransportCredentials.self.clusterUUID ||
+              cut.sourceDeploymentID != live->second->plan.config.deploymentID() ||
+              cut.applicationID != live->second->plan.config.applicationID ||
+              cut.shardGroup != live->second->plan.shardGroup || cut.nShardGroups != live->second->plan.nShardGroups) break;
+          Message::construct(live->second->wBuffer, ContainerTopic::statefulStoreSourceCut, encoded);
+          if (streamIsActive(live->second)) Ring::queueSend(live->second);
+          break;
+        }
       case NeuronTopic::statefulDataAuthority:
         {
           uint128_t uuid = 0;
           String encoded;
           Message::extractArg<ArgumentNature::fixed>(args, uuid);
           Message::extractToStringView(args, encoded);
+          StatefulDataAuthorityPreparation preparation;
+          if (args == terminal && BitseryEngine::deserializeSafe(encoded, preparation) && !preparation.response &&
+              preparation.memberRequestUUID != 0 && prodigyStatefulDataAuthorityPreparationValid(preparation)) {
+            auto current = containers.find(uuid);
+            if (current == containers.end() || !current->second ||
+                current->second->plan.config.applicationID != preparation.applicationID ||
+                current->second->plan.config.deploymentID() != preparation.deploymentID ||
+                current->second->plan.shardGroup != preparation.shardGroup ||
+                current->second->plan.nShardGroups != preparation.nShardGroups ||
+                preparation.clusterUUID != controlTransportCredentials.self.clusterUUID) break;
+            current->second->statefulPreparationRequest = preparation;
+            Message::construct(current->second->wBuffer, ContainerTopic::statefulDataAuthority, encoded);
+            Ring::queueSend(current->second);
+            break;
+          }
           StatefulDataAuthorityReceipt command;
           auto live = containers.find(uuid);
           if (args != terminal || live == containers.end() || !live->second ||
@@ -6145,6 +8845,42 @@ public:
           topology.servingMode = StatefulTopologyServingMode::applicationDataAuthority;
           topology.dataAuthority = command.authority;
           Message::construct(live->second->wBuffer, ContainerTopic::statefulDataAuthority, encoded);
+          Ring::queueSend(live->second);
+          break;
+        }
+      case NeuronTopic::statefulStoreProofRecovery:
+        {
+          uint128_t uuid = 0; String encoded = {};
+          Message::extractArg<ArgumentNature::fixed>(args, uuid);
+          Message::extractToStringView(args, encoded);
+          ProdigyStatefulStoreProofRecovery request = {};
+          auto live = containers.find(uuid);
+          if (args != terminal || live == containers.end() || !live->second ||
+              !BitseryEngine::deserializeSafe(encoded, request) || request.response ||
+              !prodigyStatefulStoreProofRecoveryValid(request) || request.authority.targetContainerUUID != uuid ||
+              request.authority.targetClusterUUID != controlTransportCredentials.self.clusterUUID ||
+              request.authority.targetDeploymentID != live->second->plan.config.deploymentID() ||
+              request.authority.applicationID != live->second->plan.config.applicationID ||
+              request.authority.shardGroup != live->second->plan.shardGroup ||
+              request.authority.nShardGroups != live->second->plan.nShardGroups) break;
+          Message::construct(live->second->wBuffer, ContainerTopic::statefulStoreProofRecovery, encoded);
+          Ring::queueSend(live->second);
+          break;
+        }
+      case NeuronTopic::statefulStoreSeedAuthority:
+        {
+          uint128_t uuid = 0; String encoded = {};
+          Message::extractArg<ArgumentNature::fixed>(args, uuid);
+          Message::extractToStringView(args, encoded);
+          ProdigyStatefulStoreSeedAuthority authority = {};
+          auto live = containers.find(uuid);
+          if (args != terminal || live == containers.end() || !live->second ||
+              !BitseryEngine::deserializeSafe(encoded, authority) || !prodigyStatefulStoreSeedAuthorityValid(authority) ||
+              authority.targetContainerUUID != uuid || authority.targetClusterUUID != controlTransportCredentials.self.clusterUUID ||
+              authority.targetDeploymentID != live->second->plan.config.deploymentID() ||
+              authority.applicationID != live->second->plan.config.applicationID ||
+              authority.shardGroup != live->second->plan.shardGroup || authority.nShardGroups != live->second->plan.nShardGroups) break;
+          Message::construct(live->second->wBuffer, ContainerTopic::statefulStoreSeedAuthority, encoded);
           Ring::queueSend(live->second);
           break;
         }
@@ -6208,11 +8944,14 @@ public:
           Message::extractBytes<Alignment::one>(args, (uint8_t *)&uploadedFragment, sizeof(struct local_container_subnet6));
           const bool hadFragments = haveFragments();
           const bool fragmentChanged = (memcmp(&lcsubnet6, &uploadedFragment, sizeof(uploadedFragment)) != 0);
-          if (stateUploadRestoreRemaining != 0 && fragmentChanged)
+          if ((stateUploadRestoreRemaining != 0 || retainedStateUploadCandidatesPending()) && fragmentChanged)
           {
             // A pending restore is bound to its assigned fragment. Let the
             // normal reconnect path obtain a fresh authoritative upload
             // rather than publishing either generation under the other.
+            std::fprintf(stderr,
+                         "neuron stateUpload rejected reason=pending-restore-fragment-changed\n");
+            std::fflush(stderr);
             if (brain)
             {
               brain->rBuffer.clear();
@@ -6247,7 +8986,8 @@ public:
           // Container re-adoption carries several large domain values. Keep
           // them in a separate non-inlined frame so the bounded control
           // dispatcher does not reserve that storage for every Neuron topic.
-          auto applyStateUploadPlans = [this, &args, terminal, restoreEpoch]() __attribute__((noinline)) -> bool {
+          const char *stateUploadRejection = "unknown";
+          auto applyStateUploadPlans = [this, &args, terminal, restoreEpoch, &stateUploadRejection]() __attribute__((noinline)) -> bool {
             bool malformedStateUpload = false;
             while (args < terminal) // it's possible that some of these containers died right?
             {
@@ -6255,6 +8995,7 @@ public:
             Message::extractToStringView(args, buffer);
             if (buffer.data() > terminal || buffer.size() > uint64_t(terminal - buffer.data()))
             {
+              stateUploadRejection = "plan-frame-bounds";
               malformedStateUpload = true;
               break;
             }
@@ -6269,6 +9010,7 @@ public:
             }
             else if (BitseryEngine::deserializeSafe(buffer, restoredPlan) == false)
             {
+              stateUploadRejection = "plan-decode";
               malformedStateUpload = true;
               break;
             }
@@ -6290,8 +9032,29 @@ public:
             }
             if (isPendingContainerLaunch(restoredPlan.uuid))
             {
+              if (pendingContainerLaunchIsCurrent(restoredPlan.uuid,
+                                                  containerLaunchControlGeneration) == false)
+              {
+                // The previous worker may still own cgroup/rootfs cleanup.
+                // Retain this exact authenticated replay until its final
+                // pending-launch callback marks the UUID drained; no second
+                // worker may materialize the same UUID concurrently.
+                const uint128_t replayUUID = restoredPlan.uuid;
+                if (!queuePendingContainerLaunchReplay(std::move(restoredPlan), metricPolicy))
+                {
+                  stateUploadRejection = "pending-replay-identity";
+                  malformedStateUpload = true;
+                  break;
+                }
+                if (pendingContainerLaunchIsDrained(replayUUID))
+                {
+                  resumeDrainedPendingContainerLaunchReplay(replayUUID);
+                }
+                continue;
+              }
               if (!admitRepeatedStateUploadRestore(restoredPlan, metricPolicy, restoreEpoch))
               {
+                stateUploadRejection = "repeat-restore-admission";
                 malformedStateUpload = true;
                 break;
               }
@@ -6307,6 +9070,14 @@ public:
               {
                 liveContainer->neuronScalingDimensionsMask = metricPolicy.scalingDimensionsMask;
                 liveContainer->neuronMetricsCadenceMs = metricPolicy.metricsCadenceMs;
+                // A fresh host router has no static Whitehole bindings. Rehydrate
+                // them from the locally owned live plan before skipping this
+                // idempotent state-upload entry.
+                if (liveContainer->plan.whiteholes.empty() == false)
+                {
+                  openWhiteholesForLocalContainer(liveContainer->plan.fragment,
+                                                  liveContainer->plan.whiteholes);
+                }
                 basics_log("neuron stateUpload skipped existing live container uuid=%llu pid=%d state=%u\n",
                            (unsigned long long)liveContainer->plan.uuid,
                            int(liveContainer->pid),
@@ -6321,6 +9092,7 @@ public:
               if (retained == nullptr || retained->plan.uuid != restoredPlan.uuid ||
                   retained->networkQuarantineRetained == false)
               {
+                stateUploadRejection = "quarantined-owner-invalid";
                 malformedStateUpload = true;
                 break;
               }
@@ -6334,6 +9106,7 @@ public:
             uint32_t executionHostID = 0;
             if (prodigyDeriveContainerHostIDs(restoredPlan, userID, executionHostID) == false)
             {
+              stateUploadRejection = "container-host-id-derivation";
               malformedStateUpload = true;
               break;
             }
@@ -6363,7 +9136,7 @@ public:
             memset(container->lcores, 0, sizeof(container->lcores));
             // A launch that never reached Neuron has no cpuset to recover.
             // Let the existing missing-process failure path resolve its UUID.
-            if (processPresent && applicationUsesIsolatedCPUs(container->plan.config))
+            if (processPresent && container->plan.usesIsolatedCPUs())
             {
               String configuredCPUs = {};
               String effectiveCPUs = {};
@@ -6374,15 +9147,16 @@ public:
               if (prodigyResolveRestoredLogicalCores(
                       configuredCPUs,
                       effectiveCPUs,
-                      container->plan.config.nLogicalCores,
+                      container->plan.logicalCores(),
                       container->lcores,
                       std::size(container->lcores)) == false)
               {
+                stateUploadRejection = "restored-cpuset-recovery";
                 basics_log("restoreContainer cpuset recovery failed uuid=%llu configured=%s effective=%s requested=%u\n",
                            (unsigned long long)container->plan.uuid,
                            configuredCPUs.c_str(),
                            effectiveCPUs.c_str(),
-                           unsigned(container->plan.config.nLogicalCores));
+                           unsigned(container->plan.logicalCores()));
                 delete container;
                 malformedStateUpload = true;
                 break;
@@ -6440,6 +9214,7 @@ public:
                   // A duplicate UUID was filtered above. Reaching this path
                   // therefore means the bounded restore queue could not own
                   // the candidate, so reject this malformed/overfull round.
+                  stateUploadRejection = "restore-queue-admission";
                   malformedStateUpload = true;
                   break;
                 }
@@ -6452,7 +9227,7 @@ public:
                   eth.addIP(prefix);
                 }
 
-                installDatacenterMeshRoutes(eth, lcsubnet6.dpfx);
+                installContainerMeshRoutes(eth);
               }
 
               container->assignNeuronListenerPath();
@@ -6500,7 +9275,21 @@ public:
                 uint128_t restoredUUID = container->plan.uuid;
                 if (container->plan.restartOnFailure)
                 {
-                  restarted = ContainerManager::restartContainer(container);
+                  if (container->plan.system.kind == SystemContainerKind::crossClusterMasqueGateway)
+                  {
+                    std::unique_ptr<Container> candidate(container);
+                    if (!beginColdStateUploadGatewayRestore(std::move(candidate), restoreEpoch))
+                    {
+                      stateUploadRejection = "cold-gateway-restore-admission";
+                      malformedStateUpload = true;
+                      break;
+                    }
+                    continue;
+                  }
+                  else
+                  {
+                    restarted = ContainerManager::restartContainer(container);
+                  }
                 }
                 else
                 {
@@ -6515,6 +9304,7 @@ public:
                   // owner which Brain will no longer track.
                   if (retireContainerLaunch(restoredUUID) == false)
                   {
+                    stateUploadRejection = "terminal-launch-retirement";
                     malformedStateUpload = true;
                     break;
                   }
@@ -6531,6 +9321,10 @@ public:
           if (malformedStateUpload)
           {
             basics_log("neuron stateUpload malformed plan payload\n");
+            std::fprintf(stderr,
+                         "neuron stateUpload rejected reason=%s\n",
+                         stateUploadRejection);
+            std::fflush(stderr);
             if (brain)
             {
               brain->rBuffer.clear();
@@ -6540,7 +9334,12 @@ public:
           else
           {
             stateUploadRestoreReplyPending = true;
-            if (!stateUploadRestoresPending())
+            // A complete batch may have supplied authority/credentials before
+            // its missing-process gateway was admitted. Retry only now, after
+            // every plan in this stateUpload has been validated.
+            retrySettledStateUploadGatewayRecoveries();
+            if (!stateUploadRestoresPending() && !retainedStateUploadCandidatesPending() &&
+                stateUploadRestoreReplyPending)
             {
               stateUploadRestoreReplyPending = false;
               queueNeuronStateUpload();
@@ -7008,7 +9807,10 @@ public:
           }
 
           overlayRoutingConfig = config;
-          syncOverlayRoutingPrograms();
+          // The Brain refresh owns ordinary routes only. Reconcile the current
+          // usable private-BGP fallback before publishing so this refresh cannot
+          // withdraw its runtime-owned remote-site route.
+          reconcileCrossClusterPrivateBGPSwitchboardFallback();
           break;
         }
       case NeuronTopic::openSwitchboardWormholes:
@@ -7025,6 +9827,9 @@ public:
                        prodigyComputeWormholeDesiredStateRevision(operation.containerID, operation.desired, expectedRevision) &&
                        expectedRevision.equals(operation.revision) &&
                        prodigyDecodeWormholeDesiredState(operation.desired, desired);
+          if (valid && (operation.containerID == generateLocalContainerID(prodigyCrossClusterMasqueGatewayRuntimeFragmentFirst) ||
+                        operation.containerID == generateLocalContainerID(prodigyCrossClusterMasqueGatewayRuntimeFragmentSecond)))
+            valid = false;
           if (valid)
           {
             if (Container *container = findTrackedContainerByLocalID(operation.containerID); container != nullptr)
@@ -7088,7 +9893,8 @@ public:
           if (auto it = containers.find(containerUUID); it != containers.end())
           {
             Container *container = it->second;
-            if (container == nullptr || container->pendingDestroy)
+            if (container == nullptr || container->pendingDestroy ||
+                container->plan.system.kind == SystemContainerKind::crossClusterMasqueGateway)
             {
               break;
             }
@@ -7413,6 +10219,228 @@ public:
     }
   }
 
+  // The recovery parser deliberately owns only protocol and admission state.
+  // Its three I/O edges are injected so tests can observe the exact transition
+  // without using Ring send/recv/close as their assertion mechanism.
+  struct RecoveryFrameDispatch {
+    std::function<void(CrossClusterMasqueGatewayReadinessCarrier *)> send;
+    std::function<void(CrossClusterMasqueGatewayReadinessCarrier *)> recv;
+    std::function<void(CrossClusterMasqueGatewayReadinessCarrier *)> close;
+    std::function<bool(uint8_t *, uint32_t)> nonce;
+  };
+
+  void processRecoveryFrame(CrossClusterMasqueGatewayReadinessCarrier *carrier,
+                            const RecoveryFrameDispatch& dispatch)
+  {
+    if (carrier == nullptr) return;
+    const auto reject = [&]() {
+      (void)revokeCrossClusterMasqueGatewayReadiness(carrier->containerUUID);
+      carrier->rBuffer.clear();
+      if (dispatch.close) dispatch.close(carrier);
+    };
+    const auto tupleMatches = [](const ProdigyGatewayLocalTuple& lhs, const ProdigyGatewayLocalTuple& rhs) {
+      return lhs.pairUUID == rhs.pairUUID && lhs.localClusterUUID == rhs.localClusterUUID && lhs.localMachineUUID == rhs.localMachineUUID &&
+          lhs.keyEpoch == rhs.keyEpoch && lhs.authorityGeneration == rhs.authorityGeneration && lhs.gatewayGeneration == rhs.gatewayGeneration;
+    };
+
+    // Recovery never falls back to v1. Before publication it is a two-message
+    // handshake; once established it carries only correlated v2 path-fault
+    // replies. A second receipt can therefore never re-enter launch.
+    if (carrier->receiptAccepted) {
+      const uint64_t available = carrier->rBuffer.outstandingBytes();
+      if (available < sizeof(uint32_t)) { if (dispatch.recv) dispatch.recv(carrier); return; }
+      uint32_t payloadBytes = 0; memcpy(&payloadBytes, carrier->rBuffer.pHead(), sizeof(payloadBytes));
+      const uint64_t frameBytes = uint64_t(sizeof(uint32_t)) + payloadBytes;
+      if (!payloadBytes || frameBytes > CrossClusterMasqueGatewayReadinessListener::maximumFrameBytes || available != frameBytes) { reject(); return; }
+      CrossClusterMasqueGatewayReadinessListener::PeerIdentity observed = {};
+      ProdigyGatewayLocalControlFrame frame = {};
+      if (!carrier->capturePeerIdentity || !carrier->capturePeerIdentity(carrier->peerPID, observed) || observed != carrier->retainedIdentity ||
+          !prodigyGatewayLocalCarrierLockMode(carrier->localMode, carrier->rBuffer.pHead(), uint32_t(frameBytes), true) ||
+          !prodigyDecodeGatewayLocalControlFrame(carrier->rBuffer.pHead(), uint32_t(frameBytes), frame) ||
+          !prodigyGatewayLocalControlFrameAllowed(carrier->localMode, ProdigyGatewayLocalCarrierPhase::established, frame) ||
+          !carrier->faultFramePending || !frame.pathFault.fromGateway) { reject(); return; }
+      carrier->rBuffer.consume(frameBytes, true);
+      finishCrossClusterPathFaultGatewayControl(carrier, frame.pathFault);
+      if (dispatch.recv) dispatch.recv(carrier);
+      return;
+    }
+    const uint64_t available = carrier->rBuffer.outstandingBytes();
+    if (available < sizeof(uint32_t)) { if (dispatch.recv) dispatch.recv(carrier); return; }
+    uint32_t payloadBytes = 0; memcpy(&payloadBytes, carrier->rBuffer.pHead(), sizeof(payloadBytes));
+    const uint64_t frameBytes = uint64_t(sizeof(uint32_t)) + payloadBytes;
+    if (!payloadBytes || frameBytes > CrossClusterMasqueGatewayReadinessListener::maximumFrameBytes || available > frameBytes) {
+      reject(); return;
+    }
+    if (available < frameBytes) { if (dispatch.recv) dispatch.recv(carrier); return; }
+    ProdigyGatewayLocalControlFrame frame = {};
+    CrossClusterMasqueGatewayReadinessListener::PeerIdentity observed = {};
+    const bool identityCurrent = carrier->capturePeerIdentity && carrier->capturePeerIdentity(carrier->peerPID, observed) && observed == carrier->retainedIdentity;
+    if (!identityCurrent || !prodigyGatewayLocalCarrierLockMode(carrier->localMode, carrier->rBuffer.pHead(), uint32_t(frameBytes), true) ||
+        !prodigyDecodeGatewayLocalControlFrame(carrier->rBuffer.pHead(), uint32_t(frameBytes), frame) ||
+        !prodigyGatewayLocalControlFrameAllowed(carrier->localMode, carrier->localPhase, frame)) {
+      reject(); return;
+    }
+    if (carrier->localPhase == ProdigyGatewayLocalCarrierPhase::rebindHello) {
+      if (frame.rebindHello.recoveryToken != carrier->recoveryToken || !tupleMatches(frame.rebindHello.tuple, carrier->recoveryTuple)) {
+        reject(); return;
+      }
+      if (!dispatch.nonce || !dispatch.nonce(carrier->recoveryNonce, sizeof(carrier->recoveryNonce)) ||
+          !prodigyGatewayLocalNonceValid(carrier->recoveryNonce)) { reject(); return; }
+      ProdigyGatewayLocalControlFrame challenge = {};
+      challenge.direction = ProdigyGatewayLocalDirection::neuronToGateway; challenge.kind = ProdigyGatewayLocalKind::rebindChallenge;
+      challenge.rebindChallenge.tuple = carrier->recoveryTuple; memcpy(challenge.rebindChallenge.nonce, carrier->recoveryNonce, sizeof(carrier->recoveryNonce));
+      String encoded = {};
+      if (!prodigyGatewayLocalControlFrameAllowedForSend(carrier->localPhase, challenge) ||
+          !prodigyEncodeGatewayLocalControlFrame(challenge, encoded)) { reject(); return; }
+      carrier->wBuffer.append(encoded); carrier->localPhase = ProdigyGatewayLocalCarrierPhase::rebindReceipt;
+      carrier->rBuffer.consume(frameBytes, true);
+      if (dispatch.send) dispatch.send(carrier);
+      if (dispatch.recv) dispatch.recv(carrier);
+      return;
+    }
+    auto found = pendingStateUploadRestores.find(carrier->containerUUID);
+    auto *runtime = crossClusterMasqueGatewayRuntimeForContainer(carrier->containerUUID);
+    ProdigyCrossClusterMasqueGatewayReadiness readiness = {};
+    readiness.pairUUID = frame.rebindReceipt.tuple.pairUUID;
+    readiness.localClusterUUID = frame.rebindReceipt.tuple.localClusterUUID;
+    readiness.localMachineUUID = frame.rebindReceipt.tuple.localMachineUUID;
+    readiness.keyEpoch = frame.rebindReceipt.tuple.keyEpoch;
+    readiness.authorityGeneration = frame.rebindReceipt.tuple.authorityGeneration;
+    readiness.gatewayGeneration = frame.rebindReceipt.tuple.gatewayGeneration;
+    readiness.authenticatedMasqueQUICReady = frame.rebindReceipt.authenticatedMasqueQUICReady && frame.rebindReceipt.ready &&
+        prodigyIsSHA256HexDigest(frame.rebindReceipt.routeSetSHA256);
+    CrossClusterMasqueGatewayReadinessListener::PeerIdentity candidateIdentity = {};
+    const bool admissionCurrent = carrier->localPhase == ProdigyGatewayLocalCarrierPhase::rebindReceipt &&
+        tupleMatches(frame.rebindReceipt.tuple, carrier->recoveryTuple) &&
+        memcmp(frame.rebindReceipt.nonce, carrier->recoveryNonce, sizeof(carrier->recoveryNonce)) == 0 && runtime != nullptr &&
+        runtime->systemPlanAdmitted && runtime->systemContainerUUID == carrier->containerUUID &&
+        tupleMatches(gatewayRecoveryTuple(runtime->authority), carrier->recoveryTuple) && found != pendingStateUploadRestores.end() && found->second != nullptr &&
+        found->second->container != nullptr && found->second->settled && !found->second->terminalRetirementPending &&
+        found->second->container->pid == carrier->peerPID && found->second->container->pidfd >= 0 &&
+        carrier->capturePeerIdentity && carrier->capturePeerIdentity(found->second->container->pid, candidateIdentity) && candidateIdentity == carrier->retainedIdentity &&
+        found->second->epoch == carrier->recoveryEpoch && carrier->recoveryEpoch == stateUploadRestoreEpoch && found->second->gatewayRecoveryTokenBound &&
+        found->second->boundGatewayRecoveryToken == carrier->recoveryToken &&
+        found->second->stream == brain && found->second->requestedStream == brain && brain != nullptr &&
+        found->second->streamGeneration == brain->ioGeneration && found->second->requestedGeneration == brain->ioGeneration &&
+        streamIsActive(brain) && memcmp(&found->second->fragment, &lcsubnet6, sizeof(lcsubnet6)) == 0 &&
+        pendingContainerLaunchIsCurrent(carrier->containerUUID, found->second->launchAdmissionGeneration) &&
+        prodigyCrossClusterMasqueGatewayReadinessMatches(runtime->authority, readiness);
+    if (!admissionCurrent || !publishRestoredStateUploadContainer(*found->second, carrier->containerUUID, carrier->recoveryEpoch)) { reject(); return; }
+    carrier->receiptAccepted = true; carrier->localPhase = ProdigyGatewayLocalCarrierPhase::established;
+    carrier->rBuffer.consume(frameBytes, true);
+    // The candidate is now owned by `containers`; a later readiness/BGP fence
+    // may revoke route eligibility, but must not undo or reject publication.
+    (void)recordCrossClusterMasqueGatewayReadiness(carrier->containerUUID, readiness);
+    if (dispatch.recv) dispatch.recv(carrier);
+  }
+
+  void recvCrossClusterMasqueGatewayReadinessCarrier(
+      CrossClusterMasqueGatewayReadinessCarrier *carrier, int result)
+  {
+    if (carrier == nullptr || !carrier->pendingRecv) return;
+    carrier->pendingRecv = false;
+    if (result <= 0)
+    {
+      (void)revokeCrossClusterMasqueGatewayReadiness(carrier->containerUUID);
+      queueCloseIfActive(carrier);
+      return;
+    }
+    if (uint64_t(result) > carrier->rBuffer.remainingCapacity())
+    {
+      (void)revokeCrossClusterMasqueGatewayReadiness(carrier->containerUUID);
+      carrier->rBuffer.clear();
+      queueCloseIfActive(carrier);
+      return;
+    }
+    carrier->rBuffer.advance(result);
+    if (carrier->recovery)
+    {
+      const RecoveryFrameDispatch dispatch = {
+        [](CrossClusterMasqueGatewayReadinessCarrier *item) { Ring::queueSend(item); },
+        [](CrossClusterMasqueGatewayReadinessCarrier *item) { Ring::queueRecv(item); },
+        [this](CrossClusterMasqueGatewayReadinessCarrier *item) { queueCloseIfActive(item); },
+        [](uint8_t *bytes, uint32_t size) {
+          if (bytes == nullptr || size != 16) return false;
+          uint128_t value = 0;
+          while (value == 0) value = Random::generateNumberWithNBits<128, uint128_t>();
+          memcpy(bytes, &value, size);
+          return true;
+        }};
+      processRecoveryFrame(carrier, dispatch);
+      return;
+    }
+    // After the initial PID/token-authenticated receipt this same carrier may
+    // contain correlated fault replies or a fresh readiness receipt after a
+    // paused session reconnects. Frames remain independently bounded.
+    if (carrier->receiptAccepted)
+    {
+      while (carrier->rBuffer.outstandingBytes() >= sizeof(uint32_t)) {
+        uint32_t payloadBytes = 0;
+        memcpy(&payloadBytes, carrier->rBuffer.pHead(), sizeof(payloadBytes));
+        const uint64_t frameBytes = uint64_t(sizeof(uint32_t)) + payloadBytes;
+        if (!payloadBytes || frameBytes > CrossClusterMasqueGatewayReadinessListener::maximumFrameBytes) {
+          (void)revokeCrossClusterMasqueGatewayReadiness(carrier->containerUUID);
+          carrier->rBuffer.clear(); queueCloseIfActive(carrier); return;
+        }
+        if (carrier->rBuffer.outstandingBytes() < frameBytes) break;
+        ProdigyCrossClusterPathFaultGatewayControlPayload response = {};
+        ProdigyCrossClusterMasqueGatewayLocalReceipt receipt = {};
+        const bool fault = carrier->faultFramePending &&
+            prodigyDecodeCrossClusterPathFaultGatewayControlFrame(carrier->rBuffer.pHead(), uint32_t(frameBytes), response) &&
+            response.fromGateway;
+        const auto *runtime = crossClusterMasqueGatewayRuntimeForContainer(carrier->containerUUID);
+        const bool ready = !fault && runtime && runtime->faultLeaseActive &&
+            prodigyDecodeCrossClusterMasqueGatewayLocalReceiptFrame(carrier->rBuffer.pHead(), uint32_t(frameBytes), receipt) &&
+            recordCrossClusterMasqueGatewayLocalReceipt(carrier->containerUUID, carrier->peerPID, receipt);
+        if (!fault && !ready) {
+          (void)revokeCrossClusterMasqueGatewayReadiness(carrier->containerUUID);
+          carrier->rBuffer.clear(); queueCloseIfActive(carrier); return;
+        }
+        carrier->rBuffer.consume(frameBytes, true);
+        if (fault) finishCrossClusterPathFaultGatewayControl(carrier, response);
+      }
+      Ring::queueRecv(carrier);
+      return;
+    }
+    const uint64_t available = carrier->rBuffer.outstandingBytes();
+    if (available < sizeof(uint32_t))
+    {
+      Ring::queueRecv(carrier);
+      return;
+    }
+    uint32_t payloadBytes = 0;
+    memcpy(&payloadBytes, carrier->rBuffer.pHead(), sizeof(payloadBytes));
+    const uint64_t frameBytes = uint64_t(sizeof(uint32_t)) + payloadBytes;
+    if (payloadBytes == 0 || payloadBytes >
+            CrossClusterMasqueGatewayReadinessListener::maximumFrameBytes - sizeof(uint32_t) ||
+        available > frameBytes)
+    {
+      (void)revokeCrossClusterMasqueGatewayReadiness(carrier->containerUUID);
+      carrier->rBuffer.clear();
+      queueCloseIfActive(carrier);
+      return;
+    }
+    if (available < frameBytes)
+    {
+      Ring::queueRecv(carrier);
+      return;
+    }
+    ProdigyCrossClusterMasqueGatewayLocalReceipt receipt = {};
+    if (!prodigyDecodeCrossClusterMasqueGatewayLocalReceiptFrame(
+            carrier->rBuffer.pHead(), uint32_t(frameBytes), receipt) ||
+        !recordCrossClusterMasqueGatewayLocalReceipt(
+            carrier->containerUUID, carrier->peerPID, receipt))
+    {
+      (void)revokeCrossClusterMasqueGatewayReadiness(carrier->containerUUID);
+      carrier->rBuffer.clear();
+      queueCloseIfActive(carrier);
+      return;
+    }
+    carrier->receiptAccepted = true;
+    carrier->rBuffer.consume(frameBytes, true);
+    Ring::queueRecv(carrier);
+  }
+
   template <typename T, typename Dispatch>
   void recvHandler(T *stream, int result, Dispatch&& dispatch)
   {
@@ -7456,8 +10484,19 @@ public:
       {
         if (stream->transportEncryptionEnabled())
         {
-          if (stream->decryptTransportTLS(uint32_t(result)) == false || ((void *)stream == (void *)brain && verifyBrainTransportTLSPeer() == false))
+          const bool decrypted = stream->decryptTransportTLS(uint32_t(result));
+          const bool brainPeerVerified = decrypted && ((void *)stream != (void *)brain || verifyBrainTransportTLSPeer());
+          if (!decrypted || !brainPeerVerified)
           {
+            if constexpr (std::is_same_v<T, NeuronBrainControlStream>)
+            {
+              PRODIGY_DEBUG_LOG(
+                  "neuron brain recv reject reason=%s result=%d tlsNegotiated=%d peerVerified=%d pendingSend=%d pendingRecv=%d fd=%d fslot=%d\n",
+                  !decrypted ? "tls-decrypt" : "tls-peer-verify", result,
+                  int(stream->isTransportNegotiated()), int(stream->tlsPeerVerified), int(stream->pendingSend),
+                  int(stream->pendingRecv), stream->fd, stream->fslot);
+              PRODIGY_DEBUG_FLUSH();
+            }
             stream->rBuffer.clear();
             queueCloseIfActive(stream);
             return;
@@ -7511,9 +10550,25 @@ public:
             return;
           }
         }
+        const uint16_t dispatchedTopic = message->topic;
+        if constexpr (std::is_same_v<T, NeuronBrainControlStream>)
+        {
+          PRODIGY_DEBUG_LOG(
+              "neuron brain dispatch enter topic=%u argsBytes=%llu fd=%d fslot=%d closing=%d\n",
+              unsigned(dispatchedTopic),
+              (unsigned long long)(message->terminal() >= message->args ? message->terminal() - message->args : 0),
+              stream->fd, stream->fslot, int(Ring::socketIsClosing(stream)));
+          PRODIGY_DEBUG_FLUSH();
+        }
         dispatch(message);
         if constexpr (std::is_same_v<T, NeuronBrainControlStream>)
         {
+          PRODIGY_DEBUG_LOG(
+              "neuron brain dispatch exit topic=%u closing=%d active=%d commandsRejected=%d pendingSend=%d pendingRecv=%d queued=%llu\n",
+              unsigned(dispatchedTopic), int(Ring::socketIsClosing(stream)), int(streamIsActive(stream)),
+              int(stream->commandsRejected), int(stream->pendingSend), int(stream->pendingRecv),
+              (unsigned long long)stream->queuedSendOutstandingBytes());
+          PRODIGY_DEBUG_FLUSH();
           if (stream->commandsRejected)
           {
             stop = true;
@@ -7545,6 +10600,13 @@ public:
                    unsigned(peekSize),
                    stream->fd,
                    stream->fslot);
+        if constexpr (std::is_same_v<T, NeuronBrainControlStream>)
+        {
+          PRODIGY_DEBUG_LOG(
+              "neuron brain recv reject reason=parse-failure outstanding=%llu peekSize=%u fd=%d fslot=%d\n",
+              (unsigned long long)outstanding, unsigned(peekSize), stream->fd, stream->fslot);
+          PRODIGY_DEBUG_FLUSH();
+        }
         stream->rBuffer.clear();
         queueCloseIfActive(stream);
         return;
@@ -7619,6 +10681,12 @@ public:
   void recvHandler(void *socket, int result) override
   {
     verboseNeuronSocketLog("neuron recvHandler socket=%p brain=%p result=%d\n", socket, brain, result);
+    for (const auto& carrier : crossClusterMasqueGatewayReadinessCarriers)
+    {
+      if (socket != static_cast<void *>(carrier.get())) continue;
+      recvCrossClusterMasqueGatewayReadinessCarrier(carrier.get(), result);
+      return;
+    }
     if (socket == (void *)brain)
     {
       recvHandler(brain, result, [&](Message *message) -> void {
@@ -7810,6 +10878,9 @@ public:
 
   void sendHandler(void *socket, int result) override
   {
+    for (const auto& carrier : crossClusterMasqueGatewayReadinessCarriers) {
+      if (carrier.get() == socket) { sendHandler(carrier.get(), result); return; }
+    }
     if (socket == (void *)brain)
     {
       sendHandler(brain, result);
@@ -7852,6 +10923,7 @@ public:
       }
 
       sendHandler(container, result);
+      if (!container->pendingDestroy) flushCousinCarrierDeliveries(container);
     }
   }
 
@@ -7937,6 +11009,51 @@ public:
 
   void pollHandler(void *socket, int result) override
   {
+    for (const auto& listener : crossClusterMasqueGatewayReadinessListeners)
+    {
+      if (socket != static_cast<void *>(listener.get())) continue;
+      int acceptedFD = -1;
+      pid_t peerPID = -1;
+      const uint128_t containerUUID = listener->containerUUID;
+      if (result >= 0 && listener->acceptCarrier(acceptedFD, peerPID))
+      {
+        // A reconnect replaces the prior liveness lease and must earn a new
+        // READY receipt.  Queueing close first revokes stale route readiness
+        // even if the old peer has not delivered EOF yet.
+        (void)revokeCrossClusterMasqueGatewayReadiness(containerUUID);
+        closeCrossClusterMasqueGatewayCarriers(containerUUID);
+        auto carrier = std::make_unique<CrossClusterMasqueGatewayReadinessCarrier>();
+        carrier->fd = acceptedFD;
+        carrier->isNonBlocking = true;
+        carrier->containerUUID = containerUUID;
+        carrier->peerPID = peerPID;
+        carrier->recovery = listener->recovery;
+        if (carrier->recovery) {
+          carrier->recoveryEpoch = listener->recoveryEpoch;
+          carrier->recoveryTuple = listener->recoveryTuple;
+          carrier->recoveryToken.assign(listener->recoveryToken);
+          carrier->retainedIdentity = listener->retainedIdentity;
+          carrier->capturePeerIdentity = listener->capturePeerIdentity;
+          carrier->localPhase = ProdigyGatewayLocalCarrierPhase::rebindHello;
+        }
+        RingDispatcher::installMultiplexee(carrier.get(), this);
+        Ring::queueRecv(carrier.get());
+        activeCrossClusterMasqueGatewayReadinessCarriers.insert_or_assign(containerUUID, carrier.get());
+        crossClusterMasqueGatewayReadinessCarriers.push_back(std::move(carrier));
+      }
+      else if (result < 0)
+      {
+        // The listener itself was lost.  Invalid unauthenticated connection
+        // attempts do not revoke an already authenticated carrier.
+        (void)revokeCrossClusterMasqueGatewayReadiness(containerUUID);
+        closeCrossClusterMasqueGatewayCarriers(containerUUID);
+      }
+      if (listener->fd >= 0)
+      {
+        Ring::queuePollProcessFD(listener.get(), listener->fd, false, POLLIN);
+      }
+      return;
+    }
     if (socket == (void *)&osUpdateProcess)
     {
       osUpdateProcess.pollQueued = false;
@@ -7988,6 +11105,20 @@ public:
 
   void closeHandler(void *socket) override
   {
+    for (auto it = crossClusterMasqueGatewayReadinessCarriers.begin();
+         it != crossClusterMasqueGatewayReadinessCarriers.end(); ++it)
+    {
+      if (socket != static_cast<void *>(it->get())) continue;
+      const uint128_t containerUUID = (*it)->containerUUID;
+      if (crossClusterMasqueGatewayCarrierForContainer(containerUUID) == it->get())
+      {
+        activeCrossClusterMasqueGatewayReadinessCarriers.erase(containerUUID);
+        (void)revokeCrossClusterMasqueGatewayReadiness(containerUUID);
+      }
+      RingDispatcher::eraseMultiplexee(it->get());
+      crossClusterMasqueGatewayReadinessCarriers.erase(it);
+      return;
+    }
     if (socket == (void *)brain)
     {
       // maybe the brain failed?
@@ -8033,6 +11164,7 @@ public:
       Container *container = static_cast<Container *>(socket);
       if (container->pendingDestroy)
       {
+        discardCousinCarrierDeliveries(container->plan.uuid);
         container->destroyCloseCompleted = true;
         ContainerManager::finalizeContainerDestroyIfReady(container);
         return;
@@ -8067,6 +11199,18 @@ public:
                  container->fslot,
                  int(container->pendingSend),
                  int(container->pendingRecv));
+
+      // A carrier lease authorizes one exact live AF_UNIX control stream. A
+      // reconnect must receive a fresh Brain command; retaining queued bytes
+      // or the old pending authorization would accept frames for a dead peer.
+      discardCousinCarrierDeliveries(container->plan.uuid);
+      for (auto it = cousinSessionLocalPendings.begin(); it != cousinSessionLocalPendings.end();) {
+        if (it->containerUUID == container->plan.uuid) {
+          (void)clearPrivateCousinFlow(*it);
+          it = cousinSessionLocalPendings.erase(it);
+        } else ++it;
+      }
+      clearPrivateCousinAdmissionsForContainer(container->plan.uuid);
 
       bool processAlive = false;
       if (container->pid > 0 && kill(container->pid, 0) == 0)
@@ -8149,6 +11293,12 @@ public:
   {
     if (packet == nullptr)
     {
+      return;
+    }
+
+    if (packet == &crossClusterPathFaultTick) {
+      crossClusterPathFaultTickQueued = false;
+      if (result != -ECANCELED) serviceCrossClusterPathFaultTick();
       return;
     }
 
@@ -8303,6 +11453,43 @@ public:
     RingDispatcher::installMultiplexee(container, this);
     syncTrackedContainerPeerWhiteholeBindings();
 
+    if (container->plan.system.kind == SystemContainerKind::crossClusterMasqueGateway)
+    {
+      // The directory is created by ContainerManager before exec. Register
+      // this separate listener with the Ring; it never shares NeuronHub's
+      // framing or accepted stream ownership.
+      container->gatewayReadinessListenerReady = false;
+      auto *runtime = crossClusterMasqueGatewayRuntimeForContainer(container->plan.uuid);
+      if (runtime == nullptr)
+      {
+        (void)revokeCrossClusterMasqueGatewayReadiness(container->plan.uuid);
+      }
+      else
+      {
+        // A retained recovery listener is already bound to the exact recovery
+        // socket. Publishing its receipt must not replace it with a launch
+        // listener or assign a new NeuronHub path.
+        if (auto *existing = crossClusterMasqueGatewayListenerForContainer(container->plan.uuid);
+            existing != nullptr && existing->recovery)
+        {
+          container->gatewayReadinessListenerReady = true;
+        }
+        else
+        {
+          removeCrossClusterMasqueGatewayListener(container->plan.uuid);
+          auto listener = std::make_unique<CrossClusterMasqueGatewayReadinessListener>();
+          if (listener->openFor(*container))
+          {
+            RingDispatcher::installMultiplexee(listener.get(), this);
+            Ring::queuePollProcessFD(listener.get(), listener->fd, false, POLLIN);
+            crossClusterMasqueGatewayReadinessListeners.push_back(std::move(listener));
+            container->gatewayReadinessListenerReady = true;
+          }
+          else (void)revokeCrossClusterMasqueGatewayReadiness(container->plan.uuid);
+        }
+      }
+    }
+
     // Network setup can request runtime-map convergence before the candidate
     // is visible in containers. A wormhole refresh below requests another
     // sweep after publication; containers without wormholes need the same
@@ -8314,6 +11501,9 @@ public:
 
     if (container->exposesNeuronSocket() == false)
     {
+      if (container->plan.system.kind == SystemContainerKind::crossClusterMasqueGateway &&
+          !container->plan.wormholes.empty())
+        refreshContainerSwitchboardWormholes(container);
       return;
     }
 
@@ -8339,6 +11529,26 @@ public:
 
   void popContainer(Container *container) override
   {
+    if (container->plan.system.kind == SystemContainerKind::crossClusterMasqueGateway)
+    {
+      (void)revokeCrossClusterMasqueGatewayReadiness(container->plan.uuid);
+      removeCrossClusterMasqueGatewayListener(container->plan.uuid);
+      if (auto *runtime = crossClusterMasqueGatewayRuntimeForContainer(container->plan.uuid);
+          runtime != nullptr)
+      {
+        ensureSwitchboard()->closeWormholesToContainer(generateLocalContainerID(container->plan.fragment));
+        runtime->systemContainerUUID = 0;
+        runtime->systemPlanAdmitted = false;
+      }
+    }
+    discardCousinCarrierDeliveries(container->plan.uuid);
+    for (auto it = cousinSessionLocalPendings.begin(); it != cousinSessionLocalPendings.end();) {
+      if (it->containerUUID == container->plan.uuid) {
+        (void)clearPrivateCousinFlow(*it);
+        it = cousinSessionLocalPendings.erase(it);
+      } else ++it;
+    }
+    clearPrivateCousinAdmissionsForContainer(container->plan.uuid);
     containers.erase(container->plan.uuid);
     containerByPid.erase(container->pid);
     pendingAdvertisementPairings.erase(container->plan.uuid);

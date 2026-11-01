@@ -5,6 +5,7 @@
 #include <prodigy/cluster.pair.enrollment.h>
 #include <prodigy/cluster.pair.endpoint.h>
 #include <prodigy/cluster.pair.epoch.h>
+#include <prodigy/cluster.pair.projection.h>
 #include <prodigy/transport.credentials.h>
 
 constexpr inline uint32_t ProdigyClusterPairEnrollmentOperationMaximumEndpoints = 16;
@@ -12,6 +13,7 @@ constexpr inline uint32_t ProdigyClusterPairEnrollmentOperationMaximumEndpoints 
 class ProdigyClusterPairEnrollmentOperation {
 public:
   static constexpr uint32_t version = 3;
+  static constexpr uint32_t privateDiscoveryVersion = 4;
   static constexpr uint32_t revocationVersion = 2;
   static constexpr uint32_t legacyVersion = 1;
   uint32_t protocolVersion = legacyVersion;
@@ -44,6 +46,9 @@ public:
   Vector<uint128_t> rotationFrozenElectorate;
   Vector<ClusterPairControlEndpoint> localEndpoints;
   Vector<ClusterPairControlEndpoint> peerEndpoints;
+  uint128_t privateDiscoveryActivationUUID = 0;
+  ProdigyPairPrivateDiscoveryPhase privateDiscoveryPhase = ProdigyPairPrivateDiscoveryPhase::none;
+  uint64_t privateDiscoveryTransitionGeneration = 0;
 };
 
 static inline bool prodigyClusterPairEndpointsValid(const Vector<ClusterPairControlEndpoint>& endpoints,
@@ -72,7 +77,8 @@ static inline bool prodigyClusterPairEnrollmentOperationValid(
 {
   if ((operation.protocolVersion != ProdigyClusterPairEnrollmentOperation::legacyVersion &&
        operation.protocolVersion != ProdigyClusterPairEnrollmentOperation::revocationVersion &&
-       operation.protocolVersion != ProdigyClusterPairEnrollmentOperation::version) ||
+       operation.protocolVersion != ProdigyClusterPairEnrollmentOperation::version &&
+       operation.protocolVersion != ProdigyClusterPairEnrollmentOperation::privateDiscoveryVersion) ||
       operation.pairUUID != enrollment.pairUUID || operation.operationUUID != enrollment.operationUUID ||
       operation.localAuthorityGeneration != enrollment.localAuthorityGeneration ||
       operation.localAuthorityGeneration == 0 || operation.transitionGeneration < operation.localAuthorityGeneration ||
@@ -82,6 +88,12 @@ static inline bool prodigyClusterPairEnrollmentOperationValid(
       (enrollment.state == ProdigyClusterPairEnrollmentState::pending && operation.initialProjectionDelivered) ||
       !prodigyClusterPairEndpointsValid(operation.localEndpoints, enrollment.localClusterUUID) ||
       !prodigyClusterPairEndpointsValid(operation.peerEndpoints, enrollment.peerClusterUUID)) return false;
+  if (operation.protocolVersion < ProdigyClusterPairEnrollmentOperation::privateDiscoveryVersion) {
+    if (operation.privateDiscoveryActivationUUID || operation.privateDiscoveryPhase != ProdigyPairPrivateDiscoveryPhase::none || operation.privateDiscoveryTransitionGeneration) return false;
+  } else if (operation.privateDiscoveryActivationUUID != operation.operationUUID ||
+      (operation.privateDiscoveryPhase != ProdigyPairPrivateDiscoveryPhase::prepared && operation.privateDiscoveryPhase != ProdigyPairPrivateDiscoveryPhase::active) ||
+      operation.privateDiscoveryTransitionGeneration < operation.localAuthorityGeneration ||
+      operation.privateDiscoveryTransitionGeneration > runtimeGeneration || !operation.initialProjectionDelivered) return false;
   for (uint32_t left = 0; left < operation.frozenElectorate.size(); ++left)
   {
     if (operation.frozenElectorate[left] == 0 || (left && operation.frozenElectorate[left - 1] >= operation.frozenElectorate[left])) return false;
@@ -103,10 +115,10 @@ static inline bool prodigyClusterPairEnrollmentOperationValid(
     for (uint32_t left = 0; left < operation.revocationFrozenElectorate.size(); ++left)
       if (operation.revocationFrozenElectorate[left] == 0 ||
           (left && operation.revocationFrozenElectorate[left - 1] >= operation.revocationFrozenElectorate[left])) return false;
-  } else if (operation.protocolVersion == ProdigyClusterPairEnrollmentOperation::version &&
+  } else if (operation.protocolVersion >= ProdigyClusterPairEnrollmentOperation::version &&
              (operation.projectionsWithdrawn || operation.revocationTransitionGeneration != 0 ||
               operation.revocationPinnedMasterAuthorityEpoch != 0 || !operation.revocationFrozenElectorate.empty())) return false;
-  if (operation.protocolVersion != ProdigyClusterPairEnrollmentOperation::version) return true;
+  if (operation.protocolVersion < ProdigyClusterPairEnrollmentOperation::version) return true;
   const bool rotating = operation.rotationPhase != ProdigyClusterPairEpochPhase::none;
   if (!rotating)
     return operation.agreementUUID == 0 && operation.oldEpoch == 0 && operation.nextEpoch == 0 &&
@@ -173,6 +185,16 @@ static void serialize(S&& serializer, ProdigyClusterPairEnrollmentOperation& ope
       [](auto& nested, auto& endpoint) { nested.object(endpoint); });
   serializer.container(operation.peerEndpoints, ProdigyClusterPairEnrollmentOperationMaximumEndpoints,
       [](auto& nested, auto& endpoint) { nested.object(endpoint); });
+  if (operation.protocolVersion >= ProdigyClusterPairEnrollmentOperation::privateDiscoveryVersion) {
+    serializer.value16b(operation.privateDiscoveryActivationUUID);
+    uint8_t phase = uint8_t(operation.privateDiscoveryPhase); serializer.value1b(phase);
+    operation.privateDiscoveryPhase = ProdigyPairPrivateDiscoveryPhase(phase);
+    serializer.value8b(operation.privateDiscoveryTransitionGeneration);
+  } else {
+    operation.privateDiscoveryActivationUUID = 0;
+    operation.privateDiscoveryPhase = ProdigyPairPrivateDiscoveryPhase::none;
+    operation.privateDiscoveryTransitionGeneration = 0;
+  }
 }
 
 static inline bool prodigyValidateClusterPairEnrollmentOperations(
@@ -257,16 +279,33 @@ public:
 
 class ProdigyClusterPairEnrollmentRequest {
 public:
-  static constexpr uint32_t version = 1; uint32_t protocolVersion = version; uint64_t expectedAuthorityGeneration = 0;
+  static constexpr uint32_t version = 1, privateDiscoveryVersion = 2; uint32_t protocolVersion = version; uint64_t expectedAuthorityGeneration = 0;
   ProdigyClusterPairEnrollment enrollment; Vector<ClusterPairControlEndpoint> localEndpoints, peerEndpoints;
+  uint128_t privateDiscoveryActivationUUID = 0;
+  ProdigyPairPrivateDiscoveryPhase privateDiscoveryPhase = ProdigyPairPrivateDiscoveryPhase::none;
 };
-class ProdigyClusterPairEnrollmentQuery { public: static constexpr uint32_t version = 1; uint32_t protocolVersion = version; uint128_t operationUUID = 0; };
+class ProdigyClusterPairEnrollmentQuery { public: static constexpr uint32_t version = 1, capabilityVersion = 2; uint32_t protocolVersion = version; uint128_t operationUUID = 0; };
 class ProdigyClusterPairEnrollmentResponse {
 public:
-  static constexpr uint32_t version = 1; uint32_t protocolVersion = version; bool success = false, found = false, qualified = false, initialProjectionDelivered = false;
+  static constexpr uint32_t version = 1, capabilityVersion = 2; uint32_t protocolVersion = version; bool success = false, found = false, qualified = false, initialProjectionDelivered = false;
   uint128_t localClusterUUID = 0; uint64_t currentAuthorityGeneration = 0; ProdigyClusterPairEnrollment enrollment;
   Vector<ClusterPairControlEndpoint> localEndpoints, peerEndpoints; String failure;
+  bool privateDiscoverySupported = false;
+  uint128_t privateDiscoveryActivationUUID = 0;
+  ProdigyPairPrivateDiscoveryPhase privateDiscoveryPhase = ProdigyPairPrivateDiscoveryPhase::none;
+  bool privateDiscoveryProjectionAcknowledged = false;
 };
+static inline bool prodigyPairPrivateDiscoveryTransitionAcknowledged(
+    const ProdigyClusterPairEnrollmentResponse& response, uint128_t activationUUID,
+    ProdigyPairPrivateDiscoveryPhase phase)
+{
+  return activationUUID != 0 && (phase == ProdigyPairPrivateDiscoveryPhase::prepared || phase == ProdigyPairPrivateDiscoveryPhase::active) &&
+      (response.privateDiscoveryPhase == ProdigyPairPrivateDiscoveryPhase::prepared || response.privateDiscoveryPhase == ProdigyPairPrivateDiscoveryPhase::active) &&
+      response.protocolVersion == ProdigyClusterPairEnrollmentResponse::capabilityVersion &&
+      response.success && response.found && response.qualified && response.initialProjectionDelivered &&
+      response.privateDiscoverySupported && response.privateDiscoveryActivationUUID == activationUUID &&
+      uint8_t(response.privateDiscoveryPhase) >= uint8_t(phase) && response.privateDiscoveryProjectionAcknowledged;
+}
 template <typename S> static void serialize(S&& serializer, ProdigyClusterPairEpochRotateRequest& request) {
   serializer.value4b(request.protocolVersion); serializer.value8b(request.expectedAuthorityGeneration);
   serializer.value16b(request.pairUUID); serializer.value16b(request.operationUUID);
@@ -319,6 +358,10 @@ template <typename S> static void serialize(S&& serializer, ProdigyClusterPairEn
   serializer.value4b(request.protocolVersion); serializer.value8b(request.expectedAuthorityGeneration); serializer.object(request.enrollment);
   serializer.container(request.localEndpoints, ProdigyClusterPairEnrollmentOperationMaximumEndpoints, [](auto& n, auto& e){n.object(e);});
   serializer.container(request.peerEndpoints, ProdigyClusterPairEnrollmentOperationMaximumEndpoints, [](auto& n, auto& e){n.object(e);});
+  if (request.protocolVersion >= ProdigyClusterPairEnrollmentRequest::privateDiscoveryVersion) {
+    serializer.value16b(request.privateDiscoveryActivationUUID);
+    uint8_t phase = uint8_t(request.privateDiscoveryPhase); serializer.value1b(phase); request.privateDiscoveryPhase = ProdigyPairPrivateDiscoveryPhase(phase);
+  }
 }
 template <typename S> static void serialize(S&& serializer, ProdigyClusterPairEnrollmentQuery& query) { serializer.value4b(query.protocolVersion); serializer.value16b(query.operationUUID); }
 template <typename S> static void serialize(S&& serializer, ProdigyClusterPairEnrollmentResponse& response) {
@@ -334,4 +377,9 @@ template <typename S> static void serialize(S&& serializer, ProdigyClusterPairEn
   }
   serializer.container(response.localEndpoints, ProdigyClusterPairEnrollmentOperationMaximumEndpoints, [](auto& n, auto& e){n.object(e);});
   serializer.container(response.peerEndpoints, ProdigyClusterPairEnrollmentOperationMaximumEndpoints, [](auto& n, auto& e){n.object(e);}); serializer.text1b(response.failure, 1024);
+  if (response.protocolVersion >= ProdigyClusterPairEnrollmentResponse::capabilityVersion) {
+    serializer.value1b(response.privateDiscoverySupported); serializer.value16b(response.privateDiscoveryActivationUUID);
+    uint8_t phase = uint8_t(response.privateDiscoveryPhase); serializer.value1b(phase); response.privateDiscoveryPhase = ProdigyPairPrivateDiscoveryPhase(phase);
+    serializer.value1b(response.privateDiscoveryProjectionAcknowledged);
+  }
 }

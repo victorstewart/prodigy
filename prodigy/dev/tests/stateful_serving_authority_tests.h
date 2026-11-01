@@ -1,5 +1,121 @@
 #pragma once
 
+static void testAllMastersSeedBootstrapSchema(TestSuite& suite)
+{
+  auto plan = makeDeploymentPlan(3, 112);
+  ProdigyStatefulServingAuthority authority = {};
+  authority.deploymentID = plan.config.deploymentID(); authority.applicationID = 3;
+  authority.revision = 1; authority.phase = StatefulWorkerTopologyUpgradePhase::allMastersSeedBootstrap;
+  authority.targetConfig = plan.config; authority.allMasters = true;
+  auto& b = authority.allMastersSeedBootstrap;
+  b.sourceClusterUUID = 3; b.targetClusterUUID = 4; b.targetDeploymentID = authority.deploymentID;
+  b.qualificationRunUUID = 1; b.successorOperationUUID = 2; b.shardGroup = 0; b.expectedSeedGeneration = 5;
+  auto& q = authority.qualificationCancellation;
+  q.request.applicationName = "bootstrap-test"_ctv; q.request.applicationID = 3;
+  q.request.activeVersionID = 111; q.request.successorVersionID = 112;
+  q.request.operationID = "00000000-0000-0000-0000-000000000001"_ctv; q.request.reason = "qualification"_ctv;
+  q.qualificationRunUUID = 1; q.successorOperationUUID = 2; q.sourceClusterUUID = 3;
+  q.executionGeneration = 1; q.deadlineAtMilliseconds = 123456;
+  q.placementIntentSHA256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv;
+  q.successorPlanSHA256 = q.successorArtifactSHA256 = q.placementIntentSHA256;
+  q.members.push_back({4, 5}); q.members.push_back({6, 7}); q.members.push_back({8, 9});
+  Vector<BrainReplicatedContainerRuntimeState> states;
+  suite.expect(prodigyValidateStatefulServingAuthority(authority, states, 1), "bootstrap_empty_scope_valid");
+  suite.expect(prodigyStatefulServingAuthorityMatchesShard(authority, authority.deploymentID, 0) &&
+      !prodigyStatefulServingAuthorityMatchesShard(authority, authority.deploymentID, 1), "bootstrap_empty_scope_matches_only_selected_shard");
+  String bytes; auto original = authority; ProdigyStatefulServingAuthority decoded;
+  suite.expect(BitseryEngine::serialize(bytes, original) && BitseryEngine::deserializeSafe(bytes, decoded) &&
+      decoded == authority && prodigyValidateStatefulServingAuthority(decoded, states, 1), "bootstrap_authority_roundtrip");
+  decoded.allMastersSeedBootstrap.successorOperationUUID++;
+  suite.expect(!prodigyValidateStatefulServingAuthority(decoded, states, 1), "bootstrap_scope_mismatch_rejected");
+  auto other = authority; other.allMastersSeedBootstrap.shardGroup = 1;
+  suite.expect(!prodigyStatefulServingAuthoritySameScope(authority, other), "bootstrap_shards_are_distinct_scopes");
+  ProdigyAllMastersSeedBootstrapOperation op; op.bootstrap = b; op.qualificationCancellation = q;
+  String wire; ProdigyAllMastersSeedBootstrapOperation restored;
+  suite.expect(BitseryEngine::serialize(wire, op) && BitseryEngine::deserializeSafe(wire, restored) &&
+      restored.protocolVersion == op.version && restored.bootstrap == b, "bootstrap_operation_roundtrip");
+  StatefulTopology topology; topology.shardGroup = 0; topology.servingMode = StatefulTopologyServingMode::allMastersSeedBootstrap;
+  topology.allMastersSeedBootstrap = b;
+  suite.expect(prodigyStatefulTopologyIsAllMastersSeedBootstrap(topology) && prodigyStatefulTopologyServesClients(topology),
+      "bootstrap_listener_remains_published");
+  topology.allMastersSeedBootstrap.expectedSeedGeneration = 0;
+  suite.expect(!prodigyStatefulTopologyIsAllMastersSeedBootstrap(topology) && !prodigyStatefulTopologyServesClients(topology),
+      "bootstrap_missing_generation_rejected");
+  // The initial form has no predecessor. It has its own authority and operation
+  // discriminator while using the same native seed-binding tuple.
+  auto initial = authority; initial.phase = StatefulWorkerTopologyUpgradePhase::initialAllMastersSeedBootstrap;
+  initial.targetConfig.type = ApplicationType::stateful;
+  initial.targetConfig.containerBlobSHA256 = q.successorArtifactSHA256;
+  initial.targetConfig.containerBlobBytes = 42;
+  auto& is = initial.initialAllMastersSeedBootstrap;
+  is.bootstrap = b; is.baselineOperationUUID = 99; is.nShardGroups = 1;
+  is.planSHA256 = q.successorPlanSHA256; is.artifactSHA256 = q.successorArtifactSHA256; is.artifactBytes = 42;
+  suite.expect(prodigyValidateStatefulServingAuthority(initial, states, 1), "initial_bootstrap_empty_scope_valid");
+  String initialBytes; auto initialCopy = initial; ProdigyStatefulServingAuthority initialDecoded;
+  suite.expect(BitseryEngine::serialize(initialBytes, initialCopy) && BitseryEngine::deserializeSafe(initialBytes, initialDecoded) &&
+      initialDecoded == initial && prodigyValidateStatefulServingAuthority(initialDecoded, states, 1), "initial_bootstrap_authority_roundtrip");
+  suite.expect(prodigyStatefulServingAuthoritySameScope(initial, authority) &&
+      prodigyStatefulServingAuthorityMatchesShard(initial, initial.deploymentID, 0) &&
+      !prodigyStatefulServingAuthorityMatchesShard(initial, initial.deploymentID, 1), "initial_bootstrap_exact_scope");
+  initialDecoded.initialAllMastersSeedBootstrap.baselineOperationUUID = 0;
+  suite.expect(!prodigyValidateStatefulServingAuthority(initialDecoded, states, 1), "initial_bootstrap_requires_baseline");
+  initialDecoded = initial; initialDecoded.initialAllMastersSeedBootstrap.bootstrap.expectedSeedGeneration = 0;
+  suite.expect(!prodigyValidateStatefulServingAuthority(initialDecoded, states, 1), "initial_bootstrap_requires_generation");
+  initialDecoded = initial; initialDecoded.initialAllMastersSeedBootstrap.artifactBytes++;
+  suite.expect(!prodigyValidateStatefulServingAuthority(initialDecoded, states, 1), "initial_bootstrap_requires_exact_artifact");
+  initialDecoded = initial; initialDecoded.applicationID = 2; initialDecoded.targetConfig.applicationID = 2;
+  initialDecoded.deploymentID = initialDecoded.targetConfig.deploymentID();
+  initialDecoded.initialAllMastersSeedBootstrap.bootstrap.targetDeploymentID = initialDecoded.deploymentID;
+  initialDecoded.initialAllMastersSeedBootstrap.nShardGroups = 2;
+  suite.expect(!prodigyValidateStatefulServingAuthority(initialDecoded, states, 1), "initial_bootstrap_graph_requires_one_group");
+  ProdigyInitialAllMastersSeedBootstrapOperation initialOp, initialOpDecoded; initialOp.scope = is;
+  String initialWire;
+  suite.expect(BitseryEngine::serialize(initialWire, initialOp) && BitseryEngine::deserializeSafe(initialWire, initialOpDecoded) &&
+      initialOpDecoded.protocolVersion == initialOp.version && initialOpDecoded.scope.baselineOperationUUID == 99 &&
+      initialOp.version != op.version, "initial_bootstrap_operation_roundtrip_distinct");
+  {
+    ScopedRing ring = {};
+    StreamingTestBrain candidate = {}; BrainBase *oldBrain = thisBrain; thisBrain = &candidate;
+    NeuronBase *oldNeuron = thisNeuron; Neuron self = {}; self.uuid = 0x8301; thisNeuron = &self;
+    candidate.weAreMaster = true; candidate.nBrains = 1; candidate.boottimens = 100; candidate.brainConfig.clusterUUID = b.targetClusterUUID;
+    candidate.masterAuthorityEpoch = 9; candidate.masterAuthorityRuntimeState.generation = 1;
+    candidate.masterAuthorityRuntimeStateDurable = true; candidate.durableMasterAuthorityRuntimeStateGeneration = 1;
+    candidate.hasAuthoritativeTopology = true; candidate.authoritativeTopology.machines.push_back(ClusterMachine {});
+    candidate.authoritativeTopology.machines.back().uuid = self.uuid; candidate.authoritativeTopology.machines.back().isBrain = true;
+    auto initialPlan = plan; initialPlan.isStateful = true; initialPlan.stateful.allMasters = true;
+    initialPlan.canaryCount = 0; initialPlan.config = initial.targetConfig;
+    String serializedPlan; BitseryEngine::serialize(serializedPlan, initialPlan);
+    String planHash; prodigyComputeSHA256Hex(serializedPlan, planHash);
+    initial.initialAllMastersSeedBootstrap.planSHA256 = planHash;
+    ProdigyInitialAllMastersSeedBootstrapOperation query; query.query = true;
+    query.scope = initial.initialAllMastersSeedBootstrap; query.deploymentPlan = serializedPlan;
+    auto install = query; install.query = false;
+    install.expectedAuthorityGeneration = candidate.masterAuthorityRuntimeState.generation;
+    install.expectedMasterUUID = self.uuid; install.expectedMasterBootNs = candidate.boottimens;
+    auto response = candidate.initialAllMastersSeedBootstrapOperation(install);
+    if (!response.accepted) fprintf(stderr, "initial bootstrap install: %s\n", response.failure.c_str());
+    suite.expect(response.accepted && candidate.masterAuthorityRuntimeState.statefulServingAuthorities.size() == 1,
+        "initial_bootstrap_install_empty_target");
+    response = candidate.initialAllMastersSeedBootstrapOperation(query);
+    suite.expect(response.accepted, "initial_bootstrap_query_exact_authority");
+    query.scope.bootstrap.expectedSeedGeneration++;
+    response = candidate.initialAllMastersSeedBootstrapOperation(query);
+    suite.expect(!response.accepted && !response.failure.empty(), "initial_bootstrap_query_conflict_rejected");
+    candidate.authoritativeTopology.machines.push_back(ClusterMachine {});
+    candidate.authoritativeTopology.machines.back().uuid = 0x8302; candidate.authoritativeTopology.machines.back().isBrain = true;
+    response = candidate.initialAllMastersSeedBootstrapOperation(query);
+    suite.expect(!response.accepted && !response.failure.empty(), "initial_bootstrap_old_or_missing_peer_rejected");
+    thisNeuron = oldNeuron; thisBrain = oldBrain;
+  }
+  TestBrain brain = {}; brain.masterAuthorityRuntimeState.statefulServingAuthorities.push_back(authority);
+  BrainBase *savedBrain = thisBrain; thisBrain = &brain;
+  ApplicationDeployment predecessor = {}, successor = {}; successor.plan = plan; predecessor.next = &successor;
+  predecessor.rollForward();
+  suite.expect(successor.state == DeploymentState::none && brain.allMastersSeedBootstrapAwaitingCancellation(authority.deploymentID),
+      "bootstrap_roll_forward_waits_for_qualified_cancellation");
+  thisBrain = savedBrain;
+}
+
 static void testRestoredRuntimeRequiresFreshInventory(TestSuite& suite)
 {
   ScopedRing ring = {};

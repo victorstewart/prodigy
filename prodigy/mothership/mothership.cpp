@@ -76,6 +76,7 @@
 #include "mothership.local.vm.boundary.inc"
 #include <prodigy/mothership/mothership.tidesdb.migration.command.h>
 #include <prodigy/mothership/mothership.retained.recovery.command.h>
+#include <prodigy/mothership/mothership.nametag.qualification.h>
 
 // for now every time we create a new application or service we're going to have to recompile the mothership so that
 // it can read the enum values from enums.datacenter.h, but in the future we can do something else more flexible
@@ -2621,6 +2622,12 @@ static void printManagedCluster(const MothershipProdigyCluster& cluster)
                  unsigned(machine.ownedMemoryMB),
                  unsigned(machine.ownedStorageMB),
                  int(machine.uuid != 0));
+      if (!machine.ssh.hostPublicKeyOpenSSH.empty())
+      {
+        String hostPublicKey = machine.ssh.hostPublicKeyOpenSSH;
+        basics_log("      topologyMachineHostPublicKey identity=%s hostPublicKeyOpenSSH=%s\n",
+                   machineIdentity.c_str(), hostPublicKey.c_str());
+      }
     }
   }
 }
@@ -3959,8 +3966,8 @@ static bool mothershipVDCCaptureLocalCheckpoint(MothershipVDCBundleRecovery& ope
   auto reject = [&](const char *message) { if (failure) failure->assign(message); return false; };
   if (std::getenv("PRODIGY_STATE_SECRETS_DB") != nullptr)
     return reject("explicit secrets DB override is incompatible with isolated recovery state capture");
-  if (mothershipVDCSignal(operation.worker, SIGSTOP) == false || mothershipVDCWaitStopped(operation.worker) == false)
-    return reject("cannot freeze exact Brain for private state capture");
+  MothershipVDCProcessResumeGuard resume(operation.worker);
+  if (!resume.freeze(failure)) return false;
   MothershipVDCCheckpointContext context = {};
   context.runtime = operation.worker;
   if (mothershipVDCReadApplicationIdentities(operation.worker, context.applications, failure) == false) return false;
@@ -3977,33 +3984,11 @@ static bool mothershipVDCCaptureLocalCheckpoint(MothershipVDCBundleRecovery& ope
       std::filesystem::remove_all(secrets.c_str(), error);
     }
   } cleanup {copy, copySecrets};
-  auto copyState = [&](const String& from, const String& to) {
-    std::error_code error;
-    if (::mkdir(const_cast<String&>(to).c_str(), 0700) != 0) return false;
-    for (std::filesystem::recursive_directory_iterator it(const_cast<String&>(from).c_str(), error), end;
-         error.value() == 0 && it != end; it.increment(error))
-    {
-      auto relative = it->path().lexically_relative(const_cast<String&>(from).c_str());
-      auto destination = std::filesystem::path(const_cast<String&>(to).c_str()) / relative;
-      if (it->is_symlink(error)) return false;
-      if (it->is_directory(error))
-      {
-        if (::mkdir(destination.c_str(), 0700) != 0) return false;
-      }
-      else if (it->is_regular_file(error))
-      {
-        if (std::filesystem::copy_file(it->path(), destination, std::filesystem::copy_options::none, error) == false ||
-            ::chmod(destination.c_str(), 0600) != 0) return false;
-      }
-      else return false;
-    }
-    return error.value() == 0;
-  };
   String sourceSecrets = source; sourceSecrets.append(".secrets"_ctv);
-  if (copyState(source, copy) == false || copyState(sourceSecrets, copySecrets) == false)
+  if (!mothershipVDCCopyPrivateStateTree(source, copy, failure) ||
+      !mothershipVDCCopyPrivateStateTree(sourceSecrets, copySecrets, failure))
     return reject("private crash-consistent Brain state capture failed");
-  if (mothershipVDCSignal(operation.worker, SIGCONT) == false)
-    return reject("cannot resume exact Brain for authenticated checkpoint export");
+  if (!resume.resume(failure)) return false;
 
   String checkpointPath = {}, failurePath = {};
   mothershipVirtualDatacenterPath(directory, "local-checkpoint.bin", checkpointPath);
@@ -4088,6 +4073,118 @@ static bool mothershipVDCCaptureLocalCheckpoint(MothershipVDCBundleRecovery& ope
       mothershipVDCDurableWrite(directory, "successor-boot.json", successorBoot, failure) == false)
     return false;
   return true;
+}
+
+// Capture-only entry point used by the remote coordinator below.  It is
+// intentionally local to one already-selected Brain and cannot choose a host,
+// application, deployment, or recovery operation.  Both state trees are copied
+// while the exact process is stopped; the copied owner is opened only after the
+// guard has verified that process resumed.
+static bool mothershipVDCCaptureBrainStateLocal(
+    uint128_t expectedClusterUUID, uint128_t expectedMachineUUID,
+    uint64_t expectedPID, const String& directory, String *failure)
+{
+  auto reject = [&](const char *message) {
+    if (failure && failure->empty()) failure->assign(message);
+    return false;
+  };
+  if (expectedClusterUUID == 0 || expectedMachineUUID == 0 || expectedPID < 2 ||
+      !mothershipVDCPrivateDirectory(directory) ||
+      std::getenv("PRODIGY_STATE_DB") != nullptr ||
+      std::getenv("PRODIGY_STATE_SECRETS_DB") != nullptr)
+    return reject("invalid isolated Brain state capture input");
+
+  MothershipVDCBrainStateCaptureReceipt receipt = {};
+  receipt.clusterUUID = expectedClusterUUID;
+  receipt.machineUUID = expectedMachineUUID;
+  if (!mothershipVDCReadProcess(expectedPID, receipt.process) ||
+      !mothershipVDCWriteBrainStateCaptureReceipt(directory, receipt, failure))
+    return reject("exact Brain process identity is unavailable");
+
+  String source = {}, sourceSecrets = {}, copy = {}, copySecrets = {}, processRoot = {};
+  processRoot.snprintf<"/proc/{itoa}/root"_ctv>(expectedPID);
+  mothershipVirtualDatacenterPath(directory, "state", copy);
+  mothershipVirtualDatacenterPath(directory, "state.secrets", copySecrets);
+  struct RemoveIncompleteCopy {
+    String primary, secrets;
+    bool committed = false;
+    ~RemoveIncompleteCopy() {
+      if (committed) return;
+      std::error_code error = {};
+      std::filesystem::remove_all(primary.c_str(), error);
+      error.clear();
+      std::filesystem::remove_all(secrets.c_str(), error);
+    }
+  } cleanup {copy, copySecrets};
+
+  MothershipVDCProcessResumeGuard resume(receipt.process);
+  if (!resume.freeze(failure)) return false;
+  if (!mothershipVDCBrainCaptureStatePaths(processRoot, source, sourceSecrets, failure)) return false;
+  if (!mothershipVDCCopyPrivateStateTree(source, copy, failure) ||
+      !mothershipVDCCopyPrivateStateTree(sourceSecrets, copySecrets, failure))
+    return reject("private crash-consistent Brain state capture failed");
+  if (!resume.resume(failure)) return false;
+  receipt.resumed = true;
+  if (!mothershipVDCWriteBrainStateCaptureReceipt(directory, receipt, failure)) return false;
+
+  // Preserve the frozen bytes even if recovery/identity validation fails.
+  // Opening TidesDB may perform recovery writes, so validate a disposable clone.
+  // The existing captureComplete bit remains the recovery admission boundary.
+  cleanup.committed = true;
+  String validation = {}, validationSecrets = {};
+  mothershipVirtualDatacenterPath(directory, "validation", validation);
+  validationSecrets = validation; validationSecrets.append(".secrets"_ctv);
+  RemoveIncompleteCopy validationCleanup {validation, validationSecrets};
+  if (!mothershipVDCCopyPrivateStateTree(copy, validation, failure) ||
+      !mothershipVDCCopyPrivateStateTree(copySecrets, validationSecrets, failure))
+    return reject("captured Brain state validation clone failed");
+  ProdigyPersistentStateStore state(validation);
+  ProdigyPersistentLocalBrainState local = {};
+  ProdigyPersistentBrainSnapshot snapshot = {};
+  const bool valid = state.loadLocalBrainState(local, failure) &&
+      state.loadBrainSnapshot(snapshot, failure) &&
+      local.ownerClusterUUID == expectedClusterUUID && local.uuid == expectedMachineUUID &&
+      snapshot.brainConfig.clusterUUID == expectedClusterUUID;
+  state.close();
+  if (!valid) {
+    reject("copied Brain state does not match the selected cluster and machine");
+    String detail = failure && !failure->empty() ? *failure : String("Brain capture validation failed");
+    (void)mothershipVDCDurableWrite(directory, "brain-capture.incomplete", detail, nullptr);
+    return false;
+  }
+  receipt.captureComplete = true;
+  if (!mothershipVDCWriteBrainStateCaptureReceipt(directory, receipt, failure)) return false;
+  cleanup.committed = true;
+  return true;
+}
+
+// Reconciliation command for an interrupted SSH/controller result.  It never
+// stops a process.  It resumes only the exact persisted process identity and
+// rewrites the receipt only after observing that identity outside T/t state.
+static bool mothershipVDCResumeBrainStateCaptureLocal(
+    uint64_t expectedPID, const String& directory, String *failure)
+{
+  MothershipVDCBrainStateCaptureReceipt receipt = {};
+  if (expectedPID < 2 || !mothershipVDCReadBrainStateCaptureReceipt(directory, receipt) ||
+      receipt.process.pid != expectedPID || !mothershipVDCProcessMatches(receipt.process))
+  {
+    if (failure) failure->assign("Brain capture resume identity is absent or changed"_ctv);
+    return false;
+  }
+  char state = 0;
+  if (!mothershipVDCProcessMatches(receipt.process, &state)) return false;
+  if ((state == 'T' || state == 't') && !mothershipVDCSignal(receipt.process, SIGCONT))
+  {
+    if (failure) failure->assign("cannot resume exact Brain capture identity"_ctv);
+    return false;
+  }
+  if (!mothershipVDCWaitForStoppedState(receipt.process, false))
+  {
+    if (failure) failure->assign("exact Brain capture identity did not resume"_ctv);
+    return false;
+  }
+  receipt.resumed = true;
+  return mothershipVDCWriteBrainStateCaptureReceipt(directory, receipt, failure);
 }
 
 // The lifecycle owner asks Switchboard to retain its existing resources. It
@@ -8233,6 +8330,25 @@ private:
     }
     else
     {
+      // A tag sweep cannot prove that every registered writer is gone: a
+      // missing tag can hide an otherwise live machine. The exact durable
+      // roster goes through the provider's verified-deletion owner first.
+      if (runtimeEnvironment.kind == ProdigyEnvironmentKind::vultr)
+      {
+        destroyed = mothershipRunProviderHostJob(
+            hostRuntime, runtimeEnvironment,
+            MultiCurlClient::Clock::now() + std::chrono::minutes(10),
+            "exact cluster machine destroy", failure,
+            [&](CoroutineStack *coro, BrainIaaS& provider, bool& completed, String& jobFailure) -> void {
+              if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+                    mothershipDestroyProviderMachines(coro, provider, cloudIDs, completed, &jobFailure);
+                  }))
+              {
+                co_await coro->suspendAtIndex(suspendIndex);
+              }
+            });
+        if (!destroyed) return false;
+      }
       Vector<MothershipProdigyClusterMachine> adoptedMachines = {};
       mothershipCollectAdoptedClusterRemoveMachines(cluster, adoptedMachines);
       if (runtimeEnvironment.kind == ProdigyEnvironmentKind::vultr && adoptedMachines.empty())
@@ -8260,25 +8376,12 @@ private:
                 co_await coro->suspendAtIndex(suspendIndex);
               }
             });
-        destroyedCloudMachines = destroyed ? providerDestroyedCloudMachines : 0;
+        destroyedCloudMachines = destroyed ? uint32_t(cloudIDs.size()) + providerDestroyedCloudMachines : 0;
         return destroyed;
       }
       else if (runtimeEnvironment.kind == ProdigyEnvironmentKind::vultr)
       {
-        destroyed = mothershipRunProviderHostJob(
-            hostRuntime,
-            runtimeEnvironment,
-            MultiCurlClient::Clock::now() + std::chrono::minutes(10),
-            "machine destroy",
-            failure,
-            [&](CoroutineStack *coro, BrainIaaS& provider, bool& completed, String& jobFailure) -> void {
-              if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
-                    mothershipDestroyProviderMachines(coro, provider, cloudIDs, completed, &jobFailure);
-                  }))
-              {
-                co_await coro->suspendAtIndex(suspendIndex);
-              }
-            });
+        destroyed = true; // Exact registered machines were verified above.
       }
       else
       {
@@ -9067,6 +9170,62 @@ private:
     return drainCommittedLocalMembershipCleanup(registry, cluster, pending, failure);
   }
 
+  bool checkpointGraphReplicaClusterRemoval(const MothershipProdigyCluster& cluster,
+      bool complete, String& failure)
+  {
+    auto registry = openClusterRegistry();
+    for (uint16_t applicationID : {uint16_t(2), uint16_t(5)}) {
+      MothershipApplicationPlacement placement;
+      String readFailure;
+      if (!registry.loadApplicationPlacement(applicationID, placement, &readFailure)) {
+        if (readFailure == "record not found"_ctv) continue;
+        failure = readFailure; return false;
+      }
+      MothershipGraphReplicaPlacement member;
+      bool found = false;
+      for (const auto& active : placement.graphReplicas) if (active.clusterUUID == cluster.clusterUUID) {
+        member = active; found = true; break;
+      }
+      for (const auto& retired : placement.graphReplicaRetirements) if (retired.member.clusterUUID == cluster.clusterUUID) {
+        member = retired.member; found = true; break;
+      }
+      if (!found) continue;
+      String receipt;
+      if (complete) {
+        // Reached only after the existing cluster lifecycle and membership
+        // cleanup owners succeeded. Stable exact-member input makes retries
+        // after a crash produce the same completion receipt.
+        String bytes = "PRODIGY-GRAPH-REPLICA-CLUSTER-REMOVAL-v1\n"_ctv;
+        String identity; BitseryEngine::serialize(identity, member); bytes.append(identity);
+        if (!prodigyComputeSHA256Hex(bytes, receipt)) return false;
+      }
+      bool resumed = false;
+      MothershipApplicationPlacement stored;
+      if (!registry.retireGraphReplicaPlacement(applicationID, member, placement.ownerClusterUUID,
+              placement.generation, complete, receipt, stored, resumed, &failure)) return false;
+    }
+    return true;
+  }
+
+  bool completeTruthOwnerClusterRemoval(const MothershipProdigyCluster& cluster,
+      const MothershipApplicationPlacement& expected, String& failure)
+  {
+    if (expected.truthRetirementStartedGeneration == 0) return true;
+    // This receipt identifies the verified cleanup; it does not itself prove
+    // absence. The caller reaches here only after the lifecycle owner has
+    // verified exact provider IDs absent and membership/graph cleanup passed.
+    String bytes;
+    bytes.assign("PRODIGY-TRUTH-OWNER-CLUSTER-REMOVAL-v1\n"_ctv);
+    auto binding = expected;
+    binding.truthRetirementCompletedGeneration = 0;
+    binding.truthRetirementCleanupSHA256.clear();
+    String encoded, receipt;
+    BitseryEngine::serialize(encoded, binding); bytes.append(encoded);
+    if (!prodigyComputeSHA256Hex(bytes, receipt, &failure)) return false;
+    auto registry = openClusterRegistry();
+    return registry.completeTruthOwnerRetirement(cluster, expected, receipt, &failure);
+  }
+
   bool reconcileClusterToDesiredSpec(
       MothershipClusterRegistry& registry,
       const MothershipProdigyCluster& controlCluster,
@@ -9442,21 +9601,86 @@ private:
     }
 
     socket.close();
-    if (response.success == false)
+    if constexpr (requires { response.success; response.failure; })
     {
-      if (response.failure.size() > 0)
+      if (response.success == false)
       {
-        failure = response.failure;
-      }
-      else
-      {
-        failure.snprintf<"{} request failed"_ctv>(topicName);
-      }
+        if (response.failure.size() > 0)
+        {
+          failure = response.failure;
+        }
+        else
+        {
+          failure.snprintf<"{} request failed"_ctv>(topicName);
+        }
 
-      mothershipMarkFailureNonRetryable(failure);
+        mothershipMarkFailureNonRetryable(failure);
+        return false;
+      }
+    }
+
+    failure.clear();
+    return true;
+  }
+
+  bool requestCrossClusterMasqueGatewayAuthorityRoundTrip(
+      const ProdigyCrossClusterMasqueGatewayAuthorityRequest& request,
+      const String& artifactBlob,
+      ProdigyCrossClusterMasqueGatewayAuthorityResponse& response,
+      String& failure)
+  {
+    response = {};
+    if (socket.connect() != 0)
+    {
+      failure = socket.connectFailureDetail();
+      if (failure.empty())
+        failure.assign("failed to connect for cross-cluster MASQUE gateway authority commit"_ctv);
       return false;
     }
 
+    String serializedRequest = {};
+    auto requestCopy = request;
+    BitseryEngine::serialize(serializedRequest, requestCopy);
+    Message::construct(socket.wBuffer,
+        MothershipTopic::commitCrossClusterMasqueGatewayAuthority,
+        serializedRequest,
+        artifactBlob);
+    if (socket.send() == false)
+    {
+      socket.close();
+      failure.assign("failed to send cross-cluster MASQUE gateway authority request"_ctv);
+      return false;
+    }
+
+    Message *message = socket.recvExpectedTopic(
+        MothershipTopic::commitCrossClusterMasqueGatewayAuthority);
+    if (message == nullptr)
+    {
+      failure = socket.ioFailureDetail();
+      if (failure.empty())
+        failure.assign("timed out waiting for cross-cluster MASQUE gateway authority response"_ctv);
+      socket.close();
+      return false;
+    }
+    uint8_t *args = message->args;
+    String encoded = {};
+    Message::extractToStringView(args, encoded);
+    const bool decoded = args == message->terminal() &&
+        BitseryEngine::deserializeSafe(encoded, response);
+    socket.close();
+    if (!decoded)
+    {
+      failure.assign("invalid cross-cluster MASQUE gateway authority response payload"_ctv);
+      return false;
+    }
+    if (!response.success)
+    {
+      failure = response.failure;
+      if (failure.empty())
+        failure.assign("cross-cluster MASQUE gateway authority request failed"_ctv);
+      mothershipMarkFailureNonRetryable(failure);
+      return false;
+    }
     failure.clear();
     return true;
   }
@@ -9498,7 +9722,9 @@ private:
     const bool decoded = args == message->terminal() && BitseryEngine::deserializeSafe(encoded, response);
     Vault::secureClearString(socket.wBuffer);
     socket.close();
-    if (!decoded || response.protocolVersion != ProdigyClusterPairEnrollmentResponse::version || !response.success)
+    const uint32_t expectedResponseVersion = request.protocolVersion == ProdigyClusterPairEnrollmentRequest::privateDiscoveryVersion ?
+        ProdigyClusterPairEnrollmentResponse::capabilityVersion : ProdigyClusterPairEnrollmentResponse::version;
+    if (!decoded || response.protocolVersion != expectedResponseVersion || !response.success)
     {
       failure = response.failure;
       if (failure.empty()) failure.assign("cluster pair enrollment response invalid or rejected"_ctv);
@@ -9509,16 +9735,246 @@ private:
   }
 
   bool queryClusterPairEnrollment(const MothershipProdigyCluster& cluster, uint128_t operationUUID,
-                                  ProdigyClusterPairEnrollmentResponse& response, String& failure)
+                                  ProdigyClusterPairEnrollmentResponse& response, String& failure,
+                                  bool queryPrivateCapability = false)
   {
     String clusterName = cluster.name;
     if (!configureControlTarget(clusterName.c_str(), &failure)) return false;
     ProdigyClusterPairEnrollmentQuery query = {};
     query.operationUUID = operationUUID;
+    if (queryPrivateCapability) query.protocolVersion = ProdigyClusterPairEnrollmentQuery::capabilityVersion;
     if (!requestTopicRoundTrip(MothershipTopic::pullClusterPairEnrollment, query, response, failure)) return false;
-    if (response.protocolVersion != ProdigyClusterPairEnrollmentResponse::version)
+    if (response.protocolVersion != query.protocolVersion)
     { failure.assign("unsupported cluster pair enrollment response"_ctv); return false; }
     return true;
+  }
+
+  bool commitCrossClusterMasqueGatewayAuthority(
+      const MothershipProdigyCluster& cluster,
+      const CrossClusterMasqueGatewayAuthority& authority,
+      ProdigyCrossClusterMasqueGatewayAuthorityResponse& response,
+      String& failure)
+  {
+    response = {};
+    String clusterName = cluster.name;
+    if (cluster.clusterUUID == 0 || cluster.clusterUUID != authority.localClusterUUID ||
+        !prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(authority) ||
+        !configureControlTarget(clusterName.c_str(), &failure))
+    {
+      if (failure.empty()) failure.assign("cross-cluster MASQUE gateway target cluster is invalid"_ctv);
+      return false;
+    }
+    ProdigyCrossClusterMasqueGatewayAuthorityRequest request = {};
+    request.authority = authority;
+    String artifactBlob = {};
+    if (authority.state == CrossClusterMasqueGatewayState::active &&
+        !ContainerStore::systemLoadVerified(
+            SystemContainerKind::crossClusterMasqueGateway,
+            authority.artifactSHA256,
+            authority.artifactBytes,
+            artifactBlob,
+            &failure))
+    {
+      String detail = failure;
+      failure.assign("cross-cluster MASQUE gateway artifact load failed: "_ctv);
+      failure.append(detail);
+      return false;
+    }
+    if (!requestCrossClusterMasqueGatewayAuthorityRoundTrip(
+            request, artifactBlob, response, failure))
+    {
+      return false;
+    }
+    String expected = {};
+    CrossClusterMasqueGatewayAuthority expectedCopy = authority;
+    BitseryEngine::serialize(expected, expectedCopy);
+    const auto responseMatches = [&](const ProdigyCrossClusterMasqueGatewayAuthorityResponse& current) {
+      if (!current.found || current.localClusterUUID != cluster.clusterUUID) return false;
+      String observed = {};
+      CrossClusterMasqueGatewayAuthority observedCopy = current.authority;
+      BitseryEngine::serialize(observed, observedCopy);
+      return observed == expected;
+    };
+    if (!responseMatches(response))
+    {
+      failure.assign("cross-cluster MASQUE gateway authority response conflicts"_ctv);
+      return false;
+    }
+
+    // Brain deliberately acknowledges the in-memory commit before the replicated
+    // authority generation is durable.  Do not publish a successful Mothership
+    // operation until a subsequent read observes that exact record qualified by
+    // the durable generation. A withdrawal also waits for the exact gateway's
+    // terminal kill acknowledgement or authenticated absence before its slot is
+    // reusable. This makes a resumed configure or withdrawal idempotent.
+    ProdigyCrossClusterMasqueGatewayAuthorityQuery query = {};
+    query.pairUUID = authority.pairUUID;
+    query.localMachineUUID = authority.localMachineUUID;
+    const unsigned attempts = authority.state ==
+        CrossClusterMasqueGatewayState::withdrawn ? 300 : 30;
+    for (unsigned attempt = 0; attempt < attempts; ++attempt)
+    {
+      if (response.qualified)
+      {
+        failure.clear();
+        return true;
+      }
+      ::usleep(100'000);
+      if (!requestTopicRoundTrip(
+              MothershipTopic::pullCrossClusterMasqueGatewayAuthority,
+              query, response, failure))
+      {
+        return false;
+      }
+      if (!responseMatches(response))
+      {
+        failure.assign("cross-cluster MASQUE gateway authority changed before durable qualification"_ctv);
+        return false;
+      }
+      if (response.qualified)
+      {
+        failure.clear();
+        return true;
+      }
+    }
+    if (authority.state == CrossClusterMasqueGatewayState::withdrawn)
+      failure.assign(
+          "timed out waiting for terminal cross-cluster MASQUE gateway retirement"_ctv);
+    else
+      failure.assign(
+          "timed out waiting for durable cross-cluster MASQUE gateway authority"_ctv);
+    return false;
+  }
+
+  bool installCrossClusterPrivateBGPSecret(const MothershipProdigyCluster& cluster,
+      const CrossClusterMasqueGatewayAuthority& authority, String& failure)
+  {
+    ProdigyPairPrivateBGPSecretDeliveryRequest delivery = {};
+    delivery.scope.pairUUID = authority.pairUUID; delivery.scope.operationUUID = authority.pairOperationUUID;
+    delivery.scope.keyEpoch = authority.keyGeneration; delivery.scope.tunnelSlot = authority.tunnelSlot;
+    delivery.scope.clusterUUID = authority.localClusterUUID; delivery.scope.machineUUID = authority.localMachineUUID;
+    delivery.scope.authorityGeneration = authority.pairAuthorityGeneration; delivery.scope.gatewayGeneration = authority.generation;
+    delivery.controlIdentitySHA256 = authority.localIdentitySHA256;
+    ProdigyPairPrivateBGPSecretDeliveryResponse delivered = {};
+    {
+      MothershipClusterRegistry registry = openClusterRegistry();
+      if (!registry.deliverCrossClusterPrivateBGPSecret(delivery, authority.localIdentitySHA256, delivered, &failure)) return false;
+    }
+    ProdigyPairPrivateBGPSecretInstallCommand command = {}; command.scope = delivered.scope;
+    command.credential = std::move(delivered.credential); command.gatewayRootCertPem = std::move(delivered.gatewayRootCertPem);
+    command.localLeafCertPem = std::move(delivered.localLeafCertPem); command.localLeafKeyPem = std::move(delivered.localLeafKeyPem);
+    command.peerLeafCertDERHex = std::move(delivered.peerLeafCertDERHex);
+    MothershipResponse response = {}; String clusterName = cluster.name;
+    const bool sent = configureControlTarget(clusterName.c_str(), &failure) && requestTopicRoundTrip(MothershipTopic::installCrossClusterPrivateBGPSecret, command, response, failure);
+    Vault::secureClearString(command.credential); Vault::secureClearString(command.gatewayRootCertPem);
+    Vault::secureClearString(command.localLeafCertPem); Vault::secureClearString(command.localLeafKeyPem);
+    Vault::secureClearString(command.peerLeafCertDERHex);
+    return sent && response.success;
+  }
+
+  static ProdigyPairPrivateBGPSecretScope crossClusterPrivateBGPScope(const CrossClusterMasqueGatewayAuthority& authority)
+  {
+    ProdigyPairPrivateBGPSecretScope scope = {};
+    scope.pairUUID = authority.pairUUID; scope.operationUUID = authority.pairOperationUUID;
+    scope.keyEpoch = authority.keyGeneration; scope.tunnelSlot = authority.tunnelSlot;
+    scope.clusterUUID = authority.localClusterUUID; scope.machineUUID = authority.localMachineUUID;
+    scope.authorityGeneration = authority.pairAuthorityGeneration; scope.gatewayGeneration = authority.generation;
+    return scope;
+  }
+
+  bool waitForCrossClusterMasqueGatewayReadiness(const MothershipProdigyCluster& cluster,
+                                                  const CrossClusterMasqueGatewayAuthority& authority, String& failure,
+                                                  ProdigyCrossClusterMasqueGatewayReadiness *observed = nullptr,
+                                                  ProdigyCrossClusterPrivateBGPReadiness *privateBGPObserved = nullptr,
+                                                  bool requirePrivateBGP = true)
+  {
+    const ProdigyPairPrivateBGPSecretScope scope = crossClusterPrivateBGPScope(authority);
+    if (!prodigyPairPrivateBGPSecretScopeValid(scope)) { failure.assign("cross-cluster MASQUE readiness scope is invalid"_ctv); return false; }
+    ProdigyCrossClusterMasqueGatewayReadinessQuery query = {}; query.scope = scope;
+    String latestDiagnostic;
+    bool lastFound = false, lastMasqueReady = false, lastPrivateBGPFound = false, lastPrivateBGPReady = false;
+    for (unsigned attempt = 0; attempt < 30; ++attempt) {
+      String clusterName = cluster.name;
+      ProdigyCrossClusterMasqueGatewayReadinessResponse response = {};
+      if (!configureControlTarget(clusterName.c_str(), &failure) || !requestTopicRoundTrip(MothershipTopic::pullCrossClusterMasqueGatewayReadiness, query, response, failure)) return false;
+      if (response.protocolVersion != ProdigyCrossClusterMasqueGatewayReadinessResponse::version || !response.success) {
+        if (failure.empty()) failure.assign("cross-cluster MASQUE readiness query was rejected"_ctv); return false;
+      }
+      latestDiagnostic.assign(response.failure);
+      const bool masqueReady = response.found && response.receipt.pairUUID == scope.pairUUID &&
+          response.receipt.localClusterUUID == scope.clusterUUID &&
+          response.receipt.localMachineUUID == scope.machineUUID && response.receipt.keyEpoch == scope.keyEpoch &&
+          response.receipt.authorityGeneration == scope.authorityGeneration && response.receipt.gatewayGeneration == scope.gatewayGeneration &&
+          response.receipt.authenticatedMasqueQUICReady;
+      const bool privateBGPReady = response.privateBGPFound &&
+          prodigyPairPrivateBGPSecretScopeEqual(response.privateBGPReceipt.scope, scope) &&
+          prodigyCrossClusterPrivateBGPReadinessMatchesAuthority(response.privateBGPReceipt, authority) &&
+          prodigyCrossClusterPrivateBGPReady(response.privateBGPReceipt);
+      lastFound = response.found; lastMasqueReady = masqueReady;
+      lastPrivateBGPFound = response.privateBGPFound; lastPrivateBGPReady = privateBGPReady;
+      if (masqueReady && (!requirePrivateBGP || privateBGPReady)) {
+        if (observed != nullptr) *observed = response.receipt;
+        if (requirePrivateBGP && privateBGPObserved != nullptr) *privateBGPObserved = response.privateBGPReceipt;
+        failure.clear(); return true;
+      }
+      ::usleep(100'000);
+    }
+    if (requirePrivateBGP)
+      failure.assign("timed out waiting for exact MASQUE, private-BGP /96 import, and Switchboard route readiness"_ctv);
+    else
+      failure.assign("timed out waiting for exact authenticated MASQUE process readiness"_ctv);
+    if (!latestDiagnostic.empty()) {
+      failure.append("; "_ctv);
+      failure.append(latestDiagnostic);
+    }
+    failure.append("; last readiness found="_ctv);
+    if (lastFound) failure.append("true"_ctv); else failure.append("false"_ctv);
+    failure.append(", masqueReady="_ctv);
+    if (lastMasqueReady) failure.append("true"_ctv); else failure.append("false"_ctv);
+    if (requirePrivateBGP) {
+      failure.append(", privateBGPFound="_ctv);
+      if (lastPrivateBGPFound) failure.append("true"_ctv); else failure.append("false"_ctv);
+      failure.append(", privateBGPReady="_ctv);
+      if (lastPrivateBGPReady) failure.append("true"_ctv); else failure.append("false"_ctv);
+    }
+    return false;
+  }
+
+  bool withdrawCrossClusterPrivateBGPSecret(const MothershipProdigyCluster& cluster,
+                                             const CrossClusterMasqueGatewayAuthority& authority,
+                                             String& failure)
+  {
+    const ProdigyPairPrivateBGPSecretScope scope = crossClusterPrivateBGPScope(authority);
+    if (!prodigyPairPrivateBGPSecretScopeValid(scope)) { failure.assign("cross-cluster private BGP withdrawal scope is invalid"_ctv); return false; }
+    bool acknowledged = false;
+    {
+      MothershipClusterRegistry registry = openClusterRegistry();
+      acknowledged = registry.crossClusterPrivateBGPSecretRevocationAcknowledged(scope);
+    }
+    if (!acknowledged) {
+      ProdigyPairPrivateBGPSecretWithdrawalResponse command = {}; command.scope = scope;
+      ProdigyPairPrivateBGPSecretWithdrawalResponse queued = {}; String clusterName = cluster.name;
+      if (!configureControlTarget(clusterName.c_str(), &failure) || !requestTopicRoundTrip(MothershipTopic::withdrawCrossClusterPrivateBGPSecret, command, queued, failure) ||
+          queued.protocolVersion != ProdigyPairPrivateBGPSecretWithdrawalResponse::version || !queued.success || !queued.acknowledged) {
+        if (failure.empty()) failure.assign("cross-cluster private BGP withdrawal command was rejected"_ctv); return false;
+      }
+      ProdigyCrossClusterPrivateBGPWithdrawalReceiptQuery query = {}; query.scope = scope;
+      bool received = false;
+      for (unsigned attempt = 0; attempt < 30; ++attempt) {
+        ProdigyCrossClusterPrivateBGPWithdrawalReceiptResponse receipt = {}; clusterName = cluster.name;
+        if (!configureControlTarget(clusterName.c_str(), &failure) || !requestTopicRoundTrip(MothershipTopic::pullCrossClusterPrivateBGPWithdrawalReceipt, query, receipt, failure)) return false;
+        if (receipt.protocolVersion != ProdigyCrossClusterPrivateBGPWithdrawalReceiptResponse::version || !receipt.success) {
+          if (failure.empty()) failure.assign("cross-cluster private BGP withdrawal receipt query was rejected"_ctv); return false;
+        }
+        if (receipt.found && prodigyPairPrivateBGPSecretScopeEqual(receipt.receipt, scope)) { received = true; break; }
+        ::usleep(100'000);
+      }
+      if (!received) { failure.assign("timed out waiting for exact cross-cluster private BGP withdrawal receipt"_ctv); return false; }
+      bool deleted = false;
+      MothershipClusterRegistry registry = openClusterRegistry();
+      if (!registry.acknowledgeCrossClusterPrivateBGPSecretRevocation(scope, deleted)) { failure.assign("cross-cluster private BGP withdrawal acknowledgement was not persisted"_ctv); return false; }
+    }
+    failure.clear(); return true;
   }
 
   static bool fillClusterPairEnrollmentRequest(const MothershipClusterPairEnrollmentIntent& intent,
@@ -9635,6 +10091,7 @@ private:
   private:
 
     Mothership *owner = nullptr;
+    String recoveryExpectedSeedID;
     MothershipTunnelGatewayAuth tunnelProviderGatewayAuth;
     // This is command-scoped test input, deliberately not cluster state.  A
     // persisted cluster always resolves its normal release sibling on later
@@ -9877,6 +10334,8 @@ private:
           testInitialBundlePath(std::move(initialTestBundlePath)),
           testInitialBundleSHA256(std::move(initialTestBundleSHA256))
     {}
+
+    void requireRecoverySeedID(const String& id) { recoveryExpectedSeedID = id; }
 
     bool prepareProviderBootstrapArtifacts(const MothershipProdigyCluster& cluster, ProdigyTimingAttribution *timingAttribution = nullptr, String *failure = nullptr) override
     {
@@ -10234,6 +10693,12 @@ private:
             "seed provisioning",
             localFailure,
             [&](CoroutineStack *coro, BrainIaaS& provider, bool& completed, String& jobFailure) -> void {
+              if (!recoveryExpectedSeedID.empty())
+              {
+                auto *vultr = dynamic_cast<VultrBrainIaaS *>(&provider);
+                if (!vultr) { jobFailure.assign("recovery requires Vultr seed provider"_ctv); co_return; }
+                vultr->configureRecoveryExpectedSeedID(recoveryExpectedSeedID);
+              }
               if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
                     mothershipProvisionCreatedSeedMachine(coro,
                                                           cluster,
@@ -10243,7 +10708,8 @@ private:
                                                           completed,
                                                           &progressPrinter,
                                                           timingAttribution,
-                                                          &jobFailure);
+                                                          &jobFailure,
+                                                          !recoveryExpectedSeedID.empty());
                   }))
               {
                 co_await coro->suspendAtIndex(suspendIndex);
@@ -10677,6 +11143,7 @@ private:
         return false;
       }
 
+      if (!recoveryExpectedSeedID.empty()) prodigyRequireFreshRemoteBootstrapGuest(plan);
       bool ok = prodigyExecuteRemoteBootstrapPlan(plan, failure);
       finalizeTiming();
       return ok;
@@ -11188,7 +11655,8 @@ private:
                                        const String& observedTargetArchitecture,
                                        const MothershipProdigyCluster *registeredCluster,
                                        MothershipUpgradePlannerInput& input,
-                                       String& failure)
+                                       String& failure,
+                                       bool operatorAcceptedActiveWorkloadInterruption = false)
   {
     input = {};
     failure.clear();
@@ -11208,7 +11676,7 @@ private:
       input.freeBytes = std::min(input.freeBytes, peer.stagingAvailableBytes);
     if (report.peers.empty()) input.freeBytes = 0;
     // A workload-bearing fleet still needs its own overlap and endpoint proof.
-    // Empty isolated test clusters and exact registered remote clusters with no
+    // Empty isolated test clusters and exact registered local or remote clusters with no
     // Mothership-managed deployments have no public app to probe.  The latter
     // is a distinct planner receipt, not a synthetic healthy-public-baseline.
     input.emptyIsolatedTestCluster = registeredCluster != nullptr &&
@@ -11218,9 +11686,19 @@ private:
         report.activeDeploymentCount == 0;
     input.noManagedPublicWorkloads = registeredCluster != nullptr &&
         registeredCluster->clusterUUID == report.clusterUUID &&
-        registeredCluster->deploymentMode == MothershipClusterDeploymentMode::remote &&
+        (registeredCluster->deploymentMode == MothershipClusterDeploymentMode::remote ||
+         registeredCluster->deploymentMode == MothershipClusterDeploymentMode::local) &&
         report.activeDeploymentCount == 0;
-    input.overlapCapacityAvailable = report.activeDeploymentCount == 0 &&
+    input.operatorAcceptedActiveWorkloadInterruption =
+        operatorAcceptedActiveWorkloadInterruption && registeredCluster != nullptr &&
+        registeredCluster->clusterUUID == report.clusterUUID &&
+        (registeredCluster->deploymentMode == MothershipClusterDeploymentMode::remote ||
+         registeredCluster->deploymentMode == MothershipClusterDeploymentMode::local) &&
+        report.activeDeploymentCount != 0;
+    if (operatorAcceptedActiveWorkloadInterruption && !input.operatorAcceptedActiveWorkloadInterruption)
+      failure.assign("active-workload interruption acceptance requires an exact registered local or remote cluster with active deployments"_ctv);
+    input.overlapCapacityAvailable =
+        (report.activeDeploymentCount == 0 || input.operatorAcceptedActiveWorkloadInterruption) &&
         report.stagingCapacityComplete && report.requiredStagingBytes == targetBundle.contract.requiredFreeBytes &&
         report.targetBundleSHA256 == targetBundle.bundleSHA256 &&
         report.targetContractSHA256 == targetBundle.contract.contractSHA256;
@@ -11279,8 +11757,8 @@ private:
     }
   }
 
-  bool requestUpgradeAdmissionReport(const ProdigyUpgradeAdmissionReportRequest& request,
-                                     MothershipUpgradeAdmissionReport& report, String& failure)
+  bool readValidatedUpgradeAdmissionReport(const ProdigyUpgradeAdmissionReportRequest& request,
+                                           MothershipUpgradeAdmissionReport& report, String& failure)
   {
     report = {};
     failure.clear();
@@ -11312,7 +11790,8 @@ private:
     uint8_t *args = response->args;
     Message::extractToStringView(args, serialized);
     const bool valid = args == response->terminal() && BitseryEngine::deserializeSafe(serialized, report) &&
-        report.version == 4 && report.clusterUUID != 0 && report.observationReceiptVersion != 0;
+        report.version == 4 && report.clusterUUID != 0 &&
+        (!report.master || report.observationReceiptVersion != 0);
     socket.close();
     if (!valid)
     {
@@ -11325,10 +11804,33 @@ private:
       failure.assign("upgrade admission capacity report is bound to a different target or operation"_ctv);
       return false;
     }
-    if (!report.stagingCapacityResponsesComplete)
+    return true;
+  }
+
+  bool requestUpgradeAdmissionReport(const ProdigyUpgradeAdmissionReportRequest& request,
+                                     MothershipUpgradeAdmissionReport& report, String& failure)
+  {
+    // Snapshots may be incomplete while the existing peer and capacity probes
+    // finish. Keep the admission gate closed and wait within the observation's
+    // 30-second freshness window; the query-only command reads once instead.
+    const uint64_t started = Time::msSinceBoot();
+    constexpr uint64_t deadlineMs = 30'000;
+    for (;;)
     {
-      failure.assign("upgrade admission capacity report is missing commissioned-peer measurements"_ctv);
-      return false;
+      if (!readValidatedUpgradeAdmissionReport(request, report, failure)) return false;
+      if (report.observationReceiptVersion == 0)
+      {
+        failure.assign("upgrade admission report is invalid or unsupported"_ctv);
+        return false;
+      }
+      if (report.stagingCapacityResponsesComplete) break;
+      const uint64_t now = Time::msSinceBoot();
+      if (now < started || now - started >= deadlineMs)
+      {
+        failure.assign("upgrade admission capacity report is missing commissioned-peer measurements"_ctv);
+        return false;
+      }
+      ::usleep(250'000);
     }
     if (!report.stagingCapacityComplete)
     {
@@ -11338,11 +11840,24 @@ private:
     return true;
   }
 
+  bool localVMUnreadyUpgradeReportValid(
+      const MothershipUpgradeAdmissionReport& report,
+      const MothershipUpgradeAdmissionRecord& admission,
+      const MothershipProdigyCluster& cluster, uint128_t machineUUID,
+      bool completed, uint64_t minimumReceiptVersion, String& failure)
+  {
+    return mothershipLocalVMUnreadyUpgradeReportValid(
+        report, admission, cluster, machineUUID, completed, minimumReceiptVersion, &failure);
+  }
+
   void runPlanUpgrade(int argc, char *argv[])
   {
-    if (argc != 4)
+    const bool queryOnly = argc == 5 && String(argv[4]) == "--query"_ctv;
+    const bool acceptActiveWorkloadInterruption =
+        argc == 5 && String(argv[4]) == "--accept-active-workload-interruption"_ctv;
+    if (argc != 4 && !queryOnly && !acceptActiveWorkloadInterruption)
     {
-      basics_log("usage: planUpgrade [target] [approved target bundle] [approved source bundle] [operationID canonical hex]\n");
+      basics_log("usage: planUpgrade [target] [approved target bundle] [approved source bundle] [operationID canonical hex] [--query|--accept-active-workload-interruption]\n");
       exit(EXIT_FAILURE);
     }
     String failure = {}, targetInput = {}, sourceInput = {}, operationText = {};
@@ -11381,6 +11896,21 @@ private:
       exit(EXIT_FAILURE);
     }
     MothershipUpgradeAdmissionReport report = {};
+    if (queryOnly)
+    {
+      MothershipProdigyCluster targetCluster = {};
+      if (!tryLoadStoredClusterTarget(argv[0], targetCluster, &failure) ||
+          targetCluster.clusterUUID == 0 ||
+          !readValidatedUpgradeAdmissionReport(observationRequest, report, failure) ||
+          report.clusterUUID != targetCluster.clusterUUID)
+      {
+        basics_log("planUpgradeQuery success=0 complete=0 failure=report unavailable or target identity mismatch\n");
+        exit(EXIT_FAILURE);
+      }
+      logUpgradeAdmissionReportFacts(report);
+      basics_log("planUpgradeQuery success=1 complete=%u\n", unsigned(report.observationComplete));
+      return;
+    }
     constexpr uint32_t maximumObservationAttempts = 3;
     bool reportReceived = false;
     for (uint32_t attempt = 0; attempt < maximumObservationAttempts; ++attempt)
@@ -11409,7 +11939,8 @@ private:
     MothershipProdigyCluster upgradeCluster = {};
     const bool hasUpgradeCluster = tryLoadStoredClusterTarget(argv[0], upgradeCluster);
     buildUpgradePlannerInput(targetBundle, sourceIdentity, report, observedTargetArchitecture,
-                             hasUpgradeCluster ? &upgradeCluster : nullptr, input, failure);
+                             hasUpgradeCluster ? &upgradeCluster : nullptr, input, failure,
+                             acceptActiveWorkloadInterruption);
     if (failure.empty() && report.masterApprovedBundleSHA256 != sourceBundle.bundleSHA256)
       failure.assign("approved source bundle does not match master observed bundle digest"_ctv);
     if (failure.empty())
@@ -11456,17 +11987,43 @@ private:
     requested.firstStopGate = plan.firstStopGate;
     MothershipUpgradeAdmissionRecord recorded = {};
     bool resumed = false;
-    MothershipClusterRegistry registry = openClusterRegistry();
-    if (!registry.recordUpgradeAdmission(requested, recorded, resumed, &failure))
     {
+      MothershipClusterRegistry registry = openClusterRegistry();
+      if (!registry.recordUpgradeAdmission(requested, recorded, resumed, &failure))
+      {
+        basics_log("planUpgrade success=0 failure=%s\n", failure.c_str());
+        exit(EXIT_FAILURE);
+      }
+    }
+    MothershipUpgradeAdmissionRecord persisted = {};
+    {
+      MothershipClusterRegistry registry = openClusterRegistry();
+      if (!registry.loadUpgradeAdmission(report.clusterUUID, operationID, persisted, &failure))
+      {
+        basics_log("planUpgrade success=0 failure=persisted admission readback failed: %s\n", failure.c_str());
+        exit(EXIT_FAILURE);
+      }
+    }
+    String recordedBytes = {}, persistedBytes = {}, persistedSHA256 = {};
+    if (!BitseryEngine::serialize(recordedBytes, recorded) ||
+        !BitseryEngine::serialize(persistedBytes, persisted) ||
+        recordedBytes != persistedBytes ||
+        !prodigyComputeSHA256Hex(persistedBytes, persistedSHA256, &failure))
+    {
+      if (failure.empty()) failure.assign("persisted admission readback differs from recorded state"_ctv);
       basics_log("planUpgrade success=0 failure=%s\n", failure.c_str());
       exit(EXIT_FAILURE);
     }
+    recorded = std::move(persisted);
     String clusterUUIDText = {};
     clusterUUIDText.assignItoh(recorded.clusterUUID);
-    basics_log("planUpgrade success=1 eligible=%u resumed=%u clusterUUID=%s operationID=%s inputSHA256=%s firstStopGate=%s\n",
+    basics_log("planUpgrade success=1 eligible=%u resumed=%u clusterUUID=%s operationID=%s inputSHA256=%s activeWorkloadInterruptionAccepted=%u firstStopGate=%s\n",
                unsigned(recorded.eligible), unsigned(resumed), clusterUUIDText.c_str(),
-               operationText.c_str(), recorded.plannerInputSHA256.c_str(), recorded.firstStopGate.c_str());
+               operationText.c_str(), recorded.plannerInputSHA256.c_str(),
+               unsigned(input.operatorAcceptedActiveWorkloadInterruption), recorded.firstStopGate.c_str());
+    basics_log("planUpgradePersisted success=1 eligible=%u resumed=%u clusterUUID=%s operationID=%s recordSHA256=%s\n",
+               unsigned(recorded.eligible), unsigned(resumed), clusterUUIDText.c_str(),
+               operationText.c_str(), persistedSHA256.c_str());
   }
 
   void runClusterReport(int argc, char *argv[])
@@ -11948,28 +12505,14 @@ private:
     if (!sent) exit(EXIT_FAILURE);
   }
 
-  void runFaultRemoteCloudMachine(int argc, char *argv[])
+  // Submit exactly one registered cloud-machine reboot. Qualification owns
+  // durable dispatch and boot observation; submission alone is not a receipt.
+  bool submitRemoteCloudMachineReboot(MothershipProdigyCluster& cluster, uint128_t machineUUID,
+      uint64_t& topologyVersion, String& failure)
   {
-    String identity = argc > 0 ? String(argv[0]) : String();
-    String action = argc > 2 ? String(argv[2]) : String();
-    String failure = {};
-    uint128_t machineUUID = 0;
-    MothershipProdigyCluster cluster = {};
-    bool valid = argc == 3 && action == "hard-reboot"_ctv &&
-        prodigyParseCanonicalHex128(String(argv[1]), machineUUID) && machineUUID != 0 &&
-        loadClusterForScopedMutation("faultRemoteCloudMachine", identity, cluster, failure);
-    if (valid == false && failure.empty())
-    {
-      failure.assign("usage: faultRemoteCloudMachine CLUSTER MACHINE_UUID hard-reboot"_ctv);
-    }
-    if (valid && (cluster.deploymentMode != MothershipClusterDeploymentMode::remote ||
-                  cluster.provider != MothershipClusterProvider::vultr))
-    {
-      failure.assign("faultRemoteCloudMachine requires a remote Vultr cluster"_ctv);
-      valid = false;
-    }
-
-    ClusterTopology currentTopology = {};
+    ClusterTopology currentTopology = {}; bool valid = true;
+    if (!machineUUID || cluster.deploymentMode != MothershipClusterDeploymentMode::remote ||
+        cluster.provider != MothershipClusterProvider::vultr) return false;
     if (valid)
     {
       ClusterCreateHooks hooks(this);
@@ -12027,18 +12570,577 @@ private:
           });
     }
 
+    topologyVersion = currentTopology.version;
+    return submitted;
+  }
+
+  void runFaultRemoteCloudMachine(int argc, char *argv[])
+  {
+    String identity = argc > 0 ? String(argv[0]) : String();
+    String action = argc > 2 ? String(argv[2]) : String();
+    String failure = {}; uint128_t machineUUID = 0; uint64_t topologyVersion = 0;
+    MothershipProdigyCluster cluster = {};
+    bool valid = argc == 3 && action == "hard-reboot"_ctv &&
+        prodigyParseCanonicalHex128(String(argv[1]), machineUUID) && machineUUID != 0 &&
+        loadClusterForScopedMutation("faultRemoteCloudMachine", identity, cluster, failure);
+    if (!valid && failure.empty()) failure.assign("usage: faultRemoteCloudMachine CLUSTER MACHINE_UUID hard-reboot"_ctv);
+    bool submitted = valid && submitRemoteCloudMachineReboot(cluster, machineUUID, topologyVersion, failure);
     basics_log("faultRemoteCloudMachine submitted=%u action=hard-reboot clusterUUID=%016llx%016llx machineUUID=%016llx%016llx topologyVersion=%llu failure=%s\n",
-               unsigned(submitted),
-               (unsigned long long)(cluster.clusterUUID >> 64),
-               (unsigned long long)cluster.clusterUUID,
-               (unsigned long long)(machineUUID >> 64),
-               (unsigned long long)machineUUID,
-               (unsigned long long)currentTopology.version,
-               failure.c_str());
-    if (submitted == false)
+        unsigned(submitted), (unsigned long long)(cluster.clusterUUID >> 64), (unsigned long long)cluster.clusterUUID,
+        (unsigned long long)(machineUUID >> 64), (unsigned long long)machineUUID,
+        (unsigned long long)topologyVersion, failure.c_str());
+    if (!submitted) exit(EXIT_FAILURE);
+  }
+
+  // Repairs one exact cloud member only when a previously admitted rollout
+  // left its service failed with an empty runtime root.  The immutable upgrade
+  // admission remains the sole authorization record; this command deliberately
+  // has no retry journal because a post-install transport failure is uncertain
+  // and must be reconciled through the ordinary authenticated cluster report.
+  void runRepairRemoteCloudMachineRuntime(int argc, char *argv[])
+  {
+    const bool checkOnly = argc == 6 && std::strcmp(argv[5], "--check") == 0;
+    if (argc != 5 && !checkOnly)
     {
+      basics_log("usage: repairRemoteCloudMachineRuntime CLUSTER MACHINE_UUID OPERATION_ID APPROVED_BUNDLE EXPECTED_LINUX_MACHINE_ID [--check]\n");
       exit(EXIT_FAILURE);
     }
+
+    String clusterIdentity = {}, memberText = {}, operationText = {}, bundleInput = {}, expectedLinuxID = {};
+    clusterIdentity.assign(argv[0]); memberText.assign(argv[1]); operationText.assign(argv[2]);
+    bundleInput.assign(argv[3]); expectedLinuxID.assign(argv[4]);
+    uint128_t memberUUID = 0, operationID = 0;
+    const auto canonicalMachineID = [](const String& value) {
+      if (value.size() != 32) return false;
+      for (uint64_t index = 0; index < value.size(); ++index)
+        if (!((value[index] >= '0' && value[index] <= '9') || (value[index] >= 'a' && value[index] <= 'f')))
+          return false;
+      return true;
+    };
+    if (!prodigyParseCanonicalHex128(memberText, memberUUID) || memberUUID == 0 ||
+        !prodigyParseCanonicalHex128(operationText, operationID) || operationID == 0 ||
+        !canonicalMachineID(expectedLinuxID))
+    {
+      basics_log("repairRemoteCloudMachineRuntime success=0 dispatched=0 failure=machine UUID, operation ID, or expected Linux machine ID is invalid\n");
+      exit(EXIT_FAILURE);
+    }
+
+    String failure = {};
+    MothershipProdigyCluster cluster = {};
+    if (!loadClusterForScopedMutation("repairRemoteCloudMachineRuntime", clusterIdentity, cluster, failure) ||
+        cluster.deploymentMode != MothershipClusterDeploymentMode::remote ||
+        cluster.provider != MothershipClusterProvider::vultr || cluster.clusterUUID == 0 ||
+        cluster.remoteProdigyPath.empty() || cluster.remoteProdigyPath[0] != '/')
+    {
+      basics_log("repairRemoteCloudMachineRuntime success=0 dispatched=0 failure=%s\n",
+                 failure.empty() ? "repair requires one registered remote Vultr cluster with an absolute runtime root" : failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    MachineCpuArchitecture architecture = MachineCpuArchitecture::unknown;
+    String bundlePath = {};
+    ProdigyApprovedUpgradeBundle approved = {};
+    if (!resolveProdigyBundleTargetArchitecture(clusterIdentity.c_str(), architecture, &failure) ||
+        !prodigyResolveBundleArtifactInput(bundleInput, architecture, bundlePath, &failure) ||
+        !prodigyApproveBundleUpgradeContract(bundlePath, approved, &failure) ||
+        !approved.verifyRetainedSnapshot(&failure))
+    {
+      basics_log("repairRemoteCloudMachineRuntime success=0 dispatched=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    MothershipUpgradeAdmissionRecord admission = {};
+    {
+      MothershipClusterRegistry registry = openClusterRegistry();
+      if (!registry.loadUpgradeAdmission(cluster.clusterUUID, operationID, admission, &failure) ||
+          !admission.eligible || admission.approvedPath != uint8_t(MothershipUpgradePath::sameLogicalRollout) ||
+          admission.targetBundleSHA256 != approved.bundleSHA256 ||
+          admission.targetContractSHA256 != approved.contract.contractSHA256)
+      {
+        basics_log("repairRemoteCloudMachineRuntime success=0 dispatched=0 failure=%s\n",
+                   failure.empty() ? "immutable upgrade admission does not authorize this target bundle" : failure.c_str());
+        exit(EXIT_FAILURE);
+      }
+    }
+
+    MothershipProdigyClusterMachine target = {};
+    String cloudID = {};
+    uint64_t topologyVersion = 0;
+    const auto preflight = [&]() -> bool {
+      ClusterTopology providerTopology = {};
+      ClusterCreateHooks hooks(this);
+      if (!hooks.fetchSeedTopology(cluster, providerTopology, &failure) ||
+          !mothershipResolveVerifiedCreatedCloudMachineID(cluster.topology, providerTopology, memberUUID, cloudID, &failure))
+        return false;
+
+      ClusterStatusReport report = {};
+      if (!readManagedClusterStatus(cluster, report, failure) || !report.hasTopology ||
+          report.topology.version == 0 || report.topology != providerTopology)
+      {
+        if (failure.empty()) failure.assign("live source master topology differs from the provider-confirmed registered topology"_ctv);
+        return false;
+      }
+      uint32_t masters = 0, reachableBrains = 0, targetMatches = 0;
+      for (const ClusterMachine& machine : report.topology.machines)
+      {
+        if (machine.uuid == memberUUID)
+        {
+          ++targetMatches;
+          mothershipPopulateRemoveMachineFromTopology(machine, target);
+          mothershipHydrateTopologyRemoteCandidateSSH(cluster, target);
+        }
+      }
+      for (const MachineStatusReport& status : report.machineReports)
+      {
+        if (!status.isBrain || status.state != "healthy"_ctv || !status.controlPlaneReachable || !status.runtimeReady) continue;
+        ++reachableBrains;
+        if (status.currentMaster) ++masters;
+      }
+      if (report.topology.machines.size() != 3 || targetMatches != 1 || !target.isBrain ||
+          target.ssh.address.empty() || target.ssh.hostPublicKeyOpenSSH.empty() ||
+          reachableBrains < 2 || masters != 1)
+      {
+        failure.assign("repair requires one live source master, a reachable two-Brain quorum, and one exact registered target"_ctv);
+        return false;
+      }
+      topologyVersion = report.topology.version;
+      return true;
+    };
+
+    if (!preflight())
+    {
+      basics_log("repairRemoteCloudMachineRuntime success=0 dispatched=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    LIBSSH2_SESSION *session = nullptr;
+    int fd = -1;
+    if (!mothershipConnectSSHSession(target, session, fd, &failure,
+                                     &cluster.bootstrapSshKeyPackage, &cluster.bootstrapSshPrivateKeyPath))
+    {
+      basics_log("repairRemoteCloudMachineRuntime success=0 dispatched=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    const auto close = [&]() { mothershipCloseSSHSession(session, fd); session = nullptr; fd = -1; };
+    const auto emptyRuntimePredicate = [&]() {
+      String command = {};
+      command.append("set -eu; test \"$(cat /etc/machine-id)\" = "_ctv);
+      prodigyAppendShellSingleQuoted(command, expectedLinuxID);
+      command.append("; test \"$(systemctl show -p MainPID --value prodigy)\" = 0; systemctl is-failed --quiet prodigy; if pgrep -x prodigy > /dev/null; then exit 1; fi; test \"$(realpath -m "_ctv);
+      prodigyAppendShellSingleQuoted(command, cluster.remoteProdigyPath);
+      command.append(")\" = "_ctv);
+      prodigyAppendShellSingleQuoted(command, cluster.remoteProdigyPath);
+      command.append("; if test -e "_ctv);
+      prodigyAppendShellSingleQuoted(command, cluster.remoteProdigyPath);
+      command.append("; then test -d "_ctv);
+      prodigyAppendShellSingleQuoted(command, cluster.remoteProdigyPath);
+      command.append("; test ! -L "_ctv);
+      prodigyAppendShellSingleQuoted(command, cluster.remoteProdigyPath);
+      command.append("; found=$(find "_ctv);
+      prodigyAppendShellSingleQuoted(command, cluster.remoteProdigyPath);
+      command.append(" -type f -size +0c -print -quit); test -z \"$found\"; found=$(find "_ctv);
+      prodigyAppendShellSingleQuoted(command, cluster.remoteProdigyPath);
+      command.append(" -type l -print -quit); test -z \"$found\"; fi"_ctv);
+      return command;
+    };
+    if (!prodigyRunBlockingSSHCommand(session, fd, emptyRuntimePredicate(), nullptr, &failure, 30'000))
+    {
+      close();
+      basics_log("repairRemoteCloudMachineRuntime success=0 dispatched=0 failure=target is not an exact failed empty runtime: %s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    if (checkOnly)
+    {
+      close();
+      basics_log("repairRemoteCloudMachineRuntime success=1 checked=1 dispatched=0 clusterUUID=%016llx%016llx machineUUID=%016llx%016llx topologyVersion=%llu bundleSHA256=%s\n",
+                 (unsigned long long)(cluster.clusterUUID >> 64), (unsigned long long)cluster.clusterUUID,
+                 (unsigned long long)(memberUUID >> 64), (unsigned long long)memberUUID,
+                 (unsigned long long)topologyVersion, approved.bundleSHA256.c_str());
+      return;
+    }
+
+    String stage = {};
+    if (!prodigyRunBlockingSSHCommand(session, fd,
+            "set -eu; d=$(mktemp -d /tmp/prodigy-runtime-repair.XXXXXX); chmod 700 \"$d\"; printf '%s' \"$d\""_ctv,
+            &stage, &failure, 30'000))
+    {
+      close();
+      basics_log("repairRemoteCloudMachineRuntime success=0 dispatched=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    constexpr const char *stagePrefix = "/tmp/prodigy-runtime-repair.";
+    const size_t prefixBytes = std::strlen(stagePrefix);
+    if (stage.size() <= prefixBytes || std::memcmp(stage.data(), stagePrefix, prefixBytes) != 0 ||
+        !std::all_of(stage.data() + prefixBytes, stage.data() + stage.size(), [](char c) { return std::isalnum(static_cast<unsigned char>(c)); }))
+    {
+      close();
+      basics_log("repairRemoteCloudMachineRuntime success=0 dispatched=0 failure=remote repair staging directory is invalid\n");
+      exit(EXIT_FAILURE);
+    }
+    String remoteBundle = stage; remoteBundle.append("/bundle.tar.zst"_ctv);
+    bool uploaded = prodigyUploadLocalFileToSSHSession(session, fd, approved.retainedSnapshotPath, remoteBundle, 0600, &failure, 120'000);
+    if (uploaded)
+    {
+      String shaCommand = {};
+      shaCommand.append("set -eu; test \"$(sha256sum "_ctv); prodigyAppendShellSingleQuoted(shaCommand, remoteBundle);
+      shaCommand.append(" | cut -d' ' -f1)\" = "_ctv); prodigyAppendShellSingleQuoted(shaCommand, approved.bundleSHA256);
+      shaCommand.append("; printf '%s\\n' "_ctv); prodigyAppendShellSingleQuoted(shaCommand, approved.bundleSHA256);
+      shaCommand.append(" > "_ctv); String remoteBundleSHA = {}; prodigyResolveBundleSHA256Path(remoteBundle, remoteBundleSHA);
+      prodigyAppendShellSingleQuoted(shaCommand, remoteBundleSHA);
+      uploaded = prodigyRunBlockingSSHCommand(session, fd, shaCommand, nullptr, &failure, 30'000);
+    }
+    const auto cleanupStage = [&]() {
+      String cleanup = {};
+      cleanup.append("rm -rf -- "_ctv);
+      prodigyAppendShellSingleQuoted(cleanup, stage);
+      String cleanupFailure = {};
+      return prodigyRunBlockingSSHCommand(session, fd, cleanup, nullptr, &cleanupFailure, 30'000);
+    };
+    if (!uploaded || !preflight())
+    {
+      (void)cleanupStage();
+      close();
+      basics_log("repairRemoteCloudMachineRuntime success=0 dispatched=0 failure=%s\n", failure.empty() ? "repair preflight changed before install" : failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    String install = {};
+    prodigyBuildBundleInstallCommand(remoteBundle, cluster.remoteProdigyPath, install);
+    String command = emptyRuntimePredicate();
+    command.append("; "_ctv); command.append(install);
+    command.append("; test \"$(sha256sum "_ctv); String executable = cluster.remoteProdigyPath; executable.append("/prodigy"_ctv);
+    prodigyAppendShellSingleQuoted(command, executable);
+    command.append(" | cut -d' ' -f1)\" = "_ctv); prodigyAppendShellSingleQuoted(command, approved.contract.prodigySHA256);
+    command.append("; test \"$(sha256sum "_ctv); String installedBundle = cluster.remoteProdigyPath; installedBundle.append("/prodigy.bundle.tar.zst"_ctv);
+    prodigyAppendShellSingleQuoted(command, installedBundle);
+    command.append(" | cut -d' ' -f1)\" = "_ctv); prodigyAppendShellSingleQuoted(command, approved.bundleSHA256);
+    command.append("; systemctl start prodigy; systemctl is-active --quiet prodigy; pid=$(systemctl show -p MainPID --value prodigy); test \"$pid\" -gt 1; test \"$(sha256sum /proc/$pid/exe | cut -d' ' -f1)\" = "_ctv);
+    prodigyAppendShellSingleQuoted(command, approved.contract.prodigySHA256);
+    const bool repaired = prodigyRunBlockingSSHCommand(session, fd, command, nullptr, &failure, 120'000);
+    if (!repaired)
+    {
+      close();
+      basics_log("repairRemoteCloudMachineRuntime success=0 dispatched=1 uncertain=1 retainedStage=%s failure=%s\n", stage.c_str(), failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    const bool stageCleaned = cleanupStage();
+    close();
+    basics_log("repairRemoteCloudMachineRuntime success=1 dispatched=1 stageCleaned=%d clusterUUID=%016llx%016llx machineUUID=%016llx%016llx topologyVersion=%llu bundleSHA256=%s runtimeSHA256=%s authenticatedRecoveryPending=1%s%s\n",
+               stageCleaned ? 1 : 0,
+               (unsigned long long)(cluster.clusterUUID >> 64), (unsigned long long)cluster.clusterUUID,
+               (unsigned long long)(memberUUID >> 64), (unsigned long long)memberUUID,
+               (unsigned long long)topologyVersion, approved.bundleSHA256.c_str(), approved.contract.prodigySHA256.c_str(),
+               stageCleaned ? "" : " retainedStage=", stageCleaned ? "" : stage.c_str());
+  }
+
+  void runCaptureBrainStateLocal(int argc, char *argv[])
+  {
+    String clusterText = argc > 0 ? String(argv[0]) : String();
+    String machineText = argc > 1 ? String(argv[1]) : String();
+    String pidText = argc > 2 ? String(argv[2]) : String();
+    String directory = argc > 3 ? String(argv[3]) : String();
+    uint128_t clusterUUID = 0, machineUUID = 0;
+    uint64_t pid = 0;
+    const char *pidBegin = reinterpret_cast<const char *>(pidText.data());
+    String failure = {};
+    const bool valid = argc == 4 &&
+        prodigyParseCanonicalHex128(clusterText, clusterUUID) &&
+        prodigyParseCanonicalHex128(machineText, machineUUID) &&
+        mothershipVDCParseUnsigned(pidBegin, pidBegin + pidText.size(), pid) && pid > 1 &&
+        mothershipVDCCaptureBrainStateLocal(clusterUUID, machineUUID, pid, directory, &failure);
+    basics_log("captureBrainStateLocal success=%u clusterUUID=%s machineUUID=%s pid=%llu failure=%s\n",
+               unsigned(valid), clusterText.c_str(), machineText.c_str(),
+               (unsigned long long)pid, failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
+  void runResumeBrainStateCaptureLocal(int argc, char *argv[])
+  {
+    String pidText = argc > 0 ? String(argv[0]) : String();
+    String directory = argc > 1 ? String(argv[1]) : String();
+    uint64_t pid = 0;
+    const char *pidBegin = reinterpret_cast<const char *>(pidText.data());
+    String failure = {};
+    bool valid = argc == 2 && mothershipVDCParseUnsigned(pidBegin, pidBegin + pidText.size(), pid) &&
+        pid > 1 && mothershipVDCResumeBrainStateCaptureLocal(pid, directory, &failure);
+    MothershipVDCBrainStateCaptureReceipt receipt = {};
+    if (valid) valid = mothershipVDCReadBrainStateCaptureReceipt(directory, receipt) &&
+                       receipt.process.pid == pid && receipt.resumed;
+    basics_log("resumeBrainStateCaptureLocal success=%u pid=%llu captureComplete=%u failure=%s\n",
+               unsigned(valid), (unsigned long long)pid,
+               unsigned(valid && receipt.captureComplete), failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
+  // Captures one fresh, exact current remote master through the local owner
+  // above.  The output is one private tar archive on the controller; it is not
+  // a deployment, bundle replacement, or materialized-recovery request.
+  void runCaptureBrainState(int argc, char *argv[])
+  {
+    if (argc != 2)
+    {
+      basics_log("usage: captureBrainState CLUSTER EXISTING_PRIVATE_OUTPUT_DIRECTORY\n");
+      exit(EXIT_FAILURE);
+    }
+    String clusterIdentity = {}, outputDirectory = {}, failure = {};
+    clusterIdentity.assign(argv[0]); outputDirectory.assign(argv[1]);
+    String archivePath = {}, partialArchivePath = {};
+    mothershipVirtualDatacenterPath(outputDirectory, "brain-state.tar", archivePath);
+    partialArchivePath = archivePath; partialArchivePath.append(".partial"_ctv);
+    if (!mothershipVDCPrivateDirectory(outputDirectory) ||
+        ::access(archivePath.c_str(), F_OK) == 0 || ::access(partialArchivePath.c_str(), F_OK) == 0)
+    {
+      basics_log("captureBrainState success=0 failure=output must be an existing private empty capture directory\n");
+      exit(EXIT_FAILURE);
+    }
+
+    MothershipProdigyCluster cluster = {};
+    ClusterStatusReport before = {};
+    if (!loadClusterForScopedMutation("captureBrainState", clusterIdentity, cluster, failure) ||
+        cluster.deploymentMode != MothershipClusterDeploymentMode::remote ||
+        cluster.nBrains != 3 || cluster.topology.machines.size() != 3 ||
+        cluster.remoteProdigyPath.empty() || cluster.remoteProdigyPath[0] != '/' ||
+        !productionClusterHealthy(cluster, before, failure))
+    {
+      basics_log("captureBrainState success=0 failure=%s\n",
+                 failure.empty() ? "capture requires one healthy registered remote three-Brain cluster" : failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    uint128_t masterUUID = 0;
+    const ClusterMachine *liveMaster = nullptr;
+    const ClusterMachine *registeredMaster = nullptr;
+    uint32_t liveMatches = 0, registeredMatches = 0, masterStatuses = 0;
+    for (const MachineStatusReport& status : before.machineReports)
+    {
+      if (!status.currentMaster) continue;
+      ++masterStatuses;
+      for (const ClusterMachine& machine : before.topology.machines)
+      {
+        String identity = {}; identity.assignItoh(machine.uuid);
+        if (status.machineUUID == identity) { masterUUID = machine.uuid; liveMaster = &machine; ++liveMatches; }
+      }
+    }
+    for (const ClusterMachine& machine : cluster.topology.machines)
+      if (machine.uuid == masterUUID) { registeredMaster = &machine; ++registeredMatches; }
+    if (masterStatuses != 1 || liveMatches != 1 || registeredMatches != 1 ||
+        liveMaster == nullptr || registeredMaster == nullptr || !liveMaster->isBrain ||
+        !registeredMaster->isBrain || !liveMaster->sameIdentityAs(*registeredMaster))
+    {
+      basics_log("captureBrainState success=0 failure=current master is not one exact registered Brain\n");
+      exit(EXIT_FAILURE);
+    }
+    MothershipProdigyClusterMachine target = {};
+    mothershipPopulateRemoveMachineFromTopology(*liveMaster, target);
+    mothershipHydrateTopologyRemoteCandidateSSH(cluster, target);
+    if (target.uuid != masterUUID || target.ssh.address.empty() ||
+        target.ssh.user.empty() || target.ssh.hostPublicKeyOpenSSH.empty())
+    {
+      basics_log("captureBrainState success=0 failure=registered master SSH authority is incomplete\n");
+      exit(EXIT_FAILURE);
+    }
+
+    String executable = {}, executableSHA = {};
+    if (!prodigyResolveCurrentExecutablePath(executable) ||
+        !prodigyComputeFileSHA256Hex(executable, executableSHA, &failure))
+    {
+      basics_log("captureBrainState success=0 failure=%s\n",
+                 failure.empty() ? "cannot resolve capture owner executable" : failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    LIBSSH2_SESSION *session = nullptr;
+    int fd = -1;
+    auto connect = [&]() {
+      if (session != nullptr || fd >= 0) mothershipCloseSSHSession(session, fd);
+      return mothershipConnectSSHSession(target, session, fd, &failure,
+          &cluster.bootstrapSshKeyPackage, &cluster.bootstrapSshPrivateKeyPath);
+    };
+    if (!connect())
+    {
+      basics_log("captureBrainState success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    String stage = {};
+    if (!prodigyRunBlockingSSHCommand(session, fd,
+            "set -eu; d=$(mktemp -d /var/lib/prodigy/mothership-brain-capture.XXXXXX); chmod 700 \"$d\"; printf '%s' \"$d\""_ctv,
+            &stage, &failure, 30'000))
+    {
+      mothershipCloseSSHSession(session, fd);
+      basics_log("captureBrainState success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    constexpr const char *stagePrefix = "/var/lib/prodigy/mothership-brain-capture.";
+    const size_t stagePrefixBytes = std::strlen(stagePrefix);
+    bool safeStage = stage.size() > stagePrefixBytes &&
+        std::memcmp(stage.data(), stagePrefix, stagePrefixBytes) == 0;
+    for (size_t index = stagePrefixBytes; safeStage && index < stage.size(); ++index)
+      safeStage = std::isalnum(static_cast<unsigned char>(stage[index]));
+    if (!safeStage)
+    {
+      mothershipCloseSSHSession(session, fd);
+      basics_log("captureBrainState success=0 failure=remote capture staging directory is invalid\n");
+      exit(EXIT_FAILURE);
+    }
+    String remoteOwner = stage; remoteOwner.append("/mothership"_ctv);
+    bool uploaded = prodigyUploadLocalFileToSSHSession(
+        session, fd, executable, remoteOwner, 0700, &failure, 120'000);
+    String remoteLibrary = cluster.remoteProdigyPath; remoteLibrary.append("/lib"_ctv);
+    String clusterText = {}, masterText = {};
+    clusterText.assignItoh(cluster.clusterUUID); masterText.assignItoh(masterUUID);
+    auto quoteInto = [](String& command, const String& value) {
+      prodigyAppendShellSingleQuoted(command, value);
+    };
+    if (uploaded)
+    {
+      String verify = {};
+      verify.assign("set -eu; test \"$(sha256sum "_ctv); quoteInto(verify, remoteOwner);
+      verify.append(" | cut -d' ' -f1)\" = "_ctv); quoteInto(verify, executableSHA);
+      uploaded = prodigyRunBlockingSSHCommand(session, fd, verify, nullptr, &failure, 30'000);
+    }
+    if (!uploaded)
+    {
+      String cleanup = {}; cleanup.assign("rm -rf -- "_ctv); quoteInto(cleanup, stage);
+      String ignored = {}; (void)prodigyRunBlockingSSHCommand(session, fd, cleanup, nullptr, &ignored, 30'000);
+      mothershipCloseSSHSession(session, fd);
+      basics_log("captureBrainState success=0 captureStarted=0 brainResumed=1 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    bool initialCaptureResult = false;
+    {
+      String command = {};
+      command.assign("set -eu; pid=$(systemctl show -p MainPID --value prodigy); test \"$pid\" -gt 1; "_ctv);
+      command.append("timeout --signal=TERM --kill-after=10s 90s env -u PRODIGY_STATE_DB -u PRODIGY_STATE_SECRETS_DB LD_LIBRARY_PATH="_ctv);
+      quoteInto(command, remoteLibrary); command.append(" "_ctv); quoteInto(command, remoteOwner);
+      command.append(" captureBrainStateLocal "_ctv); quoteInto(command, clusterText);
+      command.append(" "_ctv); quoteInto(command, masterText);
+      command.append(" \"$pid\" "_ctv); quoteInto(command, stage);
+      initialCaptureResult = prodigyRunBlockingSSHCommand(session, fd, command, nullptr, &failure, 120'000);
+    }
+    String initialFailure = failure;
+
+    // Always reconcile through a fresh authenticated session.  A failed or
+    // timed-out first SSH result is not treated as proof that capture did not run.
+    mothershipCloseSSHSession(session, fd);
+    String resumeOutput = {};
+    bool resumed = connect();
+    if (resumed)
+    {
+      String command = {};
+      command.assign("set -eu; pid=$(systemctl show -p MainPID --value prodigy); test \"$pid\" -gt 1; if test -f "_ctv);
+      String receiptPath = stage; receiptPath.append("/brain-capture.receipt"_ctv); quoteInto(command, receiptPath);
+      command.append("; then env -u PRODIGY_STATE_DB -u PRODIGY_STATE_SECRETS_DB LD_LIBRARY_PATH="_ctv);
+      quoteInto(command, remoteLibrary); command.append(" "_ctv); quoteInto(command, remoteOwner);
+      command.append(" resumeBrainStateCaptureLocal \"$pid\" "_ctv); quoteInto(command, stage);
+      command.append("; else printf 'resumeBrainStateCaptureLocal success=1 pid=%s captureComplete=0 noReceipt=1\\n' \"$pid\"; fi; systemctl is-active --quiet prodigy; test \"$(systemctl show -p MainPID --value prodigy)\" = \"$pid\""_ctv);
+      resumed = prodigyRunBlockingSSHCommand(session, fd, command, &resumeOutput, &failure, 30'000);
+    }
+    const bool captureComplete = resumed &&
+        std::strstr(resumeOutput.c_str(), "captureComplete=1") != nullptr;
+    if (!resumed)
+    {
+      mothershipCloseSSHSession(session, fd);
+      basics_log("captureBrainState success=0 brainResumed=0 remoteStage=%s failure=%s\n",
+                 stage.c_str(), failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    if (!captureComplete)
+    {
+      String cleanup = {}; cleanup.assign("rm -rf -- "_ctv); quoteInto(cleanup, stage);
+      String ignored = {}; (void)prodigyRunBlockingSSHCommand(session, fd, cleanup, nullptr, &ignored, 30'000);
+      mothershipCloseSSHSession(session, fd);
+      basics_log("captureBrainState success=0 brainResumed=1 captureComplete=0 initialResult=%u failure=%s\n",
+                 unsigned(initialCaptureResult), initialFailure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    ClusterStatusReport after = {};
+    mothershipCloseSSHSession(session, fd);
+    bool sameMaster = productionClusterHealthy(cluster, after, failure);
+    uint32_t afterMasters = 0;
+    for (const MachineStatusReport& status : after.machineReports)
+    {
+      if (!status.currentMaster) continue;
+      ++afterMasters;
+      String expected = {}; expected.assignItoh(masterUUID);
+      sameMaster = sameMaster && status.machineUUID == expected;
+    }
+    if (!sameMaster || afterMasters != 1 || !connect())
+    {
+      mothershipCloseSSHSession(session, fd);
+      basics_log("captureBrainState success=0 brainResumed=1 captureComplete=1 remoteStage=%s failure=%s\n",
+                 stage.c_str(), failure.empty() ? "current master changed across capture" : failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    String remoteArchive = stage; remoteArchive.append("/brain-state.tar"_ctv);
+    String archiveMetadata = {};
+    String archiveCommand = {};
+    archiveCommand.assign("set -eu; umask 077; test ! -e "_ctv); quoteInto(archiveCommand, remoteArchive);
+    archiveCommand.append("; tar --sort=name --numeric-owner --owner=0 --group=0 --mode='u=rwX,go=' -cf "_ctv);
+    String remotePartial = remoteArchive; remotePartial.append(".partial"_ctv);
+    quoteInto(archiveCommand, remotePartial); archiveCommand.append(" -C "_ctv); quoteInto(archiveCommand, stage);
+    archiveCommand.append(" state state.secrets brain-capture.receipt; chmod 600 "_ctv); quoteInto(archiveCommand, remotePartial);
+    archiveCommand.append("; mv -T "_ctv); quoteInto(archiveCommand, remotePartial); archiveCommand.append(" "_ctv); quoteInto(archiveCommand, remoteArchive);
+    archiveCommand.append("; sync -f "_ctv); quoteInto(archiveCommand, remoteArchive);
+    archiveCommand.append("; stat -c '%s' "_ctv); quoteInto(archiveCommand, remoteArchive);
+    archiveCommand.append("; sha256sum "_ctv); quoteInto(archiveCommand, remoteArchive);
+    archiveCommand.append(" | cut -d' ' -f1"_ctv);
+    bool archived = prodigyRunBlockingSSHCommand(session, fd, archiveCommand, &archiveMetadata, &failure, 120'000);
+    uint64_t archiveBytes = 0;
+    String archiveSHA = {};
+    if (archived)
+    {
+      const char *begin = reinterpret_cast<const char *>(archiveMetadata.data());
+      const char *end = begin + archiveMetadata.size();
+      const char *firstNewline = static_cast<const char *>(std::memchr(begin, '\n', size_t(end - begin)));
+      const char *secondNewline = firstNewline == nullptr ? nullptr :
+          static_cast<const char *>(std::memchr(firstNewline + 1, '\n', size_t(end - firstNewline - 1)));
+      archived = firstNewline != nullptr && secondNewline == end - 1 &&
+          mothershipVDCParseUnsigned(begin, firstNewline, archiveBytes) && archiveBytes > 0 && archiveBytes <= 1024ULL * 1024ULL * 1024ULL;
+      if (archived)
+      {
+        archiveSHA.assign(firstNewline + 1, uint64_t(secondNewline - firstNewline - 1));
+        archived = prodigyIsSHA256HexDigest(archiveSHA);
+      }
+      if (!archived) failure.assign("remote capture archive metadata is invalid"_ctv);
+    }
+    if (archived)
+      archived = prodigyDownloadRemoteFileFromSSHSession(
+          session, fd, remoteArchive, partialArchivePath, 1024ULL * 1024ULL * 1024ULL, &archiveBytes, &failure, 120'000);
+    String downloadedSHA = {};
+    if (archived)
+      archived = prodigyComputeFileSHA256Hex(partialArchivePath, downloadedSHA, &failure) &&
+                 downloadedSHA == archiveSHA;
+    if (archived)
+    {
+      if (::rename(partialArchivePath.c_str(), archivePath.c_str()) != 0)
+      {
+        failure.assign("cannot publish private capture archive"_ctv); archived = false;
+      }
+      else
+      {
+        int directoryFD = ::open(outputDirectory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        archived = directoryFD >= 0 && ::fsync(directoryFD) == 0;
+        if (directoryFD >= 0) ::close(directoryFD);
+        if (!archived) failure.assign("cannot sync private capture archive directory"_ctv);
+      }
+    }
+    if (!archived) (void)::unlink(partialArchivePath.c_str());
+
+    String cleanup = {}; cleanup.assign("rm -rf -- "_ctv); quoteInto(cleanup, stage);
+    String cleanupFailure = {};
+    bool remoteCleaned = prodigyRunBlockingSSHCommand(session, fd, cleanup, nullptr, &cleanupFailure, 30'000);
+    mothershipCloseSSHSession(session, fd);
+    if (!archived || !remoteCleaned)
+    {
+      basics_log("captureBrainState success=0 brainResumed=1 captureComplete=1 archiveRetained=%u remoteCleaned=%u remoteStage=%s failure=%s\n",
+                 unsigned(archived), unsigned(remoteCleaned), stage.c_str(),
+                 (!archived ? failure : cleanupFailure).c_str());
+      exit(EXIT_FAILURE);
+    }
+    basics_log("captureBrainState success=1 brainResumed=1 captureComplete=1 remoteCleaned=1 masterMachineUUID=%s archivePath=%s archiveBytes=%llu archiveSHA256=%s ownerSHA256=%s\n",
+               masterText.c_str(), archivePath.c_str(), (unsigned long long)archiveBytes,
+               archiveSHA.c_str(), executableSHA.c_str());
   }
 
   void runFaultTestCluster(int argc, char *argv[])
@@ -12140,6 +13242,90 @@ private:
   void runRecoverRetainedFleet(int argc, char *argv[])
   {
     String failure;
+    if (argc==2 && (std::strcmp(argv[1],"prepare-initial-seed-runtime-repair")==0 ||
+                    std::strcmp(argv[1],"recover-initial-seed-runtime-repair")==0)) {
+      struct RepairHooks final : MothershipRetainedRecovery::InitialSeedRuntimeRepairHooks {
+        Mothership& owner; ProdigyRuntimeEnvironmentConfig environment;
+        std::map<uint128_t,String> cloudIDs;
+        explicit RepairHooks(Mothership& value):owner(value) {}
+        bool prepare(MothershipTidesMigration::Execution& e,
+                     MothershipInitialSeedRuntimeRepairBinding& binding,String *failure) override {
+          using namespace MothershipRetainedRecovery;
+          // Bind the complete scope to the existing initial-seed journal, not
+          // to reconstructed caller-selected source/qualification fields.
+          MothershipNametagInitialSeedRecord record; MothershipNametagAllMastersIntent intent;
+          { auto registry=owner.openClusterRegistry();
+            if (!registry.loadNametagInitialSeed(binding.initialSeedOperationUUID,record,failure)) return false; }
+          if (!mothershipNametagInitialSeedRecordValid(record) || record.intentSHA256!=binding.initialSeedIntentSHA256 ||
+              !BitseryEngine::deserializeSafe(record.intentBytes,intent)) return false;
+          uint32_t matched=0;
+          for (uint32_t index=0;index<record.plans.size();++index) {
+            const auto& bound=record.plans[index];
+            if (bound.site>=intent.sites.size() || intent.sites[bound.site].clusterUUID!=binding.clusterUUID ||
+                bound.deploymentID!=binding.deploymentID) continue;
+            const auto scope=owner.nametagInitialSeedScope(record,intent,bound,binding.clusterUUID,0);
+            if (bound.nShardGroups!=1 || record.completedMask!=0 || record.dispatchMask!=uint8_t(1u<<index)) return false;
+            binding.initialSeedScopeSHA256=text(repairObjectSHA(scope));binding.normalizedDeploymentPlan=bound.normalizedPlan;
+            String scopeBytes;auto scopeCopy=scope;if(!BitseryEngine::serialize(scopeBytes,scopeCopy))return false;
+            const auto sealed=fs::path(e.plan.operationRoot)/"repair-initial-seed-scope";
+            if (e.receipt.phase!=MothershipTidesDBMigrationPhase::accepted && !fs::exists(sealed)) return false;
+            repairSeal(sealed,scopeBytes);
+            ++matched;
+          }
+          if (matched!=1) return false;
+          const auto path=fs::path(e.plan.operationRoot)/"repair-provider-topology";
+          ClusterTopology frozen;
+          if (fs::exists(path)) {
+            privateFile(path);
+            if (!BitseryEngine::deserializeSafe(text(read(path)),frozen)) return false;
+          } else {
+            if (e.receipt.phase!=MothershipTidesDBMigrationPhase::accepted) return false;
+            ClusterStatusReport report; String why;
+            if (!owner.productionClusterHealthy(e.cluster,report,why)) { if(failure)*failure=why; return false; }
+            String master; master.assignItoh(binding.masterMachineUUID); uint32_t masters=0;
+            for (const auto& machine:report.machineReports) if (machine.currentMaster) {
+              if (machine.machineUUID!=master) return false; ++masters;
+            }
+            if (masters!=1) return false;
+            ClusterCreateHooks hooks(&owner);
+            if (!hooks.fetchSeedTopology(e.cluster,frozen,failure)) return false;
+          }
+          cloudIDs.clear();
+          for (const auto& machine:e.plan.machines) {
+            String id;
+            if (!mothershipResolveVerifiedCreatedCloudMachineID(e.cluster.topology,frozen,machine.uuid,id,failure)) return false;
+            cloudIDs.emplace(machine.uuid,std::move(id));
+          }
+          MothershipProviderCredential credential;
+          String why;
+          if (!owner.validateClusterProviderCredentialReference(e.cluster,why,&credential) ||
+              !mothershipBuildClusterProvisioningRuntimeEnvironment(e.cluster,&credential,environment,&why) ||
+              environment.kind!=ProdigyEnvironmentKind::vultr) { if(failure)*failure=why; return false; }
+          if (!fs::exists(path)) {
+            String bytes; if(!BitseryEngine::serialize(bytes,frozen))return false;
+            repairSeal(path,bytes);
+          }
+          return true;
+        }
+        bool reboot(MothershipTidesMigration::Execution&,uint128_t machineUUID,String *failure) override {
+          const auto found=cloudIDs.find(machineUUID); if(found==cloudIDs.end())return false;
+          String why;
+          const bool submitted=mothershipRunProviderHostJob(owner.hostRuntime,environment,
+              MultiCurlClient::Clock::now()+std::chrono::minutes(5),"hard reboot",why,
+              [&](CoroutineStack *coro,BrainIaaS& provider,bool& completed,String& jobFailure)->void {
+                if(uint32_t suspendIndex=coro->nextSuspendIndex();coro->didSuspend([&]()->void {
+                    mothershipHardRebootProviderMachine(coro,provider,found->second,completed,&jobFailure);
+                  })) { co_await coro->suspendAtIndex(suspendIndex); }
+              });
+          if(failure)*failure=why; return submitted;
+        }
+      } hooks(*this);
+      if (!MothershipRetainedRecovery::runInitialSeedRuntimeRepair(argv[0],argv[1],hooks,&failure)) {
+        basics_log("recoverRetainedFleet success=0 failure=%s\n",failure.c_str()); exit(EXIT_FAILURE);
+      }
+      basics_log("recoverRetainedFleet success=1 action=%s applicationHealthAttested=0 meshHealthAttested=0\n",argv[1]);
+      return;
+    }
     const bool supersede=argc==3 && std::strcmp(argv[1], "supersede-preactivation")==0;
     const bool repair=argc==3 && (std::strcmp(argv[1], "recover")==0 || std::strcmp(argv[1], "prepare")==0 || std::strcmp(argv[1], "compact-contained")==0 || std::strcmp(argv[1], "resume-compacted")==0);
     if ((argc != 2 && argc != 3) || (!supersede && !repair && argc != 2) ||
@@ -12160,6 +13346,118 @@ private:
       basics_log("prepareRetainedRecoveryLocal success=0 failure=%s\n", failure.c_str()); exit(EXIT_FAILURE);
     }
     basics_log("prepareRetainedRecoveryLocal success=1\n");
+  }
+
+  [[noreturn]] void runRecoverStoppedLocalVM(int argc, char *argv[])
+  {
+    uint128_t operationUUID = 0;
+    if (argc != 5 || argv[0][0] != '/' ||
+        !prodigyParseCanonicalHex128(String(argv[2]), operationUUID) || operationUUID == 0 ||
+        !prodigyIsSHA256HexDigest(String(argv[4])))
+    {
+      basics_log("recoverStoppedLocalVM requires STATE_PATH TASK_ID OPERATION_UUID EXPECTED_GUEST_UUID EXPECTED_STATE_SHA256\n");
+      exit(EXIT_FAILURE);
+    }
+    // The registry may itself live inside the stopped controller VM. Recover
+    // only the exact operator-bound local state through the embedded VM owner;
+    // never open a registry, accept a command override, or invoke a sidecar.
+    Vector<String> arguments = {};
+    arguments.push_back(String("recover-stopped"));
+    const char *options[] = {"--state", "--task-id", "--operation-uuid",
+                             "--expected-guest-uuid", "--expected-state-sha256"};
+    String providerOperationUUID = {};
+    mothershipAssignProviderHex128(operationUUID, providerOperationUUID);
+    for (uint32_t index = 0; index < 5; ++index)
+    {
+      arguments.push_back(String(options[index]));
+      if (index == 2) arguments.push_back(providerOperationUUID);
+      else arguments.push_back(String(argv[index]));
+    }
+    String output = {}, failure = {};
+    if (!mothershipRunSealedPythonProvider("mothership-local-vm-boundary",
+            mothershipLocalVMBoundarySource, sizeof(mothershipLocalVMBoundarySource),
+            std::move(arguments), output, failure, 660'000))
+    {
+      basics_log("recoverStoppedLocalVM success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    basics_log("%s", output.c_str());
+    exit(EXIT_SUCCESS);
+  }
+
+  [[noreturn]] void runLaunchLocalVM(int argc, char *argv[])
+  {
+    // A fresh boundary is the only supported local-VM sizing path. The
+    // embedded launcher owns all image, firmware, network, identity, and
+    // state validation; this command fixes the lifecycle verb to launch.
+    if (argc < 3 || argc > 128 || argv[0][0] != '/')
+    {
+      basics_log("launchLocalVM requires STATE_PATH TASK_ID BOUNDARY_LAUNCH_ARGUMENTS...\n");
+      exit(EXIT_FAILURE);
+    }
+    for (int index = 2; index < argc; ++index)
+    {
+      const size_t bytes = std::strlen(argv[index]);
+      if (std::strcmp(argv[index], "--") == 0 || std::strcmp(argv[index], "-h") == 0 ||
+          (bytes >= 3 && bytes <= 6 && std::strncmp(argv[index], "--help", bytes) == 0) || bytes > 4096)
+      {
+        basics_log("launchLocalVM requires bounded launch options, not help or a guest command delimiter\n");
+        exit(EXIT_FAILURE);
+      }
+    }
+
+    Vector<String> arguments = {};
+    arguments.emplace_back("launch"_ctv);
+    arguments.emplace_back("--state"_ctv); arguments.emplace_back(argv[0]);
+    arguments.emplace_back("--task-id"_ctv); arguments.emplace_back(argv[1]);
+    arguments.emplace_back("--"_ctv);
+    for (int index = 2; index < argc; ++index) arguments.emplace_back(argv[index]);
+    // Keep the boundary parser as the option authority, but make its optional
+    // executable selectors Mothership-owned. These occur after caller options
+    // so argparse's existing last-value rule also defeats abbreviated forms.
+    arguments.emplace_back("--qemu"_ctv); arguments.emplace_back("qemu-system-x86_64"_ctv);
+    arguments.emplace_back("--qemu-img"_ctv); arguments.emplace_back("qemu-img"_ctv);
+    arguments.emplace_back("--ssh"_ctv); arguments.emplace_back("ssh"_ctv);
+
+    String output = {}, failure = {};
+    if (!mothershipRunSealedPythonProvider("mothership-local-vm-boundary",
+            mothershipLocalVMBoundarySource, sizeof(mothershipLocalVMBoundarySource),
+            std::move(arguments), output, failure, 1'860'000))
+    {
+      basics_log("launchLocalVM success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    basics_log("launchLocalVM success=1\n");
+    if (!output.empty()) basics_log("%s", output.c_str());
+    exit(EXIT_SUCCESS);
+  }
+
+  [[noreturn]] void runRemoveLocalVM(int argc, char *argv[])
+  {
+    // `remove` is the existing idempotent boundary cleanup action. Keep the
+    // action and argument shape fixed here: only the sealed launcher may
+    // identify, stop, and unlink the prior VM's owned resources.
+    if (argc != 2 || argv[0][0] != '/')
+    {
+      basics_log("removeLocalVM requires STATE_PATH TASK_ID\n");
+      exit(EXIT_FAILURE);
+    }
+    Vector<String> arguments = {};
+    arguments.emplace_back("remove"_ctv);
+    arguments.emplace_back("--state"_ctv); arguments.emplace_back(argv[0]);
+    arguments.emplace_back("--task-id"_ctv); arguments.emplace_back(argv[1]);
+
+    String output = {}, failure = {};
+    if (!mothershipRunSealedPythonProvider("mothership-local-vm-boundary",
+            mothershipLocalVMBoundarySource, sizeof(mothershipLocalVMBoundarySource),
+            std::move(arguments), output, failure, 90'000))
+    {
+      basics_log("removeLocalVM success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    basics_log("removeLocalVM success=1\n");
+    if (!output.empty()) basics_log("%s", output.c_str());
+    exit(EXIT_SUCCESS);
   }
 
   void runPrepareRetainedRecoveryArtifactLocal(int argc, char *argv[])
@@ -12420,8 +13718,20 @@ private:
     return true;
   }
 
+  // Keep source-cut selection and its read-only observation on one owner.
+  static const DeploymentIdentityStatefulMember* nametagSourceCutMember(
+      const DeploymentIdentityReport& report, uint32_t group)
+  {
+    const DeploymentIdentityStatefulMember* selected = nullptr;
+    for (const auto& member : report.statefulRuntimeCohort)
+      if (member.shardGroup == group && (!selected || member.containerUUID < selected->containerUUID))
+        selected = &member;
+    return selected;
+  }
+
   bool readDeploymentIdentity(const MothershipProdigyCluster& cluster, uint64_t deploymentID,
-                              DeploymentIdentityReport& report, String& failure, bool requireLive = true)
+                              DeploymentIdentityReport& report, String& failure, bool requireLive = true,
+                              bool allowMissing = false)
   {
     report = {};
     socket.close();
@@ -12434,9 +13744,18 @@ private:
     uint8_t *args = response->args;
     String encoded = {};
     Message::extractToStringView(args, encoded);
-    const bool valid = args == response->terminal() && BitseryEngine::deserializeSafe(encoded, report) &&
-                       report.version == 1 && report.found && (!requireLive || report.live) &&
-                       report.clusterUUID == cluster.clusterUUID && report.deploymentID == deploymentID;
+    bool valid = args == response->terminal() && BitseryEngine::deserializeSafe(encoded, report) &&
+                 prodigyDeploymentIdentityReportVersionSupported(report.version);
+    if (valid && allowMissing && !report.found) {
+      // The current Brain emits the exact empty v1 record for an absent
+      // deployment. Do not reinterpret an invalid or partial identity as a
+      // retryable absence.
+      DeploymentIdentityReport missing; String empty;
+      valid = BitseryEngine::serialize(empty, missing) && empty == encoded;
+    } else {
+      valid = valid && report.found && (!requireLive || report.live) &&
+          report.clusterUUID == cluster.clusterUUID && report.deploymentID == deploymentID;
+    }
     socket.close();
     if (!valid) failure.assign("exact live deployment identity is unavailable"_ctv);
     return valid;
@@ -12500,6 +13819,88 @@ private:
     {
       if (failure.empty()) failure.assign("active qualified cousin permission observation is unavailable"_ctv);
       return false;
+    }
+    return true;
+  }
+
+  // Graph replicas use the durable COUSIN route registry, but admission must
+  // also prove that both Brains still serve the same current generation.  This
+  // consumes the registry's receipts and the existing live permission/route
+  // observations; it deliberately does not cache another health state.
+  bool graphReplicaCousinRoutesReady(const MothershipProdigyCluster& owner,
+                                     const MothershipProdigyCluster& replica,
+                                     const DeploymentPlan& replicaPlan,
+                                     const Vector<MothershipGraphReplicaRouteBinding>& bindings,
+                                     String& failure)
+  {
+    if (!prodigyGraphDeploymentPlanCanonical(replicaPlan, true) || bindings.size() != 2) {
+      failure.assign("graph replica requires the two exact retained COUSIN service bindings"_ctv);
+      return false;
+    }
+    auto planCopy = replicaPlan;
+    String planBytes, planSHA256;
+    if (!BitseryEngine::serialize(planBytes, planCopy) || !prodigyComputeSHA256Hex(planBytes, planSHA256)) {
+      failure.assign("graph replica plan cannot be canonically bound to COUSIN permissions"_ctv);
+      return false;
+    }
+    auto observeLiveRoute = [&](const MothershipProdigyCluster& cluster, const CousinRouteRecord& route,
+                                CousinRouteHalf half, const CousinRouteApplyReceipt& minimumReceipt) {
+      ProdigyCousinRouteQuery query = {}; query.routeUUID = route.routeUUID;
+      ProdigyCousinRouteResponse response = {};
+      String targetName = cluster.name;
+      if (!configureControlTarget(targetName.c_str(), &failure) ||
+          !requestTopicRoundTrip(MothershipTopic::pullCousinRoute, query, response, failure) ||
+          response.protocolVersion != ProdigyCousinRouteResponse::version || !response.success || !response.found ||
+          !response.qualified || response.localClusterUUID != cluster.clusterUUID ||
+          !prodigyCousinRouteResponseValid(response) || response.applyReceipt.localHalf != half ||
+          response.route.priorOperationUUIDs != route.priorOperationUUIDs ||
+          !cousinRouteExactMatches(response.route, route) ||
+          !cousinRouteApplyReceiptMatchesCurrentRoute(response.applyReceipt, route) ||
+          response.applyReceipt.localRuntimeRevision < minimumReceipt.localRuntimeRevision) {
+        if (failure.empty()) failure.assign("graph replica COUSIN route is absent, stale, or not live on its required cluster half"_ctv);
+        return false;
+      }
+      return true;
+    };
+    for (const auto& binding : bindings) {
+      const uint64_t service = prodigyRuntimeStatefulServicePrefix(replicaPlan.config.applicationID,
+          binding.purpose == ProdigyCousinServicePurpose::sibling ? 2 : 4);
+      if ((binding.purpose != ProdigyCousinServicePurpose::sibling &&
+           binding.purpose != ProdigyCousinServicePurpose::seeding) ||
+          binding.route.sourceClusterUUID != replica.clusterUUID || binding.route.destinationClusterUUID != owner.clusterUUID ||
+          binding.route.sourceApplicationID != replicaPlan.config.applicationID ||
+          binding.route.destinationApplicationID != replicaPlan.config.applicationID ||
+          binding.route.sourceCousinServicePrefix != service || binding.route.destinationCousinServicePrefix != service) {
+        failure.assign("graph replica COUSIN route has the wrong application, direction, or service purpose"_ctv);
+        return false;
+      }
+      ProdigyLocalCousinServicePermissionResponse ownerPermission = {}, replicaPermission = {};
+      if (!readLocalCousinServicePermission(replica, binding.route.sourcePermissionUUID, replicaPermission, failure) ||
+          !readLocalCousinServicePermission(owner, binding.route.destinationPermissionUUID, ownerPermission, failure)) return false;
+      const auto& source = replicaPermission.permission;
+      const auto& destination = ownerPermission.permission;
+      const uint64_t authorizedService = MeshServices::constrainPrefixToGroup(service, 0);
+      if (source.localHalf != CousinRouteHalf::source || destination.localHalf != CousinRouteHalf::destination ||
+          source.permissionUUID != binding.route.sourcePermissionUUID || destination.permissionUUID != binding.route.destinationPermissionUUID ||
+          source.purpose != binding.purpose || destination.purpose != binding.purpose ||
+          source.localClusterUUID != replica.clusterUUID || source.peerClusterUUID != owner.clusterUUID ||
+          destination.localClusterUUID != owner.clusterUUID || destination.peerClusterUUID != replica.clusterUUID ||
+          source.localCousinServicePrefix != service || source.peerCousinServicePrefix != service ||
+          destination.localCousinServicePrefix != service || destination.peerCousinServicePrefix != service ||
+          source.authorizedService != authorizedService || destination.authorizedService != authorizedService ||
+          source.localDeploymentID != replicaPlan.config.deploymentID() ||
+          source.canonicalPlanSHA256 != planSHA256 ||
+          source.artifactSHA256 != replicaPlan.config.containerBlobSHA256 ||
+          source.artifactBytes != replicaPlan.config.containerBlobBytes ||
+          destination.peerDeploymentID != source.localDeploymentID || destination.peerCanonicalPlanSHA256 != planSHA256 ||
+          destination.peerArtifactSHA256 != replicaPlan.config.containerBlobSHA256 ||
+          destination.peerArtifactBytes != replicaPlan.config.containerBlobBytes ||
+          !prodigyCousinServicePermissionPeerScopeMatches(source, destination) ||
+          !observeLiveRoute(replica, binding.route, CousinRouteHalf::source, binding.replicaReceipt) ||
+          !observeLiveRoute(owner, binding.route, CousinRouteHalf::destination, binding.ownerReceipt)) {
+        if (failure.empty()) failure.assign("graph replica COUSIN permission or route receipt is not exact and active"_ctv);
+        return false;
+      }
     }
     return true;
   }
@@ -12823,6 +14224,40 @@ private:
         !receiptCurrent(targetResponse.applyReceipt, expected.destinationRouteReceipt))
     {
       if (failure.empty()) failure.assign("production migration COUSIN route is not freshly qualified on both clusters"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  bool productionPairDataClusters(const MothershipProductionPairRecord& record,
+                                  const MothershipProdigyCluster& routeSource,
+                                  const MothershipProdigyCluster& routeDestination,
+                                  MothershipProdigyCluster& dataSource,
+                                  MothershipProdigyCluster& dataTarget,
+                                  String& failure)
+  {
+    dataSource = {}; dataTarget = {};
+    const auto& intent = record.intent;
+    if (intent.protocolVersion != MothershipProductionPairIntent::statefulVersion ||
+        routeSource.clusterUUID != intent.route.sourceClusterUUID ||
+        routeDestination.clusterUUID != intent.route.destinationClusterUUID)
+    {
+      failure.assign("stateful data-role resolution requires the exact qualified route clusters"_ctv);
+      return false;
+    }
+    if (routeSource.clusterUUID == intent.sourceWorkload.clusterUUID &&
+        routeDestination.clusterUUID == intent.targetWorkload.clusterUUID)
+    {
+      dataSource = routeSource; dataTarget = routeDestination;
+    }
+    else if (routeSource.clusterUUID == intent.targetWorkload.clusterUUID &&
+             routeDestination.clusterUUID == intent.sourceWorkload.clusterUUID)
+    {
+      dataSource = routeDestination; dataTarget = routeSource;
+    }
+    else
+    {
+      failure.assign("stateful data source and target do not exactly cover the qualified route clusters"_ctv);
       return false;
     }
     return true;
@@ -13411,6 +14846,43 @@ private:
     return mothershipPhysicalFaultMachineObservationValid(observation);
   }
 
+  bool physicalFaultUnreadyMachineObservation(
+      const ClusterStatusReport& report, uint128_t clusterUUID, uint128_t machineUUID,
+      MothershipPhysicalFaultMachineObservation& observation, String& failure)
+  {
+    observation = {};
+    if (!report.hasTopology || report.topology.version == 0 || machineUUID == 0)
+    { failure.assign("unready local VM recovery requires a current versioned cluster topology"_ctv); return false; }
+    String machineIdentity = {}; machineIdentity.assignItoh(machineUUID);
+    uint32_t topologyMatches = 0, reportMatches = 0;
+    const MachineStatusReport *status = nullptr;
+    for (const auto& machine : report.topology.machines)
+      if (machine.uuid == machineUUID && machine.isBrain && machine.kind == MachineConfig::MachineKind::vm &&
+          machine.backing == ClusterMachineBacking::owned && machine.lifetime == MachineLifetime::owned)
+        ++topologyMatches;
+    for (const auto& candidate : report.machineReports)
+      if (candidate.machineUUID == machineIdentity) { ++reportMatches; status = &candidate; }
+    if (topologyMatches != 1 || reportMatches != 1 || status == nullptr || !status->isBrain ||
+        status->currentMaster || status->controlPlaneReachable || status->runtimeReady ||
+        status->bootTimeMs <= 0 || status->hardwareFailure || status->decommissioning ||
+        status->rebooting || status->updatingOS || status->updateStage != "idle"_ctv)
+    { failure.assign("unready local VM recovery requires one exact commissioned non-master Brain missing readiness"_ctv); return false; }
+    Vector<String> identity = {};
+    identity.emplace_back("mothership-unready-local-vm-recovery-v1"_ctv);
+    identity.emplace_back(); identity.back().assignItoh(clusterUUID);
+    identity.push_back(machineIdentity);
+    identity.emplace_back(); identity.back().assignItoa(report.topology.version);
+    identity.emplace_back(); identity.back().assignItoa(status->bootTimeMs);
+    identity.push_back(status->state);
+    identity.push_back(status->runningProdigyVersion);
+    identity.push_back(status->approvedBundleSHA256);
+    String encoded = {}; BitseryEngine::serialize(encoded, identity);
+    observation.clusterUUID = clusterUUID; observation.machineUUID = machineUUID;
+    observation.topologyVersion = report.topology.version;
+    if (!prodigyComputeSHA256Hex(encoded, observation.stateSHA256, &failure)) return false;
+    return mothershipPhysicalFaultMachineObservationValid(observation);
+  }
+
   static bool topologyMachineForAddress(const ClusterStatusReport& report, const String& address,
                                         uint128_t& machineUUID)
   {
@@ -13842,6 +15314,43 @@ private:
                                           observedPID, observedStarttime);
   }
 
+  struct LocalVMGuestLinuxIdentity {
+    String machineID;
+    String bootID;
+    uint64_t qemuPID = 0;
+    String qemuStarttime;
+  };
+
+  bool queryLocalVMBoundaryGuestLinuxIdentity(
+      const MothershipLocalVMBoundaryDescriptor& descriptor,
+      LocalVMGuestLinuxIdentity& identity, String& failure)
+  {
+    identity = {};
+    Vector<String> arguments = {};
+    arguments.emplace_back("query-guest-identity"_ctv);
+    arguments.emplace_back("--state"_ctv); arguments.push_back(descriptor.statePath);
+    arguments.emplace_back("--task-id"_ctv); arguments.push_back(descriptor.taskID);
+    String output = {};
+    if (!runLocalVMBoundarySealedLauncher(descriptor, arguments, 45'000, output, failure)) return false;
+    simdjson::dom::parser parser; simdjson::dom::element document;
+    std::string_view machineID, bootID, qemuStarttime;
+    uint64_t qemuPID = 0;
+    if (output.size() > 4_KB || parser.parse(output.data(), output.size()).get(document) != simdjson::SUCCESS ||
+        document.type() != simdjson::dom::element_type::OBJECT || document.get_object().size() != 4 ||
+        document["machineID"].get(machineID) || document["bootID"].get(bootID) ||
+        document["qemuPID"].get(qemuPID) || document["qemuStarttime"].get(qemuStarttime))
+    { failure.assign("local VM guest Linux identity query returned malformed state"_ctv); return false; }
+    identity.machineID.assign(machineID.data(), machineID.size());
+    identity.bootID.assign(bootID.data(), bootID.size());
+    identity.qemuPID = qemuPID;
+    identity.qemuStarttime.assign(qemuStarttime.data(), qemuStarttime.size());
+    if (!mothershipLocalVMLinuxMachineIDValid(identity.machineID) ||
+        !mothershipLocalVMLinuxBootIDValid(identity.bootID) || identity.qemuPID == 0 ||
+        !mothershipLocalVMProcessStarttimeValid(identity.qemuStarttime))
+    { identity = {}; failure.assign("local VM guest Linux identity query returned invalid state"_ctv); return false; }
+    return true;
+  }
+
   bool reconcileLocalVMBoundaryExecutorForUpgrade(
       const MothershipLocalVMBoundaryDescriptor& descriptor,
       String& immutableStateSHA256, String& failure,
@@ -14202,16 +15711,450 @@ private:
     return false;
   }
 
+  template<typename T> static bool localRecoveryObjectDigest(T value,String& digest,String& failure) {
+    String bytes;
+    return BitseryEngine::serialize(bytes,value) && prodigyComputeSHA256Hex(bytes,digest,&failure);
+  }
+  static bool localRecoveryLine(String& value,uint64_t bytes) {
+    if(value.size()!=bytes+1 || value[bytes]!='\n')return false;
+    value=value.substr(0,bytes,Copy::yes);return true;
+  }
+  static String localRecoverySourceBundle(const MothershipLocalAuthorityRecoveryCohortRequest& request) {
+    return request.protocolVersion==MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion ?
+        request.admittedRuntime.sourceBundleSHA256 : String(mothershipLocalInterruptedUpgradeSourceBundle);
+  }
+  static String localRecoveryTargetBundle(const MothershipLocalAuthorityRecoveryCohortRequest& request) {
+    return request.protocolVersion==MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion ?
+        request.admittedRuntime.targetBundleSHA256 : String(mothershipLocalInterruptedUpgradeTargetBundle);
+  }
+  static String localRecoverySourceRuntime(const MothershipLocalAuthorityRecoveryCohortRequest& request) {
+    return request.protocolVersion==MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion ?
+        request.admittedRuntime.sourceProdigySHA256 : String(mothershipLocalInterruptedUpgradeSourceRuntime);
+  }
+  static String localRecoveryTargetRuntime(const MothershipLocalAuthorityRecoveryCohortRequest& request) {
+    return request.protocolVersion==MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion ?
+        request.admittedRuntime.targetProdigySHA256 : String(mothershipLocalInterruptedUpgradeTargetRuntime);
+  }
+
+  // The controller is itself the registered seed guest. Its verified local
+  // branch must not invent an SSH pin for its own address.
+  bool localRecoveryRuntimeCommand(const MothershipProdigyCluster& cluster,
+      const LocalAuthorityRecoveryTarget& target,const std::string& command,String& output,String& failure,
+      const String *uploadSource=nullptr,const String *uploadDestination=nullptr)
+  {
+    using namespace MothershipTidesMigration;
+    output.clear();
+    if(target.localSeed) {
+      bool detected=false;uint128_t local=0;
+      if(!resolveVerifiedDisposableLocalVMIdentity(detected,local,&failure) || !detected || local!=target.executor.machineUUID) {
+        failure.assign("local runtime recovery is not executing in its exact registered seed guest"_ctv);return false;
+      }
+      if(uploadSource && (!uploadDestination || !prodigyRunLocalShellCommand(
+          text("install -m 0600 "+quote(str(*uploadSource))+" "+quote(str(*uploadDestination))),&failure)))return false;
+      char path[]="/tmp/mothership-local-runtime-output.XXXXXX";
+      const int fd=::mkstemp(path);if(fd<0)return false;::close(fd);
+      const bool ok=prodigyRunLocalShellCommand(text("set -euo pipefail; {\n"+command+"\n} > "+quote(path)),&failure);
+      if(ok) Filesystem::openReadAtClose(-1,String(path),output,1024*1024);
+      ::unlink(path);return ok;
+    }
+    MothershipProdigyClusterMachine machine;bool found=false;
+    for(const auto& entry:cluster.topology.machines)if(entry.uuid==target.executor.machineUUID) {
+      if(found)return false;found=true;mothershipPopulateRemoveMachineFromTopology(entry,machine);
+      mothershipHydrateTopologyRemoteCandidateSSH(cluster,machine);
+    }
+    if(!found || machine.ssh.hostPublicKeyOpenSSH.empty())return false;
+    LIBSSH2_SESSION *session=nullptr;int fd=-1;
+    if(!mothershipConnectSSHSession(machine,session,fd,&failure,
+        &cluster.bootstrapSshKeyPackage,&cluster.bootstrapSshPrivateKeyPath))return false;
+    bool ok=!uploadSource || (uploadDestination && prodigyUploadLocalFileToSSHSession(
+        session,fd,*uploadSource,*uploadDestination,0600,&failure,120'000));
+    if(ok)ok=prodigyRunBlockingSSHCommand(session,fd,text("set -eu; "+command),&output,&failure,120'000);
+    mothershipCloseSSHSession(session,fd);return ok;
+  }
+
+  static std::string localRecoveryRuntimeRoot(const MothershipLocalAuthorityRecoveryCohortRequest& request) {
+    String operation;operation.assignItoh(request.operationUUID);
+    return "/var/lib/prodigy/mothership-local-authority-runtime/"+MothershipTidesMigration::str(operation);
+  }
+  static std::string localRecoveryGatewayInventory(const MothershipLocalAuthorityRecoveryCohortRequest& request,
+                                                   uint128_t machine,bool emptyOnly=false) {
+    using namespace MothershipRetainedRecovery;
+    InitialSeedRuntimeRepairManifest manifest;
+    manifest.gatewayExecutableSHA="fdc9fe507e486c1c74967558ac9733767612d0a725e45448329c6dc96c758cf5";
+    manifest.gatewayExecutableBytes=6441168;manifest.binding.gateways=request.runtime.gateways;
+    const auto empty=initialSeedRepairInventoryProgram(manifest,machine,false);
+    if(emptyOnly)return empty;
+    // Absence after the preceding cold recovery is valid. Otherwise the same
+    // typed gateway environment/executable/cgroup owner must prove both leaves.
+    return "if test -z \"$(find /sys/fs/cgroup/containers.slice -name cgroup.procs -exec cat {} + 2>/dev/null)\"; then\n"+
+        empty+"\nelse\n"+initialSeedRepairInventoryProgram(manifest,machine)+"\nfi";
+  }
+
+  bool localRecoveryRuntimeObservation(const MothershipProdigyCluster& cluster,
+      const LocalAuthorityRecoveryTarget& target,const MothershipLocalAuthorityRecoveryCohortRequest& request,
+      MothershipLocalRecoveryRuntimeMember& member,
+      bool targetRuntime,String& failure)
+  {
+    using namespace MothershipTidesMigration;
+    const std::string program=R"PY(python3 - <<'LOCAL_RUNTIME'
+import hashlib,json,pathlib,re,subprocess
+p=pathlib.Path
+def value(k):return subprocess.check_output(['systemctl','show','-p',k,'--value','prodigy'],text=True).strip()
+assert value('ActiveState')=='active' and value('FragmentPath')=='/etc/systemd/system/prodigy.service'
+assert value('WorkingDirectory')==''
+assert re.findall(r'path=([^ ;]+)',value('ExecStart'))==['/root/prodigy/prodigy']
+pid=int(value('MainPID'));assert pid>1
+env=dict(v.split(b'=',1) for v in p('/proc',str(pid),'environ').read_bytes().split(b'\0') if v)
+assert env.get(b'PRODIGY_STATE_DB',b'/var/lib/prodigy/state')==b'/var/lib/prodigy/state'
+assert env.get(b'PRODIGY_STATE_SECRETS_DB',b'/var/lib/prodigy/state.secrets')==b'/var/lib/prodigy/state.secrets'
+def sha(path):
+ with path.open('rb') as f:return hashlib.file_digest(f,'sha256').hexdigest()
+print(json.dumps(dict(machineID=p('/etc/machine-id').read_text().strip(),bootID=p('/proc/sys/kernel/random/boot_id').read_text().strip(),runtimeSHA=sha(p('/proc',str(pid),'exe')),installedSHA=sha(p('/root/prodigy/prodigy')),bundleSHA=sha(p('/root/prodigy/prodigy.bundle.tar.zst')))))
+assert int(value('MainPID'))==pid
+LOCAL_RUNTIME
+)PY";
+    String bytes;if(!localRecoveryRuntimeCommand(cluster,target,program,bytes,failure))return false;
+    try {
+      simdjson::dom::parser parser;simdjson::dom::element doc;
+      require(parser.parse(bytes.data(),bytes.size()).get(doc)==simdjson::SUCCESS,"local runtime observation JSON is invalid");
+      const String runtimeSHA=targetRuntime ? localRecoveryTargetRuntime(request) : localRecoverySourceRuntime(request);
+      const String bundleSHA=targetRuntime ? localRecoveryTargetBundle(request) : localRecoverySourceBundle(request);
+      require(text(field(doc,"runtimeSHA"))==runtimeSHA && text(field(doc,"installedSHA"))==runtimeSHA &&
+              text(field(doc,"bundleSHA"))==bundleSHA,"local runtime observation is not the exact admitted release");
+      if(!member.linuxMachineID.empty())require(member.linuxMachineID==text(field(doc,"machineID")),"local runtime guest machine ID changed");
+      member.linuxMachineID=text(field(doc,"machineID"));member.beforeBootID=text(field(doc,"bootID"));
+      member.machineUUID=target.executor.machineUUID;member.runtimeRoot="/root/prodigy"_ctv;
+      return true;
+    } catch(const std::exception& e) {failure.assign(e.what());return false;}
+  }
+
+  bool localRecoveryRuntimeFreshAuthority(const MothershipProdigyCluster& cluster,
+      const MothershipLocalAuthorityRecoveryCohortRequest& request,const ProdigyApprovedUpgradeBundle& bundle,
+      bool completed,String& failure)
+  {
+    ClusterStatusReport status;
+    if(!productionClusterHealthy(cluster,status,failure) ||
+       !mothershipLocalAuthorityRecoveryTopologyMatches(request,status.topology) ||
+       !mothershipLocalRecoveryRuntimeReportValid(request,status,completed)) {
+      if(failure.empty())failure.assign("local runtime recovery lacks its exact empty healthy runtime cohort"_ctv);
+      return false;
+    }
+    String clusterName=cluster.name;
+    if(!configureControlTarget(clusterName.c_str(),&failure))return false;
+    ProdigyUpgradeAdmissionReportRequest query;query.operationID.assignItoh(request.runtime.upgradeOperationUUID);
+    query.targetBundleSHA256=bundle.bundleSHA256;query.targetContractSHA256=bundle.contract.contractSHA256;
+    query.requiredStagingBytes=bundle.contract.requiredFreeBytes;
+    MothershipUpgradeAdmissionReport report;
+    if(!requestUpgradeAdmissionReport(query,report,failure))return false;
+    const uint32_t expectedDeployments = request.protocolVersion==
+        MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion ?
+        request.admittedRuntime.activeDeploymentCount : 0;
+    if(report.clusterUUID!=cluster.clusterUUID || !report.master || !report.observationComplete ||
+        !report.authorityQuorumHealthy || !report.authorityAcknowledged || !report.recoveryWitnessAcknowledged ||
+        !report.commissionedPeerTransportVerified || !report.fleetInventoriesFresh || !report.fleetBundleDigestsFresh ||
+        report.activeDeploymentCount!=expectedDeployments || report.healthyCommissionedBrainCount!=3 || report.peers.size()!=3) {
+      failure.assign("local runtime recovery requires fresh exact inventory and current durable authority"_ctv);return false;
+    }
+    for(uint32_t peerIndex=0;peerIndex<report.peers.size();++peerIndex) {
+      const auto& peer=report.peers[peerIndex];
+      for(uint32_t prior=0;prior<peerIndex;++prior)
+        if(report.peers[prior].machineUUID==peer.machineUUID) {
+          failure.assign("local runtime recovery contains duplicate peer inventory"_ctv);return false;
+        }
+      bool match=false;
+      for(const auto& member:request.runtime.members)if(peer.machineUUID==member.machineUUID) {
+        const String expected=(completed || !member.installRequired) ? localRecoveryTargetBundle(request) :
+                                                                      localRecoverySourceBundle(request);
+        match=peer.localInstalledBundleVerified && peer.installedBundleSHA256==expected && peer.stateUploadFresh &&
+            peer.authorityAcknowledged && peer.recoveryWitnessAcknowledged;
+      }
+      if(!match){failure.assign("local runtime recovery peer proof differs from its frozen members"_ctv);return false;}
+    }
+    for(const auto& authority:request.runtime.gateways) {
+      ProdigyCrossClusterMasqueGatewayAuthorityQuery q;q.pairUUID=authority.pairUUID;q.localMachineUUID=authority.localMachineUUID;
+      ProdigyCrossClusterMasqueGatewayAuthorityResponse response;
+      if(!requestTopicRoundTrip(MothershipTopic::pullCrossClusterMasqueGatewayAuthority,q,response,failure) ||
+          !response.success || !response.found || !response.qualified || response.localClusterUUID!=cluster.clusterUUID ||
+          !mothershipPhysicalFaultExactSerializedEqual(authority,response.authority)) {
+        if(failure.empty())failure.assign("local runtime recovery gateway authority changed");return false;
+      }
+    }
+    return true;
+  }
+
+  static bool captureLocalRecoveryWorkloads(const ClusterStatusReport& report,
+      Vector<MothershipLocalRecoveryWorkloadIdentity>& workloads,String& failure)
+  {
+    workloads.clear();
+    if(report.nApplications!=report.applicationReports.size()) {
+      failure.assign("local runtime recovery application inventory is incomplete"_ctv);return false;
+    }
+    for(const auto& application:report.applicationReports)
+      for(const auto& deployment:application.deploymentReports) {
+        MothershipLocalRecoveryWorkloadIdentity identity;
+        if(!mothershipLocalRecoveryWorkloadIdentityFromReport(
+            application.applicationID,deployment,identity)) {
+          failure.assign("local runtime recovery observed a malformed deployment identity"_ctv);return false;
+        }
+        workloads.push_back(std::move(identity));
+      }
+    std::sort(workloads.begin(),workloads.end(),[](const auto& left,const auto& right) {
+      return left.applicationID==right.applicationID ? left.deploymentID<right.deploymentID :
+          left.applicationID<right.applicationID;
+    });
+    if(workloads.empty()) {
+      failure.assign("local runtime recovery admitted-runtime mode requires an active workload"_ctv);return false;
+    }
+    for(uint32_t index=1;index<workloads.size();++index)
+      if(workloads[index-1].applicationID==workloads[index].applicationID &&
+          workloads[index-1].deploymentID==workloads[index].deploymentID) {
+        failure.assign("local runtime recovery contains duplicate deployment identity"_ctv);return false;
+      }
+    return true;
+  }
+
+  bool prepareLocalRecoveryRuntimeIntent(const MothershipProdigyCluster& cluster,
+      const Vector<LocalAuthorityRecoveryTarget>& targets,const char *upgradeText,const char *bundleText,
+      const char *predecessorText,bool existing,MothershipLocalAuthorityRecoveryCohortRequest& request,
+      ProdigyApprovedUpgradeBundle& bundle,String& failure)
+  {
+    using namespace MothershipTidesMigration;
+    const bool admittedRuntime=std::strcmp(predecessorText,"--admitted-active-runtime")==0;
+    uint128_t upgrade=0,predecessor=0;
+    if(!prodigyParseCanonicalHex128(String(upgradeText),upgrade) ||
+        (!admittedRuntime && !prodigyParseCanonicalHex128(String(predecessorText),predecessor)))return false;
+    if(!admittedRuntime && (upgrade!=mothershipLocalInterruptedUpgradeOperationUUID() ||
+        predecessor!=mothershipLocalInterruptedUpgradePredecessorUUID() ||
+        cluster.clusterUUID!=mothershipLocalInterruptedUpgradeClusterUUID()))return false;
+    MachineCpuArchitecture architecture=MachineCpuArchitecture::unknown;String path,clusterName=cluster.name;
+    if(!resolveProdigyBundleTargetArchitecture(clusterName.c_str(),architecture,&failure) ||
+        !prodigyResolveBundleArtifactInput(String(bundleText),architecture,path,&failure) ||
+        !prodigyApproveBundleUpgradeContract(path,bundle,&failure) || !bundle.verifyRetainedSnapshot(&failure))return false;
+    if(!admittedRuntime && (bundle.bundleSHA256!=mothershipLocalInterruptedUpgradeTargetBundle ||
+        bundle.contract.prodigySHA256!=mothershipLocalInterruptedUpgradeTargetRuntime))return false;
+    auto& intent=request.runtime;
+    if(existing) {
+      const uint32_t protocol=admittedRuntime ?
+          MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion :
+          MothershipLocalAuthorityRecoveryCohortRequest::interruptedUpgradeVersion;
+      if(request.protocolVersion!=protocol ||
+          intent.upgradeOperationUUID!=upgrade || intent.predecessorRecoveryUUID!=predecessor ||
+          intent.bundlePath!=path || intent.targetContractSHA256!=bundle.contract.contractSHA256 ||
+          (admittedRuntime && (request.admittedRuntime.targetBundleSHA256!=bundle.bundleSHA256 ||
+            request.admittedRuntime.targetProdigySHA256!=bundle.contract.prodigySHA256 ||
+            request.admittedRuntime.targetMothershipSHA256!=bundle.contract.mothershipSHA256)))return false;
+    } else {
+      request.protocolVersion=admittedRuntime ?
+          MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion :
+          MothershipLocalAuthorityRecoveryCohortRequest::interruptedUpgradeVersion;
+      intent.upgradeOperationUUID=upgrade;intent.predecessorRecoveryUUID=predecessor;
+      intent.bundlePath=path;intent.targetContractSHA256=bundle.contract.contractSHA256;
+      MothershipUpgradeAdmissionRecord admission;MothershipLocalAuthorityRecoveryCohortRecord prior;
+      { auto registry=openClusterRegistry();
+        if(!registry.loadUpgradeAdmission(cluster.clusterUUID,upgrade,admission,&failure) ||
+            !registry.loadLocalRecoveryGateways(cluster.clusterUUID,intent.gateways,&failure) ||
+            (!admittedRuntime && !registry.loadLocalAuthorityRecoveryCohort(predecessor,prior,&failure)))return false;
+      }
+      if(!localRecoveryObjectDigest(admission,intent.admissionSHA256,failure) ||
+          (!admittedRuntime && !localRecoveryObjectDigest(prior,intent.predecessorRecoverySHA256,failure)))return false;
+      if(!admission.eligible || admission.approvedPath!=uint8_t(MothershipUpgradePath::sameLogicalRollout) ||
+          admission.clusterUUID!=cluster.clusterUUID || admission.operationID!=upgrade ||
+          admission.targetBundleSHA256!=bundle.bundleSHA256 ||
+          admission.targetContractSHA256!=bundle.contract.contractSHA256)return false;
+      MothershipUpgradeIdentity source;source.releaseID=admission.sourceReleaseID;
+      source.contractSHA256=admission.sourceContractSHA256;source.prodigySHA256=admission.sourceProdigySHA256;
+      source.mothershipSHA256=admission.sourceMothershipSHA256;
+      String architectureName(machineCpuArchitectureName(architecture));
+      if(!prodigyValidateSameClusterUpgradeRelease(bundle,architectureName,cluster.clusterUUID,&source,true,&failure))return false;
+      if(admittedRuntime) {
+        auto& identity=request.admittedRuntime;
+        identity.sourceBundleSHA256=admission.sourceBundleSHA256;
+        identity.sourceContractSHA256=admission.sourceContractSHA256;
+        identity.sourceReleaseID=admission.sourceReleaseID;
+        identity.sourceProdigySHA256=admission.sourceProdigySHA256;
+        identity.sourceMothershipSHA256=admission.sourceMothershipSHA256;
+        identity.targetBundleSHA256=bundle.bundleSHA256;
+        identity.targetReleaseID=bundle.contract.releaseID;
+        identity.targetProdigySHA256=bundle.contract.prodigySHA256;
+        identity.targetMothershipSHA256=bundle.contract.mothershipSHA256;
+        identity.targetBinaryVersion=bundle.contract.binaryVersion;
+        identity.authorityGeneration=admission.authorityGeneration;
+        identity.masterUUID=admission.masterUUID;identity.masterBootNs=admission.masterBootNs;
+        identity.semanticObservationSHA256=admission.semanticObservationSHA256;
+        ClusterStatusReport status;
+        if(!productionClusterHealthy(cluster,status,failure) ||
+            !captureLocalRecoveryWorkloads(status,identity.workloads,failure))return false;
+        identity.activeDeploymentCount=identity.workloads.size();
+        for(const auto& observed:status.machineReports) {
+          uint128_t machine=0;
+          if(!prodigyParseCanonicalHex128(observed.machineUUID,machine) ||
+              observed.approvedBundleSHA256!=identity.sourceBundleSHA256 ||
+              observed.runningProdigyVersion.empty() ||
+              (observed.currentMaster && machine!=identity.masterUUID) ||
+              (!identity.sourceBinaryVersion.empty() && identity.sourceBinaryVersion!=observed.runningProdigyVersion))return false;
+          identity.sourceBinaryVersion=observed.runningProdigyVersion;
+        }
+      }
+      for(uint32_t i=0;i<targets.size();++i) {
+        MothershipLocalRecoveryRuntimeMember member;member.installRequired=admittedRuntime || i!=0;
+        if(!localRecoveryRuntimeObservation(cluster,targets[i],request,member,!member.installRequired,failure) ||
+            !localRecoveryRuntimeCommand(cluster,targets[i],localRecoveryGatewayInventory(request,member.machineUUID),
+                                         member.gatewayInventory,failure))return false;
+        try {
+          simdjson::dom::parser parser;simdjson::dom::element inventory;
+          require(parser.parse(member.gatewayInventory.data(),member.gatewayInventory.size()).get(inventory)==simdjson::SUCCESS &&
+                  text(field(inventory,"linuxMachineID"))==member.linuxMachineID &&
+                  text(field(inventory,"bootID"))==member.beforeBootID,"local recovery inventory changed during admission");
+        } catch(const std::exception& e){failure.assign(e.what());return false;}
+        intent.members.push_back(std::move(member));
+      }
+      if(!mothershipLocalAuthorityRecoveryCohortRequestValid(request,&failure))return false;
+      if(!localRecoveryRuntimeFreshAuthority(cluster,request,bundle,false,failure))return false;
+    }
+    auto registry=openClusterRegistry();
+    Vector<CrossClusterMasqueGatewayAuthority> gateways;
+    if(!registry.localRecoveryRuntimeAuthorityMatches(request,&failure) ||
+        !registry.loadLocalRecoveryGateways(cluster.clusterUUID,gateways,&failure) ||
+        !mothershipPhysicalFaultExactSerializedEqual(gateways,intent.gateways))return false;
+    return true;
+  }
+
+  bool installLocalRecoveryRuntime(const MothershipProdigyCluster& cluster,
+      const LocalAuthorityRecoveryTarget& target,uint32_t index,const ProdigyApprovedUpgradeBundle& bundle,
+      MothershipLocalAuthorityRecoveryCohortRecord& record,String& failure)
+  {
+    using namespace MothershipTidesMigration;
+    const auto& request=record.request;const auto member=request.runtime.members[index];
+    if(record.boundaries[index].phase!=MothershipLocalAuthorityRecoveryPhase::armed)return false;
+    auto progress=record.runtimeProgress[index];
+    const auto root=localRecoveryRuntimeRoot(request),staged=root+"/runtime",fence=root+"/writers-fenced";
+    String bindingSHA;if(!localRecoveryObjectDigest(request,bindingSHA,failure))return false;
+    const auto prefix="test \"$(cat /etc/machine-id)\" = "+quote(str(member.linuxMachineID))+
+        "; test \"$(cat /proc/sys/kernel/random/boot_id)\" = "+quote(str(member.beforeBootID))+"; "+
+        runtimeServiceExecStartCheck("/root/prodigy");
+    String output;
+    // The executor can have durably released while the controller lost the
+    // corresponding registry advance. Query that existing owner before any
+    // original-boot install check; never infer another reboot is needed.
+    LocalAuthorityRecoveryExecutorReceipt reboot;String rebootSHA;
+    if(!runLocalAuthorityRecoveryExecutor(target.boundary,target.executor.executorOperationUUID,request.operationUUID,
+        "query",0,request.timeoutMilliseconds,reboot,rebootSHA,failure))return false;
+    if(!member.installRequired) {
+      if(reboot.phase!=LocalAuthorityRecoveryExecutorPhase::armed)return true;
+      auto observed=member;
+      return localRecoveryRuntimeObservation(cluster,target,request,observed,true,failure) &&
+          observed.beforeBootID==member.beforeBootID &&
+          localRecoveryRuntimeCommand(cluster,target,localRecoveryGatewayInventory(request,member.machineUUID),output,failure) &&
+          output==member.gatewayInventory;
+    }
+    if(reboot.phase!=LocalAuthorityRecoveryExecutorPhase::armed) {
+      if(!progress.installDispatched || progress.stateSHA256.empty())return false;
+      return localRecoveryRuntimeCommand(cluster,target,
+          "test \"$(cat /etc/machine-id)\" = "+quote(str(member.linuxMachineID))+
+          "; test \"$(cat "+quote(fence)+")\" = "+quote(str(bindingSHA))+
+          "; test \"$(sha256sum /root/prodigy/prodigy | cut -d' ' -f1)\" = "+quote(str(bundle.contract.prodigySHA256))+
+          "; test \"$(sha256sum /root/prodigy/prodigy.bundle.tar.zst | cut -d' ' -f1)\" = "+quote(str(bundle.bundleSHA256)),output,failure);
+    }
+    if(!progress.installDispatched) {
+      auto observed=member;
+      if(!localRecoveryRuntimeObservation(cluster,target,request,observed,false,failure) || observed.beforeBootID!=member.beforeBootID ||
+          !localRecoveryRuntimeCommand(cluster,target,localRecoveryGatewayInventory(request,member.machineUUID),output,failure) ||
+          output!=member.gatewayInventory)return false;
+    }
+    // Stage privately before service stop. Reentry never treats existence as
+    // artifact verification and never overwrites an uncertain partial install.
+    if(!localRecoveryRuntimeCommand(cluster,target,prefix+
+        "test ! -L /var/lib/prodigy; test ! -L /var/lib/prodigy/mothership-local-authority-runtime; test ! -L "+quote(root)+
+        "; umask 077; mkdir -p "+quote(root)+"; test \"$(stat -c %u "+quote(root)+")\" = 0; chmod 700 "+quote(root)+
+        "; if test -e "+quote(root+"/binding")+"; then test \"$(cat "+quote(root+"/binding")+")\" = "+quote(str(bindingSHA))+
+        "; else printf %s "+quote(str(bindingSHA))+" > "+quote(root+"/binding")+"; sync -f "+quote(root)+"; fi",output,failure))return false;
+    String remoteBundle=text(root+"/approved.bundle.tar.zst"),remoteSHA;
+    prodigyResolveBundleSHA256Path(remoteBundle,remoteSHA);
+    if(!bundle.verifyRetainedSnapshot(&failure) || !localRecoveryRuntimeCommand(cluster,target,prefix+
+        "test \"$(sha256sum "+quote(str(remoteBundle))+" | cut -d' ' -f1)\" = "+quote(str(bundle.bundleSHA256))+
+        "; printf '%s\\n' "+quote(str(bundle.bundleSHA256))+" > "+quote(str(remoteSHA))+"; sync -f "+quote(root),
+        output,failure,&bundle.retainedSnapshotPath,&remoteBundle))return false;
+    String install;prodigyBuildBundleInstallCommand(remoteBundle,text(staged),install);
+    if(!localRecoveryRuntimeCommand(cluster,target,prefix+"if test ! -e "+quote(staged)+"; then "+str(install)+
+        "; fi; test \"$(sha256sum "+quote(staged+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(str(bundle.contract.prodigySHA256))+
+        "; test \"$(sha256sum "+quote(staged+"/prodigy.bundle.tar.zst")+" | cut -d' ' -f1)\" = "+quote(str(bundle.bundleSHA256)),output,failure))return false;
+    if(!progress.installDispatched) {
+      progress.installDispatched=true;auto registry=openClusterRegistry();
+      if(!registry.checkpointLocalRecoveryRuntime(request.operationUUID,progress,record,&failure))return false;
+    }
+    if(!localRecoveryRuntimeCommand(cluster,target,prefix+
+        "if test -e "+quote(fence)+"; then test \"$(cat "+quote(fence)+")\" = "+quote(str(bindingSHA))+"; fi; "+
+        runtimeStartupFenceCommand(root,str(bindingSHA))+"; "+quiesceServiceCommand(true),output,failure))return false;
+    if(!localRecoveryRuntimeCommand(cluster,target,localRecoveryGatewayInventory(request,member.machineUUID),output,failure) ||
+        output!=member.gatewayInventory)return false;
+    String stateSHA,secretsSHA;
+    if(!localRecoveryRuntimeCommand(cluster,target,MothershipRetainedRecovery::initialSeedRepairTreeProgram("/var/lib/prodigy/state"),stateSHA,failure) ||
+        !localRecoveryRuntimeCommand(cluster,target,MothershipRetainedRecovery::initialSeedRepairTreeProgram("/var/lib/prodigy/state.secrets"),secretsSHA,failure))return false;
+    if(!localRecoveryLine(stateSHA,64) || !localRecoveryLine(secretsSHA,64))return false;
+    if(progress.stateSHA256.empty()) {
+      progress.stateSHA256=stateSHA;progress.secretsSHA256=secretsSHA;auto registry=openClusterRegistry();
+      if(!registry.checkpointLocalRecoveryRuntime(request.operationUUID,progress,record,&failure))return false;
+    } else if(stateSHA!=progress.stateSHA256 || secretsSHA!=progress.secretsSHA256)return false;
+    const auto retained="/root/prodigy.local-recovery-"+str(bindingSHA).substr(0,16);
+    if(!localRecoveryRuntimeCommand(cluster,target,prefix+
+        retainedRuntimePublicationCommand("/root/prodigy",staged,retained,
+            str(localRecoverySourceRuntime(request)),str(localRecoverySourceBundle(request)),
+            str(bundle.contract.prodigySHA256))+
+        "test \"$(sha256sum /root/prodigy/prodigy.bundle.tar.zst | cut -d' ' -f1)\" = "+quote(str(bundle.bundleSHA256)),output,failure))return false;
+    if(!localRecoveryRuntimeCommand(cluster,target,MothershipRetainedRecovery::initialSeedRepairTreeProgram("/var/lib/prodigy/state"),stateSHA,failure) ||
+        !localRecoveryRuntimeCommand(cluster,target,MothershipRetainedRecovery::initialSeedRepairTreeProgram("/var/lib/prodigy/state.secrets"),secretsSHA,failure))return false;
+    if(!localRecoveryLine(stateSHA,64) || !localRecoveryLine(secretsSHA,64))return false;
+    return stateSHA==progress.stateSHA256 && secretsSHA==progress.secretsSHA256;
+  }
+
+  bool activateLocalRecoveryRuntime(const MothershipProdigyCluster& cluster,
+      const LocalAuthorityRecoveryTarget& target,uint32_t index,MothershipLocalAuthorityRecoveryCohortRecord& record,
+      String& failure)
+  {
+    using namespace MothershipTidesMigration;
+    const auto member=record.request.runtime.members[index];auto progress=record.runtimeProgress[index];
+    const auto root=localRecoveryRuntimeRoot(record.request),fence=root+"/writers-fenced";
+    String bindingSHA,boot,output;
+    if(!localRecoveryObjectDigest(record.request,bindingSHA,failure) ||
+        !localRecoveryRuntimeCommand(cluster,target,"test \"$(cat /etc/machine-id)\" = "+quote(str(member.linuxMachineID))+
+        "; cat /proc/sys/kernel/random/boot_id",boot,failure))return false;
+    if(!localRecoveryLine(boot,36) || boot==member.beforeBootID)return false;
+    if(!progress.activationBootID.empty() && progress.activationBootID!=boot)return false;
+    if(progress.activationBootID.empty()) {
+      if(member.installRequired) {
+        if(!localRecoveryRuntimeCommand(cluster,target,"test \"$(cat "+quote(fence)+")\" = "+quote(str(bindingSHA))+
+            "; test \"$(systemctl show -p MainPID --value prodigy)\" = 0; "+
+            localRecoveryGatewayInventory(record.request,member.machineUUID,true),output,failure))return false;
+        String state,secrets;
+        if(!localRecoveryRuntimeCommand(cluster,target,MothershipRetainedRecovery::initialSeedRepairTreeProgram("/var/lib/prodigy/state"),state,failure) ||
+            !localRecoveryRuntimeCommand(cluster,target,MothershipRetainedRecovery::initialSeedRepairTreeProgram("/var/lib/prodigy/state.secrets"),secrets,failure))return false;
+        if(!localRecoveryLine(state,64) || !localRecoveryLine(secrets,64) ||
+            state!=progress.stateSHA256 || secrets!=progress.secretsSHA256)return false;
+      }
+      progress.activationBootID=boot;auto registry=openClusterRegistry();
+      if(!registry.checkpointLocalRecoveryRuntime(record.request.operationUUID,progress,record,&failure))return false;
+    }
+    if(member.installRequired && !localRecoveryRuntimeCommand(cluster,target,
+        runtimeServiceExecStartCheck("/root/prodigy")+"test \"$(cat /proc/sys/kernel/random/boot_id)\" = "+quote(str(boot))+
+        "; test \"$(sha256sum /root/prodigy/prodigy | cut -d' ' -f1)\" = "+quote(str(localRecoveryTargetRuntime(record.request)))+
+        "; test \"$(sha256sum /root/prodigy/prodigy.bundle.tar.zst | cut -d' ' -f1)\" = "+quote(str(localRecoveryTargetBundle(record.request)))+
+        "; if test -e "+quote(fence)+"; then test \"$(cat "+quote(fence)+")\" = "+quote(str(bindingSHA))+
+        "; rm -- "+quote(fence)+"; sync -f "+quote(root)+"; fi; systemctl start prodigy; systemctl is-active --quiet prodigy",output,failure))return false;
+    auto observed=member;
+    return localRecoveryRuntimeObservation(cluster,target,record.request,observed,true,failure) && observed.beforeBootID==boot;
+  }
+
   void runRecoverLocalClusterAuthority(int argc, char *argv[])
   {
     String failure = {};
     uint128_t operationUUID = 0;
     uint64_t timeout = 0;
-    bool valid = argc == 3 && prodigyParseCanonicalHex128(String(argv[0]), operationUUID) && operationUUID != 0 &&
+    const bool interruptedUpgrade=argc==7 && std::strcmp(argv[3],"--complete-interrupted-upgrade")==0;
+    bool valid = (argc == 3 || interruptedUpgrade) && prodigyParseCanonicalHex128(String(argv[0]), operationUUID) && operationUUID != 0 &&
         mothershipParseUnsignedArgument(argv[2], mothershipLocalVMFaultMaximumRecoveryMilliseconds, timeout) &&
         timeout >= mothershipLocalAuthorityRecoveryMinimumTimeoutMilliseconds;
     if (!valid)
-      failure.assign("usage: recoverLocalClusterAuthority OPERATION_UUID CLUSTER TIMEOUT_MS (timeout must be 120000..300000)"_ctv);
+      failure.assign("usage: recoverLocalClusterAuthority OPERATION_UUID CLUSTER TIMEOUT_MS [--complete-interrupted-upgrade UPGRADE_OPERATION APPROVED_BUNDLE PREDECESSOR_RECOVERY|--admitted-active-runtime] (timeout must be 120000..300000)"_ctv);
 
     MothershipProdigyCluster cluster = {};
     if (valid)
@@ -14275,6 +16218,7 @@ private:
 
     MothershipLocalAuthorityRecoveryCohortRequest request = {};
     MothershipLocalAuthorityRecoveryCohortRecord record = {};
+    ProdigyApprovedUpgradeBundle repairBundle;
     bool resumed = false;
     if (valid)
     {
@@ -14287,10 +16231,20 @@ private:
           existingCohortRecord.request.topologyVersion : cluster.topology.version;
       request.timeoutMilliseconds = uint32_t(timeout);
       for (const auto& target : targets) request.executors.push_back(target.executor);
-      if (existingCohort &&
+      if(interruptedUpgrade) {
+        if(existingCohort) {
+          request.protocolVersion=existingCohortRecord.request.protocolVersion;
+          request.runtime=existingCohortRecord.request.runtime;
+          request.admittedRuntime=existingCohortRecord.request.admittedRuntime;
+        }
+        valid=prepareLocalRecoveryRuntimeIntent(cluster,targets,argv[4],argv[5],argv[6],existingCohort,
+                                                request,repairBundle,failure);
+        if(!valid && failure.empty())failure.assign("local runtime recovery admission or artifact binding failed"_ctv);
+      }
+      if (valid && existingCohort &&
           !mothershipLocalAuthorityRecoveryTopologyMatches(existingCohortRecord.request, cluster.topology))
       { failure.assign("local authority recovery current topology conflicts with its immutable cohort"_ctv); valid = false; }
-      else if (existingCohort &&
+      else if (valid && existingCohort &&
                !mothershipPhysicalFaultExactSerializedEqual(existingCohortRecord.request, request))
       { failure.assign("local authority recovery retry conflicts with its immutable cohort"_ctv); valid = false; }
     }
@@ -14311,6 +16265,17 @@ private:
     }
     if (valid && record.phase == MothershipLocalAuthorityRecoveryPhase::recovered)
     {
+      if(interruptedUpgrade) {
+        for(uint32_t i=0;valid && i<targets.size();++i) {
+          auto member=request.runtime.members[i];
+          valid=localRecoveryRuntimeObservation(cluster,targets[i],request,member,true,failure) &&
+                member.beforeBootID==record.runtimeProgress[i].activationBootID;
+        }
+        if(valid)valid=localRecoveryRuntimeFreshAuthority(cluster,request,repairBundle,true,failure);
+        if(!valid) {
+          basics_log("recoverLocalClusterAuthority success=0 pending=1 resumed=1 failure=%s\n",failure.c_str());exit(75);
+        }
+      }
       basics_log("recoverLocalClusterAuthority success=1 pending=0 resumed=1 phase=%u operationUUID=%016llx%016llx clusterUUID=%016llx%016llx failure=\n",
           unsigned(record.phase), (unsigned long long)(operationUUID >> 64), (unsigned long long)operationUUID,
           (unsigned long long)(cluster.clusterUUID >> 64), (unsigned long long)cluster.clusterUUID);
@@ -14347,6 +16312,9 @@ private:
           record.boundaries[index].phase == MothershipLocalAuthorityRecoveryPhase::recovered) continue;
       if (record.boundaries[index].phase == MothershipLocalAuthorityRecoveryPhase::armed)
       {
+        if(interruptedUpgrade && !installLocalRecoveryRuntime(cluster,targets[index],index,repairBundle,record,failure)) {
+          valid=false;recoveryPending=true;break;
+        }
         LocalAuthorityRecoveryExecutorReceipt receipt = {}; String receiptSHA256 = {};
         valid = runLocalAuthorityRecoveryExecutor(
             targets[index].boundary, targets[index].executor.executorOperationUUID, operationUUID,
@@ -14367,6 +16335,9 @@ private:
           !awaitLocalAuthorityRecoveryNonSeed(
               targets[index], operationUUID, uint32_t(timeout), completedReceiptSHA256, failure))
       { valid = false; recoveryPending = true; }
+      if(valid && interruptedUpgrade && !activateLocalRecoveryRuntime(cluster,targets[index],index,record,failure)) {
+        valid=false;recoveryPending=true;
+      }
     }
 
     uint32_t seedIndex = targets.size();
@@ -14375,6 +16346,10 @@ private:
     if (valid && seedIndex == targets.size())
     { failure.assign("local authority recovery lost its exact seed VM identity"_ctv); valid = false; }
     bool seedReleasedPending = false;
+    if (valid && interruptedUpgrade && record.boundaries[seedIndex].phase == MothershipLocalAuthorityRecoveryPhase::armed &&
+        !installLocalRecoveryRuntime(cluster,targets[seedIndex],seedIndex,repairBundle,record,failure)) {
+      valid=false;recoveryPending=true;
+    }
     if (valid && record.boundaries[seedIndex].phase == MothershipLocalAuthorityRecoveryPhase::armed)
     {
       LocalAuthorityRecoveryExecutorReceipt receipt = {}; String receiptSHA256 = {};
@@ -14431,12 +16406,18 @@ private:
         break;
       }
       completedReceiptSHA256s[index] = std::move(receiptSHA256);
+      if(interruptedUpgrade && !activateLocalRecoveryRuntime(cluster,targets[index],index,record,failure)) {
+        valid=false;recoveryPending=true;
+      }
     }
 
     ClusterStatusReport status = {};
     if (valid && !awaitLocalAuthorityRecoveryClusterHealth(
                      cluster, record, uint32_t(timeout), status, failure))
     { valid = false; recoveryPending = true; }
+    if(valid && interruptedUpgrade && !localRecoveryRuntimeFreshAuthority(cluster,request,repairBundle,true,failure)) {
+      valid=false;recoveryPending=true;
+    }
     if (valid)
     {
       for (uint32_t index = 0; valid && index < targets.size(); ++index)
@@ -14910,8 +16891,417 @@ private:
       exit(EXIT_FAILURE);
   }
 
+  static uint32_t localVMClusterLANIPv6ReceiptFailureMask(
+      std::string_view interfaceName, std::string_view macView,
+      std::string_view subnetView, std::string_view addressView,
+      std::string_view dropInView)
+  {
+    constexpr const char *dropIn =
+        "/etc/systemd/network/10-cloud-init-lan0.network.d/50-prodigy-cluster-lan-ipv6.conf";
+    const auto exact = [](std::string_view value, const char *expected) {
+      return value == std::string_view(expected, std::strlen(expected));
+    };
+    const auto lowercaseMAC = [](std::string_view value) {
+      if (value.size() != 17 || value[0] != '0' || value[1] != '2') return false;
+      for (size_t offset = 2; offset < value.size(); ++offset)
+      {
+        if (offset % 3 == 2) { if (value[offset] != ':') return false; }
+        else if (!((value[offset] >= '0' && value[offset] <= '9') ||
+                   (value[offset] >= 'a' && value[offset] <= 'f'))) return false;
+      }
+      return true;
+    };
+    String subnetText = {}, addressText = {};
+    subnetText.assign(subnetView.data(), subnetView.size());
+    addressText.assign(addressView.data(), addressView.size());
+    IPPrefix subnet = {}, addressPrefix = {};
+    const bool subnetParsed = parseCIDRPrefix(subnetText.c_str(), subnet);
+    const bool addressParsed = parseCIDRPrefix(addressText.c_str(), addressPrefix);
+    const auto slash = std::find(addressText.begin(), addressText.end(), '/');
+    String hostAddressText = {};
+    if (slash != addressText.end())
+      hostAddressText.append(addressText.data(), size_t(slash - addressText.begin()));
+    IPAddress hostAddress = {};
+    const bool hostParsed = ClusterMachine::parseIPAddressLiteral(hostAddressText, hostAddress);
+
+    uint32_t failures = 0;
+    if (!exact(interfaceName, "lan0")) failures |= 1u << 0;
+    if (!exact(dropInView, dropIn)) failures |= 1u << 1;
+    if (!lowercaseMAC(macView)) failures |= 1u << 2;
+    if (!subnetParsed) failures |= 1u << 3;
+    if (!addressParsed) failures |= 1u << 4;
+    if (!hostParsed) failures |= 1u << 5;
+    if (!subnet.network.is6) failures |= 1u << 6;
+    if (subnet.cidr != 64) failures |= 1u << 7;
+    if (subnet.network.v6[0] != 0xfd) failures |= 1u << 8;
+    if (!addressPrefix.network.is6) failures |= 1u << 9;
+    if (addressPrefix.cidr != 64) failures |= 1u << 10;
+    if (!addressPrefix.equals(subnet)) failures |= 1u << 11;
+    if (!hostAddress.is6) failures |= 1u << 12;
+    if (hostAddress.equals(subnet.network)) failures |= 1u << 13;
+    return failures;
+  }
+
+  void runConfigureLocalVMClusterLANIPv6(int argc, char *argv[])
+  {
+    String failure = {};
+    MothershipProdigyCluster cluster = {};
+    Vector<uint128_t> expectedMachineUUIDs = {};
+    Vector<MothershipLocalVMBoundaryDescriptor> boundaries = {};
+    bool valid = argc == 1;
+    if (!valid) failure.assign("usage: configureLocalVMClusterLANIPv6 CLUSTER"_ctv);
+    if (valid)
+    {
+      MothershipClusterRegistry registry = openClusterRegistry();
+      valid = registry.getClusterByIdentity(String(argv[0]), cluster, &failure);
+      if (valid && (cluster.deploymentMode != MothershipClusterDeploymentMode::local || cluster.nBrains != 3 ||
+                    cluster.topology.version == 0 || cluster.topology.machines.size() != 3))
+      { failure.assign("cluster LAN IPv6 configuration requires one exact three-Brain deploymentMode=local topology"_ctv); valid = false; }
+      if (valid)
+      {
+        for (const auto& machine : cluster.topology.machines)
+        {
+          if (machine.uuid == 0 || machine.kind != MachineConfig::MachineKind::vm || !machine.isBrain)
+          { failure.assign("cluster LAN IPv6 configuration requires three VM Brain machine identities"_ctv); valid = false; break; }
+          expectedMachineUUIDs.push_back(machine.uuid);
+        }
+      }
+      if (valid) valid = registry.listLocalVMBoundaries(cluster.clusterUUID, boundaries, &failure) &&
+          MothershipClusterRegistry::activeLocalVMBoundariesExactForMachines(
+              cluster.clusterUUID, expectedMachineUUIDs, boundaries, &failure);
+    }
+    if (valid)
+    {
+      std::sort(boundaries.begin(), boundaries.end(), [](const auto& left, const auto& right) {
+        return left.machineUUID < right.machineUUID;
+      });
+      for (const auto& boundary : boundaries)
+      {
+        if (boundary.retired || boundary.taskID != boundaries.front().taskID)
+        { failure.assign("cluster LAN IPv6 configuration requires one shared active VM task identity"_ctv); valid = false; break; }
+      }
+    }
+
+    Vector<uint64_t> observedPIDs = {};
+    Vector<String> observedStarttimes = {};
+    if (valid)
+    {
+      // Refresh the embedded launcher binding and prove all three immutable VM
+      // boundaries before the first guest network mutation. A retry can safely
+      // resume because the sealed action itself is idempotent.
+      for (auto& boundary : boundaries)
+      {
+        if (!reconcileLocalVMBoundaryExecutorBinding(boundary, failure))
+        { valid = false; break; }
+        String immutable = {}, starttime = {};
+        uint64_t pid = 0;
+        if (!queryLocalVMBoundaryExecutor(boundary, immutable, failure, &pid, &starttime) ||
+            immutable != boundary.immutableStateSHA256)
+        {
+          if (failure.empty()) failure.assign("cluster LAN IPv6 configuration found changed immutable VM state"_ctv);
+          valid = false; break;
+        }
+        observedPIDs.push_back(pid);
+        observedStarttimes.push_back(std::move(starttime));
+      }
+    }
+
+    String sharedSubnet = {};
+    Vector<String> configuredAddresses = {};
+    Vector<String> configuredMACs = {};
+    uint32_t configured = 0;
+    for (uint32_t index = 0; valid && index < boundaries.size(); ++index)
+    {
+      auto& boundary = boundaries[index];
+      Vector<String> arguments = {};
+      arguments.emplace_back("configure-cluster-lan-ipv6"_ctv);
+      arguments.emplace_back("--state"_ctv); arguments.push_back(boundary.statePath);
+      arguments.emplace_back("--task-id"_ctv); arguments.push_back(boundary.taskID);
+      String output = {};
+      valid = runLocalVMBoundarySealedLauncher(boundary, arguments, 60'000, output, failure);
+      if (!valid) break;
+
+      simdjson::dom::parser parser; simdjson::dom::element document;
+      if (output.size() > 16_KB || parser.parse(output.data(), output.size()).get(document) != simdjson::SUCCESS ||
+          document.type() != simdjson::dom::element_type::OBJECT)
+      { failure.assign("cluster LAN IPv6 owner returned malformed receipt"_ctv); valid = false; break; }
+      auto object = document.get_object();
+      if (object.size() != 5)
+      { failure.assign("cluster LAN IPv6 owner returned unsupported receipt schema"_ctv); valid = false; break; }
+      for (auto field : object)
+      {
+        String key = {}; key.setInvariant(field.key.data(), field.key.size());
+        if (key != "interface"_ctv && key != "mac"_ctv && key != "subnet"_ctv &&
+            key != "address"_ctv && key != "dropIn"_ctv)
+        { failure.assign("cluster LAN IPv6 owner receipt contains an unknown field"_ctv); valid = false; break; }
+      }
+      if (!valid) break;
+      std::string_view interfaceName, macView, subnetView, addressView, dropInView;
+      if (object["interface"].get(interfaceName) || object["mac"].get(macView) ||
+          object["subnet"].get(subnetView) || object["address"].get(addressView) ||
+          object["dropIn"].get(dropInView))
+      { failure.assign("cluster LAN IPv6 owner receipt has invalid field types"_ctv); valid = false; break; }
+      const uint32_t receiptFailures = localVMClusterLANIPv6ReceiptFailureMask(
+          interfaceName, macView, subnetView, addressView, dropInView);
+      if (receiptFailures != 0)
+      {
+        failure.snprintf<"cluster LAN IPv6 owner receipt is not one exact private lan0 /64 assignment mask={itoa}"_ctv>(
+            uint64_t(receiptFailures));
+        valid = false;
+        break;
+      }
+      String subnetText = {}, addressText = {}, mac = {};
+      subnetText.assign(subnetView.data(), subnetView.size());
+      addressText.assign(addressView.data(), addressView.size());
+      mac.assign(macView.data(), macView.size());
+      if (!sharedSubnet.empty() && sharedSubnet != subnetText)
+      { failure.assign("cluster LAN IPv6 owners derived different task subnets"_ctv); valid = false; break; }
+      for (const auto& prior : configuredAddresses)
+        if (prior == addressText)
+        { failure.assign("cluster LAN IPv6 owners derived duplicate guest addresses"_ctv); valid = false; break; }
+      for (const auto& prior : configuredMACs)
+        if (prior == mac)
+        { failure.assign("cluster LAN IPv6 owners reported duplicate guest MACs"_ctv); valid = false; break; }
+      if (!valid) break;
+
+      String immutable = {}, afterStarttime = {}; uint64_t afterPID = 0;
+      if (!queryLocalVMBoundaryExecutor(boundary, immutable, failure, &afterPID, &afterStarttime) ||
+          immutable != boundary.immutableStateSHA256 || afterPID != observedPIDs[index] ||
+          afterStarttime != observedStarttimes[index])
+      {
+        if (failure.empty()) failure.assign("cluster LAN IPv6 action changed its immutable VM process boundary"_ctv);
+        valid = false; break;
+      }
+      if (sharedSubnet.empty()) sharedSubnet = subnetText;
+      configuredAddresses.push_back(addressText);
+      configuredMACs.push_back(mac);
+      String machineUUID = {}; machineUUID.assignItoh(boundary.machineUUID);
+      basics_log("configureLocalVMClusterLANIPv6 memberSuccess=1 machineUUID=%s mac=%s address=%s\n",
+                 machineUUID.c_str(), mac.c_str(), addressText.c_str());
+      ++configured;
+    }
+
+    String clusterUUID = {}; clusterUUID.assignItoh(cluster.clusterUUID);
+    basics_log("configureLocalVMClusterLANIPv6 success=%u clusterUUID=%s configured=%u subnet=%s failure=%s\n",
+               unsigned(valid), clusterUUID.c_str(), unsigned(configured), sharedSubnet.c_str(), failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
+  void runRecoverUnreadyLocalClusterMachine(int argc, char *argv[])
+  {
+    String failure = {};
+    uint128_t operationUUID = 0, boundaryUUID = 0, upgradeOperationUUID = 0;
+    uint64_t timeout = 0;
+    bool valid = argc == 6 && prodigyParseCanonicalHex128(String(argv[0]), operationUUID) && operationUUID != 0 &&
+        prodigyParseCanonicalHex128(String(argv[1]), boundaryUUID) && boundaryUUID != 0 &&
+        std::strcmp(argv[2], "recover-unready-upgrade") == 0 &&
+        mothershipParseUnsignedArgument(argv[3], mothershipLocalVMFaultMaximumRecoveryMilliseconds, timeout) && timeout > 0 &&
+        prodigyParseCanonicalHex128(String(argv[4]), upgradeOperationUUID) && upgradeOperationUUID != 0;
+    MothershipLocalVMBoundaryDescriptor boundary = {};
+    MothershipProdigyCluster cluster = {};
+    MothershipUpgradeAdmissionRecord upgradeAdmission = {};
+    ProdigyApprovedUpgradeBundle targetBundle = {};
+    String targetBundlePath = {}, upgradeAdmissionSHA256 = {}, clusterIdentity = {};
+    if (valid)
+    {
+      {
+        auto registry = openClusterRegistry();
+        valid = registry.loadLocalVMBoundary(boundaryUUID, boundary, &failure);
+        if (valid)
+        {
+          clusterIdentity.assignItoh(boundary.clusterUUID);
+          valid = registry.getClusterByIdentity(clusterIdentity, cluster, &failure);
+        }
+      }
+      if (valid && (boundary.retired || cluster.deploymentMode != MothershipClusterDeploymentMode::local ||
+                    cluster.nBrains != 3 || cluster.topology.machines.size() != 3))
+      { failure.assign("unready local VM recovery requires an active three-Brain deploymentMode=local boundary"_ctv); valid = false; }
+      if (valid) valid = reconcileLocalVMBoundaryExecutorBinding(boundary, failure);
+      MachineCpuArchitecture architecture = MachineCpuArchitecture::unknown;
+      String targetInput = {}; targetInput.assign(argv[5]);
+      if (valid) valid = resolveProdigyBundleTargetArchitecture(clusterIdentity.c_str(), architecture, &failure) &&
+          prodigyResolveBundleArtifactInput(targetInput, architecture, targetBundlePath, &failure) &&
+          prodigyApproveBundleUpgradeContract(targetBundlePath, targetBundle, &failure);
+      if (valid)
+      {
+        auto registry = openClusterRegistry();
+        valid = registry.loadUpgradeAdmission(
+            cluster.clusterUUID, upgradeOperationUUID, upgradeAdmission, &failure);
+      }
+      if (valid)
+      {
+        String encoded = {}; auto copy = upgradeAdmission;
+        valid = BitseryEngine::serialize(encoded, copy) &&
+            prodigyComputeSHA256Hex(encoded, upgradeAdmissionSHA256, &failure) &&
+            upgradeAdmission.eligible && upgradeAdmission.approvedPath == 1 &&
+            upgradeAdmission.targetBundleSHA256 == targetBundle.bundleSHA256 &&
+            upgradeAdmission.targetContractSHA256 == targetBundle.contract.contractSHA256;
+        if (!valid && failure.empty()) failure.assign("unready local VM recovery differs from its admitted upgrade"_ctv);
+      }
+    }
+
+    MothershipLocalVMMachineFaultRecord record = {};
+    MothershipLocalVMMachineFaultRequest request = {};
+    bool resumed = false, alreadyAdmitted = false;
+    if (valid)
+    {
+      auto registry = openClusterRegistry(); String readFailure = {};
+      if (registry.loadLocalVMMachineFault(operationUUID, record, &readFailure))
+      {
+        alreadyAdmitted = true; request = record.request;
+        valid = request.protocolVersion == MothershipLocalVMMachineFaultRequest::unreadyUpgradeRecoveryVersion &&
+            request.vmBoundaryUUID == boundaryUUID && request.clusterUUID == cluster.clusterUUID &&
+            request.machineUUID == boundary.machineUUID &&
+            request.action == MothershipLocalVMMachineFaultAction::recoverUnreadyUpgrade &&
+            request.durationMilliseconds == timeout && request.upgradeOperationUUID == upgradeOperationUUID &&
+            request.targetBundleSHA256 == targetBundle.bundleSHA256 &&
+            request.targetContractSHA256 == targetBundle.contract.contractSHA256 &&
+            request.upgradeAdmissionSHA256 == upgradeAdmissionSHA256 &&
+            request.expectedBoundarySHA256 == boundary.immutableStateSHA256;
+        if (!valid) failure.assign("unready local VM recovery retry conflicts with its durable request"_ctv);
+      }
+      else if (!readFailure.equal("record not found"_ctv)) { failure = readFailure; valid = false; }
+    }
+    if (valid && alreadyAdmitted && record.hasReceipt)
+    {
+      basics_log("faultLocalClusterMachine success=1 resumed=1 restored=1 inventoryComplete=1 freshUpgradeAdmissionRequired=1 mode=recover-unready-upgrade operationUUID=%016llx%016llx boundaryUUID=%016llx%016llx failure=\n",
+          (unsigned long long)(operationUUID >> 64), (unsigned long long)operationUUID,
+          (unsigned long long)(boundaryUUID >> 64), (unsigned long long)boundaryUUID);
+      return;
+    }
+
+    LocalVMGuestLinuxIdentity beforeGuest = {};
+    MothershipPhysicalFaultMachineObservation before = {};
+    ProdigyUpgradeAdmissionReportRequest observationRequest = {};
+    if (valid && !alreadyAdmitted)
+    {
+      String immutable = {}, starttime = {}; uint64_t pid = 0;
+      valid = queryLocalVMBoundaryExecutor(boundary, immutable, failure, &pid, &starttime) &&
+          immutable == boundary.immutableStateSHA256 &&
+          queryLocalVMBoundaryGuestLinuxIdentity(boundary, beforeGuest, failure) &&
+          beforeGuest.qemuPID == pid && beforeGuest.qemuStarttime == starttime;
+      if (!valid && failure.empty()) failure.assign("unready local VM recovery could not bind the exact live guest process"_ctv);
+      ClusterStatusReport beforeReport = {};
+      if (valid) valid = readManagedClusterStatus(cluster, beforeReport, failure) &&
+          physicalFaultUnreadyMachineObservation(beforeReport, cluster.clusterUUID,
+                                                 boundary.machineUUID, before, failure);
+      String clusterIdentity = {}; clusterIdentity.assignItoh(cluster.clusterUUID);
+      if (valid) valid = configureControlTarget(clusterIdentity.c_str(), &failure);
+      observationRequest.operationID.assignItoh(upgradeOperationUUID);
+      observationRequest.targetBundleSHA256 = targetBundle.bundleSHA256;
+      observationRequest.targetContractSHA256 = targetBundle.contract.contractSHA256;
+      observationRequest.requiredStagingBytes = targetBundle.contract.requiredFreeBytes;
+      MothershipUpgradeAdmissionReport preRecovery = {};
+      if (valid) valid = requestUpgradeAdmissionReport(observationRequest, preRecovery, failure) &&
+          mothershipLocalVMUnreadyUpgradePreRecoveryReportValid(
+              preRecovery, upgradeAdmission, cluster, boundary.machineUUID, &failure);
+      if (valid)
+      {
+        request.protocolVersion = MothershipLocalVMMachineFaultRequest::unreadyUpgradeRecoveryVersion;
+        request.operationUUID = operationUUID; request.vmBoundaryUUID = boundaryUUID;
+        request.clusterUUID = cluster.clusterUUID; request.machineUUID = boundary.machineUUID;
+        request.action = MothershipLocalVMMachineFaultAction::recoverUnreadyUpgrade;
+        request.durationMilliseconds = uint32_t(timeout); request.expectedBootSHA256 = before.stateSHA256;
+        request.upgradeOperationUUID = upgradeOperationUUID;
+        request.targetBundleSHA256 = targetBundle.bundleSHA256;
+        request.targetContractSHA256 = targetBundle.contract.contractSHA256;
+        request.upgradeAdmissionSHA256 = upgradeAdmissionSHA256;
+        request.expectedBoundarySHA256 = boundary.immutableStateSHA256;
+        request.expectedLinuxMachineID = beforeGuest.machineID;
+        request.expectedLinuxBootID = beforeGuest.bootID;
+        request.expectedQemuPID = beforeGuest.qemuPID;
+        request.expectedQemuStarttime = beforeGuest.qemuStarttime;
+        request.incompleteObservationReceiptVersion = preRecovery.observationReceiptVersion;
+        auto registry = openClusterRegistry();
+        valid = registry.admitLocalVMMachineFault(request, before, record, resumed, &failure);
+      }
+    }
+    else if (valid)
+    {
+      before = record.admission;
+      observationRequest.operationID.assignItoh(request.upgradeOperationUUID);
+      observationRequest.targetBundleSHA256 = request.targetBundleSHA256;
+      observationRequest.targetContractSHA256 = request.targetContractSHA256;
+      observationRequest.requiredStagingBytes = targetBundle.contract.requiredFreeBytes;
+    }
+
+    uint64_t faultedAt = 0, executorRestoredAt = 0;
+    bool rebooted = false;
+    if (valid)
+    {
+      valid = runLocalVMBoundaryExecutorAction(boundary, operationUUID, "cold-reboot",
+                                               uint32_t(timeout), faultedAt, executorRestoredAt, failure);
+      rebooted = valid;
+    }
+    LocalVMGuestLinuxIdentity afterGuest = {};
+    String afterImmutable = {}, afterStarttime = {}; uint64_t afterPID = 0;
+    if (valid) valid = queryLocalVMBoundaryExecutor(boundary, afterImmutable, failure, &afterPID, &afterStarttime) &&
+        afterImmutable == request.expectedBoundarySHA256 &&
+        queryLocalVMBoundaryGuestLinuxIdentity(boundary, afterGuest, failure) &&
+        afterGuest.qemuPID == afterPID && afterGuest.qemuStarttime == afterStarttime &&
+        afterGuest.machineID == request.expectedLinuxMachineID &&
+        afterGuest.bootID != request.expectedLinuxBootID &&
+        (afterGuest.qemuPID != request.expectedQemuPID ||
+         afterGuest.qemuStarttime != request.expectedQemuStarttime);
+    if (!valid && rebooted && failure.empty())
+      failure.assign("unready local VM recovery did not prove a distinct guest boot on the unchanged boundary"_ctv);
+
+    MothershipPhysicalFaultMachineObservation after = {};
+    const int64_t deadline = Time::now<TimeResolution::ms>() + int64_t(timeout);
+    while (valid && Time::now<TimeResolution::ms>() <= deadline)
+    {
+      ClusterStatusReport afterReport = {}; String observationFailure = {};
+      if (readManagedClusterStatus(cluster, afterReport, observationFailure) &&
+          physicalFaultMachineObservation(afterReport, cluster.clusterUUID,
+                                          boundary.machineUUID, after, observationFailure) &&
+          after.stateSHA256 != request.expectedBootSHA256) break;
+      after = {}; ::usleep(500'000);
+    }
+    if (valid && !mothershipPhysicalFaultMachineObservationValid(after))
+    { failure.assign("unready local VM recovery did not restore one healthy commissioned Brain before its deadline"_ctv); valid = false; }
+
+    MothershipUpgradeAdmissionReport completed = {};
+    String completedReportSHA256 = {};
+    if (valid) valid = requestUpgradeAdmissionReport(observationRequest, completed, failure) &&
+        localVMUnreadyUpgradeReportValid(completed, upgradeAdmission, cluster,
+                                         boundary.machineUUID, true,
+                                         request.incompleteObservationReceiptVersion, failure) &&
+        hashUpgradeAdmissionReport(completed, completedReportSHA256, failure);
+    MothershipLocalVMMachineFaultReceipt receipt = {};
+    if (valid)
+    {
+      receipt.protocolVersion = MothershipLocalVMMachineFaultReceipt::unreadyUpgradeRecoveryVersion;
+      receipt.operationUUID = operationUUID; receipt.vmBoundaryUUID = boundaryUUID;
+      receipt.before = record.admission; receipt.after = after;
+      receipt.restoredBootSHA256 = after.stateSHA256;
+      receipt.faultedAtMonotonicMilliseconds = faultedAt;
+      receipt.restoredAtMonotonicMilliseconds = executorRestoredAt;
+      receipt.restored = true;
+      receipt.beforeLinuxMachineID = request.expectedLinuxMachineID;
+      receipt.beforeLinuxBootID = request.expectedLinuxBootID;
+      receipt.beforeQemuPID = request.expectedQemuPID;
+      receipt.beforeQemuStarttime = request.expectedQemuStarttime;
+      receipt.afterLinuxMachineID = afterGuest.machineID;
+      receipt.afterLinuxBootID = afterGuest.bootID;
+      receipt.afterQemuPID = afterGuest.qemuPID;
+      receipt.afterQemuStarttime = afterGuest.qemuStarttime;
+      receipt.completedObservationReceiptVersion = completed.observationReceiptVersion;
+      receipt.completedUpgradeReportSHA256 = completedReportSHA256;
+      auto registry = openClusterRegistry();
+      valid = registry.recordLocalVMMachineFaultReceipt(request, receipt, record, resumed, &failure);
+    }
+    basics_log("faultLocalClusterMachine success=%u resumed=%u restored=%u inventoryComplete=%u freshUpgradeAdmissionRequired=%u mode=recover-unready-upgrade operationUUID=%016llx%016llx boundaryUUID=%016llx%016llx failure=%s\n",
+        unsigned(valid), unsigned(resumed), unsigned(rebooted), unsigned(valid && record.hasReceipt),
+        unsigned(valid && record.hasReceipt),
+        (unsigned long long)(operationUUID >> 64), (unsigned long long)operationUUID,
+        (unsigned long long)(boundaryUUID >> 64), (unsigned long long)boundaryUUID, failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
   void runFaultLocalClusterMachine(int argc, char *argv[])
   {
+    if (argc == 6 && std::strcmp(argv[2], "recover-unready-upgrade") == 0)
+    { runRecoverUnreadyLocalClusterMachine(argc, argv); return; }
     String failure = {};
     uint128_t operationUUID = 0, boundaryUUID = 0;
     uint64_t timeout = 0;
@@ -15019,44 +17409,97 @@ private:
     if (!valid) exit(EXIT_FAILURE);
   }
 
+  struct PhysicalFaultProviderRequest {
+    uint128_t operationUUID = 0;
+    const char *role = nullptr;
+    uint128_t guestUUID = 0;
+    String peerAddress;
+    String gatewayEndpoint;
+    String flowTarget;
+    String flowIdentity;
+    uint32_t durationMilliseconds = 0;
+  };
+
   struct PhysicalFaultProviderReceipt {
+    bool active = false;
+    bool restored = false;
     uint64_t installedAtMonotonicMs = 0;
+    uint64_t autoRestoreDeadlineMonotonicMs = 0;
     uint64_t restoredAtMonotonicMs = 0;
   };
 
-  bool parsePhysicalFaultProviderReceipt(const String& output, uint128_t operationUUID,
-                                         const char *role, uint128_t guestUUID,
-                                         const String& peerAddress, uint32_t durationMilliseconds,
+  static bool physicalFaultProviderRequestValid(const PhysicalFaultProviderRequest& request,
+                                                String& failure)
+  {
+    if (request.operationUUID == 0 || request.role == nullptr ||
+        (std::strcmp(request.role, "source") != 0 && std::strcmp(request.role, "target") != 0) ||
+        request.guestUUID == 0 || !mothershipPhysicalFaultNumericAddressValid(request.peerAddress) ||
+        !mothershipPhysicalFaultNumericAddressValid(request.gatewayEndpoint) ||
+        request.flowTarget.empty() || !mothershipPhysicalFaultFlowIdentityValid(request.flowIdentity) ||
+        request.durationMilliseconds == 0 ||
+        request.durationMilliseconds > mothershipPhysicalFaultMaximumDurationMilliseconds)
+    { failure.assign("physical fault provider request lacks one exact authenticated lifecycle identity"_ctv); return false; }
+    return true;
+  }
+
+  static bool physicalFaultProviderIdentityMatches(
+      std::string_view operation, std::string_view observedRole, std::string_view guest,
+      std::string_view peer, std::string_view gateway, std::string_view flowTarget,
+      std::string_view flowIdentity, uint64_t duration, std::string_view boot,
+      const PhysicalFaultProviderRequest& request)
+  {
+    String expectedOperation = {}, expectedGuest = {};
+    mothershipAssignProviderHex128(request.operationUUID, expectedOperation);
+    mothershipAssignProviderHex128(request.guestUUID, expectedGuest);
+    const auto equal = [](std::string_view observed, const String& expected) {
+      return observed.size() == expected.size() &&
+          (!observed.empty() || std::memcmp(observed.data(), expected.data(), observed.size()) == 0);
+    };
+    return equal(operation, expectedOperation) && observedRole == request.role && equal(guest, expectedGuest) &&
+        equal(peer, request.peerAddress) && equal(gateway, request.gatewayEndpoint) &&
+        equal(flowTarget, request.flowTarget) && equal(flowIdentity, request.flowIdentity) &&
+        duration == request.durationMilliseconds && !boot.empty();
+  }
+
+  bool parsePhysicalFaultProviderReceipt(const String& output,
+                                         const PhysicalFaultProviderRequest& request,
+                                         bool allowActive, bool allowTerminal,
                                          PhysicalFaultProviderReceipt& receipt, String& failure)
   {
     receipt = {};
+    if (!physicalFaultProviderRequestValid(request, failure)) return false;
     simdjson::dom::parser parser; simdjson::dom::element document;
     if (output.size() > 16_KB || parser.parse(output.data(), output.size()).get(document) != simdjson::SUCCESS ||
         document.type() != simdjson::dom::element_type::OBJECT)
     { failure.assign("physical fault provider returned malformed JSON"_ctv); return false; }
     auto object = document.get_object();
-    std::string_view operation, observedRole, guest, peer, boot;
-    uint64_t duration = 0, installed = 0, restored = 0; bool didRestore = false;
-    if (object.size() != 9 || object["operationID"].get(operation) || object["role"].get(observedRole) ||
+    std::string_view operation, observedRole, guest, peer, gateway, target, identity, boot, phase;
+    uint64_t duration = 0, installed = 0, deadline = 0, restoredAt = 0, routeMetric = 0;
+    bool didRestore = false, authenticated = false;
+    // Active and terminal receipts intentionally have disjoint exact schemas.
+    // This rejects accidental acceptance of a future provider field as proof.
+    const bool active = object.size() == 15 && !object["phase"].get(phase) &&
+        phase == "applied" && !object["routeMetric"].get(routeMetric) &&
+        !object["authenticated"].get(authenticated) && authenticated;
+    const bool terminal = object.size() == 13 && !object["restoredAtMonotonicMs"].get(restoredAt);
+    if ((!active && !terminal) || object["operationID"].get(operation) || object["role"].get(observedRole) ||
         object["guestID"].get(guest) || object["peerAddress"].get(peer) ||
-        object["durationMilliseconds"].get(duration) || object["bootID"].get(boot) ||
-        object["installedAtMonotonicMs"].get(installed) ||
-        object["restoredAtMonotonicMs"].get(restored) || object["restored"].get(didRestore) ||
-        !didRestore || installed == 0 || restored < installed ||
-        restored - installed < durationMilliseconds ||
-        restored - installed > uint64_t(durationMilliseconds) + mothershipPhysicalFaultRestorationSlackMilliseconds)
-    { failure.assign("physical fault provider receipt does not prove bounded restoration"_ctv); return false; }
-    String expectedOperation = {}, expectedGuest = {};
-    mothershipAssignProviderHex128(operationUUID, expectedOperation);
-    mothershipAssignProviderHex128(guestUUID, expectedGuest);
-    auto equal = [](std::string_view observed, const String& expected) {
-      return observed.size() == expected.size() &&
-          (!observed.size() || std::memcmp(observed.data(), expected.data(), observed.size()) == 0);
-    };
-    if (!equal(operation, expectedOperation) || observedRole != role || !equal(guest, expectedGuest) ||
-        !equal(peer, peerAddress) || duration != durationMilliseconds || boot.empty())
-    { failure.assign("physical fault provider receipt conflicts with its exact request"_ctv); return false; }
-    receipt.installedAtMonotonicMs = installed; receipt.restoredAtMonotonicMs = restored;
+        object["gatewayEndpoint"].get(gateway) || object["flowTarget"].get(target) ||
+        object["flowIdentity"].get(identity) || object["durationMilliseconds"].get(duration) ||
+        object["bootID"].get(boot) || object["installedAtMonotonicMs"].get(installed) ||
+        object["autoRestoreDeadlineMonotonicMs"].get(deadline) || object["restored"].get(didRestore) ||
+        !physicalFaultProviderIdentityMatches(operation, observedRole, guest, peer, gateway, target, identity,
+                                              duration, boot, request) || installed == 0 || deadline < installed ||
+        deadline - installed != request.durationMilliseconds || (active && didRestore) ||
+        (terminal && (!didRestore || restoredAt < installed)))
+    { failure.assign("physical fault provider receipt conflicts with its exact lifecycle request"_ctv); return false; }
+    if (active && !allowActive) { failure.assign("physical fault provider returned active receipt at terminal boundary"_ctv); return false; }
+    if (terminal && !allowTerminal) { failure.assign("physical fault provider returned terminal receipt before cleanup boundary"_ctv); return false; }
+    if (terminal && restoredAt > deadline + mothershipPhysicalFaultRestorationSlackMilliseconds)
+    { failure.assign("physical fault terminal receipt exceeds its bounded restoration deadline"_ctv); return false; }
+    receipt.active = active; receipt.restored = terminal;
+    receipt.installedAtMonotonicMs = installed; receipt.autoRestoreDeadlineMonotonicMs = deadline;
+    receipt.restoredAtMonotonicMs = restoredAt;
     return true;
   }
 
@@ -15128,21 +17571,43 @@ private:
     return true;
   }
 
-  void physicalFaultProviderArguments(uint128_t operationUUID, const char *role,
-                                      uint128_t guestUUID, const String& peerAddress,
-                                      uint32_t durationMilliseconds, Vector<String>& arguments)
+  void physicalFaultProviderArguments(const char *command, const PhysicalFaultProviderRequest& request,
+                                      Vector<String>& arguments)
   {
     String operation = {}, guest = {}, duration = {};
-    mothershipAssignProviderHex128(operationUUID, operation);
-    mothershipAssignProviderHex128(guestUUID, guest);
-    duration.assignItoa(durationMilliseconds);
-    arguments.clear(); arguments.emplace_back("execute"_ctv);
+    mothershipAssignProviderHex128(request.operationUUID, operation);
+    mothershipAssignProviderHex128(request.guestUUID, guest);
+    duration.assignItoa(request.durationMilliseconds);
+    arguments.clear(); arguments.emplace_back(command);
     arguments.emplace_back("--state-root"_ctv); arguments.emplace_back("/var/lib/prodigy/mothership-physical-faults"_ctv);
     arguments.emplace_back("--operation-id"_ctv); arguments.push_back(operation);
-    arguments.emplace_back("--role"_ctv); arguments.emplace_back(role);
+    arguments.emplace_back("--role"_ctv); arguments.emplace_back(request.role);
     arguments.emplace_back("--guest-id"_ctv); arguments.push_back(guest);
-    arguments.emplace_back("--peer-address"_ctv); arguments.push_back(peerAddress);
+    arguments.emplace_back("--peer-address"_ctv); arguments.push_back(request.peerAddress);
     arguments.emplace_back("--duration-ms"_ctv); arguments.push_back(duration);
+    arguments.emplace_back("--gateway-endpoint"_ctv); arguments.push_back(request.gatewayEndpoint);
+    arguments.emplace_back("--flow-target"_ctv); arguments.push_back(request.flowTarget);
+    arguments.emplace_back("--flow-identity"_ctv); arguments.push_back(request.flowIdentity);
+  }
+
+  bool runPhysicalFaultProviderLifecycle(const MothershipProdigyCluster& cluster,
+                                         MothershipPhysicalFaultExecutorKind executorKind,
+                                         uint128_t localVMBoundaryUUID, const String& cloudID,
+                                         const char *command, const PhysicalFaultProviderRequest& request,
+                                         bool allowActive, bool allowTerminal,
+                                         PhysicalFaultProviderReceipt& receipt, String& failure)
+  {
+    if (!physicalFaultProviderRequestValid(request, failure)) return false;
+    MothershipProdigyClusterMachine executor = {};
+    if (!resolvePhysicalFaultExecutor(cluster, request.guestUUID, executorKind, localVMBoundaryUUID,
+                                      cloudID, executor, failure)) return false;
+    Vector<String> arguments = {}; physicalFaultProviderArguments(command, request, arguments);
+    String output = {};
+    if (!mothershipRunRemoteSealedPythonProvider(
+          cluster, executor, "mothership-physical-fault-upload",
+          mothershipPhysicalFaultProviderSource, sizeof(mothershipPhysicalFaultProviderSource),
+          arguments, int(request.durationMilliseconds + 30'000), output, failure)) return false;
+    return parsePhysicalFaultProviderReceipt(output, request, allowActive, allowTerminal, receipt, failure);
   }
 
   bool runPhysicalFaultProvider(const MothershipProdigyCluster& cluster, uint128_t operationUUID,
@@ -15152,18 +17617,27 @@ private:
                                 uint128_t localVMBoundaryUUID, const String& cloudID,
                                 PhysicalFaultProviderReceipt& receipt, String& failure)
   {
-    MothershipProdigyClusterMachine executor = {};
-    if (!resolvePhysicalFaultExecutor(cluster, guestUUID, executorKind, localVMBoundaryUUID,
-                                      cloudID, executor, failure)) return false;
-    Vector<String> arguments = {};
-    physicalFaultProviderArguments(operationUUID, role, guestUUID, peerAddress, durationMilliseconds, arguments);
-    String output = {};
-    if (!mothershipRunRemoteSealedPythonProvider(
-          cluster, executor, "mothership-physical-fault-upload",
-          mothershipPhysicalFaultProviderSource, sizeof(mothershipPhysicalFaultProviderSource),
-          arguments, int(durationMilliseconds + 30'000), output, failure)) return false;
-    return parsePhysicalFaultProviderReceipt(output, operationUUID, role, guestUUID,
-                                             peerAddress, durationMilliseconds, receipt, failure);
+    // Legacy faultClusterNetwork remains terminal: it invokes the reusable
+    // lifecycle in order, leaving a qualification owner free to put workload
+    // and convergence checks between apply and remove.
+    PhysicalFaultProviderRequest request = {};
+    request.operationUUID = operationUUID; request.role = role; request.guestUUID = guestUUID;
+    request.peerAddress = peerAddress; request.gatewayEndpoint = peerAddress;
+    request.flowTarget = "peer-host"_ctv; request.flowIdentity = "host:"_ctv;
+    request.flowIdentity.append(peerAddress); request.durationMilliseconds = durationMilliseconds;
+    PhysicalFaultProviderReceipt applied = {}, observed = {};
+    if (!runPhysicalFaultProviderLifecycle(cluster, executorKind, localVMBoundaryUUID, cloudID,
+                                           "apply", request, true, false, applied, failure) ||
+        !runPhysicalFaultProviderLifecycle(cluster, executorKind, localVMBoundaryUUID, cloudID,
+                                           "query", request, true, true, observed, failure)) return false;
+    if (observed.restored) { receipt = observed; return true; }
+    ::usleep(useconds_t(durationMilliseconds) * 1000);
+    if (!runPhysicalFaultProviderLifecycle(cluster, executorKind, localVMBoundaryUUID, cloudID,
+                                           "query", request, true, true, observed, failure)) return false;
+    // remove is idempotent, so a deadline-driven terminal query is still
+    // followed by a terminal cleanup receipt from the exact same operation.
+    return runPhysicalFaultProviderLifecycle(cluster, executorKind, localVMBoundaryUUID, cloudID,
+                                             "remove", request, false, true, receipt, failure);
   }
 
   void runFaultClusterNetwork(int argc, char *argv[])
@@ -15848,10 +18322,15 @@ private:
       failure.assign("stateful command outcome is unknown; resume the exact pair operation"_ctv); return false;
     }
     auto *args = message->args; String payload;
+    const bool preparation = request.version == 2 && request.preparationQuery;
     if (!ProdigyIngressValidation::extractVariableStringView(args, message->terminal(), payload) ||
-        args != message->terminal() || !BitseryEngine::deserializeSafe(payload, response) || response.version != 1 ||
-        response.deploymentID != request.deploymentID || response.pairIntentSHA256 != request.pairIntentSHA256 ||
-        !prodigyStatefulDataAuthorityEqual(response.authority, request.authority)) {
+        args != message->terminal() || !BitseryEngine::deserializeSafe(payload, response) ||
+        response.deploymentID != request.deploymentID ||
+        (preparation
+         ? (response.version != 2 || !response.preparationQuery ||
+            !prodigyStatefulDataAuthorityPreparationContextEqual(response.preparation, request.preparation))
+         : (response.version != 1 || response.pairIntentSHA256 != request.pairIntentSHA256 ||
+            !prodigyStatefulDataAuthorityEqual(response.authority, request.authority)))) {
       failure.assign("stateful owner returned a mismatched operation receipt"_ctv); return false;
     }
     if (!response.failure.empty()) { failure = response.failure; return false; }
@@ -15924,8 +18403,9 @@ private:
   bool abortNametagStatefulPairBeforeFence(MothershipProductionPairRecord& record, String& failure)
   {
     if (record.phase == MothershipProductionPairPhase::statefulAbortedBeforeFence) return true;
-    MothershipProdigyCluster source, target;
-    if (!productionPairTransportReady(record, source, target, failure)) return false;
+    MothershipProdigyCluster routeSource, routeDestination, source, target;
+    if (!productionPairTransportReady(record, routeSource, routeDestination, failure) ||
+        !productionPairDataClusters(record, routeSource, routeDestination, source, target, failure)) return false;
     const auto operation = record.intent.operationUUID;
     if (record.phase != MothershipProductionPairPhase::statefulAbortBeforeFencePending) {
       auto copy = record.intent; String bytes, digest;
@@ -16008,8 +18488,9 @@ private:
 
   bool advanceNametagStatefulPair(MothershipProductionPairRecord& record, const String& artifactPath, String& failure)
   {
-    MothershipProdigyCluster source, target;
-    if (!productionPairTransportReady(record, source, target, failure)) return false;
+    MothershipProdigyCluster routeSource, routeDestination, source, target;
+    if (!productionPairTransportReady(record, routeSource, routeDestination, failure) ||
+        !productionPairDataClusters(record, routeSource, routeDestination, source, target, failure)) return false;
     const auto& intent = record.intent;
     String artifactDigest; uint64_t artifactBytes = 0;
     if (!mothershipValidateDiscombobulatorContainerBlobContract(artifactPath, &failure) ||
@@ -16089,7 +18570,8 @@ private:
       if (!mothershipProductionPairStatefulCommand(record, MothershipProductionPairPhase::targetOwnershipActive, query)) return false;
       query.query = true;
       if (!exchangeStatefulDataAuthority(target, query, response, nullptr, failure) || !response.ready ||
-          !productionPairTransportReady(record, source, target, failure)) return false;
+          !productionPairTransportReady(record, routeSource, routeDestination, failure) ||
+          !productionPairDataClusters(record, routeSource, routeDestination, source, target, failure)) return false;
       String evidence, digest; BitseryEngine::serialize(evidence, response);
       auto route = intent.route; String routeBytes; BitseryEngine::serialize(routeBytes, route); evidence.append(routeBytes);
       if (!prodigyComputeSHA256Hex(evidence, digest)) return false;
@@ -16132,6 +18614,1362 @@ private:
     basics_log("nametagStatefulPair success=%u phase=%u complete=%u failure=%s\n", unsigned(valid), unsigned(record.phase),
         unsigned(valid && mothershipProductionPairTerminal(record.phase)), failure.c_str());
     if (!valid) exit(EXIT_FAILURE);
+  }
+
+  void runPrepareNametagStatefulPair(int argc, char *argv[])
+  {
+    String failure = {}, requestBytes = {}, artifactPath = {};
+    MothershipNametagStatefulPreparationRequest request = {};
+    uint64_t sourceDeploymentID = 0, shardGroup = 0;
+    bool valid = argc == 9 &&
+        prodigyParseCanonicalHex128(String(argv[0]), request.operationUUID) && request.operationUUID != 0 &&
+        prodigyParseCanonicalHex128(String(argv[1]), request.routeUUID) && request.routeUUID != 0 &&
+        mothershipParseUnsignedArgument(argv[3], UINT64_MAX, sourceDeploymentID) && sourceDeploymentID != 0 &&
+        mothershipParseUnsignedArgument(argv[4], UINT16_MAX, shardGroup);
+    if (!valid) failure.assign("usage: prepareNametagStatefulPair OPERATION_UUID ROUTE_UUID SOURCE_CLUSTER SOURCE_DEPLOYMENT_ID SHARD_GROUP TARGET_CLUSTER TARGET_PLAN_JSON TARGET_ARTIFACT OUTPUT_INTENT_BIN"_ctv);
+
+    MothershipProdigyCluster source = {}, target = {};
+    CousinRouteRecord route = {}; CousinRouteApplyReceipt routeSourceReceipt = {}, routeDestinationReceipt = {};
+    if (valid) {
+      auto registry = openClusterRegistry();
+      valid = registry.getClusterByIdentity(String(argv[2]), source, &failure) &&
+          registry.getClusterByIdentity(String(argv[5]), target, &failure) &&
+          registry.loadUsableCousinRoute(request.routeUUID, Time::now<TimeResolution::ms>(), route, &failure) &&
+          registry.loadCurrentCousinRouteApplyReceipt(route.routeUUID, CousinRouteHalf::source,
+                                                       routeSourceReceipt, &failure) &&
+          registry.loadCurrentCousinRouteApplyReceipt(route.routeUUID, CousinRouteHalf::destination,
+                                                       routeDestinationReceipt, &failure);
+      if (valid && (source.clusterUUID == target.clusterUUID || source.deploymentMode == MothershipClusterDeploymentMode::test ||
+          target.deploymentMode == MothershipClusterDeploymentMode::test || source.nBrains != 3 || target.nBrains != 3 ||
+          route.sourceClusterUUID != target.clusterUUID || route.destinationClusterUUID != source.clusterUUID)) {
+        failure.assign("Nametag stateful preparation requires an outbound target-to-source route across distinct non-test three-Brain clusters"_ctv);
+        valid = false;
+      }
+    }
+    request.sourceClusterUUID = source.clusterUUID; request.targetClusterUUID = target.clusterUUID;
+    request.sourceDeploymentID = sourceDeploymentID; request.shardGroup = uint32_t(shardGroup);
+
+    DeploymentPlan targetPlan = {}; bool returnAfterOkay = false;
+    if (valid) valid = prepareDeploymentPlan(target.name.c_str(), argv[6], argv[7], targetPlan,
+                                             artifactPath, returnAfterOkay, failure);
+    socket.close();
+    if (valid) {
+      auto planCopy = targetPlan;
+      valid = BitseryEngine::serialize(request.targetDeploymentPlan, planCopy) &&
+          mothershipNametagStatefulPreparationRequestValid(request) &&
+          BitseryEngine::serialize(requestBytes, request);
+      if (!valid && failure.empty()) failure.assign("Nametag stateful preparation request could not be canonicalized"_ctv);
+    }
+    String requestSHA256 = {};
+    if (valid) valid = prodigyComputeSHA256Hex(requestBytes, requestSHA256, &failure);
+    if (valid) {
+      MothershipNametagStatefulPreparationRecord prior = {}; String readFailure = {};
+      auto registry = openClusterRegistry();
+      if (registry.loadNametagStatefulPreparation(request.operationUUID, prior, &readFailure)) {
+        if (prior.requestSHA256 != requestSHA256) { failure.assign("Nametag stateful preparation retry conflicts with its immutable request"_ctv); valid = false; }
+        else { String encoded = {}; auto copy = prior.intent; BitseryEngine::serialize(encoded, copy);
+          valid = ContainerStore::atomicWriteRuntimeFile(String(argv[8]), encoded, &failure);
+          basics_log("prepareNametagStatefulPair success=%u resumed=1 operationUUID=%s failure=%s\n", unsigned(valid), argv[0], failure.c_str());
+          if (!valid) exit(EXIT_FAILURE); return;
+        }
+      } else if (!readFailure.equal("record not found"_ctv)) { failure = readFailure; valid = false; }
+    }
+    ProdigyLocalCousinServicePermissionResponse routeSourcePermission = {}, routeDestinationPermission = {};
+    ClusterStatusReport sourceStatus = {}, targetStatus = {}; DeploymentIdentityReport sourceReport = {};
+    if (valid) valid = source.deploymentMode != MothershipClusterDeploymentMode::test && target.deploymentMode != MothershipClusterDeploymentMode::test &&
+        productionClusterHealthy(source, sourceStatus, failure) && productionClusterHealthy(target, targetStatus, failure) &&
+        readLocalCousinServicePermission(target, route.sourcePermissionUUID, routeSourcePermission, failure) &&
+        readLocalCousinServicePermission(source, route.destinationPermissionUUID, routeDestinationPermission, failure) &&
+        routeSourcePermission.permission.purpose == ProdigyCousinServicePurpose::statefulCousin &&
+        routeDestinationPermission.permission.purpose == ProdigyCousinServicePurpose::statefulCousin &&
+        readDeploymentIdentity(source, request.sourceDeploymentID, sourceReport, failure);
+    MothershipProductionWorkloadIdentity sourceWorkload = {}, targetWorkload = {};
+    String artifactDigest = {}; uint64_t artifactBytes = 0;
+    if (valid) {
+      String targetPlanDigest = {};
+      const uint64_t selectedShardReplicaCount = uint64_t(sourceReport.nShardGroups) * 3;
+      valid = sourceReport.isStateful && sourceReport.applicationID >= 3 && sourceReport.applicationID <= 4 &&
+          prodigyDeploymentIdentityReportVersionSupported(sourceReport.version, 2) && sourceReport.nShardGroups == 3 &&
+          request.shardGroup < sourceReport.nShardGroups && selectedShardReplicaCount <= UINT32_MAX &&
+          sourceReport.nTarget == selectedShardReplicaCount && sourceReport.nDeployed == selectedShardReplicaCount &&
+          sourceReport.nHealthy == selectedShardReplicaCount &&
+          sourceReport.clusterUUID == source.clusterUUID &&
+          mothershipValidateDiscombobulatorContainerBlobContract(artifactPath, &failure) &&
+          prodigyComputeFileSHA256Hex(artifactPath, artifactDigest, &artifactBytes, &failure) &&
+          prodigyComputeSHA256Hex(request.targetDeploymentPlan, targetPlanDigest, &failure) &&
+          targetPlan.isStateful && targetPlan.config.type == ApplicationType::stateful &&
+          targetPlan.config.applicationID == sourceReport.applicationID && targetPlan.config.containerBlobSHA256 == artifactDigest &&
+          targetPlan.config.containerBlobBytes == artifactBytes &&
+          !targetPlan.stateful.neverShard &&
+          StatefulMeshRoles::forShardGroup(targetPlan.stateful, targetPlan.config.applicationID,
+              request.shardGroup).hasDistinctServices();
+      sourceWorkload.clusterUUID = source.clusterUUID; sourceWorkload.applicationID = sourceReport.applicationID;
+      sourceWorkload.deploymentID = sourceReport.deploymentID; sourceWorkload.canonicalPlanSHA256 = sourceReport.canonicalPlanSHA256;
+      sourceWorkload.artifactSHA256 = sourceReport.containerBlobSHA256; sourceWorkload.artifactBytes = sourceReport.containerBlobBytes; sourceWorkload.replicas = 3;
+      targetWorkload.clusterUUID = target.clusterUUID; targetWorkload.applicationID = targetPlan.config.applicationID;
+      targetWorkload.deploymentID = targetPlan.config.deploymentID(); targetWorkload.canonicalPlanSHA256 = targetPlanDigest;
+      targetWorkload.artifactSHA256 = artifactDigest; targetWorkload.artifactBytes = artifactBytes; targetWorkload.replicas = 3;
+      valid = valid && mothershipProductionWorkloadIdentityValid(sourceWorkload, true) &&
+          mothershipProductionWorkloadIdentityValid(targetWorkload, true);
+    }
+    Vector<uint128_t> targetMachines = {};
+    if (valid) { for (const auto& machine : targetStatus.topology.machines) targetMachines.push_back(machine.uuid); std::sort(targetMachines.begin(), targetMachines.end()); }
+    StatefulDataAuthorityOperation challenge = {}, response = {};
+    if (valid) {
+      challenge.version = 2; challenge.query = true; challenge.preparationQuery = true;
+      challenge.deploymentID = request.sourceDeploymentID; challenge.preparation.requestUUID = Random::generateNumberWithNBits<128, uint128_t>();
+      challenge.preparation.clusterUUID = source.clusterUUID; challenge.preparation.applicationID = sourceReport.applicationID;
+      challenge.preparation.deploymentID = request.sourceDeploymentID;
+      challenge.preparation.shardGroup = request.shardGroup; challenge.preparation.nShardGroups = sourceReport.nShardGroups;
+      // A stale first round is intentionally used only to learn current master
+      // identity; no member is addressed until the canonical cohort is returned.
+      (void)exchangeStatefulDataAuthority(source, challenge, response, nullptr, failure);
+      challenge.expectedAuthorityGeneration = response.expectedAuthorityGeneration; challenge.expectedMasterUUID = response.expectedMasterUUID;
+      challenge.expectedMasterBootNs = response.expectedMasterBootNs; failure.clear();
+      valid = challenge.preparation.requestUUID != 0 && challenge.expectedAuthorityGeneration != 0 && challenge.expectedMasterUUID != 0 &&
+          exchangeStatefulDataAuthority(source, challenge, response, nullptr, failure) && response.accepted && response.cohort.size() == 3 &&
+          std::all_of(response.cohort.begin(), response.cohort.end(), [&](const auto& member) {
+            return member.isSource && member.shardGroup == request.shardGroup;
+          });
+      if (valid) challenge.cohort = response.cohort;
+      for (uint32_t poll = 0; valid && poll < 300; ++poll) {
+        valid = exchangeStatefulDataAuthority(source, challenge, response, nullptr, failure);
+        if (valid && response.ready) break;
+        if (valid) ::usleep(100'000);
+      }
+      valid = valid && response.ready && prodigyStatefulDataAuthorityPreparationMembersAgree(challenge.preparation, challenge.cohort, response.preparationMembers);
+    }
+    MothershipProductionPairIntent intent = {}; MothershipNametagStatefulPreparationRecord prepared = {}, recorded = {}; bool resumed = false;
+    if (valid) {
+      const auto& proof = response.preparationMembers.front().preparation;
+      const uint128_t dataset = proof.hasAuthority ? 0 : Random::generateNumberWithNBits<128, uint128_t>();
+      const uint128_t snapshot = Random::generateNumberWithNBits<128, uint128_t>();
+      valid = mothershipSynthesizeNametagStatefulPreparation(request, route, routeSourcePermission.permission, routeDestinationPermission.permission,
+          routeSourceReceipt, routeDestinationReceipt, sourceWorkload, targetWorkload, challenge.preparation, challenge.cohort,
+          response.preparationMembers, targetMachines, dataset, snapshot, intent, &failure);
+      prepared.requestSHA256 = requestSHA256; prepared.intent = intent;
+      if (valid) { auto registry = openClusterRegistry(); valid = registry.persistNametagStatefulPreparation(prepared, recorded, resumed, &failure); }
+    }
+    if (valid) { String encoded = {}; auto copy = recorded.intent; BitseryEngine::serialize(encoded, copy); valid = ContainerStore::atomicWriteRuntimeFile(String(argv[8]), encoded, &failure); }
+    basics_log("prepareNametagStatefulPair success=%u resumed=%u operationUUID=%s failure=%s\n", unsigned(valid), unsigned(resumed), argc ? argv[0] : "", failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
+  static ProdigyInitialAllMastersSeedBootstrapScope nametagInitialSeedScope(
+      const MothershipNametagInitialSeedRecord& record,const MothershipNametagAllMastersIntent& intent,
+      const MothershipNametagInitialSeedPlan& bound,uint128_t clusterUUID,uint32_t group)
+  {
+    ProdigyInitialAllMastersSeedBootstrapScope scope; auto& b=scope.bootstrap;
+    b.sourceClusterUUID=intent.sites[0].clusterUUID; b.targetClusterUUID=clusterUUID;
+    b.targetDeploymentID=bound.deploymentID; b.qualificationRunUUID=record.operationUUID;
+    b.successorOperationUUID=record.operationUUID; b.shardGroup=group; b.expectedSeedGeneration=1;
+    scope.baselineOperationUUID=record.baselineOperationUUID; scope.nShardGroups=bound.nShardGroups;
+    scope.planSHA256=bound.planSHA256; scope.artifactSHA256=bound.artifactSHA256; scope.artifactBytes=bound.artifactBytes;
+    return scope;
+  }
+
+  bool installNametagInitialSeedPlan(const MothershipNametagInitialSeedRecord& supplied,
+      uint32_t index, const MothershipProdigyCluster& cluster, String& failure)
+  {
+    // The registry, not the caller's copy, owns the exact scope and progress.
+    MothershipNametagInitialSeedRecord record;
+    { auto registry = openClusterRegistry();
+      if (!registry.loadNametagInitialSeed(supplied.operationUUID, record, &failure)) return false; }
+    auto suppliedInitial = supplied, storedInitial = record;
+    suppliedInitial.dispatchMask = suppliedInitial.completedMask = 0;
+    storedInitial.dispatchMask = storedInitial.completedMask = 0;
+    String suppliedBytes, storedBytes;
+    if (!mothershipNametagInitialSeedRecordValid(record) || index >= record.plans.size() ||
+        !BitseryEngine::serialize(suppliedBytes, suppliedInitial) ||
+        !BitseryEngine::serialize(storedBytes, storedInitial) || suppliedBytes != storedBytes) {
+      failure.assign("initial bootstrap does not match its durable journal"_ctv); return false;
+    }
+    MothershipNametagAllMastersIntent intent;
+    if (!BitseryEngine::deserializeSafe(record.intentBytes, intent)) return false;
+    const auto& bound = record.plans[index];
+    String clusterName = cluster.name;
+    if (bound.site >= intent.sites.size() || cluster.clusterUUID != intent.sites[bound.site].clusterUUID) {
+      failure.assign("initial bootstrap target cluster differs from durable intent"_ctv); return false;
+    }
+    DeploymentPlan plan;
+    if (!BitseryEngine::deserializeSafe(bound.normalizedPlan, plan)) return false;
+    const int64_t deadline = Time::now<TimeResolution::ms>() + 15 * 60 * 1000;
+    for (uint32_t group = 0; group < bound.nShardGroups; ++group) {
+      ProdigyInitialAllMastersSeedBootstrapOperation request;
+      request.query = true; request.deploymentPlan = bound.normalizedPlan;
+      request.scope = nametagInitialSeedScope(record,intent,bound,cluster.clusterUUID,group);
+      bool ready = false;
+      while (Time::now<TimeResolution::ms>() < deadline) {
+        ProdigyInitialAllMastersSeedBootstrapOperation reply;
+        if (!configureControlTarget(clusterName.c_str(), &failure) ||
+            !requestTopicRoundTrip(MothershipTopic::statefulDataAuthority, request, reply, failure)) return false;
+        auto expected = request, observed = reply;
+        expected.expectedAuthorityGeneration = observed.expectedAuthorityGeneration = 0;
+        expected.expectedMasterUUID = observed.expectedMasterUUID = 0;
+        expected.expectedMasterBootNs = observed.expectedMasterBootNs = 0;
+        expected.accepted = observed.accepted = expected.ready = observed.ready = false;
+        expected.failure.clear(); observed.failure.clear();
+        String a, z;
+        if (!BitseryEngine::serialize(a, expected) || !BitseryEngine::serialize(z, observed) || a != z ||
+            !reply.expectedAuthorityGeneration || !reply.expectedMasterUUID || reply.expectedMasterBootNs <= 0) {
+          failure.assign("initial bootstrap returned a mismatched authority response"_ctv); return false;
+        }
+        if (!reply.failure.empty()) { failure = reply.failure; return false; }
+        if (request.expectedMasterUUID && (request.expectedMasterUUID != reply.expectedMasterUUID ||
+            request.expectedMasterBootNs != reply.expectedMasterBootNs)) {
+          failure.assign("initial bootstrap master incarnation changed during admission"_ctv); return false;
+        }
+        if (reply.accepted && reply.ready) { ready = true; break; }
+        request.expectedAuthorityGeneration = reply.expectedAuthorityGeneration;
+        request.expectedMasterUUID = reply.expectedMasterUUID; request.expectedMasterBootNs = reply.expectedMasterBootNs;
+        request.query = reply.accepted;
+        ::usleep(100'000);
+      }
+      if (!ready) { failure.assign("initial bootstrap authority peer acknowledgement timed out"_ctv); return false; }
+    }
+    auto matches = [&](const DeploymentIdentityReport& observed) {
+      return observed.found && observed.clusterUUID == cluster.clusterUUID &&
+          observed.deploymentID == bound.deploymentID && observed.applicationID == bound.applicationID &&
+          observed.canonicalPlanSHA256 == bound.planSHA256 && observed.containerBlobSHA256 == bound.artifactSHA256 &&
+          observed.containerBlobBytes == bound.artifactBytes &&
+          observed.normalizedDeploymentPlan == bound.normalizedPlan;
+    };
+    DeploymentIdentityReport observed;
+    if (!readDeploymentIdentity(cluster, bound.deploymentID, observed, failure, false, true)) return false;
+    if (observed.found && !matches(observed)) {
+      failure.assign("existing initial deployment differs from durable plan or artifact"_ctv); return false;
+    }
+    const uint8_t bit = uint8_t(1u << index);
+    if (!observed.found) {
+      String artifactDigest; uint64_t artifactBytes = 0;
+      if (!mothershipValidateDiscombobulatorContainerBlobContract(bound.artifactPath, &failure) ||
+          !prodigyComputeFileSHA256Hex(bound.artifactPath, artifactDigest, &artifactBytes, &failure) ||
+          artifactDigest != bound.artifactSHA256 || artifactBytes != bound.artifactBytes) {
+        if (failure.empty()) failure.assign("initial bootstrap artifact changed after journaling"_ctv);
+        return false;
+      }
+      // Record intent before issuing the ordinary lifecycle request. A retry
+      // first reconciles the exact deployment identity, including a lost ACK.
+      if (!(record.dispatchMask & bit)) {
+        auto registry = openClusterRegistry();
+        if (!registry.updateNametagInitialSeedProgress(record.operationUUID, index, false, &failure)) return false;
+      }
+      DeploymentDispatchResult dispatch;
+      if (!configureControlTarget(clusterName.c_str(), &failure) ||
+          !dispatchValidatedDeployment(plan, bound.artifactPath, true, false, dispatch)) {
+        if (failure.empty()) failure = dispatch.failure;
+        return false;
+      }
+    } else if (!(record.dispatchMask & bit)) {
+      auto registry = openClusterRegistry();
+      if (!registry.updateNametagInitialSeedProgress(record.operationUUID, index, false, &failure)) return false;
+    }
+    const auto kind = bound.nShardGroups == 3 ? DeploymentIdentityStoreKind::kv : DeploymentIdentityStoreKind::graph;
+    while (Time::now<TimeResolution::ms>() < deadline) {
+      if (!readDeploymentIdentity(cluster, bound.deploymentID, observed, failure, false, true)) return false;
+      if (observed.found && !matches(observed)) {
+        failure.assign("initial deployment identity changed while awaiting readiness"_ctv); return false;
+      }
+      if (mothershipNametagAllMastersDeploymentReadyForSeedSelection(observed, cluster.clusterUUID,
+            bound.deploymentID, bound.applicationID, bound.nShardGroups, kind)) {
+        auto registry = openClusterRegistry();
+        return registry.updateNametagInitialSeedProgress(record.operationUUID, index, true, &failure);
+      }
+      ::usleep(100'000);
+    }
+    failure.assign("initial deployment did not reach its exact healthy cohort before deadline"_ctv);
+    return false;
+  }
+
+  void runBootstrapNametagAllMasters(int argc, char *argv[])
+  {
+    String failure, intentBytes, planBytes;
+    auto readBounded = [&](const char *path, String& bytes, size_t maximum) {
+      bytes.clear(); struct stat st = {};
+      int fd = ::open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+      bool valid = fd >= 0 && ::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0 && uint64_t(st.st_size) <= maximum;
+      while (valid) {
+        char buffer[4096]; ssize_t n = ::read(fd, buffer, sizeof(buffer));
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) { valid = false; break; }
+        if (!n) break;
+        bytes.append(buffer, size_t(n)); if (bytes.size() > maximum) valid = false;
+      }
+      if (fd >= 0) ::close(fd);
+      return valid;
+    };
+    MothershipNametagAllMastersIntent intent;
+    MothershipNametagInitialSeedRecord proposed, recorded; bool resumed = false;
+    bool valid = argc == 2 && readBounded(argv[0], intentBytes, 1024 * 1024) &&
+        BitseryEngine::deserializeSafe(intentBytes, intent) && mothershipNametagAllMastersIntentValid(intent) &&
+        intent.protocolVersion == MothershipNametagAllMastersIntent::seedRouteVersion &&
+        readBounded(argv[1], planBytes, 65536);
+    simdjson::dom::parser parser; simdjson::dom::element document; simdjson::dom::array entries;
+    valid = valid && parser.parse(planBytes.data(), planBytes.size()).get(document) == simdjson::SUCCESS &&
+        document.get(entries) == simdjson::SUCCESS && entries.size() == 8;
+    Vector<MothershipProdigyCluster> clusters;
+    if (valid) {
+      proposed.operationUUID = intent.operationUUID; proposed.baselineOperationUUID = intent.sourceBaselineOperationUUID;
+      proposed.intentBytes = intentBytes;
+      valid = prodigyComputeSHA256Hex(intentBytes, proposed.intentSHA256, &failure);
+      MothershipNametagSourceBaselineRecord baseline; bool found = false; String encoded;
+      { auto registry = openClusterRegistry();
+        valid = valid && registry.loadNametagSourceBaseline(intent.sourceBaselineOperationUUID, baseline, found, &failure) && found;
+        for (uint32_t site = 0; valid && site < 3; ++site) {
+          MothershipProdigyCluster cluster; String id; id.assignItoh(intent.sites[site].clusterUUID);
+          valid = registry.getClusterByIdentity(id, cluster, &failure) &&
+              mothershipNametagAllMastersSiteIdentityMatches(site, intent.sites[site].clusterUUID, cluster);
+          if (valid) clusters.push_back(std::move(cluster));
+        }
+      }
+      valid = valid && BitseryEngine::serialize(encoded, baseline.receipt) &&
+          prodigyComputeSHA256Hex(encoded, proposed.baselineReceiptSHA256, &failure);
+    }
+    if (valid) for (auto entry : entries) {
+      simdjson::dom::object object; uint64_t site = 0, app = 0; std::string_view plan, artifact;
+      valid = !entry.get(object) && object.size() == 4 && !object["site"].get(site) && site >= 1 && site <= 2 &&
+          !object["applicationID"].get(app) && (app == 2 || app == 3 || app == 4 || app == 5) &&
+          !object["plan"].get(plan) && plan.size() > 2 && plan.size() <= 4096 && plan[0] == '@' && plan[1] == '/' &&
+          !object["artifact"].get(artifact) && !artifact.empty() && artifact.size() <= 4096 && artifact[0] == '/';
+      if (!valid) break;
+      String planArgument, artifactArgument; planArgument.assign(plan.data(), plan.size()); artifactArgument.assign(artifact.data(), artifact.size());
+      DeploymentPlan deployment; MothershipNametagInitialSeedPlan bound; bool early = false;
+      valid = prepareDeploymentPlan(clusters[site].name.c_str(), planArgument.c_str(), artifactArgument.c_str(),
+          deployment, bound.artifactPath, early, failure) &&
+          mothershipValidateDiscombobulatorContainerBlobContract(bound.artifactPath, &failure) &&
+          prodigyComputeFileSHA256Hex(bound.artifactPath, bound.artifactSHA256, &bound.artifactBytes, &failure);
+      if (!valid) break;
+      deployment.config.containerBlobSHA256 = bound.artifactSHA256; deployment.config.containerBlobBytes = bound.artifactBytes;
+      bound.site = uint8_t(site); bound.applicationID = uint16_t(app); bound.deploymentID = deployment.config.deploymentID();
+      bound.nShardGroups = app == 3 || app == 4 ? 3 : 1;
+      valid = BitseryEngine::serialize(bound.normalizedPlan, deployment) &&
+          prodigyComputeSHA256Hex(bound.normalizedPlan, bound.planSHA256, &failure);
+      if (!valid) break;
+      proposed.plans.push_back(std::move(bound));
+    }
+    if (valid) {
+      std::sort(proposed.plans.begin(), proposed.plans.end(), [](const auto& a, const auto& b) {
+        return a.site < b.site || (a.site == b.site && a.applicationID < b.applicationID);
+      });
+      auto registry = openClusterRegistry();
+      valid = registry.persistNametagInitialSeed(proposed, resumed, &failure) &&
+          registry.loadNametagInitialSeed(proposed.operationUUID, recorded, &failure);
+    }
+    for (uint32_t i = 0; valid && i < recorded.plans.size(); ++i)
+      valid = installNametagInitialSeedPlan(recorded, i, clusters[recorded.plans[i].site], failure);
+    if (!valid && failure.empty()) failure.assign("initial bootstrap requires the exact intent and eight private all-masters plan/artifact inputs"_ctv);
+    basics_log("bootstrapNametagAllMasters success=%u resumed=%u failure=%s\n", unsigned(valid), unsigned(resumed), failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
+  bool prepareNametagExpiredCutRecovery(MothershipNametagAllMastersPreparation& preparation, String& failure)
+  {
+    auto& intent = preparation.intent;
+    if (!intent.isExpiredCutRecovery()) return true;
+    MothershipNametagAllMastersRecord prior; MothershipNametagInitialSeedRecord bootstrap;
+    MothershipNametagSourceBaselineRecord baseline; MothershipNametagAllMastersIntent claim;
+    MothershipProdigyCluster source; bool baselineFound = false, claimed = false;
+    String encoded, digest, sourceID;
+    {
+      auto registry = openClusterRegistry();
+      if (!registry.loadNametagAllMasters(intent.predecessorOperationUUID, prior, &failure) ||
+          !BitseryEngine::serialize(encoded, prior) || !prodigyComputeSHA256Hex(encoded, digest, &failure) ||
+          digest != intent.predecessorRecordSHA256 ||
+          !registry.loadNametagInitialSeed(intent.predecessorOperationUUID, bootstrap, &failure) ||
+          !registry.loadNametagSourceBaseline(prior.intent.sourceBaselineOperationUUID, baseline, baselineFound, &failure) || !baselineFound ||
+          !registry.loadNametagExpiredCutRecoveryPreparation(intent.predecessorOperationUUID, claim, claimed, &failure)) return false;
+      sourceID.assignItoh(prior.intent.sites[0].clusterUUID);
+      if (!registry.getClusterByIdentity(sourceID, source, &failure)) return false;
+    }
+    encoded.clear();
+    if (!BitseryEngine::serialize(encoded, bootstrap) || !prodigyComputeSHA256Hex(encoded, intent.initialSeedRecordSHA256, &failure)) return false;
+    encoded.clear();
+    if (!BitseryEngine::serialize(encoded, baseline) || !prodigyComputeSHA256Hex(encoded, intent.predecessorBaselineSHA256, &failure)) return false;
+    for (size_t i = 0; i < preparation.sourceRepairApplications.size(); ++i) {
+      MothershipNametagSourceRepairPlan bound;
+      bound.applicationID = preparation.sourceRepairApplications[i];
+      bound.previousDeploymentID = bound.applicationID == 3 ? prior.intent.sites[0].hotDeploymentID :
+          bound.applicationID == 4 ? prior.intent.sites[0].coldDeploymentID : prior.intent.sites[0].radarDeploymentID;
+      DeploymentPlan plan; String artifact; bool early = false;
+      if (!prepareDeploymentPlan(source.name.c_str(), preparation.sourceRepairPlanPaths[i].c_str(),
+          preparation.sourceRepairArtifactPaths[i].c_str(), plan, artifact, early, failure) ||
+          !mothershipValidateDiscombobulatorContainerBlobContract(artifact, &failure) ||
+          !prodigyComputeFileSHA256Hex(artifact, bound.artifactSHA256, &bound.artifactBytes, &failure)) return false;
+      plan.config.containerBlobSHA256 = bound.artifactSHA256; plan.config.containerBlobBytes = bound.artifactBytes;
+      bound.successorDeploymentID = plan.config.deploymentID();
+      if (!BitseryEngine::serialize(bound.normalizedPlan, plan) || !prodigyComputeSHA256Hex(bound.normalizedPlan, bound.planSHA256, &failure)) return false;
+      if (claimed) {
+        const auto old = std::find_if(claim.sourceRepairPlans.begin(), claim.sourceRepairPlans.end(),
+            [&](const auto& value) { return value.applicationID == bound.applicationID; });
+        if (old == claim.sourceRepairPlans.end()) return false;
+        bound.predecessor = old->predecessor;
+      } else {
+        DeploymentIdentityReport unlaunched;
+        if (!readDeploymentIdentity(source, bound.previousDeploymentID, bound.predecessor, failure) ||
+            !readDeploymentIdentity(source, bound.successorDeploymentID, unlaunched, failure, false, true) || unlaunched.found) {
+          if (failure.empty()) failure.assign("source repair must be prepared against the live predecessor before successor admission"_ctv);
+          return false;
+        }
+      }
+      if (!mothershipNametagSourceRepairPlanValid(bound)) { failure.assign("source repair permits only exact predecessor image and version replacement"_ctv); return false; }
+      intent.sourceRepairPlans.push_back(std::move(bound));
+    }
+    std::sort(intent.sourceRepairPlans.begin(), intent.sourceRepairPlans.end(), [](const auto& a, const auto& b) { return a.applicationID < b.applicationID; });
+    bool resumed = false;
+    auto registry = openClusterRegistry();
+    return registry.persistNametagExpiredCutRecoveryPreparation(intent, resumed, &failure);
+  }
+
+  void runPrepareNametagAllMasters(int argc, char *argv[])
+  {
+    String failure = {}, bytes = {}, intentSHA256 = {};
+    MothershipNametagAllMastersPreparation preparation = {};
+    bool valid = argc == 2;
+    const int fd = valid ? ::open(argv[0], O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK) : -1;
+    struct stat state = {};
+    valid = valid && fd >= 0 && ::fstat(fd, &state) == 0 && S_ISREG(state.st_mode) &&
+        state.st_size > 0 && state.st_size <= 1024 * 1024;
+    for (char buffer[4096] = {}; valid;) {
+      const ssize_t count = ::read(fd, buffer, sizeof(buffer));
+      if (count < 0 && errno == EINTR) continue;
+      if (count < 0) { valid = false; break; }
+      if (count == 0) break;
+      bytes.append(buffer, size_t(count));
+      if (bytes.size() > 1024 * 1024) { valid = false; break; }
+    }
+    if (fd >= 0) ::close(fd);
+    simdjson::dom::parser parser; simdjson::dom::element document;
+    valid = valid && !bytes.empty() && parser.parse(bytes.data(), bytes.size()).get(document) == simdjson::SUCCESS &&
+        mothershipParseNametagAllMastersPreparationJSON(document, preparation, failure);
+    if (!valid && failure.empty())
+      failure.assign("usage: prepareNametagAllMasters OPERATOR_JSON_PATH OUTPUT_INTENT_BIN (bounded regular JSON file required)"_ctv);
+    if (valid) {
+      auto registry = openClusterRegistry();
+      Vector<MothershipProdigyCluster> sites = {};
+      for (uint32_t site = 0; valid && site < preparation.intent.sites.size(); ++site) {
+        MothershipProdigyCluster cluster = {};
+        valid = registry.getClusterByIdentity(preparation.siteNames[site], cluster, &failure) &&
+            mothershipNametagAllMastersPreparedSiteMatches(site, preparation.siteNames[site], cluster);
+        if (valid) {
+          preparation.intent.sites[site].clusterUUID = cluster.clusterUUID;
+          sites.push_back(std::move(cluster));
+        }
+        if (!valid && failure.empty())
+          failure.assign("all-masters preparation requires the registered EWR, ORD and LAN three-Brain clusters in that order"_ctv);
+      }
+      bool pairs[3][3] = {};
+      for (const uint128_t operationUUID : preparation.pairOperationUUIDs) {
+        if (!valid) break;
+        MothershipClusterPairEnrollmentIntent pair = {};
+        valid = registry.loadClusterPairEnrollmentIntent(operationUUID, pair, &failure) &&
+            pair.operationUUID == operationUUID && pair.pairUUID != 0 && pair.firstQualified && pair.secondQualified;
+        uint32_t first = UINT32_MAX, second = UINT32_MAX;
+        for (uint32_t site = 0; valid && site < sites.size(); ++site) {
+          if (sites[site].clusterUUID == pair.firstClusterUUID) first = site;
+          if (sites[site].clusterUUID == pair.secondClusterUUID) second = site;
+        }
+        valid = valid && first < 3 && second < 3 && first != second;
+        const uint32_t left = first < second ? first : second;
+        const uint32_t right = first < second ? second : first;
+        valid = valid && !pairs[left][right];
+        if (valid) pairs[left][right] = true;
+        for (uint32_t direction = 0; valid && direction < 2; ++direction) {
+          const uint32_t local = direction == 0 ? first : second;
+          if (!valid) break;
+          const uint32_t peer = local == first ? second : first;
+          for (const ClusterMachine& machine : sites[local].topology.machines) {
+            CrossClusterMasqueGatewayAuthority authority = {};
+            valid = machine.isBrain && machine.uuid != 0 &&
+                registry.loadCrossClusterMasqueGateway(pair.pairUUID, machine.uuid, authority, &failure) &&
+                prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(authority) &&
+                authority.state == CrossClusterMasqueGatewayState::active &&
+                authority.pairUUID == pair.pairUUID && authority.pairOperationUUID == operationUUID &&
+                authority.localClusterUUID == sites[local].clusterUUID && authority.peerClusterUUID == sites[peer].clusterUUID &&
+                authority.localMachineUUID == machine.uuid;
+            if (valid) preparation.intent.directGatewayAuthorities.push_back(std::move(authority));
+            else if (failure.empty())
+              failure.assign("all-masters preparation requires each current active gateway authority for the enrolled pair topology"_ctv);
+            if (!valid) break;
+          }
+        }
+      }
+      valid = valid && pairs[0][1] && pairs[0][2] && pairs[1][2];
+      if (!valid && failure.empty())
+        failure.assign("all-masters preparation requires exactly the EWR/ORD, EWR/LAN and ORD/LAN enrollments"_ctv);
+    }
+    if (valid && !prepareNametagExpiredCutRecovery(preparation, failure)) {
+      valid = false;
+      if (failure.empty()) failure.assign("expired-cut recovery preparation does not match its immutable predecessor or exact repair inputs"_ctv);
+    }
+    if (valid) {
+      valid = mothershipNametagAllMastersIntentValid(preparation.intent) &&
+          BitseryEngine::serialize(bytes, preparation.intent) && prodigyComputeSHA256Hex(bytes, intentSHA256, &failure);
+      if (!valid && failure.empty())
+        failure.assign("all-masters preparation lacks the exact eighteen-authority direct topology or distinct deployment identities"_ctv);
+    }
+    if (valid) valid = ContainerStore::atomicWriteRuntimeFile(String(argv[1]), bytes, &failure);
+    basics_log("prepareNametagAllMasters success=%u intentSHA256=%s failure=%s\n",
+        unsigned(valid), intentSHA256.c_str(), failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
+  bool validateNametagSeedRoute(const MothershipNametagAllMastersRecord& record,
+      const MothershipNametagAllMastersSeedPlacement& row, const ProdigyStatefulStoreSeedAuthority& authority,
+      String& failure)
+  {
+    if (record.intent.protocolVersion != MothershipNametagAllMastersIntent::seedRouteVersion &&
+        !record.intent.isExpiredCutRecovery()) {
+      failure.assign("source-cut seeding requires versioned durable seed route references"_ctv); return false;
+    }
+    const auto reference = std::find_if(record.intent.seedRoutes.begin(), record.intent.seedRoutes.end(), [&](const auto& value) {
+      return value.site == row.site && value.applicationID == row.applicationID && value.shardGroup == row.shardGroup;
+    });
+    if (reference == record.intent.seedRoutes.end() || reference->routeUUID != authority.seedRouteUUID) {
+      failure.assign("missing exact seed route reference"_ctv); return false;
+    }
+    CousinRouteRecord route = {};
+    CousinRouteApplyReceipt sourceReceipt = {}, destinationReceipt = {};
+    MothershipProdigyCluster target = {}, source = {}; String targetID = {}, sourceID = {};
+    targetID.assignItoh(row.targetClusterUUID); sourceID.assignItoh(row.sourceClusterUUID);
+    {
+      auto registry = openClusterRegistry();
+      if (!registry.getClusterByIdentity(targetID, target, &failure) || !registry.getClusterByIdentity(sourceID, source, &failure) ||
+          !registry.loadUsableCousinRoute(reference->routeUUID, Time::now<TimeResolution::ms>(), route, &failure) ||
+          !registry.loadCurrentCousinRouteApplyReceipt(route.routeUUID, CousinRouteHalf::source, sourceReceipt, &failure) ||
+          !registry.loadCurrentCousinRouteApplyReceipt(route.routeUUID, CousinRouteHalf::destination, destinationReceipt, &failure)) return false;
+    }
+    const uint64_t service = prodigyRuntimeStatefulServicePrefix(row.applicationID, 4);
+    const bool gatewayPair = std::any_of(record.intent.directGatewayAuthorities.begin(), record.intent.directGatewayAuthorities.end(),
+      [&](const auto& gateway) { return gateway.pairUUID == route.pairUUID && gateway.localClusterUUID == row.targetClusterUUID &&
+          gateway.peerClusterUUID == row.sourceClusterUUID && gateway.state == CrossClusterMasqueGatewayState::active; });
+    if (!gatewayPair || route.sourceClusterUUID != row.targetClusterUUID || route.destinationClusterUUID != row.sourceClusterUUID ||
+        route.sourceApplicationID != row.applicationID || route.destinationApplicationID != row.applicationID ||
+        !service || route.sourceCousinServicePrefix != service || route.destinationCousinServicePrefix != service ||
+        route.expiresAtMs < int64_t(authority.retainUntilMilliseconds)) {
+      failure.assign("seed route does not bind the exact target-to-source cohort, gateway, service and cut lifetime"_ctv); return false;
+    }
+    ProdigyLocalCousinServicePermissionResponse subscriber = {}, advertiser = {};
+    if (!readLocalCousinServicePermission(target, route.sourcePermissionUUID, subscriber, failure) ||
+        !readLocalCousinServicePermission(source, route.destinationPermissionUUID, advertiser, failure)) return false;
+    const auto& left = subscriber.permission; const auto& right = advertiser.permission;
+    uint16_t slot = 0, peerSlot = 0;
+    if (left.localHalf != CousinRouteHalf::source || right.localHalf != CousinRouteHalf::destination ||
+        left.purpose != ProdigyCousinServicePurpose::seeding || right.purpose != ProdigyCousinServicePurpose::seeding ||
+        left.localDeploymentID != row.targetDeploymentID || right.localDeploymentID != row.sourceDeploymentID ||
+        left.peerDeploymentID != row.sourceDeploymentID || right.peerDeploymentID != row.targetDeploymentID ||
+        left.destinationShardGroup != row.shardGroup || right.destinationShardGroup != row.shardGroup ||
+        left.destinationShardGroups != authority.nShardGroups || right.destinationShardGroups != authority.nShardGroups ||
+        !prodigyCousinServicePermissionPeerScopeMatches(left, right) ||
+        !prodigyCousinServicePermissionSingleSlot(left, slot) || !prodigyCousinServicePermissionSingleSlot(right, peerSlot) ||
+        slot != peerSlot || route.slots != left.slots || route.slots != right.slots || !route.slots.contains(slot)) {
+      failure.assign("seed route permissions do not bind exact deployment, shard and slot"_ctv); return false;
+    }
+    if (route.endpointKind == CousinRouteEndpointKind::privateContainer) {
+      DeploymentIdentityReport sourceReport = {};
+      ProdigyCousinDiscoveryQuery query = {}; query.permissionUUID = route.sourcePermissionUUID; query.slot = slot;
+      ProdigyCousinDiscoveryResponse discovery = {};
+      if (!readDeploymentIdentity(source, row.sourceDeploymentID, sourceReport, failure) ||
+          !configureControlTarget(target.name.c_str(), &failure) ||
+          !requestTopicRoundTrip(MothershipTopic::pullCousinCounterparts, query, discovery, failure) ||
+          discovery.protocolVersion != ProdigyCousinDiscoveryResponse::version || !discovery.success ||
+          discovery.records.size() > ProdigyCousinDiscoveryMaximumRecords ||
+          std::count_if(discovery.records.begin(), discovery.records.end(), [&](const auto& counterpart) {
+            return mothershipNametagPrivateSeedCounterpartMatches(row, authority, route, left, right, slot,
+                sourceReport, counterpart);
+          }) != 1) {
+        if (failure.empty()) failure.assign("private seed route lacks the exact current retained source counterpart"_ctv);
+        return false;
+      }
+    } else {
+      RoutableSubnetRegistryReport ranges = {};
+      if (!readRoutableSubnets(source, ranges, failure)) return false;
+      const auto range = std::find_if(ranges.subnets.begin(), ranges.subnets.end(), [&](const auto& value) {
+        return value.uuid == route.destinationRoutablePrefixUUID;
+      });
+      if (range == ranges.subnets.end() || !cousinRouteDestinationRangeContainsAddress(route, range->subnet)) {
+        failure.assign("seed route destination is outside its registered source prefix"_ctv); return false;
+      }
+    }
+    ProdigyCousinRouteResponse targetResponse = {}, sourceResponse = {};
+    return observeCousinRouteSide(target, route, CousinRouteHalf::source, targetResponse, failure) &&
+        observeCousinRouteSide(source, route, CousinRouteHalf::destination, sourceResponse, failure) &&
+        targetResponse.found && sourceResponse.found && targetResponse.qualified && sourceResponse.qualified &&
+        cousinRouteExactMatches(targetResponse.route, route) &&
+        cousinRouteExactMatches(sourceResponse.route, route) &&
+        cousinRouteApplyReceiptMatchesCurrentRoute(targetResponse.applyReceipt, route) &&
+        cousinRouteApplyReceiptMatchesCurrentRoute(sourceResponse.applyReceipt, route);
+  }
+
+  void runNametagAllMasters(int argc, char *argv[])
+  {
+    String failure = {}, bytes = {}, baselineFixture = {};
+    MothershipNametagAllMastersIntent intent = {};
+    bool valid = argc == 1;
+    int fd = valid ? ::open(argv[0], O_RDONLY | O_CLOEXEC | O_NOFOLLOW) : -1;
+    if (fd < 0) valid = false;
+    for (char buffer[4096] = {}; valid;) {
+      const ssize_t count = ::read(fd, buffer, sizeof(buffer));
+      if (count < 0 || (count == 0 && bytes.empty())) { valid = false; break; }
+      if (count == 0) break;
+      bytes.append(buffer, size_t(count));
+      if (bytes.size() > 1024 * 1024) { valid = false; break; }
+    }
+    if (fd >= 0) ::close(fd);
+    valid = valid && BitseryEngine::deserializeSafe(bytes, intent) && mothershipNametagAllMastersIntentValid(intent);
+    if (!valid) failure.assign("usage: nametagAllMasters VERSIONED_INTENT_BIN (valid exact all-masters intent required)"_ctv);
+    MothershipNametagAllMastersRecord proposed = {}, recorded = {}; bool resumed = false;
+    Vector<DeploymentIdentityReport> pulseObservations = {}, hotObservations = {}, coldObservations = {}, radarObservations = {};
+    Vector<MothershipProdigyCluster> siteClusters = {};
+    if (valid) {
+      Vector<DeploymentIdentityReport> app6Observations = {};
+      DeploymentIdentityReport ewrTruthObservation = {};
+      for (uint32_t index = 0; valid && index < intent.sites.size(); ++index) {
+        MothershipProdigyCluster cluster = {}; DeploymentIdentityReport pulse = {}, hot = {}, cold = {}, radar = {}, truth = {}, app6 = {};
+        String clusterIdentity = {}; clusterIdentity.assignItoh(intent.sites[index].clusterUUID);
+        // Control-target resolution opens the same registry; release each local
+        // registry handle before entering a control-plane operation.
+        {
+          auto registry = openClusterRegistry();
+          valid = registry.getClusterByIdentity(clusterIdentity, cluster, &failure) &&
+              mothershipNametagAllMastersSiteIdentityMatches(index, intent.sites[index].clusterUUID, cluster) && cluster.nBrains == 3;
+        }
+        valid = valid &&
+            readDeploymentIdentity(cluster, intent.sites[index].pulseDeploymentID, pulse, failure) &&
+            readDeploymentIdentity(cluster, intent.sites[index].hotDeploymentID, hot, failure) &&
+            readDeploymentIdentity(cluster, intent.sites[index].coldDeploymentID, cold, failure) &&
+            readDeploymentIdentity(cluster, intent.sites[index].radarDeploymentID, radar, failure) &&
+            readDeploymentIdentity(cluster, intent.sites[index].app6DeploymentID, app6, failure) &&
+            (index != 0 || readDeploymentIdentity(cluster, intent.sites[index].truthDeploymentID, truth, failure)) &&
+            // A new source-cut operation starts before any remote seed receipt.
+            (index == 0 && intent.protocolVersion == MothershipNametagAllMastersIntent::version ?
+             mothershipNametagAllMastersSiteObserved(intent.sites[index], pulse, hot, cold, radar, &truth) :
+             index == 0 ? mothershipNametagAllMastersSiteReadyForSeedSelection(intent.sites[index], pulse, hot, cold, radar, &truth) :
+             mothershipNametagAllMastersSiteReadyForSeedSelection(intent.sites[index], pulse, hot, cold, radar, nullptr));
+        if (valid) {
+          // Keep the authenticated reports until the bounded seed placement is
+          // synthesized.  The caller supplied no container identities.
+          pulseObservations.push_back(pulse); hotObservations.push_back(hot);
+          coldObservations.push_back(cold); radarObservations.push_back(radar);
+          siteClusters.push_back(cluster);
+          app6Observations.push_back(std::move(app6)); if (index == 0) ewrTruthObservation = std::move(truth);
+        }
+        if (!valid && failure.empty()) failure.assign("Nametag all-masters seed selection lacks an exact healthy target plan or EWR Truth writer"_ctv);
+      }
+      if (valid && (!mothershipNametagApp6IdentitySetObserved(app6Observations, intent.sites) ||
+          !mothershipNametagTruthWriterObserved(ewrTruthObservation, intent.sites[0]))) {
+        valid = false; failure.assign("Nametag all-masters requires exact app6 identities and the EWR Truth writer"_ctv);
+      }
+      if (valid) {
+        MothershipApplicationPlacement truthPlacement = {};
+        {
+          auto registry = openClusterRegistry();
+          valid = registry.loadTruthPlacement(truthPlacement, &failure) &&
+              truthPlacement.ownerClusterUUID == intent.sites[0].clusterUUID;
+        }
+        for (uint32_t site = 0; valid && site < siteClusters.size(); ++site) {
+          ClusterStatusReport status = {};
+          valid = readManagedClusterStatus(siteClusters[site], status, failure) &&
+              mothershipNametagAllMastersTruthDeploymentCardinalityObserved(status, site == 0);
+        }
+        if (!valid && failure.empty()) failure.assign("Nametag all-masters requires exactly the authenticated EWR Truth deployment and no ORD/LAN Truth deployment"_ctv);
+      }
+      // Each pair is represented by both local gateway authorities.  Reload
+      // the durable record byte-for-byte, then require its current authenticated
+      // QUIC readiness before the seed authority can leave Mothership.
+      for (const auto& requested : intent.directGatewayAuthorities) {
+        if (!valid) break;
+        uint32_t localSite = UINT32_MAX;
+        for (uint32_t site = 0; site < intent.sites.size(); ++site)
+          if (intent.sites[site].clusterUUID == requested.localClusterUUID) localSite = site;
+        CrossClusterMasqueGatewayAuthority persisted = {};
+        String requestedBytes = {}, persistedBytes = {};
+        auto requestedCopy = requested;
+        {
+          auto registry = openClusterRegistry();
+          valid = localSite < siteClusters.size() &&
+              registry.loadCrossClusterMasqueGateway(requested.pairUUID, requested.localMachineUUID, persisted, &failure);
+        }
+        valid = valid &&
+            BitseryEngine::serialize(requestedBytes, requestedCopy) &&
+            BitseryEngine::serialize(persistedBytes, persisted) && requestedBytes == persistedBytes &&
+            waitForCrossClusterMasqueGatewayReadiness(siteClusters[localSite], persisted, failure);
+        if (!valid && failure.empty()) failure.assign("Nametag all-masters requires current direct MASQUE readiness for every site pair"_ctv);
+      }
+    }
+    if (valid) {
+      auto copy = intent;
+      valid = BitseryEngine::serialize(bytes, copy) && prodigyComputeSHA256Hex(bytes, proposed.requestSHA256, &failure);
+      proposed.intent = intent;
+      if (valid && intent.isExpiredCutRecovery()) {
+        MothershipNametagAllMastersRecord prior; MothershipNametagInitialSeedRecord bootstrap;
+        auto registry = openClusterRegistry();
+        valid = registry.validateNametagExpiredCutRecovery(intent, prior, bootstrap, &failure) &&
+            mothershipNametagExpiredCutRecoveryReportsMatch(intent, bootstrap, pulseObservations, hotObservations, coldObservations, radarObservations);
+        if (!valid && failure.empty()) failure.assign("source repair or remote bootstrap reports differ from the immutable prepared plans"_ctv);
+      }
+      if (valid && intent.protocolVersion >= MothershipNametagAllMastersIntent::sourceCutVersion) {
+        MothershipNametagSourceBaselineRecord baseline = {}; bool found = false;
+        const auto& site = intent.sites[0];
+        {
+          auto registry = openClusterRegistry();
+          valid = registry.loadNametagSourceBaseline(intent.sourceBaselineOperationUUID, baseline, found, &failure) && found &&
+              baseline.command.ewrClusterUUID == site.clusterUUID && baseline.command.pulseDeploymentID == site.pulseDeploymentID &&
+              baseline.command.hotDeploymentID == site.hotDeploymentID && baseline.command.coldDeploymentID == site.coldDeploymentID &&
+              baseline.command.radarDeploymentID == site.radarDeploymentID && baseline.command.truthDeploymentID == site.truthDeploymentID;
+          if (valid && intent.isExpiredCutRecovery()) {
+            MothershipNametagAllMastersRecord prior; MothershipNametagSourceBaselineRecord oldBaseline; bool oldFound = false;
+            valid = registry.loadNametagAllMasters(intent.predecessorOperationUUID, prior, &failure) &&
+                registry.loadNametagSourceBaseline(prior.intent.sourceBaselineOperationUUID, oldBaseline, oldFound, &failure) && oldFound &&
+                baseline.command.probeDeploymentID == oldBaseline.command.probeDeploymentID;
+          }
+        }
+        if (valid) baselineFixture = baseline.command.fixtureManifestSHA256;
+        if (!valid && failure.empty()) failure.assign("source cut requires the exact durable completed EWR source baseline"_ctv);
+        proposed.protocolVersion = MothershipNametagAllMastersRecord::sourceCutVersion;
+        proposed.phase = MothershipNametagAllMastersRecord::Phase::sourceCutsPreparing;
+        struct Source { uint16_t app; DeploymentIdentityStoreKind kind; uint32_t groups; const Vector<DeploymentIdentityReport> *reports; };
+        const Source sources[] = {{MeshRegistry::Pulse::applicationID, DeploymentIdentityStoreKind::graph, 1, &pulseObservations},
+          {MeshRegistry::Hot::applicationID, DeploymentIdentityStoreKind::kv, 3, &hotObservations},
+          {MeshRegistry::Cold::applicationID, DeploymentIdentityStoreKind::kv, 3, &coldObservations},
+          {MeshRegistry::Radar::applicationID, DeploymentIdentityStoreKind::graph, 1, &radarObservations}};
+        // Keep the frozen source copy available across bounded delivery and recovery.
+        const int64_t retainUntil = Time::now<TimeResolution::ms>() + 3'600'000;
+        for (const auto& source : sources) for (uint32_t group = 0; valid && group < source.groups; ++group) {
+          const auto& report = source.reports->front();
+          const auto* selected = nametagSourceCutMember(report, group);
+          if (!selected) { valid = false; break; }
+          MothershipNametagSourceCutProgress cut = {};
+          cut.request.operationUUID = mothershipNametagSeedOperationUUID(proposed);
+          cut.request.requestUUID = Random::generateNumberWithNBits<128, uint128_t>();
+          cut.request.sourceClusterUUID = report.clusterUUID; cut.request.sourceDeploymentID = report.deploymentID;
+          cut.request.sourceContainerUUID = selected->containerUUID; cut.request.applicationID = source.app;
+          cut.request.storeKind = source.kind; cut.request.shardGroup = group; cut.request.nShardGroups = source.groups;
+          cut.request.retainUntilMilliseconds = retainUntil;
+          valid = prodigyStatefulStoreSourceCutValid(cut.request);
+          if (valid) proposed.sourceCuts.push_back(std::move(cut));
+        }
+        if (valid) {
+          auto registry = openClusterRegistry();
+          valid = registry.persistNametagAllMasters(proposed, recorded, resumed, &failure);
+        }
+        for (uint32_t i = 0; valid && i < recorded.sourceCuts.size(); ++i) {
+          auto cut = recorded.sourceCuts[i];
+          if (recorded.phase == MothershipNametagAllMastersRecord::Phase::remoteSeeded) continue;
+          if (cut.released || cut.request.retainUntilMilliseconds <= Time::now<TimeResolution::ms>()) {
+            valid = false; failure.assign("persisted source cut is released or expired"_ctv); break;
+          }
+          if (cut.proof.ready) continue;
+          if (cut.dispatched && cut.request.memberRequestUUID == 0) {
+            valid = false; failure.assign("source cut dispatch outcome is ambiguous; refusing a new challenge"_ctv); break;
+          }
+          if (!cut.dispatched) {
+            MothershipNametagAllMastersRecord progressed = {};
+            {
+              auto registry = openClusterRegistry();
+              valid = registry.updateNametagAllMastersSourceCut(intent.operationUUID, i, true, nullptr, progressed, &failure);
+            }
+            if (!valid) break;
+            recorded = std::move(progressed); cut = recorded.sourceCuts[i];
+          }
+          for (uint32_t poll = 0; valid && poll < 300 && !recorded.sourceCuts[i].proof.ready; ++poll) {
+            ProdigyStatefulStoreSourceCut reply = {};
+            const auto request = recorded.sourceCuts[i].request;
+            valid = configureControlTarget(siteClusters[0].name.c_str(), &failure) &&
+                requestTopicRoundTrip(MothershipTopic::statefulStoreSourceCut, request, reply, failure);
+            if (!valid) break;
+            auto expected = request;
+            if (expected.memberRequestUUID == 0) expected.memberRequestUUID = reply.memberRequestUUID;
+            valid = prodigyStatefulStoreSourceCutResponseMatches(expected, reply) && reply.failure.empty();
+            if (!valid) {
+              if (!reply.failure.empty()) failure = reply.failure;
+              else failure.assign("source cut returned an invalid challenge"_ctv);
+              break;
+            }
+            MothershipNametagAllMastersRecord progressed = {};
+            {
+              auto registry = openClusterRegistry();
+              valid = registry.updateNametagAllMastersSourceCut(intent.operationUUID, i, false, &reply, progressed, &failure);
+            }
+            if (valid) recorded = std::move(progressed);
+            if (valid && !reply.ready) ::usleep(100'000);
+          }
+          if (valid && !recorded.sourceCuts[i].proof.ready) { valid = false; failure.assign("source cut did not become ready"_ctv); }
+        }
+        for (uint32_t i = 0; valid && i < recorded.sourceCuts.size(); ++i) {
+          const auto& cut = recorded.sourceCuts[i];
+          if (cut.released || recorded.phase == MothershipNametagAllMastersRecord::Phase::remoteSeeded) continue;
+          auto query = cut.request; query.action = ProdigyStatefulStoreSourceCutAction::query;
+          query.cutUUID = cut.proof.cutUUID; query.cutGeneration = cut.proof.cutGeneration;
+          ProdigyStatefulStoreSourceCut reply = {};
+          valid = configureControlTarget(siteClusters[0].name.c_str(), &failure) &&
+              requestTopicRoundTrip(MothershipTopic::statefulStoreSourceCut, query, reply, failure) &&
+              prodigyStatefulStoreSourceCutResponseMatches(query, reply) && reply.ready && reply.failure.empty() &&
+              reply.contentSHA256 == cut.proof.contentSHA256 && reply.headsSHA256 == cut.proof.headsSHA256 &&
+              cut.request.retainUntilMilliseconds > Time::now<TimeResolution::ms>();
+          if (!valid && failure.empty()) failure.assign("retained native source cut is no longer current"_ctv);
+        }
+        if (valid && recorded.phase == MothershipNametagAllMastersRecord::Phase::sourceCutsPreparing) {
+          MothershipNametagAllMastersRecord progressed = {};
+          auto registry = openClusterRegistry();
+          valid = registry.installNametagAllMastersSourceCutPlacements(intent.operationUUID, pulseObservations, hotObservations,
+              coldObservations, radarObservations, baselineFixture, progressed, &failure);
+          if (valid) recorded = std::move(progressed);
+        }
+      }
+      if (valid && intent.protocolVersion == MothershipNametagAllMastersIntent::version && !mothershipNametagAllMastersSeedPlacementsSynthesize(
+              intent, pulseObservations, hotObservations, coldObservations, radarObservations, proposed.seedPlacements)) {
+        valid = false; failure.assign("Nametag all-masters seed placement could not bind every authenticated replica"_ctv);
+      }
+      if (valid && intent.protocolVersion == MothershipNametagAllMastersIntent::version) { auto registry = openClusterRegistry(); valid = registry.persistNametagAllMasters(proposed, recorded, resumed, &failure); }
+      // The registry record is the only authority source. Convert each
+      // persisted remote row into one exact target command; no live deployment
+      // observation is reused for delivery. Persist acceptance before moving
+      // to the next target so Mothership can resume after a process restart.
+      for (uint32_t rowIndex = 0; valid && rowIndex < recorded.seedPlacements.size(); ++rowIndex) {
+        auto row = recorded.seedPlacements[rowIndex];
+        if (row.deliveryApplied && (recorded.protocolVersion < MothershipNametagAllMastersRecord::sourceCutVersion || row.catchupObserved)) continue;
+        {
+          auto registry = openClusterRegistry();
+          valid = registry.claimNametagAllMastersSeedDelivery(recorded.intent.operationUUID, rowIndex, recorded, &failure);
+          if (!valid) break;
+          row = recorded.seedPlacements[rowIndex];
+        }
+        MothershipProdigyCluster cluster = {}; String identity = {}; identity.assignItoh(row.targetClusterUUID);
+        {
+          auto registry = openClusterRegistry();
+          valid = registry.getClusterByIdentity(identity, cluster, &failure);
+        }
+        valid = valid && configureControlTarget(cluster.name.c_str(), &failure) && socket.ensureConnected();
+        ProdigyStatefulStoreSeedAuthority authority = {};
+        if (valid) {
+          authority.authorityGeneration = row.seedGeneration; authority.operationUUID = recorded.intent.operationUUID;
+          authority.applicationID = row.applicationID; authority.storeKind = row.storeKind; authority.shardGroup = row.shardGroup;
+          authority.nShardGroups = (row.applicationID == MeshRegistry::Hot::applicationID || row.applicationID == MeshRegistry::Cold::applicationID) ? 3 : 1;
+          authority.targetClusterUUID = row.targetClusterUUID; authority.targetDeploymentID = row.targetDeploymentID; authority.targetContainerUUID = row.targetContainerUUID;
+          authority.sourceClusterUUID = row.sourceClusterUUID; authority.sourceDeploymentID = row.sourceDeploymentID; authority.sourceContainerUUID = row.sourceContainerUUID;
+          authority.seedGeneration = row.seedGeneration; authority.fixtureSHA256 = row.fixtureSHA256;
+          authority.expectedCatchupWatermarkSHA256 = row.expectedCatchupWatermarkSHA256;
+          authority.sourceContentWatermarkSHA256 = row.sourceContentWatermarkSHA256;
+          authority.sourceCatchupWatermarkSHA256 = row.sourceCatchupWatermarkSHA256;
+          if (recorded.protocolVersion >= MothershipNametagAllMastersRecord::sourceCutVersion)
+            valid = mothershipNametagSourceCutAuthority(recorded, row, authority);
+          String encoded = {}; auto copy = authority;
+          valid = valid && prodigyStatefulStoreSeedAuthorityValid(authority);
+          if (valid && recorded.protocolVersion >= MothershipNametagAllMastersRecord::sourceCutVersion)
+            valid = validateNametagSeedRoute(recorded, row, authority, failure) && configureControlTarget(cluster.name.c_str(), &failure) && socket.ensureConnected();
+          valid = valid && BitseryEngine::serialize(encoded, copy);
+          if (valid) {
+            Message::construct(socket.wBuffer, MothershipTopic::applyNametagAllMastersSeedAuthority, encoded);
+            valid = socket.send();
+            Message *response = valid ? socket.recvExpectedTopic(MothershipTopic::applyNametagAllMastersSeedAuthority) : nullptr;
+            uint8_t applied = 0;
+            if (!response) valid = false;
+            else { uint8_t *reply = response->args; Message::extractArg<ArgumentNature::fixed>(reply, applied); valid = reply == response->terminal() && applied == 1; }
+          }
+          if (valid && authority.protocolVersion == ProdigyStatefulStoreSeedAuthority::qualificationSeedFaultVersion) {
+            ProdigyNametagQualificationSeedFault arm = {}, reply = {};
+            arm.runUUID = authority.qualificationRunUUID; arm.challengeUUID = authority.qualificationChallengeUUID;
+            arm.executionGeneration = authority.qualificationExecutionGeneration;
+            arm.deadlineAtMilliseconds = authority.qualificationDeadlineAtMilliseconds;
+            arm.stage = ProdigyNametagQualificationSeedFaultStage::arm; arm.authority = authority;
+            bool armed = false;
+            while (Time::now<TimeResolution::ms>() < arm.deadlineAtMilliseconds) {
+              if (!requestTopicRoundTrip(MothershipTopic::nametagQualification, arm, reply, failure) ||
+                  !prodigyNametagQualificationSeedFaultResponseMatches(arm, reply) || !reply.failure.empty()) {
+                valid = false; break;
+              }
+              if (reply.ready) { armed = true; break; }
+              ::usleep(100'000);
+            }
+            if (!armed) { valid = false; if (failure.empty()) failure.assign("seed fault arm was not acknowledged"_ctv); }
+          }
+        }
+        socket.close();
+        if (valid) {
+          MothershipNametagAllMastersRecord progressed = {};
+          auto registry = openClusterRegistry();
+          valid = registry.markNametagAllMastersSeedDelivered(recorded.intent.operationUUID, row, progressed, &failure);
+          if (valid) recorded = std::move(progressed);
+        }
+        if (!valid && failure.empty()) failure.assign("persisted Nametag all-masters seed authority was not accepted by its exact target"_ctv);
+      }
+      // Recover only a previously observed durable row. The old receipt is an
+      // expectation; Brain requests a new receipt from the still-live store.
+      if (valid && recorded.protocolVersion >= MothershipNametagAllMastersRecord::sourceCutVersion) {
+        for (const auto& row : recorded.seedPlacements) {
+          if (!row.deliveryApplied || !row.catchupObserved) continue;
+          ProdigyStatefulStoreProofRecovery request = {};
+          request.expected = row.nativeSourceCutReceipt;
+          request.nonce = Random::generateNumberWithNBits<128, uint128_t>();
+          MothershipProdigyCluster cluster = {}; String identity = {}; identity.assignItoh(row.targetClusterUUID);
+          ProdigyStatefulStoreProofRecovery reply = {};
+          {
+            auto registry = openClusterRegistry();
+            valid = mothershipNametagSourceCutAuthority(recorded, row, request.authority) &&
+                prodigyStatefulStoreProofRecoveryValid(request) && registry.getClusterByIdentity(identity, cluster, &failure);
+          }
+          valid = valid && configureControlTarget(cluster.name.c_str(), &failure) &&
+              requestTopicRoundTrip(MothershipTopic::statefulStoreProofRecovery, request, reply, failure);
+          String expectedBytes, replyBytes; auto expected = request; expected.response = true; expected.accepted = true;
+          valid = valid && reply.response && reply.accepted && prodigyStatefulStoreProofRecoveryValid(reply) &&
+              BitseryEngine::serialize(expectedBytes, expected) && BitseryEngine::serialize(replyBytes, reply) && expectedBytes == replyBytes;
+          if (!valid) { if (failure.empty()) failure.assign("native proof recovery was not accepted by its exact target"_ctv); break; }
+        }
+      }
+      // Delivery only admits a bounded native seed authority.  Completion is
+      // the fresh receipt-backed cohort proof, never the pre-seed identity
+      // observation used to choose target containers.
+      for (uint32_t poll = 0; valid && poll < 300; ++poll) {
+        Vector<DeploymentIdentityReport> pulse = {}, hot = {}, cold = {}, radar = {}, app6 = {};
+        DeploymentIdentityReport truth = {};
+        bool converged = siteClusters.size() == 3;
+        for (uint32_t site = 0; converged && site < siteClusters.size(); ++site) {
+          DeploymentIdentityReport onePulse = {}, oneHot = {}, oneCold = {}, oneRadar = {}, oneApp6 = {}, oneTruth = {};
+          converged = readDeploymentIdentity(siteClusters[site], recorded.intent.sites[site].pulseDeploymentID, onePulse, failure) &&
+              readDeploymentIdentity(siteClusters[site], recorded.intent.sites[site].hotDeploymentID, oneHot, failure) &&
+              readDeploymentIdentity(siteClusters[site], recorded.intent.sites[site].coldDeploymentID, oneCold, failure) &&
+              readDeploymentIdentity(siteClusters[site], recorded.intent.sites[site].radarDeploymentID, oneRadar, failure) &&
+              readDeploymentIdentity(siteClusters[site], recorded.intent.sites[site].app6DeploymentID, oneApp6, failure) &&
+              (site != 0 || readDeploymentIdentity(siteClusters[site], recorded.intent.sites[site].truthDeploymentID, oneTruth, failure)) &&
+              // Keep EWR's baseline live while recording each remote target
+              // independently; requiring all remote rows here would lose
+              // restart-resume progress until the final target catches up.
+              (site == 0 && recorded.protocolVersion < MothershipNametagAllMastersRecord::sourceCutVersion ? mothershipNametagAllMastersSiteObserved(recorded.intent.sites[site], onePulse, oneHot, oneCold, oneRadar, &oneTruth) :
+               site == 0 ? mothershipNametagAllMastersSiteReadyForSeedSelection(recorded.intent.sites[site], onePulse, oneHot, oneCold, oneRadar, &oneTruth) :
+               mothershipNametagAllMastersSiteReadyForSeedSelection(recorded.intent.sites[site], onePulse, oneHot, oneCold, oneRadar, nullptr));
+          pulse.push_back(std::move(onePulse)); hot.push_back(std::move(oneHot)); cold.push_back(std::move(oneCold));
+          radar.push_back(std::move(oneRadar)); app6.push_back(std::move(oneApp6)); if (site == 0) truth = std::move(oneTruth);
+        }
+        // Persist each native receipt before requiring remote App6 traffic;
+        // clients cannot obtain its Truth receipt until their stores seed.
+        if (converged) {
+          MothershipNametagAllMastersRecord progressed = {};
+          auto registry = openClusterRegistry();
+          converged = registry.recordNametagAllMastersSeedObservations(recorded.intent.operationUUID,
+              pulse, hot, cold, radar, progressed, &failure);
+          if (converged) recorded = std::move(progressed);
+        }
+        if (converged && recorded.protocolVersion >= MothershipNametagAllMastersRecord::sourceCutVersion) {
+          // Durable history alone is not live evidence: every target must have
+          // independently republished a current, matching native receipt.
+          for (const auto& row : recorded.seedPlacements) {
+            const auto *reports = row.applicationID == MeshRegistry::Pulse::applicationID ? &pulse :
+                (row.applicationID == MeshRegistry::Hot::applicationID ? &hot :
+                 (row.applicationID == MeshRegistry::Cold::applicationID ? &cold : &radar));
+            ProdigyStatefulStoreSeedAuthority authority = {};
+            if (row.site >= reports->size() || !mothershipNametagSourceCutAuthority(recorded, row, authority)) { converged = false; break; }
+            const auto& report = (*reports)[row.site];
+            auto found = std::find_if(report.statefulRuntimeCohort.begin(), report.statefulRuntimeCohort.end(), [&](const auto& member) {
+              return member.containerUUID == row.targetContainerUUID && member.shardGroup == row.shardGroup &&
+                  member.nativeSourceCutReceipt.state == ProdigyStatefulStoreReceiptState::active &&
+                  prodigyStatefulStoreReceiptMatchesSourceCutAuthority(member.nativeSourceCutReceipt, authority);
+            });
+            if (report.version < 5 || report.clusterUUID != row.targetClusterUUID || report.deploymentID != row.targetDeploymentID ||
+                found == report.statefulRuntimeCohort.end()) { converged = false; break; }
+          }
+        }
+        // A target reply is merely authority acceptance. Completion requires
+        // every persisted remote row to have the matching native receipt and
+        // the same still-live EWR baseline proof.
+        converged = converged && recorded.phase == MothershipNametagAllMastersRecord::Phase::remoteSeeded &&
+            (recorded.protocolVersion >= MothershipNametagAllMastersRecord::sourceCutVersion ||
+             mothershipNametagAllMastersSeedPlacementsObserved(recorded.seedPlacements, pulse, hot, cold, radar));
+        converged = converged && mothershipNametagApp6TruthMeshSetObserved(app6, recorded.intent.sites, truth);
+        if (converged) break;
+        if (poll == 299) { valid = false; failure.assign("Nametag all-masters timed out waiting for native seed receipts and current app6 Truth traffic"_ctv); break; }
+        ::usleep(100'000);
+      }
+        if (valid && recorded.phase == MothershipNametagAllMastersRecord::Phase::remoteSeeded) {
+          for (uint32_t i = 0; valid && i < recorded.sourceCuts.size(); ++i) {
+            if (recorded.sourceCuts[i].released ||
+                recorded.sourceCuts[i].request.retainUntilMilliseconds <= Time::now<TimeResolution::ms>()) continue;
+            auto release = recorded.sourceCuts[i].request;
+            release.action = ProdigyStatefulStoreSourceCutAction::release;
+            release.cutUUID = recorded.sourceCuts[i].proof.cutUUID; release.cutGeneration = recorded.sourceCuts[i].proof.cutGeneration;
+            bool released = false;
+            for (uint32_t poll = 0; valid && poll < 300 && !released; ++poll) {
+              ProdigyStatefulStoreSourceCut reply = {};
+              valid = configureControlTarget(siteClusters[0].name.c_str(), &failure) &&
+                  requestTopicRoundTrip(MothershipTopic::statefulStoreSourceCut, release, reply, failure) &&
+                  prodigyStatefulStoreSourceCutResponseMatches(release, reply) && reply.failure.empty();
+              if (!valid) break;
+              if (!reply.released) { ::usleep(100'000); continue; }
+              MothershipNametagAllMastersRecord progressed = {};
+              {
+                auto registry = openClusterRegistry();
+                valid = registry.updateNametagAllMastersSourceCut(intent.operationUUID, i, false, &reply, progressed, &failure);
+              }
+              if (valid) { recorded = std::move(progressed); released = true; }
+            }
+            if (valid && !released) { valid = false; failure.assign("source cut release did not complete"_ctv); }
+          }
+        }
+    }
+    basics_log("nametagAllMasters success=%u resumed=%u operationUUID=%s failure=%s\n", unsigned(valid), unsigned(resumed),
+        argc ? argv[0] : "", failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
+  // Resume the exact durable source-cut challenges for a successor. A lost
+  // first reply is ambiguous and must never mint a replacement challenge.
+  bool prepareNametagSeedSuccessorCuts(MothershipNametagSeedSuccessor& recorded,
+      const Vector<DeploymentIdentityReport>& reports, String& failure)
+  {
+    for (uint32_t index = 0; index < recorded.sourceCuts.size(); ++index) {
+      auto cut = recorded.sourceCuts[index];
+      if (cut.released || cut.request.retainUntilMilliseconds <= Time::now<TimeResolution::ms>()) {
+        failure.assign("successor source cut expired or was released"_ctv); return false;
+      }
+      if (cut.dispatched && !cut.request.memberRequestUUID) {
+        failure.assign("successor source cut dispatch outcome is ambiguous"_ctv); return false;
+      }
+      if (!cut.dispatched) {
+        MothershipNametagSeedSuccessor next = {};
+        auto registry = openClusterRegistry();
+        if (!registry.updateNametagSeedSuccessorCut(recorded.operationUUID, index, true, nullptr, reports, next, &failure)) return false;
+        recorded = std::move(next);
+      }
+      MothershipProdigyCluster source = {}; String identity = {};
+      identity.assignItoh(recorded.sourceCuts[index].request.sourceClusterUUID);
+      { auto registry = openClusterRegistry(); if (!registry.getClusterByIdentity(identity, source, &failure)) return false; }
+      for (uint32_t poll = 0; poll < 300 && !recorded.sourceCuts[index].proof.ready; ++poll) {
+        const auto request = recorded.sourceCuts[index].request;
+        ProdigyStatefulStoreSourceCut reply = {};
+        if (!configureControlTarget(source.name.c_str(), &failure) ||
+            !requestTopicRoundTrip(MothershipTopic::statefulStoreSourceCut, request, reply, failure)) return false;
+        auto expected = request;
+        if (!expected.memberRequestUUID) expected.memberRequestUUID = reply.memberRequestUUID;
+        if (!prodigyStatefulStoreSourceCutResponseMatches(expected, reply) || !reply.failure.empty()) {
+          failure.assign("successor source cut returned an invalid challenge"_ctv); return false;
+        }
+        MothershipNametagSeedSuccessor next = {};
+        { auto registry = openClusterRegistry();
+          if (!registry.updateNametagSeedSuccessorCut(recorded.operationUUID, index, false, &reply, reports, next, &failure)) return false; }
+        recorded = std::move(next);
+        if (!reply.ready) ::usleep(100'000);
+      }
+      cut = recorded.sourceCuts[index];
+      if (!cut.proof.ready) { failure.assign("successor source cut did not become ready"_ctv); return false; }
+      auto query = cut.request; query.action = ProdigyStatefulStoreSourceCutAction::query;
+      query.cutUUID = cut.proof.cutUUID; query.cutGeneration = cut.proof.cutGeneration;
+      ProdigyStatefulStoreSourceCut reply = {};
+      if (!configureControlTarget(source.name.c_str(), &failure) ||
+          !requestTopicRoundTrip(MothershipTopic::statefulStoreSourceCut, query, reply, failure) ||
+          !prodigyStatefulStoreSourceCutResponseMatches(query, reply) || !reply.ready || !reply.failure.empty() ||
+          reply.contentSHA256 != cut.proof.contentSHA256 || reply.headsSHA256 != cut.proof.headsSHA256 ||
+          cut.request.retainUntilMilliseconds <= Time::now<TimeResolution::ms>()) {
+        if (failure.empty()) failure.assign("successor retained source cut is no longer current"_ctv);
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool deliverNametagSeedSuccessorAuthority(MothershipNametagSeedSuccessor& recorded,
+      const MothershipNametagAllMastersRecord& prior, const Vector<DeploymentIdentityReport>& reports,
+      uint32_t index, uint128_t challenge, int64_t deadline, String& failure)
+  {
+    if (index >= recorded.targets.size()) return false;
+    auto target = recorded.targets[index];
+    if (!target.authority.protocolVersion) {
+      ProdigyStatefulStoreSeedAuthority authority = {};
+      if (!mothershipNametagSeedSuccessorAuthority(recorded, prior, index, challenge, deadline, authority)) return false;
+      MothershipNametagSeedSuccessor next = {};
+      { auto registry = openClusterRegistry();
+        if (!registry.installNametagSeedSuccessorAuthority(recorded.operationUUID, index, authority, reports, next, &failure)) return false; }
+      recorded = std::move(next); target = recorded.targets[index];
+    }
+    if ((index == recorded.heldTargetIndex &&
+         (target.authority.qualificationChallengeUUID != challenge ||
+          target.authority.qualificationDeadlineAtMilliseconds != deadline)) ||
+        (index != recorded.heldTargetIndex && (challenge || deadline))) return false;
+    if (target.deliveryApplied) return true;
+    if (!target.deliveryDispatched) {
+      MothershipNametagSeedSuccessor next = {};
+      { auto registry = openClusterRegistry();
+        if (!registry.updateNametagSeedSuccessorDelivery(recorded.operationUUID, index, true, reports, next, &failure)) return false; }
+      recorded = std::move(next); target = recorded.targets[index];
+    }
+    MothershipProdigyCluster cluster = {}; String identity = {};
+    identity.assignItoh(target.authority.targetClusterUUID);
+    { auto registry = openClusterRegistry(); if (!registry.getClusterByIdentity(identity, cluster, &failure)) return false; }
+    if (!configureControlTarget(cluster.name.c_str(), &failure) || !socket.ensureConnected()) return false;
+    auto authority = target.authority; String encoded = {};
+    if (!BitseryEngine::serialize(encoded, authority)) return false;
+    Message::construct(socket.wBuffer, MothershipTopic::applyNametagAllMastersSeedAuthority, encoded);
+    if (!socket.send()) return false;
+    Message *response = socket.recvExpectedTopic(MothershipTopic::applyNametagAllMastersSeedAuthority);
+    if (!response) return false;
+    uint8_t applied = 0; uint8_t *args = response->args;
+    Message::extractArg<ArgumentNature::fixed>(args, applied);
+    if (args != response->terminal() || applied != 1) return false;
+    if (authority.protocolVersion == ProdigyStatefulStoreSeedAuthority::qualificationSeedFaultVersion) {
+      ProdigyNametagQualificationSeedFault arm = {}, reply = {};
+      arm.runUUID = authority.qualificationRunUUID; arm.challengeUUID = authority.qualificationChallengeUUID;
+      arm.executionGeneration = authority.qualificationExecutionGeneration;
+      arm.deadlineAtMilliseconds = authority.qualificationDeadlineAtMilliseconds;
+      arm.stage = ProdigyNametagQualificationSeedFaultStage::arm; arm.authority = authority;
+      bool armed = false;
+      while (Time::now<TimeResolution::ms>() < arm.deadlineAtMilliseconds) {
+        if (!requestTopicRoundTrip(MothershipTopic::nametagQualification, arm, reply, failure) ||
+            !prodigyNametagQualificationSeedFaultResponseMatches(arm, reply) || !reply.failure.empty()) return false;
+        if (reply.ready) { armed = true; break; }
+        ::usleep(100'000);
+      }
+      if (!armed) { failure.assign("successor seed arm was not acknowledged"_ctv); return false; }
+    }
+    MothershipNametagSeedSuccessor next = {};
+    { auto registry = openClusterRegistry();
+      if (!registry.updateNametagSeedSuccessorDelivery(recorded.operationUUID, index, false, reports, next, &failure)) return false; }
+    recorded = std::move(next);
+    return true;
+  }
+
+  bool observeNametagSeedSuccessorHold(MothershipNametagSeedSuccessor& recorded,
+      const Vector<DeploymentIdentityReport>& reports, String& failure)
+  {
+    if (recorded.heldTargetIndex >= recorded.targets.size()) return false;
+    const auto& target = recorded.targets[recorded.heldTargetIndex];
+    const auto& authority = target.authority;
+    if (!target.deliveryApplied || authority.protocolVersion != ProdigyStatefulStoreSeedAuthority::qualificationSeedFaultVersion) return false;
+    MothershipProdigyCluster cluster = {}; String identity = {}; identity.assignItoh(authority.targetClusterUUID);
+    { auto registry = openClusterRegistry(); if (!registry.getClusterByIdentity(identity, cluster, &failure)) return false; }
+    ProdigyNametagQualificationSeedFault query = {}, reply = {};
+    query.runUUID = authority.qualificationRunUUID; query.challengeUUID = authority.qualificationChallengeUUID;
+    query.executionGeneration = authority.qualificationExecutionGeneration;
+    query.deadlineAtMilliseconds = authority.qualificationDeadlineAtMilliseconds;
+    query.stage = ProdigyNametagQualificationSeedFaultStage::query; query.authority = authority;
+    while (Time::now<TimeResolution::ms>() < query.deadlineAtMilliseconds) {
+      if (!configureControlTarget(cluster.name.c_str(), &failure) ||
+          !requestTopicRoundTrip(MothershipTopic::nametagQualification, query, reply, failure) ||
+          !prodigyNametagQualificationSeedFaultResponseMatches(query, reply) || !reply.failure.empty()) return false;
+      if (reply.held) {
+        MothershipNametagSeedSuccessor next = {};
+        { auto registry = openClusterRegistry();
+          if (!registry.recordNametagSeedSuccessorHeld(recorded.operationUUID, reply, reports, next, &failure)) return false; }
+        recorded = std::move(next); return true;
+      }
+      ::usleep(100'000);
+    }
+    failure.assign("successor seed did not reach the held applied-progress boundary"_ctv);
+    return false;
+  }
+
+  bool releaseNametagSeedSuccessorHold(MothershipNametagSeedSuccessor& recorded,
+      const Vector<DeploymentIdentityReport>& reports, String& failure)
+  {
+    if (recorded.stage >= MothershipNametagSeedSuccessorStage::resumed) return true;
+    if (recorded.heldTargetIndex >= recorded.targets.size()) return false;
+    MothershipNametagSeedSuccessor next = {};
+    { auto registry = openClusterRegistry();
+      if (!registry.updateNametagSeedSuccessorRelease(recorded.operationUUID, true, nullptr, reports, next, &failure)) return false; }
+    recorded = std::move(next);
+    const auto authority = recorded.targets[recorded.heldTargetIndex].authority;
+    MothershipProdigyCluster cluster = {}; String identity = {}; identity.assignItoh(authority.targetClusterUUID);
+    { auto registry = openClusterRegistry(); if (!registry.getClusterByIdentity(identity, cluster, &failure)) return false; }
+    ProdigyNametagQualificationSeedFault request = {}, reply = {};
+    request.runUUID = authority.qualificationRunUUID; request.challengeUUID = authority.qualificationChallengeUUID;
+    request.executionGeneration = authority.qualificationExecutionGeneration;
+    request.deadlineAtMilliseconds = authority.qualificationDeadlineAtMilliseconds;
+    request.stage = ProdigyNametagQualificationSeedFaultStage::release; request.authority = authority;
+    while (Time::now<TimeResolution::ms>() < request.deadlineAtMilliseconds) {
+      if (!configureControlTarget(cluster.name.c_str(), &failure) ||
+          !requestTopicRoundTrip(MothershipTopic::nametagQualification, request, reply, failure) ||
+          !prodigyNametagQualificationSeedFaultResponseMatches(request, reply) || !reply.failure.empty()) return false;
+      if (reply.ready) {
+        { auto registry = openClusterRegistry();
+          if (!registry.updateNametagSeedSuccessorRelease(recorded.operationUUID, false, &reply, reports, next, &failure)) return false; }
+        recorded = std::move(next); return true;
+      }
+      ::usleep(100'000);
+    }
+    failure.assign("successor held seed was not released before the deadline"_ctv); return false;
+  }
+
+  bool releaseNametagSeedSuccessorCuts(MothershipNametagSeedSuccessor& recorded,
+      const Vector<DeploymentIdentityReport>& reports, String& failure)
+  {
+    if (!mothershipNametagSeedSuccessorNativeComplete(recorded)) return false;
+    for (uint32_t index = 0; index < recorded.sourceCuts.size(); ++index) {
+      auto cut = recorded.sourceCuts[index];
+      if (cut.released) continue;
+      MothershipNametagSeedSuccessor next = {};
+      { auto registry = openClusterRegistry();
+        if (!registry.updateNametagSeedSuccessorCutRelease(recorded.operationUUID, index, true, nullptr, reports, next, &failure)) return false; }
+      recorded = std::move(next); cut = recorded.sourceCuts[index];
+      MothershipProdigyCluster cluster = {}; String identity = {}; identity.assignItoh(cut.request.sourceClusterUUID);
+      { auto registry = openClusterRegistry(); if (!registry.getClusterByIdentity(identity, cluster, &failure)) return false; }
+      auto request = cut.request; request.action = ProdigyStatefulStoreSourceCutAction::release;
+      request.cutUUID = cut.proof.cutUUID; request.cutGeneration = cut.proof.cutGeneration;
+      bool released = false;
+      for (uint32_t poll = 0; poll < 300 && !released; ++poll) {
+        ProdigyStatefulStoreSourceCut reply = {};
+        if (!configureControlTarget(cluster.name.c_str(), &failure) ||
+            !requestTopicRoundTrip(MothershipTopic::statefulStoreSourceCut, request, reply, failure) ||
+            !prodigyStatefulStoreSourceCutResponseMatches(request, reply) || !reply.failure.empty()) return false;
+        if (!reply.released) { ::usleep(100'000); continue; }
+        { auto registry = openClusterRegistry();
+          if (!registry.updateNametagSeedSuccessorCutRelease(recorded.operationUUID, index, false, &reply, reports, next, &failure)) return false; }
+        recorded = std::move(next); released = true;
+      }
+      if (!released) { failure.assign("successor source cut release did not complete"_ctv); return false; }
+    }
+    return recorded.stage == MothershipNametagSeedSuccessorStage::complete;
+  }
+
+  bool rebootNametagSeedSuccessorBrain(MothershipNametagSeedSuccessor& recorded, bool source,
+      MothershipNametagSeedRebootFence fence, const Vector<DeploymentIdentityReport>& reports,
+      int64_t deadline, String& failure)
+  {
+    if (!fence.clusterUUID || !fence.machineUUID || !fence.dispatchUUID || deadline <= Time::now<TimeResolution::ms>() ||
+        recorded.heldTargetIndex >= recorded.targets.size()) return false;
+    if ((source && (recorded.sourceCuts.empty() || fence.clusterUUID != recorded.sourceCuts[0].request.sourceClusterUUID)) ||
+        (!source && fence.clusterUUID != recorded.targets[recorded.heldTargetIndex].authority.targetClusterUUID)) return false;
+    if (!source && fence.machineUUID == recorded.targets[recorded.heldTargetIndex].machineUUID) return false;
+    if (source) for (const auto& cut : recorded.sourceCuts) {
+      bool found = false;
+      for (const auto& report : reports) for (const auto& member : report.statefulRuntimeCohort) {
+        if (report.clusterUUID == fence.clusterUUID && member.containerUUID == cut.request.sourceContainerUUID) {
+          if (member.machineUUID == fence.machineUUID) return false;
+          found = true;
+        }
+      }
+      if (!found) return false;
+    }
+    MothershipProdigyCluster cluster = {}; String identity = {}; identity.assignItoh(fence.clusterUUID);
+    { auto registry = openClusterRegistry(); if (!registry.getClusterByIdentity(identity, cluster, &failure)) return false; }
+    auto queryBoot = [&](uint128_t challenge, String& boot) -> bool {
+      ProdigyNametagQualificationMachineBoot request = {}, reply = {};
+      request.runUUID = recorded.qualificationRunUUID; request.challengeUUID = challenge;
+      request.executionGeneration = recorded.executionGeneration; request.deadlineAtMilliseconds = deadline;
+      request.clusterUUID = fence.clusterUUID; request.machineUUID = fence.machineUUID;
+      while (Time::now<TimeResolution::ms>() < deadline) {
+        socket.close();
+        if (configureControlTarget(cluster.name.c_str(), &failure) &&
+            requestTopicRoundTrip(MothershipTopic::nametagQualification, request, reply, failure) &&
+            prodigyNametagQualificationMachineBootMatches(request, reply) && reply.ready && reply.failure.empty()) {
+          boot = reply.bootID; failure.clear(); socket.close(); return true;
+        }
+        socket.close(); ::usleep(100'000);
+      }
+      return false;
+    };
+    auto saved = source ? recorded.sourceReboot : recorded.destinationReboot;
+    if (!saved.dispatchUUID) {
+      ClusterStatusReport status = {};
+      if (!productionClusterHealthy(cluster, status, failure)) return false;
+      String machine = {}; machine.assignItoh(fence.machineUUID);
+      if (std::count_if(status.machineReports.begin(), status.machineReports.end(), [&](const auto& m) {
+            return m.machineUUID == machine && m.currentMaster;
+          }) != 1 || !queryBoot(fence.dispatchUUID, fence.beforeBootID)) return false;
+      MothershipNametagSeedSuccessor next = {};
+      { auto registry = openClusterRegistry();
+        if (!registry.updateNametagSeedSuccessorReboot(recorded.operationUUID, source, fence, reports, next, &failure)) return false; }
+      recorded = std::move(next); saved = source ? recorded.sourceReboot : recorded.destinationReboot;
+    }
+    if (saved.clusterUUID != fence.clusterUUID || saved.machineUUID != fence.machineUUID || saved.dispatchUUID != fence.dispatchUUID) return false;
+    if (saved.observed) return true;
+    if (saved.dispatched && !saved.providerAccepted) {
+      failure.assign("reboot submission outcome is ambiguous after restart"_ctv); return false;
+    }
+    if (!saved.dispatched) {
+      saved.dispatched = true; MothershipNametagSeedSuccessor next = {};
+      { auto registry = openClusterRegistry();
+        if (!registry.updateNametagSeedSuccessorReboot(recorded.operationUUID, source, saved, reports, next, &failure)) return false; }
+      recorded = std::move(next);
+      uint64_t topologyVersion = 0;
+      if (!submitRemoteCloudMachineReboot(cluster, saved.machineUUID, topologyVersion, failure)) return false;
+      saved.providerAccepted = true;
+      { auto registry = openClusterRegistry();
+        if (!registry.updateNametagSeedSuccessorReboot(recorded.operationUUID, source, saved, reports, next, &failure)) return false; }
+      recorded = std::move(next);
+    }
+    uint128_t afterChallenge = saved.dispatchUUID ^ uint128_t(1);
+    if (!afterChallenge) afterChallenge = uint128_t(2);
+    String after = {};
+    while (Time::now<TimeResolution::ms>() < deadline) {
+      if (queryBoot(afterChallenge, after) && after != saved.beforeBootID) {
+        if (!prepareNametagSeedSuccessorCuts(recorded, reports, failure) ||
+            !observeNametagSeedSuccessorHold(recorded, reports, failure)) return false;
+        saved.afterBootID = after; saved.observed = true;
+        MothershipNametagSeedSuccessor next = {};
+        { auto registry = openClusterRegistry();
+          if (!registry.updateNametagSeedSuccessorReboot(recorded.operationUUID, source, saved, reports, next, &failure)) return false; }
+        recorded = std::move(next); return true;
+      }
+      ::usleep(100'000);
+    }
+    failure.assign("successor Brain reboot did not produce a different authenticated boot identity"_ctv); return false;
+  }
+
+  bool runNametagSeedSuccessorTransfer(MothershipNametagSeedSuccessor& recorded,
+      const MothershipNametagAllMastersRecord& prior, Vector<DeploymentIdentityReport>& reports,
+      uint128_t challenge, int64_t deadline, MothershipNametagSeedRebootFence sourceReboot,
+      MothershipNametagSeedRebootFence destinationReboot, String& failure)
+  {
+    if (recorded.stage == MothershipNametagSeedSuccessorStage::complete) return true;
+    if (!challenge || recorded.heldTargetIndex >= recorded.targets.size() ||
+        deadline <= Time::now<TimeResolution::ms>()) return false;
+    if (recorded.stage < MothershipNametagSeedSuccessorStage::resumed) {
+      if (!prepareNametagSeedSuccessorCuts(recorded, reports, failure)) return false;
+      if (!deliverNametagSeedSuccessorAuthority(recorded, prior, reports, recorded.heldTargetIndex,
+                                                 challenge, deadline, failure)) return false;
+      for (uint32_t i = 0; i < recorded.targets.size(); ++i) {
+        if (i != recorded.heldTargetIndex &&
+            !deliverNametagSeedSuccessorAuthority(recorded, prior, reports, i, 0, 0, failure)) return false;
+      }
+      if (!observeNametagSeedSuccessorHold(recorded, reports, failure)) return false;
+    }
+    auto refreshNative = [&]() -> bool {
+      Vector<DeploymentIdentityReport> fresh = {};
+      for (const auto& old : reports) {
+        const bool target = std::any_of(recorded.targets.begin(), recorded.targets.end(), [&](const auto& t) {
+          return t.targetDeploymentID == old.deploymentID && t.authority.targetClusterUUID == old.clusterUUID;
+        });
+        if (!target) fresh.push_back(old);
+      }
+      for (const auto& target : recorded.targets) {
+        if (std::any_of(fresh.begin(), fresh.end(), [&](const auto& r) {
+              return r.deploymentID == target.targetDeploymentID && r.clusterUUID == target.authority.targetClusterUUID;
+            })) continue;
+        MothershipProdigyCluster cluster = {}; String identity = {}; identity.assignItoh(target.authority.targetClusterUUID);
+        { auto registry = openClusterRegistry(); if (!registry.getClusterByIdentity(identity, cluster, &failure)) return false; }
+        DeploymentIdentityReport report = {};
+        if (!readDeploymentIdentity(cluster, target.targetDeploymentID, report, failure)) return false;
+        fresh.push_back(std::move(report));
+      }
+      MothershipNametagSeedSuccessor next = {};
+      { auto registry = openClusterRegistry();
+        if (!registry.recordNametagSeedSuccessorNative(recorded.operationUUID, fresh, next, &failure)) return false; }
+      reports = std::move(fresh); recorded = std::move(next); return true;
+    };
+    // For the replica scenario the other members complete their native seed
+    // before the selected member is released; the site attempt is separate.
+    while (Time::now<TimeResolution::ms>() < deadline) {
+      if (!refreshNative()) return false;
+      bool othersReady = true;
+      for (uint32_t i = 0; i < recorded.targets.size(); ++i)
+        if (i != recorded.heldTargetIndex && !recorded.targets[i].nativeReceipt.protocolVersion) othersReady = false;
+      if (othersReady) break;
+      ::usleep(100'000);
+    }
+    for (uint32_t i = 0; i < recorded.targets.size(); ++i)
+      if (i != recorded.heldTargetIndex && !recorded.targets[i].nativeReceipt.protocolVersion) {
+        failure.assign("successor peers did not finish seeding before release"_ctv); return false;
+      }
+    if (recorded.stage < MothershipNametagSeedSuccessorStage::resumed &&
+        recorded.qualificationRow == uint8_t(ProdigyNametagQualificationRow::brainHardRebootCatchup) &&
+        (!rebootNametagSeedSuccessorBrain(recorded, true, sourceReboot, reports, deadline, failure) ||
+         !rebootNametagSeedSuccessorBrain(recorded, false, destinationReboot, reports, deadline, failure))) return false;
+    if (!releaseNametagSeedSuccessorHold(recorded, reports, failure)) return false;
+    while (Time::now<TimeResolution::ms>() < deadline && !mothershipNametagSeedSuccessorNativeComplete(recorded)) {
+      if (!refreshNative()) return false;
+      if (!mothershipNametagSeedSuccessorNativeComplete(recorded)) ::usleep(100'000);
+    }
+    if (!mothershipNametagSeedSuccessorNativeComplete(recorded)) {
+      failure.assign("successor did not publish all native seed receipts"_ctv); return false;
+    }
+    return releaseNametagSeedSuccessorCuts(recorded, reports, failure);
   }
 
   void runProductionPair(int argc, char *argv[])
@@ -17242,22 +21080,121 @@ private:
   {
     const uint16_t applicationID = plan.config.applicationID;
     if (!mothershipApplicationPlacementRequired(applicationID)) return true;
+    const bool graph = applicationID == 2 || applicationID == 5;
+    const bool graphReplica = prodigyGraphDeploymentPlanCanonical(plan, true);
+    if (graph && !graphReplica && !prodigyGraphDeploymentPlanCanonical(plan, false)) {
+      failure.assign("graph admission requires the canonical one-group writer or non-client replica profile"_ctv);
+      return false;
+    }
     const uint128_t requested = socket.configuredClusterUUID();
     if (requested == 0) { failure.assign("Truth admission requires an exact registered cluster identity"_ctv); return false; }
+    if (graph && plan.stateful.allMasters) {
+      // Graph genesis deliberately precedes cross-site seed authorization.  It
+      // still dispatches only to the configured, durably registered cluster;
+      // cousin permissions and remote seed admission remain their own owners.
+      auto registry = openClusterRegistry();
+      MothershipProdigyCluster target; String identity; identity.assignItoh(requested);
+      if (!registry.getClusterByIdentity(identity, target, &failure) || target.clusterUUID != requested) {
+        if (failure.empty()) failure.assign("graph all-master admission requires its exact registered cluster identity"_ctv);
+        return false;
+      }
+      return true;
+    }
     Vector<MothershipProdigyCluster> clusters;
+    bool replicaOwnerKnown = false;
     {
       auto registry = openClusterRegistry();
       MothershipApplicationPlacement existing;
       String readFailure;
       if (registry.loadApplicationPlacement(applicationID, existing, &readFailure)) {
-        if (existing.ownerClusterUUID == requested) return true;
-        failure.assign("Truth destination admission conflicts with its durable source placement"_ctv);
-        return false;
+        if (applicationID == 10 && existing.truthRetirementStartedGeneration != 0 &&
+            existing.ownerClusterUUID == existing.truthRetirementOwnerClusterUUID) {
+          if (existing.truthRetirementCompletedGeneration == 0) {
+            failure.assign("Truth owner retirement is pending; admission remains fenced"_ctv);
+            return false;
+          }
+          // A verified, removed owner permits a fresh complete observation,
+          // not reuse of its old observation or an implicit writer transfer.
+          if (!registry.listClusters(clusters, &failure)) return false;
+        }
+        else if (existing.ownerClusterUUID == requested) {
+          MothershipApplicationPlacement stored; bool resumed = false;
+          return registry.admitApplicationPlacement(plan, requested, existing.observationReceiptSHA256,
+              stored, resumed, &failure);
+        }
+        else if (!graphReplica) {
+          failure.assign("destination admission conflicts with its durable writer placement"_ctv);
+          return false;
+        }
+        else replicaOwnerKnown = true;
       }
-      if (readFailure != "record not found"_ctv || !registry.listClusters(clusters, &failure)) {
+      else if (readFailure != "record not found"_ctv || !registry.listClusters(clusters, &failure)) {
         if (failure.empty()) failure = readFailure;
         return false;
       }
+    }
+    // Live observations resolve their targets through this same exclusive
+    // registry, so no database handle spans the RPCs.
+    if (replicaOwnerKnown) {
+      MothershipApplicationPlacement existing;
+      MothershipProdigyCluster source, target;
+      { auto registry = openClusterRegistry(); String identity;
+        if (!registry.loadApplicationPlacement(applicationID, existing, &failure)) return false;
+        identity.assignItoh(existing.ownerClusterUUID);
+        if (!registry.getClusterByIdentity(identity, source, &failure)) return false;
+        identity.assignItoh(requested);
+        if (!registry.getClusterByIdentity(identity, target, &failure)) return false;
+      }
+      String observations, topologyBytes, topologyDigest;
+      ClusterStatusReport targetReport;
+      bool memberKnown = false;
+      for (const auto& member : existing.graphReplicas) if (member.clusterUUID == requested) memberKnown = true;
+      Vector<MothershipGraphReplicaRouteBinding> routeBindings;
+      { auto registry = openClusterRegistry();
+        if (!registry.loadGraphReplicaRouteBindings(applicationID, existing.ownerClusterUUID, requested,
+                Time::now<TimeResolution::ms>(), routeBindings, &failure)) return false;
+      }
+      if (!graphReplicaCousinRoutesReady(source, target, plan, routeBindings, failure)) return false;
+      for (const auto *cluster : {&source, &target}) {
+        ClusterStatusReport report;
+        if (!readManagedClusterStatus(*cluster, report, failure) || !report.hasTopology ||
+            report.topology.version == 0 || report.machineReports.empty()) return false;
+        uint32_t masters = 0;
+        for (const auto& machine : report.machineReports) {
+          if (machine.state != "healthy"_ctv || !machine.runtimeReady || !machine.controlPlaneReachable) {
+            failure.assign("graph membership requires fresh healthy authenticated cluster observations"_ctv); return false;
+          }
+          if (machine.currentMaster) ++masters;
+        }
+        if (masters != 1) { failure.assign("graph membership requires one current master per cluster"_ctv); return false; }
+        for (const auto& app : report.applicationReports) if (app.applicationID == applicationID)
+          for (const auto& deployment : app.deploymentReports) {
+            if (!deployment.isStateful || deployment.nShardGroups != 1 ||
+                (cluster == &target && (!memberKnown || deployment.versionID != plan.config.versionID))) {
+              failure.assign("graph membership observation contains an unknown deployment or noncanonical shard count"_ctv); return false;
+            }
+            if (cluster == &target && deployment.nDeployed != 0) {
+              DeploymentIdentityReport identity;
+              auto planCopy = plan; String encodedPlan, planDigest;
+              BitseryEngine::serialize(encodedPlan, planCopy);
+              if (!prodigyComputeSHA256Hex(encodedPlan, planDigest) ||
+                  !readDeploymentIdentity(target, plan.config.deploymentID(), identity, failure) ||
+                  identity.canonicalPlanSHA256 != planDigest || identity.containerBlobSHA256 != plan.config.containerBlobSHA256 ||
+                  identity.containerBlobBytes != plan.config.containerBlobBytes) return false;
+            }
+          }
+        String encoded; BitseryEngine::serialize(encoded, report);
+        observations.append(reinterpret_cast<const uint8_t *>(&cluster->clusterUUID), sizeof(cluster->clusterUUID));
+        observations.append(encoded);
+        if (cluster == &target) targetReport = std::move(report);
+      }
+      if (!socket.configureCluster(target, &failure)) return false;
+      BitseryEngine::serialize(topologyBytes, targetReport.topology);
+      String receipt;
+      if (!prodigyComputeSHA256Hex(topologyBytes, topologyDigest) || !prodigyComputeSHA256Hex(observations, receipt)) return false;
+      auto registry = openClusterRegistry(); MothershipApplicationPlacement stored; bool resumed = false;
+      return registry.admitGraphReplicaPlacement(plan, requested, existing.ownerClusterUUID, existing.generation,
+          targetReport.topology.version, topologyDigest, receipt, stored, resumed, &failure);
     }
     std::sort(clusters.begin(), clusters.end(), [](const auto& a, const auto& b) { return a.clusterUUID < b.clusterUUID; });
     auto target = std::find_if(clusters.begin(), clusters.end(), [&](const auto& cluster) { return cluster.clusterUUID == requested; });
@@ -17279,6 +21216,12 @@ private:
       observations.append(reinterpret_cast<const uint8_t *>(&cluster.clusterUUID), sizeof(cluster.clusterUUID));
       observations.append(encoded);
       for (const auto& application : report.applicationReports) if (application.applicationID == applicationID && !application.deploymentReports.empty()) {
+        if (graph && std::any_of(application.deploymentReports.begin(), application.deploymentReports.end(),
+            [](const auto& deployment) { return !deployment.isStateful || deployment.nShardGroups != 1; })) {
+          socket.configureCluster(*target, nullptr);
+          failure.assign("graph placement observation is outside its single-group stateful authority"_ctv);
+          return false;
+        }
         if (observedOwner != 0 && observedOwner != cluster.clusterUUID) {
           socket.configureCluster(*target, nullptr);
           failure.assign("Truth is already declared by more than one cluster; admission is fenced"_ctv);
@@ -17290,11 +21233,17 @@ private:
     if (!socket.configureCluster(*target, &failure)) return false;
     String receipt;
     if (!prodigyComputeSHA256Hex(observations, receipt, &failure)) return false;
-    auto registry = openClusterRegistry();
     MothershipApplicationPlacement placement;
     bool resumed = false;
-    if (!registry.admitApplicationPlacement(plan, observedOwner != 0 ? observedOwner : requested, receipt, placement, resumed, &failure)) return false;
+    if (graphReplica && (observedOwner == 0 || observedOwner == requested)) {
+      failure.assign("a graph replica cannot establish or replace the retained writer owner"_ctv); return false;
+    }
+    { auto registry = openClusterRegistry();
+      if (!registry.admitApplicationPlacement(applicationID, observedOwner != 0 ? observedOwner : requested,
+          receipt, placement, resumed, &failure)) return false;
+    }
     if (placement.ownerClusterUUID != requested) {
+      if (graphReplica) return admitTruthDeploymentPlacement(plan, failure);
       failure.assign("Truth remains assigned to its observed source cluster; fresh deploy cannot transfer ownership"_ctv);
       return false;
     }
@@ -17320,6 +21269,14 @@ private:
       }
     };
     result = {};
+    MothershipTruthLifecycleLock truthLifecycleLock;
+    if (plan.config.applicationID == 10) {
+      String path;
+      { auto registry = openClusterRegistry(); path = registry.path(); }
+      // Hold through admission AND dispatch, so teardown cannot race a
+      // previously admitted request that has not reached its Brain yet.
+      if (!truthLifecycleLock.acquire(path, &result.failure)) return false;
+    }
     if (!admitTruthDeploymentPlacement(plan, result.failure)) return false;
     String serializedPlan = {};
     BitseryEngine::serialize(serializedPlan, plan);
@@ -17582,6 +21539,7 @@ private:
     DeploymentPlan plan {};
 
     bool sawSubnet = false;
+    bool statefulClientPrefixPresent = false;
     debugLog("json_parsed");
 
     for (auto field : doc.get_object())
@@ -18770,14 +22728,15 @@ private:
             int64_t value = 0;
             (void)subfield.value.get(value);
 
-            if (value <= 0)
+            if (value < 0)
             {
-              basics_log("stateful.clientPrefix must be positive\n");
+              basics_log("stateful.clientPrefix must be nonnegative\n");
               deploymentFailure.assign("deployment request rejected"_ctv);
       return false;
             }
 
             plan.stateful.clientPrefix = value;
+            statefulClientPrefixPresent = true;
           }
           else if (key.equal("siblingPrefix"_ctv))
           {
@@ -18923,7 +22882,7 @@ private:
           }
         }
 
-        if (plan.stateful.clientPrefix == 0)
+        if (!statefulClientPrefixPresent)
         {
           basics_log("stateful.clientPrefix required\n");
           deploymentFailure.assign("deployment request rejected"_ctv);
@@ -20288,6 +24247,11 @@ private:
       }
     }
 
+    if (plan.stateful.clientPrefix == 0 && (plan.isStateful || statefulClientPrefixPresent) &&
+        !prodigyGraphDeploymentPlanCanonical(plan, true)) {
+      deploymentFailure.assign("only the canonical non-client graph replica may omit writer authority"_ctv);
+      return false;
+    }
     if (plan.isStateful)
     {
       if (!StatefulMeshRoles::forShardGroup(plan.stateful, plan.config.applicationID, 0).hasDistinctServices())
@@ -20547,9 +24511,9 @@ private:
 
   void runDeploy(int argc, char *argv[])
   {
-    if (argc < 3)
+    if (argc != 3 && !(argc == 4 && std::strcmp(argv[3], "--submit-only") == 0))
     {
-      basics_log("too few arguments provided to deploy. ex: deploy [target: local|clusterName|clusterUUID] [json|-|@path] [path to container blob]\n");
+      basics_log("usage: deploy [target: local|clusterName|clusterUUID] [json|-|@path] [path to container blob] [--submit-only]\n");
       exit(EXIT_FAILURE);
     }
 
@@ -20562,6 +24526,8 @@ private:
       if (failure.size() > 0) basics_log("deploy failed: %s\n", failure.c_str());
       exit(EXIT_FAILURE);
     }
+    const bool submitOnly = argc == 4;
+    if (submitOnly) returnAfterInitialSpinOkay = true;
 
     DeploymentDispatchResult dispatch = {};
     if (dispatchValidatedDeployment(plan, containerPath, returnAfterInitialSpinOkay, true, dispatch) == false)
@@ -20569,6 +24535,8 @@ private:
       if (dispatch.failure.size() > 0) basics_log("deploy failed: %s\n", dispatch.failure.c_str());
       exit(EXIT_FAILURE);
     }
+    if (submitOnly) basics_log("deploy accepted=1 ready=unverified deploymentID=%llu\n",
+                               (unsigned long long)plan.config.deploymentID());
   }
 
   void runApplicationReport(int argc, char *argv[])
@@ -23095,11 +27063,13 @@ private:
       // generation only after the Brain says the exact quorum transition is
       // qualified and its initial projection is durably delivered.
       const bool completed = response.qualified && response.initialProjectionDelivered;
-      return registry.recordClusterPairEnrollmentCompletion(intent.operationUUID,
+      const bool recorded = registry.recordClusterPairEnrollmentCompletion(intent.operationUUID,
           first && completed ? response.enrollment.localAuthorityGeneration : 0,
           !first && completed ? response.enrollment.localAuthorityGeneration : 0,
           first && response.initialProjectionDelivered, !first && response.initialProjectionDelivered,
           first && response.qualified, !first && response.qualified, updated, &failure);
+      if (recorded) intent = updated;
+      return recorded;
     };
     auto admitOrObserveSide = [&](bool first, ProdigyClusterPairEnrollmentResponse& response, bool verifyExisting = false) -> bool {
       uint64_t expectedGeneration = 0, creationGeneration = 0;
@@ -23143,6 +27113,67 @@ private:
       failure.assign("cluster pair enrollment remains pending qualified active projection; retry the same operation UUID"_ctv);
       valid = false;
     }
+    // Capability probes are optional for legacy enrollment. Once both exact
+    // endpoints support v2, prepare and acknowledge both before activating
+    // either emitter. The durable enrollment operation UUID is the retry key.
+    bool privateDiscoveryEnabled = false;
+    if (valid) {
+      ProdigyClusterPairEnrollmentResponse firstCapability = {}, secondCapability = {};
+      String capabilityFailure = {};
+      const bool firstQueried = queryClusterPairEnrollment(*clusterFor(intent.firstClusterUUID), intent.operationUUID, firstCapability, capabilityFailure, true);
+      const bool secondQueried = queryClusterPairEnrollment(*clusterFor(intent.secondClusterUUID), intent.operationUUID, secondCapability, capabilityFailure, true);
+      const bool capable = firstQueried && secondQueried &&
+          firstCapability.privateDiscoverySupported && secondCapability.privateDiscoverySupported;
+      if (!capable && (firstCapability.privateDiscoveryActivationUUID || secondCapability.privateDiscoveryActivationUUID)) {
+        failure.assign("private discovery activation is pending current capabilities; retry the same pair operation UUID"_ctv);
+        valid = false;
+      }
+      if (valid && capable) {
+        auto matchesSide = [&](bool first, const ProdigyClusterPairEnrollmentResponse& observed) -> bool {
+          return observed.success && observed.found && observed.enrollment.pairUUID == intent.pairUUID &&
+              observed.enrollment.operationUUID == intent.operationUUID && observed.enrollment.rootGeneration == intent.rootGeneration &&
+              observed.enrollment.agreedKeyEpoch == intent.keyEpoch &&
+              observed.localClusterUUID == (first ? intent.firstClusterUUID : intent.secondClusterUUID) &&
+              observed.enrollment.localClusterUUID == (first ? intent.firstClusterUUID : intent.secondClusterUUID) &&
+              observed.enrollment.peerClusterUUID == (first ? intent.secondClusterUUID : intent.firstClusterUUID) &&
+              observed.enrollment.localAuthorityGeneration == (first ? intent.firstEnrolledAuthorityGeneration : intent.secondEnrolledAuthorityGeneration) &&
+              observed.localEndpoints == (first ? intent.firstEndpoints : intent.secondEndpoints) &&
+              observed.peerEndpoints == (first ? intent.secondEndpoints : intent.firstEndpoints);
+        };
+        if (!matchesSide(true, firstCapability) || !matchesSide(false, secondCapability)) {
+          failure.assign("private discovery capability does not match the durable pair enrollment"_ctv);
+          valid = false;
+        }
+        auto advance = [&](bool first, ProdigyPairPrivateDiscoveryPhase phase, ProdigyClusterPairEnrollmentResponse& observed) -> bool {
+          const auto *cluster = clusterFor(first ? intent.firstClusterUUID : intent.secondClusterUUID);
+          if (!cluster || !queryClusterPairEnrollment(*cluster, intent.operationUUID, observed, failure, true) ||
+              !matchesSide(first, observed)) return false;
+          if (!observed.qualified || !observed.initialProjectionDelivered || !observed.privateDiscoverySupported) return true;
+          if (observed.privateDiscoveryActivationUUID == intent.operationUUID &&
+              uint8_t(observed.privateDiscoveryPhase) >= uint8_t(phase)) return true;
+          if ((observed.privateDiscoveryActivationUUID != 0 && observed.privateDiscoveryActivationUUID != intent.operationUUID) ||
+              (phase == ProdigyPairPrivateDiscoveryPhase::active && observed.privateDiscoveryPhase != ProdigyPairPrivateDiscoveryPhase::prepared)) return false;
+          ProdigyClusterPairEnrollmentRequest request = {};
+          if (!fillClusterPairEnrollmentRequest(intent, first, observed.currentAuthorityGeneration,
+              observed.enrollment.localAuthorityGeneration, request)) return false;
+          request.protocolVersion = ProdigyClusterPairEnrollmentRequest::privateDiscoveryVersion;
+          request.privateDiscoveryActivationUUID = intent.operationUUID; request.privateDiscoveryPhase = phase;
+          String clusterName = cluster->name;
+          return configureControlTarget(clusterName.c_str(), &failure) && requestClusterPairEnrollment(request, observed, failure);
+        };
+        for (auto phase : {ProdigyPairPrivateDiscoveryPhase::prepared, ProdigyPairPrivateDiscoveryPhase::active}) {
+          bool acknowledged = false;
+          for (uint32_t attempt = 0; valid && attempt < 60 && !acknowledged; ++attempt) {
+            valid = advance(true, phase, firstCapability) && advance(false, phase, secondCapability);
+            acknowledged = valid && prodigyPairPrivateDiscoveryTransitionAcknowledged(firstCapability, intent.operationUUID, phase) &&
+                prodigyPairPrivateDiscoveryTransitionAcknowledged(secondCapability, intent.operationUUID, phase);
+            if (valid && !acknowledged) ::usleep(500'000);
+          }
+          if (!acknowledged) { if (failure.empty()) failure.assign("private discovery activation pending; retry the same pair operation UUID"_ctv); valid = false; break; }
+          if (phase == ProdigyPairPrivateDiscoveryPhase::active) privateDiscoveryEnabled = true;
+        }
+      }
+    }
 
     MothershipClusterPairEnrollmentIntent finalIntent = {};
     {
@@ -23160,6 +27191,7 @@ private:
                unsigned(secondResponse.qualified), unsigned(secondResponse.initialProjectionDelivered),
                unsigned(!(firstResponse.qualified && firstResponse.initialProjectionDelivered &&
                           secondResponse.qualified && secondResponse.initialProjectionDelivered)), failure.c_str());
+    if (valid) basics_log("enrollClusterPairPrivateDiscovery state=%s\n", privateDiscoveryEnabled ? "enabled" : "unavailable");
     // The pair UUID is public routing identity, not key material. Emit it only
     // with the completed receipt so later ordinary Mothership operations can
     // bind service permissions to this exact enrollment without reading the
@@ -23177,7 +27209,8 @@ private:
     uint128_t operationUUID = 0;
     MothershipClusterPairEnrollmentIntent intent;
     MothershipProdigyCluster first, second;
-    bool valid = argc == 1 && prodigyParseCanonicalHex128(String(argv[0]), operationUUID) && operationUUID != 0;
+    const bool queryOnly = argc == 2 && String(argv[1]) == "--query"_ctv;
+    bool valid = (argc == 1 || queryOnly) && prodigyParseCanonicalHex128(String(argv[0]), operationUUID) && operationUUID != 0;
     if (valid)
     {
       auto registry = openClusterRegistry();
@@ -23218,6 +27251,52 @@ private:
           requestTopicRoundTrip(MothershipTopic::pullClusterPairRevocation, query, response, failure) &&
           bindResponse(firstSide, response);
     };
+    if (queryOnly)
+    {
+      // The two reads can observe different generations while authority advances.
+      // Validate each independently against the immutable enrollment intent.
+      auto reportSide = [&](bool firstSide) {
+        ProdigyClusterPairEnrollmentResponse enrollment = {};
+        ProdigyClusterPairAuthorityRevokeResponse revocation = {};
+        const MothershipProdigyCluster& cluster = firstSide ? first : second;
+        bool enrollmentOK = queryClusterPairEnrollment(cluster, operationUUID, enrollment, failure);
+        if (enrollmentOK)
+        {
+          ProdigyClusterPairAuthorityRevokeResponse identity = {};
+          identity.success = enrollment.success;
+          identity.found = enrollment.found;
+          identity.localClusterUUID = enrollment.localClusterUUID;
+          identity.currentAuthorityGeneration = enrollment.currentAuthorityGeneration;
+          identity.enrollment = enrollment.enrollment;
+          identity.localEndpoints = enrollment.localEndpoints;
+          identity.peerEndpoints = enrollment.peerEndpoints;
+          enrollmentOK = bindResponse(firstSide, identity);
+        }
+        const bool revocationOK = querySide(firstSide, revocation);
+        basics_log("revokeClusterPairQuerySide side=%s success=%u enrollmentQueryValid=%u revocationQueryValid=%u localClusterUUID=0x%016llx%016llx enrollmentState=%u enrollmentAuthorityGeneration=%llu activeQualified=%u initialProjection=%u revocationAuthorityGeneration=%llu qualifiedRevoked=%u projectionsWithdrawn=%u\n",
+            firstSide ? "first" : "second", unsigned(enrollmentOK && revocationOK), unsigned(enrollmentOK), unsigned(revocationOK),
+            (unsigned long long)(cluster.clusterUUID >> 64), (unsigned long long)cluster.clusterUUID,
+            enrollmentOK ? unsigned(enrollment.enrollment.state) : 0u,
+            enrollmentOK ? (unsigned long long)enrollment.currentAuthorityGeneration : 0ull,
+            enrollmentOK ? unsigned(enrollment.qualified) : 0u,
+            enrollmentOK ? unsigned(enrollment.initialProjectionDelivered) : 0u,
+            revocationOK ? (unsigned long long)revocation.currentAuthorityGeneration : 0ull,
+            revocationOK ? unsigned(revocation.qualifiedRevoked) : 0u,
+            revocationOK ? unsigned(revocation.projectionsWithdrawn) : 0u);
+        return enrollmentOK && revocationOK;
+      };
+      bool firstOK = false, secondOK = false;
+      if (valid)
+      {
+        firstOK = reportSide(true);
+        secondOK = reportSide(false);
+      }
+      valid = valid && firstOK && secondOK;
+      basics_log("revokeClusterPairQuery success=%u operationUUID=0x%016llx%016llx\n",
+                 unsigned(valid), (unsigned long long)(operationUUID >> 64), (unsigned long long)operationUUID);
+      if (!valid) exit(EXIT_FAILURE);
+      return;
+    }
     auto revokeSide = [&](bool firstSide, ProdigyClusterPairAuthorityRevokeResponse& response) {
       if (!querySide(firstSide, response)) return false;
       ProdigyClusterPairAuthorityRevokeRequest request;
@@ -23327,7 +27406,8 @@ private:
     uint64_t deploymentID = 0;
     MothershipProdigyCluster cluster = {};
     DeploymentIdentityReport report = {};
-    bool valid = argc == 2 && argv[1][0] >= '0' && argv[1][0] <= '9' &&
+    const bool seedDetails = argc == 3 && String(argv[2]) == "--seed-details"_ctv;
+    bool valid = (argc == 2 || seedDetails) && argv[1][0] >= '0' && argv[1][0] <= '9' &&
         mothershipParseUnsignedArgument(argv[1], UINT64_MAX, deploymentID) && deploymentID != 0;
     if (valid) {
       auto registry = openClusterRegistry();
@@ -23338,12 +27418,63 @@ private:
           prodigyIsSHA256HexDigest(report.canonicalPlanSHA256) &&
           prodigyIsSHA256HexDigest(report.containerBlobSHA256) && report.containerBlobBytes != 0;
     }
-    if (!valid && failure.empty()) failure.assign("usage: deploymentIdentity CLUSTER DEPLOYMENT_ID; requires a live deployment"_ctv);
+    if (!valid && failure.empty()) failure.assign("usage: deploymentIdentity CLUSTER DEPLOYMENT_ID [--seed-details]; requires a live deployment"_ctv);
     basics_log("deploymentIdentity success=%u clusterUUID=%016llx%016llx deploymentID=%llu applicationID=%u planSHA256=%s artifactSHA256=%s artifactBytes=%llu failure=%s\n",
         unsigned(valid), (unsigned long long)(report.clusterUUID >> 64), (unsigned long long)report.clusterUUID,
         (unsigned long long)report.deploymentID, unsigned(report.applicationID), report.canonicalPlanSHA256.c_str(),
         report.containerBlobSHA256.c_str(), (unsigned long long)report.containerBlobBytes, failure.c_str());
     if (!valid) exit(EXIT_FAILURE);
+    for (const auto& member : report.statefulRuntimeCohort) {
+      const auto* selected = nametagSourceCutMember(report, member.shardGroup);
+      uint32_t sourceCutSlot = UINT32_MAX;
+      if (report.nShardGroups > 0 && report.nShardGroups <= UINT16_MAX && member.shardGroup < report.nShardGroups)
+        forEachStatefulServiceSlotOwnedByGroup(uint16_t(member.shardGroup), uint16_t(report.nShardGroups),
+            [&](uint16_t slot) { if (sourceCutSlot == UINT32_MAX) sourceCutSlot = slot; });
+      basics_log("deploymentIdentityMember clusterUUID=%016llx%016llx deploymentID=%llu applicationID=%u shardGroup=%u shardGroups=%u sourceCutSlot=%u containerUUID=%016llx%016llx machineUUID=%016llx%016llx sourceCutSelected=%u\n",
+          (unsigned long long)(report.clusterUUID >> 64), (unsigned long long)report.clusterUUID,
+          (unsigned long long)report.deploymentID, unsigned(report.applicationID), unsigned(member.shardGroup),
+          unsigned(report.nShardGroups), unsigned(sourceCutSlot),
+          (unsigned long long)(member.containerUUID >> 64), (unsigned long long)member.containerUUID,
+          (unsigned long long)(member.machineUUID >> 64), (unsigned long long)member.machineUUID,
+          unsigned(selected == &member));
+    }
+    if (seedDetails) {
+      String serializedReport, reportSHA256, reportHex;
+      const bool serialized = BitseryEngine::serialize(serializedReport, report) &&
+          prodigyComputeSHA256Hex(serializedReport, reportSHA256, nullptr);
+      if (serialized) {
+        static constexpr char hex[] = "0123456789abcdef";
+        reportHex.reserve(serializedReport.size() * 2);
+        for (uint32_t i = 0; i < serializedReport.size(); ++i) {
+          const uint8_t byte = uint8_t(serializedReport[i]);
+          reportHex.append(hex[byte >> 4]); reportHex.append(hex[byte & 0x0f]);
+        }
+      }
+      basics_log("deploymentIdentitySeedDetailsCanonical clusterUUID=%016llx%016llx deploymentID=%llu applicationID=%u reportVersion=%u serializeSuccess=%u reportSHA256=%s reportHex=%s\n",
+          (unsigned long long)(report.clusterUUID >> 64), (unsigned long long)report.clusterUUID,
+          (unsigned long long)report.deploymentID, unsigned(report.applicationID), unsigned(report.version), unsigned(serialized),
+          reportSHA256.c_str(), reportHex.c_str());
+      uint64_t runtimeStateBytes = 0;
+      for (const auto& state : report.statefulCohortRuntimeStates) runtimeStateBytes += state.size();
+      basics_log("deploymentIdentitySeedDetails reportVersion=%u found=%u live=%u state=%u isStateful=%u statefulCohortReady=%u statefulRuntimeCohortConverged=%u target=%u deployed=%u healthy=%u acknowledgedPeers=%u selectedShardGroup=%u shardGroups=%u runtimeMembers=%u runtimeStateRecords=%u runtimeStateBytes=%llu cohortFailure=%s\n",
+          unsigned(report.version), unsigned(report.found), unsigned(report.live), unsigned(report.state), unsigned(report.isStateful),
+          unsigned(report.statefulCohortReady), unsigned(report.statefulRuntimeCohortConverged), unsigned(report.nTarget),
+          unsigned(report.nDeployed), unsigned(report.nHealthy), unsigned(report.acknowledgedPeerCount),
+          unsigned(report.selectedShardGroup), unsigned(report.nShardGroups), unsigned(report.statefulRuntimeCohort.size()),
+          unsigned(report.statefulCohortRuntimeStates.size()), (unsigned long long)runtimeStateBytes, report.statefulCohortFailure.c_str());
+      for (const auto& member : report.statefulRuntimeCohort) {
+        const auto* selected = nametagSourceCutMember(report, member.shardGroup);
+        auto receipt = member.nativeSourceCutReceipt;
+        basics_log("deploymentIdentitySeedMember shardGroup=%u shardGroups=%u storeKind=%u containerUUID=%016llx%016llx machineUUID=%016llx%016llx writable=%u clientServing=%u allMasters=%u sourceCutSelected=%u receiptValid=%u receiptProtocol=%u receiptState=%u receiptSeedGeneration=%llu receiptSiblingHealthy=%u receiptCutMaterialized=%u receiptHeadsDominateCut=%u receiptContentSHA256=%s receiptHeadsSHA256=%s\n",
+            unsigned(member.shardGroup), unsigned(report.nShardGroups), unsigned(member.storeKind),
+            (unsigned long long)(member.containerUUID >> 64), (unsigned long long)member.containerUUID,
+            (unsigned long long)(member.machineUUID >> 64), (unsigned long long)member.machineUUID,
+            unsigned(member.writable), unsigned(member.clientServing), unsigned(member.allMasters), unsigned(selected == &member),
+            unsigned(prodigyStatefulStoreReceiptValid(receipt)), unsigned(receipt.protocolVersion), unsigned(receipt.state),
+            (unsigned long long)receipt.seedGeneration, unsigned(receipt.siblingSessionHealthy), unsigned(receipt.cutMaterialized),
+            unsigned(receipt.committedHeadsDominateCut), receipt.materializedContentSHA256.c_str(), receipt.materializedHeadsSHA256.c_str());
+      }
+    }
   }
 
   void runCousinDiscovery(int argc, char *argv[])
@@ -23381,7 +27512,8 @@ private:
         if (failure.empty()) failure.assign("counterpart observation returned an invalid response"_ctv);
       }
       if (valid) for (const auto& record : response.records)
-        if (!prodigyCousinCounterpartMatchesPermission(record, permission.permission, query.slot)) {
+        if (!prodigyCousinCounterpartMatchesPermission(record, permission.permission, query.slot,
+                record.routablePrefixUUID == 0)) {
           valid = false; failure.assign("counterpart observation conflicts with the source permission"_ctv); break;
         }
     }
@@ -23650,6 +27782,10 @@ private:
           route.sourcePermissionUUID = requested.sourcePermissionUUID;
           route.destinationPermissionUUID = requested.destinationPermissionUUID;
           route.transportProtocol = requested.transportProtocol; route.destinationCIDR = requested.destinationCIDR;
+          if (requested.endpointKind == CousinRouteEndpointKind::privateContainer) {
+            route.version = 3;
+            route.endpointKind = requested.endpointKind;
+          }
           route.pathMTU = requested.pathMTU; route.generation = requested.generation;
           route.issuedAtMs = requested.issuedAtMs; route.expiresAtMs = requested.expiresAtMs;
           route.rootGeneration = sourceEnrollment.enrollment.rootGeneration;
@@ -23660,7 +27796,8 @@ private:
           valid = cousinRouteStructurallyValid(route) && cousinRouteCurrentContract(route);
         }
       }
-      if (valid && route.state == CousinRouteState::active) {
+      if (valid && route.state == CousinRouteState::active &&
+          route.endpointKind == CousinRouteEndpointKind::externalWormhole) {
         RoutableSubnetRegistryReport ranges = {};
         valid = readRoutableSubnets(destination, ranges, failure);
         const auto range = valid ? std::find_if(ranges.subnets.begin(), ranges.subnets.end(), [&](const auto& candidate) {
@@ -23688,6 +27825,262 @@ private:
         (unsigned long long)route.generation, unsigned(route.state), unsigned(resumed),
         unsigned(sourceResponse.found), unsigned(sourceResponse.qualified),
         unsigned(destinationResponse.found), unsigned(destinationResponse.qualified), failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
+  void runCrossClusterMasqueGateway(int argc, char *argv[])
+  {
+    String action = {}, failure = {};
+    CrossClusterMasqueGatewayAuthority authority = {}, recorded = {};
+    bool resumed = false;
+    bool valid = argc >= 1;
+    if (valid) action.assign(argv[0]);
+
+    auto parseUnsigned = [](const char *text, uint64_t maximum, uint64_t& value) {
+      if (text == nullptr || text[0] == '\0') return false;
+      char *end = nullptr;
+      errno = 0;
+      const unsigned long long parsed = std::strtoull(text, &end, 10);
+      if (errno != 0 || end == text || *end != '\0' || parsed > maximum) return false;
+      value = parsed;
+      return true;
+    };
+    auto parseUUID = [](const char *text, uint128_t& value) {
+      return text != nullptr && prodigyParseCanonicalHex128(String(text), value) && value != 0;
+    };
+    auto parseSlot = [](const char *text, uint8_t& value) {
+      if (text == nullptr || text[0] < '0' || text[0] > '2' || text[1] != '\0') return false;
+      value = uint8_t(text[0] - '0');
+      return true;
+    };
+
+    if (valid && (action == "configure"_ctv || action == "configurePair"_ctv))
+    {
+      const bool configurePair = action == "configurePair"_ctv;
+      // Only the selected machines and underlay properties are operator input.
+      // Cluster identities, globally leased datacenter bytes, canonical /96s,
+      // and pair/key generations are derived from Mothership-owned records.
+      const bool hasSlots = argc == 16 || argc == 17;
+      const bool hasArtifactBlob = argc == 14 || argc == 17;
+      valid = argc == 13 || argc == 14 || hasSlots;
+      uint128_t pairOperationUUID = 0;
+      uint64_t parsed = 0;
+      if (valid && hasSlots)
+      {
+        valid = String(argv[argc - 3]) == "--slots"_ctv &&
+            parseSlot(argv[argc - 2], authority.gatewaySlot) &&
+            parseSlot(argv[argc - 1], authority.tunnelSlot);
+      }
+      if (valid) valid = parseUUID(argv[1], pairOperationUUID) && parseUUID(argv[2], authority.localMachineUUID) &&
+          parseUUID(argv[3], authority.peerMachineUUID);
+      if (valid && String(argv[4]) == "listener"_ctv)
+        authority.localRole = CrossClusterMasqueGatewayRole::listener;
+      else if (valid && String(argv[4]) == "connector"_ctv)
+        authority.localRole = CrossClusterMasqueGatewayRole::connector;
+      else valid = false;
+      if (valid) valid = ClusterMachine::parseIPAddressLiteral(
+          String(argv[5]), authority.listenerPublicUDPEndpoint) &&
+          !authority.listenerPublicUDPEndpoint.isNull() &&
+          parseUnsigned(argv[6], UINT16_MAX, parsed);
+      if (valid) authority.listenerPublicUDPPort = uint16_t(parsed);
+      if (valid) authority.artifactSHA256.assign(argv[7]);
+      if (valid) valid = parseUnsigned(argv[8], UINT64_MAX, authority.artifactBytes);
+      if (valid) authority.localIdentitySHA256.assign(argv[9]);
+      if (valid) authority.peerIdentitySHA256.assign(argv[10]);
+      if (valid) authority.peerTrustSHA256.assign(argv[11]);
+      if (valid) valid = parseUnsigned(argv[12], UINT64_MAX, authority.generation);
+
+      MothershipClusterPairEnrollmentIntent intent = {};
+      MothershipProdigyCluster first = {}, second = {};
+      ProdigyClusterPairEnrollmentResponse firstEnrollment = {}, secondEnrollment = {};
+      ProdigyClusterPairEnrollment localEnrollment = {};
+      ProdigyClusterPairEnrollment reciprocalEnrollment = {};
+      const MothershipProdigyCluster *localCluster = nullptr, *peerCluster = nullptr;
+      const MothershipProdigyCluster *reciprocalCluster = nullptr;
+      CrossClusterMasqueGatewayAuthority reciprocal = {}, reciprocalRecorded = {};
+      bool reciprocalResumed = false;
+      if (valid)
+      {
+        // The registry is process-exclusive.  Keep its handle scoped to its
+        // short read/write phases; control-plane round trips must not retain it.
+        {
+          MothershipClusterRegistry registry = openClusterRegistry();
+          String firstID = {}, secondID = {};
+          valid = registry.loadClusterPairEnrollmentIntent(pairOperationUUID, intent, &failure);
+          if (valid) {
+            firstID.assignItoh(intent.firstClusterUUID); secondID.assignItoh(intent.secondClusterUUID);
+            valid = intent.firstQualified && intent.secondQualified &&
+                registry.getClusterByIdentity(firstID, first, &failure) &&
+                registry.getClusterByIdentity(secondID, second, &failure);
+          }
+        }
+        if (valid) {
+          valid = queryClusterPairEnrollment(first, pairOperationUUID, firstEnrollment, failure) &&
+              queryClusterPairEnrollment(second, pairOperationUUID, secondEnrollment, failure) &&
+              firstEnrollment.found && firstEnrollment.qualified && secondEnrollment.found && secondEnrollment.qualified &&
+              firstEnrollment.enrollment.state == ProdigyClusterPairEnrollmentState::active &&
+              secondEnrollment.enrollment.state == ProdigyClusterPairEnrollmentState::active &&
+              firstEnrollment.enrollment.pairUUID == intent.pairUUID && secondEnrollment.enrollment.pairUUID == intent.pairUUID &&
+              firstEnrollment.enrollment.operationUUID == pairOperationUUID &&
+              secondEnrollment.enrollment.operationUUID == pairOperationUUID &&
+              firstEnrollment.enrollment.rootGeneration == secondEnrollment.enrollment.rootGeneration &&
+              firstEnrollment.enrollment.agreedKeyEpoch == secondEnrollment.enrollment.agreedKeyEpoch;
+        }
+        if (valid) {
+          const auto hasMachine = [](const MothershipProdigyCluster& cluster, uint128_t machineUUID) {
+            uint32_t matches = 0;
+            for (const ClusterMachine& machine : cluster.topology.machines)
+              if (machine.uuid == machineUUID) ++matches;
+            return matches == 1;
+          };
+          const bool firstIsLocal = hasMachine(first, authority.localMachineUUID) &&
+              hasMachine(second, authority.peerMachineUUID);
+          const bool secondIsLocal = hasMachine(second, authority.localMachineUUID) &&
+              hasMachine(first, authority.peerMachineUUID);
+          valid = firstIsLocal != secondIsLocal;
+          if (valid && firstIsLocal) {
+            localCluster = &first; peerCluster = &second;
+            localEnrollment = firstEnrollment.enrollment;
+          } else if (valid) {
+            localCluster = &second; peerCluster = &first;
+            localEnrollment = secondEnrollment.enrollment;
+          }
+          valid = valid && localEnrollment.localClusterUUID == localCluster->clusterUUID &&
+              localEnrollment.peerClusterUUID == peerCluster->clusterUUID;
+          if (!valid && failure.empty())
+            failure.assign("selected MASQUE gateway machines do not uniquely span the enrolled pair"_ctv);
+
+          if (valid && configurePair)
+          {
+            // The reciprocal record is selected from the same enrolled pair;
+            // only local/peer orientation and listener role invert.  Its TLS
+            // digests are deliberately left as '-' so the existing Vault owner
+            // derives and verifies the peer's exact credentials for that scope.
+            reciprocal = authority;
+            reciprocal.localMachineUUID = authority.peerMachineUUID;
+            reciprocal.peerMachineUUID = authority.localMachineUUID;
+            reciprocal.localRole = authority.localRole == CrossClusterMasqueGatewayRole::listener ?
+                CrossClusterMasqueGatewayRole::connector : CrossClusterMasqueGatewayRole::listener;
+            reciprocal.localIdentitySHA256.assign("-"_ctv);
+            reciprocal.peerIdentitySHA256.assign("-"_ctv);
+            reciprocal.peerTrustSHA256.assign("-"_ctv);
+            reciprocalCluster = peerCluster;
+            reciprocalEnrollment = localCluster == &first ? secondEnrollment.enrollment : firstEnrollment.enrollment;
+            valid = reciprocalEnrollment.localClusterUUID == reciprocalCluster->clusterUUID &&
+                reciprocalEnrollment.peerClusterUUID == localCluster->clusterUUID;
+            if (!valid && failure.empty())
+              failure.assign("reciprocal MASQUE gateway enrollment does not match the selected pair"_ctv);
+          }
+        }
+        if (valid && hasArtifactBlob) {
+          String blob = {}, storeFailure = {};
+          Filesystem::openReadAtClose(-1, String(argv[13]), blob);
+          valid = blob.size() != 0 && ContainerStore::systemStore(
+              SystemContainerKind::crossClusterMasqueGateway, authority.artifactSHA256,
+              authority.artifactBytes, blob, &storeFailure);
+          if (!valid && failure.empty()) failure.snprintf<"cross-cluster MASQUE artifact store failed: {}"_ctv>(storeFailure);
+        }
+        if (valid) {
+          MothershipClusterRegistry registry = openClusterRegistry();
+          valid = registry.putCrossClusterMasqueGateway(
+              authority, localEnrollment, *localCluster, *peerCluster, recorded, resumed, &failure);
+          if (valid && configurePair)
+            valid = registry.putCrossClusterMasqueGateway(
+                reciprocal, reciprocalEnrollment, *reciprocalCluster, *localCluster,
+                reciprocalRecorded, reciprocalResumed, &failure);
+        }
+        if (valid) {
+          ProdigyCrossClusterMasqueGatewayAuthorityResponse response = {};
+          valid = commitCrossClusterMasqueGatewayAuthority(
+              *localCluster, recorded, response, failure);
+          if (valid && configurePair)
+            valid = commitCrossClusterMasqueGatewayAuthority(
+                *reciprocalCluster, reciprocalRecorded, response, failure);
+          // Bootstrap mTLS is delivered before gateway launch so the Neuron
+          // can stage it out of durable state.  Its BGP half is deferred until
+          // the authenticated MASQUE receipt, then this exact scope is
+          // delivered again to start the routing plane.
+          if (valid) valid = installCrossClusterPrivateBGPSecret(*localCluster, recorded, failure);
+          if (valid && configurePair)
+            valid = installCrossClusterPrivateBGPSecret(*reciprocalCluster, reciprocalRecorded, failure);
+          if (valid) valid = waitForCrossClusterMasqueGatewayReadiness(
+              *localCluster, recorded, failure, nullptr, nullptr, false);
+          if (valid && configurePair)
+            valid = waitForCrossClusterMasqueGatewayReadiness(
+                *reciprocalCluster, reciprocalRecorded, failure, nullptr, nullptr, false);
+          if (valid) valid = installCrossClusterPrivateBGPSecret(*localCluster, recorded, failure);
+          if (valid && configurePair)
+            valid = installCrossClusterPrivateBGPSecret(*reciprocalCluster, reciprocalRecorded, failure);
+          if (valid) valid = waitForCrossClusterMasqueGatewayReadiness(
+              *localCluster, recorded, failure);
+          if (valid && configurePair)
+            valid = waitForCrossClusterMasqueGatewayReadiness(
+                *reciprocalCluster, reciprocalRecorded, failure);
+        }
+      }
+    }
+    else if (valid && (action == "query"_ctv || action == "withdraw"_ctv))
+    {
+      uint128_t pairUUID = 0, localMachineUUID = 0;
+      valid = argc == (action == "query"_ctv ? 3 : 4) && parseUUID(argv[1], pairUUID) && parseUUID(argv[2], localMachineUUID);
+      uint64_t generation = 0;
+      MothershipProdigyCluster localCluster = {};
+      {
+        MothershipClusterRegistry registry = openClusterRegistry();
+        if (valid && action == "query"_ctv)
+          valid = registry.loadCrossClusterMasqueGateway(pairUUID, localMachineUUID, recorded, &failure);
+        else if (valid) {
+          valid = parseUnsigned(argv[3], UINT64_MAX, generation) &&
+              registry.loadCrossClusterMasqueGateway(pairUUID, localMachineUUID, recorded, &failure) &&
+              (recorded.state == CrossClusterMasqueGatewayState::active ||
+               (recorded.state == CrossClusterMasqueGatewayState::withdrawn && recorded.generation == generation));
+          if (valid) {
+            String clusterIdentity = {}; clusterIdentity.assignItoh(recorded.localClusterUUID);
+            valid = registry.getClusterByIdentity(clusterIdentity, localCluster, &failure);
+          }
+        }
+      }
+      if (valid && action == "withdraw"_ctv && recorded.state == CrossClusterMasqueGatewayState::active) {
+        // The Neuron's receipt means its private BGPHub peer, fallback and
+        // credential cache are gone. Only then persist this half's vault ACK
+        // and advance the durable authority to withdrawn.
+        valid = withdrawCrossClusterPrivateBGPSecret(localCluster, recorded, failure);
+        if (valid) {
+          MothershipClusterRegistry registry = openClusterRegistry();
+          valid = registry.withdrawCrossClusterMasqueGateway(pairUUID, localMachineUUID, generation, recorded, &failure);
+        }
+      }
+      if (valid && action == "withdraw"_ctv) {
+        // Replays must prove the same terminal runtime fence as the first
+        // attempt. A persisted tombstone alone does not prove that its
+        // gateway process has acknowledged destruction or is absent from a
+        // fresh authenticated inventory.
+        ProdigyCrossClusterMasqueGatewayAuthorityResponse response = {};
+        valid = commitCrossClusterMasqueGatewayAuthority(
+            localCluster, recorded, response, failure);
+      }
+    }
+    else valid = false;
+
+    if (!valid && failure.empty()) failure.assign(
+        "usage: crossClusterMasqueGateway configure|configurePair PAIR_OPERATION_UUID LOCAL_MACHINE_UUID PEER_MACHINE_UUID listener|connector LISTENER_UDP_IP LISTENER_UDP_PORT ARTIFACT_SHA256 ARTIFACT_BYTES LOCAL_ID_SHA256 PEER_ID_SHA256 PEER_TRUST_SHA256 GENERATION [ARTIFACT_BLOB] [--slots GATEWAY_SLOT TUNNEL_SLOT] | query PAIR_UUID LOCAL_MACHINE_UUID | withdraw PAIR_UUID LOCAL_MACHINE_UUID GENERATION"_ctv);
+    basics_log("crossClusterMasqueGateway success=%u action=%s pairUUID=%016llx%016llx localMachineUUID=%016llx%016llx generation=%llu state=%u resumed=%u failure=%s\n",
+        unsigned(valid), action.c_str(), (unsigned long long)(recorded.pairUUID >> 64), (unsigned long long)recorded.pairUUID,
+        (unsigned long long)(recorded.localMachineUUID >> 64), (unsigned long long)recorded.localMachineUUID,
+        (unsigned long long)recorded.generation, unsigned(recorded.state), unsigned(resumed), failure.c_str());
+    if (valid && action == "query"_ctv)
+    {
+      String localPrefix, peerPrefix;
+      (void)ClusterMachine::renderIPAddressLiteral(recorded.localSitePrefix.network, localPrefix);
+      (void)ClusterMachine::renderIPAddressLiteral(recorded.peerSitePrefix.network, peerPrefix);
+      basics_log("crossClusterMasqueGatewayQuery localClusterUUID=%016llx%016llx peerClusterUUID=%016llx%016llx localMachineUUID=%016llx%016llx peerMachineUUID=%016llx%016llx gatewaySlot=%u tunnelSlot=%u privateTunnelInterface=%s localSitePrefix=%s/%u peerSitePrefix=%s/%u\n",
+          (unsigned long long)(recorded.localClusterUUID >> 64), (unsigned long long)recorded.localClusterUUID,
+          (unsigned long long)(recorded.peerClusterUUID >> 64), (unsigned long long)recorded.peerClusterUUID,
+          (unsigned long long)(recorded.localMachineUUID >> 64), (unsigned long long)recorded.localMachineUUID,
+          (unsigned long long)(recorded.peerMachineUUID >> 64), (unsigned long long)recorded.peerMachineUUID,
+          unsigned(recorded.gatewaySlot), unsigned(recorded.tunnelSlot), recorded.privateTunnelInterface.c_str(),
+          localPrefix.c_str(), unsigned(recorded.localSitePrefix.cidr), peerPrefix.c_str(), unsigned(recorded.peerSitePrefix.cidr));
+    }
     if (!valid) exit(EXIT_FAILURE);
   }
 
@@ -23762,12 +28155,17 @@ private:
       }
     }
     auto& observed = response.permission;
-    basics_log("cousinPermission success=%u action=%s permissionUUID=%016llx%016llx found=%u qualified=%u generation=%llu state=%u authorityGeneration=%llu localApplicationID=%u peerApplicationID=%u deploymentID=%llu planSHA256=%s failure=%s\n",
+    basics_log("cousinPermission success=%u action=%s permissionUUID=%016llx%016llx found=%u qualified=%u generation=%llu state=%u authorityGeneration=%llu localApplicationID=%u peerApplicationID=%u deploymentID=%llu planSHA256=%s protocolVersion=%u purpose=%s peerDeploymentID=%llu peerPlanSHA256=%s peerArtifactSHA256=%s peerArtifactBytes=%llu authorizedService=%llu transportSourcePolicy=%s destinationShardGroup=%u destinationShardGroups=%u failure=%s\n",
         unsigned(valid), action.c_str(), (unsigned long long)(query.permissionUUID >> 64), (unsigned long long)query.permissionUUID,
         unsigned(response.found), unsigned(response.qualified), (unsigned long long)observed.generation,
         unsigned(observed.state), (unsigned long long)response.currentAuthorityGeneration,
         unsigned(observed.localApplicationID), unsigned(observed.peerApplicationID),
-        (unsigned long long)observed.localDeploymentID, observed.canonicalPlanSHA256.c_str(), failure.c_str());
+        (unsigned long long)observed.localDeploymentID, observed.canonicalPlanSHA256.c_str(),
+        observed.protocolVersion, prodigyCousinServicePurposeName(observed.purpose),
+        (unsigned long long)observed.peerDeploymentID, observed.peerCanonicalPlanSHA256.c_str(), observed.peerArtifactSHA256.c_str(),
+        (unsigned long long)observed.peerArtifactBytes, (unsigned long long)observed.authorizedService,
+        observed.transportSourcePolicy == ProdigyCousinTransportSourcePolicy::exact ? "exact" : "authenticated-NAT",
+        unsigned(observed.destinationShardGroup), unsigned(observed.destinationShardGroups), failure.c_str());
     if (!valid) exit(EXIT_FAILURE);
   }
 
@@ -24198,11 +28596,12 @@ private:
     if (!valid) exit(EXIT_FAILURE);
   }
 
-  void runCreateCluster(int argc, char *argv[])
+  void runCreateClusterRequest(int argc, char *argv[], bool checkProviderPlan)
   {
-    if (argc < 1 || argc > 2)
+    if (argc < 1 || argc > (checkProviderPlan ? 1 : 2))
     {
-      basics_log("usage: createCluster [json|-|@path] [optional test initial bundle]\n");
+      if (checkProviderPlan) basics_log("usage: checkClusterProviderPlan [json|-|@path]\n");
+      else basics_log("usage: createCluster [json|-|@path] [optional test initial bundle]\n");
       exit(EXIT_FAILURE);
     }
 
@@ -24221,7 +28620,7 @@ private:
     }
 
     String json;
-    if (resolveJSONArgument("createCluster", argv[0], json) == false)
+    if (resolveJSONArgument(checkProviderPlan ? "checkClusterProviderPlan" : "createCluster", argv[0], json) == false)
     {
       exit(EXIT_FAILURE);
     }
@@ -24231,13 +28630,13 @@ private:
     simdjson::dom::element doc;
     if (parser.parse(json.data(), json.size()).get(doc))
     {
-      basics_log("invalid json for createCluster\n");
+      basics_log("invalid json for %s\n", checkProviderPlan ? "checkClusterProviderPlan" : "createCluster");
       exit(EXIT_FAILURE);
     }
 
     if (doc.type() != simdjson::dom::element_type::OBJECT)
     {
-      basics_log("createCluster requires object json\n");
+      basics_log("%s requires object json\n", checkProviderPlan ? "checkClusterProviderPlan" : "createCluster");
       exit(EXIT_FAILURE);
     }
 
@@ -24849,6 +29248,31 @@ private:
     }
 
     String failure;
+    if (checkProviderPlan)
+    {
+      if (hasProviderCredentialOverride || hasDNSProviderCredentialOverride ||
+          request.mothershipConnectivity.kind == MothershipConnectivityKind::tunnelProvider ||
+          request.test.specified || hasTestInitialBundleInput)
+      {
+        basics_log("checkClusterProviderPlan success=0 failure=inline credentials, tunnel connectivity, and test inputs are not supported\n");
+        exit(EXIT_FAILURE);
+      }
+      if (request.deploymentMode != MothershipClusterDeploymentMode::remote ||
+          request.provider != MothershipClusterProvider::vultr || request.machineSchemas.empty())
+      {
+        basics_log("checkClusterProviderPlan success=0 failure=requires remote Vultr and nonempty machineSchemas\n");
+        exit(EXIT_FAILURE);
+      }
+      MothershipProviderCredential credential = {};
+      if (validateClusterProviderCredentialReference(request, failure, &credential) == false ||
+          inferClusterMachineSchemaCpuCapabilities(request, &credential, failure) == false)
+      {
+        basics_log("checkClusterProviderPlan success=0 failure=%s\n", failure.c_str());
+        exit(EXIT_FAILURE);
+      }
+      basics_log("checkClusterProviderPlan success=1\n");
+      return;
+    }
 
     // A test fixture may select an exact, independently built initial runtime.
     // Keep it transient: neither the request nor the registry record gains a
@@ -24983,6 +29407,48 @@ private:
     printManagedCluster(stored);
   }
 
+  void runResumeClusterCreation(int argc, char *argv[])
+  {
+    if (argc != 2 || std::strlen(argv[0]) != 34 || std::strncmp(argv[0], "0x", 2) != 0 || std::strlen(argv[1]) != 36)
+    { basics_log("usage: resumeClusterCreation [exact 0x cluster UUID] [expected seed cloud UUID]\n"); exit(EXIT_FAILURE); }
+    for (unsigned i = 2; i < 34; ++i)
+      if (!((argv[0][i] >= '0' && argv[0][i] <= '9') || (argv[0][i] >= 'a' && argv[0][i] <= 'f')))
+      { basics_log("resumeClusterCreation invalid cluster UUID\n"); exit(EXIT_FAILURE); }
+    for (unsigned i = 0; i < 36; ++i)
+      if ((i == 8 || i == 13 || i == 18 || i == 23) ? argv[1][i] != '-' :
+          !((argv[1][i] >= '0' && argv[1][i] <= '9') || (argv[1][i] >= 'a' && argv[1][i] <= 'f')))
+      { basics_log("resumeClusterCreation invalid seed cloud UUID\n"); exit(EXIT_FAILURE); }
+    String failure = {}, identity = {}; identity.assign(argv[0]);
+    MothershipProdigyCluster cluster = {};
+    uint128_t requestedUUID = 0;
+    bool found = false;
+    { auto registry = openClusterRegistry(); found = registry.getClusterByIdentity(identity, cluster, &failure); }
+    if (!prodigyParseCanonicalHex128(identity, requestedUUID) || !found ||
+        !mothershipCanResumeVultrSeedCreation(cluster, requestedUUID))
+    { basics_log("resumeClusterCreation success=0 failure=cluster is not an eligible incomplete Vultr creation\n"); exit(EXIT_FAILURE); }
+    MothershipProviderCredential credential = {}, dnsCredential = {};
+    if (!validateClusterProviderCredentialReference(cluster, failure, &credential) ||
+        !validateClusterDNSProviderCredentialReference(cluster, failure, &dnsCredential))
+    { basics_log("resumeClusterCreation success=0 failure=%s\n", failure.c_str()); exit(EXIT_FAILURE); }
+    ClusterCreateHooks hooks(this); hooks.requireRecoverySeedID(String(argv[1]));
+    MothershipClusterCreateTimingSummary timing = {};
+    const auto *dns = cluster.dnsProvider == MothershipClusterProvider::unknown ? nullptr : &dnsCredential;
+    if (!mothershipStandUpCluster(cluster, &credential, hooks, &timing, &failure, dns, true))
+    { persistClusterRefreshFailure(cluster, failure); basics_log("resumeClusterCreation success=0 failure=%s\n", failure.c_str()); exit(EXIT_FAILURE); }
+    persistClusterTopology(cluster, cluster.topology);
+    basics_log("resumeClusterCreation success=1\n"); printManagedCluster(cluster);
+  }
+
+  void runCreateCluster(int argc, char *argv[])
+  {
+    runCreateClusterRequest(argc, argv, false);
+  }
+
+  void runCheckClusterProviderPlan(int argc, char *argv[])
+  {
+    runCreateClusterRequest(argc, argv, true);
+  }
+
   void runPrintClusters(int argc, char *argv[])
   {
     if (argc != 0)
@@ -25034,9 +29500,15 @@ private:
 
     String failure;
     TestPairLifecycleLock pairLock;
+    MothershipTruthLifecycleLock truthLifecycleLock;
+    MothershipApplicationPlacement truthRetirement;
     MothershipProdigyCluster cluster = {};
     {
       MothershipClusterRegistry clusterRegistry = openClusterRegistry();
+      if (!truthLifecycleLock.acquire(clusterRegistry.path(), &failure)) {
+        basics_log("removeCluster success=0 removed=0 failure=%s\n", failure.c_str());
+        exit(EXIT_FAILURE);
+      }
       if (clusterRegistry.getClusterByIdentity(name, cluster, &failure) == false)
       {
         basics_log("removeCluster success=0 removed=0 identity=%s failure=%s\n", name.c_str(), (failure.size() ? failure.c_str() : ""));
@@ -25059,6 +29531,32 @@ private:
       }
     }
 
+
+    {
+      auto registry = openClusterRegistry();
+      if (!registry.beginTruthOwnerRetirement(cluster, truthRetirement, &failure)) {
+        basics_log("removeCluster success=0 removed=0 identity=%s failure=%s\n", name.c_str(), failure.c_str());
+        exit(EXIT_FAILURE);
+      }
+      if (truthRetirement.truthRetirementCompletedGeneration != 0) {
+        // A crash after durable verified completion must not require a DNS
+        // RPC to machines already destroyed. Only finish the registry removal.
+        String exactIdentity; exactIdentity.assignItoh(cluster.clusterUUID);
+        if (!registry.removeClusterByIdentity(exactIdentity, &failure)) {
+          basics_log("removeCluster success=0 removed=0 identity=%s failure=%s\n", name.c_str(), failure.c_str());
+          exit(EXIT_FAILURE);
+        }
+        basics_log("removeCluster success=1 removed=1 identity=%s resumedVerifiedTruthRetirement=1\n", name.c_str());
+        return;
+      }
+    }
+
+    // Fence replica re-admission before any existing removal owner performs
+    // effects. A failed/partial teardown keeps this exact fence on restart.
+    if (!checkpointGraphReplicaClusterRemoval(cluster, false, failure)) {
+      basics_log("removeCluster success=0 removed=0 identity=%s failure=%s\n", name.c_str(), failure.c_str());
+      exit(EXIT_FAILURE);
+    }
 
     if (offlineDNSRecovery || offlineUnconfiguredDNSRecovery)
     {
@@ -25132,6 +29630,14 @@ private:
                    name.c_str(), failure.c_str());
         exit(EXIT_FAILURE);
       }
+      if (!checkpointGraphReplicaClusterRemoval(cluster, true, failure)) {
+        basics_log("removeCluster success=0 removed=0 identity=%s offlineDNSRecovery=1 failure=%s\n", name.c_str(), failure.c_str());
+        exit(EXIT_FAILURE);
+      }
+      if (!completeTruthOwnerClusterRemoval(cluster, truthRetirement, failure)) {
+        basics_log("removeCluster success=0 removed=0 identity=%s failure=%s\n", name.c_str(), failure.c_str());
+        exit(EXIT_FAILURE);
+      }
       MothershipClusterRegistry clusterRegistry = openClusterRegistry();
       if (clusterRegistry.removeClusterByIdentity(name, &failure) == false)
       {
@@ -25158,6 +29664,16 @@ private:
       exit(EXIT_FAILURE);
     }
 
+    if (!checkpointGraphReplicaClusterRemoval(cluster, true, failure)) {
+      basics_log("removeCluster success=0 removed=0 identity=%s failure=%s\n", name.c_str(), failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    if (!completeTruthOwnerClusterRemoval(cluster, truthRetirement, failure)) {
+      basics_log("removeCluster success=0 removed=0 identity=%s failure=%s\n", name.c_str(), failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
     {
       MothershipClusterRegistry clusterRegistry = openClusterRegistry();
       if (clusterRegistry.removeClusterByIdentity(name, &failure) == false)
@@ -25179,12 +29695,14 @@ private:
   void runUpdateProdigy(int argc, char *argv[])
   {
     uint8_t brainConcurrency = 0;
-    if (argc != 3 && argc != 5)
+    const bool acceptActiveWorkloadInterruption =
+        argc == 6 && std::strcmp(argv[5], "--accept-active-workload-interruption") == 0;
+    if (argc != 3 && argc != 5 && !acceptActiveWorkloadInterruption)
     {
-      basics_log("usage: updateProdigy [target: local|clusterName|clusterUUID] [approved bundle] [operationID canonical hex] [--brain-concurrency 1|2]\n");
+      basics_log("usage: updateProdigy [target: local|clusterName|clusterUUID] [approved bundle] [operationID canonical hex] [--brain-concurrency 1|2] [--accept-active-workload-interruption]\n");
       exit(EXIT_FAILURE);
     }
-    if (argc == 5)
+    if (argc == 5 || acceptActiveWorkloadInterruption)
     {
       if (std::strcmp(argv[3], "--brain-concurrency") != 0 ||
           (std::strcmp(argv[4], "1") != 0 && std::strcmp(argv[4], "2") != 0))
@@ -25193,6 +29711,11 @@ private:
         exit(EXIT_FAILURE);
       }
       brainConcurrency = uint8_t(argv[4][0] - '0');
+    }
+    if (acceptActiveWorkloadInterruption && brainConcurrency != 1)
+    {
+      basics_log("updateProdigy active-workload interruption requires --brain-concurrency 1\n");
+      exit(EXIT_FAILURE);
     }
 
     String inputPath = {}, operationText = {};
@@ -25283,7 +29806,8 @@ private:
     observedTargetArchitecture.assign(machineCpuArchitectureName(targetArchitecture));
     MothershipUpgradePlannerInput input = {};
     buildUpgradePlannerInput(approvedBundle, sourceIdentity, report, observedTargetArchitecture,
-                             hasUpgradeCluster ? &upgradeCluster : nullptr, input, failure);
+                             hasUpgradeCluster ? &upgradeCluster : nullptr, input, failure,
+                             acceptActiveWorkloadInterruption);
     if (failure.empty() && report.clusterUUID != admission.clusterUUID)
       failure.assign("fresh upgrade report cluster identity differs from the admission record"_ctv);
     if (failure.empty() && report.masterApprovedBundleSHA256 != admission.sourceBundleSHA256)
@@ -25385,9 +29909,10 @@ private:
       socket.close(); basics_log("updateProdigy success=0 failure=%s\n", response.failure.empty() ? "admitted update rejected" : response.failure.c_str());
       exit(EXIT_FAILURE);
     }
-    basics_log("updateProdigy success=1 staged=1 bytes=%zu sha256=%s operationID=%s brainConcurrency=%u\n",
+    basics_log("updateProdigy success=1 staged=1 bytes=%zu sha256=%s operationID=%s brainConcurrency=%u activeWorkloadInterruptionAccepted=%u\n",
                size_t(targetBundleBytes.size()), approvedBundle.bundleSHA256.c_str(), operationText.c_str(),
-               unsigned(brainConcurrency == 0 ? 1 : brainConcurrency));
+               unsigned(brainConcurrency == 0 ? 1 : brainConcurrency),
+               unsigned(input.operatorAcceptedActiveWorkloadInterruption));
     socket.close();
   }
 
@@ -26069,6 +30594,7 @@ private:
     char canonicalPrefix[INET6_ADDRSTRLEN + 8] = {};
     if (!parseRoutablePrefixLiteral(argv[1], prefix) || std::strchr(argv[1], '/') == nullptr ||
         prefix.cidr > (prefix.network.is6 ? 128 : 32) || !prefix.equals(prefix.canonicalized()) ||
+        !mothershipProviderBGPOriginPrefixAllowed(prefix) ||
         !formatCIDRPrefix(prefix, canonicalPrefix, sizeof(canonicalPrefix)) || std::strcmp(argv[1], canonicalPrefix) != 0)
     { basics_log("authorizeBGPOriginPrefix requires a canonical CIDR prefix\n"); exit(EXIT_FAILURE); }
     bool created = false;
@@ -27703,6 +32229,37 @@ private:
 
 public:
 
+  static uint32_t unitTestLocalVMClusterLANIPv6ReceiptFailureMask(
+      std::string_view interfaceName, std::string_view mac,
+      std::string_view subnet, std::string_view address,
+      std::string_view dropIn)
+  {
+    return localVMClusterLANIPv6ReceiptFailureMask(interfaceName, mac, subnet, address, dropIn);
+  }
+
+  static bool unitTestNoManagedPublicWorkloads(const MothershipProdigyCluster *cluster,
+                                               const MothershipUpgradeAdmissionReport& report)
+  {
+    ProdigyApprovedUpgradeBundle bundle = {};
+    MothershipUpgradeIdentity source = {};
+    MothershipUpgradePlannerInput input = {};
+    String failure = {}, architecture = {};
+    buildUpgradePlannerInput(bundle, source, report, architecture, cluster, input, failure);
+    return input.noManagedPublicWorkloads;
+  }
+
+  static bool unitTestActiveWorkloadInterruptionAccepted(const MothershipProdigyCluster *cluster,
+                                                         const MothershipUpgradeAdmissionReport& report,
+                                                         bool accepted)
+  {
+    ProdigyApprovedUpgradeBundle bundle = {};
+    MothershipUpgradeIdentity source = {};
+    MothershipUpgradePlannerInput input = {};
+    String failure = {}, architecture = {};
+    buildUpgradePlannerInput(bundle, source, report, architecture, cluster, input, failure, accepted);
+    return input.operatorAcceptedActiveWorkloadInterruption;
+  }
+
   bool unitTestConfigureSeedCluster(const MothershipProdigyCluster& cluster, const BrainConfig& config, String *failure = nullptr)
   {
     ClusterCreateHooks hooks(this);
@@ -27757,6 +32314,3055 @@ public:
 
 private:
 
+  bool qualificationPathControl(const MothershipProdigyCluster& cluster,
+      const ProdigyCrossClusterPathFaultRequest& fault,
+      ProdigyCrossClusterPathFaultGatewayAction action, int64_t deadlineAtMilliseconds,
+      ProdigyCrossClusterPathFaultControl& observation, String& failure)
+  {
+    observation = {};
+    ProdigyCrossClusterPathFaultControl request = {};
+    request.request = fault; request.action = action;
+    if (!prodigyCrossClusterPathFaultControlValid(request) ||
+        fault.authority.localClusterUUID != cluster.clusterUUID ||
+        deadlineAtMilliseconds <= Time::now<TimeResolution::ms>()) {
+      failure.assign("qualification path control lacks a current exact gateway tuple"_ctv); return false;
+    }
+    String clusterName = cluster.name;
+    while (Time::now<TimeResolution::ms>() < deadlineAtMilliseconds) {
+      ProdigyCrossClusterPathFaultControl response = {}; String transient = {};
+      if (configureControlTarget(clusterName.c_str(), &transient) &&
+          requestTopicRoundTrip(MothershipTopic::crossClusterPathFault, request, response, transient) &&
+          prodigyCrossClusterPathFaultControlValid(response) && response.response &&
+          response.action == request.action &&
+          prodigyCrossClusterPathFaultRequestEqual(response.request, request.request) && response.accepted) {
+        const bool stateMatches = action == ProdigyCrossClusterPathFaultGatewayAction::pause ?
+            (!response.sessionReady && !response.bgpReady) :
+            (action == ProdigyCrossClusterPathFaultGatewayAction::resume ?
+                (response.sessionReady && response.bgpReady) : true);
+        if (!stateMatches) {
+          failure.assign("qualification gateway result contradicts the requested path state"_ctv); return false;
+        }
+        observation = std::move(response); failure.clear(); return true;
+      }
+      ::usleep(100'000);
+    }
+    failure.assign("qualification path control lacks an exact native observation before its deadline"_ctv);
+    return false;
+  }
+
+  bool qualificationPathApplicationStage(const MothershipNametagQualificationAdapter& adapter,
+      const MothershipNametagQualificationIntent& intent, const MothershipNametagAllMastersRecord& allMasters,
+      const Vector<MothershipProdigyCluster>& clusters, uint8_t batch, int64_t expiry,
+      ProdigyNametagQualificationPathStage stage, MothershipNametagQualificationExecutionRecord& execution,
+      String& failure)
+  {
+    if (clusters.size() != 3 || allMasters.intent.sites.size() != 3) return false;
+    const int64_t deadline = stage == ProdigyNametagQualificationPathStage::final ?
+        intent.convergenceDeadlineAtMilliseconds : std::min(expiry, intent.deadlineAtMilliseconds);
+    auto requestFor = [&](uint32_t site, MothershipNametagQualificationSiteAction action) {
+      MothershipNametagQualificationSiteRequest request = {};
+      request.protocolVersion = MothershipNametagQualificationSiteRequest::pathStageVersion;
+      request.intent = intent; request.targetClusterUUID = allMasters.intent.sites[site].clusterUUID;
+      request.targetApp6DeploymentID = allMasters.intent.sites[site].app6DeploymentID;
+      request.targetProbeDeploymentID = intent.probeTargets[site].probeDeploymentID;
+      request.pathStage = stage; request.pathBatch = batch;
+      request.pathFaultExpiresAtMilliseconds = expiry; request.action = action;
+      return request;
+    };
+    auto saved = [&](uint128_t site) {
+      return std::any_of(execution.pathWorkReceipts.begin(), execution.pathWorkReceipts.end(), [&](const auto& r) {
+        return r.localClusterUUID == site && r.pathBatch == batch && r.pathStage == stage;
+      });
+    };
+    return mothershipNametagQualificationDispatchSites([&](uint32_t site) {
+      if (saved(clusters[site].clusterUUID)) return true;
+      String clusterName = clusters[site].name;
+      auto request = requestFor(site, MothershipNametagQualificationSiteAction::execute);
+      MothershipNametagQualificationSiteResponse response = {};
+      return clusters[site].clusterUUID == request.targetClusterUUID && Time::now<TimeResolution::ms>() < deadline &&
+          mothershipNametagQualificationSiteRequestValid(request) && configureControlTarget(clusterName.c_str(), &failure) &&
+          requestTopicRoundTrip(MothershipTopic::nametagQualification, request, response, failure) &&
+          mothershipNametagQualificationSiteResponseValid(request, response);
+    }, [&](uint32_t site) {
+      if (saved(clusters[site].clusterUUID)) return true;
+      String clusterName = clusters[site].name;
+      auto request = requestFor(site, MothershipNametagQualificationSiteAction::query);
+      while (Time::now<TimeResolution::ms>() < deadline) {
+        MothershipNametagQualificationSiteResponse response = {}; String transient = {};
+        if (configureControlTarget(clusterName.c_str(), &transient) &&
+            requestTopicRoundTrip(MothershipTopic::nametagQualification, request, response, transient) &&
+            mothershipNametagQualificationSiteResponseValid(request, response)) {
+          auto registry = openClusterRegistry();
+          return registry.recordNametagQualificationPathReceipt(adapter, intent, response.applicationReceipt, execution, &failure);
+        }
+        ::usleep(100'000);
+      }
+      failure.assign("qualification path application witness timed out"_ctv); return false;
+    });
+  }
+
+  bool qualificationClaimApplicationStage(const MothershipNametagQualificationAdapter& adapter,
+      const MothershipNametagQualificationIntent& intent, const MothershipNametagAllMastersRecord& allMasters,
+      const Vector<MothershipProdigyCluster>& clusters, ProdigyNametagQualificationClaimStage stage, int64_t expiry,
+      MothershipNametagQualificationExecutionRecord& execution, String& failure)
+  {
+    if (clusters.size() != 3 || allMasters.intent.sites.size() != 3) return false;
+    const int64_t deadline = stage == ProdigyNametagQualificationClaimStage::contend ? expiry : intent.convergenceDeadlineAtMilliseconds;
+    auto saved = [&](uint128_t site) {
+      return std::any_of(execution.claimReceipts.begin(), execution.claimReceipts.end(), [&](const auto& r) {
+        return r.localClusterUUID == site && r.claimStage == stage;
+      });
+    };
+    auto requestFor = [&](uint32_t site, MothershipNametagQualificationSiteAction action) {
+      MothershipNametagQualificationSiteRequest request = {};
+      request.protocolVersion = MothershipNametagQualificationSiteRequest::claimStageVersion;
+      request.intent = intent; request.targetClusterUUID = allMasters.intent.sites[site].clusterUUID;
+      request.targetApp6DeploymentID = allMasters.intent.sites[site].app6DeploymentID;
+      request.targetProbeDeploymentID = intent.probeTargets[site].probeDeploymentID;
+      request.claimStage = stage; request.claimFaultExpiresAtMilliseconds = expiry;
+      if (stage >= ProdigyNametagQualificationClaimStage::settle) request.claimWinnerSites = execution.claimWinnerSites;
+      request.action = action; return request;
+    };
+    return mothershipNametagQualificationDispatchSites([&](uint32_t site) {
+      if (saved(clusters[site].clusterUUID)) return true;
+      auto request = requestFor(site, MothershipNametagQualificationSiteAction::execute);
+      MothershipNametagQualificationSiteResponse response = {}; String name = clusters[site].name;
+      return clusters[site].clusterUUID == request.targetClusterUUID && Time::now<TimeResolution::ms>() < deadline &&
+          mothershipNametagQualificationSiteRequestValid(request) && configureControlTarget(name.c_str(), &failure) &&
+          requestTopicRoundTrip(MothershipTopic::nametagQualification, request, response, failure) &&
+          mothershipNametagQualificationSiteResponseValid(request, response);
+    }, [&](uint32_t site) {
+      if (saved(clusters[site].clusterUUID)) return true;
+      auto request = requestFor(site, MothershipNametagQualificationSiteAction::query); String name = clusters[site].name;
+      while (Time::now<TimeResolution::ms>() < deadline) {
+        MothershipNametagQualificationSiteResponse response = {}; String transient = {};
+        if (configureControlTarget(name.c_str(), &transient) &&
+            requestTopicRoundTrip(MothershipTopic::nametagQualification, request, response, transient) &&
+            mothershipNametagQualificationSiteResponseValid(request, response)) {
+          auto registry = openClusterRegistry();
+          return registry.recordNametagQualificationClaimReceipt(adapter, intent, response.applicationReceipt, execution, &failure);
+        }
+        ::usleep(100'000);
+      }
+      failure.assign("qualification claim application witness timed out"_ctv); return false;
+    });
+  }
+
+  bool qualificationPathBatch(const MothershipNametagQualificationAdapter& adapter,
+      const MothershipNametagQualificationIntent& intent, const MothershipNametagAllMastersRecord& allMasters,
+      const Vector<MothershipProdigyCluster>& clusters, uint8_t batch,
+      MothershipNametagQualificationExecutionRecord& execution, String& failure)
+  {
+    if (clusters.size() != 3 || allMasters.intent.sites.size() != 3) return false;
+    const bool row11 = intent.row == MothershipNametagQualificationRow::masqueSessionLossBgpRecovery;
+    const bool row12 = intent.row == MothershipNametagQualificationRow::ewrOrdPathLoss;
+    const bool row4 = intent.row == MothershipNametagQualificationRow::truthClaimPartition;
+    const auto ewr = allMasters.intent.sites[0].clusterUUID, ord = allMasters.intent.sites[1].clusterUUID;
+    bool hasBatch = false;
+    for (const auto& w : execution.pathFaults) if (w.batch == batch) hasBatch = true;
+    if (!hasBatch) {
+      const int64_t now = Time::now<TimeResolution::ms>();
+      const int64_t expiry = std::min(now + 55000, intent.convergenceDeadlineAtMilliseconds);
+      if (now <= 0 || expiry <= now) return false;
+      Vector<MothershipNametagQualificationExecutionRecord::PathFaultWitness> plan = {};
+      for (const auto& authority : allMasters.intent.directGatewayAuthorities) {
+        const bool selected = row12 ? (authority.localClusterUUID == ewr && authority.peerClusterUUID == ord) :
+            (authority.localClusterUUID == ord && (!row11 || batch == 1 ||
+              (authority.peerClusterUUID == ewr && authority.tunnelSlot == 0)));
+        if (!selected) continue;
+        MothershipNametagQualificationExecutionRecord::PathFaultWitness witness = {};
+        witness.batch = batch; witness.request.action = ProdigyCrossClusterPathFaultGatewayAction::pause;
+        auto& fault = witness.request.request;
+        fault.protocolVersion = ProdigyCrossClusterPathFaultRequest::leaseVersion;
+        fault.authority = authority; fault.scope = prodigyCrossClusterPathFaultScope(authority);
+        prodigyCrossClusterPathFaultFlowIdentity(fault.scope, fault.flowIdentity);
+        fault.expiresAtMilliseconds = uint64_t(expiry);
+        if (RAND_priv_bytes(reinterpret_cast<unsigned char *>(&fault.operationUUID), sizeof(fault.operationUUID)) != 1 ||
+            !fault.operationUUID) return false;
+        plan.push_back(std::move(witness));
+      }
+      auto registry = openClusterRegistry();
+      if (!registry.recordNametagQualificationPathBatch(adapter, intent, batch, plan, execution, &failure)) return false;
+    }
+    int64_t expiry = 0;
+    for (const auto& w : execution.pathFaults) if (w.batch == batch) expiry = int64_t(w.request.request.expiresAtMilliseconds);
+    if (!expiry) return false;
+    auto control = [&](const auto& witness, ProdigyCrossClusterPathFaultGatewayAction action,
+                       int64_t deadline, ProdigyCrossClusterPathFaultControl& result, String& why) {
+      const auto site = std::find_if(clusters.begin(), clusters.end(), [&](const auto& cluster) {
+        return cluster.clusterUUID == witness.request.request.authority.localClusterUUID;
+      });
+      return site != clusters.end() && qualificationPathControl(*site, witness.request.request, action, deadline, result, why);
+    };
+    auto survivingLanPathsReady = [&](bool during) {
+      if (!row12) return true;
+      const auto& saved = during ? execution.pathSurvivorsDuring : execution.pathSurvivorsBefore;
+      if (saved.observedAtMilliseconds) return true;
+      MothershipNametagQualificationExecutionRecord::PathSurvivorStage stage = {};
+      const auto lan = allMasters.intent.sites[2].clusterUUID;
+      for (const auto& authority : allMasters.intent.directGatewayAuthorities) {
+        if (authority.localClusterUUID != lan && authority.peerClusterUUID != lan) continue;
+        const auto site = std::find_if(clusters.begin(), clusters.end(), [&](const auto& cluster) {
+          return cluster.clusterUUID == authority.localClusterUUID;
+        });
+        CrossClusterMasqueGatewayAuthority persisted = {}; String expected = {}, actual = {};
+        auto copy = authority;
+        { auto registry = openClusterRegistry();
+          if (!registry.loadCrossClusterMasqueGateway(authority.pairUUID, authority.localMachineUUID, persisted, &failure)) return false; }
+        ProdigyCrossClusterMasqueGatewayReadiness gateway = {};
+        ProdigyCrossClusterPrivateBGPReadiness bgp = {};
+        if (site == clusters.end() || Time::now<TimeResolution::ms>() >= expiry ||
+            !BitseryEngine::serialize(expected, copy) || !BitseryEngine::serialize(actual, persisted) || expected != actual ||
+            !waitForCrossClusterMasqueGatewayReadiness(*site, persisted, failure, &gateway, &bgp) ||
+            Time::now<TimeResolution::ms>() >= expiry) return false;
+        ProdigyCrossClusterPathFaultSurvivorReceipt survivor = {};
+        survivor.scope = prodigyCrossClusterPathFaultScope(authority);
+        survivor.masque = std::move(gateway); survivor.privateBGP = std::move(bgp);
+        stage.receipts.push_back(std::move(survivor));
+      }
+      stage.observedAtMilliseconds = Time::now<TimeResolution::ms>();
+      auto registry = openClusterRegistry();
+      return registry.recordNametagQualificationPathSurvivors(adapter, intent, during, stage, execution, &failure);
+    };
+    auto restore = [&]() {
+      bool restored = true;
+      // Every planned request may have reached the gateway, including the
+      // one whose acknowledgement was lost. Resume each exact tuple.
+      for (size_t i = 0; i < execution.pathFaults.size(); ++i) {
+        auto witness = execution.pathFaults[i]; if (witness.batch != batch || witness.restored.response) continue;
+        ProdigyCrossClusterPathFaultControl result = {}; String why = {};
+        if (!control(witness, ProdigyCrossClusterPathFaultGatewayAction::resume,
+                     intent.convergenceDeadlineAtMilliseconds, result, why)) { restored = false; continue; }
+        auto registry = openClusterRegistry();
+        if (!registry.recordNametagQualificationPathObservation(adapter, intent, batch, result, execution, &why)) restored = false;
+      }
+      return restored;
+    };
+    if (execution.pathAborting) { (void)restore(); return false; }
+    size_t workCount = 0, readCount = 0;
+    const bool restorationStarted = (execution.pathRestoringBatches & (uint8_t(1) << batch)) != 0;
+    for (const auto& receipt : execution.pathWorkReceipts)
+      if (receipt.pathBatch == batch) {
+        if (receipt.pathStage == ProdigyNametagQualificationPathStage::localWork) ++workCount;
+        if (receipt.pathStage == ProdigyNametagQualificationPathStage::partitionRead) ++readCount;
+      }
+    // Never resume a workload after restoring even one path. A crash after
+    // work completion may only finish restoration and the final readback.
+    if (row4) { workCount = 0; for (const auto& receipt : execution.claimReceipts)
+      if (receipt.claimStage == ProdigyNametagQualificationClaimStage::contend) ++workCount; }
+    bool ok = restorationStarted ? (workCount == 3 && (!row12 || readCount == 3)) :
+        Time::now<TimeResolution::ms>() < expiry;
+    if (ok && !restorationStarted) ok = survivingLanPathsReady(false);
+    for (size_t i = 0; ok && i < execution.pathFaults.size(); ++i) {
+      auto witness = execution.pathFaults[i]; if (witness.batch != batch || witness.paused.response) continue;
+      ProdigyCrossClusterPathFaultControl result = {};
+      ok = control(witness, ProdigyCrossClusterPathFaultGatewayAction::pause, expiry, result, failure);
+      if (ok) { auto registry = openClusterRegistry();
+        ok = registry.recordNametagQualificationPathObservation(adapter, intent, batch, result, execution, &failure); }
+    }
+    if (ok && !restorationStarted && workCount != 3)
+      ok = row4 ? qualificationClaimApplicationStage(adapter, intent, allMasters, clusters,
+          ProdigyNametagQualificationClaimStage::contend, expiry, execution, failure) :
+          qualificationPathApplicationStage(adapter, intent, allMasters, clusters, batch, expiry,
+          ProdigyNametagQualificationPathStage::localWork, execution, failure);
+    if (ok && !restorationStarted && row12 && readCount != 3)
+      ok = qualificationPathApplicationStage(adapter, intent, allMasters, clusters, batch, expiry,
+          ProdigyNametagQualificationPathStage::partitionRead, execution, failure);
+    if (ok && !restorationStarted) ok = survivingLanPathsReady(true);
+    for (const auto& witness : execution.pathFaults) if (ok && !restorationStarted && witness.batch == batch) {
+      ProdigyCrossClusterPathFaultControl result = {};
+      ok = control(witness, ProdigyCrossClusterPathFaultGatewayAction::query, expiry, result, failure) &&
+          !result.sessionReady && !result.bgpReady;
+    }
+    if (!ok) {
+      String cleanupFailure = {}; bool marked = false;
+      { auto registry = openClusterRegistry();
+        marked = registry.markNametagQualificationPathAbort(adapter, intent, execution, &cleanupFailure); }
+      if (marked) (void)restore();
+      return false;
+    }
+    if (!restorationStarted) {
+      bool marked = false;
+      { auto registry = openClusterRegistry();
+        marked = registry.markNametagQualificationPathRestoring(adapter, intent, batch, execution, &failure); }
+      if (!marked) {
+        String cleanupFailure = {}; bool abortMarked = false;
+        { auto registry = openClusterRegistry();
+          abortMarked = registry.markNametagQualificationPathAbort(adapter, intent, execution, &cleanupFailure); }
+        if (abortMarked) (void)restore();
+        return false;
+      }
+    }
+    if (!restore()) {
+      String cleanupFailure = {}; auto registry = openClusterRegistry();
+      (void)registry.markNametagQualificationPathAbort(adapter, intent, execution, &cleanupFailure);
+      return false;
+    }
+    if (row4) return qualificationClaimApplicationStage(adapter, intent, allMasters, clusters,
+        ProdigyNametagQualificationClaimStage::settle, expiry, execution, failure) &&
+        qualificationClaimApplicationStage(adapter, intent, allMasters, clusters,
+        ProdigyNametagQualificationClaimStage::final, expiry, execution, failure);
+    return qualificationPathApplicationStage(adapter, intent, allMasters, clusters, batch, expiry,
+        ProdigyNametagQualificationPathStage::final, execution, failure);
+  }
+
+  bool exerciseSecondTruthWriterAdmission(
+      const MothershipNametagQualificationAdapter& adapter,
+      const MothershipNametagQualificationIntent& intent,
+      const MothershipNametagAllMastersRecord& allMasters,
+      const Vector<MothershipProdigyCluster>& clusters,
+      MothershipNametagQualificationExecutionRecord& execution, String& failure)
+  {
+    if (intent.row != MothershipNametagQualificationRow::secondTruthWriterFencing ||
+        intent.direction != MothershipNametagQualificationDirection::injection || clusters.size() != 3 ||
+        allMasters.intent.sites.size() != 3 || clusters[0].clusterUUID != allMasters.intent.sites[0].clusterUUID ||
+        clusters[1].clusterUUID != allMasters.intent.sites[1].clusterUUID) {
+      failure.assign("second Truth-writer exercise lacks canonical EWR and ORD authority"_ctv);
+      return false;
+    }
+    if (mothershipNametagQualificationSecondTruthWriterAdmissionMatchesIntent(
+            intent, execution.secondTruthWriterAdmission)) return true;
+
+    DeploymentIdentityReport source = {};
+    DeploymentPlan candidate = {};
+    String candidateBytes = {}, candidateDigest = {};
+    MothershipApplicationPlacement before = {}, after = {};
+    if (!readDeploymentIdentity(clusters[0], allMasters.intent.sites[0].truthDeploymentID, source, failure) ||
+        source.clusterUUID != clusters[0].clusterUUID ||
+        !mothershipNametagQualificationSecondTruthWriterCandidatePlan(source, candidate, &failure) ||
+        !BitseryEngine::serialize(candidateBytes, candidate) ||
+        !prodigyComputeSHA256Hex(candidateBytes, candidateDigest, &failure)) {
+      if (failure.empty()) failure.assign("second Truth-writer exercise lacks the exact retained EWR Truth plan"_ctv);
+      return false;
+    }
+    {
+      auto registry = openClusterRegistry();
+      if (!registry.loadTruthPlacement(before, &failure) || before.ownerClusterUUID != clusters[0].clusterUUID ||
+          before.policy != MothershipApplicationPlacement::Policy::hardSingleton || before.generation == 0) return false;
+    }
+    String candidateClusterName = clusters[1].name;
+    if (!configureControlTarget(candidateClusterName.c_str(), &failure)) return false;
+    String admissionFailure = {};
+    if (admitTruthDeploymentPlacement(candidate, admissionFailure) ||
+        admissionFailure != "destination admission conflicts with its durable writer placement"_ctv) {
+      failure.assign("second Truth-writer candidate was not rejected by the retained singleton policy"_ctv);
+      return false;
+    }
+    {
+      auto registry = openClusterRegistry();
+      if (!registry.loadTruthPlacement(after, &failure) || after.applicationID != before.applicationID ||
+          after.ownerClusterUUID != before.ownerClusterUUID || after.generation != before.generation ||
+          after.observationReceiptSHA256 != before.observationReceiptSHA256 || after.policy != before.policy) return false;
+    }
+    MothershipNametagQualificationExecutionRecord::SecondTruthWriterAdmissionReceipt receipt = {};
+    receipt.sourceClusterUUID = clusters[0].clusterUUID;
+    receipt.candidateClusterUUID = clusters[1].clusterUUID;
+    receipt.retainedOwnerClusterUUID = before.ownerClusterUUID;
+    receipt.retainedPlacementGeneration = before.generation;
+    receipt.candidatePlanSHA256 = candidateDigest;
+    receipt.fenced = true;
+    bool resumed = false;
+    auto registry = openClusterRegistry();
+    return registry.recordNametagQualificationSecondTruthWriterAdmission(adapter, intent, receipt, execution, resumed, &failure);
+  }
+
+  static bool nametagQualificationApp6RoutesMatchStatus(const MothershipNametagQualificationIntent& intent,
+      uint128_t clusterUUID, const ClusterStatusReport& status)
+  {
+    if (intent.row != MothershipNametagQualificationRow::secondStreamHandoffFence &&
+        intent.row != MothershipNametagQualificationRow::truthClaimPartition) return true;
+    for (const auto& route : intent.app6Routes) {
+      if (route.clusterUUID != clusterUUID) continue;
+      bool foundContainer = false;
+      for (const auto& application : status.applicationReports) {
+        if (application.applicationID != 6) continue;
+        for (const auto& deployment : application.deploymentReports) {
+          if (deployment.versionID != (route.deploymentID & 0x0000ffffffffffffULL) ||
+              deployment.nHealthy != deployment.nDeployed || !deployment.nHealthy) continue;
+          for (const auto& container : deployment.containerRuntimes)
+            if (container.uuid == route.containerUUID) foundContainer = true;
+        }
+      }
+      if (!foundContainer) return false;
+    }
+    return true;
+  }
+
+  bool observeNametagQualificationAllMasters(
+      const MothershipNametagQualificationIntent& intent,
+      const MothershipNametagAllMastersRecord& allMasters,
+      const Vector<ProdigyNametagQualificationApplicationReceipt>& applicationReceipts,
+      String& canonicalReceipt, int64_t& observedAtMilliseconds, String& failure)
+  {
+    canonicalReceipt.clear(); observedAtMilliseconds = 0;
+    if (!mothershipNametagQualificationIntentValid(intent) ||
+        !mothershipNametagAllMastersRecordValid(allMasters) ||
+        allMasters.intent.operationUUID != intent.allMastersOperationUUID ||
+        applicationReceipts.size() != 3)
+    {
+      failure.assign("qualification global observation has no exact three-site authority"_ctv);
+      return false;
+    }
+
+    Vector<String> evidenceDigests = {};
+    auto appendEvidence = [&](auto value) -> bool {
+      String encoded = {}, digest = {};
+      if (!BitseryEngine::serialize(encoded, value) || !prodigyComputeSHA256Hex(encoded, digest, &failure)) return false;
+      evidenceDigests.push_back(std::move(digest));
+      return true;
+    };
+    if (!appendEvidence(allMasters)) return false;
+
+    for (uint32_t site = 0; site < 3; ++site)
+    {
+      const auto& expectedTarget = intent.probeTargets[site];
+      const auto& application = applicationReceipts[site];
+      if (!prodigyNametagQualificationApplicationReceiptValid(application) ||
+          application.localClusterUUID != expectedTarget.clusterUUID ||
+          application.deploymentID != expectedTarget.probeDeploymentID ||
+          application.runUUID != intent.runUUID || application.row != uint8_t(intent.row) ||
+          application.direction != uint8_t(intent.direction) || application.executionGeneration != intent.executionGeneration ||
+          !application.rowID.equal(intent.rowID) ||
+          application.startedAtMilliseconds != intent.startedAtMilliseconds ||
+          application.deadlineAtMilliseconds != intent.deadlineAtMilliseconds ||
+          application.convergenceDeadlineAtMilliseconds != intent.convergenceDeadlineAtMilliseconds ||
+          !appendEvidence(application))
+      {
+        if (failure.empty()) failure.assign("qualification application receipts do not prove the exact row-specific three-site witness"_ctv);
+        return false;
+      }
+    }
+
+    Vector<MothershipProdigyCluster> clusters = {};
+    Vector<ClusterStatusReport> statuses = {};
+    Vector<DeploymentIdentityReport> pulse = {}, hot = {}, cold = {}, radar = {}, app6 = {};
+    DeploymentIdentityReport truth = {};
+    uint8_t datacenterFragments[3] = {};
+    for (uint32_t site = 0; site < 3; ++site)
+    {
+      const auto& desired = allMasters.intent.sites[site];
+      if (intent.probeTargets[site].clusterUUID != desired.clusterUUID) {
+        failure.assign("qualification probe target order does not match canonical EWR/ORD/LAN authority"_ctv); return false;
+      }
+      MothershipProdigyCluster cluster = {}; String identity = {}; identity.assignItoh(desired.clusterUUID);
+      {
+        auto registry = openClusterRegistry();
+        if (!registry.getClusterByIdentity(identity, cluster, &failure)) return false;
+      }
+      // The LAN's local machine is represented by includeLocalMachine, not
+      // another entry in the adopted-machine specification. The observed
+      // topology below is the authority for the three-machine cardinality.
+      if (!mothershipNametagAllMastersSiteIdentityMatches(site, desired.clusterUUID, cluster) || cluster.nBrains != 3 ||
+          cluster.architecture != MachineCpuArchitecture::x86_64 || cluster.datacenterFragment == 0 ||
+          cluster.topology.machines.size() != 3)
+      {
+        failure.assign("qualification requires fixed three-machine x86_64 Vultr EWR/ORD plus retained LAN topology"_ctv);
+        return false;
+      }
+      for (uint32_t prior = 0; prior < site; ++prior)
+        if (datacenterFragments[prior] == cluster.datacenterFragment) {
+          failure.assign("qualification sites do not have globally unique datacenter address tags"_ctv); return false;
+        }
+      datacenterFragments[site] = cluster.datacenterFragment;
+
+      ClusterStatusReport status = {};
+      if (!readManagedClusterStatus(cluster, status, failure) || !status.hasTopology || status.topology.version == 0 ||
+          status.nMachines != 3 || status.topology.machines.size() != 3 ||
+          std::count_if(status.topology.machines.begin(), status.topology.machines.end(),
+                        [](const auto& machine) { return machine.isBrain; }) != 3)
+      {
+        if (failure.empty()) failure.assign("qualification site does not expose exactly three current Brain machines"_ctv);
+        return false;
+      }
+      if (!nametagQualificationApp6RoutesMatchStatus(intent, desired.clusterUUID, status)) {
+        failure.assign("row 2 route does not name a current healthy App6 container"_ctv); return false;
+      }
+
+      DeploymentIdentityReport onePulse = {}, oneHot = {}, oneCold = {}, oneRadar = {}, oneApp6 = {}, oneProbe = {}, oneTruth = {};
+      if (!readDeploymentIdentity(cluster, desired.pulseDeploymentID, onePulse, failure) ||
+          !readDeploymentIdentity(cluster, desired.hotDeploymentID, oneHot, failure) ||
+          !readDeploymentIdentity(cluster, desired.coldDeploymentID, oneCold, failure) ||
+          !readDeploymentIdentity(cluster, desired.radarDeploymentID, oneRadar, failure) ||
+          !readDeploymentIdentity(cluster, desired.app6DeploymentID, oneApp6, failure) ||
+          !readDeploymentIdentity(cluster, intent.probeTargets[site].probeDeploymentID, oneProbe, failure) ||
+          (site == 0 && !readDeploymentIdentity(cluster, desired.truthDeploymentID, oneTruth, failure)) ||
+          !mothershipNametagAllMastersSiteObserved(desired, onePulse, oneHot, oneCold, oneRadar,
+                                                   site == 0 ? &oneTruth : nullptr) ||
+          oneProbe.applicationID != 11 || oneProbe.isStateful || oneProbe.nTarget != 1 ||
+          oneProbe.nDeployed != 1 || oneProbe.nHealthy != 1)
+      {
+        if (failure.empty()) failure.assign("qualification lacks exact live five-store, app6, Truth, or App11 probe deployment evidence"_ctv);
+        return false;
+      }
+      if (!appendEvidence(status) || !appendEvidence(onePulse) || !appendEvidence(oneHot) ||
+          !appendEvidence(oneCold) || !appendEvidence(oneRadar) || !appendEvidence(oneApp6) ||
+          !appendEvidence(oneProbe) || (site == 0 && !appendEvidence(oneTruth))) return false;
+      pulse.push_back(std::move(onePulse)); hot.push_back(std::move(oneHot)); cold.push_back(std::move(oneCold));
+      radar.push_back(std::move(oneRadar)); app6.push_back(std::move(oneApp6));
+      if (site == 0) truth = std::move(oneTruth);
+      clusters.push_back(std::move(cluster)); statuses.push_back(std::move(status));
+    }
+
+    if (!mothershipNametagApp6TruthMeshSetObserved(app6, allMasters.intent.sites, truth) ||
+        !mothershipNametagAllMastersSeedPlacementsObserved(allMasters.seedPlacements, pulse, hot, cold, radar))
+    {
+      failure.assign("qualification lacks current native seed/catch-up or persistent remote Truth-carrier evidence"_ctv);
+      return false;
+    }
+    for (uint32_t site = 0; site < 3; ++site) {
+      if (!mothershipNametagAllMastersTruthDeploymentCardinalityObserved(statuses[site], site == 0)) {
+        failure.assign("qualification observed a missing or additional global Truth writer"_ctv); return false;
+      }
+    }
+
+    for (const auto& requested : allMasters.intent.directGatewayAuthorities)
+    {
+      uint32_t localSite = UINT32_MAX;
+      for (uint32_t site = 0; site < 3; ++site)
+        if (clusters[site].clusterUUID == requested.localClusterUUID) localSite = site;
+      bool machinePresent = localSite < 3 && std::any_of(statuses[localSite].topology.machines.begin(),
+          statuses[localSite].topology.machines.end(), [&](const auto& machine) { return machine.uuid == requested.localMachineUUID; });
+      CrossClusterMasqueGatewayAuthority persisted = {};
+      String requestedBytes = {}, persistedBytes = {};
+      auto requestedCopy = requested;
+      {
+        auto registry = openClusterRegistry();
+        if (!machinePresent || !registry.loadCrossClusterMasqueGateway(
+                requested.pairUUID, requested.localMachineUUID, persisted, &failure)) return false;
+      }
+      ProdigyCrossClusterMasqueGatewayReadiness readiness = {};
+      ProdigyCrossClusterPrivateBGPReadiness privateBGPReadiness = {};
+      if (!BitseryEngine::serialize(requestedBytes, requestedCopy) ||
+          !BitseryEngine::serialize(persistedBytes, persisted) || requestedBytes != persistedBytes ||
+          !waitForCrossClusterMasqueGatewayReadiness(
+              clusters[localSite], persisted, failure, &readiness, &privateBGPReadiness) ||
+          !appendEvidence(persisted) || !appendEvidence(readiness) || !appendEvidence(privateBGPReadiness))
+      {
+        if (failure.empty()) failure.assign("qualification lacks all 18 exact direct MASQUE/private-BGP /96 route directions"_ctv);
+        return false;
+      }
+    }
+
+    observedAtMilliseconds = Time::now<TimeResolution::ms>();
+    if (observedAtMilliseconds < intent.startedAtMilliseconds ||
+        observedAtMilliseconds > intent.convergenceDeadlineAtMilliseconds)
+    {
+      failure.assign("qualification global observation missed its convergence deadline"_ctv);
+      return false;
+    }
+    String evidence = {}, digest = {};
+    if (!BitseryEngine::serialize(evidence, evidenceDigests) ||
+        !prodigyComputeSHA256Hex(evidence, digest, &failure)) return false;
+    canonicalReceipt.assign("nametag-five-store-global-v3:"_ctv); canonicalReceipt.append(digest);
+    failure.clear();
+    return true;
+  }
+
+  [[noreturn]] void runNametagQualificationCapabilities(int argc, char *argv[])
+  {
+    if (argc != 0) {
+      basics_log("{\"success\":false,\"failure\":\"qualification capabilities requires no arguments\"}\n");
+      exit(EXIT_FAILURE);
+    }
+    // This is an offline code-availability report, never a live health or
+    // semantic witness. It must not open a registry or contact a provider.
+    // Use the executor's admission predicate so CLI spellings alone cannot
+    // permit provisioning for a campaign whose fault owner is still absent.
+    String output = {};
+    output.assign("{\"schema\":\"mothership.nametag-qualification-capabilities.v1\",\"receiptProtocolVersion\":4,\"adapters\":["_ctv);
+    bool first = true;
+    for (const auto& adapter : mothershipNametagQualificationAdapters) {
+      if (!first) output.append(","_ctv);
+      first = false;
+      const bool implemented = mothershipNametagQualificationImplemented(adapter.row);
+      output.append("{\"rowID\":"_ctv); appendEscapedJSONString(output, String(adapter.rowID));
+      output.append(",\"direction\":"_ctv);
+      appendEscapedJSONString(output, String(adapter.direction == MothershipNametagQualificationDirection::injection ? "injection" : "observation"));
+      output.append(",\"operation\":"_ctv); appendEscapedJSONString(output, String(adapter.operation));
+      if (implemented) output.append(",\"implemented\":true,\"reason\":"_ctv);
+      else output.append(",\"implemented\":false,\"reason\":"_ctv);
+      appendEscapedJSONString(output, String(implemented ? "" : mothershipNametagQualificationFaultOwnerUnavailableReason(adapter.row)));
+      output.append("}"_ctv);
+    }
+    output.append("]}"_ctv);
+    basics_log("%s\n", output.c_str());
+    exit(EXIT_SUCCESS);
+  }
+
+  [[noreturn]] void runNametagSourceBaseline(int argc, char *argv[])
+  {
+    String failure = {}, bytes = {}; ProdigyNametagSourceBaselineCommand command = {};
+    MothershipNametagSourceBaselineIntent baselineIntent = {}, recordedIntent = {};
+    MothershipNametagSourceBaselineRecord completed = {}; bool found = false, resumed = false;
+    uint32_t deadlineSeconds = 0; String suppliedName = {}; uint128_t suppliedUUID = 0;
+    bool valid = argc == 1;
+    const int fd = valid ? ::open(argv[0], O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK) : -1;
+    struct stat state = {}; valid = valid && fd >= 0 && ::fstat(fd, &state) == 0 && S_ISREG(state.st_mode) && state.st_size > 0 && state.st_size <= 16384;
+    for (char buffer[4096] = {}; valid;) { const ssize_t count = ::read(fd, buffer, sizeof(buffer));
+      if (count < 0 && errno == EINTR) continue; if (count < 0) { valid = false; break; } if (count == 0) break;
+      bytes.append(buffer, size_t(count)); if (bytes.size() > 16384) valid = false; }
+    if (fd >= 0) ::close(fd);
+    // Exact bounded schema: no environment fallback and no hidden authority.
+    simdjson::dom::parser parser; simdjson::dom::element document;
+    valid = valid && parser.parse(bytes.data(), bytes.size()).get(document) == simdjson::SUCCESS && document.type() == simdjson::dom::element_type::OBJECT;
+    const auto reject = [&]() { valid = false; failure.assign("invalid source baseline input: require exact mothership.nametag-source-baseline.v1 fields"_ctv); };
+    if (valid) {
+      constexpr std::string_view fields[] = {"schema", "operationUUID", "clusterName", "clusterUUID", "probeDeploymentID", "hotDeploymentID", "coldDeploymentID", "radarDeploymentID", "pulseDeploymentID", "truthDeploymentID", "deadlineSeconds"};
+      uint32_t seen = 0;
+      for (auto field : document.get_object()) {
+        uint32_t index = 0; while (index < std::size(fields) && fields[index] != field.key) ++index;
+        if (index == std::size(fields) || (seen & (1u << index))) { reject(); break; } seen |= 1u << index;
+        if (index == 0) { std::string_view value; if (field.value.get(value) != simdjson::SUCCESS || value != "mothership.nametag-source-baseline.v1") { reject(); break; } }
+        else if (index == 1 || index == 3) { std::string_view value; String text = {}; if (field.value.get(value) != simdjson::SUCCESS) { reject(); break; } text.setInvariant(value.data(), value.size()); if (!prodigyParseCanonicalHex128(text, index == 1 ? command.operationUUID : suppliedUUID) || (index == 1 ? command.operationUUID : suppliedUUID) == 0) { reject(); break; } }
+        else if (index == 2) { std::string_view value; if (field.value.get(value) != simdjson::SUCCESS || value.empty() || value.size() > 256) { reject(); break; } suppliedName.setInvariant(value.data(), value.size()); }
+        else { uint64_t value = 0; if (field.value.get(value) != simdjson::SUCCESS || value == 0) { reject(); break; }
+          uint64_t *destination[] = {&command.probeDeploymentID, &command.hotDeploymentID, &command.coldDeploymentID, &command.radarDeploymentID, &command.pulseDeploymentID, &command.truthDeploymentID};
+          if (index < 4 || index > 10 || (index == 10 && value > 3600) || (index == 10 && value > UINT32_MAX)) { reject(); break; }
+          if (index == 10) deadlineSeconds = uint32_t(value); else *destination[index - 4] = value;
+        }
+      }
+      if (valid && (seen != ((1u << std::size(fields)) - 1) || command.operationUUID == 0 || suppliedUUID == 0 || suppliedName.empty() || deadlineSeconds == 0)) reject();
+      // The exact JSON request is the fixture declaration.  Its digest is
+      // frozen before the durable intent, not supplied through an ambient env.
+      if (valid) valid = prodigyComputeSHA256Hex(bytes, command.fixtureManifestSHA256, &failure);
+    }
+    if (valid) command.ewrClusterUUID = suppliedUUID;
+    const auto sameInput = [](const ProdigyNametagSourceBaselineCommand& left, const ProdigyNametagSourceBaselineCommand& right) {
+      return left.operationUUID == right.operationUUID && left.ewrClusterUUID == right.ewrClusterUUID &&
+          left.probeDeploymentID == right.probeDeploymentID && left.hotDeploymentID == right.hotDeploymentID &&
+          left.coldDeploymentID == right.coldDeploymentID && left.radarDeploymentID == right.radarDeploymentID &&
+          left.pulseDeploymentID == right.pulseDeploymentID && left.truthDeploymentID == right.truthDeploymentID &&
+          left.fixtureManifestSHA256 == right.fixtureManifestSHA256;
+    };
+    const ProdigyNametagSourceBaselineCommand suppliedCommand = command;
+    if (valid) { auto registry = openClusterRegistry(); valid = registry.loadNametagSourceBaseline(command.operationUUID, completed, found, &failure); }
+    if (valid && found) { bool intentFound = false; auto registry = openClusterRegistry(); valid = registry.loadNametagSourceBaselineIntent(command.operationUUID, recordedIntent, intentFound, &failure) && intentFound && recordedIntent.deadlineSeconds == deadlineSeconds && sameInput(command, completed.command); command = completed.command; resumed = true; if (!valid) failure.assign("source baseline completed receipt conflicts with immutable caller input"_ctv); }
+    if (valid && !found) {
+      bool intentFound = false; auto registry = openClusterRegistry(); valid = registry.loadNametagSourceBaselineIntent(command.operationUUID, recordedIntent, intentFound, &failure);
+      if (valid && intentFound) { resumed = true; command = recordedIntent.command; valid = recordedIntent.ewrClusterName.equal(suppliedName) && recordedIntent.deadlineSeconds == deadlineSeconds && sameInput(suppliedCommand, command); if (!valid) failure.assign("source baseline retry conflicts with its immutable EWR tuple"_ctv); }
+      if (valid && !intentFound) { command.action = ProdigyNametagSourceBaselineAction::execute; command.ewrClusterUUID = suppliedUUID; const int64_t now = Time::now<TimeResolution::ms>(); command.deadlineAtMilliseconds = now > 0 && deadlineSeconds <= uint64_t(INT64_MAX - now) / 1000 ? now + int64_t(deadlineSeconds) * 1000 : 0; baselineIntent.ewrClusterName = suppliedName; baselineIntent.deadlineSeconds = deadlineSeconds; baselineIntent.command = command; valid = registry.persistNametagSourceBaselineIntent(baselineIntent, recordedIntent, resumed, &failure); if (valid) command = recordedIntent.command; }
+    }
+    MothershipProdigyCluster ewr = {};
+    if (valid) {
+      auto registry = openClusterRegistry();
+      valid = registry.getClusterByIdentity(suppliedName, ewr, &failure) &&
+          ewr.clusterUUID == command.ewrClusterUUID &&
+          mothershipNametagAllMastersPreparedSiteMatches(0, suppliedName, ewr);
+      if (!valid && failure.empty()) failure.assign("source baseline requires the registered EWR Vultr three-Brain cluster"_ctv);
+    }
+    // Source population happens before its native content/watermark receipts
+    // exist.  Admit only the current EWR deployment/cohort shape here; the
+    // App11 readback remains an application proof and cannot be substituted
+    // for the later native source receipt owner.
+    if (valid && !found) {
+      DeploymentIdentityReport pulse = {}, hot = {}, cold = {}, radar = {}, truth = {};
+      MothershipNametagAllMastersSite truthSite = {};
+      truthSite.clusterUUID = command.ewrClusterUUID;
+      truthSite.truthDeploymentID = command.truthDeploymentID;
+      valid = readDeploymentIdentity(ewr, command.pulseDeploymentID, pulse, failure) && readDeploymentIdentity(ewr, command.hotDeploymentID, hot, failure) && readDeploymentIdentity(ewr, command.coldDeploymentID, cold, failure) && readDeploymentIdentity(ewr, command.radarDeploymentID, radar, failure) && readDeploymentIdentity(ewr, command.truthDeploymentID, truth, failure) &&
+          mothershipNametagAllMastersDeploymentReadyForSeedSelection(pulse, command.ewrClusterUUID, command.pulseDeploymentID,
+              MeshRegistry::Pulse::applicationID, 1, DeploymentIdentityStoreKind::graph) &&
+          mothershipNametagAllMastersDeploymentReadyForSeedSelection(hot, command.ewrClusterUUID, command.hotDeploymentID,
+              MeshRegistry::Hot::applicationID, 3, DeploymentIdentityStoreKind::kv) &&
+          mothershipNametagAllMastersDeploymentReadyForSeedSelection(cold, command.ewrClusterUUID, command.coldDeploymentID,
+              MeshRegistry::Cold::applicationID, 3, DeploymentIdentityStoreKind::kv) &&
+          mothershipNametagAllMastersDeploymentReadyForSeedSelection(radar, command.ewrClusterUUID, command.radarDeploymentID,
+              MeshRegistry::Radar::applicationID, 1, DeploymentIdentityStoreKind::graph) &&
+          mothershipNametagTruthWriterObserved(truth, truthSite);
+      if (!valid && failure.empty()) failure.assign("source baseline requires ready EWR Hot/Cold/graph cohorts and the exact global Truth placement"_ctv);
+    }
+    MothershipNametagSourceBaselineExchange request = {}; request.command = command;
+    if (valid && !found) {
+      MothershipNametagSourceBaselineExchange accepted = {};
+      valid = configureControlTarget(ewr.name.c_str(), &failure) &&
+          requestTopicRoundTrip(MothershipTopic::nametagSourceBaseline, request, accepted, failure) &&
+          mothershipNametagSourceBaselineExchangeResponseValid(request, accepted);
+    }
+    // Reissue/query is idempotent: the application cache is keyed by the
+    // immutable command.  Query must return its exact authenticated readback.
+    MothershipNametagSourceBaselineExchange response = {};
+    if (valid && !found) {
+      request.command.action = ProdigyNametagSourceBaselineAction::query;
+      for (;;) { String queryFailure = {}; response = {};
+        if (configureControlTarget(ewr.name.c_str(), &queryFailure) && requestTopicRoundTrip(MothershipTopic::nametagSourceBaseline, request, response, queryFailure) && mothershipNametagSourceBaselineExchangeResponseValid(request, response)) break;
+        if (Time::now<TimeResolution::ms>() >= command.deadlineAtMilliseconds) { valid = false; failure.assign("source baseline lacks an exact authenticated App11 readback before deadline"_ctv); break; }
+        ::usleep(100000);
+      }
+    }
+    if (valid && !found) { MothershipNametagSourceBaselineRecord record = {}; record.command = command; record.receipt = response.receipt; auto registry = openClusterRegistry(); valid = registry.recordNametagSourceBaseline(record, completed, resumed, &failure); }
+    if (!valid && failure.empty()) failure.assign("source baseline request is invalid or incomplete"_ctv);
+    basics_log("{\"success\":%s,\"operation\":\"%s\",\"resumed\":%s,\"failure\":\"%s\"}\n", valid ? "true" : "false", argc ? argv[0] : "", resumed ? "true" : "false", failure.c_str());
+    exit(valid ? EXIT_SUCCESS : EXIT_FAILURE);
+  }
+
+  // Query and commit through the existing permission owner.  The same UUID
+  // is retried after interruption; the Brain supplies the authority generation.
+  bool qualificationCousinPermission(const MothershipProdigyCluster& cluster,
+      const ProdigyLocalCousinServicePermission& desired, bool commit,
+      ProdigyLocalCousinServicePermissionResponse& response, String& failure)
+  {
+    ProdigyLocalCousinServicePermissionQuery query = {}; query.permissionUUID = desired.permissionUUID;
+    String clusterName = cluster.name;
+    auto observe = [&]() {
+      response = {};
+      return configureControlTarget(clusterName.c_str(), &failure) &&
+          requestTopicRoundTrip(MothershipTopic::pullLocalCousinServicePermission, query, response, failure) &&
+          response.protocolVersion == ProdigyLocalCousinServicePermissionResponse::version && response.success &&
+          response.localClusterUUID == cluster.clusterUUID && response.currentAuthorityGeneration != 0 &&
+          response.currentMasterUUID != 0 && response.currentMasterBootNs > 0 &&
+          (!response.found || (prodigyLocalCousinServicePermissionValid(response.permission) &&
+           response.permission.permissionUUID == query.permissionUUID && response.permission.localClusterUUID == cluster.clusterUUID &&
+           response.permission.acceptedAuthorityGeneration <= response.currentAuthorityGeneration));
+    };
+    if (!observe()) return false;
+    auto accepted = [&]() { return response.found && response.qualified &&
+        prodigyLocalCousinServicePermissionRequestAccepted(desired, response.permission); };
+    if (!commit) return true;
+    if (accepted()) return true;
+    ProdigyLocalCousinServicePermissionRequest request = {};
+    request.expectedAuthorityGeneration = response.currentAuthorityGeneration;
+    request.expectedMasterUUID = response.currentMasterUUID; request.expectedMasterBootNs = response.currentMasterBootNs;
+    request.permission = desired;
+    if (!configureControlTarget(clusterName.c_str(), &failure) ||
+        !requestTopicRoundTrip(MothershipTopic::commitLocalCousinServicePermission, request, response, failure) || !response.success) {
+      if (failure.empty()) failure = response.failure; return false;
+    }
+    for (uint32_t attempt = 0; attempt < 60; ++attempt) {
+      if (!observe()) return false;
+      if (accepted()) return true;
+      ::usleep(500'000);
+    }
+    failure.assign("qualification cousin permission awaits an exact qualified durable result"_ctv); return false;
+  }
+
+  bool qualificationCousinRouteApply(CousinRouteRecord desired, MothershipProdigyCluster& source,
+      MothershipProdigyCluster& destination, String& failure, uint64_t minimumSourceGeneration = 0,
+      uint64_t minimumDestinationGeneration = 0)
+  {
+    CousinRouteRecord recorded = {}; bool resumed = false;
+    desired.priorOperationUUIDs.clear();
+    { auto registry = openClusterRegistry();
+      if (!registry.recordCousinRoute(desired, recorded, resumed, &failure)) return false;
+    }
+    ProdigyCousinRouteResponse first = {}, second = {};
+    if (!applyCousinRoute(recorded, source, destination, first, second, failure)) return false;
+    if ((minimumSourceGeneration && first.currentAuthorityGeneration <= minimumSourceGeneration) ||
+        (minimumDestinationGeneration && second.currentAuthorityGeneration <= minimumDestinationGeneration)) {
+      failure.assign("qualification successor route did not advance both Brain authority generations"_ctv); return false;
+    }
+    return true;
+  }
+
+  bool qualificationCousinFault(const MothershipNametagQualificationIntent& intent,
+      const MothershipNametagQualificationExecutionRecord& execution,
+      MothershipProdigyCluster& source, MothershipProdigyCluster& destination, String& failure)
+  {
+    for (size_t i = 0; i < execution.cousinRecoveryBindings.size(); ++i) {
+      const auto& binding = execution.cousinRecoveryBindings[i]; const auto& reference = intent.cousinRecoveries[i];
+      if (binding.route.generation == UINT64_MAX) { failure.assign("qualification route generation exhausted"_ctv); return false; }
+      CousinRouteRecord current = {};
+      { auto registry = openClusterRegistry(); if (!registry.loadCousinRoute(binding.route.routeUUID, current, &failure)) return false; }
+      if (cousinRouteExactMatches(current, binding.route)) {
+        ProdigyLocalCousinServicePermissionResponse first = {}, second = {};
+        ProdigyCousinRouteResponse firstRoute = {}, secondRoute = {};
+        if (!cousinRouteAllowsNewAdmissionAt(current, Time::now<TimeResolution::ms>()) ||
+            !readLocalCousinServicePermission(source, binding.sourcePermission.permissionUUID, first, failure) ||
+            !readLocalCousinServicePermission(destination, binding.destinationPermission.permissionUUID, second, failure) ||
+            !observeCousinRouteSide(source, current, CousinRouteHalf::source, firstRoute, failure) ||
+            !observeCousinRouteSide(destination, current, CousinRouteHalf::destination, secondRoute, failure) ||
+            !firstRoute.found || !firstRoute.qualified || !secondRoute.found || !secondRoute.qualified ||
+            first.currentAuthorityGeneration != firstRoute.currentAuthorityGeneration ||
+            first.currentMasterUUID != firstRoute.currentMasterUUID || first.currentMasterBootNs != firstRoute.currentMasterBootNs ||
+            second.currentAuthorityGeneration != secondRoute.currentAuthorityGeneration ||
+            second.currentMasterUUID != secondRoute.currentMasterUUID || second.currentMasterBootNs != secondRoute.currentMasterBootNs ||
+            !prodigyLocalCousinServicePermissionEqual(first.permission, binding.sourcePermission) ||
+            !prodigyLocalCousinServicePermissionEqual(second.permission, binding.destinationPermission)) {
+          if (failure.empty()) failure.assign("qualification permission changed before fault injection"_ctv); return false;
+        }
+      }
+      CousinRouteRecord withdrawn = binding.route;
+      withdrawn.operationUUID = reference.withdrawOperationUUID; withdrawn.generation++;
+      withdrawn.state = CousinRouteState::withdrawn; withdrawn.withdrawalGeneration = withdrawn.generation;
+      withdrawn.withdrawnAtMs = intent.startedAtMilliseconds;
+      if (!qualificationCousinRouteApply(withdrawn, source, destination, failure)) return false;
+      if (intent.row == MothershipNametagQualificationRow::permissionRevokeReinstall) {
+        auto revoked = binding.sourcePermission; revoked.state = ProdigyLocalCousinServicePermissionState::revoked;
+        revoked.generation = 2; revoked.acceptedAuthorityGeneration = 0;
+        ProdigyLocalCousinServicePermissionResponse observed = {};
+        if (!qualificationCousinPermission(source, revoked, true, observed, failure)) return false;
+      }
+    }
+    return true;
+  }
+
+  bool qualificationCousinRestore(const MothershipNametagQualificationIntent& intent,
+      const MothershipNametagQualificationExecutionRecord& execution,
+      MothershipProdigyCluster& source, MothershipProdigyCluster& destination, String& failure)
+  {
+    for (size_t i = 0; i < execution.cousinRecoveryBindings.size(); ++i) {
+      const auto& binding = execution.cousinRecoveryBindings[i]; const auto& reference = intent.cousinRecoveries[i];
+      CousinRouteRecord current = {};
+      { auto registry = openClusterRegistry(); if (!registry.loadCousinRoute(binding.route.routeUUID, current, &failure)) return false; }
+      if (cousinRouteExactMatches(current, binding.route)) continue; // This route was never withdrawn.
+      CousinRouteRecord withdrawn = binding.route;
+      if (withdrawn.generation == UINT64_MAX) return false;
+      withdrawn.operationUUID = reference.withdrawOperationUUID; withdrawn.generation++;
+      withdrawn.state = CousinRouteState::withdrawn; withdrawn.withdrawalGeneration = withdrawn.generation;
+      withdrawn.withdrawnAtMs = intent.startedAtMilliseconds;
+      if (!cousinRouteExactMatches(current, withdrawn) || !qualificationCousinRouteApply(withdrawn, source, destination, failure)) {
+        if (failure.empty()) failure.assign("qualification route no longer matches the planned withdrawal"_ctv); return false;
+      }
+      uint128_t permissionUUID = binding.sourcePermission.permissionUUID;
+      if (intent.row == MothershipNametagQualificationRow::permissionRevokeReinstall) {
+        ProdigyLocalCousinServicePermissionResponse observed = {};
+        if (!qualificationCousinPermission(source, binding.sourcePermission, false, observed, failure) || !observed.found) return false;
+        if (observed.permission.state == ProdigyLocalCousinServicePermissionState::revoked) {
+          auto successor = binding.sourcePermission; successor.permissionUUID = reference.successorPermissionUUID;
+          successor.protocolVersion = successor.protocolVersion >= ProdigyLocalCousinServicePermission::purposeVersion ?
+              ProdigyLocalCousinServicePermission::purposeVersion : 1;
+          successor.generation = 1; successor.acceptedAuthorityGeneration = 0;
+          successor.baselineLogicalCores = successor.baselineMemoryMB = successor.baselineStorageMB = 0;
+          if (!qualificationCousinPermission(source, successor, true, observed, failure) ||
+              observed.permission.acceptedAuthorityGeneration <= binding.sourcePermission.acceptedAuthorityGeneration) return false;
+          permissionUUID = successor.permissionUUID;
+        } else if (!observed.qualified || !prodigyLocalCousinServicePermissionEqual(observed.permission, binding.sourcePermission)) {
+          failure.assign("qualification original cousin permission changed during recovery"_ctv); return false;
+        }
+      }
+      CousinRouteRecord successor = binding.route;
+      successor.routeUUID = reference.successorRouteUUID; successor.operationUUID = reference.successorRouteOperationUUID;
+      successor.sourcePermissionUUID = permissionUUID; successor.generation = 1;
+      successor.state = CousinRouteState::active; successor.withdrawalGeneration = 0; successor.withdrawnAtMs = 0;
+      if (!cousinRouteAllowsNewAdmissionAt(successor, Time::now<TimeResolution::ms>()) ||
+          !qualificationCousinRouteApply(successor, source, destination, failure,
+              binding.sourceAuthorityGeneration, binding.destinationAuthorityGeneration)) return false;
+    }
+    return true;
+  }
+
+  bool qualificationReplaySiteDispatch(const MothershipNametagQualificationIntent& intent,
+      MothershipProdigyCluster& site, uint64_t app6DeploymentID,
+      ProdigyNametagQualificationReplayWorkStage stage,
+      const Vector<ProdigyNametagQualificationReplay>& sources,
+      MothershipNametagQualificationSiteAction action,
+      MothershipNametagQualificationSiteResponse& response, String& failure)
+  {
+    auto target = std::find_if(intent.probeTargets.begin(), intent.probeTargets.end(),
+        [&](const auto& item) { return item.clusterUUID == site.clusterUUID; });
+    if (target == intent.probeTargets.end()) return false;
+    MothershipNametagQualificationSiteRequest request = {};
+    request.protocolVersion = MothershipNametagQualificationSiteRequest::replayStageVersion;
+    request.intent = intent; request.targetClusterUUID = site.clusterUUID;
+    request.targetApp6DeploymentID = app6DeploymentID; request.targetProbeDeploymentID = target->probeDeploymentID;
+    request.action = action; request.replayStage = stage; request.replaySources = sources;
+    return mothershipNametagQualificationSiteRequestValid(request) &&
+        configureControlTarget(site.name.c_str(), &failure) &&
+        requestTopicRoundTrip(MothershipTopic::nametagQualification, request, response, failure) &&
+        mothershipNametagQualificationSiteResponseValid(request, response);
+  }
+
+  bool qualificationReplayResolve(const MothershipNametagQualificationAdapter& adapter,
+      const MothershipNametagQualificationIntent& intent, const MothershipNametagAllMastersRecord& allMasters,
+      MothershipNametagQualificationExecutionRecord& execution, MothershipProdigyCluster& ewr,
+      MothershipProdigyCluster& ord, size_t index, String& failure)
+  {
+    if (index < execution.replayWitnesses.size()) return true;
+    if (index != execution.replayWitnesses.size() || index >= 2) return false;
+    const auto store = index == 0 ? ProdigyNametagQualificationReplayStore::kv : ProdigyNametagQualificationReplayStore::graph;
+    const uint16_t app = prodigyNametagQualificationReplayApplicationID(store);
+    if (allMasters.intent.sites.size() != 3) return false;
+    MothershipProdigyCluster& source = index == 0 ? ord : ewr;
+    MothershipProdigyCluster& destination = index == 0 ? ewr : ord;
+    const uint64_t sourceDID = index == 0 ? allMasters.intent.sites[1].hotDeploymentID : allMasters.intent.sites[0].pulseDeploymentID;
+    const uint64_t destinationDID = index == 0 ? allMasters.intent.sites[0].hotDeploymentID : allMasters.intent.sites[1].pulseDeploymentID;
+    const auto purpose = index == 0 ? ProdigyCousinServicePurpose::statefulCousin : ProdigyCousinServicePurpose::sibling;
+    Vector<CousinRouteRecord> candidates;
+    { auto registry = openClusterRegistry(); Vector<uint16_t> applications = {app};
+      if (!registry.listNametagSeedSuccessorRouteCandidates(source.clusterUUID, applications,
+          Time::now<TimeResolution::ms>(), candidates, &failure)) return false;
+    }
+    CousinRouteRecord route = {};
+    ProdigyLocalCousinServicePermissionResponse sp = {}, dp = {};
+    uint32_t matches = 0;
+    for (const auto& candidate : candidates) {
+      if (candidate.sourceClusterUUID != source.clusterUUID || candidate.destinationClusterUUID != destination.clusterUUID ||
+          candidate.sourceApplicationID != app || candidate.destinationApplicationID != app ||
+          std::any_of(allMasters.intent.seedRoutes.begin(), allMasters.intent.seedRoutes.end(),
+              [&](const auto& ref) { return ref.routeUUID == candidate.routeUUID; })) continue;
+      bool coversGroup = false;
+      for (uint16_t slot = 0; slot < CousinRouteSlotBitmap::slotCount; ++slot)
+        if (candidate.slots.contains(slot) && (index == 0 ? statefulServiceGroupOwnerForSlot(slot, 3) == 0 : slot == 0)) coversGroup = true;
+      if (!coversGroup) continue;
+      ProdigyLocalCousinServicePermissionResponse left = {}, right = {};
+      if (!readLocalCousinServicePermission(source, candidate.sourcePermissionUUID, left, failure) ||
+          !readLocalCousinServicePermission(destination, candidate.destinationPermissionUUID, right, failure)) return false;
+      if (!left.found || !right.found || !left.qualified || !right.qualified ||
+          left.permission.localDeploymentID != sourceDID || right.permission.localDeploymentID != destinationDID ||
+          left.permission.purpose != purpose || right.permission.purpose != purpose ||
+          !mothershipSeedSuccessorRoutePermissionPairValid(candidate, left.permission, right.permission, true)) continue;
+      if (!cousinRouteAllowsNewAdmissionAt(candidate, Time::now<TimeResolution::ms>())) {
+        failure.assign("replay ordinary route is expired or withdrawn"_ctv); return false;
+      }
+      CousinRouteApplyReceipt a = {}, b = {}; ProdigyCousinRouteResponse observedA = {}, observedB = {};
+      { auto registry = openClusterRegistry();
+        if (!registry.loadCurrentCousinRouteApplyReceipt(candidate.routeUUID, CousinRouteHalf::source, a, &failure) ||
+            !registry.loadCurrentCousinRouteApplyReceipt(candidate.routeUUID, CousinRouteHalf::destination, b, &failure)) return false;
+      }
+      if (!observeCousinRouteSide(source, candidate, CousinRouteHalf::source, observedA, failure) ||
+          !observeCousinRouteSide(destination, candidate, CousinRouteHalf::destination, observedB, failure) ||
+          !observedA.found || !observedA.qualified || !observedB.found || !observedB.qualified ||
+          !cousinRouteExactMatches(observedA.route, candidate) || !cousinRouteExactMatches(observedB.route, candidate) ||
+          !cousinRouteApplyReceiptExactMatches(observedA.applyReceipt, a) || !cousinRouteApplyReceiptExactMatches(observedB.applyReceipt, b) ||
+          left.currentAuthorityGeneration != observedA.currentAuthorityGeneration || right.currentAuthorityGeneration != observedB.currentAuthorityGeneration ||
+          left.currentMasterUUID != observedA.currentMasterUUID || right.currentMasterUUID != observedB.currentMasterUUID ||
+          left.currentMasterBootNs != observedA.currentMasterBootNs || right.currentMasterBootNs != observedB.currentMasterBootNs) return false;
+      route = candidate; sp = left; dp = right; ++matches;
+    }
+    if (matches != 1) { failure.assign("replay requires exactly one current authenticated ordinary route for the requested group"_ctv); return false; }
+    ProdigyNametagQualificationReplay initial = {}, resolved = {};
+    initial.runUUID = intent.runUUID; initial.executionGeneration = intent.executionGeneration;
+    initial.deadlineAtMilliseconds = std::min<int64_t>(intent.deadlineAtMilliseconds, Time::now<TimeResolution::ms>() + 29000);
+    initial.direction = 1; initial.stage = ProdigyNametagQualificationReplayStage::arm;
+    initial.store = store;
+    initial.applicationID = app; initial.shardGroup = 0;
+    if (!prodigyNametagQualificationReplayWorkloadName(intent.runUUID, initial.store, 0, initial.workloadName)) return false;
+    auto& session = initial.session; session.pairUUID = route.pairUUID; session.routeUUID = route.routeUUID;
+    session.sourcePermissionUUID = route.sourcePermissionUUID; session.destinationPermissionUUID = route.destinationPermissionUUID;
+    session.sourceClusterUUID = route.sourceClusterUUID; session.destinationClusterUUID = route.destinationClusterUUID;
+    session.sourceDeploymentID = sp.permission.localDeploymentID; session.destinationDeploymentID = dp.permission.localDeploymentID;
+    session.routeGeneration = route.generation; session.sourcePermissionAuthorityGeneration = sp.permission.acceptedAuthorityGeneration;
+    if (!prodigyNametagQualificationReplayInitialValid(initial) || !configureControlTarget(ewr.name.c_str(), &failure) ||
+        !requestTopicRoundTrip(MothershipTopic::nametagQualification, initial, resolved, failure) ||
+        !prodigyNametagQualificationReplayResolutionMatches(initial, resolved)) return false;
+    resolved.response = false;
+    auto registry = openClusterRegistry();
+    return registry.recordNametagQualificationReplayWitness(adapter, intent, index, resolved, execution, &failure);
+  }
+
+  bool qualificationReplayNativeStage(const MothershipNametagQualificationAdapter& adapter,
+      const MothershipNametagQualificationIntent& intent, MothershipNametagQualificationExecutionRecord& execution,
+      MothershipProdigyCluster& site, size_t index, bool target, ProdigyNametagQualificationReplayStage stage, String& failure,
+      bool releasePrearm = false)
+  {
+    if (index >= execution.replayWitnesses.size()) return false;
+    auto w = execution.replayWitnesses[index];
+    auto request = target ? ((stage == ProdigyNametagQualificationReplayStage::prearm || releasePrearm) ? w.targetPrearmChallenge :
+        (w.targetChallenge.challengeUUID ? w.targetChallenge : w.targetPrearmChallenge)) : w.sourceChallenge;
+    if (target && stage == ProdigyNametagQualificationReplayStage::prearm && !request.challengeUUID) {
+      request = w.sourceChallenge; request.targetSide = true; request.stage = stage;
+      auto registry = openClusterRegistry();
+      if (!registry.recordNametagQualificationReplayWitness(adapter, intent, index, request, execution, &failure)) return false;
+    } else if (target && stage == ProdigyNametagQualificationReplayStage::arm && !w.targetChallenge.challengeUUID) {
+      if (!w.sourceCapture.ready) return false;
+      request = w.sourceChallenge; request.targetSide = true; request.originUUID = w.sourceCapture.originUUID;
+      request.committedID = w.sourceCapture.committedID; request.olderCommittedID = w.sourceCapture.olderCommittedID;
+      request.delayedID = w.sourceCapture.delayedID; request.catchupID = w.sourceCapture.catchupID;
+      auto registry = openClusterRegistry();
+      if (!registry.recordNametagQualificationReplayWitness(adapter, intent, index, request, execution, &failure)) return false;
+    }
+    request.stage = stage;
+    w = execution.replayWitnesses[index];
+    const auto& existing = target ? (stage == ProdigyNametagQualificationReplayStage::prearm ? w.targetPrearm :
+        stage == ProdigyNametagQualificationReplayStage::arm ? w.targetArm : stage == ProdigyNametagQualificationReplayStage::replay ? w.targetReplay :
+        stage == ProdigyNametagQualificationReplayStage::query ? w.targetQuery : w.targetRelease) :
+        (stage == ProdigyNametagQualificationReplayStage::arm ? w.sourceArm : stage == ProdigyNametagQualificationReplayStage::replay ? w.sourceReplay :
+         stage == ProdigyNametagQualificationReplayStage::query ? (w.sourceReplay.ready ? w.sourceQuery : w.sourceCapture) : w.sourceRelease);
+    if (existing.ready) return true;
+    const int64_t stop = request.deadlineAtMilliseconds + (stage == ProdigyNametagQualificationReplayStage::release ? 60000 : 0);
+    while (Time::now<TimeResolution::ms>() < stop) {
+      ProdigyNametagQualificationReplay response = {};
+      if (!configureControlTarget(site.name.c_str(), &failure) ||
+          !requestTopicRoundTrip(MothershipTopic::nametagQualification, request, response, failure) ||
+          !prodigyNametagQualificationReplayResponseMatches(request, response) || !response.failure.empty()) return false;
+      if (response.ready) { auto registry = openClusterRegistry();
+        return registry.recordNametagQualificationReplayWitness(adapter, intent, index, response, execution, &failure); }
+      ::usleep(100'000);
+    }
+    failure.assign("native replay stage timed out"_ctv); return false;
+  }
+
+  bool qualificationReplayApplicationStage(const MothershipNametagQualificationAdapter& adapter,
+      const MothershipNametagQualificationIntent& intent, const MothershipNametagAllMastersRecord& allMasters,
+      MothershipNametagQualificationExecutionRecord& execution, Vector<MothershipProdigyCluster>& clusters,
+      ProdigyNametagQualificationReplayWorkStage stage, String& failure)
+  {
+    if (clusters.size() != 3 || allMasters.intent.sites.size() != 3) return false;
+    Vector<ProdigyNametagQualificationReplay> sources = {};
+    if (stage == ProdigyNametagQualificationReplayWorkStage::workload) {
+      if (execution.replayLocalWork.runUUID) return true;
+      if (execution.replayWitnesses.size() != 2) return false;
+      for (const auto& witness : execution.replayWitnesses) sources.push_back(witness.sourceChallenge);
+    }
+    auto complete = [&](size_t i) {
+      if (stage == ProdigyNametagQualificationReplayWorkStage::workload) return execution.replayLocalWork.runUUID != 0;
+      if (stage == ProdigyNametagQualificationReplayWorkStage::final)
+        return std::any_of(execution.replayFinalReadbacks.begin(), execution.replayFinalReadbacks.end(),
+            [&](const auto& r) { return r.localClusterUUID == clusters[i].clusterUUID; });
+      return false;
+    };
+    const size_t count = stage == ProdigyNametagQualificationReplayWorkStage::workload ? 1 : 3;
+    for (size_t i = 0; i < count; ++i) {
+      if (complete(i)) continue;
+      MothershipNametagQualificationSiteResponse response = {};
+      if (!qualificationReplaySiteDispatch(intent, clusters[i], allMasters.intent.sites[i].app6DeploymentID,
+          stage, sources, MothershipNametagQualificationSiteAction::execute, response, failure)) return false;
+    }
+    if (stage == ProdigyNametagQualificationReplayWorkStage::prepare) return true;
+    for (size_t i = 0; i < count; ++i) {
+      if (complete(i)) continue;
+      bool recorded = false;
+      while (Time::now<TimeResolution::ms>() < intent.convergenceDeadlineAtMilliseconds) {
+        MothershipNametagQualificationSiteResponse response = {}; String temporary = {};
+        if (qualificationReplaySiteDispatch(intent, clusters[i], allMasters.intent.sites[i].app6DeploymentID,
+            stage, sources, MothershipNametagQualificationSiteAction::query, response, temporary)) {
+          auto registry = openClusterRegistry();
+          if (!registry.recordNametagQualificationReplayReadback(adapter, intent, response.applicationReceipt, execution, &failure)) return false;
+          recorded = true; break;
+        }
+        ::usleep(100'000);
+      }
+      if (!recorded) { failure.assign("replay application stage timed out"_ctv); return false; }
+    }
+    return true;
+  }
+
+  bool qualificationReplayExecute(const MothershipNametagQualificationAdapter& adapter,
+      const MothershipNametagQualificationIntent& intent, const MothershipNametagAllMastersRecord& allMasters,
+      MothershipNametagQualificationExecutionRecord& execution, Vector<MothershipProdigyCluster>& clusters, String& failure)
+  {
+    using Stage = ProdigyNametagQualificationReplayStage;
+    using Work = ProdigyNametagQualificationReplayWorkStage;
+    if (clusters.size() != 3) return false;
+    bool ok = !execution.replayAborting;
+    if (ok) ok = qualificationReplayApplicationStage(adapter, intent, allMasters, execution, clusters, Work::prepare, failure);
+    for (size_t i = 0; ok && i < 2; ++i) ok = qualificationReplayResolve(adapter, intent, allMasters, execution, clusters[0], clusters[1], i, failure);
+    for (size_t i = 0; ok && i < 2; ++i) ok = qualificationReplayNativeStage(adapter, intent, execution, clusters[1], i, true, Stage::prearm, failure);
+    for (size_t i = 0; ok && i < 2; ++i) ok = qualificationReplayNativeStage(adapter, intent, execution, clusters[0], i, false, Stage::arm, failure);
+    if (ok) ok = qualificationReplayApplicationStage(adapter, intent, allMasters, execution, clusters, Work::workload, failure);
+    for (size_t i = 0; ok && i < 2; ++i) ok = qualificationReplayNativeStage(adapter, intent, execution, clusters[0], i, false, Stage::query, failure);
+    for (size_t i = 0; ok && i < 2; ++i) ok = qualificationReplayNativeStage(adapter, intent, execution, clusters[1], i, true, Stage::arm, failure);
+    for (size_t i = 0; ok && i < 2; ++i) ok = qualificationReplayNativeStage(adapter, intent, execution, clusters[1], i, true, Stage::replay, failure);
+    for (size_t i = 0; ok && i < 2; ++i) ok = qualificationReplayNativeStage(adapter, intent, execution, clusters[0], i, false, Stage::replay, failure);
+    for (size_t i = 0; ok && i < 2; ++i) ok = qualificationReplayNativeStage(adapter, intent, execution, clusters[0], i, false, Stage::query, failure);
+    for (size_t i = 0; ok && i < 2; ++i) ok = qualificationReplayNativeStage(adapter, intent, execution, clusters[1], i, true, Stage::query, failure);
+    // Persist the abort before cleanup so a retry cannot reopen work.
+    if (!ok && !execution.replayWitnesses.empty() && !execution.replayAborting) {
+      auto registry = openClusterRegistry(); String abortFailure = {};
+      if (!registry.markNametagQualificationReplayAbort(adapter, intent, execution, &abortFailure)) {
+        if (failure.empty()) failure = abortFailure; return false;
+      }
+    }
+    // Release both independently even if another step failed.  The retained
+    // native deadlines remain the final bound if a release cannot be reached.
+    bool released = true; String cleanupFailure = {};
+    for (size_t i = 0; i < execution.replayWitnesses.size(); ++i) {
+      auto witness = execution.replayWitnesses[i];
+      if (witness.sourceChallenge.challengeUUID && !witness.sourceRelease.ready &&
+          !qualificationReplayNativeStage(adapter, intent, execution, clusters[0], i, false, Stage::release, cleanupFailure)) released = false;
+      witness = execution.replayWitnesses[i];
+      if (witness.targetPrearmChallenge.challengeUUID && !witness.targetRelease.ready) {
+        bool targetReleased = qualificationReplayNativeStage(adapter, intent, execution, clusters[1], i, true, Stage::release, cleanupFailure);
+        if (!targetReleased && witness.targetChallenge.challengeUUID && !witness.targetArm.ready) {
+          cleanupFailure.clear();
+          targetReleased = qualificationReplayNativeStage(adapter, intent, execution, clusters[1], i, true, Stage::release, cleanupFailure, true);
+        }
+        if (!targetReleased) released = false;
+      }
+    }
+    if (!ok || !released) { if (failure.empty()) failure = cleanupFailure; return false; }
+    return qualificationReplayApplicationStage(adapter, intent, allMasters, execution, clusters, Work::final, failure) &&
+        mothershipNametagQualificationReplayExecutionComplete(execution);
+  }
+
+  bool qualificationWriterNativeStage(const MothershipNametagQualificationAdapter& adapter,
+      const MothershipNametagQualificationIntent& intent, MothershipNametagQualificationExecutionRecord& execution,
+      MothershipProdigyCluster& source, uint64_t hotDeploymentID,
+      ProdigyNametagQualificationWriterIsolationStage stage, String& failure)
+  {
+    if (stage == ProdigyNametagQualificationWriterIsolationStage::arm && !execution.writerIsolation.challenge.challengeUUID) {
+      ProdigyNametagQualificationWriterIsolation initial = {}, resolved = {};
+      initial.runUUID = intent.runUUID; initial.executionGeneration = intent.executionGeneration;
+      initial.clusterUUID = intent.probeTargets[0].clusterUUID; initial.deploymentID = hotDeploymentID;
+      initial.deadlineAtMilliseconds = intent.deadlineAtMilliseconds; initial.stage = stage;
+      initial.applicationID = 3; initial.shardGroup = 0; initial.validForMilliseconds = 60000;
+      if (!prodigyNametagQualificationWriterIsolationInitialArmValid(initial) ||
+          !configureControlTarget(source.name.c_str(), &failure) ||
+          !requestTopicRoundTrip(MothershipTopic::nametagQualification, initial, resolved, failure) ||
+          !resolved.response || resolved.ready || !resolved.failure.empty() ||
+          resolved.runUUID != initial.runUUID || resolved.executionGeneration != initial.executionGeneration ||
+          resolved.clusterUUID != initial.clusterUUID || resolved.deploymentID != initial.deploymentID ||
+          resolved.applicationID != initial.applicationID || resolved.shardGroup != initial.shardGroup ||
+          resolved.deadlineAtMilliseconds != initial.deadlineAtMilliseconds ||
+          resolved.validForMilliseconds != initial.validForMilliseconds || resolved.stage != initial.stage) return false;
+      resolved.response = false;
+      auto registry = openClusterRegistry();
+      if (!registry.recordNametagQualificationWriterIsolationWitness(adapter, intent, resolved, execution, &failure)) return false;
+    }
+    auto request = execution.writerIsolation.challenge; request.stage = stage;
+    if (!prodigyNametagQualificationWriterIsolationValid(request)) return false;
+    const auto& w = execution.writerIsolation;
+    const auto& old = stage == ProdigyNametagQualificationWriterIsolationStage::arm ? w.arm :
+        stage == ProdigyNametagQualificationWriterIsolationStage::isolate ? w.isolated :
+        stage == ProdigyNametagQualificationWriterIsolationStage::query ? w.queried : w.released;
+    if (old.ready) return true;
+    const int64_t stopAt = intent.deadlineAtMilliseconds +
+        (stage == ProdigyNametagQualificationWriterIsolationStage::release ? 60000 : 0);
+    while (Time::now<TimeResolution::ms>() < stopAt) {
+      ProdigyNametagQualificationWriterIsolation response = {};
+      if (!configureControlTarget(source.name.c_str(), &failure) ||
+          !requestTopicRoundTrip(MothershipTopic::nametagQualification, request, response, failure)) return false;
+      if (!response.failure.empty()) { failure = response.failure; return false; }
+      if (!prodigyNametagQualificationWriterIsolationResponseMatches(request, response)) return false;
+      if (response.ready) {
+        if (stage == ProdigyNametagQualificationWriterIsolationStage::query && !response.isolated) {
+          failure.assign("writer isolation expired before survivor writes were observed"_ctv); return false;
+        }
+        auto registry = openClusterRegistry();
+        return registry.recordNametagQualificationWriterIsolationWitness(adapter, intent, response, execution, &failure);
+      }
+      ::usleep(100'000);
+    }
+    failure.assign("writer isolation native witness timed out"_ctv); return false;
+  }
+
+  bool qualificationWriterLocalStage(const MothershipNametagQualificationAdapter& adapter,
+      const MothershipNametagQualificationIntent& intent, MothershipNametagQualificationExecutionRecord& execution,
+      MothershipProdigyCluster& source, uint64_t app6DeploymentID,
+      ProdigyNametagQualificationWriterStage stage, String& failure)
+  {
+    const auto& current = stage == ProdigyNametagQualificationWriterStage::arm ?
+        execution.writerIsolation.localArm : execution.writerIsolation.localWork;
+    if (current.runUUID) return true;
+    MothershipNametagQualificationSiteRequest request = {};
+    request.protocolVersion = MothershipNametagQualificationSiteRequest::writerStageVersion;
+    request.intent = intent; request.targetClusterUUID = intent.probeTargets[0].clusterUUID;
+    request.targetProbeDeploymentID = intent.probeTargets[0].probeDeploymentID;
+    request.targetApp6DeploymentID = app6DeploymentID; request.writerStage = stage;
+    request.writerIsolation = execution.writerIsolation.challenge;
+    MothershipNametagQualificationSiteResponse response = {};
+    request.action = MothershipNametagQualificationSiteAction::execute;
+    if (!mothershipNametagQualificationSiteRequestValid(request) || !configureControlTarget(source.name.c_str(), &failure) ||
+        !requestTopicRoundTrip(MothershipTopic::nametagQualification, request, response, failure) ||
+        !mothershipNametagQualificationSiteResponseValid(request, response)) return false;
+    request.action = MothershipNametagQualificationSiteAction::query;
+    while (Time::now<TimeResolution::ms>() < intent.deadlineAtMilliseconds) {
+      response = {}; String queryFailure = {};
+      if (configureControlTarget(source.name.c_str(), &queryFailure) &&
+          requestTopicRoundTrip(MothershipTopic::nametagQualification, request, response, queryFailure) &&
+          mothershipNametagQualificationSiteResponseValid(request, response)) {
+        auto registry = openClusterRegistry();
+        return registry.recordNametagQualificationWriterIsolationLocalWork(adapter, intent, response.applicationReceipt,
+                                                                            execution, &failure);
+      }
+      ::usleep(100'000);
+    }
+    failure.assign("writer isolation App11 witness timed out"_ctv); return false;
+  }
+
+  bool qualificationCousinNativeStage(const MothershipNametagQualificationAdapter& adapter,
+      const MothershipNametagQualificationIntent& intent, MothershipNametagQualificationExecutionRecord& execution,
+      MothershipProdigyCluster& source, ProdigyNametagQualificationCousinStage stage, String& failure)
+  {
+    for (size_t i = 0; i < intent.cousinRecoveries.size(); ++i) {
+      const auto& binding = execution.cousinRecoveryBindings[i]; const auto& ref = intent.cousinRecoveries[i];
+      if (stage == ProdigyNametagQualificationCousinStage::arm && i >= execution.cousinNativeWitnesses.size()) {
+        ProdigyNametagQualificationCousinTransport initial = {};
+        initial.runUUID = intent.runUUID; initial.executionGeneration = intent.executionGeneration;
+        initial.deadlineAtMilliseconds = intent.deadlineAtMilliseconds; initial.stage = stage;
+        auto& s = initial.session; s.pairUUID = binding.route.pairUUID; s.routeUUID = binding.route.routeUUID;
+        s.sourcePermissionUUID = binding.sourcePermission.permissionUUID; s.destinationPermissionUUID = binding.destinationPermission.permissionUUID;
+        s.sourceClusterUUID = binding.route.sourceClusterUUID; s.destinationClusterUUID = binding.route.destinationClusterUUID;
+        s.sourceDeploymentID = binding.sourcePermission.localDeploymentID; s.destinationDeploymentID = binding.destinationPermission.localDeploymentID;
+        s.routeGeneration = binding.route.generation; s.sourcePermissionAuthorityGeneration = binding.sourcePermission.acceptedAuthorityGeneration;
+        s.successorRouteUUID = ref.successorRouteUUID; s.successorRouteGeneration = 1;
+        s.successorSourcePermissionUUID = ref.successorPermissionUUID ? ref.successorPermissionUUID : binding.sourcePermission.permissionUUID;
+        ProdigyNametagQualificationCousinTransport resolved = {};
+        if (!prodigyNametagQualificationCousinTransportInitialArmValid(initial) ||
+            !configureControlTarget(source.name.c_str(), &failure) ||
+            !requestTopicRoundTrip(MothershipTopic::nametagQualification, initial, resolved, failure) ||
+            !resolved.response || resolved.ready || !resolved.failure.empty()) return false;
+        resolved.response = false;
+        auto registry = openClusterRegistry();
+        if (!registry.recordNametagQualificationCousinNativeWitness(adapter, intent, i, resolved, execution, &failure)) return false;
+      }
+      if (i >= execution.cousinNativeWitnesses.size()) return false;
+      auto request = execution.cousinNativeWitnesses[i].challenge; request.stage = stage;
+      if (stage == ProdigyNametagQualificationCousinStage::final) {
+        auto expected = binding.sourcePermission;
+        expected.acceptedAuthorityGeneration = 0;
+        if (ref.successorPermissionUUID) { expected.permissionUUID = ref.successorPermissionUUID; expected.generation = 1;
+          expected.protocolVersion = expected.protocolVersion >= ProdigyLocalCousinServicePermission::purposeVersion ?
+              ProdigyLocalCousinServicePermission::purposeVersion : 1;
+          expected.baselineLogicalCores = expected.baselineMemoryMB = expected.baselineStorageMB = 0; }
+        ProdigyLocalCousinServicePermissionResponse observed = {};
+        if (!qualificationCousinPermission(source, expected, false, observed, failure) || !observed.found || !observed.qualified ||
+            observed.permission.permissionUUID != request.session.successorSourcePermissionUUID ||
+            !prodigyLocalCousinServicePermissionRequestAccepted(expected, observed.permission)) return false;
+        request.session.successorPermissionAuthorityGeneration = observed.permission.acceptedAuthorityGeneration;
+      }
+      const auto& w = execution.cousinNativeWitnesses[i];
+      const auto& existing = stage == ProdigyNametagQualificationCousinStage::arm ? w.arm :
+          stage == ProdigyNametagQualificationCousinStage::faultObserved ? w.fault : w.final;
+      if (existing.ready) continue;
+      while (Time::now<TimeResolution::ms>() < intent.deadlineAtMilliseconds) {
+        ProdigyNametagQualificationCousinTransport response = {};
+        if (!configureControlTarget(source.name.c_str(), &failure) ||
+            !requestTopicRoundTrip(MothershipTopic::nametagQualification, request, response, failure)) return false;
+        if (!response.failure.empty()) { failure = response.failure; return false; }
+        if (!prodigyNametagQualificationCousinTransportResponseMatches(request, response)) return false;
+        if (response.ready) {
+          auto registry = openClusterRegistry();
+          if (!registry.recordNametagQualificationCousinNativeWitness(adapter, intent, i, response, execution, &failure)) return false;
+          break;
+        }
+        ::usleep(100'000);
+      }
+      const auto& complete = execution.cousinNativeWitnesses[i];
+      if (!(stage == ProdigyNametagQualificationCousinStage::arm ? complete.arm.ready :
+            stage == ProdigyNametagQualificationCousinStage::faultObserved ? complete.fault.ready : complete.final.ready)) {
+        failure.assign("qualification native transport witness timed out"_ctv); return false;
+      }
+    }
+    return true;
+  }
+
+  bool qualificationRestartProcess(MothershipNametagQualificationExecutionRecord::RestartProcess& process, String& failure)
+  {
+    process = {}; MothershipVDCProcessIdentity identity = {};
+    if (!mothershipVDCReadProcess(uint64_t(::getpid()), identity) ||
+        !mothershipVDCRead(String("/proc/sys/kernel/random/boot_id"), process.bootID, 64) ||
+        !prodigyComputeFileSHA256Hex(String("/proc/self/exe"), process.executableSHA256, &failure)) return false;
+    if (!process.bootID.empty() && process.bootID[process.bootID.size() - 1] == '\n')
+      process.bootID = process.bootID.substr(0, process.bootID.size() - 1, Copy::yes);
+    process.pid = identity.pid; process.startTime = identity.startTime;
+    return true;
+  }
+
+  struct NametagSeedSuccessorInput {
+    uint16_t applicationID = 0;
+    String planArgument, artifactPath;
+  };
+  struct NametagSeedSuccessorPreparedPlan {
+    DeploymentPlan plan;
+    String artifactPath, encodedPlan;
+  };
+
+  bool readNametagSeedSuccessorInputs(MothershipNametagQualificationRow row,
+      Vector<Vector<NametagSeedSuccessorInput>>& attempts, String& digest, String& failure)
+  {
+    attempts.clear(); digest.clear();
+    const char *path = std::getenv("PRODIGY_NAMETAG_QUALIFICATION_SEED_PLANS_JSON");
+    String bytes; struct stat st = {};
+    int fd = path ? ::open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK) : -1;
+    bool valid = fd >= 0 && ::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+        st.st_size > 0 && st.st_size <= 65536;
+    while (valid) {
+      char buffer[4096]; const ssize_t count = ::read(fd, buffer, sizeof(buffer));
+      if (count < 0 && errno == EINTR) continue;
+      if (count < 0) { valid = false; break; }
+      if (!count) break;
+      bytes.append(buffer, size_t(count)); if (bytes.size() > 65536) valid = false;
+    }
+    if (fd >= 0) ::close(fd);
+    simdjson::dom::parser parser; simdjson::dom::element document; simdjson::dom::object object;
+    valid = valid && parser.parse(bytes.data(), bytes.size()).get(document) == simdjson::SUCCESS &&
+        !document.get(object) && object.size() == 2 && prodigyComputeSHA256Hex(bytes, digest, &failure);
+    uint8_t seen = 0;
+    if (valid) for (auto field : object) {
+      const bool replica = field.key == "seed-interruption-resume";
+      if (!replica && field.key != "brain-hard-reboot-catchup") { valid = false; break; }
+      const uint8_t bit = replica ? 1 : 2;
+      if (seen & bit) { valid = false; break; }
+      seen |= bit;
+      simdjson::dom::array rows;
+      if (field.value.get(rows) || rows.size() != (replica ? 2u : 1u)) { valid = false; break; }
+      for (auto attempt : rows) {
+        simdjson::dom::array plans; Vector<NametagSeedSuccessorInput> input;
+        if (attempt.get(plans) || plans.size() != 4) { valid = false; break; }
+        for (auto plan : plans) {
+          simdjson::dom::object entry; uint64_t app = 0; std::string_view json, artifact;
+          if (plan.get(entry) || entry.size() != 3 || entry["applicationID"].get(app) ||
+              entry["plan"].get(json) || entry["artifact"].get(artifact) ||
+              (app != 3 && app != 4 && app != 5 && app != 2) ||
+              json.size() < 3 || json.size() > 4096 || json[0] != '@' || json[1] != '/' ||
+              artifact.empty() || artifact.size() > 4096 || artifact[0] != '/' ||
+              std::any_of(input.begin(), input.end(), [&](const auto& value) { return value.applicationID == app; })) {
+            valid = false; break;
+          }
+          NametagSeedSuccessorInput value; value.applicationID = uint16_t(app);
+          value.planArgument.assign(json.data(), json.size()); value.artifactPath.assign(artifact.data(), artifact.size());
+          input.push_back(std::move(value));
+        }
+        if (!valid) break;
+        if ((replica && row == MothershipNametagQualificationRow::seedInterruptionResume) ||
+            (!replica && row == MothershipNametagQualificationRow::brainHardRebootCatchup))
+          attempts.push_back(std::move(input));
+      }
+      if (!valid) break;
+    }
+    if (!valid || seen != 3 || attempts.size() !=
+        (row == MothershipNametagQualificationRow::seedInterruptionResume ? 2u : 1u)) {
+      failure.assign("seed qualification requires bounded exact plan/artifact inputs for both rows"_ctv);
+      attempts.clear(); digest.clear(); return false;
+    }
+    return true;
+  }
+
+  // Resolve through the ordinary deployment parser and Discombobulator
+  // contract. Freeze every old member before the first cancellation so a
+  // retry never reconstructs its scope from a partially retired cohort.
+  bool prepareNametagSeedSuccessorPlacement(
+      MothershipNametagSeedSuccessorPlacementIntent& placement,
+      const MothershipNametagAllMastersRecord& prior,
+      const Vector<NametagSeedSuccessorInput>& inputs,
+      Vector<NametagSeedSuccessorPreparedPlan>& prepared, String& failure)
+  {
+    prepared.clear();
+    if (placement.site < 1 || placement.site > 2 || inputs.size() != 4 || placement.plans.size() != 4)
+      return false;
+    MothershipProdigyCluster cluster = {}; String identity;
+    identity.assignItoh(prior.intent.sites[placement.site].clusterUUID);
+    MothershipNametagSeedSuccessorPlacementIntent saved;
+    bool exists = false;
+    {
+      auto registry = openClusterRegistry();
+      if (!registry.getClusterByIdentity(identity, cluster, &failure)) return false;
+      String lookupFailure;
+      exists = registry.loadNametagSeedSuccessorPlacementIntent(placement.operationUUID, saved, &lookupFailure);
+      if (!exists && !lookupFailure.equal("record not found"_ctv)) {
+        failure = lookupFailure; return false;
+      }
+    }
+    if (exists) {
+      if (saved.predecessorOperationUUID != placement.predecessorOperationUUID ||
+          saved.predecessorSHA256 != placement.predecessorSHA256 ||
+          saved.predecessorSuccessorUUID != placement.predecessorSuccessorUUID ||
+          saved.predecessorSuccessorSHA256 != placement.predecessorSuccessorSHA256 ||
+          saved.qualificationRunUUID != placement.qualificationRunUUID ||
+          saved.executionGeneration != placement.executionGeneration ||
+          saved.qualificationRow != placement.qualificationRow || saved.site != placement.site)
+        return false;
+      placement = std::move(saved);
+    }
+    for (uint32_t i = 0; i < placement.plans.size(); ++i) {
+      auto& bound = placement.plans[i];
+      auto input = std::find_if(inputs.begin(), inputs.end(), [&](const auto& value) {
+        return value.applicationID == bound.applicationID;
+      });
+      if (input == inputs.end() || std::count_if(inputs.begin(), inputs.end(), [&](const auto& value) {
+            return value.applicationID == bound.applicationID;
+          }) != 1) return false;
+      NametagSeedSuccessorPreparedPlan one; bool returnEarly = false;
+      auto planArgument = input->planArgument, artifactPath = input->artifactPath;
+      if (!prepareDeploymentPlan(cluster.name.c_str(), planArgument.c_str(), artifactPath.c_str(),
+            one.plan, one.artifactPath, returnEarly, failure) ||
+          !mothershipValidateDiscombobulatorContainerBlobContract(one.artifactPath, &failure)) return false;
+      if (!one.plan.isStateful || !one.plan.stateful.allMasters || one.plan.useHostNetworkNamespace ||
+          one.plan.config.applicationID != bound.applicationID ||
+          one.plan.config.deploymentID() != bound.successorDeploymentID ||
+          bound.successorDeploymentID <= bound.previousDeploymentID ||
+          !one.plan.wormholes.empty() || !one.plan.whiteholes.empty()) {
+        failure.assign("seed successor requires the exact private all-masters deployment"_ctv); return false;
+      }
+      // Brain's normal artifact owner records these before hashing its plan.
+      // Hash the same normalized identity, never the unfilled parser output.
+      if (!prodigyComputeFileSHA256Hex(one.artifactPath, one.plan.config.containerBlobSHA256,
+            &one.plan.config.containerBlobBytes, &failure) ||
+          !BitseryEngine::serialize(one.encodedPlan, one.plan)) return false;
+      String planDigest;
+      if (!prodigyComputeSHA256Hex(one.encodedPlan, planDigest, &failure)) return false;
+      if (exists) {
+        if (bound.planSHA256 != planDigest || bound.artifactSHA256 != one.plan.config.containerBlobSHA256) {
+          failure.assign("seed successor input changed after durable placement"_ctv); return false;
+        }
+      } else {
+        bound.planSHA256 = planDigest; bound.artifactSHA256 = one.plan.config.containerBlobSHA256;
+        DeploymentIdentityReport old;
+        const uint32_t groups = bound.applicationID == 3 || bound.applicationID == 4 ? 3 : 1;
+        const auto kind = groups == 3 ? DeploymentIdentityStoreKind::kv : DeploymentIdentityStoreKind::graph;
+        if (!readDeploymentIdentity(cluster, bound.previousDeploymentID, old, failure) ||
+            !mothershipNametagAllMastersDeploymentReadyForSeedSelection(old, cluster.clusterUUID,
+                bound.previousDeploymentID, bound.applicationID, groups, kind)) return false;
+        bound.previousMembers.clear();
+        for (const auto& row : prior.seedPlacements) {
+          if (row.site != placement.site || row.applicationID != bound.applicationID) continue;
+          auto member = std::find_if(old.statefulRuntimeCohort.begin(), old.statefulRuntimeCohort.end(),
+              [&](const auto& value) { return value.containerUUID == row.targetContainerUUID; });
+          if (member == old.statefulRuntimeCohort.end() || !member->machineUUID ||
+              row.targetDeploymentID != bound.previousDeploymentID || member->shardGroup != row.shardGroup)
+            return false;
+          bound.previousMembers.push_back({member->containerUUID, member->machineUUID});
+        }
+        std::sort(bound.previousMembers.begin(), bound.previousMembers.end(), [](const auto& a, const auto& b) {
+          return a.containerUUID < b.containerUUID;
+        });
+      }
+      prepared.push_back(std::move(one));
+    }
+    auto initial = placement;
+    initial.cancellationDispatchedMask = initial.cancellationCompletedMask = 0;
+    initial.cancellationReceipts.clear(); initial.routePlan.clear();
+    bool resumed = false; auto registry = openClusterRegistry();
+    return registry.persistNametagSeedSuccessorPlacementIntent(initial, resumed, &failure) &&
+        registry.loadNametagSeedSuccessorPlacementIntent(placement.operationUUID, placement, &failure);
+  }
+
+  bool nametagSeedSuccessorCancellationScope(
+      const MothershipNametagSeedSuccessorPlacementIntent& placement,
+      const MothershipNametagAllMastersRecord& prior, uint32_t index, int64_t deadline,
+      ProdigyQualificationStatefulCancellation& scope, String& failure)
+  {
+    if (index >= placement.plans.size()) return false;
+    const auto& plan = placement.plans[index];
+    auto initial = placement; initial.cancellationDispatchedMask = initial.cancellationCompletedMask = 0;
+    initial.cancellationReceipts.clear(); initial.routePlan.clear(); String bytes;
+    scope = {};
+    if (!BitseryEngine::serialize(bytes, initial) ||
+        !prodigyComputeSHA256Hex(bytes, scope.placementIntentSHA256, &failure)) return false;
+    scope.qualificationRunUUID = placement.qualificationRunUUID;
+    scope.successorOperationUUID = placement.operationUUID;
+    scope.sourceClusterUUID = prior.intent.sites[0].clusterUUID;
+    scope.executionGeneration = placement.executionGeneration; scope.deadlineAtMilliseconds = deadline;
+    scope.successorPlanSHA256 = plan.planSHA256; scope.successorArtifactSHA256 = plan.artifactSHA256;
+    scope.members = plan.previousMembers;
+    auto& request = scope.request; request.applicationID = plan.applicationID;
+    switch (plan.applicationID) {
+      case 3: request.applicationName.assign("Hot"_ctv); break;
+      case 4: request.applicationName.assign("Cold"_ctv); break;
+      case 5: request.applicationName.assign("Radar"_ctv); break;
+      case 2: request.applicationName.assign("Pulse"_ctv); break;
+      default: return false;
+    }
+    request.activeVersionID = plan.previousDeploymentID & ((uint64_t(1) << 48) - 1);
+    request.successorVersionID = plan.successorDeploymentID & ((uint64_t(1) << 48) - 1);
+    constexpr char hex[] = "0123456789abcdef";
+    for (uint32_t n = 0; n < 32; ++n) {
+      if (n == 8 || n == 12 || n == 16 || n == 20) request.operationID.append('-');
+      request.operationID.append(hex[uint8_t(plan.cancellationOperationUUID >> ((31 - n) * 4)) & 15]);
+    }
+    request.reason.assign("qualified fresh all-masters seed successor"_ctv);
+    return prodigyQualificationStatefulCancellationValid(scope) && prodigyCanonicalOperationUUID(request.operationID);
+  }
+
+  bool installNametagSeedSuccessorBootstrap(
+      const MothershipNametagSeedSuccessorPlacementIntent& placement,
+      const MothershipNametagAllMastersRecord& prior, uint32_t index,
+      const NametagSeedSuccessorPreparedPlan& prepared, int64_t deadline, String& failure)
+  {
+    ProdigyQualificationStatefulCancellation scope;
+    if (!nametagSeedSuccessorCancellationScope(placement, prior, index, deadline, scope, failure)) return false;
+    MothershipProdigyCluster cluster; String identity;
+    identity.assignItoh(prior.intent.sites[placement.site].clusterUUID);
+    { auto registry = openClusterRegistry(); if (!registry.getClusterByIdentity(identity, cluster, &failure)) return false; }
+    const auto& plan = placement.plans[index];
+    const uint32_t groups = plan.applicationID == 3 || plan.applicationID == 4 ? 3 : 1;
+    for (uint32_t group = 0; group < groups; ++group) {
+      auto old = std::find_if(prior.seedPlacements.begin(), prior.seedPlacements.end(), [&](const auto& value) {
+        return value.site == placement.site && value.applicationID == plan.applicationID && value.shardGroup == group;
+      });
+      if (old == prior.seedPlacements.end() || old->seedGeneration == UINT64_MAX) return false;
+      ProdigyAllMastersSeedBootstrapOperation request;
+      request.query = true; request.qualificationCancellation = scope; request.deploymentPlan = prepared.encodedPlan;
+      auto& b = request.bootstrap;
+      b.sourceClusterUUID = scope.sourceClusterUUID; b.targetClusterUUID = cluster.clusterUUID;
+      b.targetDeploymentID = plan.successorDeploymentID; b.qualificationRunUUID = placement.qualificationRunUUID;
+      b.successorOperationUUID = placement.operationUUID; b.shardGroup = group;
+      b.expectedSeedGeneration = old->seedGeneration + 1;
+      bool ready = false;
+      while (Time::now<TimeResolution::ms>() < deadline) {
+        ProdigyAllMastersSeedBootstrapOperation reply;
+        if (!configureControlTarget(cluster.name.c_str(), &failure) ||
+            !requestTopicRoundTrip(MothershipTopic::statefulDataAuthority, request, reply, failure)) return false;
+        auto expected = request, observed = reply;
+        expected.expectedAuthorityGeneration = observed.expectedAuthorityGeneration = 0;
+        expected.expectedMasterUUID = observed.expectedMasterUUID = 0;
+        expected.expectedMasterBootNs = observed.expectedMasterBootNs = 0;
+        expected.accepted = observed.accepted = expected.ready = observed.ready = false;
+        expected.failure.clear(); observed.failure.clear();
+        String a, z;
+        if (!BitseryEngine::serialize(a, expected) || !BitseryEngine::serialize(z, observed) || a != z ||
+            !reply.expectedMasterUUID || reply.expectedMasterBootNs <= 0 || !reply.expectedAuthorityGeneration) {
+          failure.assign("seed bootstrap returned a mismatched authority response"_ctv); return false;
+        }
+        if (!reply.failure.empty()) { failure = reply.failure; return false; }
+        if (request.expectedMasterUUID && (request.expectedMasterUUID != reply.expectedMasterUUID ||
+            request.expectedMasterBootNs != reply.expectedMasterBootNs)) {
+          failure.assign("seed bootstrap master incarnation changed during admission"_ctv); return false;
+        }
+        if (reply.accepted && reply.ready) { ready = true; break; }
+        request.expectedAuthorityGeneration = reply.expectedAuthorityGeneration;
+        request.expectedMasterUUID = reply.expectedMasterUUID; request.expectedMasterBootNs = reply.expectedMasterBootNs;
+        request.query = reply.accepted;
+        ::usleep(100'000);
+      }
+      if (!ready) { failure.assign("seed bootstrap did not receive durable peer acknowledgement"_ctv); return false; }
+    }
+    return true;
+  }
+
+  bool cancelNametagSeedSuccessorPredecessors(
+      MothershipNametagSeedSuccessorPlacementIntent& placement,
+      const MothershipNametagAllMastersRecord& prior,
+      const Vector<NametagSeedSuccessorPreparedPlan>& prepared, int64_t deadline,
+      Vector<DeploymentIdentityReport>& reports, String& failure)
+  {
+    reports.clear();
+    if (prepared.size() != placement.plans.size()) return false;
+    MothershipProdigyCluster cluster; String identity;
+    identity.assignItoh(prior.intent.sites[placement.site].clusterUUID);
+    { auto registry = openClusterRegistry(); if (!registry.getClusterByIdentity(identity, cluster, &failure)) return false; }
+    // Install every exact admission before any destructive predecessor action.
+    for (uint32_t i = 0; i < prepared.size(); ++i)
+      if (!installNametagSeedSuccessorBootstrap(placement, prior, i, prepared[i], deadline, failure)) return false;
+    for (uint32_t i = 0; i < prepared.size(); ++i) {
+      const uint8_t bit = uint8_t(1u << i);
+      if (!(placement.cancellationDispatchedMask & bit)) {
+        const auto& bound = placement.plans[i];
+        DeploymentIdentityReport observed;
+        if (!readDeploymentIdentity(cluster, bound.successorDeploymentID, observed, failure, false, true)) return false;
+        if (!observed.found) {
+          auto plan = prepared[i].plan; DeploymentDispatchResult dispatch;
+          if (!configureControlTarget(cluster.name.c_str(), &failure) ||
+              !dispatchValidatedDeployment(plan, prepared[i].artifactPath, true, false, dispatch)) {
+            if (failure.empty()) failure = dispatch.failure;
+            return false;
+          }
+          // Acknowledged spin can still be awaiting its persisted plan. A
+          // retry after a lost ACK reconciles this same identity above instead
+          // of resubmitting an already accepted deployment.
+          while (Time::now<TimeResolution::ms>() < deadline) {
+            if (!readDeploymentIdentity(cluster, bound.successorDeploymentID, observed, failure, false, true)) return false;
+            if (observed.found) break;
+            ::usleep(100'000);
+          }
+        }
+        if (!observed.found || observed.canonicalPlanSHA256 != bound.planSHA256 ||
+            observed.containerBlobSHA256 != bound.artifactSHA256 ||
+            observed.containerBlobBytes != prepared[i].plan.config.containerBlobBytes) {
+          failure.assign("queued seed successor does not match its durable plan and artifact"_ctv); return false;
+        }
+        { auto registry = openClusterRegistry();
+          if (!registry.updateNametagSeedSuccessorCancellation(placement.operationUUID, i, true, nullptr, &failure) ||
+              !registry.loadNametagSeedSuccessorPlacementIntent(placement.operationUUID, placement, &failure)) return false; }
+      }
+      ProdigyQualificationStatefulCancellation scope;
+      if (!nametagSeedSuccessorCancellationScope(placement, prior, i, deadline, scope, failure)) return false;
+      while (!(placement.cancellationCompletedMask & bit) && Time::now<TimeResolution::ms>() < deadline) {
+        CancelDeploymentResponse reply;
+        if (!configureControlTarget(cluster.name.c_str(), &failure) ||
+            !requestTopicRoundTrip(MothershipTopic::cancelDeployment, scope, reply, failure) ||
+            !reply.success || reply.operationID != scope.request.operationID ||
+            reply.applicationID != scope.request.applicationID ||
+            reply.activeVersionID != scope.request.activeVersionID ||
+            reply.successorVersionID != scope.request.successorVersionID) {
+          if (failure.empty()) failure = reply.failure;
+          return false;
+        }
+        if (reply.phase == CancelDeploymentPhase::completed) {
+          auto registry = openClusterRegistry();
+          if (!registry.updateNametagSeedSuccessorCancellation(placement.operationUUID, i, false, &reply, &failure) ||
+              !registry.loadNametagSeedSuccessorPlacementIntent(placement.operationUUID, placement, &failure)) return false;
+        } else ::usleep(100'000);
+      }
+      if (!(placement.cancellationCompletedMask & bit)) {
+        failure.assign("qualified predecessor cancellation did not complete"_ctv); return false;
+      }
+    }
+    while (Time::now<TimeResolution::ms>() < deadline) {
+      reports.clear(); bool ready = true;
+      for (const auto& plan : placement.plans) {
+        DeploymentIdentityReport observed;
+        if (!readDeploymentIdentity(cluster, plan.successorDeploymentID, observed, failure, false, true)) return false;
+        if (!observed.found) { ready = false; continue; }
+        if (observed.canonicalPlanSHA256 != plan.planSHA256 || observed.containerBlobSHA256 != plan.artifactSHA256)
+          return false;
+        const uint32_t count = plan.applicationID == 3 || plan.applicationID == 4 ? 9 : 3;
+        ready &= observed.live && observed.nTarget == count && observed.nDeployed == count && observed.nHealthy == count &&
+            observed.statefulRuntimeCohort.size() == count;
+        reports.push_back(std::move(observed));
+      }
+      if (ready) return true;
+      ::usleep(100'000);
+    }
+    failure.assign("exact seed successor runtimes did not become ready"_ctv); return false;
+  }
+
+// Apply only the complete endpoint plan reloaded from the durable journal.
+bool applyNametagSeedSuccessorRoutes(MothershipNametagSeedSuccessorPlacementIntent& placement, String& failure)
+{
+  { auto registry = openClusterRegistry();
+    if (!registry.loadNametagSeedSuccessorPlacementIntent(placement.operationUUID, placement, &failure)) return false;
+  }
+  if (placement.routePlan.empty()) return false;
+  for (const auto& item : placement.routePlan) {
+    if (!item.routeReady) return false;
+    MothershipProdigyCluster source = {}, destination = {}; String a, b;
+    a.assignItoh(item.desiredRoute.sourceClusterUUID); b.assignItoh(item.desiredRoute.destinationClusterUUID);
+    { auto registry = openClusterRegistry();
+      if (!registry.getClusterByIdentity(a, source, &failure) || !registry.getClusterByIdentity(b, destination, &failure)) return false;
+    }
+    if (!qualificationCousinRouteApply(item.desiredRoute, source, destination, failure)) return false;
+  }
+  return true;
+}
+
+// Resolve endpoints only after the captured permission plan and cancellation
+// are durable. The caller authenticates the exact live deployment reports.
+bool prepareNametagSeedSuccessorRoutes(MothershipNametagSeedSuccessorPlacementIntent& placement,
+    const MothershipNametagAllMastersRecord& prior, Vector<DeploymentIdentityReport>& sourceReports,
+    Vector<DeploymentIdentityReport>& targetReports, int64_t deadline, String& failure)
+{
+  { auto registry = openClusterRegistry();
+    if (!registry.loadNametagSeedSuccessorPlacementIntent(placement.operationUUID, placement, &failure)) return false;
+  }
+  if (placement.routePlan.empty() || placement.cancellationCompletedMask != 0x0f || deadline <= Time::now<TimeResolution::ms>()) return false;
+  if (std::all_of(placement.routePlan.begin(), placement.routePlan.end(), [](const auto& p) { return p.routeReady; })) return true;
+  auto ready = placement.routePlan;
+  for (auto& item : ready) {
+    if (item.routeReady || item.desiredRoute.expiresAtMs < deadline) return false;
+    MothershipProdigyCluster src = {}, dst = {}; String a, b;
+    a.assignItoh(item.desiredRoute.sourceClusterUUID); b.assignItoh(item.desiredRoute.destinationClusterUUID);
+    { auto registry = openClusterRegistry();
+      if (!registry.getClusterByIdentity(a, src, &failure) || !registry.getClusterByIdentity(b, dst, &failure)) return false;
+    }
+    ProdigyLocalCousinServicePermissionResponse left = {}, right = {};
+    if (!qualificationCousinPermission(src, item.desiredSource, true, left, failure) ||
+        !qualificationCousinPermission(dst, item.desiredDestination, true, right, failure)) return false;
+    uint16_t slot = 0;
+    while (slot < CousinRouteSlotBitmap::slotCount && !item.desiredRoute.slots.contains(slot)) ++slot;
+    if (slot == CousinRouteSlotBitmap::slotCount || !left.permission.slots.contains(slot)) return false;
+    ProdigyCousinDiscoveryQuery query = {}; query.permissionUUID = left.permission.permissionUUID; query.slot = slot;
+    ProdigyCousinDiscoveryResponse discovery = {};
+    if (!configureControlTarget(src.name.c_str(), &failure) ||
+        !requestTopicRoundTrip(MothershipTopic::pullCousinCounterparts, query, discovery, failure) ||
+        discovery.protocolVersion != ProdigyCousinDiscoveryResponse::version || !discovery.success ||
+        discovery.records.size() > ProdigyCousinDiscoveryMaximumRecords) return false;
+    const DeploymentIdentityReport* report = nullptr;
+    for (const auto* reports : {&sourceReports, &targetReports}) for (const auto& candidate : *reports)
+      if (candidate.clusterUUID == dst.clusterUUID && candidate.deploymentID == right.permission.localDeploymentID) {
+        if (report) return false; report = &candidate;
+      }
+    if (!report || !prodigyDeploymentIdentityReportVersionSupported(report->version, 4) || !report->found || !report->live ||
+        !report->authorityGeneration || !report->masterUUID || report->masterBootNs <= 0 || report->canonicalPlanSHA256 != right.permission.canonicalPlanSHA256 ||
+        report->containerBlobSHA256 != right.permission.artifactSHA256 || report->containerBlobBytes != right.permission.artifactBytes) return false;
+    if (item.seeding && !mothershipNametagAllMastersDeploymentReadyForSeedSelection(
+        *report, dst.clusterUUID, right.permission.localDeploymentID, right.permission.localApplicationID,
+        right.permission.destinationShardGroups,
+        right.permission.localApplicationID == 3 || right.permission.localApplicationID == 4 ?
+            DeploymentIdentityStoreKind::kv : DeploymentIdentityStoreKind::graph)) return false;
+    const ProdigyCousinCounterpart* selected = nullptr;
+    for (const auto& peer : discovery.records) {
+      bool ownsRoute = true;
+      for (uint16_t bit = 0; bit < CousinRouteSlotBitmap::slotCount; ++bit)
+        if (item.desiredRoute.slots.contains(bit) && !peer.ownedSlots.contains(bit)) { ownsRoute = false; break; }
+      if (!ownsRoute || !prodigyCousinCounterpartMatchesPermission(peer, left.permission, slot, true) ||
+          !prodigyLocalCousinServicePermissionEqual(peer.permission, right.permission) ||
+          (right.permission.purpose != ProdigyCousinServicePurpose::statefulCousin && peer.shardGroup != right.permission.destinationShardGroup) ||
+          (item.seeding && placement.qualificationRow == uint8_t(ProdigyNametagQualificationRow::brainHardRebootCatchup) && peer.nodeUUID == report->masterUUID)) continue;
+      if (std::count_if(report->statefulRuntimeCohort.begin(), report->statefulRuntimeCohort.end(), [&](const auto& member) {
+          return member.clusterUUID == report->clusterUUID && member.machineUUID == peer.nodeUUID && member.containerUUID == peer.containerUUID &&
+              member.replicaUUID == peer.containerUUID && member.shardGroup == peer.shardGroup && member.allMasters;
+        }) != 1) continue;
+      if (!selected || peer.containerUUID < selected->containerUUID) selected = &peer;
+    }
+    if (!selected || item.desiredRoute.endpointKind != CousinRouteEndpointKind::privateContainer || selected->routablePrefixUUID) return false;
+    item.desiredRoute.destinationPublicAddress = selected->publicAddress;
+    item.desiredRoute.destinationTCPPort = selected->publicTCPPort;
+    if (item.seeding) { item.sourceContainerUUID = selected->containerUUID; item.sourceMachineUUID = selected->nodeUUID; }
+    item.routeReady = true;
+  }
+  { auto registry = openClusterRegistry();
+    if (!registry.finalizeNametagSeedSuccessorRoutes(placement.operationUUID, ready, &failure) ||
+        !registry.loadNametagSeedSuccessorPlacementIntent(placement.operationUUID, placement, &failure)) return false;
+  }
+  return true;
+}
+
+// Freeze the full route snapshot before dispatching any cancellation.
+bool captureNametagSeedSuccessorRoutes(MothershipNametagSeedSuccessorPlacementIntent& placement,
+    const MothershipNametagAllMastersRecord& prior,
+    const Vector<NametagSeedSuccessorPreparedPlan>& prepared, String& failure)
+{
+  { auto registry = openClusterRegistry();
+    if (!registry.loadNametagSeedSuccessorPlacementIntent(placement.operationUUID, placement, &failure)) return false;
+  }
+  if (!placement.routePlan.empty()) return true;
+  if (placement.cancellationDispatchedMask || prepared.size() != placement.plans.size() || prior.intent.sites.size() != 3) return false;
+  const uint128_t replacedSite = prior.intent.sites[placement.site].clusterUUID;
+  Vector<uint16_t> applications;
+  for (const auto& p : placement.plans) applications.push_back(p.applicationID);
+  Vector<CousinRouteRecord> candidates;
+  { auto registry = openClusterRegistry();
+    if (!registry.listNametagSeedSuccessorRouteCandidates(replacedSite, applications,
+          Time::now<TimeResolution::ms>(), candidates, &failure)) return false;
+  }
+  Vector<MothershipNametagSeedSuccessorRoutePlan> plan;
+  for (const auto& route : candidates) {
+    MothershipProdigyCluster source = {}, destination = {}; String a, b;
+    a.assignItoh(route.sourceClusterUUID); b.assignItoh(route.destinationClusterUUID);
+    { auto registry = openClusterRegistry();
+      if (!registry.getClusterByIdentity(a, source, &failure) || !registry.getClusterByIdentity(b, destination, &failure)) return false;
+    }
+    MothershipNametagSeedSuccessorRoutePlan entry = {}; entry.previousRoute = route;
+    ProdigyLocalCousinServicePermissionResponse left = {}, right = {};
+    ProdigyLocalCousinServicePermission lookupLeft = {}, lookupRight = {};
+    lookupLeft.permissionUUID = route.sourcePermissionUUID; lookupRight.permissionUUID = route.destinationPermissionUUID;
+    if (!qualificationCousinPermission(source, lookupLeft, false, left, failure) ||
+        !qualificationCousinPermission(destination, lookupRight, false, right, failure) ||
+        !left.found || !right.found) return false;
+    entry.previousSource = left.permission; entry.previousDestination = right.permission;
+    if (!mothershipSeedSuccessorRoutePermissionPairValid(route, entry.previousSource, entry.previousDestination, true)) return false;
+    const bool replaceLeft = route.sourceClusterUUID == replacedSite;
+    const auto& oldLocal = replaceLeft ? entry.previousSource : entry.previousDestination;
+    const auto old = std::find_if(placement.plans.begin(), placement.plans.end(), [&](const auto& p) {
+      return p.previousDeploymentID == oldLocal.localDeploymentID && p.applicationID == oldLocal.localApplicationID;
+    });
+    if (old == placement.plans.end()) continue;
+    if (!left.qualified || !right.qualified || !cousinRouteAllowsNewAdmissionAt(route, Time::now<TimeResolution::ms>())) {
+      failure.assign("current successor predecessor route is not qualified and usable"_ctv); return false;
+    }
+    const size_t index = size_t(old - placement.plans.begin());
+    const auto& next = prepared[index]; String computed;
+    if (next.plan.config.deploymentID() != old->successorDeploymentID || next.plan.config.containerBlobSHA256 != old->artifactSHA256 ||
+        !next.plan.config.containerBlobBytes || !prodigyComputeSHA256Hex(next.encodedPlan, computed, &failure) || computed != old->planSHA256) return false;
+    { auto registry = openClusterRegistry();
+      if (!registry.loadCurrentCousinRouteApplyReceipt(route.routeUUID, CousinRouteHalf::source, entry.previousSourceReceipt, &failure) ||
+          !registry.loadCurrentCousinRouteApplyReceipt(route.routeUUID, CousinRouteHalf::destination, entry.previousDestinationReceipt, &failure)) return false;
+    }
+    entry.seeding = entry.previousSource.purpose == ProdigyCousinServicePurpose::seeding;
+    entry.desiredRoute = route; entry.desiredRoute.priorOperationUUIDs.clear();
+    entry.desiredRoute.routeUUID = Random::generateNumberWithNBits<128, uint128_t>();
+    entry.desiredRoute.operationUUID = Random::generateNumberWithNBits<128, uint128_t>();
+    entry.desiredRoute.generation = 1; entry.desiredRoute.withdrawalGeneration = 0; entry.desiredRoute.withdrawnAtMs = 0;
+    entry.desiredSource = entry.previousSource; entry.desiredDestination = entry.previousDestination;
+    entry.desiredSource.permissionUUID = Random::generateNumberWithNBits<128, uint128_t>();
+    entry.desiredDestination.permissionUUID = Random::generateNumberWithNBits<128, uint128_t>();
+    entry.desiredRoute.sourcePermissionUUID = entry.desiredSource.permissionUUID;
+    entry.desiredRoute.destinationPermissionUUID = entry.desiredDestination.permissionUUID;
+    auto& local = replaceLeft ? entry.desiredSource : entry.desiredDestination;
+    auto& remote = replaceLeft ? entry.desiredDestination : entry.desiredSource;
+    local.localDeploymentID = old->successorDeploymentID; local.canonicalPlanSHA256 = old->planSHA256;
+    local.artifactSHA256 = old->artifactSHA256; local.artifactBytes = next.plan.config.containerBlobBytes;
+    remote.peerDeploymentID = local.localDeploymentID; remote.peerCanonicalPlanSHA256 = local.canonicalPlanSHA256;
+    remote.peerArtifactSHA256 = local.artifactSHA256; remote.peerArtifactBytes = local.artifactBytes;
+    for (auto* p : {&entry.desiredSource, &entry.desiredDestination}) {
+      p->acceptedAuthorityGeneration = 0; p->baselineLogicalCores = p->baselineMemoryMB = p->baselineStorageMB = 0;
+    }
+    plan.push_back(std::move(entry));
+  }
+  { auto registry = openClusterRegistry();
+    if (!registry.installNametagSeedSuccessorRoutePlan(placement.operationUUID, plan, &failure) ||
+        !registry.loadNametagSeedSuccessorPlacementIntent(placement.operationUUID, placement, &failure)) return false;
+  }
+  return true;
+}
+
+  bool executeNametagSeedSuccessors(const MothershipNametagQualificationAdapter& adapter,
+      MothershipNametagQualificationExecutionRecord& execution,
+      MothershipNametagAllMastersRecord& current, String& failure)
+  {
+    const auto intent = execution.intent;
+    if (intent.protocolVersion != intent.seedVersion || execution.protocolVersion != execution.seedVersion ||
+        intent.direction != MothershipNametagQualificationDirection::injection) return false;
+    Vector<Vector<NametagSeedSuccessorInput>> inputs; String inputDigest;
+    MothershipNametagAllMastersRecord original; String rootBytes, rootDigest;
+    { auto registry = openClusterRegistry();
+      if (!registry.loadNametagAllMasters(intent.allMastersOperationUUID, original, &failure)) return false;
+    }
+    if (!BitseryEngine::serialize(rootBytes, original) || !prodigyComputeSHA256Hex(rootBytes, rootDigest, &failure)) return false;
+    auto mint = [](uint128_t& id) { return RAND_priv_bytes(reinterpret_cast<unsigned char *>(&id), sizeof(id)) == 1 && id; };
+    for (uint32_t attempt = uint32_t(execution.seedSuccessors.size()); attempt < intent.seedSuccessorOperationUUIDs.size(); ++attempt) {
+      const auto operation = intent.seedSuccessorOperationUUIDs[attempt];
+      MothershipNametagSeedSuccessor completed; String completedDigest; bool completedFound = false;
+      { auto registry = openClusterRegistry();
+        if (!registry.loadCompletedNametagSeedSuccessor(operation, completed, completedDigest, completedFound, &failure)) return false;
+        if (completedFound) {
+          // The existing execution validator checks root/run/generation/kind,
+          // challenge, predecessor link and the immutable native receipts.
+          auto proposed = execution;
+          proposed.seedSuccessors.push_back({operation, completedDigest});
+          if (!registry.updateNametagQualificationSeedExecution(adapter, proposed, execution, &failure)) return false;
+        }
+      }
+      if (completedFound) continue;
+      if (inputs.empty() && (!readNametagSeedSuccessorInputs(intent.row, inputs, inputDigest, failure) ||
+          inputDigest != intent.seedInputSHA256 || inputs.size() != intent.seedSuccessorOperationUUIDs.size())) return false;
+      MothershipNametagSeedSuccessorPlacementIntent placement; bool placementExists = false;
+      { auto registry = openClusterRegistry(); String lookup;
+        placementExists = registry.loadNametagSeedSuccessorPlacementIntent(operation, placement, &lookup);
+        if (!placementExists && !lookup.equal("record not found"_ctv)) { failure = lookup; return false; }
+        if (placementExists) {
+          if (placement.qualificationRunUUID != intent.runUUID || placement.executionGeneration != intent.executionGeneration ||
+              placement.qualificationRow != uint8_t(intent.row) || placement.predecessorOperationUUID != intent.allMastersOperationUUID ||
+              placement.predecessorSHA256 != rootDigest || placement.site != 1 ||
+              !registry.loadNametagSeedSuccessorPrior(intent.allMastersOperationUUID, rootDigest,
+                  placement.predecessorSuccessorUUID, placement.predecessorSuccessorSHA256, current, &failure)) return false;
+        } else {
+          if (Time::now<TimeResolution::ms>() >= intent.deadlineAtMilliseconds ||
+              !registry.loadNametagAllMastersCurrentView(intent.allMastersOperationUUID, current,
+                  placement.predecessorSuccessorUUID, placement.predecessorSuccessorSHA256, &failure)) return false;
+          placement.operationUUID = operation; placement.predecessorOperationUUID = intent.allMastersOperationUUID;
+          placement.predecessorSHA256 = rootDigest; placement.qualificationRunUUID = intent.runUUID;
+          placement.executionGeneration = intent.executionGeneration; placement.qualificationRow = uint8_t(intent.row); placement.site = 1;
+        }
+      }
+      if (attempt && (placement.predecessorSuccessorUUID != execution.seedSuccessors.back().operationUUID ||
+          placement.predecessorSuccessorSHA256 != execution.seedSuccessors.back().sha256)) return false;
+      MothershipProdigyCluster destination; String identity; identity.assignItoh(current.intent.sites[1].clusterUUID);
+      { auto registry = openClusterRegistry(); if (!registry.getClusterByIdentity(identity, destination, &failure)) return false; }
+      if (!placementExists) {
+        for (uint32_t i = 0; i < current.seedPlacements.size(); ++i)
+          if (current.seedPlacements[i].site == 1) placement.predecessorIndices.push_back(i);
+        for (const auto& input : inputs[attempt]) {
+          MothershipNametagSeedSuccessorPlan bound; bound.applicationID = input.applicationID;
+          auto old = std::find_if(current.seedPlacements.begin(), current.seedPlacements.end(), [&](const auto& r) {
+            return r.site == 1 && r.applicationID == input.applicationID;
+          });
+          if (old == current.seedPlacements.end() || !mint(bound.cancellationOperationUUID)) return false;
+          bound.previousDeploymentID = old->targetDeploymentID;
+          DeploymentPlan candidate; String artifact; bool early = false;
+          auto planArgument = input.planArgument, artifactArgument = input.artifactPath;
+          if (!prepareDeploymentPlan(destination.name.c_str(), planArgument.c_str(), artifactArgument.c_str(),
+              candidate, artifact, early, failure)) return false;
+          bound.successorDeploymentID = candidate.config.deploymentID();
+          placement.plans.push_back(std::move(bound));
+        }
+      }
+      Vector<NametagSeedSuccessorPreparedPlan> prepared;
+      if (!prepareNametagSeedSuccessorPlacement(placement, current, inputs[attempt], prepared, failure)) return false;
+      Vector<DeploymentIdentityReport> targets, retained;
+      if (!captureNametagSeedSuccessorRoutes(placement, current, prepared, failure) ||
+          !cancelNametagSeedSuccessorPredecessors(placement, current, prepared, intent.deadlineAtMilliseconds, targets, failure)) return false;
+      // Retained reports include the third site: ordinary mesh routes can
+      // terminate there as well as at the EWR seed source.
+      for (uint32_t site : {0u, 2u}) {
+        MothershipProdigyCluster cluster; identity.assignItoh(current.intent.sites[site].clusterUUID);
+        { auto registry = openClusterRegistry(); if (!registry.getClusterByIdentity(identity, cluster, &failure)) return false; }
+        const auto& s = current.intent.sites[site];
+        for (auto did : {s.hotDeploymentID, s.coldDeploymentID, s.radarDeploymentID, s.pulseDeploymentID}) {
+          DeploymentIdentityReport report;
+          if (!readDeploymentIdentity(cluster, did, report, failure)) return false;
+          retained.push_back(std::move(report));
+        }
+      }
+      if (!prepareNametagSeedSuccessorRoutes(placement, current, retained, targets, intent.convergenceDeadlineAtMilliseconds, failure) ||
+          !applyNametagSeedSuccessorRoutes(placement, failure)) return false;
+      Vector<DeploymentIdentityReport> reports = retained; for (const auto& report : targets) reports.push_back(report);
+      MothershipNametagSeedSuccessor successor; bool exists = false;
+      { auto registry = openClusterRegistry(); String lookup;
+        exists = registry.loadNametagSeedSuccessor(operation, reports, successor, &lookup);
+        if (!exists && !lookup.equal("record not found"_ctv)) { failure = lookup; return false; }
+      }
+      if (!exists) {
+        successor.operationUUID = operation; successor.predecessorOperationUUID = placement.predecessorOperationUUID;
+        successor.predecessorSHA256 = placement.predecessorSHA256;
+        successor.predecessorSuccessorUUID = placement.predecessorSuccessorUUID;
+        successor.predecessorSuccessorSHA256 = placement.predecessorSuccessorSHA256;
+        successor.qualificationRunUUID = intent.runUUID; successor.executionGeneration = intent.executionGeneration;
+        successor.qualificationRow = uint8_t(intent.row); successor.site = 1;
+        successor.kind = intent.row == MothershipNametagQualificationRow::seedInterruptionResume && attempt == 0 ?
+            MothershipNametagSeedSuccessorKind::replica : MothershipNametagSeedSuccessorKind::site;
+        for (const auto& path : placement.routePlan) if (path.seeding) {
+          if (!path.routeReady || !path.sourceContainerUUID || !path.sourceMachineUUID) return false;
+          const auto& permission = path.desiredDestination;
+          MothershipNametagSourceCutProgress cut;
+          cut.request.operationUUID = operation;
+          if (!mint(cut.request.requestUUID)) return false;
+          cut.request.sourceClusterUUID = permission.localClusterUUID; cut.request.sourceDeploymentID = permission.localDeploymentID;
+          cut.request.sourceContainerUUID = path.sourceContainerUUID; cut.request.applicationID = path.desiredRoute.destinationApplicationID;
+          cut.request.storeKind = cut.request.applicationID == 3 || cut.request.applicationID == 4 ? DeploymentIdentityStoreKind::kv : DeploymentIdentityStoreKind::graph;
+          cut.request.shardGroup = permission.destinationShardGroup; cut.request.nShardGroups = cut.request.storeKind == DeploymentIdentityStoreKind::kv ? 3 : 1;
+          cut.request.retainUntilMilliseconds = intent.convergenceDeadlineAtMilliseconds;
+          if (!prodigyStatefulStoreSourceCutValid(cut.request)) return false;
+          successor.sourceCuts.push_back(std::move(cut));
+        }
+        for (auto index : placement.predecessorIndices) {
+          const auto& old = current.seedPlacements[index];
+          auto report = std::find_if(targets.begin(), targets.end(), [&](const auto& r) { return r.applicationID == old.applicationID; });
+          auto route = std::find_if(placement.routePlan.begin(), placement.routePlan.end(), [&](const auto& r) {
+            return r.seeding && r.desiredRoute.sourceApplicationID == old.applicationID && r.desiredDestination.destinationShardGroup == old.shardGroup;
+          });
+          if (report == targets.end() || route == placement.routePlan.end()) return false;
+          const DeploymentIdentityStatefulMember* selected = nullptr;
+          for (const auto& member : report->statefulRuntimeCohort) {
+            if (member.shardGroup != old.shardGroup || std::any_of(successor.targets.begin(), successor.targets.end(),
+                [&](const auto& t) { return t.containerUUID == member.containerUUID; })) continue;
+            if (!selected || member.containerUUID < selected->containerUUID) selected = &member;
+          }
+          if (!selected) return false;
+          MothershipNametagSeedSuccessorTarget target;
+          target.predecessorIndex = index; target.targetDeploymentID = report->deploymentID;
+          target.containerUUID = selected->containerUUID; target.machineUUID = selected->machineUUID;
+          target.routeUUID = route->desiredRoute.routeUUID;
+          if (successor.heldTargetIndex == UINT32_MAX && old.storeKind == DeploymentIdentityStoreKind::kv &&
+              (intent.row != MothershipNametagQualificationRow::brainHardRebootCatchup || selected->machineUUID != report->masterUUID))
+            successor.heldTargetIndex = uint32_t(successor.targets.size());
+          successor.targets.push_back(std::move(target));
+        }
+        bool resumed = false; MothershipNametagSeedSuccessor recorded;
+        { auto registry = openClusterRegistry();
+          if (!registry.persistNametagSeedSuccessor(successor, reports, recorded, resumed, &failure)) return false;
+        }
+        successor = std::move(recorded);
+      }
+      MothershipNametagSeedRebootFence sourceReboot = successor.sourceReboot, destinationReboot = successor.destinationReboot;
+      if (intent.row == MothershipNametagQualificationRow::brainHardRebootCatchup &&
+          successor.stage < MothershipNametagSeedSuccessorStage::resumed) {
+        auto choose = [&](uint128_t cluster, MothershipNametagSeedRebootFence& fence) {
+          if (fence.dispatchUUID) return true;
+          auto r = std::find_if(reports.begin(), reports.end(), [&](const auto& value) { return value.clusterUUID == cluster; });
+          if (r == reports.end() || !r->masterUUID || !mint(fence.dispatchUUID)) return false;
+          fence.clusterUUID = cluster; fence.machineUUID = r->masterUUID; return true;
+        };
+        if (!choose(current.intent.sites[0].clusterUUID, sourceReboot) || !choose(current.intent.sites[1].clusterUUID, destinationReboot)) return false;
+      }
+      if (!runNametagSeedSuccessorTransfer(successor, current, reports, intent.seedChallengeUUIDs[attempt],
+          intent.deadlineAtMilliseconds, sourceReboot, destinationReboot, failure)) return false;
+      auto proposed = execution; MothershipNametagQualificationExecutionRecord::SeedSuccessorRef reference;
+      reference.operationUUID = successor.operationUUID; String encoded;
+      if (!BitseryEngine::serialize(encoded, successor) || !prodigyComputeSHA256Hex(encoded, reference.sha256, &failure)) return false;
+      proposed.seedSuccessors.push_back(std::move(reference));
+      { auto registry = openClusterRegistry(); if (!registry.updateNametagQualificationSeedExecution(adapter, proposed, execution, &failure)) return false; }
+    }
+    return true;
+  }
+
+  bool finalizeNametagSeedQualification(const MothershipNametagQualificationAdapter& adapter,
+      MothershipNametagQualificationExecutionRecord& execution,
+      MothershipNametagAllMastersRecord& current, Vector<MothershipProdigyCluster>& clusters,
+      String& failure)
+  {
+    if (execution.protocolVersion != execution.seedVersion || clusters.size() != 3 ||
+        execution.seedSuccessors.size() != execution.intent.seedSuccessorOperationUUIDs.size()) return false;
+    if (execution.phase == MothershipNametagQualificationExecutionPhase::verified ||
+        execution.phase == MothershipNametagQualificationExecutionPhase::converging)
+      return mothershipNametagQualificationSeedExecutionComplete(execution);
+    const auto& intent = execution.intent;
+    MothershipNametagAllMastersRecord root;
+    MothershipNametagSourceBaselineRecord baseline; bool found = false;
+    String bytes, digest; uint128_t last = 0; String lastDigest;
+    { auto registry = openClusterRegistry();
+      if (!registry.loadNametagAllMasters(intent.allMastersOperationUUID, root, &failure) ||
+          !registry.loadNametagSourceBaseline(root.intent.sourceBaselineOperationUUID, baseline, found, &failure) || !found ||
+          !registry.loadNametagAllMastersCurrentView(intent.allMastersOperationUUID, current, last, lastDigest, &failure)) return false;
+    }
+    if (last != execution.seedSuccessors.back().operationUUID || lastDigest != execution.seedSuccessors.back().sha256) {
+      failure.assign("seed readback no longer names the current completed replacement"_ctv); return false;
+    }
+    auto proposed = execution;
+    proposed.seedBaselineOperationUUID = baseline.command.operationUUID;
+    proposed.seedBaselineFixtureSHA256 = baseline.receipt.fixtureManifestSHA256;
+    proposed.seedBaselineReadbackSHA256 = baseline.receipt.canonicalReadbackDigest;
+    for (uint32_t site = 0; site < 3; ++site) {
+      const auto& s = current.intent.sites[site];
+      proposed.seedStoreDeploymentIDs[site] = {s.hotDeploymentID, s.coldDeploymentID,
+          s.radarDeploymentID, s.pulseDeploymentID, current.intent.sites[0].truthDeploymentID};
+    }
+    if (!mothershipNametagQualificationSeedControlWitnessDigest(proposed, proposed.seedControlWitnessDigest)) return false;
+    { auto registry = openClusterRegistry();
+      if (!registry.updateNametagQualificationSeedExecution(adapter, proposed, execution, &failure)) return false;
+    }
+    for (uint32_t site = uint32_t(execution.seedFinalReadbacks.size()); site < 3; ++site) {
+      MothershipNametagQualificationSiteRequest request;
+      request.protocolVersion = MothershipNametagQualificationSiteRequest::seedReadbackVersion;
+      request.intent = intent; request.action = MothershipNametagQualificationSiteAction::query;
+      request.targetClusterUUID = current.intent.sites[site].clusterUUID;
+      request.targetApp6DeploymentID = current.intent.sites[site].app6DeploymentID;
+      request.targetProbeDeploymentID = intent.probeTargets[site].probeDeploymentID;
+      request.seedBaselineOperationUUID = execution.seedBaselineOperationUUID;
+      request.seedStoreDeploymentIDs = execution.seedStoreDeploymentIDs[site];
+      request.seedControlWitnessDigest = execution.seedControlWitnessDigest;
+      request.seedBaselineFixtureSHA256 = execution.seedBaselineFixtureSHA256;
+      request.seedBaselineReadbackSHA256 = execution.seedBaselineReadbackSHA256;
+      if (!mothershipNametagQualificationSiteRequestValid(request)) return false;
+      bool ready = false;
+      while (Time::now<TimeResolution::ms>() < intent.convergenceDeadlineAtMilliseconds) {
+        MothershipNametagQualificationSiteResponse response; String transient;
+        if (configureControlTarget(clusters[site].name.c_str(), &transient) &&
+            requestTopicRoundTrip(MothershipTopic::nametagQualification, request, response, transient) &&
+            mothershipNametagQualificationSiteResponseValid(request, response)) {
+          proposed = execution; proposed.seedFinalReadbacks.push_back(response.applicationReceipt);
+          auto registry = openClusterRegistry();
+          if (!registry.updateNametagQualificationSeedExecution(adapter, proposed, execution, &failure)) return false;
+          ready = true; break;
+        }
+        ::usleep(100'000);
+      }
+      if (!ready) { failure.assign("seed readback lacks the actual five-store baseline on every site"_ctv); return false; }
+    }
+    proposed = execution; proposed.phase = MothershipNametagQualificationExecutionPhase::converging;
+    auto registry = openClusterRegistry();
+    return registry.updateNametagQualificationSeedExecution(adapter, proposed, execution, &failure);
+  }
+
+  [[noreturn]] void runNametagQualification(const char *operation, int argc, char *argv[])
+  {
+    const MothershipNametagQualificationAdapter *adapter =
+        operation == nullptr ? nullptr : mothershipNametagQualificationAdapter(operation);
+    if (adapter == nullptr || argc != 0)
+    {
+      basics_log("{\"success\":false,\"failure\":\"qualification operation requires no arguments\"}\n");
+      exit(EXIT_FAILURE);
+    }
+
+    // The command spelling remains argument-free, but the campaign must bind
+    // itself to one already-durable three-site all-masters topology and one
+    // exact App11 probe in canonical EWR/ORD/LAN order.
+    const char *allMastersText = std::getenv("PRODIGY_NAMETAG_QUALIFICATION_ALL_MASTERS_OPERATION_UUID");
+    const char *probeTexts[] = {
+        std::getenv("PRODIGY_NAMETAG_QUALIFICATION_EWR_PROBE_DEPLOYMENT_ID"),
+        std::getenv("PRODIGY_NAMETAG_QUALIFICATION_ORD_PROBE_DEPLOYMENT_ID"),
+        std::getenv("PRODIGY_NAMETAG_QUALIFICATION_LAN_PROBE_DEPLOYMENT_ID")};
+    const char *runText = std::getenv("PRODIGY_NAMETAG_QUALIFICATION_RUN_UUID");
+    MothershipNametagQualificationIntent intent = {};
+    MothershipNametagAllMastersRecord allMasters = {};
+    MothershipNametagQualificationIntent recordedIntent = {};
+    MothershipNametagQualificationReceipt recordedReceipt = {};
+    MothershipNametagQualificationReceipt priorInjectionReceipt = {};
+    MothershipNametagQualificationExecutionRecord priorCousinExecution = {};
+    MothershipNametagQualificationExecutionRecord execution = {};
+    uint64_t probeDeploymentIDs[3] = {};
+    const uint64_t maximumOffsetMilliseconds =
+        uint64_t(std::max(adapter->deadlineSeconds, adapter->convergenceSeconds)) * 1000;
+    const int64_t startedAtMilliseconds = Time::now<TimeResolution::ms>();
+    String failure = {}; bool resumed = false, receiptResumed = false, hasRecordedReceipt = false;
+    bool hasRecordedIntent = false, hasPriorInjectionReceipt = false;
+    bool valid = runText != nullptr && prodigyParseCanonicalHex128(String(runText), intent.runUUID) && intent.runUUID != 0;
+    if (valid) {
+      auto registry = openClusterRegistry();
+      valid = registry.loadNametagQualificationReceipt(*adapter, intent.runUUID, recordedReceipt, hasRecordedReceipt, &failure) &&
+          (hasRecordedReceipt || registry.loadNametagQualificationIntent(*adapter, intent.runUUID, recordedIntent,
+              hasRecordedIntent, &failure));
+    }
+    if (valid && hasRecordedReceipt) {
+      // A completed row is recovered before a new candidate is minted. The
+      // receipt loader re-reads and validates its immutable intent.
+      resumed = receiptResumed = true;
+      auto registry = openClusterRegistry();
+      valid = registry.loadNametagAllMasters(recordedReceipt.allMastersOperationUUID, allMasters, &failure);
+    } else if (valid && hasRecordedIntent) {
+      // An incomplete run is resumed from its durable tuple. Callers cannot
+      // replace its timestamp, generation, descriptor, or probe identities.
+      intent = recordedIntent; resumed = true;
+      auto registry = openClusterRegistry();
+      valid = registry.loadNametagAllMasters(intent.allMastersOperationUUID, allMasters, &failure);
+    } else if (valid) {
+      // Mothership alone owns both wall-clock bounds and generation for a new
+      // run. The exact values become durable in the intent before dispatch.
+      valid = allMastersText != nullptr && probeTexts[0] != nullptr && probeTexts[1] != nullptr && probeTexts[2] != nullptr &&
+          prodigyParseCanonicalHex128(String(allMastersText), intent.allMastersOperationUUID) &&
+          intent.allMastersOperationUUID != 0 && startedAtMilliseconds > 0 &&
+          uint64_t(startedAtMilliseconds) <= uint64_t(INT64_MAX) - maximumOffsetMilliseconds;
+      for (uint32_t site = 0; valid && site < 3; ++site)
+        valid = mothershipParseUnsignedArgument(probeTexts[site], UINT64_MAX, probeDeploymentIDs[site]) &&
+            probeDeploymentIDs[site] != 0 && ApplicationConfig::extractApplicationID(probeDeploymentIDs[site]) == 11;
+      if (valid) { auto registry = openClusterRegistry(); valid = registry.loadNametagAllMasters(intent.allMastersOperationUUID, allMasters, &failure); }
+      if (valid) {
+        intent.row = adapter->row; intent.direction = adapter->direction; intent.executionGeneration = uint64_t(startedAtMilliseconds);
+        intent.rowID.assign(adapter->rowID); intent.descriptor = mothershipNametagQualificationDescriptor(adapter->row);
+        for (uint32_t site = 0; site < 3; ++site) {
+          MothershipNametagQualificationProbeTarget target = {};
+          target.clusterUUID = allMasters.intent.sites[site].clusterUUID;
+          target.probeDeploymentID = probeDeploymentIDs[site];
+          intent.probeTargets.push_back(std::move(target));
+        }
+        intent.deadlineSeconds = adapter->deadlineSeconds;
+        intent.convergenceSeconds = adapter->convergenceSeconds;
+        intent.startedAtMilliseconds = startedAtMilliseconds;
+        intent.deadlineAtMilliseconds = intent.startedAtMilliseconds + int64_t(adapter->deadlineSeconds) * 1000;
+        intent.convergenceDeadlineAtMilliseconds =
+            intent.startedAtMilliseconds + int64_t(adapter->convergenceSeconds) * 1000;
+        if (adapter->row == MothershipNametagQualificationRow::secondStreamHandoffFence ||
+            adapter->row == MothershipNametagQualificationRow::truthClaimPartition) {
+          // Operator supplies the exact independently gathered route/CID fixture;
+          // persist its file digest with every tuple before any dispatch.
+          const char *path = std::getenv(adapter->row == MothershipNametagQualificationRow::truthClaimPartition ?
+              "PRODIGY_NAMETAG_QUALIFICATION_ROW4_ROUTES_JSON" : "PRODIGY_NAMETAG_QUALIFICATION_ROW2_ROUTES_JSON");
+          String bytes = {}, fixtureDigest = {}; struct stat st = {};
+          int fd = path ? ::open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK) : -1;
+          valid = fd >= 0 && ::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0 && st.st_size <= 65536;
+          while (valid) {
+            char buffer[4096]; ssize_t count = ::read(fd, buffer, sizeof(buffer));
+            if (count < 0 && errno == EINTR) continue;
+            if (count < 0) { valid = false; break; }
+            if (count == 0) break;
+            bytes.append(buffer, size_t(count)); if (bytes.size() > 65536) valid = false;
+          }
+          if (fd >= 0) ::close(fd);
+          simdjson::dom::parser parser; simdjson::dom::element document; simdjson::dom::array routes;
+          valid = valid && prodigyComputeSHA256Hex(bytes, fixtureDigest, &failure) &&
+              parser.parse(bytes.data(), bytes.size()).get(document) == simdjson::SUCCESS &&
+              document.get(routes) == simdjson::SUCCESS && routes.size() == 6;
+          if (valid) for (auto entry : routes) {
+            if (!valid) break;
+            simdjson::dom::object object; simdjson::dom::array cids;
+            std::string_view cluster, container, address; uint64_t deployment = 0, port = 0;
+            valid = !entry.get(object) && object.size() == 6 && !object["clusterUUID"].get(cluster) &&
+                !object["containerUUID"].get(container) && !object["deploymentID"].get(deployment) &&
+                !object["ipv6"].get(address) && !object["port"].get(port) && !object["cids"].get(cids) &&
+                port > 0 && port <= UINT16_MAX && cids.size() >= 2 && cids.size() <= 16;
+            ProdigyNametagQualificationApp6Route route = {}; String clusterText = {}, containerText = {}, addressText = {};
+            if (!valid) break;
+            clusterText.assign(cluster.data(), cluster.size()); containerText.assign(container.data(), container.size());
+            addressText.assign(address.data(), address.size());
+            valid = prodigyParseCanonicalHex128(clusterText, route.clusterUUID) &&
+                prodigyParseCanonicalHex128(containerText, route.containerUUID) &&
+                ::inet_pton(AF_INET6, addressText.c_str(), route.ipv6) == 1;
+            route.deploymentID = deployment; route.port = uint16_t(port); route.cidFixtureSHA256 = fixtureDigest;
+            for (auto cidValue : cids) {
+              std::string_view hex; if (cidValue.get(hex) || hex.empty() || hex.size() > 40 || hex.size() % 2) { valid = false; break; }
+              String cid = {};
+              auto nibble = [](char c) -> int { if (c >= '0' && c <= '9') return c - '0'; if (c >= 'a' && c <= 'f') return c - 'a' + 10; return -1; };
+              for (size_t i = 0; valid && i < hex.size(); i += 2) {
+                int a = nibble(hex[i]), b = nibble(hex[i + 1]); if (a < 0 || b < 0) { valid = false; break; }
+                uint8_t byte = uint8_t((a << 4) | b); cid.append(&byte, 1);
+              }
+              route.cids.push_back(std::move(cid));
+            }
+            if (valid) intent.app6Routes.push_back(std::move(route));
+          }
+          if (valid) for (const auto& route : intent.app6Routes) {
+            const auto matched = std::find_if(allMasters.intent.sites.begin(), allMasters.intent.sites.end(),
+                [&](const auto& site) { return site.clusterUUID == route.clusterUUID && site.app6DeploymentID == route.deploymentID; });
+            if (matched == allMasters.intent.sites.end()) { valid = false; break; }
+          }
+          if (!valid && failure.empty()) failure.assign("qualification requires six exact route/CID fixtures in its bounded JSON file"_ctv);
+        }
+        if ((adapter->row == MothershipNametagQualificationRow::permissionRevokeReinstall ||
+             adapter->row == MothershipNametagQualificationRow::cousinRouteSessionReconnect) &&
+            adapter->direction == MothershipNametagQualificationDirection::injection) {
+          // These are commissioned ordinary routes, not the retained seed routes.
+          // Mint successor identities once; the durable intent owns all retries.
+          const char *routeTexts[] = {std::getenv("PRODIGY_NAMETAG_QUALIFICATION_COUSIN_ROUTE_UUID"),
+                                      std::getenv("PRODIGY_NAMETAG_QUALIFICATION_COUSIN_ROUTE_UUID_2")};
+          intent.protocolVersion = MothershipNametagQualificationIntent::cousinRecoveryVersion;
+          valid = routeTexts[0] != nullptr;
+          MothershipNametagQualificationExecutionRecord permissionExecution = {};
+          if (valid && adapter->row == MothershipNametagQualificationRow::cousinRouteSessionReconnect) {
+            const auto *permissionAdapter = mothershipNametagQualificationAdapter("nametagChaosPermissionRevokeReinstall");
+            MothershipNametagQualificationIntent permissionIntent = {};
+            MothershipNametagQualificationReceipt permissionReceipt = {};
+            bool intentFound = false, receiptFound = false, executionFound = false;
+            auto registry = openClusterRegistry();
+            valid = permissionAdapter &&
+                registry.loadNametagQualificationIntent(*permissionAdapter, intent.runUUID, permissionIntent, intentFound, &failure) && intentFound &&
+                registry.loadNametagQualificationReceipt(*permissionAdapter, intent.runUUID, permissionReceipt, receiptFound, &failure) && receiptFound &&
+                registry.loadNametagQualificationExecution(*permissionAdapter, permissionIntent, permissionExecution, executionFound, &failure) && executionFound &&
+                permissionReceipt.executionGeneration == permissionIntent.executionGeneration &&
+                permissionIntent.allMastersOperationUUID == intent.allMastersOperationUUID &&
+                permissionIntent.probeTargets.size() == intent.probeTargets.size();
+            for (size_t i = 0; valid && i < intent.probeTargets.size(); ++i)
+              valid = permissionIntent.probeTargets[i].clusterUUID == intent.probeTargets[i].clusterUUID &&
+                  permissionIntent.probeTargets[i].probeDeploymentID == intent.probeTargets[i].probeDeploymentID;
+          }
+          for (uint32_t i = 0; valid && i < 2 && routeTexts[i] != nullptr; ++i) {
+            MothershipNametagQualificationCousinRecovery recovery = {};
+            auto mint = [](uint128_t& id) { return RAND_priv_bytes(reinterpret_cast<unsigned char *>(&id), sizeof(id)) == 1 && id != 0; };
+            valid = prodigyParseCanonicalHex128(String(routeTexts[i]), recovery.routeUUID) && recovery.routeUUID != 0;
+            if (valid && adapter->row == MothershipNametagQualificationRow::cousinRouteSessionReconnect) {
+              uint128_t successor = 0;
+              valid = mothershipNametagQualificationPermissionSuccessor(permissionExecution, recovery.routeUUID, successor);
+              if (valid) recovery.routeUUID = successor;
+            }
+            valid = valid && mint(recovery.withdrawOperationUUID) && mint(recovery.successorRouteUUID) &&
+                mint(recovery.successorRouteOperationUUID) &&
+                (adapter->row != MothershipNametagQualificationRow::permissionRevokeReinstall || mint(recovery.successorPermissionUUID));
+            if (valid) intent.cousinRecoveries.push_back(recovery);
+          }
+          if (!valid && failure.empty()) failure.assign("qualification requires one or two commissioned ordinary cousin route UUIDs"_ctv);
+        }
+        if (prodigyNametagQualificationSeedReadbackRow(uint8_t(adapter->row))) {
+          intent.protocolVersion = MothershipNametagQualificationIntent::seedVersion;
+          if (adapter->direction == MothershipNametagQualificationDirection::injection) {
+            Vector<Vector<NametagSeedSuccessorInput>> inputs;
+            valid = readNametagSeedSuccessorInputs(adapter->row, inputs, intent.seedInputSHA256, failure);
+            for (uint32_t i = 0; valid && i < inputs.size(); ++i) {
+              uint128_t operation = 0, challenge = 0;
+              valid = RAND_priv_bytes(reinterpret_cast<unsigned char *>(&operation), sizeof(operation)) == 1 && operation &&
+                  RAND_priv_bytes(reinterpret_cast<unsigned char *>(&challenge), sizeof(challenge)) == 1 && challenge;
+              if (valid) { intent.seedSuccessorOperationUUIDs.push_back(operation); intent.seedChallengeUUIDs.push_back(challenge); }
+            }
+          } else {
+            const auto *injection = mothershipNametagQualificationAdapterForTuple(adapter->row,
+                MothershipNametagQualificationDirection::injection, adapter->rowID,
+                adapter->deadlineSeconds, adapter->convergenceSeconds);
+            MothershipNametagQualificationIntent previous; bool found = false;
+            auto registry = openClusterRegistry();
+            valid = injection && registry.loadNametagQualificationIntent(*injection, intent.runUUID, previous, found, &failure) &&
+                found && previous.protocolVersion == previous.seedVersion && previous.allMastersOperationUUID == intent.allMastersOperationUUID;
+            if (valid) { intent.seedInputSHA256 = previous.seedInputSHA256;
+              intent.seedSuccessorOperationUUIDs = previous.seedSuccessorOperationUUIDs; intent.seedChallengeUUIDs = previous.seedChallengeUUIDs; }
+          }
+        }
+        if ((adapter->row == MothershipNametagQualificationRow::secondTruthWriterFencing ||
+             adapter->row == MothershipNametagQualificationRow::mothershipRestartResume ||
+             adapter->row == MothershipNametagQualificationRow::localWriterIsolation ||
+             adapter->row == MothershipNametagQualificationRow::truthClaimPartition ||
+             adapter->row == MothershipNametagQualificationRow::graphKvReplayReorder ||
+             prodigyNametagQualificationSeedReadbackRow(uint8_t(adapter->row)) ||
+             prodigyNametagQualificationPathRow(uint8_t(adapter->row)) ||
+             adapter->row == MothershipNametagQualificationRow::permissionRevokeReinstall ||
+             adapter->row == MothershipNametagQualificationRow::cousinRouteSessionReconnect) &&
+            adapter->direction == MothershipNametagQualificationDirection::observation) {
+          const auto *injectionAdapter = mothershipNametagQualificationAdapterForTuple(
+              adapter->row, MothershipNametagQualificationDirection::injection,
+              adapter->rowID, adapter->deadlineSeconds, adapter->convergenceSeconds);
+          // The campaign driver intentionally uses the one exact run UUID for
+          // both directions. The direction-specific registry key selects the
+          // injection receipt; do not introduce a second caller-controlled
+          // correlation namespace.
+          intent.priorInjectionRunUUID = intent.runUUID;
+          valid = injectionAdapter != nullptr;
+          if (valid) {
+            auto registry = openClusterRegistry();
+            valid = registry.loadNametagQualificationReceipt(*injectionAdapter,
+                intent.priorInjectionRunUUID, priorInjectionReceipt, hasPriorInjectionReceipt, &failure) &&
+                hasPriorInjectionReceipt &&
+                mothershipNametagQualificationReceiptDigest(priorInjectionReceipt,
+                    intent.priorInjectionReceiptDigest) &&
+                priorInjectionReceipt.allMastersOperationUUID == intent.allMastersOperationUUID;
+          }
+        }
+      }
+    }
+    // Completed seed successors replace actual deployment/container identities.
+    // Subsequent rows use that verified current view while historical intent
+    // validation continues to read the immutable all-masters operation.
+    if (valid && !hasRecordedReceipt && !prodigyNametagQualificationSeedReadbackRow(uint8_t(intent.row))) {
+      uint128_t latestSuccessor = 0; String latestSuccessorSHA256;
+      auto registry = openClusterRegistry();
+      valid = registry.loadNametagAllMastersCurrentView(intent.allMastersOperationUUID, allMasters,
+          latestSuccessor, latestSuccessorSHA256, &failure);
+    }
+    if (valid && !hasRecordedReceipt && (intent.row == MothershipNametagQualificationRow::secondStreamHandoffFence ||
+        intent.row == MothershipNametagQualificationRow::truthClaimPartition)) {
+      for (const auto& site : allMasters.intent.sites) {
+        MothershipProdigyCluster cluster = {}; String identity = {}; identity.assignItoh(site.clusterUUID);
+        { auto registry = openClusterRegistry(); valid = registry.getClusterByIdentity(identity, cluster, &failure); }
+        ClusterStatusReport status = {};
+        valid = valid && readManagedClusterStatus(cluster, status, failure) &&
+            nametagQualificationApp6RoutesMatchStatus(intent, site.clusterUUID, status);
+        if (!valid) { if (failure.empty()) failure.assign("qualification route does not name a current healthy App6 container"_ctv); break; }
+      }
+    }
+    if (!valid && failure.empty()) failure.assign("qualification run, all-masters operation, Mothership clock, or three App11 probes are not configured"_ctv);
+    if (valid && !hasRecordedReceipt && !hasRecordedIntent) { auto registry = openClusterRegistry(); valid = registry.persistNametagQualificationIntent(*adapter, intent, recordedIntent, resumed, &failure); }
+    if (valid && !hasRecordedReceipt) { auto registry = openClusterRegistry(); valid = registry.loadNametagQualificationReceipt(*adapter, recordedIntent.runUUID, recordedReceipt, hasRecordedReceipt, &failure); }
+    if (valid && hasRecordedReceipt) receiptResumed = true;
+    if (valid && !hasRecordedReceipt &&
+        (recordedIntent.row == MothershipNametagQualificationRow::secondTruthWriterFencing ||
+         recordedIntent.row == MothershipNametagQualificationRow::mothershipRestartResume ||
+         recordedIntent.row == MothershipNametagQualificationRow::localWriterIsolation ||
+         recordedIntent.row == MothershipNametagQualificationRow::truthClaimPartition ||
+         recordedIntent.row == MothershipNametagQualificationRow::graphKvReplayReorder ||
+         prodigyNametagQualificationSeedReadbackRow(uint8_t(recordedIntent.row)) ||
+         prodigyNametagQualificationPathRow(uint8_t(recordedIntent.row)) ||
+         recordedIntent.row == MothershipNametagQualificationRow::permissionRevokeReinstall ||
+         recordedIntent.row == MothershipNametagQualificationRow::cousinRouteSessionReconnect) &&
+        recordedIntent.direction == MothershipNametagQualificationDirection::observation) {
+      const auto *injectionAdapter = mothershipNametagQualificationAdapterForTuple(
+          recordedIntent.row, MothershipNametagQualificationDirection::injection,
+          recordedIntent.rowID, recordedIntent.deadlineSeconds, recordedIntent.convergenceSeconds);
+      String digest;
+      valid = injectionAdapter != nullptr;
+      if (valid) {
+        auto registry = openClusterRegistry();
+        valid = registry.loadNametagQualificationReceipt(*injectionAdapter,
+            recordedIntent.priorInjectionRunUUID, priorInjectionReceipt, hasPriorInjectionReceipt, &failure) &&
+            hasPriorInjectionReceipt &&
+            mothershipNametagQualificationReceiptDigest(priorInjectionReceipt, digest) &&
+            digest == recordedIntent.priorInjectionReceiptDigest &&
+            priorInjectionReceipt.allMastersOperationUUID == recordedIntent.allMastersOperationUUID;
+      }
+      if (!valid && failure.empty())
+        failure.assign("qualification observation has no exact persisted injection receipt binding"_ctv);
+    }
+    if (valid && !hasRecordedReceipt && recordedIntent.direction == MothershipNametagQualificationDirection::observation &&
+        (recordedIntent.row == MothershipNametagQualificationRow::permissionRevokeReinstall ||
+         recordedIntent.row == MothershipNametagQualificationRow::cousinRouteSessionReconnect)) {
+      const auto *injectionAdapter = mothershipNametagQualificationAdapterForTuple(recordedIntent.row,
+          MothershipNametagQualificationDirection::injection, recordedIntent.rowID,
+          recordedIntent.deadlineSeconds, recordedIntent.convergenceSeconds);
+      MothershipNametagQualificationIntent priorIntent = {}; bool intentFound = false, executionFound = false;
+      auto registry = openClusterRegistry();
+      valid = injectionAdapter && registry.loadNametagQualificationIntent(*injectionAdapter, recordedIntent.priorInjectionRunUUID,
+          priorIntent, intentFound, &failure) && intentFound &&
+          registry.loadNametagQualificationExecution(*injectionAdapter, priorIntent, priorCousinExecution, executionFound, &failure) &&
+          executionFound && priorCousinExecution.protocolVersion == MothershipNametagQualificationExecutionRecord::cousinTransportVersion &&
+          priorCousinExecution.phase == MothershipNametagQualificationExecutionPhase::verified &&
+          mothershipNametagQualificationExecutionRecordValid(priorCousinExecution) &&
+          priorIntent.allMastersOperationUUID == recordedIntent.allMastersOperationUUID &&
+          priorIntent.probeTargets.size() == recordedIntent.probeTargets.size() &&
+          priorInjectionReceipt.runUUID == priorIntent.runUUID && priorInjectionReceipt.executionGeneration == priorIntent.executionGeneration &&
+          priorInjectionReceipt.observedAtMilliseconds <= recordedIntent.startedAtMilliseconds;
+      for (size_t i = 0; valid && i < priorIntent.probeTargets.size(); ++i)
+        valid = priorIntent.probeTargets[i].clusterUUID == recordedIntent.probeTargets[i].clusterUUID &&
+            priorIntent.probeTargets[i].probeDeploymentID == recordedIntent.probeTargets[i].probeDeploymentID;
+      if (!valid && failure.empty()) failure.assign("qualification observation lacks exact verified native injection execution"_ctv);
+    }
+    if (valid && !hasRecordedReceipt && recordedIntent.direction == MothershipNametagQualificationDirection::observation &&
+        recordedIntent.row == MothershipNametagQualificationRow::mothershipRestartResume) {
+      const auto *injectionAdapter = mothershipNametagQualificationAdapterForTuple(recordedIntent.row,
+          MothershipNametagQualificationDirection::injection, recordedIntent.rowID,
+          recordedIntent.deadlineSeconds, recordedIntent.convergenceSeconds);
+      MothershipNametagQualificationIntent priorIntent = {}; bool intentFound = false, executionFound = false;
+      auto registry = openClusterRegistry();
+      valid = injectionAdapter && registry.loadNametagQualificationIntent(*injectionAdapter, recordedIntent.priorInjectionRunUUID,
+          priorIntent, intentFound, &failure) && intentFound &&
+          registry.loadNametagQualificationExecution(*injectionAdapter, priorIntent, priorCousinExecution, executionFound, &failure) &&
+          executionFound && priorCousinExecution.protocolVersion == MothershipNametagQualificationExecutionRecord::restartVersion &&
+          priorCousinExecution.phase == MothershipNametagQualificationExecutionPhase::verified &&
+          mothershipNametagQualificationExecutionRecordValid(priorCousinExecution) &&
+          priorIntent.allMastersOperationUUID == recordedIntent.allMastersOperationUUID &&
+          priorInjectionReceipt.runUUID == priorIntent.runUUID && priorInjectionReceipt.executionGeneration == priorIntent.executionGeneration &&
+          priorInjectionReceipt.observedAtMilliseconds <= recordedIntent.startedAtMilliseconds;
+      if (!valid && failure.empty()) failure.assign("qualification observation lacks exact durable restart execution"_ctv);
+    }
+    if (valid && !hasRecordedReceipt && recordedIntent.direction == MothershipNametagQualificationDirection::observation &&
+        recordedIntent.row == MothershipNametagQualificationRow::localWriterIsolation) {
+      const auto *injectionAdapter = mothershipNametagQualificationAdapterForTuple(recordedIntent.row,
+          MothershipNametagQualificationDirection::injection, recordedIntent.rowID,
+          recordedIntent.deadlineSeconds, recordedIntent.convergenceSeconds);
+      MothershipNametagQualificationIntent priorIntent = {}; bool intentFound = false, executionFound = false;
+      auto registry = openClusterRegistry();
+      valid = injectionAdapter && registry.loadNametagQualificationIntent(*injectionAdapter, recordedIntent.priorInjectionRunUUID,
+          priorIntent, intentFound, &failure) && intentFound &&
+          registry.loadNametagQualificationExecution(*injectionAdapter, priorIntent, priorCousinExecution, executionFound, &failure) &&
+          executionFound && priorCousinExecution.protocolVersion == MothershipNametagQualificationExecutionRecord::writerIsolationVersion &&
+          priorCousinExecution.phase == MothershipNametagQualificationExecutionPhase::verified &&
+          mothershipNametagQualificationExecutionRecordValid(priorCousinExecution) &&
+          priorIntent.allMastersOperationUUID == recordedIntent.allMastersOperationUUID &&
+          priorInjectionReceipt.runUUID == priorIntent.runUUID && priorInjectionReceipt.executionGeneration == priorIntent.executionGeneration &&
+          priorInjectionReceipt.observedAtMilliseconds <= recordedIntent.startedAtMilliseconds;
+      if (!valid && failure.empty()) failure.assign("writer observation lacks exact verified isolation execution"_ctv);
+    }
+    if (valid && !hasRecordedReceipt && recordedIntent.direction == MothershipNametagQualificationDirection::observation &&
+        prodigyNametagQualificationPathRow(uint8_t(recordedIntent.row))) {
+      const auto *injectionAdapter = mothershipNametagQualificationAdapterForTuple(recordedIntent.row,
+          MothershipNametagQualificationDirection::injection, recordedIntent.rowID,
+          recordedIntent.deadlineSeconds, recordedIntent.convergenceSeconds);
+      MothershipNametagQualificationIntent priorIntent = {}; bool intentFound = false, executionFound = false;
+      auto registry = openClusterRegistry();
+      valid = injectionAdapter && registry.loadNametagQualificationIntent(*injectionAdapter, recordedIntent.priorInjectionRunUUID,
+          priorIntent, intentFound, &failure) && intentFound &&
+          registry.loadNametagQualificationExecution(*injectionAdapter, priorIntent, priorCousinExecution, executionFound, &failure) &&
+          executionFound && priorCousinExecution.phase == MothershipNametagQualificationExecutionPhase::verified &&
+          mothershipNametagQualificationExecutionRecordValid(priorCousinExecution) &&
+          mothershipNametagQualificationPathExecutionComplete(priorCousinExecution) &&
+          priorIntent.allMastersOperationUUID == recordedIntent.allMastersOperationUUID &&
+          priorInjectionReceipt.runUUID == priorIntent.runUUID &&
+          priorInjectionReceipt.executionGeneration == priorIntent.executionGeneration &&
+          priorInjectionReceipt.observedAtMilliseconds <= recordedIntent.startedAtMilliseconds &&
+          priorIntent.probeTargets.size() == recordedIntent.probeTargets.size();
+      for (size_t i = 0; valid && i < priorIntent.probeTargets.size(); ++i)
+        valid = priorIntent.probeTargets[i].clusterUUID == recordedIntent.probeTargets[i].clusterUUID &&
+            priorIntent.probeTargets[i].probeDeploymentID == recordedIntent.probeTargets[i].probeDeploymentID;
+      if (!valid && failure.empty()) failure.assign("path observation lacks its exact verified injection execution"_ctv);
+    }
+    if (valid && !hasRecordedReceipt && recordedIntent.direction == MothershipNametagQualificationDirection::observation &&
+        recordedIntent.row == MothershipNametagQualificationRow::truthClaimPartition) {
+      const auto *injectionAdapter = mothershipNametagQualificationAdapterForTuple(recordedIntent.row,
+          MothershipNametagQualificationDirection::injection, recordedIntent.rowID,
+          recordedIntent.deadlineSeconds, recordedIntent.convergenceSeconds);
+      MothershipNametagQualificationIntent priorIntent = {}; bool intentFound = false, executionFound = false;
+      auto registry = openClusterRegistry();
+      valid = injectionAdapter && registry.loadNametagQualificationIntent(*injectionAdapter, recordedIntent.priorInjectionRunUUID,
+          priorIntent, intentFound, &failure) && intentFound &&
+          registry.loadNametagQualificationExecution(*injectionAdapter, priorIntent, priorCousinExecution, executionFound, &failure) &&
+          executionFound && priorCousinExecution.phase == MothershipNametagQualificationExecutionPhase::verified &&
+          mothershipNametagQualificationExecutionRecordValid(priorCousinExecution) &&
+          mothershipNametagQualificationClaimExecutionComplete(priorCousinExecution) &&
+          priorIntent.allMastersOperationUUID == recordedIntent.allMastersOperationUUID &&
+          priorInjectionReceipt.runUUID == priorIntent.runUUID &&
+          priorInjectionReceipt.executionGeneration == priorIntent.executionGeneration &&
+          priorInjectionReceipt.observedAtMilliseconds <= recordedIntent.startedAtMilliseconds &&
+          priorIntent.probeTargets.size() == recordedIntent.probeTargets.size();
+      for (size_t i = 0; valid && i < priorIntent.probeTargets.size(); ++i)
+        valid = priorIntent.probeTargets[i].clusterUUID == recordedIntent.probeTargets[i].clusterUUID &&
+            priorIntent.probeTargets[i].probeDeploymentID == recordedIntent.probeTargets[i].probeDeploymentID;
+      if (!valid && failure.empty()) failure.assign("claim observation lacks its exact verified injection"_ctv);
+    }
+    if (valid && !hasRecordedReceipt && recordedIntent.direction == MothershipNametagQualificationDirection::observation &&
+        recordedIntent.row == MothershipNametagQualificationRow::graphKvReplayReorder) {
+      const auto *injectionAdapter = mothershipNametagQualificationAdapterForTuple(recordedIntent.row,
+          MothershipNametagQualificationDirection::injection, recordedIntent.rowID,
+          recordedIntent.deadlineSeconds, recordedIntent.convergenceSeconds);
+      MothershipNametagQualificationIntent priorIntent = {}; bool intentFound = false, executionFound = false;
+      auto registry = openClusterRegistry();
+      valid = injectionAdapter && registry.loadNametagQualificationIntent(*injectionAdapter, recordedIntent.priorInjectionRunUUID,
+          priorIntent, intentFound, &failure) && intentFound &&
+          registry.loadNametagQualificationExecution(*injectionAdapter, priorIntent, priorCousinExecution, executionFound, &failure) &&
+          executionFound && priorCousinExecution.phase == MothershipNametagQualificationExecutionPhase::verified &&
+          mothershipNametagQualificationExecutionRecordValid(priorCousinExecution) &&
+          mothershipNametagQualificationReplayExecutionComplete(priorCousinExecution) &&
+          priorIntent.allMastersOperationUUID == recordedIntent.allMastersOperationUUID &&
+          priorInjectionReceipt.runUUID == priorIntent.runUUID &&
+          priorInjectionReceipt.executionGeneration == priorIntent.executionGeneration &&
+          priorInjectionReceipt.observedAtMilliseconds <= recordedIntent.startedAtMilliseconds;
+      if (!valid && failure.empty()) failure.assign("replay observation lacks its exact verified injection"_ctv);
+    }
+    if (valid && !hasRecordedReceipt) {
+      bool phaseFound = false;
+      auto registry = openClusterRegistry();
+      valid = registry.loadNametagQualificationExecution(*adapter, recordedIntent, execution, phaseFound, &failure);
+      if (valid && !phaseFound)
+        valid = registry.persistNametagQualificationExecutionPrepared(*adapter, recordedIntent, execution, resumed, &failure);
+    }
+
+    if (valid && !hasRecordedReceipt &&
+        recordedIntent.protocolVersion == MothershipNametagQualificationIntent::cousinRecoveryVersion &&
+        execution.cousinRecoveryBindings.empty()) {
+      Vector<MothershipNametagQualificationExecutionRecord::CousinRecoveryBinding> bindings = {};
+      for (const auto& reference : recordedIntent.cousinRecoveries) {
+        MothershipNametagQualificationExecutionRecord::CousinRecoveryBinding binding = {};
+        MothershipProdigyCluster source = {}, destination = {};
+        {
+          auto registry = openClusterRegistry();
+          valid = registry.loadUsableCousinRoute(reference.routeUUID, Time::now<TimeResolution::ms>(), binding.route, &failure) &&
+              registry.loadCurrentCousinRouteApplyReceipt(reference.routeUUID, CousinRouteHalf::source, binding.sourceReceipt, &failure) &&
+              registry.loadCurrentCousinRouteApplyReceipt(reference.routeUUID, CousinRouteHalf::destination, binding.destinationReceipt, &failure) &&
+              loadCousinRouteClusters(registry, binding.route, source, destination, failure);
+        }
+        ProdigyLocalCousinServicePermissionResponse sourcePermission = {}, destinationPermission = {};
+        ProdigyCousinRouteResponse sourceRoute = {}, destinationRoute = {};
+        if (valid) valid = readLocalCousinServicePermission(source, binding.route.sourcePermissionUUID, sourcePermission, failure) &&
+            readLocalCousinServicePermission(destination, binding.route.destinationPermissionUUID, destinationPermission, failure) &&
+            observeCousinRouteSide(source, binding.route, CousinRouteHalf::source, sourceRoute, failure) &&
+            observeCousinRouteSide(destination, binding.route, CousinRouteHalf::destination, destinationRoute, failure) &&
+            sourceRoute.found && sourceRoute.qualified && destinationRoute.found && destinationRoute.qualified &&
+            sourcePermission.currentAuthorityGeneration == sourceRoute.currentAuthorityGeneration &&
+            sourcePermission.currentMasterUUID == sourceRoute.currentMasterUUID &&
+            sourcePermission.currentMasterBootNs == sourceRoute.currentMasterBootNs &&
+            destinationPermission.currentAuthorityGeneration == destinationRoute.currentAuthorityGeneration &&
+            destinationPermission.currentMasterUUID == destinationRoute.currentMasterUUID &&
+            destinationPermission.currentMasterBootNs == destinationRoute.currentMasterBootNs &&
+            cousinRouteExactMatches(sourceRoute.route, binding.route) && cousinRouteExactMatches(destinationRoute.route, binding.route) &&
+            cousinRouteApplyReceiptExactMatches(sourceRoute.applyReceipt, binding.sourceReceipt) &&
+            cousinRouteApplyReceiptExactMatches(destinationRoute.applyReceipt, binding.destinationReceipt);
+        if (!valid) { if (failure.empty()) failure.assign("commissioned cousin route is not currently qualified on both clusters"_ctv); break; }
+        binding.sourcePermission = sourcePermission.permission; binding.destinationPermission = destinationPermission.permission;
+        binding.sourceAuthorityGeneration = sourceRoute.currentAuthorityGeneration;
+        binding.destinationAuthorityGeneration = destinationRoute.currentAuthorityGeneration;
+        bindings.push_back(std::move(binding));
+      }
+      if (valid) {
+        auto registry = openClusterRegistry(); bool bindingResumed = false;
+        valid = registry.recordNametagQualificationCousinRecoveryBindings(*adapter, recordedIntent, bindings,
+            execution, bindingResumed, &failure);
+      }
+    }
+
+    Vector<MothershipProdigyCluster> clusters = {};
+    // The capability report and executor share one availability predicate.
+    // Implemented infrastructure rows still require their exact durable
+    // native fault and restoration witnesses below.
+    if (valid && !hasRecordedReceipt && !mothershipNametagQualificationImplemented(recordedIntent.row)) {
+      valid = false;
+      failure.assign(mothershipNametagQualificationFaultOwnerUnavailableReason(recordedIntent.row));
+    }
+    if (valid && !hasRecordedReceipt &&
+        execution.phase != MothershipNametagQualificationExecutionPhase::prepared &&
+        execution.phase != MothershipNametagQualificationExecutionPhase::faultApplied &&
+        execution.phase != MothershipNametagQualificationExecutionPhase::workloadIssued &&
+        execution.phase != MothershipNametagQualificationExecutionPhase::faultRestored &&
+        execution.phase != MothershipNametagQualificationExecutionPhase::converging &&
+        execution.phase != MothershipNametagQualificationExecutionPhase::verified) {
+      valid = false;
+      failure.assign("qualification execution phase is not resumable by this adapter"_ctv);
+    }
+    // Both execute and query/resume paths need fresh control targets. This
+    // prevents a cold reopen at converging from indexing an empty vector.
+    if (valid && !hasRecordedReceipt) {
+      for (uint32_t site = 0; valid && site < 3; ++site) {
+        MothershipProdigyCluster cluster = {}; String identity = {}; identity.assignItoh(recordedIntent.probeTargets[site].clusterUUID);
+        auto registry = openClusterRegistry();
+        valid = registry.getClusterByIdentity(identity, cluster, &failure) &&
+            mothershipNametagAllMastersSiteIdentityMatches(site, allMasters.intent.sites[site].clusterUUID, cluster);
+        if (valid) clusters.push_back(std::move(cluster));
+      }
+    }
+
+    const bool seedRow = prodigyNametagQualificationSeedReadbackRow(uint8_t(recordedIntent.row));
+    if (valid && !hasRecordedReceipt && seedRow && execution.phase == MothershipNametagQualificationExecutionPhase::prepared) {
+      if (recordedIntent.direction == MothershipNametagQualificationDirection::injection) {
+        valid = executeNametagSeedSuccessors(*adapter, execution, allMasters, failure);
+      } else {
+        const auto *injection = mothershipNametagQualificationAdapterForTuple(recordedIntent.row,
+            MothershipNametagQualificationDirection::injection, recordedIntent.rowID,
+            recordedIntent.deadlineSeconds, recordedIntent.convergenceSeconds);
+        MothershipNametagQualificationIntent previous; MothershipNametagQualificationExecutionRecord previousExecution;
+        bool foundIntent = false, foundExecution = false;
+        { auto registry = openClusterRegistry();
+          valid = injection && registry.loadNametagQualificationIntent(*injection, recordedIntent.runUUID, previous, foundIntent, &failure) &&
+              foundIntent && registry.loadNametagQualificationExecution(*injection, previous, previousExecution, foundExecution, &failure) &&
+              foundExecution && previousExecution.phase == MothershipNametagQualificationExecutionPhase::verified &&
+              previous.seedInputSHA256 == recordedIntent.seedInputSHA256 &&
+              previous.seedSuccessorOperationUUIDs == recordedIntent.seedSuccessorOperationUUIDs &&
+              previous.seedChallengeUUIDs == recordedIntent.seedChallengeUUIDs &&
+              priorInjectionReceipt.executionGeneration == previous.executionGeneration &&
+              priorInjectionReceipt.observedAtMilliseconds <= recordedIntent.startedAtMilliseconds;
+          if (valid) {
+            auto proposed = execution; proposed.seedSuccessors = previousExecution.seedSuccessors;
+            valid = registry.updateNametagQualificationSeedExecution(*adapter, proposed, execution, &failure);
+          }
+        }
+      }
+      if (valid) valid = finalizeNametagSeedQualification(*adapter, execution, allMasters, clusters, failure);
+    }
+    if (valid && !hasRecordedReceipt && seedRow && execution.phase != MothershipNametagQualificationExecutionPhase::prepared) {
+      uint128_t latest = 0; String digest;
+      auto registry = openClusterRegistry();
+      valid = mothershipNametagQualificationSeedExecutionComplete(execution) &&
+          registry.loadNametagAllMastersCurrentView(recordedIntent.allMastersOperationUUID, allMasters, latest, digest, &failure) &&
+          latest == execution.seedSuccessors.back().operationUUID && digest == execution.seedSuccessors.back().sha256;
+    }
+
+    const bool claimInjection = recordedIntent.row == MothershipNametagQualificationRow::truthClaimPartition &&
+        recordedIntent.direction == MothershipNametagQualificationDirection::injection;
+    const bool claimObservation = recordedIntent.row == MothershipNametagQualificationRow::truthClaimPartition &&
+        recordedIntent.direction == MothershipNametagQualificationDirection::observation;
+    const bool pathInjection = prodigyNametagQualificationPathRow(uint8_t(recordedIntent.row)) &&
+        recordedIntent.direction == MothershipNametagQualificationDirection::injection;
+    const bool pathObservation = prodigyNametagQualificationPathRow(uint8_t(recordedIntent.row)) &&
+        recordedIntent.direction == MothershipNametagQualificationDirection::observation;
+    const uint8_t pathFinalBatch = recordedIntent.row == MothershipNametagQualificationRow::masqueSessionLossBgpRecovery ? 1 : 0;
+    int64_t pathObservationExpiry = 0;
+    if (pathObservation || claimObservation) for (const auto& fault : priorCousinExecution.pathFaults)
+      if (fault.batch == pathFinalBatch) pathObservationExpiry = int64_t(fault.request.request.expiresAtMilliseconds);
+    if (valid && !hasRecordedReceipt && (pathInjection || claimInjection) &&
+        execution.phase != MothershipNametagQualificationExecutionPhase::converging &&
+        execution.phase != MothershipNametagQualificationExecutionPhase::verified) {
+      if (execution.phase == MothershipNametagQualificationExecutionPhase::prepared) {
+        if (claimInjection) valid = qualificationClaimApplicationStage(*adapter, recordedIntent, allMasters, clusters,
+            ProdigyNametagQualificationClaimStage::prepare, 0, execution, failure) &&
+            qualificationClaimApplicationStage(*adapter, recordedIntent, allMasters, clusters,
+            ProdigyNametagQualificationClaimStage::arm, 0, execution, failure);
+        if (valid) valid = qualificationPathBatch(*adapter, recordedIntent, allMasters, clusters, 0, execution, failure);
+        if (valid && recordedIntent.row == MothershipNametagQualificationRow::masqueSessionLossBgpRecovery)
+          valid = qualificationPathBatch(*adapter, recordedIntent, allMasters, clusters, 1, execution, failure);
+      }
+      if (valid) {
+        auto registry = openClusterRegistry(); bool phaseResumed = false;
+        while (valid && execution.phase != MothershipNametagQualificationExecutionPhase::converging) {
+          const auto prior = execution.phase;
+          const auto next = prior == MothershipNametagQualificationExecutionPhase::prepared ? MothershipNametagQualificationExecutionPhase::faultApplied :
+              prior == MothershipNametagQualificationExecutionPhase::faultApplied ? MothershipNametagQualificationExecutionPhase::workloadIssued :
+              prior == MothershipNametagQualificationExecutionPhase::workloadIssued ? MothershipNametagQualificationExecutionPhase::faultRestored :
+              MothershipNametagQualificationExecutionPhase::converging;
+          if (!registry.advanceNametagQualificationExecution(*adapter, recordedIntent, prior, next,
+                                                              execution, phaseResumed, &failure)) { valid = false; break; }
+        }
+      }
+    }
+
+    const bool restartInjection = recordedIntent.row == MothershipNametagQualificationRow::mothershipRestartResume &&
+        recordedIntent.direction == MothershipNametagQualificationDirection::injection;
+    const bool restartObservation = recordedIntent.row == MothershipNametagQualificationRow::mothershipRestartResume &&
+        recordedIntent.direction == MothershipNametagQualificationDirection::observation;
+    if (valid && !hasRecordedReceipt && restartInjection && execution.phase == MothershipNametagQualificationExecutionPhase::prepared) {
+      const char *mode = std::getenv("PRODIGY_NAMETAG_RESTART_MODE");
+      MothershipNametagQualificationExecutionRecord::RestartProcess current = {};
+      valid = mode && qualificationRestartProcess(current, failure);
+      if (valid && std::strcmp(mode, "arm") == 0 && execution.protocolVersion != MothershipNametagQualificationExecutionRecord::restartVersion) {
+        MothershipNametagQualificationSiteRequest request = {};
+        request.protocolVersion = MothershipNametagQualificationSiteRequest::restartStageVersion;
+        request.intent = recordedIntent; request.targetClusterUUID = recordedIntent.probeTargets[0].clusterUUID;
+        request.targetProbeDeploymentID = recordedIntent.probeTargets[0].probeDeploymentID;
+        request.targetApp6DeploymentID = allMasters.intent.sites[0].app6DeploymentID;
+        request.restartStage = ProdigyNametagQualificationRestartStage::beforeRestart;
+        MothershipNametagQualificationSiteResponse response = {};
+        valid = configureControlTarget(clusters[0].name.c_str(), &failure) &&
+            requestTopicRoundTrip(MothershipTopic::nametagQualification, request, response, failure) &&
+            mothershipNametagQualificationSiteResponseValid(request, response);
+        request.action = MothershipNametagQualificationSiteAction::query; bool observed = false;
+        while (valid && Time::now<TimeResolution::ms>() < recordedIntent.convergenceDeadlineAtMilliseconds) {
+          String transient = {}; response = {};
+          if (configureControlTarget(clusters[0].name.c_str(), &transient) &&
+              requestTopicRoundTrip(MothershipTopic::nametagQualification, request, response, transient) &&
+              mothershipNametagQualificationSiteResponseValid(request, response)) { observed = true; break; }
+          ::usleep(100'000);
+        }
+        uint128_t nonce = 0;
+        valid = valid && observed && RAND_priv_bytes(reinterpret_cast<unsigned char *>(&nonce), sizeof(nonce)) == 1 && nonce;
+        if (valid) { auto registry = openClusterRegistry();
+          valid = registry.recordNametagQualificationRestart(*adapter, recordedIntent, nonce, current,
+              &response.applicationReceipt, execution, &failure); }
+        if (valid) {
+          String nonceText = {}, runText = {}; nonceText.assignItoh(nonce); runText.assignItoh(recordedIntent.runUUID);
+          basics_log("{\"restartCheckpoint\":true,\"runUUID\":\"%s\",\"nonce\":\"%s\",\"pid\":%llu,\"startTime\":%llu,\"bootID\":\"%s\",\"binarySHA256\":\"%s\"}\n",
+              runText.c_str(), nonceText.c_str(), (unsigned long long)current.pid,
+              (unsigned long long)current.startTime, current.bootID.c_str(), current.executableSHA256.c_str());
+          std::fflush(stdout);
+          while (Time::now<TimeResolution::ms>() < recordedIntent.convergenceDeadlineAtMilliseconds) ::usleep(100'000);
+          valid = false; failure.assign("restart checkpoint expired without interruption"_ctv);
+        }
+      } else if (valid && std::strcmp(mode, "resume") == 0 &&
+                 execution.protocolVersion == MothershipNametagQualificationExecutionRecord::restartVersion) {
+        const char *nonceText = std::getenv("PRODIGY_NAMETAG_RESTART_NONCE"); uint128_t nonce = 0;
+        MothershipVDCProcessIdentity old = {};
+        const bool oldRead = mothershipVDCReadProcess(execution.restartBefore.pid, old);
+        errno = 0; const bool oldMissing = ::kill(pid_t(execution.restartBefore.pid), 0) == -1 && errno == ESRCH;
+        valid = nonceText && Time::now<TimeResolution::ms>() < recordedIntent.convergenceDeadlineAtMilliseconds &&
+            prodigyParseCanonicalHex128(String(nonceText), nonce) && nonce == execution.restartNonce &&
+            (oldMissing || (oldRead && old.startTime != execution.restartBefore.startTime));
+        if (valid && execution.restartAfter.pid) {
+          valid = current.bootID == execution.restartAfter.bootID &&
+              current.executableSHA256 == execution.restartAfter.executableSHA256;
+        } else if (valid) { auto registry = openClusterRegistry();
+          valid = registry.recordNametagQualificationRestart(*adapter, recordedIntent, nonce, current, nullptr, execution, &failure); }
+      } else valid = false;
+      if (!valid && failure.empty()) failure.assign("restart requires the exact checkpoint and a new process incarnation"_ctv);
+    }
+
+    const bool cousinRecoveryInjection = recordedIntent.protocolVersion ==
+        MothershipNametagQualificationIntent::cousinRecoveryVersion &&
+        recordedIntent.direction == MothershipNametagQualificationDirection::injection;
+    const bool cousinRecoveryObservation = recordedIntent.direction == MothershipNametagQualificationDirection::observation &&
+        (recordedIntent.row == MothershipNametagQualificationRow::permissionRevokeReinstall ||
+         recordedIntent.row == MothershipNametagQualificationRow::cousinRouteSessionReconnect);
+    const bool replayInjection = recordedIntent.row == MothershipNametagQualificationRow::graphKvReplayReorder &&
+        recordedIntent.direction == MothershipNametagQualificationDirection::injection;
+    const bool replayObservation = recordedIntent.row == MothershipNametagQualificationRow::graphKvReplayReorder &&
+        recordedIntent.direction == MothershipNametagQualificationDirection::observation;
+    const bool writerIsolationInjection = recordedIntent.row == MothershipNametagQualificationRow::localWriterIsolation &&
+        recordedIntent.direction == MothershipNametagQualificationDirection::injection;
+    const bool writerIsolationObservation = recordedIntent.row == MothershipNametagQualificationRow::localWriterIsolation &&
+        recordedIntent.direction == MothershipNametagQualificationDirection::observation;
+    auto abortWriterIsolation = [&]() {
+      if (!writerIsolationInjection || clusters.size() != 3 ||
+          execution.protocolVersion != MothershipNametagQualificationExecutionRecord::writerIsolationVersion) return false;
+      String cleanupFailure = {};
+      { auto registry = openClusterRegistry();
+        if (!registry.markNametagQualificationWriterIsolationAbort(*adapter, recordedIntent, false, execution, &cleanupFailure)) return false; }
+      if (execution.writerIsolation.arm.ready && !qualificationWriterNativeStage(*adapter, recordedIntent, execution,
+          clusters[0], allMasters.intent.sites[0].hotDeploymentID,
+          ProdigyNametagQualificationWriterIsolationStage::release, cleanupFailure)) {
+        if (!cleanupFailure.empty()) failure = cleanupFailure; return false;
+      }
+      auto registry = openClusterRegistry();
+      return registry.markNametagQualificationWriterIsolationAbort(*adapter, recordedIntent, true, execution, &cleanupFailure);
+    };
+    if (valid && !hasRecordedReceipt && writerIsolationInjection && execution.writerIsolation.aborting) {
+      (void)abortWriterIsolation(); valid = false;
+      if (failure.empty()) failure.assign("writer isolation operation is being aborted"_ctv);
+    }
+    auto abortCousinRecovery = [&]() {
+      if (!cousinRecoveryInjection || clusters.size() != 3) return false;
+      String cleanupFailure = {};
+      { auto registry = openClusterRegistry();
+        if (!registry.markNametagQualificationCousinRecoveryAborting(*adapter, recordedIntent, execution, &cleanupFailure)) return false;
+      }
+      if (!qualificationCousinRestore(recordedIntent, execution, clusters[0], clusters[1], cleanupFailure)) {
+        if (!cleanupFailure.empty()) failure = cleanupFailure; return false;
+      }
+      auto registry = openClusterRegistry();
+      if (!registry.finishNametagQualificationCousinRecoveryAbort(*adapter, recordedIntent, execution, &cleanupFailure)) {
+        if (!cleanupFailure.empty()) failure = cleanupFailure; return false;
+      }
+      return true;
+    };
+    if (valid && !hasRecordedReceipt && cousinRecoveryInjection && execution.cousinRecoveryAborting) {
+      (void)abortCousinRecovery(); valid = false;
+      if (failure.empty()) failure.assign("qualification fault was restored after an interrupted failure"_ctv);
+    }
+    if (valid && !hasRecordedReceipt && writerIsolationInjection &&
+        execution.phase == MothershipNametagQualificationExecutionPhase::prepared) {
+      valid = qualificationWriterNativeStage(*adapter, recordedIntent, execution, clusters[0],
+          allMasters.intent.sites[0].hotDeploymentID, ProdigyNametagQualificationWriterIsolationStage::arm, failure) &&
+          qualificationWriterLocalStage(*adapter, recordedIntent, execution, clusters[0],
+          allMasters.intent.sites[0].app6DeploymentID, ProdigyNametagQualificationWriterStage::arm, failure) &&
+          qualificationWriterNativeStage(*adapter, recordedIntent, execution, clusters[0],
+          allMasters.intent.sites[0].hotDeploymentID, ProdigyNametagQualificationWriterIsolationStage::isolate, failure);
+      if (valid) { auto registry = openClusterRegistry(); bool phaseResumed = false;
+        valid = registry.advanceNametagQualificationExecution(*adapter, recordedIntent,
+            MothershipNametagQualificationExecutionPhase::prepared,
+            MothershipNametagQualificationExecutionPhase::faultApplied, execution, phaseResumed, &failure); }
+    }
+    if (valid && !hasRecordedReceipt && writerIsolationInjection &&
+        execution.phase == MothershipNametagQualificationExecutionPhase::faultApplied) {
+      valid = qualificationWriterLocalStage(*adapter, recordedIntent, execution, clusters[0],
+          allMasters.intent.sites[0].app6DeploymentID, ProdigyNametagQualificationWriterStage::survivorWrites, failure) &&
+          qualificationWriterNativeStage(*adapter, recordedIntent, execution, clusters[0],
+          allMasters.intent.sites[0].hotDeploymentID, ProdigyNametagQualificationWriterIsolationStage::query, failure);
+      if (valid) { auto registry = openClusterRegistry(); bool phaseResumed = false;
+        valid = registry.advanceNametagQualificationExecution(*adapter, recordedIntent,
+            MothershipNametagQualificationExecutionPhase::faultApplied,
+            MothershipNametagQualificationExecutionPhase::workloadIssued, execution, phaseResumed, &failure); }
+    }
+    if (valid && !hasRecordedReceipt && writerIsolationInjection &&
+        execution.phase == MothershipNametagQualificationExecutionPhase::workloadIssued) {
+      valid = qualificationWriterNativeStage(*adapter, recordedIntent, execution, clusters[0],
+          allMasters.intent.sites[0].hotDeploymentID, ProdigyNametagQualificationWriterIsolationStage::release, failure);
+      if (valid) { auto registry = openClusterRegistry(); bool phaseResumed = false;
+        valid = registry.advanceNametagQualificationExecution(*adapter, recordedIntent,
+            MothershipNametagQualificationExecutionPhase::workloadIssued,
+            MothershipNametagQualificationExecutionPhase::faultRestored, execution, phaseResumed, &failure); }
+    }
+    if (valid && !hasRecordedReceipt && cousinRecoveryInjection &&
+        execution.phase == MothershipNametagQualificationExecutionPhase::prepared) {
+      // Never disturb the route until the exact old session is durably armed.
+      valid = qualificationCousinNativeStage(*adapter, recordedIntent, execution, clusters[0],
+          ProdigyNametagQualificationCousinStage::arm, failure);
+      if (valid) valid = qualificationCousinFault(recordedIntent, execution, clusters[0], clusters[1], failure);
+      if (valid) {
+        auto registry = openClusterRegistry(); bool phaseResumed = false;
+        valid = registry.advanceNametagQualificationExecution(*adapter, recordedIntent,
+            MothershipNametagQualificationExecutionPhase::prepared,
+            MothershipNametagQualificationExecutionPhase::faultApplied, execution, phaseResumed, &failure);
+      }
+      if (!valid && !execution.cousinNativeWitnesses.empty()) (void)abortCousinRecovery();
+    }
+
+    if (valid && !hasRecordedReceipt && replayInjection && execution.phase != MothershipNametagQualificationExecutionPhase::converging &&
+        execution.phase != MothershipNametagQualificationExecutionPhase::verified) {
+      if (execution.phase == MothershipNametagQualificationExecutionPhase::prepared)
+        valid = qualificationReplayExecute(*adapter, recordedIntent, allMasters, execution, clusters, failure);
+      else valid = mothershipNametagQualificationReplayExecutionComplete(execution);
+      const MothershipNametagQualificationExecutionPhase stages[] = {
+          MothershipNametagQualificationExecutionPhase::prepared, MothershipNametagQualificationExecutionPhase::faultApplied,
+          MothershipNametagQualificationExecutionPhase::workloadIssued, MothershipNametagQualificationExecutionPhase::faultRestored,
+          MothershipNametagQualificationExecutionPhase::converging };
+      for (size_t i = 0; valid && i + 1 < std::size(stages); ++i) {
+        if (execution.phase != stages[i]) continue;
+        auto registry = openClusterRegistry(); bool phaseResumed = false;
+        valid = registry.advanceNametagQualificationExecution(*adapter, recordedIntent, stages[i], stages[i + 1], execution, phaseResumed, &failure);
+      }
+      if (valid && execution.phase != MothershipNametagQualificationExecutionPhase::converging) valid = false;
+    }
+
+    // Row sixteen's control-plane part uses the retained EWR plan to prove ORD
+    // cannot be admitted, then joins that durable rejection with the App11
+    // stale-session witness.  Mothership never substitutes this receipt for
+    // the application-owned session operation.
+    if (valid && !hasRecordedReceipt &&
+        recordedIntent.row == MothershipNametagQualificationRow::secondTruthWriterFencing &&
+        recordedIntent.direction == MothershipNametagQualificationDirection::injection) {
+      if (execution.phase == MothershipNametagQualificationExecutionPhase::prepared) {
+        valid = exerciseSecondTruthWriterAdmission(*adapter, recordedIntent, allMasters, clusters, execution, failure);
+        if (valid) {
+          auto registry = openClusterRegistry(); bool phaseResumed = false;
+          valid = registry.advanceNametagQualificationExecution(*adapter, recordedIntent,
+              MothershipNametagQualificationExecutionPhase::prepared,
+              MothershipNametagQualificationExecutionPhase::faultApplied, execution, phaseResumed, &failure);
+        }
+      }
+      if (valid && execution.phase == MothershipNametagQualificationExecutionPhase::faultApplied &&
+          !mothershipNametagQualificationSecondTruthWriterAdmissionMatchesIntent(
+              recordedIntent, execution.secondTruthWriterAdmission)) {
+        valid = false; failure.assign("second Truth-writer admission exercise has no durable rejection receipt"_ctv);
+      }
+      // The durable placement rejection is the Mothership-owned fault receipt.
+      // Continue to the shared App11 dispatch: only its EWR session-fence
+      // witness, joined with the two read-only observers below, may qualify
+      // the row.
+    }
+
+    // Dispatch all three commands before querying any result. This preserves
+    // real multi-writer overlap for conflict rows instead of serializing EWR,
+    // ORD, and LAN behind three request/response workloads.
+    if (valid && !hasRecordedReceipt && writerIsolationInjection &&
+        execution.phase == MothershipNametagQualificationExecutionPhase::faultRestored) {
+      for (uint32_t site = 0; valid && site < 3; ++site) {
+        MothershipNametagQualificationSiteRequest request = {};
+        request.protocolVersion = MothershipNametagQualificationSiteRequest::writerStageVersion;
+        request.writerStage = ProdigyNametagQualificationWriterStage::final;
+        request.writerIsolation = execution.writerIsolation.challenge; request.intent = recordedIntent;
+        request.targetClusterUUID = allMasters.intent.sites[site].clusterUUID;
+        request.targetApp6DeploymentID = allMasters.intent.sites[site].app6DeploymentID;
+        request.targetProbeDeploymentID = recordedIntent.probeTargets[site].probeDeploymentID;
+        request.action = MothershipNametagQualificationSiteAction::execute;
+        MothershipNametagQualificationSiteResponse response = {};
+        valid = mothershipNametagQualificationSiteRequestValid(request) &&
+            configureControlTarget(clusters[site].name.c_str(), &failure) &&
+            requestTopicRoundTrip(MothershipTopic::nametagQualification, request, response, failure) &&
+            mothershipNametagQualificationSiteResponseValid(request, response);
+      }
+      if (valid) { auto registry = openClusterRegistry(); bool phaseResumed = false;
+        valid = registry.advanceNametagQualificationExecution(*adapter, recordedIntent,
+            MothershipNametagQualificationExecutionPhase::faultRestored,
+            MothershipNametagQualificationExecutionPhase::converging, execution, phaseResumed, &failure); }
+    }
+    const auto workloadReadyPhase =
+        ((recordedIntent.row == MothershipNametagQualificationRow::secondTruthWriterFencing &&
+         recordedIntent.direction == MothershipNametagQualificationDirection::injection) || cousinRecoveryInjection) ?
+            MothershipNametagQualificationExecutionPhase::faultApplied :
+            MothershipNametagQualificationExecutionPhase::prepared;
+    if (valid && !hasRecordedReceipt && execution.phase == workloadReadyPhase) {
+      for (uint32_t site = 0; valid && site < 3; ++site) {
+        if (cousinRecoveryInjection && site != 0) continue;
+        MothershipNametagQualificationSiteRequest request = {};
+        request.intent = recordedIntent; request.targetClusterUUID = allMasters.intent.sites[site].clusterUUID;
+        request.targetApp6DeploymentID = allMasters.intent.sites[site].app6DeploymentID;
+        request.targetProbeDeploymentID = recordedIntent.probeTargets[site].probeDeploymentID;
+        request.action = MothershipNametagQualificationSiteAction::execute;
+        if (writerIsolationObservation) { request.protocolVersion = MothershipNametagQualificationSiteRequest::writerStageVersion;
+          request.writerStage = ProdigyNametagQualificationWriterStage::final;
+          request.writerIsolation = priorCousinExecution.writerIsolation.challenge; }
+        if (cousinRecoveryInjection) { request.protocolVersion = MothershipNametagQualificationSiteRequest::cousinStageVersion;
+          request.cousinStage = ProdigyNametagQualificationCousinStage::faultObserved; }
+        if (cousinRecoveryObservation) { request.protocolVersion = MothershipNametagQualificationSiteRequest::cousinStageVersion;
+          request.cousinStage = ProdigyNametagQualificationCousinStage::final; }
+        if (restartInjection || restartObservation) { request.protocolVersion = MothershipNametagQualificationSiteRequest::restartStageVersion;
+          request.restartStage = ProdigyNametagQualificationRestartStage::afterRestart; }
+        if (claimObservation) { request.protocolVersion = MothershipNametagQualificationSiteRequest::claimStageVersion;
+          request.claimStage = ProdigyNametagQualificationClaimStage::final;
+          request.claimFaultExpiresAtMilliseconds = pathObservationExpiry; request.claimWinnerSites = priorCousinExecution.claimWinnerSites; }
+        if (replayObservation) { request.protocolVersion = MothershipNametagQualificationSiteRequest::replayStageVersion;
+          request.replayStage = ProdigyNametagQualificationReplayWorkStage::final; }
+        if (pathObservation) { request.protocolVersion = MothershipNametagQualificationSiteRequest::pathStageVersion;
+          request.pathStage = ProdigyNametagQualificationPathStage::final; request.pathBatch = pathFinalBatch;
+          request.pathFaultExpiresAtMilliseconds = pathObservationExpiry; }
+        MothershipNametagQualificationSiteResponse response = {};
+        valid = mothershipNametagQualificationSiteRequestValid(request) &&
+            configureControlTarget(clusters[site].name.c_str(), &failure) &&
+            requestTopicRoundTrip(MothershipTopic::nametagQualification, request, response, failure) &&
+            mothershipNametagQualificationSiteResponseValid(request, response);
+      }
+    }
+
+    if (!valid && cousinRecoveryInjection && !hasRecordedReceipt && clusters.size() == 3 &&
+        execution.phase == MothershipNametagQualificationExecutionPhase::faultApplied)
+      (void)abortCousinRecovery();
+
+    if (valid && !hasRecordedReceipt && cousinRecoveryInjection && execution.phase == workloadReadyPhase) {
+      // An execute ACK is only queue admission. The old native guard must be
+      // unsendable and EWR App11 must complete its local-work witness before
+      // the withdrawn route can be restored.
+      valid = qualificationCousinNativeStage(*adapter, recordedIntent, execution, clusters[0],
+          ProdigyNametagQualificationCousinStage::faultObserved, failure);
+      MothershipNametagQualificationSiteRequest request = {};
+      request.intent = recordedIntent; request.targetClusterUUID = allMasters.intent.sites[0].clusterUUID;
+      request.targetApp6DeploymentID = allMasters.intent.sites[0].app6DeploymentID;
+      request.targetProbeDeploymentID = recordedIntent.probeTargets[0].probeDeploymentID;
+      request.action = MothershipNametagQualificationSiteAction::query;
+      request.protocolVersion = MothershipNametagQualificationSiteRequest::cousinStageVersion;
+      request.cousinStage = ProdigyNametagQualificationCousinStage::faultObserved;
+      bool observed = false;
+      while (valid && Time::now<TimeResolution::ms>() < recordedIntent.deadlineAtMilliseconds) {
+        MothershipNametagQualificationSiteResponse response = {}; String queryFailure = {};
+        if (configureControlTarget(clusters[0].name.c_str(), &queryFailure) &&
+            requestTopicRoundTrip(MothershipTopic::nametagQualification, request, response, queryFailure) &&
+            mothershipNametagQualificationSiteResponseValid(request, response)) {
+          auto registry = openClusterRegistry();
+          valid = registry.recordNametagQualificationCousinLocalWork(*adapter, recordedIntent,
+              response.applicationReceipt, execution, &failure);
+          observed = valid; break;
+        }
+        ::usleep(100'000);
+      }
+      if (valid && !observed) { valid = false; failure.assign("qualification EWR local-work witness timed out"_ctv); }
+    }
+
+    Vector<ProdigyNametagQualificationApplicationReceipt> applicationReceipts = {};
+    // All three execute ACKs must arrive before the durable issued marker.
+    // A crash earlier resumes from prepared and replays the run-UUID-bound,
+    // idempotent command rather than claiming a command that was not ACKed.
+    if (valid && !hasRecordedReceipt && execution.phase == workloadReadyPhase) {
+      auto registry = openClusterRegistry(); bool phaseResumed = false;
+      valid = registry.advanceNametagQualificationExecution(*adapter, recordedIntent, workloadReadyPhase,
+          MothershipNametagQualificationExecutionPhase::workloadIssued, execution, phaseResumed, &failure);
+    }
+    if (!valid && cousinRecoveryInjection && !hasRecordedReceipt && clusters.size() == 3 &&
+        execution.phase == MothershipNametagQualificationExecutionPhase::faultApplied)
+      (void)abortCousinRecovery();
+    if (valid && !hasRecordedReceipt && cousinRecoveryInjection &&
+        execution.phase == MothershipNametagQualificationExecutionPhase::workloadIssued) {
+      valid = qualificationCousinRestore(recordedIntent, execution, clusters[0], clusters[1], failure);
+      if (!valid) (void)abortCousinRecovery();
+    }
+    if (valid && !hasRecordedReceipt && execution.phase == MothershipNametagQualificationExecutionPhase::workloadIssued) {
+      auto registry = openClusterRegistry(); bool phaseResumed = false;
+      valid = registry.advanceNametagQualificationExecution(*adapter, recordedIntent,
+          MothershipNametagQualificationExecutionPhase::workloadIssued,
+          ((recordedIntent.row == MothershipNametagQualificationRow::secondTruthWriterFencing &&
+           recordedIntent.direction == MothershipNametagQualificationDirection::injection) || cousinRecoveryInjection) ?
+              MothershipNametagQualificationExecutionPhase::faultRestored :
+              MothershipNametagQualificationExecutionPhase::converging,
+          execution, phaseResumed, &failure);
+    }
+    if (valid && !hasRecordedReceipt &&
+        ((recordedIntent.row == MothershipNametagQualificationRow::secondTruthWriterFencing &&
+        recordedIntent.direction == MothershipNametagQualificationDirection::injection) || cousinRecoveryInjection) &&
+        execution.phase == MothershipNametagQualificationExecutionPhase::faultRestored) {
+      if (cousinRecoveryInjection)
+        valid = qualificationCousinNativeStage(*adapter, recordedIntent, execution, clusters[0],
+            ProdigyNametagQualificationCousinStage::final, failure);
+      if (valid && cousinRecoveryInjection) for (uint32_t site = 0; valid && site < 3; ++site) {
+        MothershipNametagQualificationSiteRequest request = {};
+        request.protocolVersion = MothershipNametagQualificationSiteRequest::cousinStageVersion;
+        request.cousinStage = ProdigyNametagQualificationCousinStage::final;
+        request.intent = recordedIntent; request.targetClusterUUID = allMasters.intent.sites[site].clusterUUID;
+        request.targetApp6DeploymentID = allMasters.intent.sites[site].app6DeploymentID;
+        request.targetProbeDeploymentID = recordedIntent.probeTargets[site].probeDeploymentID;
+        request.action = MothershipNametagQualificationSiteAction::execute;
+        MothershipNametagQualificationSiteResponse response = {};
+        valid = configureControlTarget(clusters[site].name.c_str(), &failure) &&
+            requestTopicRoundTrip(MothershipTopic::nametagQualification, request, response, failure) &&
+            mothershipNametagQualificationSiteResponseValid(request, response);
+      }
+    }
+    if (valid && !hasRecordedReceipt &&
+        ((recordedIntent.row == MothershipNametagQualificationRow::secondTruthWriterFencing &&
+        recordedIntent.direction == MothershipNametagQualificationDirection::injection) || cousinRecoveryInjection) &&
+        execution.phase == MothershipNametagQualificationExecutionPhase::faultRestored) {
+      auto registry = openClusterRegistry(); bool phaseResumed = false;
+      valid = registry.advanceNametagQualificationExecution(*adapter, recordedIntent,
+          MothershipNametagQualificationExecutionPhase::faultRestored,
+          MothershipNametagQualificationExecutionPhase::converging, execution, phaseResumed, &failure);
+    }
+    while (valid && !hasRecordedReceipt)
+    {
+      applicationReceipts.clear(); bool complete = true;
+      if (seedRow) {
+        valid = mothershipNametagQualificationSeedExecutionComplete(execution);
+        if (valid) applicationReceipts = execution.seedFinalReadbacks;
+        else failure.assign("seed qualification lacks durable three-site native readbacks"_ctv);
+        break;
+      }
+      if (replayInjection) {
+        for (const auto& target : recordedIntent.probeTargets) {
+          const auto found = std::find_if(execution.replayFinalReadbacks.begin(), execution.replayFinalReadbacks.end(), [&](const auto& receipt) {
+            return receipt.localClusterUUID == target.clusterUUID && receipt.deploymentID == target.probeDeploymentID;
+          });
+          if (found == execution.replayFinalReadbacks.end()) { complete = false; break; }
+          applicationReceipts.push_back(*found);
+        }
+        if (!complete) { valid = false; failure.assign("qualification replay lacks durable final readbacks"_ctv); }
+        break;
+      }
+      if (claimInjection) {
+        for (const auto& target : recordedIntent.probeTargets) {
+          const auto found = std::find_if(execution.claimReceipts.begin(), execution.claimReceipts.end(), [&](const auto& receipt) {
+            return receipt.localClusterUUID == target.clusterUUID && receipt.deploymentID == target.probeDeploymentID &&
+                receipt.claimStage == ProdigyNametagQualificationClaimStage::final;
+          });
+          if (found == execution.claimReceipts.end()) { complete = false; break; }
+          applicationReceipts.push_back(*found);
+        }
+        if (!complete) { valid = false; failure.assign("qualification claim lacks durable final readbacks"_ctv); }
+        break;
+      }
+      if (pathInjection) {
+        const uint8_t batch = recordedIntent.row == MothershipNametagQualificationRow::masqueSessionLossBgpRecovery ? 1 : 0;
+        for (const auto& target : recordedIntent.probeTargets) {
+          const auto found = std::find_if(execution.pathWorkReceipts.begin(), execution.pathWorkReceipts.end(), [&](const auto& receipt) {
+            return receipt.localClusterUUID == target.clusterUUID && receipt.deploymentID == target.probeDeploymentID &&
+                receipt.pathBatch == batch && receipt.pathStage == ProdigyNametagQualificationPathStage::final;
+          });
+          if (found == execution.pathWorkReceipts.end()) { complete = false; break; }
+          applicationReceipts.push_back(*found);
+        }
+        if (!complete) { valid = false; failure.assign("qualification path lacks durable final readbacks"_ctv); }
+        break;
+      }
+      for (uint32_t site = 0; site < 3; ++site) {
+        MothershipNametagQualificationSiteRequest request = {};
+        request.intent = recordedIntent; request.targetClusterUUID = allMasters.intent.sites[site].clusterUUID;
+        request.targetApp6DeploymentID = allMasters.intent.sites[site].app6DeploymentID;
+        request.targetProbeDeploymentID = recordedIntent.probeTargets[site].probeDeploymentID;
+        request.action = MothershipNametagQualificationSiteAction::query;
+        if (writerIsolationInjection || writerIsolationObservation) { request.protocolVersion = MothershipNametagQualificationSiteRequest::writerStageVersion;
+          request.writerStage = ProdigyNametagQualificationWriterStage::final;
+          request.writerIsolation = writerIsolationInjection ? execution.writerIsolation.challenge : priorCousinExecution.writerIsolation.challenge; }
+        if (cousinRecoveryInjection || cousinRecoveryObservation) { request.protocolVersion = MothershipNametagQualificationSiteRequest::cousinStageVersion;
+          request.cousinStage = ProdigyNametagQualificationCousinStage::final; }
+        if (restartInjection || restartObservation) { request.protocolVersion = MothershipNametagQualificationSiteRequest::restartStageVersion;
+          request.restartStage = ProdigyNametagQualificationRestartStage::afterRestart; }
+        if (claimObservation) { request.protocolVersion = MothershipNametagQualificationSiteRequest::claimStageVersion;
+          request.claimStage = ProdigyNametagQualificationClaimStage::final;
+          request.claimFaultExpiresAtMilliseconds = pathObservationExpiry; request.claimWinnerSites = priorCousinExecution.claimWinnerSites; }
+        if (replayObservation) { request.protocolVersion = MothershipNametagQualificationSiteRequest::replayStageVersion;
+          request.replayStage = ProdigyNametagQualificationReplayWorkStage::final; }
+        if (pathObservation) { request.protocolVersion = MothershipNametagQualificationSiteRequest::pathStageVersion;
+          request.pathStage = ProdigyNametagQualificationPathStage::final; request.pathBatch = pathFinalBatch;
+          request.pathFaultExpiresAtMilliseconds = pathObservationExpiry; }
+        MothershipNametagQualificationSiteResponse response = {}; String queryFailure = {};
+        const bool siteComplete = mothershipNametagQualificationSiteRequestValid(request) &&
+            configureControlTarget(clusters[site].name.c_str(), &queryFailure) &&
+            requestTopicRoundTrip(MothershipTopic::nametagQualification, request, response, queryFailure) &&
+            mothershipNametagQualificationSiteResponseValid(request, response);
+        if (!siteComplete) { complete = false; break; }
+        applicationReceipts.push_back(std::move(response.applicationReceipt));
+      }
+      const int64_t now = Time::now<TimeResolution::ms>();
+      if (complete) break;
+      if (now >= recordedIntent.convergenceDeadlineAtMilliseconds) {
+        valid = false; failure.assign("qualification failed: the row-specific App11 witness is absent; generic topology evidence cannot pass"_ctv); break;
+      }
+      ::usleep(100'000);
+    }
+
+    if (valid && !hasRecordedReceipt) {
+      MothershipNametagQualificationReceipt proposed = {};
+      String topologyEvidence = {}; int64_t observedAtMilliseconds = 0;
+      valid = observeNametagQualificationAllMasters(recordedIntent, allMasters, applicationReceipts,
+          topologyEvidence, observedAtMilliseconds, failure) &&
+          mothershipNametagQualificationBuildReceipt(recordedIntent, applicationReceipts, topologyEvidence,
+              observedAtMilliseconds, proposed, &failure, &execution,
+              hasPriorInjectionReceipt ? &priorInjectionReceipt : nullptr,
+              (cousinRecoveryObservation || restartObservation || writerIsolationObservation || pathObservation || claimObservation || replayObservation) ? &priorCousinExecution : nullptr);
+      if (valid) {
+        auto registry = openClusterRegistry();
+        bool phaseResumed = false;
+        valid = registry.advanceNametagQualificationExecution(*adapter, recordedIntent,
+            MothershipNametagQualificationExecutionPhase::converging,
+            MothershipNametagQualificationExecutionPhase::verified, execution, phaseResumed, &failure);
+        if (valid) valid = registry.recordNametagQualificationReceipt(*adapter, proposed, recordedReceipt, receiptResumed, &failure);
+      }
+    }
+    if (!valid && writerIsolationInjection && !hasRecordedReceipt &&
+        execution.protocolVersion == MothershipNametagQualificationExecutionRecord::writerIsolationVersion &&
+        execution.phase != MothershipNametagQualificationExecutionPhase::failed &&
+        execution.phase != MothershipNametagQualificationExecutionPhase::verified)
+      (void)abortWriterIsolation();
+    if (!valid && failure.empty()) failure.assign("qualification did not produce authenticated global five-store and topology evidence"_ctv);
+    String output;
+    output.assign("{\"success\":"_ctv); if (valid) output.append("true"_ctv); else output.append("false"_ctv);
+    output.append(",\"operation\":"_ctv); appendEscapedJSONString(output, String(adapter->operation));
+    output.append(",\"rowID\":"_ctv); appendEscapedJSONString(output, String(adapter->rowID));
+    output.append(",\"completed\":"_ctv); if (valid) output.append("true"_ctv); else output.append("false"_ctv);
+    output.append(",\"resumed\":"_ctv); if (resumed) output.append("true"_ctv); else output.append("false"_ctv);
+    output.append(",\"receiptResumed\":"_ctv); if (receiptResumed) output.append("true"_ctv); else output.append("false"_ctv);
+    output.append(",\"failure\":"_ctv); appendEscapedJSONString(output, failure);
+    if (valid)
+    {
+      String runUUID = {}, allMastersUUID = {}, number = {};
+      runUUID.assignItoh(recordedReceipt.runUUID); allMastersUUID.assignItoh(recordedReceipt.allMastersOperationUUID);
+      output.append(",\"receipt\":{\"protocolVersion\":"_ctv); number.assignItoa(recordedReceipt.protocolVersion); output.append(number);
+      output.append(",\"runUUID\":"_ctv); appendEscapedJSONString(output, runUUID);
+      output.append(",\"rowID\":"_ctv); appendEscapedJSONString(output, recordedReceipt.rowID);
+      output.append(",\"direction\":"_ctv); appendEscapedJSONString(output,
+          String(recordedReceipt.direction == MothershipNametagQualificationDirection::injection ? "injection" : "observation"));
+      output.append(",\"allMastersOperationUUID\":"_ctv); appendEscapedJSONString(output, allMastersUUID);
+      output.append(",\"applicationReceipts\":["_ctv);
+      for (uint32_t index = 0; index < recordedReceipt.applicationReceipts.size(); ++index) {
+        if (index != 0) output.append(","_ctv);
+        const auto& application = recordedReceipt.applicationReceipts[index]; String clusterUUID = {};
+        clusterUUID.assignItoh(application.localClusterUUID);
+        output.append("{\"clusterUUID\":"_ctv); appendEscapedJSONString(output, clusterUUID);
+        output.append(",\"deploymentID\":"_ctv); number.assignItoa(application.deploymentID); output.append(number);
+        output.append(",\"witnessDigest\":"_ctv); appendEscapedJSONString(output, application.witnessDigest);
+        output.append("}"_ctv);
+      }
+      output.append("]"_ctv);
+      output.append(",\"startedAtMilliseconds\":"_ctv); number.assignItoa(uint64_t(recordedReceipt.startedAtMilliseconds)); output.append(number);
+      output.append(",\"deadlineAtMilliseconds\":"_ctv); number.assignItoa(uint64_t(recordedReceipt.deadlineAtMilliseconds)); output.append(number);
+      output.append(",\"convergenceDeadlineAtMilliseconds\":"_ctv); number.assignItoa(uint64_t(recordedReceipt.convergenceDeadlineAtMilliseconds)); output.append(number);
+      output.append(",\"observedAtMilliseconds\":"_ctv); number.assignItoa(uint64_t(recordedReceipt.observedAtMilliseconds)); output.append(number);
+      output.append(",\"deadlineSeconds\":"_ctv); number.assignItoa(adapter->deadlineSeconds); output.append(number);
+      output.append(",\"convergenceSeconds\":"_ctv); number.assignItoa(adapter->convergenceSeconds); output.append(number);
+      output.append(",\"witnessedResult\":"_ctv); number.assignItoa(uint8_t(recordedReceipt.witnessedResult)); output.append(number);
+      output.append(",\"canonicalConvergenceWitness\":"_ctv);
+      appendEscapedJSONString(output, recordedReceipt.canonicalConvergenceWitness);
+      output.append(",\"witnessDigest\":"_ctv); appendEscapedJSONString(output, recordedReceipt.witnessDigest);
+      output.append("}"_ctv);
+    }
+    output.append("}\n"_ctv);
+    basics_log("%s", output.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+    exit(EXIT_SUCCESS);
+  }
+
   void runUpsertDNSBinding(int argc, char *argv[])
   {
     runDNSBindingMutation(MothershipTopic::upsertDNSBinding, argc, argv);
@@ -27794,14 +35400,20 @@ public:
         {"adoptTestClusterSpare",            &Mothership::runAdoptTestClusterSpare           },
         {"applicationReport",               &Mothership::runApplicationReport              },
         {"authorizeBGPOriginPrefix",        &Mothership::runAuthorizeBGPOriginPrefix       },
+        {"bootstrapNametagAllMasters",      &Mothership::runBootstrapNametagAllMasters     },
         {"cancelDeployment",                &Mothership::runCancelDeployment               },
+        {"captureBrainState",               &Mothership::runCaptureBrainState              },
+        {"captureBrainStateLocal",          &Mothership::runCaptureBrainStateLocal         },
+        {"checkClusterProviderPlan",        &Mothership::runCheckClusterProviderPlan       },
         {"clusterReport",                   &Mothership::runClusterReport                  },
+        {"configureLocalVMClusterLANIPv6",  &Mothership::runConfigureLocalVMClusterLANIPv6 },
         {"containerLogs",                   &Mothership::runContainerLogs                  },
         {"cousinPermission",                &Mothership::runCousinPermission               },
         {"cousinRoute",                     &Mothership::runCousinRoute                    },
         {"createCluster",                   &Mothership::runCreateCluster                  },
         {"createProviderCredential",        &Mothership::runCreateProviderCredential       },
         {"credentialExpiryNotifications",   &Mothership::runCredentialExpiryNotifications },
+        {"crossClusterMasqueGateway",       &Mothership::runCrossClusterMasqueGateway      },
         {"deleteDNSBinding",                &Mothership::runDeleteDNSBinding               },
         {"deleteMachineSchema",             &Mothership::runDeleteMachineSchema            },
         {"deltaMachineBudget",              &Mothership::runDeltaMachineBudget             },
@@ -27818,14 +35430,20 @@ public:
         {"faultTestClusters",               &Mothership::runFaultTestClusters              },
         {"inspectLocalVMBoundaries",        &Mothership::runInspectLocalVMBoundaries       },
         {"inspectUpgradeBundle",            &Mothership::runInspectUpgradeBundle           },
+        {"launchLocalVM",                   &Mothership::runLaunchLocalVM                  },
         {"listBGPOriginPrefixes",           &Mothership::runListBGPOriginPrefixes          },
         {"migrateTidesDB9To10",             &Mothership::runMigrateTidesDB9To10             },
         {"mintClientTlsIdentity",           &Mothership::runMintClientTlsIdentity          },
+        {"nametagAllMasters",               &Mothership::runNametagAllMasters               },
+        {"nametagQualificationCapabilities", &Mothership::runNametagQualificationCapabilities},
+        {"nametagSourceBaseline",            &Mothership::runNametagSourceBaseline            },
         {"nametagStatefulPair",              &Mothership::runNametagStatefulPair             },
         {"offlineDNSCleanupInventory",      &Mothership::runOfflineDNSCleanupInventory     },
         {"pairBoundary",                    &Mothership::runPairBoundary                   },
         {"placementPolicy",                 &Mothership::runCommitDeploymentPlacementPolicy },
         {"planUpgrade",                     &Mothership::runPlanUpgrade                     },
+        {"prepareNametagAllMasters",        &Mothership::runPrepareNametagAllMasters       },
+        {"prepareNametagStatefulPair",      &Mothership::runPrepareNametagStatefulPair     },
         {"prepareProductionPair",           &Mothership::runPrepareProductionPair          },
         {"prepareRetainedRecoveryArtifactLocal", &Mothership::runPrepareRetainedRecoveryArtifactLocal},
         {"prepareRetainedRecoveryLocal", &Mothership::runPrepareRetainedRecoveryLocal},
@@ -27845,14 +35463,19 @@ public:
         {"recoverLocalClusterAuthority",    &Mothership::runRecoverLocalClusterAuthority   },
         {"recoverMaterializedStatefulDeployment", &Mothership::runRecoverMaterializedStatefulDeployment },
         {"recoverRetainedFleet", &Mothership::runRecoverRetainedFleet},
+        {"recoverStoppedLocalVM",           &Mothership::runRecoverStoppedLocalVM          },
         {"recoverTestClusterBundle",        &Mothership::runRecoverTestClusterBundle       },
         {"recoverTestClusterFollowerBrain", &Mothership::runRecoverTestClusterFollowerBrain},
         {"registerLocalVMBoundary",         &Mothership::runRegisterLocalVMBoundary        },
         {"registerRoutableSubnet",          &Mothership::runRegisterRoutableSubnet         },
         {"removeCluster",                   &Mothership::runRemoveCluster                  },
+        {"removeLocalVM",                   &Mothership::runRemoveLocalVM                  },
         {"removeProviderCredential",        &Mothership::runRemoveProviderCredential       },
+        {"repairRemoteCloudMachineRuntime", &Mothership::runRepairRemoteCloudMachineRuntime},
         {"reserveApplicationID",            &Mothership::runReserveApplicationID           },
         {"reserveServiceID",                &Mothership::runReserveServiceID               },
+        {"resumeBrainStateCaptureLocal",    &Mothership::runResumeBrainStateCaptureLocal   },
+        {"resumeClusterCreation",           &Mothership::runResumeClusterCreation          },
         {"retireAdditionalIngressLocal",    &Mothership::runRetireAdditionalIngressLocal   },
         {"retireTestPairSource",            &Mothership::runRetireTestPairSource           },
         {"revokeBGPOriginPrefix",           &Mothership::runRevokeBGPOriginPrefix          },
@@ -27883,6 +35506,14 @@ public:
 
     argc -= 1;
     argv += 1;
+
+    // The qualification table owns these public spellings.  Keeping this
+    // separate from the historical binary-search table makes every adapter
+    // explicit while preserving its sorted-command invariant.
+    if (mothershipNametagQualificationAdapter(operationText) != nullptr)
+    {
+      runNametagQualification(operationText, argc, argv);
+    }
 
     size_t lower = 0;
     size_t upper = sizeof(commands) / sizeof(commands[0]);
@@ -27916,7 +35547,7 @@ int main(int argc, char *argv[])
   if (argc < 2)
   {
     constexpr static char usage[] =
-        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultClusterNetwork, faultLocalClusterMachine, faultRemoteCloudMachine, faultTestCluster, faultTestClusters, prepareProductionPair, productionPair, registerLocalVMBoundary, inspectLocalVMBoundaries, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, recoverLocalClusterAuthority, recoverMaterializedStatefulDeployment, recoverTestClusterBundle, recoverTestClusterFollowerBrain, taskReport, containerLogs, credentialExpiryNotifications, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, authorizeBGPOriginPrefix, revokeBGPOriginPrefix, listBGPOriginPrefixes, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
+        "must be called like: ./mothership [operation: help, bootstrapNametagAllMasters, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, repairRemoteCloudMachineRuntime, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, checkClusterProviderPlan, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultClusterNetwork, faultLocalClusterMachine, faultRemoteCloudMachine, faultTestCluster, faultTestClusters, prepareProductionPair, productionPair, launchLocalVM, removeLocalVM, registerLocalVMBoundary, inspectLocalVMBoundaries, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, recoverLocalClusterAuthority, recoverMaterializedStatefulDeployment, recoverTestClusterBundle, recoverTestClusterFollowerBrain, taskReport, containerLogs, credentialExpiryNotifications, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, authorizeBGPOriginPrefix, revokeBGPOriginPrefix, listBGPOriginPrefixes, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
     std::fwrite(usage, 1, sizeof(usage) - 1, stdout);
     exit(EXIT_FAILURE);
   }
@@ -27928,6 +35559,10 @@ int main(int argc, char *argv[])
   {
     String message;
     message.append("the following operations are available:\n"_ctv);
+    message.append("bootstrapNametagAllMasters [versioned intent path] [eight-plan JSON path]\n");
+    message.append("\tjournals and launches the exact remote all-masters cohorts with native client access fenced until their retained source cut is applied\n");
+    message.append("configureLocalVMClusterLANIPv6 [cluster]\n");
+    message.append("\tconfigures one deterministic private IPv6 /64 on the exact three sealed local-VM cluster LAN owners without changing their QEMU or WAN boundaries\n");
     message.append("createProviderCredential [json|-|@path]\n");
     message.append("\tcreates a named provider auth profile in Mothership's local credential registry\n");
     message.append("pullProviderCredential [name]\n");
@@ -27949,11 +35584,14 @@ int main(int argc, char *argv[])
     message.append("recommendClusterForApplications [json]\n");
     message.append("\trecommends the cheapest AWS/GCP/Azure cluster for a required country and billingModel=hourly|spot, optionally under budget, across providers=[\"all\"] or an explicit provider set\n");
     message.append("\taccepts required minMachines plus optional ingressGBPerHour and egressGBPerHour, and now considers up to three distinct machine types per recommendation\n");
+    message.append("checkClusterProviderPlan [json|-|@path]\n");
+    message.append("\tchecks remote Vultr machine plan metadata using a stored credential; does not check full launch readiness\n");
     message.append("createCluster [json|-|@path] [optional test initial bundle]\n");
     message.append("\tcreates a managed Prodigy cluster record, assigns a clusterUUID, and uses providerCredentialName or an inline providerCredentialOverride secret block\n");
     message.append("\toptionally enables one cluster DNS provider and ACME with dnsProvider plus acme.accountEmail/acme.termsAgreed; see prodigy/docs/dns-providers.md\n");
     message.append("\tdeploymentMode=test creates a Mothership-managed virtual datacenter\n");
     message.append("\tan optional test initial bundle is a transient, approved explicit .zst archive used only to seed a test virtual datacenter\n");
+    message.append("resumeClusterCreation [exact 0x cluster UUID] [expected seed cloud UUID]\n");
     message.append("printClusters\n");
     message.append("\tlists all managed Prodigy cluster records with their clusterUUIDs\n");
     message.append("setLocalClusterMembership [name|clusterUUID] [json]\n");
@@ -27969,11 +35607,20 @@ int main(int argc, char *argv[])
     message.append("faultClusterNetwork [operationUUID] [physicalBoundaryUUID] [both|source-to-target|target-to-source] [durationMs]\n");
     message.append("\trequests one bounded guest-owned peer-host partition through the sealed Mothership physical-fault owner\n");
     message.append("faultLocalClusterMachine [operationUUID] [localVMBoundaryUUID] cold-reboot [timeoutMs]\n");
-    message.append("\tcold-reboots one exact registered VM in a three-Brain deploymentMode=local cluster and proves its new healthy boot identity\n");
-    message.append("recoverLocalClusterAuthority [operationUUID] [cluster] [timeoutMs]\n");
+    message.append("faultLocalClusterMachine [operationUUID] [localVMBoundaryUUID] recover-unready-upgrade [timeoutMs] [upgradeOperationUUID] [approvedTargetBundle]\n");
+    message.append("\tcold-reboots one exact registered VM in a three-Brain deploymentMode=local cluster and proves its new healthy boot identity; the recovery form additionally requires an exact admitted peer-inventory phase and a newer complete post-reboot inventory\n");
+    message.append("recoverLocalClusterAuthority [operationUUID] [cluster] [timeoutMs] [--complete-interrupted-upgrade upgradeOperation approvedBundle predecessorRecovery|--admitted-active-runtime]\n");
+    message.append("recoverStoppedLocalVM [absolute state path] [taskID] [operationUUID canonical hex] [expected guest UUID] [expected state SHA256]\n");
+    message.append("\trecovers one stopped local VM through its sealed boundary owner without requiring the in-guest registry\n");
     message.append("\tdurably arms and releases one exact three-VM local recovery cohort, then seals it only after all distinct reboots and normal one-master health are observed\n");
+    message.append("launchLocalVM [absolute state path] [taskID] [boundary launch arguments...]\n");
+    message.append("\tcreates one fresh persistent local VM only through the embedded sealed boundary launcher; it fixes the launch action and never accepts a guest command or lifecycle override\n");
+    message.append("removeLocalVM [absolute state path] [taskID]\n");
+    message.append("\tremoves one exact persistent local VM through the embedded sealed boundary launcher; it is idempotent when the state is already absent\n");
     message.append("faultRemoteCloudMachine [clusterName|clusterUUID] [machineUUID canonical hex] hard-reboot\n");
     message.append("\trefreshes authoritative topology, resolves one exact Mothership-created Vultr machine, and submits one bounded provider hard reboot\n");
+    message.append("repairRemoteCloudMachineRuntime [clusterName|clusterUUID] [machineUUID canonical hex] [upgrade operationUUID] [approved bundle] [expected Linux machine ID] [--check]\n");
+    message.append("\trepairs one failed, empty remote runtime only when its immutable upgrade admission, provider topology, target machine identity, and live two-Brain quorum still match; --check performs no upload or install\n");
     message.append("faultTestCluster [name|clusterUUID] [link|crash|flap] [machine indices csv] [durationMs] [cycles] [downMs] [upMs]\n");
     message.append("\trequests a bounded virtual-datacenter machine fault through the Mothership-owned test provider\n");
     message.append("faultTestClusters [first name|clusterUUID] [first machineIndex] [second name|clusterUUID] [second machineIndex] [durationMs]\n");
@@ -27984,10 +35631,26 @@ int main(int argc, char *argv[])
     message.append("\truns a bounded persistent TCP workload and prints one JSON receipt per planned request\n");
     message.append("prepareProductionPair [operationUUID] [activeRouteUUID] [physicalBoundaryUUID] [sourceDeploymentID] [targetDeploymentID] [sourceMachineIngressAddress] [ingressPort]\n");
     message.append("\tadmits two exact non-test stateless workloads, their production COUSIN transport, and one durable source-machine ingress relay\n");
+    message.append("prepareNametagStatefulPair [operationUUID] [routeUUID] [sourceCluster] [sourceDeploymentID] [shardGroup] [targetCluster] [target plan JSON] [Discombobulator app artifact] [output intent binary]\n");
+    message.append("\tconstructs a typed target-to-source Hot/Cold transfer request, collects unanimous source evidence, and durably prepares without admitting or advancing it\n");
     message.append("productionPair [operationUUID] [query|selectTarget|drain|retireSource|cleanup|abortBeforeTransit|abortBeforeCutover]\n");
     message.append("nametagStatefulPair [versioned intent binary path] [Discombobulator app artifact path] [abortBeforeFence]\n");
     message.append("\tadvances exactly one durable Hot/Cold shard gate using authenticated runtime receipts; no physical IPv4 selector\n");
     message.append("\tcoordinates one-way target selection, zero-source-flow drain, durable source retirement, post-withdrawal cleanup, or a pre-transit/pre-cutover abort\n");
+    message.append("prepareNametagAllMasters [operator JSON path] [output intent binary path]\n");
+    message.append("\tresolves exact registered EWR/ORD/LAN identities and eighteen current gateway references into the existing all-masters intent; no launch or seed\n");
+    message.append("nametagAllMasters [versioned intent binary path]\n");
+    message.append("\tobserves and durably binds the EWR/ORD/LAN Nametag all-master topology; it never selects, drains, fences, or retires a source\n");
+    message.append("nametagSourceBaseline [mothership.nametag-source-baseline.v1 JSON path]\n");
+    message.append("\tpersists and dispatches one EWR-only App11 source-population command from an exact bounded input; it is not a qualification row or native watermark substitute\n");
+    message.append("nametagQualificationCapabilities\n");
+    message.append("\tread-only offline executor capabilities; unavailable rows must reject campaign preflight before provisioning, not count as live qualification\n");
+    message.append("Nametag three-cluster qualification operations (no arguments; fail closed until the authenticated five-store probe/oracle topic is installed):\n");
+    for (const auto& adapter : mothershipNametagQualificationAdapters)
+    {
+      message.append(adapter.operation);
+      message.append("\n");
+    }
     message.append("registerLocalVMBoundary [cluster] [machineUUID] [boundaryUUID] [taskID] [hostAddress] [hostPort] [hostUser] [hostPrivateKey] [hostPublicKey] [statePath]\n");
     message.append("\tregisters the exact pinned external KVM owner for one VM member of a three-Brain deploymentMode=local cluster; Mothership owns and seals the launcher bytes\n");
     message.append("inspectLocalVMBoundaries [cluster]\n");
@@ -28014,12 +35677,14 @@ int main(int argc, char *argv[])
     message.append("\texplicit root-only recovery: retires one exactly witnessed additional-ingress XDP attachment with a kernel compare-and-swap; never used by normal startup\n");
     message.append("enrollClusterPair [first cluster name|UUID] [second cluster name|UUID] [operationUUID canonical hex]\n");
     message.append("\tcreates or resumes one durable private pair enrollment intent after both clusters return qualified endpoint rosters; it waits up to 30 seconds for both active projections\n");
-    message.append("revokeClusterPair [enrollment operationUUID canonical hex]\n");
+    message.append("revokeClusterPair [enrollment operationUUID canonical hex] [--query]\n");
     message.append("\tpermanently revokes both enrolled sides and waits for durable credential withdrawal\n");
     message.append("rotateClusterPairEpoch [enrollment operationUUID canonical hex] [request|query]\n");
     message.append("cousinPermission [target: local|clusterName|clusterUUID] [install JSON|query UUID|revoke UUID|discover UUID SLOT]\n");
     message.append("cousinRoute [put PAIR_OPERATION_UUID JSON|query ROUTE_UUID|recover ROUTE_UUID]\n");
     message.append("\tpersists one permission-bound TCP route generation and applies or resumes both enrolled cluster halves\n");
+    message.append("crossClusterMasqueGateway [configure|configurePair PAIR_OPERATION_UUID LOCAL_MACHINE_UUID PEER_MACHINE_UUID listener|connector LISTENER_UDP_IP LISTENER_UDP_PORT ARTIFACT_SHA256 ARTIFACT_BYTES LOCAL_ID_SHA256 PEER_ID_SHA256 PEER_TRUST_SHA256 GENERATION [ARTIFACT_BLOB] [--slots GATEWAY_SLOT TUNNEL_SLOT]|query PAIR_UUID LOCAL_MACHINE_UUID|withdraw PAIR_UUID LOCAL_MACHINE_UUID GENERATION]\n");
+    message.append("\tconfigurePair derives and stages both reciprocal enrolled-pair authorities before either readiness wait; an optional artifact blob is verified and stored as the dedicated gateway kind\n");
     message.append("transportCredentialLifecycle [clusterName|clusterUUID] [operationUUID canonical hex] [query|request brain|neuron rotate|revoke nodeUUID canonical hex]\n");
     message.append("\trequests a new epoch from the originating cluster, or observes both sides; clusters negotiate and finish autonomously\n");
     message.append("testClusterPairControl [enrollment operationUUID canonical hex] [prepare|query|remove|service JSON|fault delayMs durationMs [both|first-to-second|second-to-first]]\n");
@@ -28031,17 +35696,18 @@ int main(int argc, char *argv[])
     message.append("\tfetches bounded current stdout/stderr and 24-hour retained failure logs through the master Brain and Neurons\n");
     message.append("credentialExpiryNotifications [target: clusterName|clusterUUID]\n");
     message.append("\tlists retained API credential expiry metadata and acknowledges unacknowledged notices\n");
-    message.append("deploy [target: local|clusterName|clusterUUID] [json|-|@path] [path to container blob]\n");
+    message.append("deploy [target: local|clusterName|clusterUUID] [json|-|@path] [path to container blob] [--submit-only]\n");
+    message.append("\t--submit-only returns after the initial accepted spin response; readiness remains unverified\n");
     message.append("\tdeploys an application on the cluster\n");
-    message.append("deploymentIdentity [clusterName|clusterUUID] [deploymentID]\n");
+    message.append("deploymentIdentity [clusterName|clusterUUID] [deploymentID] [--seed-details]\n");
     message.append("applicationReport [target: local|clusterName|clusterUUID] [application name]\n");
     message.append("\tfetches the state of each deployment of the application\n");
     message.append("\tex: applicationReport local Radar\n");
     message.append("taskReport [target: local|clusterName|clusterUUID] [application name] [versionID]\n");
     message.append("\tfetches a retained task execution report\n");
-    message.append("planUpgrade [target] [approved target bundle] [approved source bundle] [operationID canonical hex]\n");
+    message.append("planUpgrade [target] [approved target bundle] [approved source bundle] [operationID canonical hex] [--query|--accept-active-workload-interruption]\n");
     message.append("\treads a versioned Brain admission report and records an immutable no-dispatch compatibility decision\n");
-    message.append("updateProdigy [target: local|clusterName|clusterUUID] [approved bundle] [operationID canonical hex] [--brain-concurrency 1|2]\n");
+    message.append("updateProdigy [target: local|clusterName|clusterUUID] [approved bundle] [operationID canonical hex] [--brain-concurrency 1|2] [--accept-active-workload-interruption]\n");
     message.append("\tdispatches only an approved retained snapshot through the typed Brain-side operation binding\n");
     message.append("inspectUpgradeBundle [path to prodigy binary or bundle]\n");
     message.append("\tread-only: verifies the approved flat bundle and prints its embedded upgrade compatibility policy\n");

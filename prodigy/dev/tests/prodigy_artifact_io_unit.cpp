@@ -142,6 +142,63 @@ int main()
                  "artifact_io_rejects_malformed_artifact_before_temporary_staging");
     suite.expect(prepared.prepared == false, "artifact_io_rejection_has_no_prepared_metadata");
 
+    String masqueGatewayBlob = prodigyDiscombobulatorCrossClusterMasqueGatewayBlobHeaderText();
+    masqueGatewayBlob.append("masque gateway payload"_ctv);
+    String masqueDigest = {};
+    uint64_t masqueBytes = 0;
+    String loadedMasqueGatewayBlob = {};
+    suite.expect(ContainerStore::systemStore(
+                     SystemContainerKind::crossClusterMasqueGateway,
+                     masqueGatewayBlob,
+                     masqueDigest,
+                     masqueBytes,
+                     &failure,
+                     &storeRoot.path) &&
+                     ContainerStore::systemVerify(
+                         SystemContainerKind::crossClusterMasqueGateway,
+                         masqueDigest,
+                         masqueBytes,
+                         nullptr,
+                         nullptr,
+                         &failure,
+                         &storeRoot.path) &&
+                     ContainerStore::systemLoadVerified(
+                         SystemContainerKind::crossClusterMasqueGateway,
+                         masqueDigest,
+                         masqueBytes,
+                         loadedMasqueGatewayBlob,
+                         &failure,
+                         &storeRoot.path) &&
+                     loadedMasqueGatewayBlob.equals(masqueGatewayBlob),
+                 "artifact_io_stores_and_verifies_cross_cluster_masque_gateway_contract");
+    suite.expect(ContainerStore::systemStore(
+                     SystemContainerKind::mothershipTunnelProvider,
+                     masqueDigest,
+                     masqueBytes,
+                     masqueGatewayBlob,
+                     &failure,
+                     &storeRoot.path) == false,
+                 "artifact_io_rejects_masque_gateway_as_mothership_control_tunnel_artifact");
+    String wrongKindLoadedBlob = {};
+    suite.expect(ContainerStore::systemVerify(
+                     SystemContainerKind::mothershipTunnelProvider,
+                     masqueDigest,
+                     masqueBytes,
+                     nullptr,
+                     nullptr,
+                     &failure,
+                     &storeRoot.path) == false,
+                 "artifact_io_keeps_masque_gateway_out_of_mothership_control_tunnel_store");
+    suite.expect(ContainerStore::systemLoadVerified(
+                     SystemContainerKind::mothershipTunnelProvider,
+                     masqueDigest,
+                     masqueBytes,
+                     wrongKindLoadedBlob,
+                     &failure,
+                     &storeRoot.path) == false &&
+                     wrongKindLoadedBlob.size() == 0,
+                 "artifact_io_rejects_cross_kind_digest_reuse_at_load");
+
     // Positive storage proof requires the packaged Discombobulator artifact,
     // never a hand-assembled header or synthetic rootfs. Missing positive
     // coverage must fail the test even when the executor cases can still run.

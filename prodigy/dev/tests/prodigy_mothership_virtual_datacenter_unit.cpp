@@ -29,6 +29,38 @@ public:
   }
 };
 
+static void testBrainCaptureCanonicalPaths(TestSuite& suite)
+{
+  char temporary[] = "/tmp/prodigy-capture-paths-XXXXXX";
+  if (::mkdtemp(temporary) == nullptr) { suite.expect(false, "capture_paths_fixture"); return; }
+  const std::filesystem::path root(temporary);
+  String primary, secrets, failure;
+  const String processRoot(temporary);
+  suite.expect(!mothershipVDCBrainCaptureStatePaths(processRoot, primary, secrets, &failure),
+               "capture_paths_reject_absent");
+  const auto native = root / std::filesystem::path(defaultProdigyPersistentStateDBPath()).relative_path();
+  const auto vdc = root / "containers/prodigy.state";
+  std::filesystem::create_directories(native);
+  suite.expect(!mothershipVDCBrainCaptureStatePaths(processRoot, primary, secrets, &failure),
+               "capture_paths_reject_incomplete");
+  std::filesystem::create_directories(native.string() + ".secrets");
+  suite.expect(mothershipVDCBrainCaptureStatePaths(processRoot, primary, secrets, &failure) &&
+               primary.equals(String(native.c_str())), "capture_paths_accept_native_default");
+  std::filesystem::create_directories(vdc);
+  std::filesystem::create_directories(vdc.string() + ".secrets");
+  suite.expect(!mothershipVDCBrainCaptureStatePaths(processRoot, primary, secrets, &failure),
+               "capture_paths_reject_ambiguous");
+  std::filesystem::remove_all(native);
+  std::filesystem::remove_all(native.string() + ".secrets");
+  suite.expect(mothershipVDCBrainCaptureStatePaths(processRoot, primary, secrets, &failure) &&
+               primary.equals(String(vdc.c_str())), "capture_paths_preserve_vdc");
+  std::filesystem::remove_all(vdc.string() + ".secrets");
+  std::filesystem::create_directory_symlink(vdc, vdc.string() + ".secrets");
+  suite.expect(!mothershipVDCBrainCaptureStatePaths(processRoot, primary, secrets, &failure),
+               "capture_paths_reject_symlink");
+  std::filesystem::remove_all(root);
+}
+
 static bool containsAddress(const Vector<ClusterMachineAddress>& addresses, const char *address, uint8_t prefixLength)
 {
   for (const ClusterMachineAddress& candidate : addresses)
@@ -636,6 +668,7 @@ static void testStopCleanupContractFailsClosed(TestSuite& suite)
 int main(void)
 {
   TestSuite suite;
+  testBrainCaptureCanonicalPaths(suite);
   testPublicationPreservesSelectedMachine(suite);
   testTwoPhaseStartGate(suite);
   testUnexpectedRuntimeExitPreservesLiveApplicationCgroup(suite);
@@ -1030,6 +1063,142 @@ int main(void)
     suite.expect(mothershipVDCSignal(identity, SIGCONT), "recovery_resumes_verified_process");
     (void)::kill(child, SIGKILL);
     (void)::waitpid(child, &status, 0);
+  }
+
+  // The shared private-state copier accepts only fresh directory/regular-file
+  // trees and never removes a pre-existing destination on rejection.
+  char copyRoot[] = "./vdc-private-copy-unit.XXXXXX";
+  if (::mkdtemp(copyRoot) != nullptr)
+  {
+    String source = {}, nested = {}, file = {}, destination = {}, copied = {};
+    source.snprintf<"{}/source"_ctv>(String(copyRoot));
+    nested.snprintf<"{}/nested"_ctv>(source);
+    file.snprintf<"{}/value"_ctv>(nested);
+    destination.snprintf<"{}/destination"_ctv>(String(copyRoot));
+    copied.snprintf<"{}/nested/value"_ctv>(destination);
+    suite.expect(::mkdir(source.c_str(), 0700) == 0 && ::mkdir(nested.c_str(), 0700) == 0,
+                 "recovery_private_copy_fixture_directories");
+    String payload = "private-state-value"_ctv;
+    suite.expect(mothershipVirtualDatacenterWriteFile(file, payload, 0600, &failure),
+                 "recovery_private_copy_fixture_file");
+    suite.expect(mothershipVDCCopyPrivateStateTree(source, destination, &failure),
+                 "recovery_private_copy_accepts_regular_tree");
+    String observed = {};
+    struct stat copiedState = {}, copiedDirectory = {};
+    suite.expect(mothershipVDCRead(copied, observed) && observed == payload &&
+                     ::stat(copied.c_str(), &copiedState) == 0 &&
+                     ::stat(destination.c_str(), &copiedDirectory) == 0 &&
+                     (copiedState.st_mode & 0777) == 0600 &&
+                     (copiedDirectory.st_mode & 0777) == 0700,
+                 "recovery_private_copy_preserves_bytes_with_private_modes");
+
+    String symlinkSource = {}, symlinkPath = {}, symlinkDestination = {};
+    symlinkSource.snprintf<"{}/symlink-source"_ctv>(String(copyRoot));
+    symlinkPath.snprintf<"{}/link"_ctv>(symlinkSource);
+    symlinkDestination.snprintf<"{}/symlink-destination"_ctv>(String(copyRoot));
+    suite.expect(::mkdir(symlinkSource.c_str(), 0700) == 0 &&
+                     ::symlink("/etc/passwd", symlinkPath.c_str()) == 0,
+                 "recovery_private_copy_symlink_fixture");
+    suite.expect(!mothershipVDCCopyPrivateStateTree(symlinkSource, symlinkDestination, &failure) &&
+                     ::access(symlinkDestination.c_str(), F_OK) != 0,
+                 "recovery_private_copy_rejects_symlink_and_removes_partial");
+
+    String existingDestination = {}, marker = {};
+    existingDestination.snprintf<"{}/existing"_ctv>(String(copyRoot));
+    marker.snprintf<"{}/marker"_ctv>(existingDestination);
+    suite.expect(::mkdir(existingDestination.c_str(), 0700) == 0 &&
+                     mothershipVirtualDatacenterWriteFile(marker, "keep"_ctv, 0600, &failure),
+                 "recovery_private_copy_existing_destination_fixture");
+    suite.expect(!mothershipVDCCopyPrivateStateTree(source, existingDestination, &failure) &&
+                     ::access(marker.c_str(), F_OK) == 0,
+                 "recovery_private_copy_never_removes_existing_destination");
+    std::error_code cleanupError = {};
+    std::filesystem::remove_all(copyRoot, cleanupError);
+  }
+  else suite.expect(false, "recovery_private_copy_fixture_root");
+
+  // Normal cleanup and abrupt owner death both resume only the recorded
+  // process identity.  The abrupt path uses _exit so no C++ destructor runs.
+  pid_t guarded = ::fork();
+  if (guarded == 0) { while (true) ::pause(); }
+  suite.expect(guarded > 0, "recovery_resume_guard_creates_owned_process");
+  if (guarded > 0)
+  {
+    MothershipVDCProcessIdentity identity = {};
+    suite.expect(mothershipVDCReadProcess(guarded, identity),
+                 "recovery_resume_guard_reads_identity");
+    {
+      MothershipVDCProcessResumeGuard guard(identity);
+      suite.expect(guard.freeze(&failure) &&
+                       mothershipVDCWaitForStoppedState(identity, true),
+                   "recovery_resume_guard_freezes_exact_process");
+      suite.expect(guard.resume(&failure) &&
+                       mothershipVDCWaitForStoppedState(identity, false),
+                   "recovery_resume_guard_normal_path_verifies_resume");
+    }
+    // A live but wedged owner gets a bounded rescue too.  Use a short test
+    // deadline while production capture allows the full remote timeout.
+    {
+      MothershipVDCProcessResumeGuard timeoutGuard(identity, 200);
+      suite.expect(timeoutGuard.freeze(&failure),
+                   "recovery_resume_guard_timeout_freezes_exact_process");
+      ::usleep(50'000);
+      suite.expect(mothershipVDCWaitForStoppedState(identity, true, 1),
+                   "recovery_resume_guard_honors_configured_deadline");
+      bool timeoutResumed = false;
+      for (unsigned attempt = 0; attempt < 200; ++attempt)
+      {
+        if (mothershipVDCWaitForStoppedState(identity, false, 1)) { timeoutResumed = true; break; }
+        ::usleep(10'000);
+      }
+      String timeoutFailure = {};
+      suite.expect(timeoutResumed && !timeoutGuard.resume(&timeoutFailure) &&
+                       std::strstr(timeoutFailure.c_str(), "watchdog intervened") != nullptr,
+                   "recovery_resume_guard_timeout_resumes_and_rejects_capture");
+    }
+
+    int ready[2] = {-1, -1};
+    const bool pipeReady = ::pipe2(ready, O_CLOEXEC) == 0;
+    suite.expect(pipeReady, "recovery_resume_guard_owner_death_pipe");
+    pid_t owner = pipeReady ? ::fork() : -1;
+    suite.expect(owner >= 0, "recovery_resume_guard_owner_death_fork");
+    if (owner == 0)
+    {
+      ::close(ready[0]);
+      MothershipVDCProcessResumeGuard guard(identity);
+      if (!guard.freeze(nullptr)) _exit(125);
+      const char byte = 'R';
+      if (::write(ready[1], &byte, 1) != 1) _exit(126);
+      _exit(99);
+    }
+    if (owner > 0)
+    {
+      ::close(ready[1]);
+      char byte = 0;
+      ssize_t got = -1;
+      do { got = ::read(ready[0], &byte, 1); } while (got < 0 && errno == EINTR);
+      ::close(ready[0]);
+      int ownerStatus = 0;
+      pid_t ownerWaited = -1;
+      do { ownerWaited = ::waitpid(owner, &ownerStatus, 0); } while (ownerWaited < 0 && errno == EINTR);
+      bool watchdogResumed = false;
+      for (unsigned attempt = 0; attempt < 200; ++attempt)
+      {
+        if (mothershipVDCWaitForStoppedState(identity, false, 1)) { watchdogResumed = true; break; }
+        ::usleep(10000);
+      }
+      suite.expect(got == 1 && byte == 'R' && ownerWaited == owner &&
+                       WIFEXITED(ownerStatus) && WEXITSTATUS(ownerStatus) == 99 && watchdogResumed,
+                   "recovery_resume_watchdog_recovers_abrupt_owner_death");
+    }
+    else if (pipeReady)
+    {
+      ::close(ready[0]);
+      ::close(ready[1]);
+    }
+    (void)::kill(guarded, SIGKILL);
+    int guardedStatus = 0;
+    (void)::waitpid(guarded, &guardedStatus, 0);
   }
 
   String provisionedPath = {};

@@ -475,13 +475,17 @@ static void prodigyDeriveBrainPeersFromSnapshot(Vector<ProdigyBootstrapConfig::B
   peers = snapshot.brainPeers;
 }
 
-static bool loadProdigyStartupState(const String& bootJSON, String& failure)
+static bool loadProdigyStartupState(
+    const String& bootJSON,
+    bool resetBrainSnapshot,
+    String& failure,
+    ProdigyPersistentStateStore& stateStore = persistentStateStore)
 {
   bool explicitBootJSON = (bootJSON.size() > 0);
 
   ProdigyPersistentBootState storedBootState = {};
   String storedBootFailure;
-  bool haveStoredBootState = persistentStateStore.loadBootState(storedBootState, &storedBootFailure);
+  bool haveStoredBootState = stateStore.loadBootState(storedBootState, &storedBootFailure);
 
   if (haveStoredBootState == false && storedBootFailure.size() > 0 && storedBootFailure != "record not found"_ctv)
   {
@@ -502,7 +506,7 @@ static bool loadProdigyStartupState(const String& bootJSON, String& failure)
       return false;
     }
 
-    if (persistentStateStore.saveBootState(persistentBootState, &failure) == false)
+    if (stateStore.saveBootState(persistentBootState, &failure) == false)
     {
       return false;
     }
@@ -516,12 +520,21 @@ static bool loadProdigyStartupState(const String& bootJSON, String& failure)
   effectiveBootstrapConfig = persistentBootState.bootstrapConfig;
 
   ProdigyPersistentBrainSnapshot storedBrainSnapshot = {};
-  String storedSnapshotFailure;
-  havePersistedBrainSnapshot = persistentStateStore.loadBrainSnapshot(storedBrainSnapshot, &storedSnapshotFailure);
-  if (havePersistedBrainSnapshot == false && storedSnapshotFailure.size() > 0 && storedSnapshotFailure != "record not found"_ctv)
+  if (resetBrainSnapshot == false)
   {
-    failure = storedSnapshotFailure;
-    return false;
+    String storedSnapshotFailure;
+    havePersistedBrainSnapshot = stateStore.loadBrainSnapshot(storedBrainSnapshot, &storedSnapshotFailure);
+    if (havePersistedBrainSnapshot == false && storedSnapshotFailure.size() > 0 && storedSnapshotFailure != "record not found"_ctv)
+    {
+      failure = storedSnapshotFailure;
+      return false;
+    }
+  }
+  else
+  {
+    // An explicit reset intentionally replaces this record below.  Do not
+    // decode stale bytes that the caller has authorized us to erase.
+    havePersistedBrainSnapshot = false;
   }
 
   if (havePersistedBrainSnapshot)
@@ -2307,7 +2320,7 @@ int main(int argc, char *argv[])
 
   Prodigy<ProdigyNeuron, ProdigyBrain, ProdigyHostControlNetwork>::prepareManagedSignalMask();
 
-  if (loadProdigyStartupState(bootJSON, failure) == false)
+  if (loadProdigyStartupState(bootJSON, resetBrainSnapshot, failure) == false)
   {
     std::fprintf(stderr, "failed to load prodigy startup state: %s\n", failure.c_str());
     return EXIT_FAILURE;

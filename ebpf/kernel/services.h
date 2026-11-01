@@ -115,6 +115,10 @@ __attribute__((__always_inline__)) static inline __u8 containerNetworkMode(void)
   {
     return CONTAINER_NETWORK_DENY;
   }
+  if (policy->isolationDeadlineNs != 0 && bpf_ktime_get_ns() < policy->isolationDeadlineNs)
+  {
+    return CONTAINER_NETWORK_DENY;
+  }
   return policy->mode;
 }
 
@@ -135,6 +139,15 @@ __attribute__((__always_inline__)) static inline bool containerEgressAllow4(__be
   key.port = port;
   key.addr = daddr;
   return bpf_map_lookup_elem(&ct_egress_allow, &key) != NULL;
+}
+
+__attribute__((__always_inline__)) static inline bool containerEgressAllow6(const __u8 daddr[16], __u8 proto, __be16 port)
+{
+  struct container_egress_allow6_key key = {};
+  key.proto = proto;
+  key.port = port;
+  bpf_memcpy(key.addr, daddr, sizeof(key.addr));
+  return bpf_map_lookup_elem(&ct_egr_allow6, &key) != NULL;
 }
 
 __attribute__((__always_inline__)) static inline __u32 containerInterContainerMTU(void)

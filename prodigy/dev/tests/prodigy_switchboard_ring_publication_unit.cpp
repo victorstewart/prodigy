@@ -205,6 +205,9 @@ struct FakeBPFKernel {
   std::unordered_map<int, container_id> firstEntry = {};
   std::unordered_map<int, uint32_t> innerUpdates = {};
   std::vector<Publication> publications = {};
+  // Outer maps retain inner-map objects after the userspace FD closes.
+  // Keep their current entries separate from historical publication receipts.
+  std::unordered_map<uint32_t, std::map<uint32_t, Publication>> outerMaps = {};
 
   struct QuicMap {
     uint32_t id = 0;
@@ -253,6 +256,7 @@ struct FakeBPFKernel {
     firstEntry.clear();
     innerUpdates.clear();
     publications.clear();
+    outerMaps.clear();
     quicMaps.clear();
     routerQuicMapID = 71001;
     ingressQuicMapID = 71002;
@@ -294,6 +298,7 @@ struct FakeBPFKernel {
     std::lock_guard lock(mutex);
     routingMapIDs.insert_or_assign(fd, id);
     routingMaps[id].clear();
+    outerMaps[id].clear();
   }
 
   void clearRoutingTrace(void)
@@ -519,6 +524,23 @@ struct FakeBPFKernel {
     publications.clear();
   }
 
+  bool outerSlotPresent(int fd, uint32_t slot)
+  {
+    std::lock_guard lock(mutex);
+    const auto map = outerMaps.find(mapIDForFD(fd));
+    return map != outerMaps.end() && map->second.contains(slot);
+  }
+
+  bool outerSlotComplete(int fd, uint32_t slot, uint8_t fragment)
+  {
+    std::lock_guard lock(mutex);
+    const auto map = outerMaps.find(mapIDForFD(fd));
+    if (map == outerMaps.end()) return false;
+    const auto entry = map->second.find(slot);
+    return entry != map->second.end() && innerMapComplete(entry->second) &&
+        firstEntryEquals(entry->second, fragment);
+  }
+
   bool allCreatedInnerClosed(void)
   {
     std::lock_guard lock(mutex);
@@ -553,6 +575,7 @@ static constexpr int routerEgressMapFD = 7041;
 static constexpr int ingressEgressMapFD = 7042;
 static constexpr int routerEgress4MapFD = 7051;
 static constexpr int ingressEgress4MapFD = 7052;
+static constexpr uintptr_t unavailableMapSentinel = 7099;
 
 static bool isRoutingMapFD(int fd)
 {
@@ -597,12 +620,16 @@ extern "C" int __wrap_bpf_map_update_elem(int fd, const void *key, const void *v
 {
   if (fd == routerRingMapFD || fd == ingressRingMapFD)
   {
+    if (!key || !value) { errno = EINVAL; return -1; }
     const uint32_t slot = *reinterpret_cast<const uint32_t *>(key);
     const int innerFD = *reinterpret_cast<const int *>(value);
     std::lock_guard lock(fakeKernel.mutex);
     fakeKernel.routingOperations += 1;
     fakeKernel.routingUpdates += 1;
     fakeKernel.noteRoutingOperation();
+    if (slot >= MAX_PORTALS) { errno = E2BIG; return -1; }
+    if (innerFD < 0 || !fakeKernel.innerUpdates.contains(innerFD) || fcntl(innerFD, F_GETFD) < 0)
+    { errno = EBADF; return -1; }
     if (fakeKernel.requireRetiredPortalsBeforeRingPublication)
     {
       const int portalFD = fd == routerRingMapFD ? routerPortalMapFD : ingressPortalMapFD;
@@ -618,9 +645,12 @@ extern "C" int __wrap_bpf_map_update_elem(int fd, const void *key, const void *v
     }
     const auto entry = fakeKernel.firstEntry.find(innerFD);
     const auto updates = fakeKernel.innerUpdates.find(innerFD);
-    fakeKernel.publications.push_back({fd, slot, innerFD,
-                                       entry == fakeKernel.firstEntry.end() ? container_id{} : entry->second,
-                                       updates == fakeKernel.innerUpdates.end() ? 0u : updates->second});
+    const FakeBPFKernel::Publication publication = {
+        fd, slot, innerFD,
+        entry == fakeKernel.firstEntry.end() ? container_id{} : entry->second,
+        updates == fakeKernel.innerUpdates.end() ? 0u : updates->second};
+    fakeKernel.outerMaps[fakeKernel.mapIDForFD(fd)].insert_or_assign(slot, publication);
+    fakeKernel.publications.push_back(publication);
     return 0;
   }
 
@@ -688,6 +718,14 @@ extern "C" struct bpf_map *__wrap_bpf_object__find_map_by_name(const struct bpf_
   const bool targets = name != nullptr && std::strcmp(name, "wh_targets") == 0;
   const bool egress = name != nullptr && std::strcmp(name, "wh_egress") == 0;
   const bool egress4 = name != nullptr && std::strcmp(name, "wh_egress4") == 0;
+  const bool portals = name != nullptr && std::strcmp(name, "ext_portals") == 0;
+  // Neuron also asks about overlay maps; this fixture owns only portal maps.
+  // A null lookup makes BPFProgram enumerate the ELF through real libbpf,
+  // which cannot dereference these fake object identities. Model an ELF map
+  // without a live FD instead, preserving the unavailable-map result.
+  if (!rings && !quic && !targets && !egress && !egress4 && !portals)
+    return program == routerRingMapFD || program == ingressRingMapFD
+        ? reinterpret_cast<struct bpf_map *>(unavailableMapSentinel) : nullptr;
   if (program == routerRingMapFD)
   {
     return reinterpret_cast<struct bpf_map *>(rings ? uintptr_t(routerRingMapFD) : quic ? uintptr_t(routerQuicMapFD) : targets ? uintptr_t(routerTargetMapFD) : egress ? uintptr_t(routerEgressMapFD) : egress4 ? uintptr_t(routerEgress4MapFD) : uintptr_t(routerPortalMapFD));
@@ -698,6 +736,7 @@ extern "C" struct bpf_map *__wrap_bpf_object__find_map_by_name(const struct bpf_
 
 extern "C" int __wrap_bpf_map__fd(const struct bpf_map *map)
 {
+  if (reinterpret_cast<uintptr_t>(map) == unavailableMapSentinel) return -1;
   const int fd = int(reinterpret_cast<uintptr_t>(map));
   // The ELF may declare these maps, but an adopted balancer has no live FDs
   // for maps its BPF instructions never reference.
@@ -817,6 +856,21 @@ extern "C" int __wrap_bpf_map_get_next_key(int fd, const void *key, void *next)
 
 extern "C" int __wrap_bpf_map_delete_elem(int fd, const void *key)
 {
+  if (fd == routerRingMapFD || fd == ingressRingMapFD)
+  {
+    if (!key) { errno = EINVAL; return -1; }
+    fakeKernel.delayRoutingCall();
+    std::lock_guard lock(fakeKernel.mutex);
+    fakeKernel.routingOperations += 1;
+    fakeKernel.routingDeletes += 1;
+    fakeKernel.noteRoutingOperation();
+    if (fakeKernel.failRouting || fakeKernel.failRoutingDelete) { errno = EIO; return -1; }
+    const uint32_t slot = *static_cast<const uint32_t *>(key);
+    if (slot >= MAX_PORTALS) { errno = E2BIG; return -1; }
+    auto& map = fakeKernel.outerMaps[fakeKernel.mapIDForFD(fd)];
+    if (!map.erase(slot)) { errno = ENOENT; return -1; }
+    return 0;
+  }
   if (isRoutingMapFD(fd))
   {
     fakeKernel.delayRoutingCall();
@@ -835,6 +889,17 @@ extern "C" int __wrap_bpf_map_delete_elem(int fd, const void *key)
 
 class SwitchboardRingTestAccess {
 public:
+  static void retainFakeBoundary(Switchboard& board, EthDevice *device)
+  {
+    board.additionalIngressEth = device;
+  }
+  static SwitchboardPortal *gatewayPortal(Switchboard& board, uint16_t port)
+  {
+    for (auto *portal : board.portals)
+      if (portal->gatewayListener && portal->port == port) return portal;
+    return nullptr;
+  }
+  static bool privateBGPConsumer(const Switchboard& board) { return board.privateBGPBoundaryConsumer; }
   static void installPrograms(Switchboard& board, BPFProgram& router, BPFProgram& ingress)
   {
     router.obj = reinterpret_cast<struct bpf_object *>(uintptr_t(routerRingMapFD));
@@ -2203,9 +2268,228 @@ static void runNonQuicPortalRetirementBeforeRingReassignment(TestSuite& suite)
   SwitchboardRingTestAccess::detachFakePrograms(board, router, ingress);
 }
 
+class GatewayPortalReplayNeuron final : public Neuron {
+public:
+  Switchboard& prepare(const CrossClusterMasqueGatewayAuthority& authority,
+                       BPFProgram& router, BPFProgram& ingress)
+  {
+    uuid = authority.localMachineUUID;
+    controlTransportCredentials.self.clusterUUID = authority.localClusterUUID;
+    eth.ifidx = 2; eth.mtu = 9000;
+    lcsubnet6.dpfx = authority.localDatacenterFragment;
+    lcsubnet6.mpfx[0] = 1; lcsubnet6.mpfx[1] = 2; lcsubnet6.mpfx[2] = 3;
+    switchboard = std::make_unique<Switchboard>(eth);
+    switchboard->setLocalContainerSubnet(lcsubnet6);
+    SwitchboardRingTestAccess::installPrograms(*switchboard, router, ingress);
+    // Keep the fake XDP identity installed across the ordinary reset, as an
+    // existing secondary ingress does. No real interface is opened or attached.
+    SwitchboardRingTestAccess::retainFakeBoundary(*switchboard, &eth);
+    tcx_ingress_program = &ingress;
+    // This fake router already owns the ingress and egress binding maps.
+    // Typed portal admission requires both host routing roles to be present.
+    tcx_egress_program = &ingress;
+    return *switchboard;
+  }
+
+  bool project(const CrossClusterMasqueGatewayAuthority& authority)
+  {
+    ProdigyCrossClusterMasqueGatewayAuthorityProjection projection = {};
+    projection.authorities.push_back(authority);
+    return reconcileCrossClusterMasqueGatewayAuthorityProjection(projection);
+  }
+
+  bool admit(Container& container)
+  {
+    if (!admitCrossClusterMasqueGatewaySystemPlan(container.plan))
+    {
+      dprintf(STDERR_FILENO, "GATEWAY_PORTAL_REPLAY_SETUP failed_stage=typed_plan_admission\n");
+      return false;
+    }
+    auto *runtime = crossClusterMasqueGatewayRuntimeForPair(container.plan.system.gatewayPairUUID);
+    runtime->systemContainerUUID = container.plan.uuid;
+    runtime->systemPlanAdmitted = true;
+    containers.insert_or_assign(container.plan.uuid, &container);
+    SwitchboardWormholeDesiredState desired = {};
+    if (!buildContainerWormholeDesiredState(container.plan, container.plan.wormholes, desired))
+    {
+      dprintf(STDERR_FILENO, "GATEWAY_PORTAL_REPLAY_SETUP failed_stage=desired_state\n");
+      return false;
+    }
+    const bool applied = applyContainerSwitchboardWormholes(&container, desired);
+    if (!applied)
+      dprintf(STDERR_FILENO, "GATEWAY_PORTAL_REPLAY_SETUP failed_stage=portal_application\n");
+    return applied;
+  }
+
+  void setAdmitted(uint128_t pair, bool admitted)
+  {
+    crossClusterMasqueGatewayRuntimeForPair(pair)->systemPlanAdmitted = admitted;
+  }
+
+  bool ready(uint128_t pair)
+  {
+    return crossClusterMasqueGatewayRuntimeForPair(pair)->readiness.authenticatedMasqueQUICReady;
+  }
+
+  void resetThroughControlOwner()
+  {
+    String frame = {};
+    Message::appendEcho(frame, static_cast<uint16_t>(NeuronTopic::resetSwitchboardState));
+    neuronHandler(reinterpret_cast<Message *>(frame.data()));
+  }
+
+  void finish(BPFProgram& router, BPFProgram& ingress)
+  {
+    containers.clear();
+    SwitchboardRingTestAccess::retainFakeBoundary(*switchboard, nullptr);
+    SwitchboardRingTestAccess::detachFakePrograms(*switchboard, router, ingress);
+    tcx_ingress_program = nullptr;
+    tcx_egress_program = nullptr;
+    switchboard->setHostEgressRouter(nullptr);
+  }
+};
+
+static void runGatewayPortalAuthorityReplay(TestSuite& suite)
+{
+  TestRing ring = {};
+  fakeKernel.reset();
+  BPFProgram router = {}, ingress = {};
+  GatewayPortalReplayNeuron neuron = {};
+  CrossClusterMasqueGatewayAuthority authority = {};
+  authority.pairUUID = 0x5710; authority.pairOperationUUID = 0x5711;
+  authority.localClusterUUID = 0x5720; authority.peerClusterUUID = 0x5721;
+  authority.localMachineUUID = 0x5730; authority.peerMachineUUID = 0x5731;
+  authority.localDatacenterFragment = 1; authority.peerDatacenterFragment = 2;
+  authority.localSitePrefix = prodigyContainerDatacenterSitePrefix(1);
+  authority.peerSitePrefix = prodigyContainerDatacenterSitePrefix(2);
+  authority.artifactSHA256.assign("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
+  authority.artifactBytes = 1;
+  authority.listenerPublicUDPEndpoint = IPAddress("104.238.130.39", false);
+  authority.listenerPublicUDPPort = 32001;
+  authority.privateTunnelInterface.assign("mtbgpreplay"_ctv);
+  authority.privateTunnelLocalIPv6 = IPAddress("fd00::", true);
+  authority.privateTunnelPeerIPv6 = IPAddress("fd00::1", true);
+  authority.privateLocalASN = 64512; authority.privatePeerASN = 64513;
+  authority.privateLocalBGPID = 1; authority.privatePeerBGPID = 2;
+  authority.privateSessionCredentialSHA256 = authority.artifactSHA256;
+  authority.localIdentitySHA256 = authority.artifactSHA256;
+  authority.peerIdentitySHA256 = authority.artifactSHA256;
+  authority.peerTrustSHA256 = authority.artifactSHA256;
+  authority.generation = 1; authority.pairAuthorityGeneration = 7; authority.keyGeneration = 3;
+  authority.localRole = CrossClusterMasqueGatewayRole::listener;
+  authority.state = CrossClusterMasqueGatewayState::active;
+  Switchboard& board = neuron.prepare(authority, router, ingress);
+  suite.expect(neuron.project(authority), "gateway_portal_replay_accepts_initial_authority");
+
+  Container gateway = {};
+  gateway.pid = 4242; // An admitted process identity, never launched by this fixture.
+  gateway.plan.uuid = 0x5740;
+  gateway.plan.fragment = prodigyCrossClusterMasqueGatewayRuntimeFragmentFirst;
+  gateway.plan.restartOnFailure = true;
+  gateway.plan.system.kind = SystemContainerKind::crossClusterMasqueGateway;
+  gateway.plan.config.capabilities.insert(CAP_NET_ADMIN);
+  gateway.plan.system.artifact.sha256 = authority.artifactSHA256;
+  gateway.plan.system.artifact.bytes = authority.artifactBytes;
+  gateway.plan.system.egress = prodigyCrossClusterMasqueGatewayEgressPolicy(authority);
+  suite.expect(prodigyBindCrossClusterMasqueGatewayRuntimePlanAuthority(gateway.plan.system, authority) &&
+                   prodigyCrossClusterMasqueGatewayWormholes(authority, gateway.plan.wormholes) && neuron.admit(gateway),
+               "gateway_portal_replay_establishes_exact_admitted_listener");
+  const pid_t originalPID = gateway.pid;
+  const uint128_t originalUUID = gateway.plan.uuid;
+  const uint32_t localID = 0xfc010203;
+  auto settle = [&]() {
+    bool receipt = false, ready = false;
+    board.whenRingsReady(localID, [&](bool value) { receipt = true; ready = value; });
+    return ring.runUntil([&] { return receipt; }) && ready;
+  };
+  auto published = [&]() {
+    auto *portal = SwitchboardRingTestAccess::gatewayPortal(board, 32001);
+    if (!portal) return false;
+    const portal_definition definition = portal->generatePortalDefinition();
+    const portal_meta meta = {.flags = 0, .slot = portal->slot};
+    switchboard_wormhole_target_key key = {};
+    if (!SwitchboardRingTestAccess::targetKey(board, portal, localID, key)) return false;
+    const __u16 port = htons(uint16_t(32001));
+    bool routerRing = false, ingressRing = false;
+    for (const auto& publication : fakeKernel.published()) {
+      if (publication.slot != portal->slot || !FakeBPFKernel::innerMapComplete(publication) ||
+          !FakeBPFKernel::firstEntryEquals(publication, gateway.plan.fragment)) continue;
+      routerRing |= publication.programFD == routerRingMapFD;
+      ingressRing |= publication.programFD == ingressRingMapFD;
+    }
+    return routerRing && ingressRing &&
+        fakeKernel.outerSlotComplete(routerRingMapFD, portal->slot, gateway.plan.fragment) &&
+        fakeKernel.outerSlotComplete(ingressRingMapFD, portal->slot, gateway.plan.fragment) &&
+        fakeKernel.routingValueEquals(routerPortalMapFD, definition, meta) &&
+        fakeKernel.routingValueEquals(ingressPortalMapFD, definition, meta) &&
+        fakeKernel.routingValueEquals(routerTargetMapFD, key, port) &&
+        fakeKernel.routingValueEquals(ingressTargetMapFD, key, port);
+  };
+  suite.expect(settle() && published(), "gateway_portal_replay_initial_maps_and_rings_converge");
+  neuron.resetThroughControlOwner();
+  suite.expect(SwitchboardRingTestAccess::portalCount(board) == 0 && settle(),
+               "gateway_portal_replay_normal_reset_removes_endpoints");
+  auto *application = SwitchboardRingTestAccess::addPortal(board, 0x03000401u);
+  suite.expect(SwitchboardRingTestAccess::generate(board, application) && settle(),
+               "gateway_portal_replay_application_portal_survives_independently");
+  const uint32_t oldApplicationSlot = application->slot;
+  fakeKernel.clearPublications();
+  suite.expect(neuron.project(authority) && settle() && published() &&
+                   SwitchboardRingTestAccess::portalCount(board) == 2 &&
+                   application->slot != oldApplicationSlot &&
+                   !fakeKernel.outerSlotPresent(routerRingMapFD, oldApplicationSlot) &&
+                   !fakeKernel.outerSlotPresent(ingressRingMapFD, oldApplicationSlot) &&
+                   fakeKernel.outerSlotComplete(routerRingMapFD, application->slot, 0x03) &&
+                   fakeKernel.outerSlotComplete(ingressRingMapFD, application->slot, 0x03) &&
+                   gateway.pid == originalPID && gateway.plan.uuid == originalUUID && !neuron.ready(authority.pairUUID),
+               "gateway_portal_replay_restores_same_live_listener_without_fabricating_quic_readiness");
+
+  neuron.resetThroughControlOwner();
+  neuron.setAdmitted(authority.pairUUID, false);
+  suite.expect(neuron.project(authority) && settle() && SwitchboardRingTestAccess::portalCount(board) == 0,
+               "gateway_portal_replay_unadmitted_process_cannot_restore_endpoint");
+  neuron.setAdmitted(authority.pairUUID, true);
+  gateway.pendingDestroy = true;
+  suite.expect(neuron.project(authority) && settle() && SwitchboardRingTestAccess::portalCount(board) == 0,
+               "gateway_portal_replay_pending_destroy_cannot_restore_endpoint");
+  gateway.pendingDestroy = false;
+  auto conflict = authority; ++conflict.artifactBytes;
+  suite.expect(!neuron.project(conflict) && SwitchboardRingTestAccess::portalCount(board) == 0,
+               "gateway_portal_replay_equal_generation_conflict_stays_fenced");
+  suite.expect(neuron.retireContainerLaunch(originalUUID) && neuron.project(authority) && settle() &&
+                   SwitchboardRingTestAccess::portalCount(board) == 0,
+               "gateway_portal_replay_retired_process_cannot_restore_endpoint");
+  suite.expect(ring.runUntil([&] { return board.quiesceRingPreparationForExec(); }),
+               "gateway_portal_replay_drains_existing_ring_owner");
+  neuron.finish(router, ingress);
+  gateway.pid = 0;
+}
+
 int main()
 {
   TestSuite suite = {};
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && std::strcmp(only, "gateway-portal-replay") == 0)
+  {
+    runGatewayPortalAuthorityReplay(suite);
+    dprintf(STDERR_FILENO, "GATEWAY_PORTAL_REPLAY_RESULT failed_assertions=%d\n", suite.failed);
+    return suite.failed == 0 ? 0 : 1;
+  }
+  runGatewayPortalAuthorityReplay(suite);
+  {
+    EthDevice eth = {};
+    BPFProgram router = {};
+    Switchboard board(eth);
+    // Missing subnet fails closed but retains the consumer for a later retry.
+    suite.expect(!board.setPrivateBGPBoundaryConsumer(true) && SwitchboardRingTestAccess::privateBGPConsumer(board),
+                 "private_bgp_boundary_consumer_retries_failed_initialization");
+    SwitchboardRingTestAccess::installRouterOnly(board, router);
+    board.resetState();
+    suite.expect(board.boundaryRouterProgram() == &router,
+                 "private_bgp_boundary_consumer_survives_reset_without_portals");
+    SwitchboardRingTestAccess::detachRouterOnly(board, router);
+    suite.expect(board.setPrivateBGPBoundaryConsumer(false) && !SwitchboardRingTestAccess::privateBGPConsumer(board),
+                 "private_bgp_boundary_consumer_released_after_last_fallback");
+  }
   runOwnerPublicationSuccess(suite);
   runOwnerStaleGeneration(suite);
   runOwnerResetCancelsLateWorker(suite);

@@ -119,6 +119,10 @@ struct MothershipUpgradePlannerInput {
   // has no Mothership-managed deployment at all.  This is a distinct
   // no-workload receipt, not a claim that a public workload is healthy.
   bool noManagedPublicWorkloads = false;
+  // An operator may explicitly accept interruption of disposable workloads
+  // during a serial same-cluster runtime rollout. This is not a public
+  // continuity claim and is never inferred from deployment inventory.
+  bool operatorAcceptedActiveWorkloadInterruption = false;
   bool emptyIsolatedTestCluster = false;
   uint32_t healthyBrains = 0;
   uint64_t freeBytes = 0;
@@ -478,6 +482,7 @@ static inline bool mothershipUpgradePlanInputDigest(const MothershipUpgradeContr
   mothershipUpgradeAppendBool(encoded, input.providerGatewayAvoidsHostNetworkMutation);
   mothershipUpgradeAppendBool(encoded, input.publicBaselineHealthy);
   mothershipUpgradeAppendBool(encoded, input.noManagedPublicWorkloads);
+  mothershipUpgradeAppendBool(encoded, input.operatorAcceptedActiveWorkloadInterruption);
   mothershipUpgradeAppendBool(encoded, input.emptyIsolatedTestCluster);
   mothershipUpgradeAppendUInt(encoded, input.healthyBrains);
   mothershipUpgradeAppendUInt(encoded,
@@ -564,7 +569,15 @@ static inline MothershipUpgradePlan mothershipPlanUpgrade(const MothershipUpgrad
     mothershipUpgradeReject(plan, "no-public-workload receipt contains workloads"_ctv);
     return plan;
   }
-  if (!input.publicBaselineHealthy && !input.emptyIsolatedTestCluster && !input.noManagedPublicWorkloads)
+  if (input.operatorAcceptedActiveWorkloadInterruption &&
+      (!input.workloads.empty() || input.emptyIsolatedTestCluster || input.noManagedPublicWorkloads ||
+       input.requestSeparateCluster || input.requestProviderRelocation))
+  {
+    mothershipUpgradeReject(plan, "active-workload interruption acceptance conflicts with continuity or relocation evidence"_ctv);
+    return plan;
+  }
+  if (!input.publicBaselineHealthy && !input.emptyIsolatedTestCluster && !input.noManagedPublicWorkloads &&
+      !input.operatorAcceptedActiveWorkloadInterruption)
   {
     mothershipUpgradeReject(plan, "public baseline is unqualified"_ctv);
     return plan;
@@ -630,6 +643,11 @@ static inline MothershipUpgradePlan mothershipPlanUpgrade(const MothershipUpgrad
   {
     plan.path = MothershipUpgradePath::sameLogicalRollout;
     plan.requiredPreconditions.push_back("serial follower update capability verified"_ctv);
+    if (input.operatorAcceptedActiveWorkloadInterruption)
+    {
+      plan.requiredPreconditions.push_back("operator accepted interruption of disposable active workloads"_ctv);
+      mothershipUpgradeReceipt(plan, "activeWorkloadInterruptionAccepted"_ctv);
+    }
     mothershipUpgradeReceipt(plan, "bundleStaged"_ctv);
     mothershipUpgradeReceipt(plan, "follower1Ready"_ctv);
     mothershipUpgradeReceipt(plan, "follower2Ready"_ctv);

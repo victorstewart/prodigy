@@ -11,6 +11,52 @@
 
 #include <prodigy/container.services.h>
 
+// Radar/Pulse have one logical graph.  The current all-master graph profile
+// serves locally at every site; the older retained-source profile remains
+// readable for recovery, where a second cluster has a non-client copy.  Keep
+// both shapes here so an absent client prefix cannot turn an arbitrary
+// stateful application into a replica.  The unused cousin/sharding declarations
+// retain their canonical wire identities; neverShard prevents them from
+// becoming runtime roles.
+static inline bool prodigyGraphDeploymentPlanCanonical(const DeploymentPlan& plan, bool replica)
+{
+  const uint16_t app = plan.config.applicationID;
+  const bool common = (app == 2 || app == 5) && plan.isStateful && plan.config.type == ApplicationType::stateful &&
+      plan.stateful.neverShard &&
+      plan.stateful.siblingPrefix == prodigyRuntimeStatefulServicePrefix(app, 2) &&
+      plan.stateful.cousinPrefix == prodigyRuntimeStatefulServicePrefix(app, 3) &&
+      plan.stateful.seedingPrefix == prodigyRuntimeStatefulServicePrefix(app, 4) &&
+      plan.stateful.shardingPrefix == prodigyRuntimeStatefulServicePrefix(app, 5) &&
+      plan.horizontalScalers.empty() && plan.verticalScalers.empty() && plan.canaryCount == 0 &&
+      plan.canariesMustLiveForMinutes == 0 && !plan.useHostNetworkNamespace &&
+      plan.advertisements.empty() && plan.subscriptions.empty() && plan.wormholes.empty() && plan.publicTLS.empty();
+  if (!common) return false;
+  if (plan.stateful.allMasters) {
+    return !replica && !plan.stateful.seedingAlways && plan.whiteholes.empty() &&
+        plan.stateful.clientPrefix == prodigyRuntimeStatefulServicePrefix(app, 1);
+  }
+  if (plan.whiteholes.size() != 1) return false;
+  const auto& egress = plan.whiteholes[0];
+  return plan.stateful.seedingAlways &&
+      plan.stateful.clientPrefix == (replica ? 0 : prodigyRuntimeStatefulServicePrefix(app, 1)) &&
+      egress.transport == ExternalAddressTransport::tcp && egress.family == ExternalAddressFamily::ipv6 &&
+      (egress.source == ExternalAddressSource::registeredRoutablePrefix || egress.source == ExternalAddressSource::hostPublicAddress) &&
+      !egress.hasAddress && egress.address.isNull() &&
+      egress.sourcePort == 0 && egress.bindingNonce == 0;
+}
+
+static inline bool prodigyGraphTopologyCanonical(const DeploymentPlan& plan, const StatefulTopology& topology,
+                                                uint32_t nShardGroups)
+{
+  const bool replica = prodigyGraphDeploymentPlanCanonical(plan, true);
+  const uint32_t workers = prodigyStatefulWorkerCountForLogicalCores(plan.config.nLogicalCores);
+  return (replica || prodigyGraphDeploymentPlanCanonical(plan, false)) && nShardGroups == 1 &&
+      topology.shardGroup == 0 && topology.operationID == 0 && topology.bridgeMode == StatefulTopologyBridgeMode::none &&
+      workers != 0 && topology.workerCount == workers && topology.topologyEpoch == workers &&
+      topology.sourceEpoch == workers && topology.targetEpoch == workers &&
+      topology.servingMode == (replica ? StatefulTopologyServingMode::catchupOnly : StatefulTopologyServingMode::serve);
+}
+
 // The compact startup wire format omits CPU mode and requested millis. Its
 // default values are not observations; the sealed deployment remains their owner.
 static inline void prodigyRestoreRetainedStartupCPUFields(const String& raw,
@@ -141,6 +187,14 @@ static inline bool prodigyBuildRetainedContainerBootstrap(
       : StatefulMeshRoles{};
   const bool application = deployment.isStateful &&
       parameters.statefulTopology.servingMode == StatefulTopologyServingMode::applicationDataAuthority;
+  const bool graph = deployment.config.applicationID == 2 || deployment.config.applicationID == 5;
+  const bool graphReplica = prodigyGraphDeploymentPlanCanonical(deployment, true);
+  if (graph && !prodigyGraphTopologyCanonical(deployment, parameters.statefulTopology, 1))
+    return prodigyRetainedRecoveryFail(failure, "graph recovery requires canonical group-zero owner or non-client replica");
+  if (graph && !deployment.stateful.allMasters &&
+      (parameters.whiteholes.size() != 1 || !resolvedWhiteholesValid(parameters.whiteholes) ||
+      parameters.whiteholes[0].source != deployment.whiteholes[0].source))
+    return prodigyRetainedRecoveryFail(failure, "graph recovery requires its exact resolved IPv6 egress binding");
   if (application) {
     const auto *member = applicationAuthority ? [&]() -> const ProdigyStatefulServingAuthorityMember * {
       for (const auto& value : applicationAuthority->members)
@@ -164,8 +218,8 @@ static inline bool prodigyBuildRetainedContainerBootstrap(
        parameters.statefulTopology.sourceEpoch != parameters.statefulTopology.topologyEpoch ||
        parameters.statefulTopology.targetEpoch != parameters.statefulTopology.topologyEpoch ||
        parameters.statefulTopology.workerCount != prodigyStatefulWorkerCountForLogicalCores(config.nLogicalCores) ||
-       parameters.statefulTopology.servingMode != StatefulTopologyServingMode::serve ||
-       expectedRoles.client == 0 || expectedRoles.sibling == 0 || expectedRoles.seeding == 0))
+       parameters.statefulTopology.servingMode != (graphReplica ? StatefulTopologyServingMode::catchupOnly : StatefulTopologyServingMode::serve) ||
+       (!graphReplica && expectedRoles.client == 0) || expectedRoles.sibling == 0 || expectedRoles.seeding == 0))
   {
     return prodigyRetainedRecoveryFail(failure, "retained recovery permits only one-shard non-transitioning stateful deployment");
   }

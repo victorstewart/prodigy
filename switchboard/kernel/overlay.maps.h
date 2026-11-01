@@ -42,6 +42,15 @@ struct {
   __uint(max_entries, 1024);
 } ovl_mach_full SEC(".maps");
 
+// Versioned separately from ovl_mach_full so an old pinned single-route map
+// is never reinterpreted as a larger route-set value.
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __type(key, struct switchboard_overlay_machine_route_key);
+  __type(value, struct switchboard_overlay_site_route_set);
+  __uint(max_entries, 256);
+} ovl_site_rts_v2 SEC(".maps");
+
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __type(key, struct switchboard_overlay_machine_route_key);

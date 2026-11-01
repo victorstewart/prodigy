@@ -3,7 +3,7 @@
 #include <array>
 #include <cstdint>
 
-#include <networking/includes.h>
+#include <basics/includes.h>
 #include <services/bitsery.h>
 #include <networking/ip.h>
 #include <services/prodigy.h>
@@ -25,6 +25,10 @@ enum class CousinRouteState : uint8_t {
   withdrawn = 3,
   revoked = 4
 };
+
+// Version-three routes select the container overlay explicitly. Older records
+// always retain their external-wormhole interpretation.
+enum class CousinRouteEndpointKind : uint8_t { externalWormhole = 1, privateContainer = 2 };
 
 // This is routing authorization only. logicalWorkloadUUID identifies the
 // operator-approved routing domain; it is deliberately not application data
@@ -64,6 +68,7 @@ public:
   // to bind that authoritative range before installing the route.
   uint8_t destinationCIDR = 0;
   uint16_t pathMTU = 0;
+  CousinRouteEndpointKind endpointKind = CousinRouteEndpointKind::externalWormhole;
 
   uint64_t generation = 0;
   int64_t issuedAtMs = 0;
@@ -169,6 +174,7 @@ static void serialize(S&& serializer, CousinRouteRecord& route)
     serializer.value1b(route.destinationCIDR);
     serializer.value2b(route.pathMTU);
   }
+  if (route.version >= 3) serializer.value1b(route.endpointKind);
   serializer.value8b(route.generation);
   serializer.value8b(route.issuedAtMs);
   serializer.value8b(route.expiresAtMs);
@@ -240,7 +246,7 @@ static inline bool cousinRouteTerminal(const CousinRouteRecord& route)
 
 static inline bool cousinRouteCurrentContract(const CousinRouteRecord& route)
 {
-  return route.version == 2;
+  return route.version == 2 || route.version == 3;
 }
 
 static inline bool cousinRouteDestinationRangeContainsAddress(const CousinRouteRecord& route,
@@ -253,13 +259,13 @@ static inline bool cousinRouteDestinationRangeContainsAddress(const CousinRouteR
 
 static inline bool cousinRouteStructurallyValid(const CousinRouteRecord& route)
 {
-  if ((route.version != 1 && route.version != 2) || route.routeUUID == 0 || route.operationUUID == 0 || route.pairUUID == 0 || route.logicalWorkloadUUID == 0 || route.logicalServiceUUID == 0 ||
+  if ((route.version != 1 && route.version != 2 && route.version != 3) || route.routeUUID == 0 || route.operationUUID == 0 || route.pairUUID == 0 || route.logicalWorkloadUUID == 0 || route.logicalServiceUUID == 0 ||
       route.sourceClusterUUID == 0 || route.destinationClusterUUID == 0 || route.sourceClusterUUID == route.destinationClusterUUID ||
       route.sourceApplicationID == 0 || route.destinationApplicationID == 0 ||
       !MeshServices::isPrefix(route.sourceCousinServicePrefix) || !MeshServices::isPrefix(route.destinationCousinServicePrefix) ||
       cousinRouteServiceApplicationID(route.sourceCousinServicePrefix) != route.sourceApplicationID ||
       cousinRouteServiceApplicationID(route.destinationCousinServicePrefix) != route.destinationApplicationID ||
-      route.slots.empty() || route.destinationRoutablePrefixUUID == 0 || route.destinationPublicAddress.is6 == false ||
+      route.slots.empty() || route.destinationPublicAddress.is6 == false ||
       route.destinationPublicAddress.isNull() || route.destinationTCPPort == 0 || route.generation == 0 ||
       route.issuedAtMs <= 0 || route.expiresAtMs <= route.issuedAtMs ||
       route.expiresAtMs - route.issuedAtMs > cousinRouteMaximumLifetimeMs || route.keyEpoch == 0 ||
@@ -267,6 +273,8 @@ static inline bool cousinRouteStructurallyValid(const CousinRouteRecord& route)
   {
     return false;
   }
+  if (route.version < 3 ? (route.endpointKind != CousinRouteEndpointKind::externalWormhole || route.destinationRoutablePrefixUUID == 0) :
+      (route.endpointKind != CousinRouteEndpointKind::privateContainer || route.destinationRoutablePrefixUUID != 0 || route.destinationCIDR != 128)) return false;
   if (cousinRouteCurrentContract(route) &&
       (route.sourcePermissionUUID == 0 || route.destinationPermissionUUID == 0 ||
        route.transportProtocol != IPPROTO_TCP || route.destinationCIDR == 0 || route.destinationCIDR > 128 ||
@@ -403,7 +411,7 @@ static inline bool cousinRouteScopeMatches(const CousinRouteRecord& lhs, const C
          lhs.version == rhs.version && lhs.sourcePermissionUUID == rhs.sourcePermissionUUID &&
          lhs.destinationPermissionUUID == rhs.destinationPermissionUUID &&
          lhs.transportProtocol == rhs.transportProtocol && lhs.destinationCIDR == rhs.destinationCIDR &&
-         lhs.pathMTU == rhs.pathMTU;
+         lhs.pathMTU == rhs.pathMTU && lhs.endpointKind == rhs.endpointKind;
 }
 
 // Two independently named routes may share a pair and workload, but they may
@@ -420,7 +428,8 @@ static inline bool cousinRoutePeerRangeScopeMatches(const CousinRouteRecord& lhs
          lhs.destinationCousinServicePrefix == rhs.destinationCousinServicePrefix && lhs.slots == rhs.slots &&
          lhs.destinationRoutablePrefixUUID == rhs.destinationRoutablePrefixUUID &&
          lhs.transportProtocol == rhs.transportProtocol && lhs.destinationCIDR == rhs.destinationCIDR &&
-         lhs.destinationPublicAddress.equals(rhs.destinationPublicAddress) && lhs.destinationTCPPort == rhs.destinationTCPPort;
+         lhs.destinationPublicAddress.equals(rhs.destinationPublicAddress) && lhs.destinationTCPPort == rhs.destinationTCPPort &&
+         lhs.endpointKind == rhs.endpointKind;
 }
 
 // Shared by Mothership's registry and Brain's durable-half owner.  Neither may

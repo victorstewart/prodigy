@@ -1,4 +1,5 @@
 #include <prodigy/ingress.validation.h>
+#include <prodigy/pair.private.bgp.secret.h>
 #include <prodigy/wire.h>
 #include <prodigy/bundle.artifact.h>
 #include <services/debug.h>
@@ -686,6 +687,81 @@ int main(void)
   TestSuite suite;
 
   {
+    ProdigyStatelessDeploymentAdmission admission = {};
+    admission.operationID = uint128_t(1);
+    admission.clusterUUID = uint128_t(2);
+    admission.applicationID = 62010;
+    admission.versionID = 4;
+    admission.deploymentID = (uint64_t(admission.applicationID) << 48) | admission.versionID;
+    admission.requestPlanSHA256.assign("1111111111111111111111111111111111111111111111111111111111111111"_ctv);
+    admission.normalizedPlanSHA256.assign("2222222222222222222222222222222222222222222222222222222222222222"_ctv);
+    admission.artifactSHA256.assign("3333333333333333333333333333333333333333333333333333333333333333"_ctv);
+    admission.artifactBytes = 12;
+    admission.acceptedAuthorityGeneration = 2;
+    admission.acceptedMasterUUID = uint128_t(3);
+    admission.acceptedMasterBootNs = 4;
+    ProdigyMasterAuthorityRuntimeState state = {};
+    state.generation = 3;
+    state.statelessDeploymentAdmissions.push_back(admission);
+    String legacy = {};
+    BitseryEngine::serialize(legacy, state);
+    ProdigyStatelessDeploymentRetirement retirement = {};
+    retirement.predecessorDeploymentID = admission.deploymentID;
+    retirement.successorDeploymentID = (uint64_t(admission.applicationID) << 48) | 5;
+    retirement.predecessorPlanSHA256 = admission.normalizedPlanSHA256;
+    retirement.successorPlanSHA256.assign("4444444444444444444444444444444444444444444444444444444444444444"_ctv);
+    retirement.completedAuthorityGeneration = 3;
+    state.statelessDeploymentRetirements.push_back(retirement);
+    String bytes = {};
+    BitseryEngine::serialize(bytes, state);
+    ProdigyMasterAuthorityRuntimeState decoded = {};
+    suite.expect(BitseryEngine::deserializeSafe(bytes, decoded) &&
+                 prodigyStatelessDeploymentRetirementsEqual(state.statelessDeploymentRetirements, decoded.statelessDeploymentRetirements),
+                 "stateless_retirement_v21_roundtrip");
+    decoded.statelessDeploymentRetirements.clear();
+    String reencodedLegacy = {};
+    BitseryEngine::serialize(reencodedLegacy, decoded);
+    suite.expect(reencodedLegacy == legacy, "stateless_retirement_empty_preserves_legacy_wire");
+    state.statelessDeploymentRetirements.push_back(retirement);
+    suite.expect(!prodigyStatelessDeploymentRetirementsValid(state.statelessDeploymentRetirements, state.statelessDeploymentAdmissions, state.generation),
+                 "stateless_retirement_duplicate_predecessor_rejected");
+    state.statelessDeploymentRetirements.pop_back();
+    state.statelessDeploymentRetirements[0].successorDeploymentID = (uint64_t(62011) << 48) | 5;
+    suite.expect(!prodigyStatelessDeploymentRetirementsValid(state.statelessDeploymentRetirements, state.statelessDeploymentAdmissions, state.generation),
+                 "stateless_retirement_wrong_application_rejected");
+    state.statelessDeploymentRetirements[0] = retirement;
+    state.statelessDeploymentRetirements[0].predecessorPlanSHA256 = admission.artifactSHA256;
+    String malformed = {};
+    BitseryEngine::serialize(malformed, state);
+    suite.expect(!BitseryEngine::deserializeSafe(malformed, decoded), "stateless_retirement_unmatched_admission_rejected_on_decode");
+    state.statelessDeploymentRetirements[0] = retirement;
+    state.statelessDeploymentRetirements[0].completedAuthorityGeneration = 4;
+    suite.expect(!prodigyStatelessDeploymentRetirementsValid(state.statelessDeploymentRetirements, state.statelessDeploymentAdmissions, state.generation),
+                 "stateless_retirement_future_generation_rejected");
+    DeploymentPlan predecessor = {}, successor = {};
+    predecessor.config.type = ApplicationType::stateless;
+    predecessor.config.applicationID = admission.applicationID;
+    predecessor.config.versionID = admission.versionID;
+    successor = predecessor;
+    successor.config.versionID = 5;
+    String predecessorBytes = {}, successorBytes = {};
+    BitseryEngine::serialize(predecessorBytes, predecessor);
+    BitseryEngine::serialize(successorBytes, successor);
+    ProdigyStatelessDeploymentRetirement planBound = retirement;
+    (void)prodigyComputeSHA256Hex(predecessorBytes, planBound.predecessorPlanSHA256);
+    (void)prodigyComputeSHA256Hex(successorBytes, planBound.successorPlanSHA256);
+    bytell_hash_map<uint64_t, DeploymentPlan> plans;
+    plans.insert_or_assign(planBound.predecessorDeploymentID, predecessor);
+    plans.insert_or_assign(planBound.successorDeploymentID, successor);
+    Vector<ProdigyStatelessDeploymentRetirement> bound = {planBound};
+    suite.expect(prodigyStatelessDeploymentRetirementsMatchPlans(bound, plans),
+                 "stateless_retirement_exact_plans_accepted");
+    plans[planBound.successorDeploymentID].config.versionID = 6;
+    suite.expect(!prodigyStatelessDeploymentRetirementsMatchPlans(bound, plans),
+                 "stateless_retirement_mutated_successor_plan_rejected");
+  }
+
+  {
     Wormhole wormhole = {};
     wormhole.name.assign("cousin"_ctv);
     wormhole.externalAddress = IPAddress("2001:db8::44", true);
@@ -711,6 +787,21 @@ int main(void)
     suite.expect(prodigyBuildCousinWormholeDesiredState(wormholes, true, cousinService, advertisements, protectedState) &&
                      prodigyWormholeRequiresPairAdmission(protectedState, 9443, IPPROTO_TCP),
                  "wormhole_desired_cousin_definition_protects_before_active_lifecycle_state");
+    for (uint64_t service : {
+        MeshServices::constrainPrefixToGroup(MeshRegistry::Truth::clients, 0),
+        MeshServices::constrainPrefixToGroup(MeshRegistry::Pulse::clients, 0),
+        MeshServices::constrainPrefixToGroup(MeshRegistry::Radar::clients, 0),
+        MeshServices::constrainPrefixToGroup(MeshRegistry::Hot::clients, 3),
+        MeshServices::constrainPrefixToGroup(MeshRegistry::Cold::clients, 7),
+        MeshServices::constrainPrefixToGroup(MeshRegistry::Pulse::siblings, 0),
+        MeshServices::constrainPrefixToGroup(MeshRegistry::Radar::seeding, 0)}) {
+      bytell_hash_map<uint64_t, Advertisement> retained = {};
+      retained.emplace(service, Advertisement(service, ContainerState::healthy, ContainerState::destroying, 9443));
+      SwitchboardWormholeDesiredState protectedRetained = {};
+      suite.expect(prodigyBuildCousinWormholeDesiredState(wormholes, true, 0, retained, protectedRetained) &&
+          prodigyWormholeRequiresPairAdmission(protectedRetained, 9443, IPPROTO_TCP),
+          "database_client_and_graph_listeners_protected_before_first_publication");
+    }
     auto declarations = wormholes;
     declarations.front().externalAddress = {};
     SwitchboardWormholeDesiredState declaredState = {};
@@ -962,6 +1053,60 @@ int main(void)
     ContainerParameters decoded;
     suite.expect(ProdigyWire::deserializeContainerParameters(encoded, decoded), "container_params_decode_mixed_empty_pairing_buckets");
     suite.expect(equalContainerParameters(expected, decoded), "container_params_mixed_empty_pairing_buckets_semantic_roundtrip");
+  }
+
+  {
+    ContainerPlan plan = {};
+    ContainerParameters expected = makeContainerParameters();
+    suite.expect(plan.statefulStoreSeedAuthority.protocolVersion == 0 &&
+                 expected.statefulStoreSeedAuthority.protocolVersion == 0,
+                 "container_seed_authority_defaults_absent");
+    String encoded;
+    BitseryEngine::serialize(encoded, expected);
+    ContainerParameters decoded = {};
+    suite.expect(BitseryEngine::deserializeSafe(encoded, decoded) &&
+                 decoded.statefulStoreSeedAuthority.protocolVersion == 0,
+                 "container_params_absent_authority_roundtrip");
+
+    String authorityTail;
+    BitseryEngine::serialize(authorityTail, expected.statefulStoreSeedAuthority);
+    suite.expect(encoded.size() >= authorityTail.size(), "container_params_authority_tail_size");
+    if (encoded.size() >= authorityTail.size())
+    {
+      encoded.resize(encoded.size() - authorityTail.size());
+      decoded.statefulStoreSeedAuthority.protocolVersion = ProdigyStatefulStoreSeedAuthority::version;
+      suite.expect(BitseryEngine::deserializeSafe(encoded, decoded) &&
+                   decoded.statefulStoreSeedAuthority.protocolVersion == 0,
+                   "container_params_legacy_tail_authority_absent");
+    }
+
+    auto& authority = expected.statefulStoreSeedAuthority;
+    authority.protocolVersion = ProdigyStatefulStoreSeedAuthority::version;
+    authority.authorityGeneration = 1;
+    authority.operationUUID = 2;
+    authority.applicationID = 5;
+    authority.storeKind = DeploymentIdentityStoreKind::graph;
+    authority.shardGroup = 0;
+    authority.nShardGroups = 1;
+    authority.targetClusterUUID = 3;
+    authority.targetDeploymentID = 4;
+    authority.targetContainerUUID = 5;
+    authority.sourceClusterUUID = 6;
+    authority.sourceDeploymentID = 7;
+    authority.sourceContainerUUID = 8;
+    authority.seedGeneration = 9;
+    authority.fixtureSHA256.assign("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    authority.expectedCatchupWatermarkSHA256 = authority.fixtureSHA256;
+    authority.sourceContentWatermarkSHA256 = authority.fixtureSHA256;
+    authority.sourceCatchupWatermarkSHA256 = authority.fixtureSHA256;
+    BitseryEngine::serialize(encoded, expected);
+    suite.expect(prodigyStatefulStoreSeedAuthorityValid(authority) &&
+                 BitseryEngine::deserializeSafe(encoded, decoded) &&
+                 prodigyStatefulStoreSeedAuthorityValid(decoded.statefulStoreSeedAuthority) &&
+                 decoded.statefulStoreSeedAuthority.targetContainerUUID == authority.targetContainerUUID &&
+                 decoded.statefulStoreSeedAuthority.sourceContainerUUID == authority.sourceContainerUUID &&
+                 decoded.statefulStoreSeedAuthority.sourceContentWatermarkSHA256 == authority.sourceContentWatermarkSHA256,
+                 "container_params_populated_authority_roundtrip");
   }
 
   {
@@ -1258,6 +1403,36 @@ int main(void)
     suite.expect(
         !ProdigyIngressValidation::validateNeuronPayloadForBrain(message->topic, message->args, message->terminal()),
         "neuron_registration_rejects_unknown_cousin_discovery_capability_tail");
+    frame.clear();
+    Message::construct(frame, NeuronTopic::registration, int64_t(101), "kernel"_ctv, "os"_ctv, "version"_ctv,
+        true, "0123456789abcdef"_ctv, uint8_t(1), uint8_t(3), uint8_t(1), uint8_t(1), uint8_t(3));
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(ProdigyIngressValidation::validateNeuronPayloadForBrain(message->topic, message->args, message->terminal()),
+        "neuron_registration_accepts_current_aegis_capabilities");
+    for (uint8_t pairVersion : {uint8_t(0), uint8_t(1), uint8_t(2), uint8_t(3), uint8_t(4)}) {
+      frame.clear();
+      Message::construct(frame, NeuronTopic::registration, int64_t(101), "kernel"_ctv, "os"_ctv, "version"_ctv,
+          true, "0123456789abcdef"_ctv, uint8_t(1), pairVersion);
+      message = reinterpret_cast<Message *>(frame.data());
+      suite.expect(ProdigyIngressValidation::validateNeuronPayloadForBrain(message->topic, message->args, message->terminal()) ==
+          (pairVersion >= 1 && pairVersion <= 3), "neuron_registration_pair_capability_versions");
+    }
+    for (uint8_t purposeVersion : {uint8_t(0), uint8_t(1), uint8_t(2), uint8_t(3), uint8_t(4)}) {
+      frame.clear();
+      Message::construct(frame, NeuronTopic::registration, int64_t(101), "kernel"_ctv, "os"_ctv, "version"_ctv,
+          true, "0123456789abcdef"_ctv, uint8_t(1), uint8_t(2), uint8_t(1), uint8_t(1), purposeVersion);
+      message = reinterpret_cast<Message *>(frame.data());
+      suite.expect(ProdigyIngressValidation::validateNeuronPayloadForBrain(message->topic, message->args, message->terminal()) == (purposeVersion == 2 || purposeVersion == 3),
+          "neuron_registration_purpose_capability_versions_after_lifecycle");
+      if (purposeVersion == 2 || purposeVersion == 3) {
+        frame.clear();
+        Message::construct(frame, NeuronTopic::registration, int64_t(101), "kernel"_ctv, "os"_ctv, "version"_ctv,
+            true, "0123456789abcdef"_ctv, uint8_t(1), uint8_t(2), uint8_t(1), uint8_t(1), purposeVersion, uint8_t(1));
+        message = reinterpret_cast<Message *>(frame.data());
+        suite.expect(!ProdigyIngressValidation::validateNeuronPayloadForBrain(message->topic, message->args, message->terminal()),
+            "neuron_registration_rejects_unrecognized_extra_tail");
+      }
+    }
 
     ProdigyCousinDiscoveryQuery cousinQuery = {};
     cousinQuery.permissionUUID = 0x5c11;
@@ -1506,6 +1681,134 @@ int main(void)
                  "upgrade_admission_capacity_request_ingress_valid");
     suite.expect(!ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal() - 1),
                  "upgrade_admission_capacity_request_ingress_truncated");
+
+    ProdigyCrossClusterMasqueGatewayAuthorityQuery gatewayQuery = {};
+    gatewayQuery.pairUUID = 7; gatewayQuery.localMachineUUID = 9;
+    String gatewayPayload = {}; BitseryEngine::serialize(gatewayPayload, gatewayQuery);
+    frame.clear(); Message::construct(frame, MothershipTopic::pullCrossClusterMasqueGatewayAuthority, gatewayPayload);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal()),
+                 "cross_cluster_masque_gateway_query_ingress_valid");
+    suite.expect(!ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal() - 1),
+                 "cross_cluster_masque_gateway_query_ingress_truncated");
+    // These are Brain commands, not Neuron receipts. In particular, even an
+    // empty gateway snapshot must cross this boundary on an ordinary boot.
+    ProdigyCrossClusterMasqueGatewayAuthorityProjection emptyGatewayProjection = {};
+    String emptyGatewayPayload = {};
+    BitseryEngine::serialize(emptyGatewayPayload, emptyGatewayProjection);
+    frame.clear();
+    Message::construct(frame, NeuronTopic::crossClusterMasqueGatewayAuthoritySnapshot, emptyGatewayPayload);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(ProdigyIngressValidation::validateNeuronPayloadForNeuron(
+        message->topic, message->args, message->terminal()), "empty_gateway_snapshot_reaches_neuron_on_boot");
+    for (const auto topic : {NeuronTopic::crossClusterMasqueGatewayAuthoritySnapshot,
+                            NeuronTopic::nametagQualificationApplicationCommand,
+                            NeuronTopic::statefulStoreSeedAuthority})
+    {
+      const bool hasContainer = topic != NeuronTopic::crossClusterMasqueGatewayAuthoritySnapshot;
+      const uint32_t limit = !hasContainer ? 262144 :
+          (topic == NeuronTopic::statefulStoreSeedAuthority ? 4096 : ProdigyCousinSessionMaximumBytes);
+      String payload = {};
+      payload.reserve(limit + 1);
+      payload.resize(limit);
+      const auto constructCommand = [&](uint128_t containerUUID) {
+        frame.clear();
+        if (hasContainer) Message::construct(frame, topic, containerUUID, payload);
+        else Message::construct(frame, topic, payload);
+        message = reinterpret_cast<Message *>(frame.data());
+      };
+      constructCommand(1);
+      suite.expect(ProdigyIngressValidation::validateNeuronPayloadForNeuron(
+          message->topic, message->args, message->terminal()), "brain_command_ingress_accepts_exact_payload_bound");
+      suite.expect(!ProdigyIngressValidation::validateNeuronPayloadForBrain(
+          message->topic, message->args, message->terminal()), "brain_command_ingress_rejects_reversed_direction");
+      suite.expect(!ProdigyIngressValidation::validateNeuronPayloadForNeuron(
+          message->topic, message->args, message->terminal() - 1), "brain_command_ingress_rejects_truncation");
+      frame.append(uint8_t(0));
+      message = reinterpret_cast<Message *>(frame.data());
+      suite.expect(!ProdigyIngressValidation::validateNeuronPayloadForNeuron(
+          message->topic, message->args, reinterpret_cast<uint8_t *>(frame.data() + frame.size())),
+          "brain_command_ingress_rejects_trailing_bytes");
+      payload.append('x');
+      constructCommand(1);
+      suite.expect(!ProdigyIngressValidation::validateNeuronPayloadForNeuron(
+          message->topic, message->args, message->terminal()), "brain_command_ingress_rejects_oversized_payload");
+      if (hasContainer)
+      {
+        payload.resize(1);
+        constructCommand(0);
+        suite.expect(!ProdigyIngressValidation::validateNeuronPayloadForNeuron(
+            message->topic, message->args, message->terminal()), "brain_command_ingress_rejects_zero_container");
+      }
+    }
+    ProdigyPairPrivateBGPSecretScope liveScope = {};
+    liveScope.pairUUID = 7; liveScope.operationUUID = 8; liveScope.keyEpoch = 9; liveScope.tunnelSlot = 1;
+    liveScope.clusterUUID = 10; liveScope.machineUUID = 11; liveScope.authorityGeneration = 12; liveScope.gatewayGeneration = 13;
+    String privateBGPSecret = {}; for (uint8_t index = 0; index < 32; ++index) privateBGPSecret.append('s');
+    String gatewayRootCert = "root-pem"_ctv, gatewayLocalCert = "local-cert-pem"_ctv;
+    String gatewayLocalKey = "local-key-pem"_ctv, gatewayPeerDERHex = "aabb"_ctv;
+    frame.clear(); Message::construct(frame, NeuronTopic::crossClusterPrivateBGPSecretDelivery,
+                                      liveScope.pairUUID, liveScope.operationUUID, liveScope.keyEpoch, liveScope.tunnelSlot,
+                                      liveScope.clusterUUID, liveScope.machineUUID, liveScope.authorityGeneration,
+                                      liveScope.gatewayGeneration, privateBGPSecret, gatewayRootCert, gatewayLocalCert,
+                                      gatewayLocalKey, gatewayPeerDERHex);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(ProdigyIngressValidation::validateNeuronPayloadForNeuron(message->topic, message->args, message->terminal()),
+                 "cross_cluster_private_bgp_secret_delivery_ingress_accepts_exact_tls_bundle");
+    frame.clear(); Message::construct(frame, NeuronTopic::crossClusterPrivateBGPSecretDelivery,
+                                      liveScope.pairUUID, liveScope.operationUUID, liveScope.keyEpoch, liveScope.tunnelSlot,
+                                      liveScope.clusterUUID, liveScope.machineUUID, liveScope.authorityGeneration,
+                                      liveScope.gatewayGeneration, privateBGPSecret, gatewayRootCert, gatewayLocalCert,
+                                      gatewayLocalKey);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(!ProdigyIngressValidation::validateNeuronPayloadForNeuron(message->topic, message->args, message->terminal()),
+                 "cross_cluster_private_bgp_secret_delivery_ingress_rejects_missing_tls_field");
+    ProdigyCrossClusterMasqueGatewayReadinessQuery readinessQuery = {}; readinessQuery.scope = liveScope;
+    String readinessPayload = {}; BitseryEngine::serialize(readinessPayload, readinessQuery);
+    frame.clear(); Message::construct(frame, MothershipTopic::pullCrossClusterMasqueGatewayReadiness, readinessPayload);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal()) &&
+                 !ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal() - 1),
+                 "cross_cluster_masque_readiness_query_ingress_is_bounded");
+    ProdigyCrossClusterPrivateBGPReadiness privateBGPReadiness = {};
+    privateBGPReadiness.scope = liveScope; privateBGPReadiness.peerMachineUUID = 12;
+    privateBGPReadiness.localSitePrefix = IPPrefix("fd5a:4d53:1::", true, 96);
+    privateBGPReadiness.peerSitePrefix = IPPrefix("fd5a:4d53:2::", true, 96);
+    String privateBGPReadinessPayload = {};
+    BitseryEngine::serialize(privateBGPReadinessPayload, privateBGPReadiness);
+    frame.clear(); Message::construct(frame, NeuronTopic::crossClusterPrivateBGPReadinessReceipt,
+                                      privateBGPReadinessPayload);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(ProdigyIngressValidation::validateNeuronPayloadForBrain(
+                     message->topic, message->args, message->terminal()) &&
+                 !ProdigyIngressValidation::validateNeuronPayloadForBrain(
+                     message->topic, message->args, message->terminal() - 1),
+                 "cross_cluster_private_bgp_readiness_receipt_ingress_is_bounded");
+    String gatewayAuthorityRequest = {};
+    gatewayAuthorityRequest.reserve(4097);
+    gatewayAuthorityRequest.resize(4096);
+    String gatewayArtifactBlob = "artifact"_ctv;
+    frame.clear(); Message::construct(frame, MothershipTopic::commitCrossClusterMasqueGatewayAuthority,
+                                     gatewayAuthorityRequest, gatewayArtifactBlob);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal()),
+                 "cross_cluster_masque_gateway_commit_ingress_accepts_exact_two_bounded_arguments");
+    frame.clear(); Message::construct(frame, MothershipTopic::commitCrossClusterMasqueGatewayAuthority,
+                                     gatewayAuthorityRequest);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(!ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal()),
+                 "cross_cluster_masque_gateway_commit_ingress_rejects_missing_artifact");
+    frame.clear(); Message::construct(frame, MothershipTopic::commitCrossClusterMasqueGatewayAuthority,
+                                     gatewayAuthorityRequest, gatewayArtifactBlob, "trailing"_ctv);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(!ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal()),
+                 "cross_cluster_masque_gateway_commit_ingress_rejects_extra_argument");
+    gatewayAuthorityRequest.append('r');
+    frame.clear(); Message::construct(frame, MothershipTopic::commitCrossClusterMasqueGatewayAuthority,
+                                     gatewayAuthorityRequest, gatewayArtifactBlob);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(!ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal()),
+                 "cross_cluster_masque_gateway_commit_ingress_rejects_oversized_request");
 
     Vector<uint8_t> oversizedTaskResult;
     oversizedTaskResult.resize(prodigyTaskResultMaxBytes + 1);

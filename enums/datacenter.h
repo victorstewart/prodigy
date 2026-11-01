@@ -90,7 +90,30 @@ enum class MothershipTopic : uint16_t {
   // an unrelated operation.
   commitCousinRoute,
   pullCousinRoute,
-  statefulDataAuthority
+  statefulDataAuthority,
+  // Mothership is the sole producer of these durable, local-half gateway
+  // authority records. Keep both frames appended: this enum is wire-stable.
+  commitCrossClusterMasqueGatewayAuthority,
+  pullCrossClusterMasqueGatewayAuthority,
+  installCrossClusterPrivateBGPSecret,
+  withdrawCrossClusterPrivateBGPSecret,
+  // Exact live receipts are queried independently of durable gateway authority.
+  // Appending keeps older Brains from decoding either payload as another RPC.
+  pullCrossClusterMasqueGatewayReadiness,
+  pullCrossClusterPrivateBGPWithdrawalReceipt,
+  crossClusterMasqueGatewayReadinessReceipt,
+  applyNametagAllMastersSeedAuthority,
+  // Versioned authenticated request/response for the frozen Nametag
+  // qualification matrix. Appended: MothershipTopic is wire-stable.
+  nametagQualification,
+  // EWR-only source population is deliberately outside the 17-row
+  // qualification matrix.  A legacy Brain must reject this framed request.
+  nametagSourceBaseline,
+  statefulStoreSourceCut,
+  statefulStoreProofRecovery,
+  // One authenticated request/response payload controls a bounded fault on
+  // an already-enrolled gateway. Never accepts an arbitrary host/interface.
+  crossClusterPathFault
 };
 
 constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
@@ -207,6 +230,32 @@ constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
       return "pullCousinRoute";
     case MothershipTopic::statefulDataAuthority:
       return "statefulDataAuthority";
+    case MothershipTopic::commitCrossClusterMasqueGatewayAuthority:
+      return "commitCrossClusterMasqueGatewayAuthority";
+    case MothershipTopic::pullCrossClusterMasqueGatewayAuthority:
+      return "pullCrossClusterMasqueGatewayAuthority";
+    case MothershipTopic::installCrossClusterPrivateBGPSecret:
+      return "installCrossClusterPrivateBGPSecret";
+    case MothershipTopic::withdrawCrossClusterPrivateBGPSecret:
+      return "withdrawCrossClusterPrivateBGPSecret";
+    case MothershipTopic::pullCrossClusterMasqueGatewayReadiness:
+      return "pullCrossClusterMasqueGatewayReadiness";
+    case MothershipTopic::pullCrossClusterPrivateBGPWithdrawalReceipt:
+      return "pullCrossClusterPrivateBGPWithdrawalReceipt";
+    case MothershipTopic::crossClusterMasqueGatewayReadinessReceipt:
+      return "crossClusterMasqueGatewayReadinessReceipt";
+    case MothershipTopic::applyNametagAllMastersSeedAuthority:
+      return "applyNametagAllMastersSeedAuthority";
+    case MothershipTopic::nametagQualification:
+      return "nametagQualification";
+    case MothershipTopic::nametagSourceBaseline:
+      return "nametagSourceBaseline";
+    case MothershipTopic::statefulStoreSourceCut:
+      return "statefulStoreSourceCut";
+    case MothershipTopic::statefulStoreProofRecovery:
+      return "statefulStoreProofRecovery";
+    case MothershipTopic::crossClusterPathFault:
+      return "crossClusterPathFault";
   }
 
   return "unknown";
@@ -310,7 +359,42 @@ enum class NeuronTopic : uint16_t {
   cousinAdmissionAck,
   transportCredentialLifecycle,
   transportCredentialLifecycleAck,
-  statefulDataAuthority
+  statefulDataAuthority,
+  // Durable gateway authority snapshot.  Empty is an explicit withdrawal for
+  // this Neuron, never an implicit "keep the old gateway" instruction.
+  crossClusterMasqueGatewayAuthoritySnapshot,
+  // Transient only: delivered over the authenticated Brain/Neuron stream and
+  // deliberately excluded from every authority/snapshot codec.
+  crossClusterPrivateBGPSecretDelivery,
+  crossClusterPrivateBGPSecretRevocationAck,
+  withdrawCrossClusterPrivateBGPSecret,
+  // Application 6 -> Neuron -> Brain live Truth carrier observation.
+  app6TruthMeshReceipt,
+  // Native stateful-store observation, relayed unchanged by Neuron.
+  statefulStoreReceipt,
+  statefulStoreSeedAuthority,
+  // Live gateway readiness is reported by the selected Neuron to its Brain.
+  // Append this wire topic so every previously assigned value remains stable.
+  crossClusterMasqueGatewayReadinessReceipt,
+  // Application-owned Nametag qualification evidence, relayed unchanged over
+  // the authenticated container -> Neuron -> Brain boundary.
+  nametagQualificationApplicationReceipt,
+  // Brain -> exact App11 probe execution command. The reply travels on the
+  // independently framed receipt topic above.
+  nametagQualificationApplicationCommand,
+  // Neuron-owned proof that private BGP and the exact peer-site /96 fallback
+  // are usable for the current authenticated MASQUE authority.
+  crossClusterPrivateBGPReadinessReceipt,
+  nametagSourceBaseline,
+  statefulStoreSourceCut,
+  statefulStoreProofRecovery,
+  nametagHandoffBarrier,
+  nametagQualificationCousinTransport,
+  crossClusterPathFault,
+  nametagQualificationReplay,
+  nametagQualificationWriterIsolation,
+  nametagQualificationSeedFault,
+  nametagQualificationMachineBoot
 };
 
 enum class ContainerTopic : uint16_t {
@@ -334,6 +418,24 @@ enum class ContainerTopic : uint16_t {
   cousinSessionCommand,
   cousinSessionAck,
   statefulDataAuthority,
+  // Bounded reverse-carrier data/control frame.  Appended so older Neurons
+  // fail closed instead of decoding it as an existing container action.
+  cousinCarrierFrame,
+  app6TruthMeshReceipt,
+  statefulStoreReceipt,
+  statefulStoreSeedAuthority,
+  // This is application evidence only; Brain must join it with native store
+  // and topology observations before replying to Mothership qualification.
+  nametagQualificationApplicationReceipt,
+  // Exact, bounded qualification work sent only to the selected App11 probe.
+  nametagQualificationApplicationCommand,
+  nametagSourceBaseline,
+  statefulStoreSourceCut,
+  statefulStoreProofRecovery,
+  nametagHandoffBarrier,
+  nametagQualificationCousinTransport,
+  nametagQualificationReplay,
+  nametagQualificationSeedFault,
 };
 
 enum class PulseTopic : uint16_t {

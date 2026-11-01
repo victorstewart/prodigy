@@ -36,7 +36,7 @@ set(
 )
 set(
   PRODIGY_BASICS_TIDESDB_DEPENDENCY_VERSION
-  "10.0.1-prodigy-b54457c1"
+  "10.2.1.20261031.1"
   CACHE STRING
   "Pinned TidesDB package version used when deriving the Basics-with-TidesDB release DepoFile variant"
   FORCE
@@ -504,6 +504,9 @@ function(prodigy_resolve_basics_local_depofile out_var)
   endif()
   if (DEFINED CMAKE_BUILD_TYPE AND NOT "${CMAKE_BUILD_TYPE}" STREQUAL "")
     list(APPEND _prodigy_local_basics_configure_command "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}")
+  endif()
+  if (DEFINED DEPOS_EXECUTABLE AND NOT "${DEPOS_EXECUTABLE}" STREQUAL "")
+    list(APPEND _prodigy_local_basics_configure_command "-DDEPOS_EXECUTABLE=${DEPOS_EXECUTABLE}")
   endif()
   list(APPEND
     _prodigy_local_basics_configure_command

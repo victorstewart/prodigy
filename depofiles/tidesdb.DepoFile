@@ -1,16 +1,13 @@
-# Copyright 2026 Victor Stewart
-# SPDX-License-Identifier: Apache-2.0
+# Task-local, non-published candidate. Source is immutable task-local archive.
 NAME tidesdb
-VERSION 10.0.1-prodigy-b54457c1
+VERSION 10.2.1.20261031.1
 SYSTEM_LIBS ALLOW
-# Fork bounds value-log descriptors during recovery and full-store inspection.
-# Reuse a newest header-only tail to prevent idle-reopen segment growth.
-# Pinned by immutable commit and archive checksum; upstream base 2e029f971e66.
+# Upstream v10.2.1 abd8900c plus retained descriptor, no-preallocation, and clean-tail recovery fixes.
 DEPENDS zstd VERSION 1.5.7
 DEPENDS snappy VERSION 1.2.2
 DEPENDS lz4 VERSION 1.10.0
-SOURCE URL https://github.com/victorstewart/tidesdb/archive/b54457c1de640423c75a0ca40f657c8cc8966c6a.tar.gz
-SHA256 f48fb1ae5e091343ae609f69ba96f7cb842fca0edeb3eee47dab476a346276ce
+SOURCE URL file:///root/.run/nametag-three-cluster-20261019/.run/n24-runtime-repair-tidesdb/tidesdb-v10.2.1-f858-de64-candidate.tar.gz
+SHA256 eda4a3515689ede79370fa3def8ca234d8d4f11bebfe03fb39ba1792cb1e5ede
 BUILD_SYSTEM CMAKE
 CMAKE_ARG "-DCMAKE_PREFIX_PATH=${dep:zstd};${dep:snappy};${dep:lz4}"
 CMAKE_ARG "-DCMAKE_C_FLAGS=-I${dep:zstd}/include -I${dep:snappy}/include -I${dep:lz4}/include"

@@ -594,9 +594,87 @@ static int runContainerEnvironmentSanitizationProbe(void)
   return WEXITSTATUS(status);
 }
 
-int main(void)
+static bool readIPv6ForwardingValue(const char *scope, char& value)
+{
+  String path = {};
+  path.assign("/proc/sys/net/ipv6/conf/"_ctv);
+  path.append(scope);
+  path.append("/forwarding"_ctv);
+  int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  char bytes[2] = {};
+  const ssize_t count = fd >= 0 ? read(fd, bytes, sizeof(bytes)) : -1;
+  if (fd >= 0) close(fd);
+  if (count != 2 || bytes[1] != '\n') return false;
+  value = bytes[0];
+  return true;
+}
+
+static int runGatewayForwardingNamespaceProbe()
+{
+  const int caller = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
+  char callerBefore = 0;
+  if (caller < 0 || !readIPv6ForwardingValue("all", callerBefore)) return 19;
+  String sameNamespaceFailure = {};
+  if (configureCrossClusterMasqueGatewayIPv6Forwarding(caller, caller, String("lo"_ctv), 0x700, &sameNamespaceFailure) ||
+      sameNamespaceFailure.size() == 0) return 19;
+  char callerAfter = 0;
+  if (!readIPv6ForwardingValue("all", callerAfter) || callerAfter != callerBefore) return 19;
+  if (unshare(CLONE_NEWNET) != 0) return 20;
+  const int gateway = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
+  if (gateway < 0 || setns(caller, CLONE_NEWNET) != 0) return 21;
+
+  String failure = {};
+  const bool configured = configureCrossClusterMasqueGatewayIPv6Forwarding(gateway, caller, String("lo"_ctv), 0x701, &failure);
+  struct stat current = {}, expected = {};
+  const bool restored = fstat(caller, &expected) == 0 &&
+      stat("/proc/self/ns/net", &current) == 0 && current.st_ino == expected.st_ino;
+  if (!configured || !restored) return 22;
+  if (setns(gateway, CLONE_NEWNET) != 0) return 23;
+  char all = 0, defaults = 0, loopback = 0;
+  if (!readIPv6ForwardingValue("all", all) || !readIPv6ForwardingValue("default", defaults) ||
+      !readIPv6ForwardingValue("lo", loopback) || all != '1' || defaults != '1' || loopback != '1') return 24;
+  if (setns(caller, CLONE_NEWNET) != 0) return 25;
+
+  // A normal application receives a separate fresh namespace and does not
+  // invoke the gateway-only helper.
+  if (unshare(CLONE_NEWNET) != 0) return 26;
+  char ordinary = 0;
+  if (!readIPv6ForwardingValue("all", ordinary) || ordinary != '0') return 27;
+  if (setns(caller, CLONE_NEWNET) != 0) return 28;
+
+  // The failure path writes only in a third disposable namespace and must
+  // restore the caller before startContainer can signal the child to exec.
+  if (unshare(CLONE_NEWNET) != 0) return 29;
+  const int rejectedNamespace = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
+  if (rejectedNamespace < 0 || setns(caller, CLONE_NEWNET) != 0) return 30;
+  String rejected = {};
+  const bool rejectedSafely = !configureCrossClusterMasqueGatewayIPv6Forwarding(rejectedNamespace, caller, String("missing"_ctv), 0x702, &rejected) &&
+      rejected.size() > 0 && stat("/proc/self/ns/net", &current) == 0 && current.st_ino == expected.st_ino;
+  close(rejectedNamespace); close(gateway); close(caller);
+  return rejectedSafely ? 0 : 31;
+}
+
+static bool gatewayForwardingNamespaceProbe()
+{
+  const pid_t child = fork();
+  if (child < 0) return false;
+  if (child == 0) _exit(runGatewayForwardingNamespaceProbe());
+  int status = 0;
+  return waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+int main(int argc, char **argv)
 {
   TestSuite suite;
+  if (argc == 2 && std::strcmp(argv[1], "--gateway-forwarding-only") == 0)
+  {
+    suite.expect(gatewayForwardingNamespaceProbe(),
+                 "gateway_ipv6_forwarding_isolated_namespace_setup_and_ordinary_default");
+    return suite.failed == 0 ? 0 : 1;
+  }
+  if (argc != 1) return 2;
+  suite.expect(gatewayForwardingNamespaceProbe(),
+               "gateway_ipv6_forwarding_isolated_namespace_setup_and_ordinary_default");
   testRestoredCgroupPIDParsing(suite);
 
   ProdigyLinuxCPUList cpus = {};
@@ -619,6 +697,27 @@ int main(void)
           prodigyParseLinuxCPUList(String("0,256"_ctv), cpus) == false &&
           prodigyParseLinuxCPUList(String("0,"_ctv), cpus) == false,
       "linux_cpulist_rejects_overlap_reversal_overflow_and_trailing_separator");
+  suite.expect(prodigyContainerCPUDiscovery(String("0-7"_ctv), String("member\n"_ctv), String(""_ctv), String("0-255"_ctv), cpus) &&
+                   cpus.count == 8 && cpus.maxPlusOne == 8,
+               "container_cpu_discovery_first_launch");
+  suite.expect(prodigyContainerCPUDiscovery(String("0-1"_ctv), String("isolated\n"_ctv), String("2-7"_ctv), String("0-255"_ctv), cpus) &&
+                   cpus.count == 8 && cpus.maxPlusOne == 8 && cpus.contains[2] && cpus.contains[7],
+               "container_cpu_discovery_reclaims_owned_partition_and_descendants_on_restart");
+  suite.expect(prodigyContainerCPUDiscovery(String("0-1,6"_ctv), String("root"_ctv), String("3-4,9"_ctv), String("0-255"_ctv), cpus) &&
+                   cpus.count == 6 && cpus.maxPlusOne == 10 && !cpus.contains[2] &&
+                   !cpus.contains[5] && !cpus.contains[7] && cpus.contains[9],
+               "container_cpu_discovery_preserves_sparse_and_excludes_foreign_partitions");
+  suite.expect(!prodigyContainerCPUDiscovery(String("0-1"_ctv), String("isolated invalid (no CPUs)"_ctv), String("2-7"_ctv), String("0-255"_ctv), cpus) &&
+                   !prodigyContainerCPUDiscovery(String("0-1"_ctv), String("isolated"_ctv), String(""_ctv), String("0-255"_ctv), cpus) &&
+                   !prodigyContainerCPUDiscovery(String("0-1"_ctv), String("root"_ctv), String("2,256"_ctv), String("0-255"_ctv), cpus) &&
+                   !prodigyContainerCPUDiscovery(String("0-1"_ctv), String(""_ctv), String("2-7"_ctv), String("0-255"_ctv), cpus),
+               "container_cpu_discovery_rejects_invalid_or_ambiguous_partitions");
+  suite.expect(prodigyContainerCPUDiscovery(String("0-1"_ctv), String("isolated"_ctv), String("2-7"_ctv), String("0-5"_ctv), cpus) &&
+                   cpus.count == 6 && cpus.maxPlusOne == 6 && !cpus.contains[6] && !cpus.contains[7],
+               "container_cpu_discovery_excludes_offline_owned_cpus");
+  suite.expect(!prodigyContainerCPUDiscovery(String("0-1"_ctv), String("member"_ctv), String(), String(), cpus) &&
+                   !prodigyContainerCPUDiscovery(String("0-1"_ctv), String("isolated"_ctv), String("2-7"_ctv), String("0,256"_ctv), cpus),
+               "container_cpu_discovery_rejects_missing_or_invalid_online_cpus");
   std::array<uint16_t, 4> restoredLogicalCores = {};
   suite.expect(
       prodigyResolveRestoredLogicalCores(
@@ -658,11 +757,11 @@ int main(void)
   String missingRootFailure = {};
   NeuronBase *savedNeuron = thisNeuron;
   thisNeuron = nullptr;
-  ContainerManager::createContainer(
-      missingRootPlan,
-      String("/unused"_ctv),
-      missingRootContainer,
-      &missingRootFailure);
+  auto rejectMissingRoot = [&]() -> void {
+    co_await ContainerManager::createContainer(
+        missingRootPlan, String("/unused"_ctv), missingRootContainer, &missingRootFailure);
+  };
+  rejectMissingRoot();
   thisNeuron = savedNeuron;
   suite.expect(
       missingRootContainer == nullptr && missingRootFailure.size() > 0,

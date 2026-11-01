@@ -1,0 +1,31 @@
+# Copyright 2026 Victor Stewart
+# SPDX-License-Identifier: Apache-2.0
+NAME rust_toolchain
+VERSION 1.97.1
+# Use official baseline sysroots: distro-built std/compiler_builtins may require
+# host-only ISA features even when the consuming crate sets target-cpu.
+SOURCE_VARIANT linux x86_64 URL https://static.rust-lang.org/dist/rust-1.97.1-x86_64-unknown-linux-gnu.tar.xz SHA256 88f28fa9af20594179f85d6df67078dfd6fa93e2f6da5e1e9b0ac4997988ca4f
+SOURCE_VARIANT linux aarch64 URL https://static.rust-lang.org/dist/rust-1.97.1-aarch64-unknown-linux-gnu.tar.xz SHA256 9a7a2c336b4787f1b72f6bab7c35d5b7af2fd03cbd39b4fc721466a70d402a7d
+SOURCE_VARIANT macos x86_64 URL https://static.rust-lang.org/dist/rust-1.97.1-x86_64-apple-darwin.tar.xz SHA256 891c32ea77b750dccc7fb0ea98e3feb9db3d29fe0cfea5907d002f270c59cf58
+SOURCE_VARIANT macos aarch64 URL https://static.rust-lang.org/dist/rust-1.97.1-aarch64-apple-darwin.tar.xz SHA256 c9748cc86107734a2a024069908a895de7caa2d37062fb641eef9f756938ace2
+BUILD_SYSTEM MANUAL
+MANUAL_INSTALL_SH <<'EOF'
+test "$DEPO_BUILD_ARCH" = "$DEPO_TARGET_ARCH" || {
+  echo "Pinned Rust toolchain requires a native build; no cross-target sysroot is declared" >&2
+  exit 1
+}
+case "$(uname -s):$DEPO_BUILD_ARCH" in
+  Linux:x86_64) rust_triple=x86_64-unknown-linux-gnu ;;
+  Linux:aarch64) rust_triple=aarch64-unknown-linux-gnu ;;
+  Darwin:x86_64) rust_triple=x86_64-apple-darwin ;;
+  Darwin:aarch64) rust_triple=aarch64-apple-darwin ;;
+  *) echo "Unsupported pinned Rust host" >&2; exit 1 ;;
+esac
+"${DEPO_SOURCE_DIR}/install.sh" --prefix="${DEPO_PREFIX}" --disable-ldconfig --components="rustc,cargo,rust-std-$rust_triple"
+"${DEPO_PREFIX}/bin/rustc" --version
+"${DEPO_PREFIX}/bin/cargo" --version
+EOF
+ARTIFACT bin/rustc
+ARTIFACT bin/rustdoc
+ARTIFACT bin/cargo
+ARTIFACT lib

@@ -62,6 +62,12 @@ public:
   uint64_t statefulDataAuthorityReceiptIOGeneration = 0;
   uint64_t statefulDataAuthorityReceiptAuthorityEpoch = 0;
   uint32_t statefulDataAuthorityReceiptCrashCount = 0;
+  StatefulDataAuthorityPreparation statefulPreparationRequest;
+  StatefulDataAuthorityPreparation statefulPreparationReceipt;
+  String statefulPreparationPlanSHA256;
+  uint64_t statefulPreparationIOGeneration = 0;
+  uint64_t statefulPreparationAuthorityEpoch = 0;
+  uint32_t statefulPreparationCrashCount = 0;
 
   bool isStateful = false;
   uint32_t shardGroup = 0; // only for stateful

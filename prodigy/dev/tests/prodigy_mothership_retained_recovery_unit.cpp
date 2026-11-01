@@ -772,7 +772,15 @@ static void assertEmptyMachineColdCanonicalRuntimeRecovery(void)
   }
   std::filesystem::create_directories(statePath + ".secrets");
   const String aggregateBefore = coldCanonicalStateAggregateDigest(statePath);
-  const auto inspectionRoot = root / "inspection";
+  // The repository may be mounted through a filesystem that cannot clone an
+  // open TidesDB directory with std::filesystem::copy (for example the
+  // verified Apple guest's shared workspace).  Keep the test's mutable source
+  // under .run, but inspect an exact disposable copy on the guest-local temp
+  // filesystem so the read-only check measures TidesDB behavior rather than
+  // mount copy semantics.
+  const auto inspectionRoot = std::filesystem::temp_directory_path() /
+      ("prodigy-retained-cold-inspection-" + std::to_string(::getpid()));
+  std::filesystem::remove_all(inspectionRoot);
   std::filesystem::create_directories(inspectionRoot);
   const auto inspectionState = (inspectionRoot / "state.new10").string();
   std::filesystem::copy(statePath, inspectionState, std::filesystem::copy_options::recursive);
@@ -1264,8 +1272,530 @@ static void assertSchema4ConflictingClientRetirement(void)
   assert(!mothershipPrepareRetiredConflictingClientSchema4Snapshot(wrong,approved,machines,current,previous,interrupted,successor,proof,0,&failure));
 }
 
+static void assertGraphReplicaSnapshotRecovery()
+{
+  for (uint16_t app : {uint16_t(2), uint16_t(5)}) {
+    DeploymentPlan plan = {};
+    plan.config.type = ApplicationType::stateful; plan.config.applicationID = app;
+    plan.config.versionID = 1; plan.config.nLogicalCores = 1;
+    plan.config.memoryMB = 128; plan.config.storageMB = 64;
+    plan.isStateful = true; plan.stateful.neverShard = true; plan.stateful.seedingAlways = true;
+    plan.stateful.siblingPrefix = prodigyRuntimeStatefulServicePrefix(app, 2);
+    plan.stateful.cousinPrefix = prodigyRuntimeStatefulServicePrefix(app, 3);
+    plan.stateful.seedingPrefix = prodigyRuntimeStatefulServicePrefix(app, 4);
+    plan.stateful.shardingPrefix = prodigyRuntimeStatefulServicePrefix(app, 5);
+    plan.whiteholes.emplace_back();
+    ProdigyPersistentBrainSnapshot source = {};
+    source.brainConfig.clusterUUID = 0x31; source.brainConfig.datacenterFragment = 7;
+    source.masterAuthority.deploymentPlans[plan.config.deploymentID()] = plan;
+    Vector<MothershipRetainedRecoveryMachineInput> machines;
+    for (uint32_t index = 1; index <= 3; ++index) {
+      ClusterMachine topology = {}; topology.uuid = index; source.topology.machines.push_back(topology);
+      MothershipRetainedRecoveryMachineInput machine = {}; machine.machineUUID = index; machine.machineFragment = index;
+      ContainerParameters parameters = {};
+      parameters.uuid = 0x2000 + index; parameters.deploymentID = plan.config.deploymentID();
+      parameters.nLogicalCores = 1; parameters.memoryMB = 128; parameters.storageMB = 64;
+      parameters.cpuMode = plan.config.cpuMode;
+      parameters.requestedCPUMillis = applicationRequestedCPUMillis(plan.config);
+      parameters.private6.network.is6 = true; parameters.private6.cidr = 128;
+      std::memcpy(parameters.private6.network.v6, container_network_subnet6.value, 11);
+      parameters.private6.network.v6[11] = 7; parameters.private6.network.v6[14] = index;
+      parameters.private6.network.v6[15] = 1;
+      parameters.statefulMeshRoles.sibling = MeshServices::constrainPrefixToGroup(plan.stateful.siblingPrefix, 0);
+      parameters.statefulMeshRoles.seeding = MeshServices::constrainPrefixToGroup(plan.stateful.seedingPrefix, 0);
+      parameters.advertisesOnPorts[parameters.statefulMeshRoles.sibling] = 12001;
+      parameters.advertisesOnPorts[parameters.statefulMeshRoles.seeding] = 12002;
+      prodigyPopulateDefaultStatefulTopology(parameters.statefulTopology, 0, plan.config);
+      parameters.statefulTopology.servingMode = StatefulTopologyServingMode::catchupOnly;
+      Whitehole egress = plan.whiteholes[0]; egress.hasAddress = true;
+      egress.address = IPAddress("2001:db8::7", true); egress.sourcePort = 13000 + index; egress.bindingNonce = index;
+      parameters.whiteholes.push_back(egress);
+      machine.parameters.push_back(parameters); machine.observedCreatedAtMs.push_back(1791000000000LL + index);
+      NeuronContainerBootstrap bootstrap; String failure;
+      assert(prodigyBuildRetainedContainerBootstrap(plan, parameters, index, 7, 1791000000000LL + index, bootstrap, &failure));
+      BrainReplicatedContainerRuntimeState runtime = {}; runtime.machineUUID = index; runtime.plan = bootstrap.plan;
+      source.masterAuthority.containerRuntimeStates.push_back(runtime);
+      machines.push_back(std::move(machine));
+    }
+    auto prepared = source; String failure;
+    const String bundle = MothershipTidesMigration::text(std::string(64, 'd'));
+    assert(mothershipPrepareRetainedRecoverySnapshot(prepared, source.masterAuthority.deploymentPlans, machines, bundle, &failure));
+    assert(prepared.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses.size() == 3);
+    for (const auto& witness : prepared.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses) {
+      assert(witness.containerBootstraps.size() == 1);
+      NeuronContainerBootstrap bootstrap;
+      assert(BitseryEngine::deserializeSafe(witness.containerBootstraps[0], bootstrap));
+      assert(bootstrap.plan.nShardGroups == 1 && bootstrap.plan.shardGroup == 0 &&
+          bootstrap.plan.statefulMeshRoles.client == 0 && bootstrap.plan.advertisements.size() == 2 &&
+          bootstrap.plan.statefulTopology.servingMode == StatefulTopologyServingMode::catchupOnly);
+    }
+    String encoded; BitseryEngine::serialize(encoded, prepared); ProdigyPersistentBrainSnapshot readback;
+    assert(BitseryEngine::deserializeSafe(encoded, readback));
+    char graphDirectory[] = "/tmp/prodigy-graph-recovery-XXXXXX";
+    char *graphRoot = ::mkdtemp(graphDirectory); assert(graphRoot);
+    const String graphStatePath = MothershipTidesMigration::text(std::string(graphRoot) + "/state");
+    { ProdigyPersistentStateStore store(graphStatePath); assert(store.saveBrainSnapshot(prepared, &failure)); }
+    { ProdigyPersistentStateStore reopened(graphStatePath); assert(reopened.loadBrainSnapshot(readback, &failure)); }
+    assert(readback.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses.size() == 3 &&
+        readback.masterAuthority.containerRuntimeStates.size() == 3);
+    // The stored snapshot retains the sealed envelope.  Re-preparation must
+    // name that installed envelope explicitly rather than treating it as idle.
+    assert(mothershipPrepareRetainedRecoverySnapshot(readback, source.masterAuthority.deploymentPlans, machines,
+        bundle, &failure, bundle));
+    std::filesystem::remove_all(graphRoot);
+    auto bad = readback; bad.masterAuthority.containerRuntimeStates[0].plan.nShardGroups = 2;
+    assert(!mothershipPrepareRetainedRecoverySnapshot(bad, source.masterAuthority.deploymentPlans, machines, bundle, &failure));
+    bad = source; bad.masterAuthority.containerRuntimeStates[0].plan.shardGroup = 1;
+    assert(!mothershipPrepareRetainedRecoverySnapshot(bad, source.masterAuthority.deploymentPlans, machines, bundle, &failure));
+    auto malformed = machines; malformed[0].parameters[0].statefulTopology.servingMode = StatefulTopologyServingMode::serve;
+    bad = source;
+    assert(!mothershipPrepareRetainedRecoverySnapshot(bad, source.masterAuthority.deploymentPlans, malformed, bundle, &failure));
+  }
+}
+
+static void assertInitialSeedRuntimeRepair()
+{
+  using namespace MothershipRetainedRecovery;
+  // Mothership-created fleets have no adoption entries. Their durable
+  // topology remains the complete member and pinned SSH authority.
+  MothershipProdigyCluster created;created.nBrains=3;created.deploymentMode=MothershipClusterDeploymentMode::remote;
+  created.provider=MothershipClusterProvider::vultr;
+  for(uint32_t index=0;index<3;++index) {
+    ClusterMachine member={};member.uuid=100+index;member.isBrain=true;
+    member.source=ClusterMachineSource::created;member.backing=ClusterMachineBacking::cloud;
+    member.cloud.cloudID=text("provider-member-"+std::to_string(index));
+    member.ssh.address=text("192.0.2."+std::to_string(index+1));member.ssh.port=22;
+    member.ssh.user="root"_ctv;member.ssh.hostPublicKeyOpenSSH=text("registered-host-pin-"+std::to_string(index));
+    created.topology.machines.push_back(member);
+  }
+  assert(created.machines.empty() && created.topology.machines.size()==3);
+  for(const auto& member:created.topology.machines) {
+    MothershipTidesMigration::Machine selected;selected.uuid=member.uuid;selected.address=str(member.ssh.address);
+    resolveInitialSeedRepairMachine(created,selected);
+    assert(selected.registered.uuid==member.uuid && selected.registered.ssh==member.ssh &&
+           selected.registered.source==MothershipClusterMachineSource::created && selected.registered.cloud.cloudID==member.cloud.cloudID);
+    bool rejected=false;try{resolveRegisteredMachine(created,selected);}catch(const std::exception&){rejected=true;}
+    assert(rejected); // ordinary migration still requires its adoption owner
+  }
+  auto rejectsCreated=[&](auto mutate) {
+    auto wrong=created;mutate(wrong);MothershipTidesMigration::Machine selected;
+    selected.uuid=100;selected.address="192.0.2.1";
+    bool rejected=false;try{resolveInitialSeedRepairMachine(wrong,selected);}catch(const std::exception&){rejected=true;}
+    assert(rejected);
+  };
+  rejectsCreated([](auto& c){c.topology.machines[0].uuid=999;});
+  rejectsCreated([](auto& c){c.topology.machines[1].uuid=100;});
+  rejectsCreated([](auto& c){c.topology.machines[0].ssh.address="192.0.2.99"_ctv;});
+  rejectsCreated([](auto& c){c.topology.machines[0].ssh.hostPublicKeyOpenSSH.clear();});
+  rejectsCreated([](auto& c){c.topology.machines[0].source=ClusterMachineSource::adopted;});
+  rejectsCreated([](auto& c){c.topology.machines[0].cloud.cloudID.clear();});
+  MothershipInitialSeedRuntimeRepairBinding binding;
+  binding.clusterUUID=4; binding.masterMachineUUID=10; binding.localMachineUUID=11;
+  binding.initialSeedOperationUUID=1; binding.deploymentID=(uint64_t(2)<<48)|112;
+  binding.masterGeneration=39; binding.followerGeneration=38;
+  for(uint128_t id:{uint128_t(10),uint128_t(11),uint128_t(12)}) binding.machineUUIDs.push_back(id);
+  ProdigyPersistentBrainSnapshot snapshot={}; snapshot.brainConfig.clusterUUID=4;
+  for(auto id:binding.machineUUIDs) { ClusterMachine machine={};machine.uuid=id;machine.isBrain=true;snapshot.topology.machines.push_back(machine); }
+  auto& runtime=snapshot.masterAuthority.runtimeState; runtime.generation=38;runtime.hasCompletedInitialMasterElection=true;
+  DeploymentPlan plan={};plan.isStateful=true;plan.stateful.allMasters=true;
+  plan.config.type=ApplicationType::stateful;plan.config.applicationID=2;plan.config.versionID=112;
+  plan.config.containerBlobSHA256=text(std::string(64,'a'));plan.config.containerBlobBytes=42;
+  snapshot.masterAuthority.deploymentPlans.insert_or_assign(binding.deploymentID,plan);
+  ProdigyStatefulServingAuthority authority={};authority.deploymentID=binding.deploymentID;authority.applicationID=2;
+  authority.revision=38;authority.phase=StatefulWorkerTopologyUpgradePhase::initialAllMastersSeedBootstrap;
+  authority.targetConfig=plan.config;authority.allMasters=true;
+  auto& scope=authority.initialAllMastersSeedBootstrap;
+  scope.bootstrap.sourceClusterUUID=3;scope.bootstrap.targetClusterUUID=4;scope.bootstrap.targetDeploymentID=binding.deploymentID;
+  scope.bootstrap.qualificationRunUUID=1;scope.bootstrap.successorOperationUUID=1;scope.bootstrap.expectedSeedGeneration=1;
+  scope.baselineOperationUUID=99;scope.nShardGroups=1;scope.planSHA256=text(std::string(64,'c'));
+  scope.artifactSHA256=plan.config.containerBlobSHA256;scope.artifactBytes=42;
+  binding.initialSeedIntentSHA256=text(std::string(64,'b'));
+  binding.initialSeedScopeSHA256=text(repairObjectSHA(scope));
+  assert(BitseryEngine::serialize(binding.normalizedDeploymentPlan,plan));
+  runtime.statefulServingAuthorities.push_back(authority);
+  for(auto id:binding.machineUUIDs) for(uint32_t pair=1;pair<=2;++pair) {
+    CrossClusterMasqueGatewayAuthority gateway;
+    gateway.pairUUID=pair;gateway.pairOperationUUID=pair+100;gateway.localClusterUUID=4;gateway.peerClusterUUID=pair+1000;
+    gateway.localMachineUUID=id;gateway.peerMachineUUID=id+1000*pair;gateway.localDatacenterFragment=1;gateway.peerDatacenterFragment=pair+1;
+    gateway.localSitePrefix=prodigyContainerDatacenterSitePrefix(1);gateway.peerSitePrefix=prodigyContainerDatacenterSitePrefix(pair+1);
+    gateway.artifactSHA256=text(std::string(64,'d'));gateway.artifactBytes=17;
+    gateway.listenerPublicUDPEndpoint.is6=true;gateway.listenerPublicUDPEndpoint.v6[0]=0x20;gateway.listenerPublicUDPPort=4433;
+    gateway.privateSessionCredentialSHA256=gateway.localIdentitySHA256=gateway.peerIdentitySHA256=gateway.peerTrustSHA256=text(std::string(64,'e'));
+    gateway.generation=gateway.keyGeneration=gateway.pairAuthorityGeneration=1;gateway.gatewaySlot=pair-1;
+    assert(prodigyDeriveCrossClusterMasquePrivateBGPTuple(gateway));
+    // Tuple derivation deliberately clears the credential reference.
+    gateway.privateSessionCredentialSHA256=text(std::string(64,'e'));
+    assert(prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(gateway));binding.gateways.push_back(gateway);
+  }
+  runtime.crossClusterMasqueGatewayAuthorities=binding.gateways;
+  String before,after;BitseryEngine::serialize(before,snapshot);
+  assert(mothershipInitialSeedRuntimeRepairSnapshotValid(snapshot,binding));
+  BitseryEngine::serialize(after,snapshot);assert(before==after);
+  auto rejects=[&](auto mutation) { auto bad=snapshot;mutation(bad);assert(!mothershipInitialSeedRuntimeRepairSnapshotValid(bad,binding)); };
+  rejects([](auto& s){s.masterAuthority.deploymentPlans.insert_or_assign(123,DeploymentPlan{});});
+  rejects([](auto& s){s.masterAuthority.runtimeState.updateSelf.workerExpectedBundleSHA256=text(std::string(64,'f'));});
+  rejects([](auto& s){++s.masterAuthority.runtimeState.generation;});
+  rejects([](auto& s){++s.topology.machines[0].uuid;});
+  rejects([](auto& s){++s.masterAuthority.runtimeState.crossClusterMasqueGatewayAuthorities[0].generation;});
+  rejects([](auto& s){++s.masterAuthority.runtimeState.statefulServingAuthorities[0].initialAllMastersSeedBootstrap.bootstrap.sourceClusterUUID;});
+  auto wrong=binding;wrong.followerGeneration=UINT64_MAX;wrong.masterGeneration=0;
+  assert(!mothershipInitialSeedRuntimeRepairSnapshotValid(snapshot,wrong));
+  wrong=binding;wrong.masterMachineUUID=11;assert(!mothershipInitialSeedRuntimeRepairSnapshotValid(snapshot,wrong));
+  // Exactly the first published member is permitted on the frozen master.
+  binding.localMachineUUID=10;runtime.generation=39;
+  auto& master=runtime.statefulServingAuthorities[0];master.revision=39;
+  BrainReplicatedContainerRuntimeState state={};state.machineUUID=10;state.plan.uuid=101;state.plan.config=plan.config;
+  state.plan.isStateful=true;state.plan.state=ContainerState::scheduled;state.plan.nShardGroups=1;
+  state.plan.statefulMeshRoles.client=17;state.plan.advertisements.insert_or_assign(17,Advertisement(17,ContainerState::healthy,ContainerState::destroying,19081));
+  state.plan.statefulTopology.servingMode=StatefulTopologyServingMode::allMastersSeedBootstrap;
+  state.plan.statefulTopology.allMastersSeedBootstrap=scope.bootstrap;
+  ProdigyStatefulServingAuthorityMember member;member.containerUUID=101;member.machineUUID=10;member.advertiseClient=true;
+  assert(prodigyStatefulServingRuntimeDigest(state,member.planSHA256));master.members.push_back(member);
+  snapshot.masterAuthority.servingRuntimeStates.push_back(state);
+  assert(mothershipInitialSeedRuntimeRepairSnapshotValid(snapshot,binding));
+  rejects([](auto& s){s.masterAuthority.servingRuntimeStates[0].plan.runtimeReady=true;});
+  rejects([](auto& s){auto live=s.masterAuthority.servingRuntimeStates[0];live.plan.runtimeReady=true;s.masterAuthority.containerRuntimeStates.push_back(live);});
+  rejects([](auto& s){s.masterAuthority.runtimeState.statefulServingAuthorities[0].members.clear();});
+  rejects([](auto& s){auto second=s.masterAuthority.servingRuntimeStates[0];++second.plan.uuid;auto member=s.masterAuthority.runtimeState.statefulServingAuthorities[0].members[0];member.containerUUID=second.plan.uuid;assert(prodigyStatefulServingRuntimeDigest(second,member.planSHA256));s.masterAuthority.servingRuntimeStates.push_back(second);s.masterAuthority.runtimeState.statefulServingAuthorities[0].members.push_back(member);});
+  // Runtime 54 has replicated the first member, but its unmaterialized seed
+  // still needs the runtime 55 cold-restore repair. All three private copies
+  // must carry generation 40 and the same single-member authority at 39.
+  auto replicated=snapshot;auto replicatedBinding=binding;
+  replicated.masterAuthority.runtimeState.generation=40;
+  replicatedBinding.masterGeneration=replicatedBinding.followerGeneration=40;
+  for(auto id:binding.machineUUIDs) {
+    replicatedBinding.localMachineUUID=id;
+    String encoded;assert(BitseryEngine::serialize(encoded,replicatedBinding));
+    MothershipInitialSeedRuntimeRepairBinding decoded;
+    assert(BitseryEngine::deserializeSafe(encoded,decoded));
+    assert(BitseryEngine::serialize(before,replicated));
+    assert(mothershipInitialSeedRuntimeRepairSnapshotValid(replicated,decoded));
+    assert(BitseryEngine::serialize(after,replicated) && before==after);
+    auto rejectsReplicated=[&](auto mutation) {
+      auto bad=replicated;mutation(bad);
+      assert(!mothershipInitialSeedRuntimeRepairSnapshotValid(bad,decoded));
+    };
+    rejectsReplicated([](auto& s){--s.masterAuthority.runtimeState.generation;});
+    rejectsReplicated([](auto& s){++s.masterAuthority.runtimeState.generation;});
+    rejectsReplicated([](auto& s){s.masterAuthority.runtimeState.statefulServingAuthorities[0].members.clear();s.masterAuthority.servingRuntimeStates.clear();});
+    rejectsReplicated([](auto& s){auto second=s.masterAuthority.servingRuntimeStates[0];++second.plan.uuid;auto member=s.masterAuthority.runtimeState.statefulServingAuthorities[0].members[0];member.containerUUID=second.plan.uuid;assert(prodigyStatefulServingRuntimeDigest(second,member.planSHA256));s.masterAuthority.servingRuntimeStates.push_back(second);s.masterAuthority.runtimeState.statefulServingAuthorities[0].members.push_back(member);});
+    rejectsReplicated([](auto& s){s.masterAuthority.servingRuntimeStates[0].plan.runtimeReady=true;});
+    auto asymmetric=decoded;asymmetric.followerGeneration=38;
+    assert(!mothershipInitialSeedRuntimeRepairSnapshotValid(replicated,asymmetric));
+    asymmetric=decoded;asymmetric.masterGeneration=39;
+    assert(!mothershipInitialSeedRuntimeRepairSnapshotValid(replicated,asymmetric));
+  }
+  // A replicated follower cannot be admitted through the old divergent binding.
+  wrong=binding;wrong.localMachineUUID=11;
+  auto asymmetric=replicated;asymmetric.masterAuthority.runtimeState.generation=38;
+  assert(!mothershipInitialSeedRuntimeRepairSnapshotValid(asymmetric,wrong));
+  // The original 39/38 master and its binding remain untouched and valid.
+  assert(mothershipInitialSeedRuntimeRepairSnapshotValid(snapshot,binding));
+
+  // Runtime55's failed, populated seed has three sealed UUIDs, with two on
+  // its current master. This explicit private mode never rewrites that cohort.
+  namespace P=MothershipPopulatedSeedRepair;
+  auto populated=snapshot;auto populatedBinding=binding;
+  populatedBinding.clusterUUID=P::cluster;populatedBinding.masterMachineUUID=P::master;
+  populatedBinding.localMachineUUID=P::master;populatedBinding.machineUUIDs={P::master,P::ord0,P::ord2};
+  populatedBinding.initialSeedOperationUUID=P::operation;populatedBinding.deploymentID=P::deployment;
+  populatedBinding.masterGeneration=populatedBinding.followerGeneration=43;
+  populatedBinding.initialSeedIntentSHA256="a24066295d67e6b92c6a0c4ad8cfedfcce44d2cdd92aaba871738bc1bb05f845"_ctv;
+  populated.brainConfig.clusterUUID=P::cluster;populated.topology.machines.clear();
+  for(auto id:populatedBinding.machineUUIDs) {ClusterMachine m={};m.uuid=id;m.isBrain=true;populated.topology.machines.push_back(m);}
+  auto populatedPlan=plan;populatedPlan.config.versionID=P::deployment&((uint64_t(1)<<48)-1);
+  populated.masterAuthority.deploymentPlans.clear();populated.masterAuthority.deploymentPlans.emplace(P::deployment,populatedPlan);
+  assert(BitseryEngine::serialize(populatedBinding.normalizedDeploymentPlan,populatedPlan));
+  auto& populatedRuntime=populated.masterAuthority.runtimeState;populatedRuntime.generation=43;
+  auto& populatedAuthority=populatedRuntime.statefulServingAuthorities[0];
+  populatedAuthority.deploymentID=P::deployment;populatedAuthority.revision=43;populatedAuthority.targetConfig=populatedPlan.config;
+  auto& populatedScope=populatedAuthority.initialAllMastersSeedBootstrap;
+  populatedScope.bootstrap.targetClusterUUID=P::cluster;populatedScope.bootstrap.targetDeploymentID=P::deployment;
+  populatedScope.bootstrap.successorOperationUUID=populatedScope.bootstrap.qualificationRunUUID=P::operation;
+  assert(prodigyComputeSHA256Hex(populatedBinding.normalizedDeploymentPlan,populatedScope.planSHA256));
+  populatedBinding.initialSeedScopeSHA256=text(repairObjectSHA(populatedScope));
+  populatedAuthority.members.clear();populated.masterAuthority.servingRuntimeStates.clear();
+  uint32_t ordinal=0;
+  for(auto id:{P::first,P::live,P::third}) {
+    auto row=state;row.plan.uuid=id;row.machineUUID=id==P::third ? P::ord2 : P::master;
+    row.plan.config=populatedPlan.config;row.plan.lifetime=ApplicationLifetime::base;row.plan.fragment=uint8_t(++ordinal);
+    row.plan.statefulTopology.allMastersSeedBootstrap=populatedScope.bootstrap;
+    IPPrefix address={};address.network.is6=true;address.network.v6[0]=0xfd;address.network.v6[15]=ordinal;address.cidr=128;
+    row.plan.addresses.push_back(address);
+    auto member=populatedAuthority.members.empty() ? ProdigyStatefulServingAuthorityMember{} : populatedAuthority.members[0];
+    member.containerUUID=id;member.machineUUID=row.machineUUID;member.advertiseClient=true;
+    assert(prodigyStatefulServingRuntimeDigest(row,member.planSHA256));
+    populatedAuthority.members.push_back(member);populated.masterAuthority.servingRuntimeStates.push_back(row);
+  }
+  populatedBinding.gateways.clear();populatedRuntime.crossClusterMasqueGatewayAuthorities.clear();
+  for(size_t index=0;index<binding.gateways.size();++index) {
+    auto gateway=binding.gateways[index];gateway.localClusterUUID=P::cluster;
+    gateway.localMachineUUID=populatedBinding.machineUUIDs[index/2];
+    assert(prodigyDeriveCrossClusterMasquePrivateBGPTuple(gateway));gateway.privateSessionCredentialSHA256=text(std::string(64,'e'));
+    assert(prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(gateway));
+    populatedBinding.gateways.push_back(gateway);populatedRuntime.crossClusterMasqueGatewayAuthorities.push_back(gateway);
+  }
+  auto healthy=populated.masterAuthority.servingRuntimeStates[1];healthy.plan.state=ContainerState::healthy;healthy.plan.runtimeReady=true;
+  populated.masterAuthority.containerRuntimeStates={healthy,populated.masterAuthority.servingRuntimeStates[2]};
+  FailedDeploymentRecord failed={};failed.applicationID=2;failed.deploymentID=P::deployment;
+  failed.reason="stateful container launch is not admitted by serving authority"_ctv;failed.failedAtMs=123;failed.hasTerminalReport=true;
+  failed.terminalReport={};auto& terminal=failed.terminalReport;
+  terminal.versionID=populatedPlan.config.versionID;terminal.state=DeploymentState::failed;terminal.isStateful=true;terminal.nShardGroups=1;
+  terminal.nTarget=terminal.nTargetBase=3;terminal.nDeployed=terminal.nDeployedBase=2;terminal.nHealthy=terminal.nHealthyBase=1;
+  for(auto id:{P::live,P::third}) {DeploymentStatusReport::ContainerRuntime row={};row.uuid=id;terminal.containerRuntimes.push_back(row);}
+  populated.masterAuthority.failedDeployments.emplace(P::deployment,failed);
+  MothershipPopulatedSeedRuntimeRepairProof proof;
+  proof.predecessorRevision=55;proof.successorRevision=56;proof.pulseMachineUUID=P::master;proof.pulseContainerUUID=P::live;
+  proof.pulsePID=3260;proof.pulseStartTicks=11896;proof.pulseExecutableBytes=13832704;
+  proof.pulseExecutableSHA256="0aa1cae4143847f9e47e8d7099e750f2c3a768fd01c1a66880deeb589919dfec"_ctv;
+  proof.storageDevice=56;proof.storageInode=269;proof.storageUID=proof.storageGID=9502575;
+  proof.bootID="23c00d17-59ed-4370-9d6a-6a66069f01cb"_ctv;proof.linuxMachineID="30b778da1b2745ea8438931b72d01963"_ctv;
+  proof.mountNamespace="mnt:[4026533488]"_ctv;proof.networkNamespace="net:[4026533492]"_ctv;proof.pidNamespace="pid:[4026533491]"_ctv;
+  ContainerParameters startup={};const auto& launch=populated.masterAuthority.servingRuntimeStates[1].plan;
+  startup.uuid=P::live;startup.deploymentID=P::deployment;startup.private6=launch.addresses[0];
+  startup.memoryMB=launch.config.memoryMB;startup.storageMB=launch.config.storageMB;
+  startup.nLogicalCores=applicationSharedCPUCoreHint(launch.config);startup.cpuMode=launch.config.cpuMode;
+  startup.requestedCPUMillis=applicationRequestedCPUMillis(launch.config);startup.statefulMeshRoles=launch.statefulMeshRoles;
+  startup.statefulTopology=launch.statefulTopology;startup.flags={0,1};
+  for(const auto& [service,ad]:launch.advertisements)startup.advertisesOnPorts.emplace(service,ad.port);
+  assert(BitseryEngine::serialize(proof.startupParameters,startup) && prodigyComputeSHA256Hex(proof.startupParameters,proof.parametersSHA256));
+  assert(mothershipPopulatedSeedRuntimeRepairBindingValid(populatedBinding,proof));
+  assert(mothershipInitialSeedRuntimeRepairSnapshotValid(populated,populatedBinding,&proof));
+  assert(!mothershipInitialSeedRuntimeRepairSnapshotValid(populated,populatedBinding)); // old equal-generation mode stays closed
+  auto rejectsPopulated=[&](auto mutation) {auto bad=populated;mutation(bad);assert(!mothershipInitialSeedRuntimeRepairSnapshotValid(bad,populatedBinding,&proof));};
+  rejectsPopulated([](auto& s){++s.masterAuthority.runtimeState.generation;});
+  rejectsPopulated([](auto& s){--s.masterAuthority.runtimeState.statefulServingAuthorities[0].revision;});
+  rejectsPopulated([](auto& s){s.masterAuthority.runtimeState.statefulServingAuthorities[0].members.pop_back();});
+  rejectsPopulated([](auto& s){s.masterAuthority.containerRuntimeStates[0].machineUUID=P::ord0;});
+  rejectsPopulated([](auto& s){s.masterAuthority.containerRuntimeStates.push_back(s.masterAuthority.containerRuntimeStates[0]);});
+  rejectsPopulated([](auto& s){s.masterAuthority.containerRuntimeStates[0].plan.runtimeReady=false;});
+  rejectsPopulated([](auto& s){s.masterAuthority.failedDeployments.clear();});
+  rejectsPopulated([](auto& s){s.masterAuthority.failedDeployments.begin()->second.hasOperatorCancellation=true;});
+  rejectsPopulated([](auto& s){s.masterAuthority.failedDeployments.begin()->second.reason="different failure"_ctv;});
+  rejectsPopulated([](auto& s){s.masterAuthority.failedDeployments.begin()->second.terminalReport.containerRuntimes[0].uuid=P::first;});
+  rejectsPopulated([](auto& s){s.masterAuthority.runtimeState.taskExecutions.emplace(1,TaskExecutionRecord{});});
+  auto rejectsProof=[&](auto mutation) {auto bad=proof;mutation(bad);assert(!mothershipInitialSeedRuntimeRepairSnapshotValid(populated,populatedBinding,&bad));};
+  rejectsProof([](auto& p){p.predecessorRevision=54;});rejectsProof([](auto& p){p.successorRevision=55;});
+  rejectsProof([](auto& p){++p.pulsePID;});rejectsProof([](auto& p){++p.storageInode;});
+  rejectsProof([](auto& p){p.parametersSHA256=text(std::string(64,'a'));});
+  auto wrongStartup=startup;wrongStartup.uuid=P::first;auto wrongParameters=proof;
+  assert(BitseryEngine::serialize(wrongParameters.startupParameters,wrongStartup) &&
+         prodigyComputeSHA256Hex(wrongParameters.startupParameters,wrongParameters.parametersSHA256));
+  assert(!mothershipInitialSeedRuntimeRepairSnapshotValid(populated,populatedBinding,&wrongParameters));
+  for(auto peer:{P::ord0,P::ord2}) {
+    auto follower=populated;auto followerBinding=populatedBinding;followerBinding.localMachineUUID=peer;
+    follower.masterAuthority.failedDeployments.clear();follower.masterAuthority.containerRuntimeStates.clear();
+    if(peer==P::ord0) {
+      for(auto id:{P::absentOrd0,P::absentOrd2,P::first}) {
+        auto row=populated.masterAuthority.servingRuntimeStates[0];row.plan.uuid=id;
+        row.machineUUID=id==P::absentOrd0 ? P::ord0 : id==P::absentOrd2 ? P::ord2 : P::master;
+        if(id==P::first)row.plan.nShardGroups=0;
+        follower.masterAuthority.containerRuntimeStates.push_back(row);
+      }
+    }
+    follower.masterAuthority.containerRuntimeStates.push_back(populated.masterAuthority.servingRuntimeStates[1]);
+    assert(mothershipInitialSeedRuntimeRepairSnapshotValid(follower,followerBinding,&proof));
+    auto bad=follower;bad.masterAuthority.containerRuntimeStates[0].plan.uuid=42;
+    assert(!mothershipInitialSeedRuntimeRepairSnapshotValid(bad,followerBinding,&proof));
+    String original,unchanged;assert(BitseryEngine::serialize(original,follower));
+    const auto evidence=populatedSeedSnapshotEvidence(follower,followerBinding);
+    assert(!evidence.empty() && BitseryEngine::serialize(unchanged,follower) && original==unchanged);
+  }
+  PopulatedSeedRuntimeRepairRequest request;request.binding=populatedBinding;request.proof=proof;
+  String privateBytes;assert(BitseryEngine::serialize(privateBytes,request));PopulatedSeedRuntimeRepairRequest decodedRequest;
+  assert(BitseryEngine::deserializeSafe(privateBytes,decodedRequest) &&
+         mothershipInitialSeedRuntimeRepairSnapshotValid(populated,decodedRequest.binding,&decodedRequest.proof));
+  assert(initialSeedRepairMaySubmitReboot(false,"boot-a","boot-a"));
+  assert(!initialSeedRepairMaySubmitReboot(true,"boot-a","boot-a")); // uncertain submit is never retried
+  assert(!initialSeedRepairMaySubmitReboot(true,"boot-a","boot-b")); // observed reboot needs no submit
+  assert(!initialSeedRepairMaySubmitReboot(false,"boot-a","boot-b")); // unowned reboot cannot be adopted
+
+  const auto root=fs::current_path()/".run"/("initial-seed-repair-"+std::to_string(::getpid()));
+  assert(!fs::exists(root));fs::create_directories(root);::chmod(root.c_str(),0700);
+  auto write=[&](const fs::path& path,const std::string& bytes) { fs::create_directories(path.parent_path());std::ofstream out(path,std::ios::binary);out<<bytes;out.close();assert(out); };
+  const std::string exe="approved gateway fixture";
+  InitialSeedRuntimeRepairManifest manifest;manifest.binding=binding;manifest.gatewayExecutableBytes=exe.size();
+  String hash;assert(prodigyComputeSHA256Hex(text(exe),hash));manifest.gatewayExecutableSHA=str(hash);
+  auto replace=[](std::string& value,const std::string& from,const std::string& to) { size_t pos=0;while((pos=value.find(from,pos))!=std::string::npos){value.replace(pos,from.size(),to);pos+=to.size();} };
+  const auto proc=root/"proc",cgroup=root/"cgroup";
+  write(proc/"sys/kernel/random/boot_id","11111111-1111-1111-1111-111111111111\n");write(root/"machine-id",std::string(32,'a')+"\n");
+  write(cgroup/"cgroup.procs","");
+  uint32_t index=0;
+  std::vector<std::string> environments;
+  for(const auto& gateway:binding.gateways) if(gateway.localMachineUUID==10) {
+    const auto pid=std::to_string(100+index),uuid=std::to_string(200+index);++index;
+    const auto leaf=uuid+".slice/leaf";write(cgroup/leaf/"cgroup.procs",pid+"\n");write(proc/pid/"exe",exe);
+    write(proc/pid/"cgroup","0::/containers.slice/"+leaf+"\n");
+    std::string stat=pid+" (gateway fixture) S ";for(int i=0;i<18;++i)stat+="0 ";stat+="777";write(proc/pid/"stat",stat);
+    SystemContainerRuntimePlan gp;gp.kind=SystemContainerKind::crossClusterMasqueGateway;Vector<String> env;
+    assert(prodigyBindCrossClusterMasqueGatewayRuntimePlanAuthority(gp,gateway) && prodigyAppendCrossClusterMasqueGatewayAuthorityEnvironment(gp,env));
+    std::string bytes;for(const auto& value:env){bytes+=str(value);bytes+='\0';}environments.push_back(bytes);write(proc/pid/"environ",bytes);
+  }
+  auto observeCommand=[&](std::string command) {
+    replace(command,"/sys/fs/cgroup/containers.slice",cgroup.string());replace(command,"'/proc", "'"+proc.string());replace(command,"/etc/machine-id",(root/"machine-id").string());
+    replace(command," <<'ISRR_PY'"," >/dev/null 2>/dev/null <<'ISRR_PY'");
+    String failure;return prodigyRunLocalShellCommand(text(command),&failure);
+  };
+  auto observe=[&](bool present=true) { return observeCommand(initialSeedRepairInventoryProgram(manifest,10,present)); };
+  auto preflight=[&](const InitialSeedRuntimeRepairManifest& selected) {
+    return observeCommand(initialSeedRepairPreflightInventoryProgram(selected,10));
+  };
+  auto coldManifest=manifest;coldManifest.binding.masterGeneration=coldManifest.binding.followerGeneration=40;
+  assert(observe());
+  assert(preflight(manifest) && !preflight(coldManifest));
+  write(proc/"100/exe","unapproved user executable");assert(!observe());
+  assert(!preflight(manifest) && !preflight(coldManifest));write(proc/"100/exe",exe);
+  write(proc/"100/environ",environments[1]);assert(!observe());write(proc/"100/environ",environments[0]);
+  write(cgroup/"unexpected/cgroup.procs","100\n");assert(!observe());fs::remove_all(cgroup/"unexpected");
+  assert(!observe(false));write(cgroup/"200.slice/leaf/cgroup.procs","");write(cgroup/"201.slice/leaf/cgroup.procs","");assert(observe(false));
+  assert(preflight(coldManifest) && !preflight(manifest));
+  write(cgroup/"200.slice/leaf/cgroup.procs","100\n");write(proc/"100/exe","unapproved user executable");
+  assert(!preflight(coldManifest) && !preflight(manifest));
+  // The observed 54 cohort has no containers.slice at all after its cold boot.
+  fs::remove_all(cgroup);assert(preflight(coldManifest) && !preflight(manifest));
+  assert(manifest.binding.gateways.size()==6 && coldManifest.binding.gateways.size()==6);
+  InitialSeedRuntimeRepairManifest populatedManifest;
+  populatedManifest.binding=populatedBinding;populatedManifest.populatedSeed=true;populatedManifest.populatedProof=proof;
+  auto& observedPulse=populatedManifest.populatedProof;
+  // The observer fixture substitutes ordinary files for proc/cgroup paths. It
+  // never launches an application or fabricates a deployable app artifact.
+  const auto pulseProc=proc/"3260",parametersFile=root/"startup.private",storageRoot=root/"storage";
+  const auto pulseUUID=std::string("251675310242172045408403294855390331990");
+  const auto pulseLeaf=pulseUUID+".slice/leaf";
+  write(parametersFile,str(proof.startupParameters));assert(::chmod(parametersFile.c_str(),0600)==0);
+  write(pulseProc/"exe",exe);observedPulse.pulseExecutableBytes=exe.size();observedPulse.pulseExecutableSHA256=hash;
+  write(pulseProc/"cgroup","0::/containers.slice/"+pulseLeaf+"\n");
+  std::string pulseStat="3260 (pulse fixture) S ";for(int i=0;i<18;++i)pulseStat+="0 ";pulseStat+="11896";
+  write(pulseProc/"stat",pulseStat);write(pulseProc/"environ",std::string("PRODIGY_PARAMS_FD=204")+std::string(1,'\0'));
+  fs::create_directories(pulseProc/"fd");fs::create_symlink(parametersFile,pulseProc/"fd/204");
+  fs::create_directories(pulseProc/"ns");fs::create_directories(proc/"1/ns");
+  for(const auto& entry:std::vector<std::pair<std::string,std::string>>{{"mnt",str(proof.mountNamespace)},
+      {"net",str(proof.networkNamespace)},{"pid",str(proof.pidNamespace)}}) {
+    fs::create_symlink(entry.second,pulseProc/"ns"/entry.first);
+    fs::create_symlink(entry.first+":[1]",proc/"1/ns"/entry.first);
+  }
+  fs::create_directories(storageRoot/pulseUUID);struct stat stored{};assert(::stat((storageRoot/pulseUUID).c_str(),&stored)==0);
+  observedPulse.storageDevice=stored.st_dev;observedPulse.storageInode=stored.st_ino;
+  observedPulse.storageUID=stored.st_uid;observedPulse.storageGID=stored.st_gid;
+  write(proc/"sys/kernel/random/boot_id",str(proof.bootID)+"\n");write(root/"machine-id",str(proof.linuxMachineID)+"\n");
+  write(cgroup/pulseLeaf/"cgroup.procs","3260\n");
+  auto populatedObserve=[&](const InitialSeedRuntimeRepairManifest& selected,bool beforeReboot=true) {
+    auto command=beforeReboot ? initialSeedRepairPreflightInventoryProgram(selected,P::master) :
+                               initialSeedRepairInventoryProgram(selected,P::master,false);
+    replace(command,"/containers/storage",storageRoot.string());
+    replace(command,"/memfd:container.params (deleted)",parametersFile.string());
+    return observeCommand(command);
+  };
+  assert(populatedObserve(populatedManifest) && !populatedObserve(populatedManifest,false));
+  assert(!preflight(coldManifest) && !preflight(manifest)); // neither earlier mode admits Pulse
+  auto rejectsInventory=[&](auto mutation) {auto bad=populatedManifest;mutation(bad.populatedProof);assert(!populatedObserve(bad));};
+  rejectsInventory([](auto& p){++p.pulsePID;});rejectsInventory([](auto& p){++p.pulseStartTicks;});
+  rejectsInventory([](auto& p){++p.storageInode;});rejectsInventory([](auto& p){p.mountNamespace="mnt:[1]"_ctv;});
+  rejectsInventory([](auto& p){p.parametersSHA256=text(std::string(64,'a'));});
+  write(parametersFile,"changed startup");assert(!populatedObserve(populatedManifest));write(parametersFile,str(proof.startupParameters));
+  write(pulseProc/"exe","unapproved Pulse executable");assert(!populatedObserve(populatedManifest));write(pulseProc/"exe",exe);
+  write(cgroup/"999.slice/leaf/cgroup.procs","3260\n");assert(!populatedObserve(populatedManifest));fs::remove_all(cgroup/"999.slice");
+  write(cgroup/pulseLeaf/"cgroup.procs","");assert(!populatedObserve(populatedManifest) && populatedObserve(populatedManifest,false));
+  assert(populatedManifest.binding.gateways.size()==6);
+  // The default migration gate still refuses unswapped databases; the repair
+  // gate additionally refuses a caller without its const preservation proof.
+  Plan ep;ep.operationRoot=root.string();Execution execution(ep);
+  bool rejected=false;try{execution.activate();}catch(const std::exception&){rejected=true;}assert(rejected);
+  execution.plan.initialSeedRuntimeRepair=true;execution.plan.retainedRecovery=true;
+  rejected=false;try{execution.activate();}catch(const std::exception&){rejected=true;}assert(rejected);
+  assert(!execution.receipt.activationBoundaryCrossed);
+  // Bundle identity fails before the command can consult provenance, registry
+  // or any host. The private manifest cannot turn an unapproved bundle into a
+  // same-format repair merely by naming revisions 53 and 54.
+  const auto badManifest=root/"bad-manifest.json";
+  write(badManifest,"{\"schemaVersion\":1,\"predecessorRuntimeRevision\":53,\"successorRuntimeRevision\":54,"
+      "\"stateFormatUnchanged\":true,\"wireFormatUnchanged\":true,\"clusterUUID\":\"0x4\",\"masterMachineUUID\":\"0xa\","
+      "\"initialSeedOperationUUID\":\"0x1\",\"pendingDeploymentID\":562949953421424,\"masterAuthorityGeneration\":39,\"followerAuthorityGeneration\":38,"
+      "\"initialSeedIntentSHA256\":"+repairJSON(std::string(64,'b'))+",\"expectedNewBundleSHA256\":"+repairJSON(std::string(64,'c'))+
+      ",\"expectedNewRuntimeSHA256\":"+repairJSON(std::string(64,'d'))+",\"gatewayArtifactSHA256\":"+repairJSON(std::string(64,'e'))+
+      ",\"gatewayArtifactBytes\":17,\"gatewayExecutableSHA256\":"+repairJSON(std::string(64,'f'))+",\"gatewayExecutableBytes\":19}");
+  assert(::chmod(badManifest.c_str(),0600)==0);
+  execution.plan.clusterUUID=4;MothershipTidesMigration::Machine machine;machine.uuid=10;execution.plan.machines.push_back(machine);
+  execution.receipt.approvedBundleSHA256=text(std::string(64,'a'));execution.receipt.newRuntimeSHA256=text(std::string(64,'d'));
+  rejected=false;try{parseInitialSeedRepairManifest(badManifest.string(),execution);}catch(const std::exception& error){rejected=std::string(error.what())=="repair bundle, frozen master or generation mismatch";}assert(rejected);
+  // Exercise both explicit manifest contracts through their generation gates.
+  // A deliberately mismatched provenance digest stops each admitted tuple
+  // before opening a registry; valid versions never replace artifact proof.
+  const auto provenance=root/"gateway-provenance.json";write(provenance,"{}");assert(::chmod(provenance.c_str(),0600)==0);
+  auto divergentManifest=read(badManifest);divergentManifest.pop_back();
+  divergentManifest+=",\"gatewayProvenancePath\":"+repairJSON(provenance.string())+",\"gatewayProvenanceSHA256\":"+repairJSON(std::string(64,'a'))+"}";
+  auto replicatedManifest=divergentManifest;
+  replace(replicatedManifest,"\"predecessorRuntimeRevision\":53,\"successorRuntimeRevision\":54","\"predecessorRuntimeRevision\":54,\"successorRuntimeRevision\":55");
+  replace(replicatedManifest,"\"masterAuthorityGeneration\":39,\"followerAuthorityGeneration\":38","\"masterAuthorityGeneration\":40,\"followerAuthorityGeneration\":40");
+  execution.receipt.approvedBundleSHA256=text(std::string(64,'c'));
+  auto manifestStopsAt=[&](const std::string& bytes,const char *expected) {
+    write(badManifest,bytes);bool stopped=false;
+    try{parseInitialSeedRepairManifest(badManifest.string(),execution);}
+    catch(const std::exception& error){stopped=std::string(error.what())==expected;}
+    assert(stopped);
+  };
+  manifestStopsAt(divergentManifest,"gateway package provenance digest mismatch");
+  manifestStopsAt(replicatedManifest,"gateway package provenance digest mismatch");
+  auto manifestRejects=[&](const std::string& source,const std::string& from,const std::string& to,const char *expected) {
+    auto bad=source;assert(bad.find(from)!=std::string::npos);replace(bad,from,to);manifestStopsAt(bad,expected);
+  };
+  const auto generationMismatch="repair bundle, frozen master or generation mismatch";
+  const auto versionMismatch="repair requires the explicitly approved same-format runtime53 to runtime54 or runtime54 to runtime55 contract";
+  manifestRejects(divergentManifest,"\"followerAuthorityGeneration\":38","\"followerAuthorityGeneration\":39",generationMismatch);
+  manifestRejects(replicatedManifest,"\"followerAuthorityGeneration\":40","\"followerAuthorityGeneration\":39",generationMismatch);
+  manifestRejects(replicatedManifest,"\"masterAuthorityGeneration\":40","\"masterAuthorityGeneration\":39",generationMismatch);
+  manifestRejects(replicatedManifest,"\"predecessorRuntimeRevision\":54","\"predecessorRuntimeRevision\":53",versionMismatch);
+  manifestRejects(replicatedManifest,"\"predecessorRuntimeRevision\":54","\"predecessorRuntimeRevision\":55",versionMismatch);
+  manifestRejects(replicatedManifest,"\"successorRuntimeRevision\":55","\"successorRuntimeRevision\":56",versionMismatch);
+  manifestRejects(replicatedManifest,"\"stateFormatUnchanged\":true","\"stateFormatUnchanged\":false",versionMismatch);
+  manifestRejects(replicatedManifest,"\"wireFormatUnchanged\":true","\"wireFormatUnchanged\":false",versionMismatch);
+  auto populatedJSON=divergentManifest;
+  replace(populatedJSON,"\"predecessorRuntimeRevision\":53,\"successorRuntimeRevision\":54","\"predecessorRuntimeRevision\":55,\"successorRuntimeRevision\":56");
+  replace(populatedJSON,"\"clusterUUID\":\"0x4\"","\"clusterUUID\":"+repairJSON(repairID(P::cluster)));
+  replace(populatedJSON,"\"masterMachineUUID\":\"0xa\"","\"masterMachineUUID\":"+repairJSON(repairID(P::master)));
+  replace(populatedJSON,"\"initialSeedOperationUUID\":\"0x1\"","\"initialSeedOperationUUID\":"+repairJSON(repairID(P::operation)));
+  replace(populatedJSON,"562949953421424",std::to_string(P::deployment));
+  replace(populatedJSON,"\"masterAuthorityGeneration\":39,\"followerAuthorityGeneration\":38","\"masterAuthorityGeneration\":43,\"followerAuthorityGeneration\":43");
+  replace(populatedJSON,"\"initialSeedIntentSHA256\":"+repairJSON(std::string(64,'b')),
+      "\"initialSeedIntentSHA256\":"+repairJSON(str(populatedBinding.initialSeedIntentSHA256)));
+  populatedJSON.pop_back();
+  populatedJSON+=",\"populatedSeed\":{\"pulseMachineUUID\":"+repairJSON(repairID(proof.pulseMachineUUID))+
+      ",\"pulseContainerUUID\":"+repairJSON(repairID(proof.pulseContainerUUID))+",\"pulsePID\":3260,\"pulseStartTicks\":11896,"
+      "\"pulseExecutableSHA256\":"+repairJSON(str(proof.pulseExecutableSHA256))+",\"pulseExecutableBytes\":13832704,"
+      "\"pulseParametersPath\":"+repairJSON(parametersFile.string())+",\"pulseParametersSHA256\":"+repairJSON(str(proof.parametersSHA256))+
+      ",\"pulseStorageDevice\":56,\"pulseStorageInode\":269,\"pulseStorageUID\":9502575,\"pulseStorageGID\":9502575,"
+      "\"pulseBootID\":"+repairJSON(str(proof.bootID))+",\"pulseLinuxMachineID\":"+repairJSON(str(proof.linuxMachineID))+
+      ",\"pulseMountNamespace\":"+repairJSON(str(proof.mountNamespace))+",\"pulseNetworkNamespace\":"+repairJSON(str(proof.networkNamespace))+
+      ",\"pulsePIDNamespace\":"+repairJSON(str(proof.pidNamespace))+"}}";
+  execution.plan.clusterUUID=P::cluster;execution.plan.machines.clear();
+  for(auto id:populatedBinding.machineUUIDs) {
+    MothershipTidesMigration::Machine selected;selected.uuid=id;
+    selected.linuxID=id==P::master ? "30b778da1b2745ea8438931b72d01963" :
+        id==P::ord0 ? "b8250f81b66f4cfe9c3111316b16a12f" : "78c6a43624b94d90a9d3d69a8b4fa80a";
+    execution.plan.machines.push_back(selected);
+  }
+  execution.plan.oldRuntimeSHA="7018687562fb4dba5bc45c8d37febc968a23109e739d57c9d617b1e0d8d8da81";
+  execution.plan.oldBundleSHA="d6ee8470f4db8017dc8a13ce17879d1b0431a21b8b726c354aadf50ff3299ddd";
+  manifestStopsAt(populatedJSON,"gateway package provenance digest mismatch");
+  manifestRejects(populatedJSON,"\"pulsePID\":3260","\"pulsePID\":3261","populated repair process or typed startup identity differs");
+  manifestRejects(populatedJSON,"\"followerAuthorityGeneration\":43","\"followerAuthorityGeneration\":42",generationMismatch);
+  manifestRejects(populatedJSON,"\"masterAuthorityGeneration\":43,\"followerAuthorityGeneration\":43",
+      "\"masterAuthorityGeneration\":44,\"followerAuthorityGeneration\":44","populated repair process or typed startup identity differs");
+  manifestRejects(populatedJSON,"\"successorRuntimeRevision\":56","\"successorRuntimeRevision\":57",versionMismatch);
+  fs::remove_all(root);
+}
+
 int main()
 {
+  if (const char *only=std::getenv("PRODIGY_TEST_ONLY");only &&
+      (std::strcmp(only,"initial-seed-runtime-repair")==0 || std::strcmp(only,"populated-seed-runtime-repair")==0)) {
+    assertInitialSeedRuntimeRepair();std::puts("INITIAL_SEED_RUNTIME_REPAIR_RESULT failed_assertions=0");return 0;
+  }
+  assertInitialSeedRuntimeRepair();
+  assertGraphReplicaSnapshotRecovery();
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only && std::strcmp(only, "retained-graph") == 0) {
+    std::puts("RETAINED_GRAPH_RESULT failed_assertions=0"); return 0;
+  }
   if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only != nullptr &&
       std::strcmp(only, "retained-cold-canonical") == 0)
   {

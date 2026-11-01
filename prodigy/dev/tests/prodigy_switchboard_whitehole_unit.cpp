@@ -106,6 +106,35 @@ static bool diagnoseHostIngressRawLoad(void)
   return true;
 }
 
+// This isolates the first production host-router operation: loading egress
+// with the same allocation seeder that Neuron uses before it attempts TCX
+// attachment or any bpffs reuse.  It deliberately neither attaches nor pins.
+static int runHostRouterEgressLoadOnly(void)
+{
+  libbpf_set_print(switchboardWhiteholeLibbpfDiagnostics);
+
+  String egressObjectPath = {};
+  egressObjectPath.assign(PRODIGY_TEST_BINARY_DIR);
+  egressObjectPath.append("/host.egress.router.ebpf.o"_ctv);
+
+  BPFProgram egressProgram = {};
+  errno = 0;
+  const bool loaded = egressProgram.load(egressObjectPath,
+                                         "host_egress"_ctv,
+                                         [](struct bpf_object *object, Vector<int>&) -> void {
+                                           switchboardConfigureDevelopmentWhiteholeMapAllocation(object);
+                                         });
+  const int loadErrno = loaded ? 0 : errno;
+  std::fprintf(stderr,
+               "HOST_ROUTER_LOAD_ONLY egress path=%s result=%s errno=%d (%s)\n",
+               egressObjectPath.c_str(),
+               loaded ? "PASS" : "FAIL",
+               loadErrno,
+               std::strerror(loadErrno));
+  egressProgram.close();
+  return loaded ? 0 : 1;
+}
+
 static uint32_t programMapID(BPFProgram& program, StringType auto&& mapName)
 {
   uint32_t id = 0;
@@ -127,6 +156,22 @@ static uint32_t programMapID(BPFProgram& program, StringType auto&& mapName)
   return id;
 }
 
+struct WormholeMapOverrideForTest
+{
+  BPFProgram& program;
+  const char *mapName;
+  int replacementFD;
+
+  template <typename Callback>
+  void openMap(StringType auto&& name, Callback&& callback)
+  {
+    String requested = {};
+    requested.assign(name);
+    if (std::strcmp(requested.c_str(), mapName) == 0) callback(replacementFD);
+    else program.openMap(name, callback);
+  }
+};
+
 static bool objectWhiteholeMapsUseAllocation(struct bpf_object *object, bool sparse, uint32_t maxEntries)
 {
   static constexpr std::array<const char *, 3> mapNames = {"wh_targets", "wh_egress", "wh_egress4"};
@@ -143,13 +188,85 @@ static bool objectWhiteholeMapsUseAllocation(struct bpf_object *object, bool spa
   return true;
 }
 
+static bool objectBPFNamesFitKernelLimit(struct bpf_object *object, const char *objectLabel)
+{
+  bool fits = object != nullptr;
+  if (object == nullptr)
+  {
+    std::fprintf(stderr, "unable to open BPF object for name validation: %s\n", objectLabel);
+    return false;
+  }
+
+  struct bpf_map *map = nullptr;
+  bpf_object__for_each_map(map, object)
+  {
+    const char *name = bpf_map__name(map);
+    if (name == nullptr || std::strlen(name) > BPF_OBJ_NAME_LEN - 1)
+    {
+      std::fprintf(stderr,
+                   "BPF map name exceeds %u bytes: object=%s name=%s\n",
+                   unsigned(BPF_OBJ_NAME_LEN - 1),
+                   objectLabel,
+                   name ? name : "<null>");
+      fits = false;
+    }
+  }
+
+  struct bpf_program *program = nullptr;
+  bpf_object__for_each_program(program, object)
+  {
+    const char *name = bpf_program__name(program);
+    if (name == nullptr || std::strlen(name) > BPF_OBJ_NAME_LEN - 1)
+    {
+      std::fprintf(stderr,
+                   "BPF program name exceeds %u bytes: object=%s name=%s\n",
+                   unsigned(BPF_OBJ_NAME_LEN - 1),
+                   objectLabel,
+                   name ? name : "<null>");
+      fits = false;
+    }
+  }
+
+  return fits;
+}
+
 static void verifyDevelopmentWhiteholeMapAllocation(TestSuite& suite)
 {
-  suite.expect(std::strlen("wh_pair_grants") <= 15 && std::strlen("wh_pair_routes") <= 15,
-               "switchboard_pair_admission_map_names_fit_basics_loader_limit");
-  String objectPath = {};
-  objectPath.assign(PRODIGY_TEST_BINARY_DIR);
-  objectPath.append("/host.ingress.router.ebpf.o"_ctv);
+  String ingressObjectPath = {};
+  ingressObjectPath.assign(PRODIGY_TEST_BINARY_DIR);
+  ingressObjectPath.append("/host.ingress.router.ebpf.o"_ctv);
+
+  auto validateObjectNames = [&](String& objectPath, const char *objectLabel, const char *expectation) -> void {
+    struct bpf_object *object = bpf_object__open_file(objectPath.c_str(), nullptr);
+    if (libbpf_get_error(object))
+    {
+      object = nullptr;
+    }
+    suite.expect(objectBPFNamesFitKernelLimit(object, objectLabel), expectation);
+    if (object)
+    {
+      bpf_object__close(object);
+    }
+  };
+  static constexpr std::array<const char *, 7> loadedObjects = {
+      "host.ingress.router.ebpf.o",
+      "host.ingress.router.dev.ebpf.o",
+      "host.egress.router.ebpf.o",
+      "container.ingress.router.ebpf.o",
+      "container.ingress.router.wormhole-full.ebpf.o",
+      "container.egress.router.ebpf.o",
+      "balancer.ebpf.o",
+  };
+  for (const char *loadedObject : loadedObjects)
+  {
+    String objectPath = {};
+    objectPath.assign(PRODIGY_TEST_BINARY_DIR);
+    objectPath.append("/"_ctv);
+    objectPath.append(loadedObject, std::strlen(loadedObject));
+    validateObjectNames(objectPath,
+                        loadedObject,
+                        "switchboard_all_loaded_bpf_object_names_fit_basics_loader_limit");
+  }
 
   const char *savedDevMode = std::getenv("PRODIGY_DEV_MODE");
   String savedDevModeText = {};
@@ -159,7 +276,7 @@ static void verifyDevelopmentWhiteholeMapAllocation(TestSuite& suite)
   }
 
   ::unsetenv("PRODIGY_DEV_MODE");
-  struct bpf_object *productionObject = bpf_object__open_file(objectPath.c_str(), nullptr);
+  struct bpf_object *productionObject = bpf_object__open_file(ingressObjectPath.c_str(), nullptr);
   if (libbpf_get_error(productionObject))
   {
     productionObject = nullptr;
@@ -173,7 +290,7 @@ static void verifyDevelopmentWhiteholeMapAllocation(TestSuite& suite)
   }
 
   ::setenv("PRODIGY_DEV_MODE", "1", 1);
-  struct bpf_object *developmentObject = bpf_object__open_file(objectPath.c_str(), nullptr);
+  struct bpf_object *developmentObject = bpf_object__open_file(ingressObjectPath.c_str(), nullptr);
   if (libbpf_get_error(developmentObject))
   {
     developmentObject = nullptr;
@@ -659,6 +776,159 @@ static std::vector<uint8_t> makeIPv6L4EthernetFrame(const uint8_t source[16],
   }
 
   return frame;
+}
+
+// This loads the actual host egress program but does not attach or pin it.
+// A local low-8 alias must never route a remote full identity after its exact
+// and datacenter route entries have been withdrawn.
+static int runOverlayRemoteWithdrawalOnly(void)
+{
+  TestSuite suite = {};
+  libbpf_set_print(switchboardWhiteholeLibbpfDiagnostics);
+
+  String egressObjectPath = {};
+  egressObjectPath.assign(PRODIGY_TEST_BINARY_DIR);
+  egressObjectPath.append("/host.egress.router.ebpf.o"_ctv);
+  BPFProgram egress = {};
+  suite.expect(egress.load(egressObjectPath,
+                           "host_egress"_ctv,
+                           [](struct bpf_object *object, Vector<int>&) -> void {
+                             switchboardConfigureDevelopmentWhiteholeMapAllocation(object);
+                           }),
+               "switchboard_overlay_remote_withdrawal_loads_host_egress_program");
+  if (egress.prog_fd < 0)
+  {
+    return 1;
+  }
+
+  switchboard_overlay_config config = {};
+  config.container_network_enabled = 1;
+  egress.setArrayElement("ovl_config"_ctv, 0, config);
+  mac sourceMAC = {{0x02, 0x42, 0xac, 0x11, 0x00, 0x0a}};
+  mac gatewayMAC = {{0x02, 0x42, 0xac, 0x11, 0x00, 0x01}};
+  egress.setArrayElement("mac_map"_ctv, 0, sourceMAC);
+  egress.setArrayElement("gw_mac_map"_ctv, 0, gatewayMAC);
+
+  constexpr uint32_t remoteMachine = 0x0001005au;
+  constexpr uint32_t localLow8 = remoteMachine & 0xffu;
+  const uint32_t remoteIdentity = switchboardMakeOverlayMachineIdentity(2, remoteMachine);
+  const uint32_t remoteSite = switchboardMakeOverlayDatacenterRouteKey(2);
+
+  switchboard_overlay_machine_route localAlias = {};
+  localAlias.family = SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV6;
+  localAlias.use_gateway_mac = SWITCHBOARD_OVERLAY_ROUTE_ACTION_GATEWAY_MAC;
+  parseIPv6Bytes("fd00:10::1", localAlias.source6);
+  parseIPv6Bytes("fd00:10::2", localAlias.next_hop6);
+  suite.expect(updateProgramMapElement(egress,
+                                       "ovl_mach_low8"_ctv,
+                                       switchboardMakeOverlayMachineRouteKey(localLow8),
+                                       localAlias),
+               "switchboard_overlay_remote_withdrawal_installs_local_same_low8_alias");
+
+  uint8_t source[16] = {};
+  uint8_t destination[16] = {};
+  makeContainerIPv6(source, 1, 0, 0, 1, 1);
+  makeContainerIPv6(destination, 2, 1, 0, uint8_t(localLow8), 1);
+  std::vector<uint8_t> frame = makeIPv6L4EthernetFrame(source, destination, IPPROTO_UDP, 40'000, 40'001);
+  auto run = [&](uint32_t& action, uint32_t& outputBytes) -> bool {
+    std::vector<uint8_t> output(frame.size() + sizeof(struct ipv6hdr) + 64u);
+    LIBBPF_OPTS(bpf_test_run_opts, opts,
+                .data_in = frame.data(),
+                .data_out = output.data(),
+                .data_size_in = static_cast<__u32>(frame.size()),
+                .data_size_out = static_cast<__u32>(output.size()),
+                .repeat = 1, );
+    const int result = bpf_prog_test_run_opts(egress.prog_fd, &opts);
+    action = opts.retval;
+    outputBytes = opts.data_size_out;
+    return result == 0;
+  };
+  auto erase = [&](StringType auto&& mapName, const auto& key) -> bool {
+    bool erased = false;
+    egress.openMap(mapName, [&](int mapFD) -> void {
+      erased = mapFD >= 0 && bpf_map_delete_elem(mapFD, &key) == 0;
+    });
+    return erased;
+  };
+
+  uint32_t action = 0;
+  uint32_t outputBytes = 0;
+  suite.expect(updateProgramMapElement(egress,
+                                       "ovl_mach_full"_ctv,
+                                       switchboardMakeOverlayMachineRouteKey(remoteIdentity),
+                                       localAlias) &&
+                   run(action, outputBytes) && action == TC_ACT_OK && outputBytes > frame.size(),
+               "switchboard_overlay_remote_withdrawal_exact_remote_identity_forwards");
+  suite.expect(erase("ovl_mach_full"_ctv, switchboardMakeOverlayMachineRouteKey(remoteIdentity)),
+               "switchboard_overlay_remote_withdrawal_removes_remote_exact_identity");
+
+  switchboard_overlay_site_route_set siteRoutes = {};
+  siteRoutes.version = SWITCHBOARD_OVERLAY_SITE_ROUTE_SET_VERSION;
+  siteRoutes.count = 1;
+  siteRoutes.candidates[0] = localAlias;
+  suite.expect(updateProgramMapElement(egress,
+                                       "ovl_site_rts_v2"_ctv,
+                                       switchboardMakeOverlayMachineRouteKey(remoteSite),
+                                       siteRoutes) &&
+                   run(action, outputBytes) && action == TC_ACT_OK && outputBytes > frame.size(),
+               "switchboard_overlay_remote_withdrawal_remote_site_route_forwards");
+  suite.expect(erase("ovl_site_rts_v2"_ctv, switchboardMakeOverlayMachineRouteKey(remoteSite)),
+               "switchboard_overlay_remote_withdrawal_removes_remote_site_route");
+
+  suite.expect(run(action, outputBytes) && action == TC_ACT_SHOT && outputBytes == frame.size(),
+               "switchboard_overlay_remote_withdrawal_does_not_fallback_to_local_low8_alias");
+
+  // A registered hosted address can also be the selected peer underlay.
+  // Host control traffic and an existing envelope must not be re-encapsulated,
+  // while a container-origin packet still uses the registered hosted route.
+  switchboard_overlay_hosted_ingress_route6 hosted = {};
+  hosted.machine_fragment = remoteIdentity;
+  suite.expect(updateProgramMapElement(egress, "ovl_host6"_ctv,
+                   switchboardMakeOverlayPrefix6Key(makePrefix("fd00:10::2/128")), hosted) &&
+               updateProgramMapElement(egress, "ovl_mach_full"_ctv,
+                   switchboardMakeOverlayMachineRouteKey(remoteIdentity), localAlias),
+               "switchboard_host_egress_overlap_installs_explicit_hosted_route");
+  uint8_t underlaySource[16] = {}, underlayDestination[16] = {};
+  parseIPv6Bytes("fd00:10::1", underlaySource);
+  parseIPv6Bytes("fd00:10::2", underlayDestination);
+  auto checkPacket = [&](const std::vector<uint8_t>& input, bool expectEncap, const char *name) {
+    std::vector<uint8_t> output(input.size() + sizeof(struct ipv6hdr) + 64u);
+    LIBBPF_OPTS(bpf_test_run_opts, opts,
+                .data_in = input.data(), .data_out = output.data(),
+                .data_size_in = static_cast<__u32>(input.size()),
+                .data_size_out = static_cast<__u32>(output.size()), .repeat = 1, );
+    const bool ran = bpf_prog_test_run_opts(egress.prog_fd, &opts) == 0;
+    suite.expect(ran && opts.retval == TC_ACT_OK &&
+                     (expectEncap ? opts.data_size_out == input.size() + sizeof(struct ipv6hdr)
+                                  : opts.data_size_out == input.size() && std::memcmp(output.data(), input.data(), input.size()) == 0), name);
+  };
+  auto control = makeIPv6L4EthernetFrame(underlaySource, underlayDestination, IPPROTO_TCP, 40000, 313);
+  checkPacket(control, false, "switchboard_host_egress_overlap_host_control_passes_unchanged");
+  auto tunnel = control;
+  reinterpret_cast<struct ipv6hdr *>(tunnel.data() + sizeof(struct ethhdr))->nexthdr = IPPROTO_IPV6;
+  checkPacket(tunnel, false, "switchboard_host_egress_overlap_tunnel_passes_unchanged");
+  auto containerPacket = makeIPv6L4EthernetFrame(source, underlayDestination, IPPROTO_TCP, 40000, 443);
+  checkPacket(containerPacket, true, "switchboard_host_egress_overlap_container_hosted_route_still_encapsulates");
+  switchboard_overlay_hosted_ingress_route4 hosted4 = {};
+  hosted4.machine_fragment = remoteIdentity;
+  switchboard_overlay_machine_route underlay4 = {};
+  underlay4.family = SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV4;
+  underlay4.use_gateway_mac = SWITCHBOARD_OVERLAY_ROUTE_ACTION_GATEWAY_MAC;
+  underlay4.source4 = parseIPv4Address("192.0.2.10").s_addr;
+  underlay4.next_hop4 = parseIPv4Address("192.0.2.20").s_addr;
+  suite.expect(updateProgramMapElement(egress, "ovl_host4"_ctv,
+                   switchboardMakeOverlayPrefix4Key(makePrefix("192.0.2.20/32")), hosted4) &&
+               updateProgramMapElement(egress, "ovl_mach_full"_ctv,
+                   switchboardMakeOverlayMachineRouteKey(remoteIdentity), underlay4),
+               "switchboard_host_egress_overlap_installs_ipv4_underlay");
+  auto control4 = makeIPv4L4EthernetFrame(parseIPv4Address("192.0.2.10"),
+                                           parseIPv4Address("192.0.2.20"), IPPROTO_TCP, 40000, 313);
+  checkPacket(control4, false, "switchboard_host_egress_overlap_ipv4_control_passes_unchanged");
+  auto tunnel4 = control4;
+  reinterpret_cast<struct iphdr *>(tunnel4.data() + sizeof(struct ethhdr))->protocol = IPPROTO_IPV6;
+  checkPacket(tunnel4, false, "switchboard_host_egress_overlap_ipv4_tunnel_passes_unchanged");
+  egress.close();
+  return suite.failed == 0 ? 0 : 1;
 }
 
 static std::vector<uint8_t> makeWormholeIPv6OverlayFrame(const std::vector<uint8_t>& inner,
@@ -1180,7 +1450,7 @@ static void exerciseHostIngressHostedIngressRoute(TestSuite& suite, bool ipv6, u
   gatewayMAC.mac[5] = 0x01;
   ingressProgram.setArrayElement("gw_mac_map"_ctv, 0, gatewayMAC);
 
-  const uint32_t machineFragment = 0x000002u;
+  const uint32_t machineFragment = switchboardMakeOverlayMachineIdentity(1, 0x000002u);
   if (ipv6)
   {
     switchboard_overlay_hosted_ingress_route6 hosted = {};
@@ -1303,8 +1573,8 @@ static void exerciseHostIngressRemotePortalRoute(TestSuite& suite, bool ipv6, ui
   localSubnet.mpfx[2] = 0x39;
   ingressProgram.setArrayElement("lc_subnet"_ctv, 0, localSubnet);
 
-  constexpr uint32_t remoteMachineFragment = 0x0016255bu;
   uint8_t remoteContainerID[5] = {0x01, 0x16, 0x25, 0x5b, 0x4e};
+  const uint32_t remoteMachineFragment = switchboardMakeOverlayMachineIdentity(1, 0x0016255bu);
   portal_meta meta = {};
   meta.slot = ipv6 ? (proto == IPPROTO_TCP ? 23u : 22u) : (proto == IPPROTO_TCP ? 21u : 20u);
   expectNamed(installSingleContainerPortalRing(ingressProgram, meta.slot, remoteContainerID),
@@ -1779,6 +2049,46 @@ static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
                   programMapID(ingress, "wh_pair_routes"_ctv) == hostRouteMapID &&
                   programMapID(egress, "wh_pair_routes"_ctv) == hostRouteMapID,
               "shares_pair_admission_maps_across_all_three_programs");
+  // Reopening a kernel program exposes only maps referenced by that program,
+  // unlike the fresh libbpf object above. No interface is attached by this test.
+  auto reopen = [](BPFProgram& original, BPFProgram& retained, bpf_attach_type direction, String& path) {
+    bpf_prog_info info = {};
+    __u32 bytes = sizeof(info);
+    return bpf_prog_get_info_by_fd(original.prog_fd, &info, &bytes) == 0 && info.id != 0 &&
+        retained.loadPreattached(direction, -1, info.id, path);
+  };
+  BPFProgram retainedIngress = {}, retainedEgress = {};
+  expectNamed(reopen(ingress, retainedIngress, BPF_NETKIT_PRIMARY, ingressPath), "reopens_retained_ingress_program");
+  expectNamed(reopen(egress, retainedEgress, BPF_NETKIT_PEER, egressPath), "reopens_retained_egress_program");
+  expectNamed(programMapID(retainedIngress, "wh_pair_grants"_ctv) == 0 &&
+                  programMapID(retainedEgress, "wh_pair_grants"_ctv) == hostGrantMapID,
+              "retained_grant_map_exists_only_in_consuming_direction");
+  expectNamed(switchboardProgramUsesPinnedWormholeFlowMaps(&retainedIngress, testIfindex,
+                                                         SwitchboardWormholeMapConsumer::forwarding),
+              "retained_ingress_preserves_consumed_authoritative_maps");
+  expectNamed(switchboardProgramUsesPinnedWormholeFlowMaps(&retainedEgress, testIfindex),
+              "retained_egress_preserves_consumed_authoritative_maps");
+  expectNamed(!switchboardProgramUsesPinnedWormholeFlowMaps(&retainedIngress, testIfindex),
+              "admission_consumer_still_requires_grants");
+  for (const char *name : {"wh_flows", "wh_pending", "wh_pair_routes"})
+  {
+    WormholeMapOverrideForTest missing {retainedIngress, name, -1};
+    expectNamed(!switchboardProgramUsesPinnedWormholeFlowMaps(&missing, testIfindex,
+                                                            SwitchboardWormholeMapConsumer::forwarding),
+                name);
+  }
+  int foreignRouteFD = bpf_map_create(BPF_MAP_TYPE_HASH, nullptr, sizeof(switchboard_pair_admission_route_key),
+                                      sizeof(switchboard_pair_admission_route_policy), 1024, nullptr);
+  expectNamed(foreignRouteFD >= 0, "creates_independent_compatible_route_map");
+  if (foreignRouteFD >= 0)
+  {
+    WormholeMapOverrideForTest foreign {retainedIngress, "wh_pair_routes", foreignRouteFD};
+    expectNamed(switchboardProgramHasCompatibleWormholeFlowMaps(&foreign, SwitchboardWormholeMapConsumer::forwarding) &&
+                    !switchboardProgramUsesPinnedWormholeFlowMaps(&foreign, testIfindex,
+                                                                 SwitchboardWormholeMapConsumer::forwarding),
+                "retained_forwarding_rejects_compatible_foreign_map_identity");
+    ::close(foreignRouteFD);
+  }
   bool establishedMapContract = false;
   bool pendingMapContract = false;
   bool grantMapContract = false;
@@ -1946,11 +2256,49 @@ static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
               "public_first_claims_pending_reverse_tuple");
   expectNamed(runNetkit(ingress, hostOutput, SWITCHBOARD_WORMHOLE_SKB_MARK, packetOutput) == NETKIT_PASS,
               "same_public_binding_refreshes_through_container_ingress");
+  container_network_policy gatewayPolicy = policy;
+  gatewayPolicy.mode = CONTAINER_NETWORK_DESTINATION_ALLOWLIST;
+  ingress.setArrayElement("ct_net_policy"_ctv, 0, gatewayPolicy);
+  container_egress_allow6_key listenerAllow6 = {};
+  listenerAllow6.proto = IPPROTO_UDP;
+  listenerAllow6.port = htons(8443);
+  __u8 listenerValue = 2;
+  expectNamed(updateProgramMapElement(ingress, "ct_ing_allow6"_ctv, listenerAllow6, listenerValue),
+              "masque_listener_ipv6_installs_marked_destination_policy");
+  expectNamed(runNetkit(ingress, hostOutput, SWITCHBOARD_WORMHOLE_SKB_MARK, packetOutput) == NETKIT_PASS &&
+                  runNetkit(ingress, hostOutput, 0, packetOutput) == NETKIT_DROP,
+              "masque_listener_ipv6_admits_nat_source_only_on_marked_ingress");
+  std::vector<uint8_t> otherPublicInner6 = makeIPv6L4EthernetFrame(client, external2, IPPROTO_UDP, 49'152, 4443);
+  std::vector<uint8_t> otherPublicOverlay6 = makeWormholeIPv6OverlayFrame(otherPublicInner6, selected);
+  std::vector<uint8_t> otherHostOutput6 = {};
+  expectNamed(runHost(otherPublicOverlay6, otherHostOutput6) == TC_ACT_REDIRECT &&
+                  runNetkit(ingress, otherHostOutput6, SWITCHBOARD_WORMHOLE_SKB_MARK, packetOutput) == NETKIT_DROP,
+              "masque_listener_ipv6_rejects_wrong_marked_destination_port");
+  clearProgramMap<container_egress_allow6_key>(ingress, "ct_ing_allow6"_ctv);
+  container_egress_allow6_key connectorAllow6 = {};
+  connectorAllow6.proto = IPPROTO_UDP;
+  connectorAllow6.port = htons(443);
+  std::memcpy(connectorAllow6.addr, client, sizeof(connectorAllow6.addr));
+  __u8 connectorValue = 1;
+  expectNamed(updateProgramMapElement(ingress, "ct_ing_allow6"_ctv, connectorAllow6, connectorValue),
+              "masque_connector_ipv6_installs_exact_peer_policy");
+  auto connectorReply6 = makeIPv6L4EthernetFrame(client, server, IPPROTO_UDP, 443, 7777);
+  auto wrongConnectorReply6 = makeIPv6L4EthernetFrame(client, server, IPPROTO_UDP, 444, 7777);
+  expectNamed(runNetkit(ingress, connectorReply6, 0, packetOutput) == NETKIT_PASS &&
+                  runNetkit(ingress, wrongConnectorReply6, 0, packetOutput) == NETKIT_DROP,
+              "masque_connector_ipv6_requires_exact_peer_source_port");
+  ingress.setArrayElement("ct_net_policy"_ctv, 0, policy);
   switchboard_wormhole_flow refreshed = {};
   expectNamed(lookupProgramMapElement(host, "wh_pending"_ctv, ownerKey, refreshed) &&
                   refreshed.phase == SWITCHBOARD_WORMHOLE_FLOW_PENDING &&
                   refreshed.expiresAtNs == firstPublic.expiresAtNs,
               "inbound_only_traffic_cannot_extend_pending_owner");
+
+  // The peer's NAT-selected port is part of the learned reverse tuple, not
+  // the public listener port. A reply to another port must not borrow it.
+  std::vector<uint8_t> wrongClientPortReply = makeIPv6L4EthernetFrame(server, client, IPPROTO_UDP, 8443, 49'153);
+  expectNamed(runNetkit(egress, wrongClientPortReply, 0, packetOutput) == NETKIT_DROP,
+              "ipv6_public_reply_rejects_unlearned_nat_port");
 
   std::vector<uint8_t> alreadyPublicReply = makeIPv6L4EthernetFrame(external, client, IPPROTO_UDP, 8443, 49'152);
   expectNamed(runNetkit(egress, alreadyPublicReply, 0, packetOutput) == NETKIT_PASS,
@@ -2667,6 +3015,40 @@ static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
                 "same_worker_ipv6_public_reply_restores_advertised_source_and_client_destination");
   }
 
+  // A remote portal bypasses normal routing, but its whitehole reply must still
+  // be authorized in the shared reverse-flow map before encapsulation.
+  local_container_subnet6 remoteClientSubnet = subnet;
+  remoteClientSubnet.mpfx[2] ^= 1;
+  egress.setArrayElement("lc_subnet"_ctv, 0, remoteClientSubnet);
+  egress.setArrayElement("ct_net_policy"_ctv, 0, localClientPolicy);
+  uint32_t remoteIdentity = switchboardMakeOverlayMachineIdentity(selected[0],
+      (uint32_t(selected[1]) << 16) | (uint32_t(selected[2]) << 8) | uint32_t(selected[3]));
+  switchboard_overlay_machine_route remoteRoute = {};
+  remoteRoute.family = SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV6;
+  remoteRoute.use_gateway_mac = SWITCHBOARD_OVERLAY_ROUTE_ACTION_GATEWAY_MAC;
+  parseIPv6Bytes("fd00:10::a", remoteRoute.source6);
+  parseIPv6Bytes("fd00:10::b", remoteRoute.next_hop6);
+  expectNamed(updateProgramMapElement(egress, "ovl_mach_full"_ctv,
+                                      switchboardMakeOverlayMachineRouteKey(remoteIdentity), remoteRoute),
+              "remote_portal_installs_machine_route");
+  clearProgramMap<flow_key>(egress, "white_replies"_ctv);
+  expectNamed(runNetkit(egress, sameWorkerRequest6, 0, packetOutput) == NETKIT_PASS,
+              "remote_portal_encapsulates_whitehole_request");
+  flow_key remoteWhiteholeReply = {};
+  std::memcpy(remoteWhiteholeReply.srcv6, external, sizeof(remoteWhiteholeReply.srcv6));
+  std::memcpy(remoteWhiteholeReply.dstv6, client, sizeof(remoteWhiteholeReply.dstv6));
+  remoteWhiteholeReply.port16[0] = htons(443);
+  remoteWhiteholeReply.port16[1] = htons(49'154);
+  remoteWhiteholeReply.proto = IPPROTO_UDP;
+  switchboard_whitehole_reply learnedReply = {};
+  expectNamed(lookupProgramMapElement(egress, "white_replies"_ctv, remoteWhiteholeReply, learnedReply) &&
+                  learnedReply.binding.nonce == clientWhiteholeBinding.nonce &&
+                  std::memcmp(&learnedReply.binding.container, &clientWhiteholeBinding.container,
+                              sizeof(clientWhiteholeBinding.container)) == 0 && learnedReply.expiresAtNs != 0,
+              "remote_portal_learns_exact_whitehole_reply");
+  egress.setArrayElement("lc_subnet"_ctv, 0, subnet);
+  egress.setArrayElement("ct_net_policy"_ctv, 0, policy);
+
   // The following cases exercise a remote client. Do not retain the local
   // client bindings from the preceding same-worker hairpin fixtures.
   clearProgramMap<portal_definition>(egress, "whiteholes"_ctv);
@@ -2709,6 +3091,31 @@ static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
   expectNamed(runHost(publicOverlay4, hostOutput) == TC_ACT_REDIRECT &&
                   runNetkit(ingress, hostOutput, SWITCHBOARD_WORMHOLE_SKB_MARK, packetOutput) == NETKIT_PASS,
               "ipv4_public_first_is_admitted_across_shared_map");
+  ingress.setArrayElement("ct_net_policy"_ctv, 0, gatewayPolicy);
+  container_egress_allow_key listenerAllow4 = {};
+  listenerAllow4.proto = IPPROTO_UDP;
+  listenerAllow4.port = htons(8443);
+  expectNamed(updateProgramMapElement(ingress, "ct_ing_allow"_ctv, listenerAllow4, listenerValue),
+              "masque_listener_ipv4_installs_marked_destination_policy");
+  expectNamed(runNetkit(ingress, hostOutput, SWITCHBOARD_WORMHOLE_SKB_MARK, packetOutput) == NETKIT_PASS &&
+                  runNetkit(ingress, hostOutput, 0, packetOutput) == NETKIT_DROP,
+              "masque_listener_ipv4_admits_nat_source_only_on_marked_ingress");
+  auto wrongDestination4 = makeIPv4L4EthernetFrame(client4, external4, IPPROTO_UDP, 49'154, 8444);
+  expectNamed(runNetkit(ingress, wrongDestination4, SWITCHBOARD_WORMHOLE_SKB_MARK, packetOutput) == NETKIT_DROP,
+              "masque_listener_ipv4_rejects_wrong_marked_destination_port");
+  clearProgramMap<container_egress_allow_key>(ingress, "ct_ing_allow"_ctv);
+  container_egress_allow_key connectorAllow4 = {};
+  connectorAllow4.proto = IPPROTO_UDP;
+  connectorAllow4.port = htons(443);
+  connectorAllow4.addr = client4.s_addr;
+  expectNamed(updateProgramMapElement(ingress, "ct_ing_allow"_ctv, connectorAllow4, connectorValue),
+              "masque_connector_ipv4_installs_exact_peer_policy");
+  auto connectorReply4 = makeIPv4L4EthernetFrame(client4, external4, IPPROTO_UDP, 443, 7777);
+  auto wrongConnectorReply4 = makeIPv4L4EthernetFrame(client4, external4, IPPROTO_UDP, 444, 7777);
+  expectNamed(runNetkit(ingress, connectorReply4, 0, packetOutput) == NETKIT_PASS &&
+                  runNetkit(ingress, wrongConnectorReply4, 0, packetOutput) == NETKIT_DROP,
+              "masque_connector_ipv4_requires_exact_peer_source_port");
+  ingress.setArrayElement("ct_net_policy"_ctv, 0, policy);
   switchboard_wormhole_flow public4 = {};
   expectNamed(lookupProgramMapElement(host, "wh_pending"_ctv, ownerKey4, public4) &&
                   public4.disposition == SWITCHBOARD_WORMHOLE_FLOW_PUBLIC &&
@@ -2796,6 +3203,9 @@ static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
               "ipv4_second_replica_cannot_consume_first_replica_owner");
   policy.containerFragment = selected[4];
   egress.setArrayElement("ct_net_policy"_ctv, 0, policy);
+  std::vector<uint8_t> wrongClientPortReply4 = makeIPv4L4EthernetFrame(external4, client4, IPPROTO_UDP, 8443, 49'155);
+  expectNamed(runNetkit(egress, wrongClientPortReply4, 0, packetOutput) == NETKIT_DROP,
+              "ipv4_public_reply_rejects_unlearned_nat_port");
   expectNamed(runNetkit(egress, reply4, 0, packetOutput) == NETKIT_PASS,
               "ipv4_public_reply_uses_exact_reverse_owner");
   if (packetOutput.size() >= sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr))
@@ -3180,7 +3590,7 @@ static bool configureHostedIPv4Route(BPFProgram& program, uint32_t address)
   program.setArrayElement("mac_map"_ctv, 0, localMAC);
   program.setArrayElement("gw_mac_map"_ctv, 0, gatewayMAC);
 
-  constexpr uint32_t machineFragment = 0x000002u;
+  const uint32_t machineFragment = switchboardMakeOverlayMachineIdentity(1, 0x000002u);
   switchboard_overlay_hosted_ingress_route4 hosted = {};
   hosted.machine_fragment = machineFragment;
   switchboard_overlay_prefix4_key hostedKey = {};
@@ -3381,44 +3791,8 @@ static void exerciseHostIngressHostedSocketException(TestSuite& suite)
   ingress.close();
 }
 
-int main(int argc, char **argv)
+static void exerciseWhiteholeReplyMapReuse(TestSuite& suite)
 {
-  if (argc == 2 && std::strcmp(argv[1], "--development-map-allocation-only") == 0)
-  {
-    TestSuite suite = {};
-    verifyDevelopmentWhiteholeMapAllocation(suite);
-    return suite.failed == 0 ? 0 : 1;
-  }
-
-  if (argc == 2 && std::strcmp(argv[1], "--binding-value-only") == 0)
-  {
-    TestSuite suite = {};
-    verifyWhiteholeBindingValue(suite);
-    return suite.failed == 0 ? 0 : 1;
-  }
-
-  if (const char *allow = std::getenv("PRODIGY_DEV_ALLOW_BPF_ATTACH"); allow == nullptr || std::strcmp(allow, "1") != 0)
-  {
-    std::fprintf(stderr, "SKIP: switchboard whitehole unit loads BPF programs; set PRODIGY_DEV_ALLOW_BPF_ATTACH=1 only inside an authorized isolated VM\n");
-    return 77;
-  }
-
-  if (diagnoseHostIngressRawLoad() == false)
-  {
-    return 1;
-  }
-
-  TestSuite suite = {};
-  // Keep verifier and map-create failures visible in isolated guest evidence.
-  libbpf_set_print(switchboardWhiteholeLibbpfDiagnostics);
-  verifyDevelopmentWhiteholeMapAllocation(suite);
-
-  verifyWhiteholeBindingValue(suite);
-
-  String pinPath = {};
-  switchboardWhiteholeReplyFlowPinPath(pinPath, 17);
-  suite.expect(pinPath == "/sys/fs/bpf/prodigy_whitehole_reply_flows_17"_ctv, "switchboard_whitehole_pin_path_uses_interface_index");
-
   {
     String egressObjectPath = {};
     egressObjectPath.assign(PRODIGY_TEST_BINARY_DIR);
@@ -3454,6 +3828,25 @@ int main(int argc, char **argv)
     suite.expect(egressReplyMapID != 0, "switchboard_whitehole_reply_flow_reuse_resolves_egress_map_id");
     suite.expect(ingressReplyMapID == egressReplyMapID, "switchboard_whitehole_reply_flow_reuse_shares_reply_flow_map_between_egress_and_ingress");
 
+    BPFProgram unrelatedEgress = {};
+    const bool unrelatedLoaded = unrelatedEgress.load(egressObjectPath, "host_egress"_ctv);
+    suite.expect(unrelatedLoaded && !switchboardProgramUsesPinnedWhiteholeReplyFlowMap(&unrelatedEgress, testIfindex),
+                 "switchboard_whitehole_rejects_unrelated_egress_map");
+    suite.expect(unrelatedLoaded && !switchboardPinWhiteholeReplyFlowMap(&unrelatedEgress, testIfindex) &&
+                     switchboardProgramUsesPinnedWhiteholeReplyFlowMap(&ingressProgram, testIfindex),
+                 "switchboard_whitehole_mismatched_egress_cannot_replace_pin");
+    bool replacementReused = false;
+    BPFProgram replacementEgress = {};
+    const bool replacementLoaded = replacementEgress.load(egressObjectPath, "host_egress"_ctv,
+        [&](struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
+          replacementReused = switchboardReusePinnedWhiteholeReplyFlowMap(obj, testIfindex, inner_map_fds);
+        });
+    suite.expect(replacementLoaded && replacementReused &&
+                     switchboardProgramUsesPinnedWhiteholeReplyFlowMap(&replacementEgress, testIfindex) &&
+                     switchboardPinWhiteholeReplyFlowMap(&replacementEgress, testIfindex) &&
+                     switchboardProgramUsesPinnedWhiteholeReplyFlowMap(&ingressProgram, testIfindex),
+                 "switchboard_whitehole_reattached_egress_preserves_shared_pin");
+
     if (ingressLoaded)
     {
       suite.expect(programMapID(ingressProgram, "ext_portals"_ctv) != 0,
@@ -3466,6 +3859,187 @@ int main(int argc, char **argv)
 
     (void)unlink(sharedWhiteholePinPath.c_str());
   }
+
+}
+
+static void exerciseMasqueGatewayTransitIngress(TestSuite& suite)
+{
+  String objectPath = {};
+  objectPath.assign(PRODIGY_TEST_BINARY_DIR);
+  objectPath.append("/container.ingress.router.ebpf.o"_ctv);
+
+  BPFProgram ingress = {};
+  suite.expect(ingress.load(objectPath, "ct_ingress"_ctv),
+               "switchboard_masque_gateway_transit_loads_container_ingress");
+  if (ingress.prog_fd < 0)
+  {
+    return;
+  }
+
+  local_container_subnet6 localSubnet = {};
+  localSubnet.dpfx = 0x01;
+  localSubnet.mpfx[0] = 0x52;
+  localSubnet.mpfx[1] = 0xdf;
+  localSubnet.mpfx[2] = 0x39;
+  ingress.setArrayElement("lc_subnet"_ctv, 0, localSubnet);
+
+  container_network_policy policy = {};
+  policy.mode = CONTAINER_NETWORK_DESTINATION_ALLOWLIST;
+  policy.containerFragment = SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST;
+  ingress.setArrayElement("ct_net_policy"_ctv, 0, policy);
+
+  uint8_t outerSource[16] = {};
+  uint8_t outerDestination[16] = {};
+  uint8_t localSource[16] = {};
+  uint8_t remoteDestination[16] = {};
+  uint8_t remoteSource[16] = {};
+  uint8_t localDestination[16] = {};
+  makeContainerIPv6(outerSource, localSubnet.dpfx, localSubnet.mpfx[0], localSubnet.mpfx[1], localSubnet.mpfx[2], 0);
+  makeContainerIPv6(outerDestination, localSubnet.dpfx, localSubnet.mpfx[0], localSubnet.mpfx[1], localSubnet.mpfx[2],
+                    SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST);
+  makeContainerIPv6(localSource, localSubnet.dpfx, localSubnet.mpfx[0], localSubnet.mpfx[1], localSubnet.mpfx[2], 0x4e);
+  makeContainerIPv6(remoteDestination, 0x02, 0x16, 0x25, 0x5b, 0x09);
+  makeContainerIPv6(remoteSource, 0x02, 0x16, 0x25, 0x5b, 0x0a);
+  makeContainerIPv6(localDestination, localSubnet.dpfx, localSubnet.mpfx[0], localSubnet.mpfx[1], localSubnet.mpfx[2], 0x4e);
+
+  auto makeTransit = [&](uint8_t gatewayFragment) -> std::vector<uint8_t> {
+    std::vector<uint8_t> inner = makeIPv6L4EthernetFrame(localSource, remoteDestination, IPPROTO_TCP, 49'152, 60379);
+    std::vector<uint8_t> frame(sizeof(struct ethhdr) + sizeof(struct ipv6hdr) + inner.size() - sizeof(struct ethhdr));
+    std::memcpy(frame.data(), inner.data(), sizeof(struct ethhdr));
+    struct ipv6hdr *outer = reinterpret_cast<struct ipv6hdr *>(frame.data() + sizeof(struct ethhdr));
+    outer->version = 6;
+    outer->nexthdr = IPPROTO_IPV6;
+    outer->hop_limit = 64;
+    outer->payload_len = htons(static_cast<uint16_t>(inner.size() - sizeof(struct ethhdr)));
+    std::memcpy(outer->saddr.s6_addr, outerSource, sizeof(outer->saddr.s6_addr));
+    std::memcpy(outer->daddr.s6_addr, outerDestination, sizeof(outer->daddr.s6_addr));
+    outer->daddr.s6_addr[15] = gatewayFragment;
+    std::memcpy(outer + 1, inner.data() + sizeof(struct ethhdr), inner.size() - sizeof(struct ethhdr));
+    return frame;
+  };
+
+  auto runIngress = [&](const std::vector<uint8_t>& frame, uint32_t mark, std::vector<uint8_t>& output) -> uint32_t {
+    output.resize(frame.size() + 64u);
+    struct __sk_buff context = {};
+    context.mark = mark;
+    LIBBPF_OPTS(bpf_test_run_opts, opts,
+                .data_in = frame.data(),
+                .data_out = output.data(),
+                .data_size_in = static_cast<__u32>(frame.size()),
+                .data_size_out = static_cast<__u32>(output.size()),
+                .ctx_in = &context,
+                .ctx_size_in = sizeof(context),
+                .repeat = 1, );
+    if (bpf_prog_test_run_opts(ingress.prog_fd, &opts) != 0)
+    {
+      return UINT32_MAX;
+    }
+    output.resize(opts.data_size_out);
+    return opts.retval;
+  };
+
+  std::vector<uint8_t> output = {};
+  for (uint8_t gatewayFragment : {SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST,
+                                  SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_SECOND})
+  {
+    policy.containerFragment = gatewayFragment;
+    ingress.setArrayElement("ct_net_policy"_ctv, 0, policy);
+    const std::vector<uint8_t> validTransit = makeTransit(gatewayFragment);
+    suite.expect(runIngress(validTransit, SWITCHBOARD_MASQUE_GATEWAY_INJECTION_SKB_MARK, output) == NETKIT_PASS &&
+                     output.size() == validTransit.size() - sizeof(struct ipv6hdr),
+                 "switchboard_masque_gateway_valid_transit_bypasses_endpoint_tcp_grant_and_decapsulates");
+    suite.expect(runIngress(validTransit, 0, output) == NETKIT_DROP,
+                 "switchboard_masque_gateway_unmarked_transit_is_denied");
+  }
+  const std::vector<uint8_t> invalidTransit = makeTransit(0x4e);
+  suite.expect(runIngress(invalidTransit, SWITCHBOARD_MASQUE_GATEWAY_INJECTION_SKB_MARK, output) == NETKIT_DROP,
+               "switchboard_masque_gateway_invalid_outer_proof_is_denied");
+
+  policy.mode = CONTAINER_NETWORK_DECLARED_ONLY;
+  policy.containerFragment = 0x4e;
+  ingress.setArrayElement("ct_net_policy"_ctv, 0, policy);
+  std::vector<uint8_t> direct = makeIPv6L4EthernetFrame(remoteSource, localDestination, IPPROTO_TCP, 49'152, 60379);
+  suite.expect(runIngress(direct, 0, output) == NETKIT_DROP,
+               "switchboard_masque_gateway_direct_cross_site_tcp_without_grant_remains_denied");
+  ingress.close();
+}
+
+int main(int argc, char **argv)
+{
+  if (argc == 2 && std::strcmp(argv[1], "--development-map-allocation-only") == 0)
+  {
+    TestSuite suite = {};
+    verifyDevelopmentWhiteholeMapAllocation(suite);
+    return suite.failed == 0 ? 0 : 1;
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--binding-value-only") == 0)
+  {
+    TestSuite suite = {};
+    verifyWhiteholeBindingValue(suite);
+    return suite.failed == 0 ? 0 : 1;
+  }
+
+  if (const char *allow = std::getenv("PRODIGY_DEV_ALLOW_BPF_ATTACH"); allow == nullptr || std::strcmp(allow, "1") != 0)
+  {
+    std::fprintf(stderr, "SKIP: switchboard whitehole unit loads BPF programs; set PRODIGY_DEV_ALLOW_BPF_ATTACH=1 only inside an authorized isolated VM\n");
+    return 77;
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--whitehole-reply-map-only") == 0)
+  {
+    TestSuite suite = {};
+    libbpf_set_print(switchboardWhiteholeLibbpfDiagnostics);
+    exerciseWhiteholeReplyMapReuse(suite);
+    return suite.failed == 0 ? 0 : 1;
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--wormhole-shared-flow-only") == 0)
+  {
+    TestSuite suite = {};
+    libbpf_set_print(switchboardWhiteholeLibbpfDiagnostics);
+    exerciseWormholeSharedFlowOwnership(suite);
+    return suite.failed == 0 ? 0 : 1;
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--masque-gateway-transit-only") == 0)
+  {
+    TestSuite suite = {};
+    libbpf_set_print(switchboardWhiteholeLibbpfDiagnostics);
+    exerciseMasqueGatewayTransitIngress(suite);
+    return suite.failed == 0 ? 0 : 1;
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--host-router-load-only") == 0)
+  {
+    return runHostRouterEgressLoadOnly();
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--overlay-remote-withdrawal-only") == 0)
+  {
+    return runOverlayRemoteWithdrawalOnly();
+  }
+
+  if (diagnoseHostIngressRawLoad() == false)
+  {
+    return 1;
+  }
+
+  TestSuite suite = {};
+  // Keep verifier and map-create failures visible in isolated guest evidence.
+  libbpf_set_print(switchboardWhiteholeLibbpfDiagnostics);
+  verifyDevelopmentWhiteholeMapAllocation(suite);
+
+  verifyWhiteholeBindingValue(suite);
+
+  suite.expect(runOverlayRemoteWithdrawalOnly() == 0,
+               "switchboard_overlay_remote_withdrawal_full_suite");
+
+  String pinPath = {};
+  switchboardWhiteholeReplyFlowPinPath(pinPath, 17);
+  suite.expect(pinPath == "/sys/fs/bpf/prodigy_whitehole_reply_flows_17"_ctv, "switchboard_whitehole_pin_path_uses_interface_index");
+
+  exerciseWhiteholeReplyMapReuse(suite);
 
   {
     String ingressObjectPath = {};
@@ -3814,6 +4388,7 @@ int main(int argc, char **argv)
   exerciseBalancerLocalIPv6PortalPassesUnchangedToHostIngress(suite);
   exerciseBalancerRemotePortalRoutesWithOverlay(suite);
   exerciseWormholeSharedFlowOwnership(suite);
+  exerciseMasqueGatewayTransitIngress(suite);
   exerciseWormholeTCPPromotionMapFull(suite);
   exerciseHostIngressPlainLocalIPv6(suite, IPPROTO_UDP);
   exerciseHostIngressPlainLocalIPv6(suite, IPPROTO_TCP);

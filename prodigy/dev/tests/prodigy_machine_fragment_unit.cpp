@@ -26,15 +26,21 @@ int main(void)
 
   suite.expect(machine.containerFragmentAvailable(0) == false, "fragment_zero_is_unavailable");
   suite.expect(machine.containerFragmentAvailable(prodigyMothershipTunnelProviderRuntimeFragment) == false, "fragment_reserved_is_unavailable");
+  suite.expect(machine.containerFragmentAvailable(prodigyCrossClusterMasqueGatewayRuntimeFragmentFirst) == false,
+               "fragment_first_gateway_is_unavailable");
+  suite.expect(machine.containerFragmentAvailable(prodigyCrossClusterMasqueGatewayRuntimeFragmentSecond) == false,
+               "fragment_second_gateway_is_unavailable");
   suite.expect(machine.containerFragmentAvailable(used) == false, "fragment_used_is_unavailable");
   suite.expect(machine.containerFragmentAvailable(available), "fragment_unused_is_available");
-  suite.expect(Machine::maxSchedulableContainers == 254, "fragment_capacity_matches_usable_address_cardinality");
+  suite.expect(Machine::maxSchedulableContainers == 252, "fragment_capacity_matches_usable_address_cardinality");
 
   machine.usedContainerFragments.clear();
-  constexpr uint8_t finalFragment = 253;
+  constexpr uint8_t finalFragment = 251;
   for (uint32_t fragment = 1; fragment <= UINT8_MAX; ++fragment)
   {
-    if (fragment != finalFragment && fragment != prodigyMothershipTunnelProviderRuntimeFragment)
+    if (fragment != finalFragment &&
+        fragment != prodigyMothershipTunnelProviderRuntimeFragment &&
+        !prodigyCrossClusterMasqueGatewayRuntimeFragmentValid(uint8_t(fragment)))
     {
       machine.usedContainerFragments.insert(fragment);
     }
@@ -100,9 +106,24 @@ int main(void)
   suite.expect(!prodigyValidateContainerPlanMeshIdentity(ContainerPlan {}, machineSubnet),
                "container_mesh_identity_rejects_empty_application_plan");
 
+  ContainerPlan gateway = {};
+  gateway.fragment = prodigyCrossClusterMasqueGatewayRuntimeFragmentFirst;
+  gateway.system.kind = SystemContainerKind::crossClusterMasqueGateway;
+  IPPrefix gatewayAddress = meshAddress;
+  gatewayAddress.network.v6[15] = gateway.fragment;
+  gateway.addresses.push_back(gatewayAddress);
+  suite.expect(prodigyValidateContainerPlanMeshIdentity(gateway, machineSubnet),
+               "container_mesh_identity_accepts_explicit_gateway_address");
+  gateway.addresses.clear();
+  suite.expect(!prodigyValidateContainerPlanMeshIdentity(gateway, machineSubnet),
+               "container_mesh_identity_rejects_empty_gateway_address");
+
   ContainerPlan forged = {};
   Container *container = reinterpret_cast<Container *>(uintptr_t(1));
-  ContainerManager::createContainer(forged, ""_ctv, container);
+  auto rejectForged = [&]() -> void {
+    co_await ContainerManager::createContainer(forged, ""_ctv, container);
+  };
+  rejectForged();
   suite.expect(container == nullptr, "create_container_rejects_forged_zero_fragment");
 
   return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

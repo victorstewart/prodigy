@@ -64,6 +64,9 @@ int main(void)
       switchboardBalancerPassesIPv6ToKernel(IPPROTO_IPV6),
       "switchboard_balancer_ipv6_in_ipv6_overlay_passes_to_kernel");
   suite.expect(
+      switchboardBalancerPassesIPv6ToKernel(IPPROTO_GRE),
+      "switchboard_balancer_ipv6_gre_overlay_passes_to_kernel");
+  suite.expect(
       switchboardBalancerPassesIPv6ToKernel(IPPROTO_UDP) == false,
       "switchboard_balancer_ipv6_udp_stays_on_balancer_path");
   suite.expect(

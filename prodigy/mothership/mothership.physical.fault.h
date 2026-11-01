@@ -99,9 +99,18 @@ enum class MothershipPhysicalFaultDirection : uint8_t {
   targetToSource = 2,
 };
 
+// A non-peer path fault must retain the admitted gateway and flow identity;
+// this prevents a MASQUE or BGP request from being treated as a generic route.
+enum class MothershipPhysicalFaultFlowTarget : uint8_t {
+  peerHost = 0,
+  masqueGateway = 1,
+  bgpControlPlane = 2,
+};
+
 enum class MothershipLocalVMMachineFaultAction : uint8_t {
   crash = 0,
   coldReboot = 1,
+  recoverUnreadyUpgrade = 2,
 };
 
 enum class MothershipPhysicalFaultExecutorKind : uint8_t {
@@ -215,6 +224,23 @@ static inline bool mothershipPhysicalFaultNumericAddressValid(const String& valu
   struct in6_addr address6 = {};
   return !owned.empty() && (inet_pton(AF_INET, owned.c_str(), &address4) == 1 ||
                             inet_pton(AF_INET6, owned.c_str(), &address6) == 1);
+}
+
+static inline bool mothershipPhysicalFaultFlowTargetValid(MothershipPhysicalFaultFlowTarget value)
+{
+  return value == MothershipPhysicalFaultFlowTarget::peerHost ||
+      value == MothershipPhysicalFaultFlowTarget::masqueGateway ||
+      value == MothershipPhysicalFaultFlowTarget::bgpControlPlane;
+}
+
+static inline bool mothershipPhysicalFaultFlowIdentityValid(const String& value)
+{
+  if (value.empty() || value.size() > 256) return false;
+  for (char byte : value)
+    if (!((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+          (byte >= '0' && byte <= '9') || byte == '.' || byte == '_' || byte == ':' ||
+          byte == '@' || byte == '/' || byte == '+' || byte == '=' || byte == '-')) return false;
+  return true;
 }
 
 static inline bool mothershipPhysicalFaultSafeAbsolutePath(const String& value)
@@ -373,7 +399,8 @@ static inline bool mothershipPhysicalFaultDirectionValid(MothershipPhysicalFault
 static inline bool mothershipLocalVMMachineFaultActionValid(MothershipLocalVMMachineFaultAction value)
 {
   return value == MothershipLocalVMMachineFaultAction::crash ||
-      value == MothershipLocalVMMachineFaultAction::coldReboot;
+      value == MothershipLocalVMMachineFaultAction::coldReboot ||
+      value == MothershipLocalVMMachineFaultAction::recoverUnreadyUpgrade;
 }
 
 // An observation is an opaque, versioned digest emitted by the sealed owner.
@@ -418,7 +445,7 @@ static inline bool mothershipPhysicalFaultMachineObservationEqual(
 
 class MothershipPhysicalClusterNetworkFaultRequest {
 public:
-  static constexpr uint32_t version = 2;
+  static constexpr uint32_t version = 3;
   uint32_t protocolVersion = version;
   uint128_t operationUUID = 0; // idempotency key; never reused for another request
   uint128_t boundaryUUID = 0;  // durable, pre-admitted physical boundary
@@ -435,6 +462,9 @@ public:
   String routeAuthorizationSHA256;
   String sourceAddress;
   String targetAddress;
+  MothershipPhysicalFaultFlowTarget flowTarget = MothershipPhysicalFaultFlowTarget::peerHost;
+  String gatewayEndpoint;
+  String flowIdentity;
   uint64_t sourceTopologyVersion = 0;
   uint64_t targetTopologyVersion = 0;
 };
@@ -451,6 +481,8 @@ static void serialize(S&& serializer, MothershipPhysicalClusterNetworkFaultReque
   serializer.text1b(value.routeAuthorizationSHA256, 64);
   serializer.text1b(value.sourceAddress, INET6_ADDRSTRLEN);
   serializer.text1b(value.targetAddress, INET6_ADDRSTRLEN);
+  serializer.value1b(value.flowTarget); serializer.text1b(value.gatewayEndpoint, INET6_ADDRSTRLEN);
+  serializer.text1b(value.flowIdentity, 256);
   serializer.value8b(value.sourceTopologyVersion); serializer.value8b(value.targetTopologyVersion);
 }
 
@@ -468,6 +500,11 @@ static inline bool mothershipPhysicalClusterNetworkFaultRequestValid(
       !mothershipPhysicalFaultDigestValid(value.routeAuthorizationSHA256) ||
       !mothershipPhysicalFaultNumericAddressValid(value.sourceAddress) ||
       !mothershipPhysicalFaultNumericAddressValid(value.targetAddress) ||
+      !mothershipPhysicalFaultFlowTargetValid(value.flowTarget) ||
+      (value.flowTarget == MothershipPhysicalFaultFlowTarget::peerHost ?
+           (!value.gatewayEndpoint.empty() || !value.flowIdentity.empty()) :
+           (!mothershipPhysicalFaultNumericAddressValid(value.gatewayEndpoint) ||
+            !mothershipPhysicalFaultFlowIdentityValid(value.flowIdentity))) ||
       value.sourceTopologyVersion == 0 || value.targetTopologyVersion == 0)
   {
     if (failure) failure->assign("physical network fault requires exact distinct boundary identities and a bounded duration"_ctv);
@@ -487,6 +524,8 @@ static inline bool mothershipPhysicalClusterNetworkFaultRequestEqual(
       left.durationMilliseconds == right.durationMilliseconds && left.routeUUID == right.routeUUID &&
       left.routeGeneration == right.routeGeneration && left.routeAuthorizationSHA256 == right.routeAuthorizationSHA256 &&
       left.sourceAddress == right.sourceAddress && left.targetAddress == right.targetAddress &&
+      left.flowTarget == right.flowTarget && left.gatewayEndpoint == right.gatewayEndpoint &&
+      left.flowIdentity == right.flowIdentity &&
       left.sourceTopologyVersion == right.sourceTopologyVersion && left.targetTopologyVersion == right.targetTopologyVersion;
 }
 
@@ -568,8 +607,10 @@ static inline bool mothershipPhysicalClusterNetworkFaultReceiptValid(
 
 class MothershipLocalVMMachineFaultRequest {
 public:
-  static constexpr uint32_t version = 1;
-  uint32_t protocolVersion = version;
+  static constexpr uint32_t legacyVersion = 1;
+  static constexpr uint32_t unreadyUpgradeRecoveryVersion = 2;
+  static constexpr uint32_t version = unreadyUpgradeRecoveryVersion;
+  uint32_t protocolVersion = legacyVersion;
   uint128_t operationUUID = 0;
   uint128_t vmBoundaryUUID = 0; // explicit VM-isolation owner, never an ambient host
   uint128_t clusterUUID = 0;
@@ -577,6 +618,19 @@ public:
   MothershipLocalVMMachineFaultAction action = MothershipLocalVMMachineFaultAction::crash;
   uint32_t durationMilliseconds = 0;
   String expectedBootSHA256;
+  // Version two is a distinct recovery authorization, not a relaxed fault.
+  // It binds the exact admitted upgrade, registered boundary, live QEMU
+  // process, and Linux guest identity which was observed unready.
+  uint128_t upgradeOperationUUID = 0;
+  String targetBundleSHA256;
+  String targetContractSHA256;
+  String upgradeAdmissionSHA256;
+  String expectedBoundarySHA256;
+  String expectedLinuxMachineID;
+  String expectedLinuxBootID;
+  uint64_t expectedQemuPID = 0;
+  String expectedQemuStarttime;
+  uint64_t incompleteObservationReceiptVersion = 0;
 };
 
 template <typename S>
@@ -586,13 +640,74 @@ static void serialize(S&& serializer, MothershipLocalVMMachineFaultRequest& valu
   serializer.value16b(value.vmBoundaryUUID); serializer.value16b(value.clusterUUID);
   serializer.value16b(value.machineUUID); serializer.value1b(value.action);
   serializer.value4b(value.durationMilliseconds); serializer.text1b(value.expectedBootSHA256, 64);
+  if (value.protocolVersion >= MothershipLocalVMMachineFaultRequest::unreadyUpgradeRecoveryVersion)
+  {
+    serializer.value16b(value.upgradeOperationUUID);
+    serializer.text1b(value.targetBundleSHA256, 64);
+    serializer.text1b(value.targetContractSHA256, 64);
+    serializer.text1b(value.upgradeAdmissionSHA256, 64);
+    serializer.text1b(value.expectedBoundarySHA256, 64);
+    serializer.text1b(value.expectedLinuxMachineID, 32);
+    serializer.text1b(value.expectedLinuxBootID, 36);
+    serializer.value8b(value.expectedQemuPID);
+    serializer.text1b(value.expectedQemuStarttime, 64);
+    serializer.value8b(value.incompleteObservationReceiptVersion);
+  }
+}
+
+static inline bool mothershipLocalVMLinuxMachineIDValid(const String& value)
+{
+  if (value.size() != 32) return false;
+  for (char byte : value)
+    if (!((byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f'))) return false;
+  return true;
+}
+
+static inline bool mothershipLocalVMLinuxBootIDValid(const String& value)
+{
+  if (value.size() != 36) return false;
+  for (uint32_t index = 0; index < value.size(); ++index)
+  {
+    if (index == 8 || index == 13 || index == 18 || index == 23)
+    { if (value[index] != '-') return false; }
+    else if (!((value[index] >= '0' && value[index] <= '9') ||
+               (value[index] >= 'a' && value[index] <= 'f'))) return false;
+  }
+  return true;
+}
+
+static inline bool mothershipLocalVMProcessStarttimeValid(const String& value)
+{
+  if (value.empty() || value.size() > 64) return false;
+  for (char byte : value) if (byte < '0' || byte > '9') return false;
+  return true;
 }
 
 static inline bool mothershipLocalVMMachineFaultRequestValid(const MothershipLocalVMMachineFaultRequest& value,
                                                               String *failure = nullptr)
 {
   if (failure) failure->clear();
-  if (value.protocolVersion != MothershipLocalVMMachineFaultRequest::version || value.operationUUID == 0 ||
+  const bool legacy = value.protocolVersion == MothershipLocalVMMachineFaultRequest::legacyVersion &&
+      (value.action == MothershipLocalVMMachineFaultAction::crash ||
+       value.action == MothershipLocalVMMachineFaultAction::coldReboot) &&
+      value.upgradeOperationUUID == 0 && value.targetBundleSHA256.empty() &&
+      value.targetContractSHA256.empty() && value.upgradeAdmissionSHA256.empty() &&
+      value.expectedBoundarySHA256.empty() && value.expectedLinuxMachineID.empty() &&
+      value.expectedLinuxBootID.empty() && value.expectedQemuPID == 0 &&
+      value.expectedQemuStarttime.empty() && value.incompleteObservationReceiptVersion == 0;
+  const bool unreadyUpgrade =
+      value.protocolVersion == MothershipLocalVMMachineFaultRequest::unreadyUpgradeRecoveryVersion &&
+      value.action == MothershipLocalVMMachineFaultAction::recoverUnreadyUpgrade &&
+      value.upgradeOperationUUID != 0 &&
+      mothershipPhysicalFaultDigestValid(value.targetBundleSHA256) &&
+      mothershipPhysicalFaultDigestValid(value.targetContractSHA256) &&
+      mothershipPhysicalFaultDigestValid(value.upgradeAdmissionSHA256) &&
+      mothershipPhysicalFaultDigestValid(value.expectedBoundarySHA256) &&
+      mothershipLocalVMLinuxMachineIDValid(value.expectedLinuxMachineID) &&
+      mothershipLocalVMLinuxBootIDValid(value.expectedLinuxBootID) &&
+      value.expectedQemuPID != 0 && mothershipLocalVMProcessStarttimeValid(value.expectedQemuStarttime) &&
+      value.incompleteObservationReceiptVersion != 0;
+  if ((!legacy && !unreadyUpgrade) || value.operationUUID == 0 ||
       value.vmBoundaryUUID == 0 || value.clusterUUID == 0 || value.machineUUID == 0 ||
       !mothershipLocalVMMachineFaultActionValid(value.action) || value.durationMilliseconds == 0 ||
       value.durationMilliseconds > mothershipLocalVMFaultMaximumRecoveryMilliseconds ||
@@ -610,13 +725,25 @@ static inline bool mothershipLocalVMMachineFaultRequestEqual(const MothershipLoc
   return left.protocolVersion == right.protocolVersion && left.operationUUID == right.operationUUID &&
       left.vmBoundaryUUID == right.vmBoundaryUUID && left.clusterUUID == right.clusterUUID &&
       left.machineUUID == right.machineUUID && left.action == right.action &&
-      left.durationMilliseconds == right.durationMilliseconds && left.expectedBootSHA256 == right.expectedBootSHA256;
+      left.durationMilliseconds == right.durationMilliseconds && left.expectedBootSHA256 == right.expectedBootSHA256 &&
+      left.upgradeOperationUUID == right.upgradeOperationUUID &&
+      left.targetBundleSHA256 == right.targetBundleSHA256 &&
+      left.targetContractSHA256 == right.targetContractSHA256 &&
+      left.upgradeAdmissionSHA256 == right.upgradeAdmissionSHA256 &&
+      left.expectedBoundarySHA256 == right.expectedBoundarySHA256 &&
+      left.expectedLinuxMachineID == right.expectedLinuxMachineID &&
+      left.expectedLinuxBootID == right.expectedLinuxBootID &&
+      left.expectedQemuPID == right.expectedQemuPID &&
+      left.expectedQemuStarttime == right.expectedQemuStarttime &&
+      left.incompleteObservationReceiptVersion == right.incompleteObservationReceiptVersion;
 }
 
 class MothershipLocalVMMachineFaultReceipt {
 public:
-  static constexpr uint32_t version = 1;
-  uint32_t protocolVersion = version;
+  static constexpr uint32_t legacyVersion = 1;
+  static constexpr uint32_t unreadyUpgradeRecoveryVersion = 2;
+  static constexpr uint32_t version = unreadyUpgradeRecoveryVersion;
+  uint32_t protocolVersion = legacyVersion;
   uint128_t operationUUID = 0;
   uint128_t vmBoundaryUUID = 0;
   MothershipPhysicalFaultMachineObservation before;
@@ -625,6 +752,16 @@ public:
   uint64_t faultedAtMonotonicMilliseconds = 0;
   uint64_t restoredAtMonotonicMilliseconds = 0;
   bool restored = false;
+  String beforeLinuxMachineID;
+  String beforeLinuxBootID;
+  uint64_t beforeQemuPID = 0;
+  String beforeQemuStarttime;
+  String afterLinuxMachineID;
+  String afterLinuxBootID;
+  uint64_t afterQemuPID = 0;
+  String afterQemuStarttime;
+  uint64_t completedObservationReceiptVersion = 0;
+  String completedUpgradeReportSHA256;
 };
 
 template <typename S>
@@ -634,6 +771,19 @@ static void serialize(S&& serializer, MothershipLocalVMMachineFaultReceipt& valu
   serializer.value16b(value.vmBoundaryUUID); serializer.object(value.before); serializer.object(value.after);
   serializer.text1b(value.restoredBootSHA256, 64); serializer.value8b(value.faultedAtMonotonicMilliseconds);
   serializer.value8b(value.restoredAtMonotonicMilliseconds); serializer.value1b(value.restored);
+  if (value.protocolVersion >= MothershipLocalVMMachineFaultReceipt::unreadyUpgradeRecoveryVersion)
+  {
+    serializer.text1b(value.beforeLinuxMachineID, 32);
+    serializer.text1b(value.beforeLinuxBootID, 36);
+    serializer.value8b(value.beforeQemuPID);
+    serializer.text1b(value.beforeQemuStarttime, 64);
+    serializer.text1b(value.afterLinuxMachineID, 32);
+    serializer.text1b(value.afterLinuxBootID, 36);
+    serializer.value8b(value.afterQemuPID);
+    serializer.text1b(value.afterQemuStarttime, 64);
+    serializer.value8b(value.completedObservationReceiptVersion);
+    serializer.text1b(value.completedUpgradeReportSHA256, 64);
+  }
 }
 
 static inline bool mothershipLocalVMMachineFaultReceiptValid(const MothershipLocalVMMachineFaultRequest& request,
@@ -643,7 +793,28 @@ static inline bool mothershipLocalVMMachineFaultReceiptValid(const MothershipLoc
   if (failure) failure->clear();
   if (!mothershipLocalVMMachineFaultRequestValid(request, failure)) return false;
   const uint64_t elapsed = receipt.restoredAtMonotonicMilliseconds - receipt.faultedAtMonotonicMilliseconds;
-  if (receipt.protocolVersion != MothershipLocalVMMachineFaultReceipt::version ||
+  const bool legacy = request.protocolVersion == MothershipLocalVMMachineFaultRequest::legacyVersion &&
+      receipt.protocolVersion == MothershipLocalVMMachineFaultReceipt::legacyVersion &&
+      receipt.beforeLinuxMachineID.empty() && receipt.beforeLinuxBootID.empty() && receipt.beforeQemuPID == 0 &&
+      receipt.beforeQemuStarttime.empty() && receipt.afterLinuxMachineID.empty() &&
+      receipt.afterLinuxBootID.empty() && receipt.afterQemuPID == 0 && receipt.afterQemuStarttime.empty() &&
+      receipt.completedObservationReceiptVersion == 0 && receipt.completedUpgradeReportSHA256.empty();
+  const bool unreadyUpgrade =
+      request.protocolVersion == MothershipLocalVMMachineFaultRequest::unreadyUpgradeRecoveryVersion &&
+      receipt.protocolVersion == MothershipLocalVMMachineFaultReceipt::unreadyUpgradeRecoveryVersion &&
+      receipt.beforeLinuxMachineID == request.expectedLinuxMachineID &&
+      receipt.beforeLinuxBootID == request.expectedLinuxBootID &&
+      receipt.beforeQemuPID == request.expectedQemuPID &&
+      receipt.beforeQemuStarttime == request.expectedQemuStarttime &&
+      receipt.afterLinuxMachineID == request.expectedLinuxMachineID &&
+      mothershipLocalVMLinuxBootIDValid(receipt.afterLinuxBootID) &&
+      receipt.afterLinuxBootID != request.expectedLinuxBootID && receipt.afterQemuPID != 0 &&
+      mothershipLocalVMProcessStarttimeValid(receipt.afterQemuStarttime) &&
+      (receipt.afterQemuPID != request.expectedQemuPID ||
+       receipt.afterQemuStarttime != request.expectedQemuStarttime) &&
+      receipt.completedObservationReceiptVersion > request.incompleteObservationReceiptVersion &&
+      mothershipPhysicalFaultDigestValid(receipt.completedUpgradeReportSHA256);
+  if ((!legacy && !unreadyUpgrade) ||
       receipt.operationUUID != request.operationUUID || receipt.vmBoundaryUUID != request.vmBoundaryUUID ||
       !receipt.restored || receipt.faultedAtMonotonicMilliseconds == 0 ||
       receipt.restoredAtMonotonicMilliseconds < receipt.faultedAtMonotonicMilliseconds ||
@@ -757,15 +928,104 @@ static void serialize(S&& serializer, MothershipLocalAuthorityRecoveryExecutor& 
   serializer.value16b(value.executorOperationUUID); serializer.text1b(value.immutableBoundarySHA256, 64);
 }
 
+// This is one retained LAN rollout, not general mixed-release admission. The
+// original update remains the artifact authority; the local recovery journal
+// owns only its exact registered VM runtime completion and cold reboot.
+static inline uint128_t mothershipLocalInterruptedUpgradeClusterUUID() {
+  return (uint128_t(0xc2f22c30ff2c2f11ULL) << 64) | 0xde9ede562c0b8383ULL;
+}
+static inline uint128_t mothershipLocalInterruptedUpgradeOperationUUID() {
+  return (uint128_t(0x1ac3b413a9384a4dULL) << 64) | 0x9d7345f5b278210cULL;
+}
+static inline uint128_t mothershipLocalInterruptedUpgradePredecessorUUID() {
+  return (uint128_t(0x9014af90fdfd4608ULL) << 64) | 0xbd10a431476f2bd3ULL;
+}
+constexpr static auto mothershipLocalInterruptedUpgradeSourceBundle =
+    "74f40b16f51284616db363a0fe6ea9ac0aa93ecf7bc442ef516c3aad5725c174"_ctv;
+constexpr static auto mothershipLocalInterruptedUpgradeTargetBundle =
+    "1edd6afc0b7666751361fee7b59ee0efaec9b6bb0bfc415c555e13a70028e89a"_ctv;
+constexpr static auto mothershipLocalInterruptedUpgradeSourceRuntime =
+    "29b42dd7597e89b1763e7561878638a976468bcaf3f787c3fb5dbe70e09fe613"_ctv;
+constexpr static auto mothershipLocalInterruptedUpgradeTargetRuntime =
+    "5a276698e2175e3cdfd2f55067ccf523e77c6dbab6e5013399eee20785899d01"_ctv;
+
+struct MothershipLocalRecoveryRuntimeMember {
+  uint128_t machineUUID = 0;
+  String linuxMachineID, beforeBootID, runtimeRoot, gatewayInventory;
+  bool installRequired = false;
+};
+template<typename S> static void serialize(S&& s, MothershipLocalRecoveryRuntimeMember& m) {
+  s.value16b(m.machineUUID); s.text1b(m.linuxMachineID,64); s.text1b(m.beforeBootID,64);
+  s.text1b(m.runtimeRoot,4096); s.text1b(m.gatewayInventory,65536); s.value1b(m.installRequired);
+}
+
+// Only immutable deployment intent belongs in the recovery cohort.  Runtime
+// health and placement counts are expected to change while the retained
+// containers are restarted on the promoted Brain runtime.
+struct MothershipLocalRecoveryWorkloadIdentity {
+  uint16_t applicationID = 0;
+  uint64_t deploymentID = 0;
+  bool stateful = false;
+  uint32_t shardGroups = 0;
+  uint32_t target = 0, targetBase = 0, targetSurge = 0;
+};
+template<typename S> static void serialize(S&& s, MothershipLocalRecoveryWorkloadIdentity& w) {
+  s.value2b(w.applicationID); s.value8b(w.deploymentID); s.value1b(w.stateful);
+  s.value4b(w.shardGroups); s.value4b(w.target); s.value4b(w.targetBase); s.value4b(w.targetSurge);
+}
+
+// Version three retains the existing sealed recovery owner while replacing
+// the historical one-cohort literals with the already-durable upgrade
+// admission and exact observed workload identity.
+struct MothershipLocalAdmittedRuntimeUpgradeIdentity {
+  String sourceBundleSHA256, sourceContractSHA256, sourceReleaseID;
+  String sourceProdigySHA256, sourceMothershipSHA256, sourceBinaryVersion;
+  String targetBundleSHA256, targetReleaseID;
+  String targetProdigySHA256, targetMothershipSHA256, targetBinaryVersion;
+  uint64_t authorityGeneration = 0;
+  uint128_t masterUUID = 0;
+  int64_t masterBootNs = 0;
+  String semanticObservationSHA256;
+  uint32_t activeDeploymentCount = 0;
+  Vector<MothershipLocalRecoveryWorkloadIdentity> workloads;
+};
+template<typename S> static void serialize(S&& s, MothershipLocalAdmittedRuntimeUpgradeIdentity& v) {
+  s.text1b(v.sourceBundleSHA256,64); s.text1b(v.sourceContractSHA256,64);
+  s.text1b(v.sourceReleaseID,256); s.text1b(v.sourceProdigySHA256,64);
+  s.text1b(v.sourceMothershipSHA256,64); s.text1b(v.sourceBinaryVersion,64);
+  s.text1b(v.targetBundleSHA256,64); s.text1b(v.targetReleaseID,256);
+  s.text1b(v.targetProdigySHA256,64); s.text1b(v.targetMothershipSHA256,64);
+  s.text1b(v.targetBinaryVersion,64); s.value8b(v.authorityGeneration);
+  s.value16b(v.masterUUID); s.value8b(v.masterBootNs);
+  s.text1b(v.semanticObservationSHA256,64); s.value4b(v.activeDeploymentCount);
+  s.container(v.workloads,256);
+}
+struct MothershipLocalRecoveryRuntimeIntent {
+  uint128_t upgradeOperationUUID = 0, predecessorRecoveryUUID = 0;
+  String admissionSHA256, predecessorRecoverySHA256, bundlePath, targetContractSHA256;
+  Vector<MothershipLocalRecoveryRuntimeMember> members;
+  Vector<CrossClusterMasqueGatewayAuthority> gateways;
+};
+template<typename S> static void serialize(S&& s, MothershipLocalRecoveryRuntimeIntent& r) {
+  s.value16b(r.upgradeOperationUUID); s.value16b(r.predecessorRecoveryUUID);
+  s.text1b(r.admissionSHA256,64); s.text1b(r.predecessorRecoverySHA256,64);
+  s.text1b(r.bundlePath,4096); s.text1b(r.targetContractSHA256,64);
+  s.object(r.members); s.object(r.gateways);
+}
+
 class MothershipLocalAuthorityRecoveryCohortRequest {
 public:
   static constexpr uint32_t version = 1;
+  static constexpr uint32_t interruptedUpgradeVersion = 2;
+  static constexpr uint32_t admittedRuntimeUpgradeVersion = 3;
   uint32_t protocolVersion = version;
   uint128_t operationUUID = 0;
   uint128_t clusterUUID = 0;
   uint64_t topologyVersion = 0;
   uint32_t timeoutMilliseconds = 0;
   Vector<MothershipLocalAuthorityRecoveryExecutor> executors;
+  MothershipLocalRecoveryRuntimeIntent runtime;
+  MothershipLocalAdmittedRuntimeUpgradeIdentity admittedRuntime;
 };
 template <typename S>
 static void serialize(S&& serializer, MothershipLocalAuthorityRecoveryCohortRequest& value)
@@ -773,6 +1033,245 @@ static void serialize(S&& serializer, MothershipLocalAuthorityRecoveryCohortRequ
   serializer.value4b(value.protocolVersion); serializer.value16b(value.operationUUID);
   serializer.value16b(value.clusterUUID); serializer.value8b(value.topologyVersion);
   serializer.value4b(value.timeoutMilliseconds); serializer.object(value.executors);
+  // Version-one bytes remain unchanged for already admitted cold recoveries.
+  if (value.protocolVersion >= MothershipLocalAuthorityRecoveryCohortRequest::interruptedUpgradeVersion)
+    serializer.object(value.runtime);
+  if (value.protocolVersion >= MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion)
+    serializer.object(value.admittedRuntime);
+}
+
+static inline bool mothershipLocalInterruptedRecoveryRuntimeIntentValid(
+    const MothershipLocalAuthorityRecoveryCohortRequest& r)
+{
+  const auto& v = r.runtime;
+  if (r.clusterUUID != mothershipLocalInterruptedUpgradeClusterUUID() ||
+      v.upgradeOperationUUID != mothershipLocalInterruptedUpgradeOperationUUID() ||
+      v.predecessorRecoveryUUID != mothershipLocalInterruptedUpgradePredecessorUUID() ||
+      r.operationUUID == v.upgradeOperationUUID || r.operationUUID == v.predecessorRecoveryUUID ||
+      !mothershipPhysicalFaultDigestValid(v.admissionSHA256) ||
+      !mothershipPhysicalFaultDigestValid(v.predecessorRecoverySHA256) ||
+      !mothershipPhysicalFaultSafeAbsolutePath(v.bundlePath) ||
+      v.targetContractSHA256 != "9148f79b5ea66f6ff3d17831ddc487498181549bc77b547c427a9e35f8fa35ac"_ctv ||
+      v.members.size() != 3 || v.gateways.size() != 6 || r.executors.size() != 3 ||
+      !prodigyCrossClusterMasqueGatewayAuthoritiesValid(v.gateways,r.clusterUUID)) return false;
+  const uint128_t expected[] = {
+    (uint128_t(0x0bf4487bf41a4eccULL)<<64)|0x9f3e5e316ff23a88ULL,
+    (uint128_t(0x88e88d94e0de497dULL)<<64)|0x9ef43113fd04909bULL,
+    (uint128_t(0xcbba7c68cf034a26ULL)<<64)|0xb1062449e8572b8aULL};
+  const char *linuxIDs[] = {"081d00c431314065990ff533082074f7", "cc8defd48fde42c8b304c77971e19a29",
+                           "0ef2a43f92fd48b8a04e3dd8e4eaf80d"};
+  unsigned installs = 0;
+  for (uint32_t i=0;i<3;++i) {
+    const auto& m=v.members[i];
+    if (m.machineUUID!=expected[i] || m.machineUUID!=r.executors[i].machineUUID ||
+        m.linuxMachineID!=String(linuxIDs[i]) || m.beforeBootID.size()!=36 ||
+        m.runtimeRoot!="/root/prodigy"_ctv || m.gatewayInventory.empty() || m.gatewayInventory.size()>65536 ||
+        m.installRequired!=(i!=0)) return false;
+    for (char c:m.linuxMachineID) if (!((c>='a' && c<='f') || (c>='0' && c<='9'))) return false;
+    installs += m.installRequired;
+    uint32_t gateways=0;
+    for (const auto& g:v.gateways) if (g.localMachineUUID==m.machineUUID) {
+      if (!prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(g) ||
+          g.localClusterUUID!=r.clusterUUID || g.state!=CrossClusterMasqueGatewayState::active ||
+          g.artifactSHA256!="a31d6be8fd338c5d9056822ca4eb42dc7f5cee9a2a60a08672847b016a92f631"_ctv ||
+          g.artifactBytes!=4260945) return false;
+      ++gateways;
+    }
+    if (gateways!=2) return false;
+  }
+  return installs==2;
+}
+
+static inline bool mothershipLocalRecoveryWorkloadIdentityValid(
+    const MothershipLocalRecoveryWorkloadIdentity& value)
+{
+  return value.applicationID != 0 && value.deploymentID != 0 &&
+      uint16_t(value.deploymentID >> 48) == value.applicationID && value.target != 0 &&
+      value.target == value.targetBase + value.targetSurge &&
+      (value.stateful ? value.shardGroups != 0 : value.shardGroups == 0);
+}
+
+static inline bool mothershipLocalRecoveryWorkloadIdentityFromReport(
+    uint16_t applicationID, const DeploymentStatusReport& deployment,
+    MothershipLocalRecoveryWorkloadIdentity& identity)
+{
+  if (deployment.versionID == 0 || deployment.versionID >= (uint64_t(1) << 48)) return false;
+  identity.applicationID = applicationID;
+  identity.deploymentID = (uint64_t(applicationID) << 48) | deployment.versionID;
+  identity.stateful = deployment.isStateful;
+  identity.shardGroups = deployment.nShardGroups;
+  identity.target = deployment.nTarget;
+  identity.targetBase = deployment.nTargetBase;
+  identity.targetSurge = deployment.nTargetSurge;
+  return mothershipLocalRecoveryWorkloadIdentityValid(identity);
+}
+
+static inline bool mothershipLocalAdmittedRuntimeUpgradeIdentityValid(
+    const MothershipLocalAuthorityRecoveryCohortRequest& request)
+{
+  const auto& runtime = request.runtime;
+  const auto& identity = request.admittedRuntime;
+  if (request.protocolVersion != MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion ||
+      request.clusterUUID == 0 || runtime.upgradeOperationUUID == 0 ||
+      request.operationUUID == runtime.upgradeOperationUUID || runtime.predecessorRecoveryUUID != 0 ||
+      !runtime.predecessorRecoverySHA256.empty() ||
+      !mothershipPhysicalFaultDigestValid(runtime.admissionSHA256) ||
+      !mothershipPhysicalFaultSafeAbsolutePath(runtime.bundlePath) ||
+      !mothershipPhysicalFaultDigestValid(runtime.targetContractSHA256) ||
+      runtime.members.size() != 3 || runtime.gateways.size() != 6 || request.executors.size() != 3 ||
+      !prodigyCrossClusterMasqueGatewayAuthoritiesValid(runtime.gateways, request.clusterUUID) ||
+      !mothershipPhysicalFaultDigestValid(identity.sourceBundleSHA256) ||
+      !mothershipPhysicalFaultDigestValid(identity.sourceContractSHA256) ||
+      identity.sourceReleaseID.empty() || identity.sourceReleaseID.size() > 256 ||
+      !mothershipPhysicalFaultDigestValid(identity.sourceProdigySHA256) ||
+      !mothershipPhysicalFaultDigestValid(identity.sourceMothershipSHA256) ||
+      identity.sourceBinaryVersion.empty() || identity.sourceBinaryVersion.size() > 64 ||
+      !mothershipPhysicalFaultDigestValid(identity.targetBundleSHA256) ||
+      identity.targetReleaseID.empty() || identity.targetReleaseID.size() > 256 ||
+      !mothershipPhysicalFaultDigestValid(identity.targetProdigySHA256) ||
+      !mothershipPhysicalFaultDigestValid(identity.targetMothershipSHA256) ||
+      identity.targetBinaryVersion.empty() || identity.targetBinaryVersion.size() > 64 ||
+      identity.sourceBundleSHA256 == identity.targetBundleSHA256 || identity.authorityGeneration == 0 ||
+      identity.masterUUID == 0 || identity.masterBootNs <= 0 ||
+      !mothershipPhysicalFaultDigestValid(identity.semanticObservationSHA256) ||
+      identity.activeDeploymentCount == 0 || identity.activeDeploymentCount != identity.workloads.size()) return false;
+  for (uint32_t index = 0; index < identity.workloads.size(); ++index) {
+    const auto& workload = identity.workloads[index];
+    if (!mothershipLocalRecoveryWorkloadIdentityValid(workload) ||
+        (index != 0 && (identity.workloads[index - 1].applicationID > workload.applicationID ||
+          (identity.workloads[index - 1].applicationID == workload.applicationID &&
+           identity.workloads[index - 1].deploymentID >= workload.deploymentID)))) return false;
+  }
+  for (uint32_t index = 0; index < runtime.members.size(); ++index) {
+    const auto& member = runtime.members[index];
+    if (member.machineUUID != request.executors[index].machineUUID || member.linuxMachineID.size() != 32 ||
+        member.beforeBootID.size() != 36 || member.runtimeRoot != "/root/prodigy"_ctv ||
+        member.gatewayInventory.empty() || member.gatewayInventory.size() > 65536 || !member.installRequired) return false;
+    for (char byte : member.linuxMachineID)
+      if (!((byte >= 'a' && byte <= 'f') || (byte >= '0' && byte <= '9'))) return false;
+    uint32_t gateways = 0;
+    for (const auto& authority : runtime.gateways)
+      if (authority.localMachineUUID == member.machineUUID) {
+        if (!prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(authority) ||
+            authority.localClusterUUID != request.clusterUUID ||
+            authority.state != CrossClusterMasqueGatewayState::active) return false;
+        ++gateways;
+      }
+    if (gateways != 2) return false;
+  }
+  return true;
+}
+
+static inline bool mothershipLocalRecoveryRuntimeIntentValid(
+    const MothershipLocalAuthorityRecoveryCohortRequest& request)
+{
+  return request.protocolVersion == MothershipLocalAuthorityRecoveryCohortRequest::interruptedUpgradeVersion ?
+      mothershipLocalInterruptedRecoveryRuntimeIntentValid(request) :
+      mothershipLocalAdmittedRuntimeUpgradeIdentityValid(request);
+}
+
+// Version two admits only its frozen mixed source or completed uniform target.
+static inline bool mothershipLocalInterruptedRecoveryRuntimeReportValid(
+    const MothershipLocalAuthorityRecoveryCohortRequest& request,
+    const ClusterStatusReport& report, bool completed)
+{
+  if (!mothershipLocalRecoveryRuntimeIntentValid(request) || !report.hasTopology ||
+      report.topology.machines.size()!=3 || report.machineReports.size()!=3 || report.nMachines!=3 ||
+      report.nApplications!=0 || !report.applicationReports.empty()) return false;
+  unsigned masters=0;
+  for (const auto& member:request.runtime.members) {
+    unsigned matches=0;
+    String machine; machine.assignItoh(member.machineUUID);
+    for (const auto& observed:report.machineReports) {
+      if (observed.machineUUID!=machine) continue;
+      ++matches;
+      const bool target=completed || !member.installRequired;
+      if (!observed.isBrain || !observed.controlPlaneReachable || !observed.runtimeReady ||
+          observed.state!="healthy"_ctv || observed.decommissioning || observed.rebooting || observed.updatingOS ||
+          observed.hardwareFailure || observed.activeContainers || observed.reservedContainers ||
+          !observed.deploymentIDs.empty() || observed.updateStage!="idle"_ctv || !observed.stagedBundleSHA256.empty() ||
+          observed.runningProdigyVersion!=(target ? String("54"_ctv) : String("53"_ctv)) ||
+          observed.approvedBundleSHA256!=(target ? String(mothershipLocalInterruptedUpgradeTargetBundle) :
+                                                  String(mothershipLocalInterruptedUpgradeSourceBundle)) ||
+          (!completed && observed.currentMaster==member.installRequired)) return false;
+      masters+=observed.currentMaster;
+    }
+    if (matches!=1) return false;
+  }
+  return masters==1;
+}
+
+static inline bool mothershipLocalRecoveryWorkloadsMatch(
+    const MothershipLocalAuthorityRecoveryCohortRequest& request,
+    const ClusterStatusReport& report)
+{
+  Vector<MothershipLocalRecoveryWorkloadIdentity> observed;
+  if (report.nApplications != report.applicationReports.size()) return false;
+  for (const auto& application : report.applicationReports)
+    for (const auto& deployment : application.deploymentReports) {
+      MothershipLocalRecoveryWorkloadIdentity identity;
+      if (!mothershipLocalRecoveryWorkloadIdentityFromReport(
+              application.applicationID, deployment, identity)) return false;
+      observed.push_back(std::move(identity));
+    }
+  std::sort(observed.begin(), observed.end(), [](const auto& left, const auto& right) {
+    return left.applicationID == right.applicationID ? left.deploymentID < right.deploymentID :
+        left.applicationID < right.applicationID;
+  });
+  if (observed.size() != request.admittedRuntime.workloads.size()) return false;
+  for (uint32_t index = 0; index < observed.size(); ++index) {
+    const auto& left = observed[index];
+    const auto& right = request.admittedRuntime.workloads[index];
+    if (left.applicationID != right.applicationID || left.deploymentID != right.deploymentID ||
+        left.stateful != right.stateful || left.shardGroups != right.shardGroups ||
+        left.target != right.target || left.targetBase != right.targetBase ||
+        left.targetSurge != right.targetSurge) return false;
+  }
+  return true;
+}
+
+static inline bool mothershipLocalAdmittedRuntimeUpgradeReportValid(
+    const MothershipLocalAuthorityRecoveryCohortRequest& request,
+    const ClusterStatusReport& report, bool completed)
+{
+  const auto& identity = request.admittedRuntime;
+  if (!mothershipLocalAdmittedRuntimeUpgradeIdentityValid(request) || !report.hasTopology ||
+      report.topology.version < request.topologyVersion || report.topology.machines.size() != 3 ||
+      report.machineReports.size() != 3 || report.nMachines != 3 ||
+      !mothershipLocalRecoveryWorkloadsMatch(request, report)) return false;
+  unsigned masters = 0;
+  for (const auto& member : request.runtime.members) {
+    unsigned topologyMatches = 0, reportMatches = 0;
+    for (const auto& machine : report.topology.machines)
+      topologyMatches += machine.uuid == member.machineUUID && machine.isBrain &&
+          machine.kind == MachineConfig::MachineKind::vm && machine.backing == ClusterMachineBacking::owned &&
+          machine.lifetime == MachineLifetime::owned;
+    String machineUUID; machineUUID.assignItoh(member.machineUUID);
+    for (const auto& observed : report.machineReports) {
+      if (observed.machineUUID != machineUUID) continue;
+      ++reportMatches;
+      const bool target = completed || !member.installRequired;
+      if (!observed.isBrain || !observed.controlPlaneReachable || !observed.runtimeReady ||
+          observed.state != "healthy"_ctv || observed.decommissioning || observed.rebooting || observed.updatingOS ||
+          observed.hardwareFailure || observed.updateStage != "idle"_ctv ||
+          !observed.stagedBundleSHA256.empty() ||
+          observed.runningProdigyVersion != (target ? identity.targetBinaryVersion : identity.sourceBinaryVersion) ||
+          observed.approvedBundleSHA256 != (target ? identity.targetBundleSHA256 : identity.sourceBundleSHA256) ||
+          (!completed && observed.currentMaster != (member.machineUUID == identity.masterUUID))) return false;
+      masters += observed.currentMaster;
+    }
+    if (topologyMatches != 1 || reportMatches != 1) return false;
+  }
+  return masters == 1;
+}
+
+static inline bool mothershipLocalRecoveryRuntimeReportValid(
+    const MothershipLocalAuthorityRecoveryCohortRequest& request,
+    const ClusterStatusReport& report, bool completed)
+{
+  return request.protocolVersion == MothershipLocalAuthorityRecoveryCohortRequest::interruptedUpgradeVersion ?
+      mothershipLocalInterruptedRecoveryRuntimeReportValid(request, report, completed) :
+      mothershipLocalAdmittedRuntimeUpgradeReportValid(request, report, completed);
 }
 
 static inline bool mothershipLocalAuthorityRecoveryPhaseValid(MothershipLocalAuthorityRecoveryPhase value)
@@ -787,7 +1286,9 @@ static inline bool mothershipLocalAuthorityRecoveryCohortRequestValid(
     const MothershipLocalAuthorityRecoveryCohortRequest& value, String *failure = nullptr)
 {
   if (failure) failure->clear();
-  if (value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRequest::version ||
+  if ((value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRequest::version &&
+       value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRequest::interruptedUpgradeVersion &&
+       value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion) ||
       value.operationUUID == 0 || value.clusterUUID == 0 || value.topologyVersion == 0 ||
       value.timeoutMilliseconds < mothershipLocalAuthorityRecoveryMinimumTimeoutMilliseconds ||
       value.timeoutMilliseconds > mothershipLocalVMFaultMaximumRecoveryMilliseconds || value.executors.size() != 3)
@@ -812,6 +1313,11 @@ static inline bool mothershipLocalAuthorityRecoveryCohortRequestValid(
         if (failure) failure->assign("local authority recovery requires distinct machine, boundary, and executor identities"_ctv);
         return false;
       }
+  }
+  if (value.protocolVersion >= MothershipLocalAuthorityRecoveryCohortRequest::interruptedUpgradeVersion &&
+      !mothershipLocalRecoveryRuntimeIntentValid(value)) {
+    if (failure) failure->assign("local authority recovery runtime intent differs from its exact admitted rollout"_ctv);
+    return false;
   }
   return true;
 }
@@ -850,26 +1356,44 @@ static void serialize(S&& serializer, MothershipLocalAuthorityRecoveryBoundaryPr
   serializer.value16b(value.boundaryUUID); serializer.value1b(value.phase); serializer.text1b(value.receiptSHA256, 64);
 }
 
+struct MothershipLocalRecoveryRuntimeProgress {
+  uint128_t boundaryUUID = 0;
+  bool installDispatched = false;
+  String stateSHA256, secretsSHA256, activationBootID;
+};
+template<typename S> static void serialize(S&& s, MothershipLocalRecoveryRuntimeProgress& p) {
+  s.value16b(p.boundaryUUID); s.value1b(p.installDispatched);
+  s.text1b(p.stateSHA256,64); s.text1b(p.secretsSHA256,64); s.text1b(p.activationBootID,64);
+}
+
 class MothershipLocalAuthorityRecoveryCohortRecord {
 public:
   static constexpr uint32_t version = 1;
+  static constexpr uint32_t interruptedUpgradeVersion = 2;
+  static constexpr uint32_t admittedRuntimeUpgradeVersion = 3;
   uint32_t protocolVersion = version;
   MothershipLocalAuthorityRecoveryCohortRequest request;
   MothershipLocalAuthorityRecoveryPhase phase = MothershipLocalAuthorityRecoveryPhase::admitted;
   Vector<MothershipLocalAuthorityRecoveryBoundaryProgress> boundaries;
+  Vector<MothershipLocalRecoveryRuntimeProgress> runtimeProgress;
 };
 template <typename S>
 static void serialize(S&& serializer, MothershipLocalAuthorityRecoveryCohortRecord& value)
 {
   serializer.value4b(value.protocolVersion); serializer.object(value.request); serializer.value1b(value.phase);
   serializer.object(value.boundaries);
+  if (value.protocolVersion >= MothershipLocalAuthorityRecoveryCohortRecord::interruptedUpgradeVersion)
+    serializer.object(value.runtimeProgress);
 }
 
 static inline bool mothershipLocalAuthorityRecoveryCohortRecordValid(
     const MothershipLocalAuthorityRecoveryCohortRecord& value, String *failure = nullptr)
 {
   if (failure) failure->clear();
-  if (value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRecord::version ||
+  if ((value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRecord::version &&
+       value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRecord::interruptedUpgradeVersion &&
+       value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRecord::admittedRuntimeUpgradeVersion) ||
+      value.protocolVersion != value.request.protocolVersion ||
       !mothershipLocalAuthorityRecoveryCohortRequestValid(value.request, failure) ||
       !mothershipLocalAuthorityRecoveryPhaseValid(value.phase) || value.boundaries.size() != 3)
   {
@@ -895,6 +1419,22 @@ static inline bool mothershipLocalAuthorityRecoveryCohortRecordValid(
     if (failure) failure->assign("local authority recovery cohort phase is not the durable common progress"_ctv);
     return false;
   }
+  if (value.protocolVersion >= MothershipLocalAuthorityRecoveryCohortRecord::interruptedUpgradeVersion) {
+    if (value.runtimeProgress.size()!=3) return false;
+    for (uint32_t i=0;i<3;++i) {
+      const auto& p=value.runtimeProgress[i]; const auto& member=value.request.runtime.members[i];
+      if (p.boundaryUUID!=value.boundaries[i].boundaryUUID ||
+          (!member.installRequired && (p.installDispatched || !p.stateSHA256.empty() || !p.secretsSHA256.empty())) ||
+          (!p.installDispatched && (!p.stateSHA256.empty() || !p.secretsSHA256.empty())) ||
+          (p.stateSHA256.empty()!=p.secretsSHA256.empty()) ||
+          (!p.stateSHA256.empty() && (!mothershipPhysicalFaultDigestValid(p.stateSHA256) ||
+                                    !mothershipPhysicalFaultDigestValid(p.secretsSHA256))) ||
+          (!p.activationBootID.empty() && (p.activationBootID.size()!=36 || p.activationBootID==member.beforeBootID)) ||
+          (member.installRequired && value.boundaries[i].phase>=MothershipLocalAuthorityRecoveryPhase::released &&
+           (!p.installDispatched || p.stateSHA256.empty())) ||
+          (value.boundaries[i].phase==MothershipLocalAuthorityRecoveryPhase::recovered && p.activationBootID.empty())) return false;
+    }
+  } else if (!value.runtimeProgress.empty()) return false;
   return true;
 }
 

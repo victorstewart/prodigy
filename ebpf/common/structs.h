@@ -36,6 +36,11 @@ struct container_network_policy {
   __u8 mode;
   __u8 containerFragment;
   __u32 interContainerMTU;
+  // A bounded qualification cut returns to the existing policy automatically.
+  // CLOCK_MONOTONIC and bpf_ktime_get_ns share the same time domain.
+  __u64 isolationDeadlineNs;
+  __u64 isolationOwnerHi;
+  __u64 isolationOwnerLo;
 };
 
 enum {
@@ -52,6 +57,15 @@ struct container_egress_allow_key {
   __u8 reserved;
   __be16 port;
   __be32 addr;
+};
+
+// Separate map preserves the existing IPv4 tunnel-provider ABI while adding
+// an exact IPv6 peer tuple for MASQUE gateways.
+struct container_egress_allow6_key {
+  __u8 proto;
+  __u8 reserved;
+  __be16 port;
+  __u8 addr[16];
 };
 
 #define CONTAINER_SERVICE_PAIRINGS_MAX_ENTRIES (16 * 1024)
@@ -76,6 +90,14 @@ struct container_service_peer {
 
 struct container_tcp_flow {
   __u64 expiresAtNs;
+};
+
+// Session authority is not an idle-flow cache: neither LRU pressure nor a TCP
+// reset may remove a still-current lease. Neuron alone owns this exact grant.
+struct container_tcp_authorization {
+  __u64 authorizationExpiresAtNs;
+  __u64 authorizationHi;
+  __u64 authorizationLo;
 };
 
 struct quic_long_header {

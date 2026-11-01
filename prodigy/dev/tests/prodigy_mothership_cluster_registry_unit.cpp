@@ -353,6 +353,83 @@ int main(void)
 
   String dbPath;
   dbPath.assign(created);
+  String pathFaultReopenPath;
+  ProdigyCrossClusterPathFaultGatewayLifecycleRecord pathFaultReopenExpected = {};
+  bool pathFaultReopenExpectedRecorded = false;
+
+  // The graph placement owner reads the existing durable COUSIN route/receipt
+  // registry.  Exercise absent, malformed-scope, restart, stale-generation,
+  // and withdrawn-route cases without synthesizing a graph-specific registry.
+  {
+    String graphRoutePath; graphRoutePath.snprintf<"{}/graph-routes"_ctv>(dbPath);
+    String failure;
+    constexpr uint128_t owner = 0x5101, replica = 0x5102;
+    const int64_t now = Time::now<TimeResolution::ms>();
+    auto makeRoute = [&](uint128_t id, uint16_t app, uint8_t role, uint16_t slot, bool reverse) {
+      CousinRouteRecord route = {};
+      route.routeUUID = id; route.operationUUID = id + 0x100; route.pairUUID = 0x5201;
+      route.logicalWorkloadUUID = 0x5301; route.logicalServiceUUID = id + 0x200;
+      route.sourceClusterUUID = reverse ? owner : replica; route.destinationClusterUUID = reverse ? replica : owner;
+      route.sourceApplicationID = route.destinationApplicationID = app;
+      route.sourceCousinServicePrefix = route.destinationCousinServicePrefix = prodigyRuntimeStatefulServicePrefix(app, role);
+      route.slots.insert(slot); route.destinationRoutablePrefixUUID = id + 0x300;
+      route.destinationPublicAddress = IPAddress("2001:db8:510::1", true); route.destinationPublicAddress.v6[15] = uint8_t(id);
+      route.destinationTCPPort = 443; route.sourcePermissionUUID = id + 0x400; route.destinationPermissionUUID = id + 0x500;
+      route.transportProtocol = IPPROTO_TCP; route.destinationCIDR = 64; route.pathMTU = 1500;
+      route.generation = 1; route.issuedAtMs = now - 1; route.expiresAtMs = now + 60'000; route.keyEpoch = 1; route.rootGeneration = 1;
+      return route;
+    };
+    auto recordRoute = [&](MothershipClusterRegistry& routes, CousinRouteRecord route) {
+      CousinRouteRecord recorded = {}; bool resumed = false;
+      return routes.recordCousinRoute(route, recorded, resumed, &failure) && !resumed;
+    };
+    auto recordReceipts = [&](MothershipClusterRegistry& routes, const CousinRouteRecord& route) {
+      for (const auto half : {CousinRouteHalf::source, CousinRouteHalf::destination}) {
+        CousinRouteApplyReceipt receipt = {};
+        receipt.routeUUID = route.routeUUID; receipt.generation = route.generation;
+        if (!cousinRouteAuthorizationDigest(route, receipt.authorizationSHA256)) return false;
+        receipt.localClusterUUID = half == CousinRouteHalf::source ? route.sourceClusterUUID : route.destinationClusterUUID;
+        receipt.localHalf = half; receipt.keyEpoch = route.keyEpoch;
+        receipt.localRuntimeRevision = route.generation * 10 + (half == CousinRouteHalf::source ? 1 : 2);
+        receipt.installedState = route.state;
+        CousinRouteApplyReceipt recorded = {}; bool resumed = false;
+        if (!routes.recordCousinRouteApplyReceipt(receipt, recorded, resumed, &failure)) return false;
+      }
+      return true;
+    };
+    Vector<MothershipGraphReplicaRouteBinding> bindings;
+    const auto sibling = makeRoute(0x5405, 5, 2, 0, false);
+    const auto seeding = makeRoute(0x5406, 5, 4, 0, false);
+    {
+      MothershipClusterRegistry routes(graphRoutePath);
+      suite.expect(!routes.loadGraphReplicaRouteBindings(5, owner, replica, now, bindings, &failure), "graph_route_absent_rejected");
+      suite.expect(recordRoute(routes, makeRoute(0x5401, 2, 2, 0, false)) &&
+          !routes.loadGraphReplicaRouteBindings(5, owner, replica, now, bindings, &failure), "graph_route_wrong_app_rejected");
+      suite.expect(recordRoute(routes, makeRoute(0x5402, 5, 2, 1, false)) &&
+          !routes.loadGraphReplicaRouteBindings(5, owner, replica, now, bindings, &failure), "graph_route_wrong_group_rejected");
+      suite.expect(recordRoute(routes, makeRoute(0x5403, 5, 3, 0, false)) &&
+          !routes.loadGraphReplicaRouteBindings(5, owner, replica, now, bindings, &failure), "graph_route_wrong_purpose_rejected");
+      suite.expect(recordRoute(routes, makeRoute(0x5404, 5, 2, 0, true)) &&
+          !routes.loadGraphReplicaRouteBindings(5, owner, replica, now, bindings, &failure), "graph_route_wrong_direction_rejected");
+      suite.expect(recordRoute(routes, sibling) && recordReceipts(routes, sibling) &&
+          recordRoute(routes, seeding) && recordReceipts(routes, seeding) &&
+          routes.loadGraphReplicaRouteBindings(5, owner, replica, now, bindings, &failure) && bindings.size() == 2,
+          "graph_route_exact_active_accepted");
+    }
+    MothershipClusterRegistry resumedRoutes(graphRoutePath);
+    bindings.clear();
+    suite.expect(resumedRoutes.loadGraphReplicaRouteBindings(5, owner, replica, now, bindings, &failure) && bindings.size() == 2,
+        "graph_route_restart_resume_accepted");
+    auto stale = sibling; stale.generation = 2; stale.operationUUID++; stale.issuedAtMs = now; stale.expiresAtMs = now + 60'000;
+    suite.expect(recordRoute(resumedRoutes, stale) && !resumedRoutes.loadGraphReplicaRouteBindings(5, owner, replica, now, bindings, &failure),
+        "graph_route_stale_receipt_rejected");
+    suite.expect(recordReceipts(resumedRoutes, stale), "graph_route_new_generation_receipts_recorded");
+    auto withdrawn = stale; withdrawn.generation = 3; withdrawn.operationUUID++; withdrawn.issuedAtMs = now + 1;
+    withdrawn.expiresAtMs = now + 60'000; withdrawn.state = CousinRouteState::withdrawn;
+    withdrawn.withdrawalGeneration = withdrawn.generation; withdrawn.withdrawnAtMs = now + 1;
+    suite.expect(recordRoute(resumedRoutes, withdrawn) && !resumedRoutes.loadGraphReplicaRouteBindings(5, owner, replica, now + 2, bindings, &failure),
+        "graph_route_loss_rejected");
+  }
 
   MothershipProdigyCluster local = {};
   local.name = "local-alpha"_ctv;
@@ -1045,6 +1122,7 @@ int main(void)
     suite.expect(createdCluster.mothershipConnectivity.kind == MothershipConnectivityKind::ssh, "create_local_defaults_ssh_connectivity");
     suite.expect(createdCluster.mothershipConnectivity.tunnelProvider.artifactSha256.size() == 0, "create_local_default_ssh_has_no_tunnel_artifact");
     storedLocal.clusterUUID = createdCluster.clusterUUID;
+    storedLocal.datacenterFragment = createdCluster.datacenterFragment;
     suite.expect(equalClusters(storedLocal, createdCluster), "create_local_normalized");
 
     bool createRemoteCreated = registry.createCluster(remoteCreated, &createdCluster, &failure);
@@ -1055,6 +1133,7 @@ int main(void)
     suite.expect(createRemoteCreated, "create_remote_created");
     suite.expect(createdCluster.clusterUUID != 0, "create_remote_created_cluster_uuid_generated");
     storedRemoteCreated.clusterUUID = createdCluster.clusterUUID;
+    storedRemoteCreated.datacenterFragment = createdCluster.datacenterFragment;
     suite.expect(equalClusters(storedRemoteCreated, createdCluster), "create_remote_created_normalized");
 
     bool createLocalAdopted = registry.createCluster(localAdopted, &createdCluster, &failure);
@@ -1065,6 +1144,7 @@ int main(void)
     suite.expect(createLocalAdopted, "create_local_adopted");
     suite.expect(createdCluster.clusterUUID != 0, "create_local_adopted_cluster_uuid_generated");
     storedLocalAdopted.clusterUUID = createdCluster.clusterUUID;
+    storedLocalAdopted.datacenterFragment = createdCluster.datacenterFragment;
     suite.expect(equalClusters(storedLocalAdopted, createdCluster), "create_local_adopted_normalized");
 
     bool createRemoteAdopted = registry.createCluster(remoteAdopted, &createdCluster, &failure);
@@ -1075,6 +1155,7 @@ int main(void)
     suite.expect(createRemoteAdopted, "create_remote_adopted");
     suite.expect(createdCluster.clusterUUID != 0, "create_remote_adopted_cluster_uuid_generated");
     storedRemoteAdopted.clusterUUID = createdCluster.clusterUUID;
+    storedRemoteAdopted.datacenterFragment = createdCluster.datacenterFragment;
     suite.expect(equalClusters(storedRemoteAdopted, createdCluster), "create_remote_adopted_normalized");
 
     bool createRemoteManagedGcp = registry.createCluster(remoteManagedGcp, &createdCluster, &failure);
@@ -1085,6 +1166,7 @@ int main(void)
     suite.expect(createRemoteManagedGcp, "create_remote_managed_gcp");
     suite.expect(createdCluster.clusterUUID != 0, "create_remote_managed_gcp_cluster_uuid_generated");
     storedRemoteManagedGcp.clusterUUID = createdCluster.clusterUUID;
+    storedRemoteManagedGcp.datacenterFragment = createdCluster.datacenterFragment;
     {
       String templateBase = {};
       renderExpectedManagedGcpTemplateBase(storedRemoteManagedGcp, templateBase);
@@ -1103,6 +1185,7 @@ int main(void)
     suite.expect(createRemoteMixed, "create_remote_mixed");
     suite.expect(createdCluster.clusterUUID != 0, "create_remote_mixed_cluster_uuid_generated");
     storedRemoteMixed.clusterUUID = createdCluster.clusterUUID;
+    storedRemoteMixed.datacenterFragment = createdCluster.datacenterFragment;
     storedRemoteMixed.azure.managedIdentityName.snprintf<"prodigy-{itoa}-azure-mi"_ctv>(uint64_t(storedRemoteMixed.clusterUUID));
     storedRemoteMixed.azure.managedIdentityResourceID.snprintf<
         "/subscriptions/sub-prod/resourceGroups/rg-prod/providers/Microsoft.ManagedIdentity/userAssignedIdentities/{}"_ctv>(
@@ -1117,6 +1200,7 @@ int main(void)
     suite.expect(createTestLocal, "create_test_local");
     suite.expect(createdCluster.clusterUUID != 0, "create_test_local_cluster_uuid_generated");
     storedTestLocal.clusterUUID = createdCluster.clusterUUID;
+    storedTestLocal.datacenterFragment = createdCluster.datacenterFragment;
     mothershipResolveTestClusterControlRecord(storedTestLocal.controls, storedTestLocal);
     suite.expect(equalClusters(storedTestLocal, createdCluster), "create_test_local_normalized");
 
@@ -1137,6 +1221,61 @@ int main(void)
     mothershipResolveTestClusterControlRecord(expectedSecondTestControls, storedSecondTestLocal);
     suite.expect(equalControls(storedSecondTestLocal.controls, expectedSecondTestControls),
                  "create_second_test_local_persists_fragment_resolved_controls");
+
+    {
+      String globalLeaseDbPath = {};
+      globalLeaseDbPath.snprintf<"{}/global-datacenter-fragments"_ctv>(dbPath);
+      MothershipClusterRegistry globalLeaseRegistry(globalLeaseDbPath);
+      MothershipProdigyCluster ewr = remoteCreated;
+      ewr.name = "vultr-ewr"_ctv;
+      ewr.providerScope = "vultr/ewr"_ctv;
+      ewr.datacenterFragment = 47;
+      MothershipProdigyCluster storedEwr = {};
+      suite.expect(globalLeaseRegistry.createCluster(ewr, &storedEwr, &failure),
+                   "global_datacenter_fragment_create_vultr_ewr");
+
+      MothershipProdigyCluster ord = remoteCreated;
+      ord.name = "vultr-ord"_ctv;
+      ord.providerScope = "vultr/ord"_ctv;
+      ord.datacenterFragment = 0;
+      MothershipProdigyCluster storedOrd = {};
+      suite.expect(globalLeaseRegistry.createCluster(ord, &storedOrd, &failure),
+                   "global_datacenter_fragment_auto_allocates_vultr_ord");
+
+      MothershipProdigyCluster lan = remoteCreated;
+      lan.name = "retained-lan"_ctv;
+      lan.providerScope = "retained/lan"_ctv;
+      MothershipProdigyCluster storedLan = {};
+      suite.expect(globalLeaseRegistry.createCluster(lan, &storedLan, &failure),
+                   "global_datacenter_fragment_auto_allocates_retained_lan_default");
+      suite.expect(storedEwr.datacenterFragment != 0 &&
+                       storedEwr.datacenterFragment != storedOrd.datacenterFragment &&
+                       storedEwr.datacenterFragment != storedLan.datacenterFragment &&
+                       storedOrd.datacenterFragment != storedLan.datacenterFragment,
+                   "global_datacenter_fragment_remote_sites_are_unique");
+
+      MothershipProdigyCluster testCollision = testLocal;
+      testCollision.name = "test-collides-with-ewr"_ctv;
+      testCollision.test.workspaceRoot = "/tmp/prodigy-test-collides-with-ewr"_ctv;
+      testCollision.datacenterFragment = storedEwr.datacenterFragment;
+      suite.expect(!globalLeaseRegistry.createCluster(testCollision, nullptr, &failure) &&
+                       failure.equals("cluster datacenter fragment already leased"_ctv),
+                   "global_datacenter_fragment_rejects_remote_test_collision");
+
+      MothershipProdigyCluster changedEwr = storedEwr;
+      changedEwr.datacenterFragment = storedLan.datacenterFragment;
+      changedEwr.lastRefreshMs = 444;
+      MothershipProdigyCluster persistedEwr = {};
+      suite.expect(globalLeaseRegistry.upsertCluster(changedEwr, &persistedEwr, &failure) &&
+                       persistedEwr.datacenterFragment == storedEwr.datacenterFragment &&
+                       persistedEwr.lastRefreshMs == 444,
+                   "global_datacenter_fragment_existing_lease_is_immutable");
+      MothershipProdigyCluster reloadedEwr = {};
+      suite.expect(globalLeaseRegistry.getCluster("vultr-ewr"_ctv, reloadedEwr, &failure) &&
+                       reloadedEwr.datacenterFragment == storedEwr.datacenterFragment &&
+                       reloadedEwr.lastRefreshMs == 444,
+                   "global_datacenter_fragment_existing_lease_persists");
+    }
 
     MothershipProdigyCluster duplicateTestWorkspace = testLocal;
     duplicateTestWorkspace.name = "test-local-duplicate-workspace"_ctv;
@@ -1378,7 +1517,23 @@ int main(void)
     suite.expect(createRemoteVultrBGP, "create_remote_vultr_bgp");
     suite.expect(createdCluster.clusterUUID != 0, "create_remote_vultr_bgp_cluster_uuid_generated");
     storedRemoteVultrBGP.clusterUUID = createdCluster.clusterUUID;
+    storedRemoteVultrBGP.datacenterFragment = createdCluster.datacenterFragment;
     suite.expect(equalClusters(storedRemoteVultrBGP, createdCluster), "create_remote_vultr_bgp_normalized");
+    suite.expect(!mothershipProviderBGPOriginPrefixAllowed(IPPrefix("fd5a:4d53:1::", true, 96)) &&
+                     !mothershipProviderBGPOriginPrefixAllowed(IPPrefix("fc00::", true, 7)) &&
+                     mothershipProviderBGPOriginPrefixAllowed(IPPrefix("203.0.113.0", false, 24)) &&
+                     mothershipProviderBGPOriginPrefixAllowed(IPPrefix("2602:fac0::", true, 40)),
+                 "provider_bgp_origin_policy_separates_ula_from_public_prefixes");
+
+    MothershipProdigyCluster ulaBGPOrigin = createdCluster;
+    ulaBGPOrigin.bgpAuthorizedOriginPrefixes[0] = IPPrefix("fd5a:4d53:1::", true, 96);
+    {
+      MothershipClusterRegistry::BGPOriginPolicyLock ulaPolicyLock = {};
+      suite.expect(registry.lockBGPOriginPolicy(ulaPolicyLock, &failure) &&
+                       !registry.upsertClusterBGPOriginPolicy(ulaBGPOrigin, ulaPolicyLock, nullptr, &failure) &&
+                       failure.equals("BGP origin authorization prefixes must not be ULA"_ctv),
+                   "upsert_rejects_generated_site_ula_bgp_origin_prefix");
+    }
 
     MothershipProdigyCluster duplicateBGPOrigin = createdCluster;
     duplicateBGPOrigin.bgpAuthorizedOriginPrefixes.push_back(
@@ -1565,6 +1720,11 @@ int main(void)
     noncanonical.bgpAuthorizedOriginPrefixes[0] = IPPrefix("2602:fac0::1", true, 40);
     suite.expect(writeAndRejectV8("noncanonical-prefix-v8"_ctv, noncanonical),
                  "provider_managed_bgp_v8_rejects_noncanonical_prefix");
+
+    MothershipProdigyClusterRecordV8 ulaPrefix = makeV8();
+    ulaPrefix.bgpAuthorizedOriginPrefixes[0] = IPPrefix("fd5a:4d53:1::", true, 96);
+    suite.expect(writeAndRejectV8("ula-prefix-v8"_ctv, ulaPrefix),
+                 "provider_managed_bgp_v8_rejects_restored_ula_prefix");
 
     MothershipProdigyClusterRecordV8 staticBGP = makeV8();
     staticBGP.cluster.bgp = localAdopted.bgp;
@@ -2169,6 +2329,324 @@ int main(void)
     suite.expect(createMissingAuth == false, "create_tunnel_provider_missing_auth_rejected");
     suite.expect(failure.equals("tunnelProvider.clientAuth certificate material invalid"_ctv), "create_tunnel_provider_missing_auth_reason");
 
+  }
+
+  {
+    String masquePath; masquePath.snprintf<"{}/masque"_ctv>(dbPath);
+    MothershipClusterRegistry registry(masquePath); String failure = {};
+    ProdigyClusterPairEnrollment enrollment = {}; enrollment.pairUUID = 0x9001; enrollment.localClusterUUID = 0x9002; enrollment.peerClusterUUID = 0x9003; enrollment.operationUUID = 0x9007; enrollment.rootGeneration = 7; enrollment.agreedKeyEpoch = 9; enrollment.localAuthorityGeneration = 11; enrollment.state = ProdigyClusterPairEnrollmentState::active;
+    MothershipProdigyCluster local = {}, peer = {};
+    local.clusterUUID = enrollment.localClusterUUID; local.datacenterFragment = 17; local.topology.version = 1;
+    peer.clusterUUID = enrollment.peerClusterUUID; peer.datacenterFragment = 29; peer.topology.version = 1;
+    ClusterMachine localMachine = {}, peerMachine = {};
+    localMachine.uuid = 0x9005; localMachine.isBrain = true;
+    localMachine.addresses.publicAddresses.push_back(ClusterMachineAddress {"2001:db8::1"_ctv, 128, {}});
+    peerMachine.uuid = 0x9006; peerMachine.isBrain = true;
+    peerMachine.addresses.publicAddresses.push_back(ClusterMachineAddress {"2001:db8::2"_ctv, 128, {}});
+    local.topology.machines.push_back(localMachine); peer.topology.machines.push_back(peerMachine);
+    CrossClusterMasqueGatewayAuthority requested = {};
+    requested.localMachineUUID = localMachine.uuid; requested.peerMachineUUID = peerMachine.uuid;
+    requested.artifactSHA256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_ctv;
+    // The enrolled Vault mints TLS identities; '-' requests those exact derived
+    // digests instead of pretending the artifact digest identifies a certificate.
+    requested.localIdentitySHA256 = "-"_ctv; requested.peerIdentitySHA256 = "-"_ctv;
+    requested.peerTrustSHA256 = "-"_ctv; requested.artifactBytes = 1;
+    requested.listenerPublicUDPEndpoint = IPAddress("2001:db8::1", true); requested.listenerPublicUDPPort = 443;
+    requested.localRole = CrossClusterMasqueGatewayRole::listener; requested.generation = 1;
+    requested.gatewaySlot = 1; requested.tunnelSlot = 2;
+    // MASQUE credentials are derived from the durable enrollment root.  The
+    // registry must not silently synthesize this private authority when it is
+    // absent, so install the matching immutable pair intent first.
+    MothershipClusterPairEnrollmentIntent privateIntent = {};
+    privateIntent.pairUUID = enrollment.pairUUID; privateIntent.operationUUID = enrollment.operationUUID;
+    privateIntent.firstClusterUUID = enrollment.localClusterUUID; privateIntent.secondClusterUUID = enrollment.peerClusterUUID;
+    privateIntent.rootGeneration = enrollment.rootGeneration; privateIntent.keyEpoch = enrollment.agreedKeyEpoch;
+    privateIntent.firstObservedAuthorityGeneration = enrollment.localAuthorityGeneration;
+    privateIntent.secondObservedAuthorityGeneration = enrollment.localAuthorityGeneration;
+    for (uint32_t index = 0; index < sizeof(privateIntent.root); ++index) privateIntent.root[index] = uint8_t(index + 1);
+    ClusterPairControlEndpoint localEndpoint = {};
+    localEndpoint.clusterUUID = enrollment.localClusterUUID; localEndpoint.nodeUUID = localMachine.uuid;
+    localEndpoint.role = ClusterPairControlNodeRole::switchboard; localEndpoint.address = IPAddress("fd42:4242:4242:1::1", true);
+    localEndpoint.port = mothershipPairControlBoundaryPort;
+    ClusterPairControlEndpoint peerEndpoint = localEndpoint;
+    peerEndpoint.clusterUUID = enrollment.peerClusterUUID; peerEndpoint.nodeUUID = peerMachine.uuid;
+    peerEndpoint.address = IPAddress("fd42:4242:4242:2::1", true);
+    privateIntent.firstEndpoints.push_back(localEndpoint); privateIntent.secondEndpoints.push_back(peerEndpoint);
+    MothershipClusterPairEnrollmentIntent recordedIntent = {}; bool intentResumed = false;
+    suite.expect(registry.recordClusterPairEnrollmentIntent(privateIntent, recordedIntent, intentResumed, &failure) && !intentResumed,
+                 "masque_gateway_pair_root_durable");
+    CrossClusterMasqueGatewayAuthority recorded = {}; bool resumed = false;
+    suite.expect(registry.putCrossClusterMasqueGateway(requested, enrollment, local, peer, recorded, resumed, &failure) && !resumed, "masque_gateway_put_durable");
+    suite.expect(recorded.pairUUID == enrollment.pairUUID && recorded.pairOperationUUID == enrollment.operationUUID && recorded.localDatacenterFragment == local.datacenterFragment && recorded.peerDatacenterFragment == peer.datacenterFragment && recorded.localSitePrefix.equals(prodigyContainerDatacenterSitePrefix(local.datacenterFragment)) && recorded.peerSitePrefix.equals(prodigyContainerDatacenterSitePrefix(peer.datacenterFragment)), "masque_gateway_derives_pair_and_site_authority");
+    suite.expect(recorded.gatewaySlot == 1 && recorded.tunnelSlot == 2 &&
+                     recorded.privateTunnelInterface.size() != 0 && recorded.privateTunnelInterface.size() <= 15 &&
+                     recorded.privateTunnelLocalIPv6.is6 && recorded.privateTunnelPeerIPv6.is6 &&
+                     !recorded.privateTunnelLocalIPv6.equals(recorded.privateTunnelPeerIPv6) &&
+                     recorded.privateLocalASN != 0 && recorded.privatePeerASN != 0 &&
+                     prodigyIsSHA256HexDigest(recorded.privateSessionCredentialSHA256),
+                 "masque_gateway_derives_private_bgp_tuple_not_cli_input");
+    CrossClusterMasqueGatewayAuthority loaded = {}; suite.expect(registry.loadCrossClusterMasqueGateway(recorded.pairUUID, requested.localMachineUUID, loaded, &failure) && loaded.generation == 1, "masque_gateway_load_durable");
+    suite.expect(registry.putCrossClusterMasqueGateway(requested, enrollment, local, peer, recorded, resumed, &failure) && resumed, "masque_gateway_put_idempotent_resume");
+    auto wrongTLSIdentity = requested;
+    wrongTLSIdentity.localIdentitySHA256 = requested.artifactSHA256;
+    CrossClusterMasqueGatewayAuthority rejectedTLSIdentity;
+    suite.expect(!registry.putCrossClusterMasqueGateway(wrongTLSIdentity, enrollment, local, peer,
+        rejectedTLSIdentity, resumed, &failure) &&
+        failure.equals("cross-cluster MASQUE gateway TLS identity digest does not match Vault material"_ctv),
+        "masque_gateway_rejects_fabricated_tls_identity_digest");
+    ProdigyCrossClusterPathFaultGatewayLifecycleRecord lifecycle = {};
+    lifecycle.request.operationUUID = 0x9010; lifecycle.request.authority = recorded;
+    lifecycle.request.scope = prodigyCrossClusterPathFaultScope(recorded);
+    prodigyCrossClusterPathFaultFlowIdentity(lifecycle.request.scope, lifecycle.request.flowIdentity);
+    lifecycle.admittedPlan.kind = SystemContainerKind::crossClusterMasqueGateway;
+    lifecycle.admittedPlan.artifact.sha256 = recorded.artifactSHA256;
+    lifecycle.admittedPlan.artifact.bytes = recorded.artifactBytes;
+    lifecycle.admittedPlan.gatewayPairUUID = recorded.pairUUID;
+    lifecycle.admittedPlan.gatewayLocalClusterUUID = recorded.localClusterUUID;
+    lifecycle.admittedPlan.gatewayLocalMachineUUID = recorded.localMachineUUID;
+    lifecycle.admittedPlan.gatewayKeyEpoch = recorded.keyGeneration;
+    lifecycle.admittedPlan.gatewayAuthorityGeneration = recorded.pairAuthorityGeneration;
+    lifecycle.admittedPlan.gatewayGeneration = recorded.generation;
+    lifecycle.admittedPlan.gatewayTunnelInterface = recorded.privateTunnelInterface;
+    lifecycle.admittedPlan.egress.peerIsIPv6 = true; lifecycle.admittedPlan.egress.protocol = IPPROTO_UDP;
+    lifecycle.admittedPlan.egress.port = recorded.listenerPublicUDPPort;
+    std::memcpy(lifecycle.admittedPlan.egress.address6, recorded.listenerPublicUDPEndpoint.v6, sizeof(lifecycle.admittedPlan.egress.address6));
+    lifecycle.admittedPlan.egress.allowIngressFromPeer = true;
+    ClusterMachine::renderIPAddressLiteral(recorded.listenerPublicUDPEndpoint, lifecycle.admittedPlan.gatewayEndpoint);
+    lifecycle.admittedPlan.gatewayLocalIdentity = recorded.localIdentitySHA256;
+    lifecycle.admittedPlan.gatewayPeerIdentity = recorded.peerIdentitySHA256;
+    lifecycle.admittedPlan.gatewayPeerTrust = recorded.peerTrustSHA256;
+    lifecycle.retiringContainerUUID = 0x9011; lifecycle.admittedLaunchGeneration = 17;
+    ProdigyCrossClusterPathFaultGatewayLifecycleRecord lifecycleRecorded = {}; bool lifecycleResumed = false;
+    suite.expect(registry.putCrossClusterPathFaultLifecycle(lifecycle, lifecycleRecorded, lifecycleResumed, &failure) && !lifecycleResumed,
+                 "masque_gateway_path_fault_lifecycle_writes_ahead_before_retirement");
+    suite.expect(registry.putCrossClusterPathFaultLifecycle(lifecycle, lifecycleRecorded, lifecycleResumed, &failure) && lifecycleResumed,
+                 "masque_gateway_path_fault_lifecycle_prepared_replay_is_exact");
+    auto secondLifecycle = lifecycle; ++secondLifecycle.request.operationUUID;
+    suite.expect(!registry.putCrossClusterPathFaultLifecycle(secondLifecycle, lifecycleRecorded, lifecycleResumed, &failure),
+                 "masque_gateway_path_fault_lifecycle_rejects_second_active_scope");
+    lifecycle.phase = ProdigyCrossClusterPathFaultGatewayLifecyclePhase::suspended;
+    suite.expect(registry.advanceCrossClusterPathFaultLifecycle(lifecycle, lifecycleRecorded, lifecycleResumed, &failure) && !lifecycleResumed,
+                 "masque_gateway_path_fault_lifecycle_advances_prepared_to_suspended");
+    lifecycle.phase = ProdigyCrossClusterPathFaultGatewayLifecyclePhase::restoreNeeded;
+    suite.expect(registry.advanceCrossClusterPathFaultLifecycle(lifecycle, lifecycleRecorded, lifecycleResumed, &failure) && !lifecycleResumed,
+                 "masque_gateway_path_fault_lifecycle_records_restore_needed");
+    lifecycle.phase = ProdigyCrossClusterPathFaultGatewayLifecyclePhase::restored;
+    lifecycle.replacementContainerUUID = 0x9012;
+    suite.expect(registry.advanceCrossClusterPathFaultLifecycle(lifecycle, lifecycleRecorded, lifecycleResumed, &failure) && !lifecycleResumed,
+                 "masque_gateway_path_fault_lifecycle_advances_to_restored");
+    ProdigyCrossClusterPathFaultGatewayLifecycleRecord reopenedLifecycle = {};
+    suite.expect(registry.loadCrossClusterPathFaultLifecycle(lifecycle.request, reopenedLifecycle, &failure) &&
+                     MothershipClusterRegistry::crossClusterPathFaultLifecycleEqual(reopenedLifecycle, lifecycle),
+                 "masque_gateway_path_fault_lifecycle_loads_exact_restored_record");
+    pathFaultReopenPath = masquePath;
+    pathFaultReopenExpected = lifecycle;
+    pathFaultReopenExpectedRecorded = true;
+    auto wrongPrefix = requested; wrongPrefix.generation = 2; wrongPrefix.peerSitePrefix = prodigyContainerDatacenterSitePrefix(3);
+    suite.expect(!registry.putCrossClusterMasqueGateway(wrongPrefix, enrollment, local, peer, recorded, resumed, &failure), "masque_gateway_rejects_prefix_datacenter_mismatch");
+    auto stalePair = requested; stalePair.generation = 2; stalePair.pairAuthorityGeneration += 1;
+    suite.expect(!registry.putCrossClusterMasqueGateway(stalePair, enrollment, local, peer, recorded, resumed, &failure), "masque_gateway_rejects_stale_pair_authority");
+    auto staleKey = requested; staleKey.generation = 2; staleKey.keyGeneration += 1;
+    suite.expect(!registry.putCrossClusterMasqueGateway(staleKey, enrollment, local, peer, recorded, resumed, &failure), "masque_gateway_rejects_stale_key_epoch");
+    auto changedScope = requested; changedScope.generation = 2; changedScope.peerMachineUUID += 1;
+    suite.expect(!registry.putCrossClusterMasqueGateway(changedScope, enrollment, local, peer, recorded, resumed, &failure), "masque_gateway_rejects_scope_change");
+    auto unregisteredListener = requested; unregisteredListener.localMachineUUID = 0x9999;
+    suite.expect(!registry.putCrossClusterMasqueGateway(unregisteredListener, enrollment, local, peer, recorded, resumed, &failure), "masque_gateway_rejects_unregistered_machine");
+    auto wrongEndpoint = requested; wrongEndpoint.listenerPublicUDPEndpoint = IPAddress("2001:db8::9", true);
+    suite.expect(!registry.putCrossClusterMasqueGateway(wrongEndpoint, enrollment, local, peer, recorded, resumed, &failure), "masque_gateway_rejects_unregistered_listener_endpoint");
+    suite.expect(registry.loadCrossClusterMasqueGateway(enrollment.pairUUID, localMachine.uuid, recorded, &failure),
+                  "masque_gateway_reload_before_bilateral_withdrawal");
+    auto replacement = recorded; replacement.generation = 2;
+    suite.expect(prodigyCrossClusterMasqueGatewayAuthorityCanAdvance(recorded, replacement),
+                 "masque_gateway_active_replacement_is_monotone");
+    auto peerRequested = requested; peerRequested.localMachineUUID = peerMachine.uuid;
+    peerRequested.peerMachineUUID = localMachine.uuid; peerRequested.localRole = CrossClusterMasqueGatewayRole::connector;
+    auto peerEnrollment = enrollment; peerEnrollment.localClusterUUID = enrollment.peerClusterUUID;
+    peerEnrollment.peerClusterUUID = enrollment.localClusterUUID;
+    CrossClusterMasqueGatewayAuthority peerRecorded = {};
+    suite.expect(registry.putCrossClusterMasqueGateway(peerRequested, peerEnrollment, peer, local, peerRecorded, resumed, &failure),
+                  "masque_gateway_reciprocal_scope_durable");
+    ProdigyPairPrivateBGPSecretScope localScope = {};
+    localScope.pairUUID = enrollment.pairUUID; localScope.operationUUID = enrollment.operationUUID;
+    localScope.keyEpoch = enrollment.agreedKeyEpoch; localScope.tunnelSlot = requested.tunnelSlot;
+    localScope.clusterUUID = local.clusterUUID; localScope.machineUUID = localMachine.uuid;
+    localScope.authorityGeneration = enrollment.localAuthorityGeneration; localScope.gatewayGeneration = 1;
+    auto peerScope = localScope; peerScope.clusterUUID = peer.clusterUUID; peerScope.machineUUID = peerMachine.uuid;
+    bool deleted = false;
+    suite.expect(registry.acknowledgeCrossClusterPrivateBGPSecretRevocation(localScope, deleted) && !deleted,
+                  "masque_gateway_local_secret_revoked_first");
+    CrossClusterMasqueGatewayAuthority withdrawn = {};
+    suite.expect(registry.withdrawCrossClusterMasqueGateway(enrollment.pairUUID, localMachine.uuid, 2, withdrawn, &failure) &&
+                      withdrawn.state == CrossClusterMasqueGatewayState::withdrawn,
+                  "masque_gateway_withdraw_monotone");
+    suite.expect(registry.withdrawCrossClusterMasqueGateway(enrollment.pairUUID, localMachine.uuid, 2, withdrawn, &failure),
+                 "masque_gateway_withdraw_idempotent_resume");
+    suite.expect(!registry.withdrawCrossClusterMasqueGateway(enrollment.pairUUID, localMachine.uuid, 1, withdrawn, &failure),
+                 "masque_gateway_rejects_stale_withdrawal");
+    suite.expect(registry.acknowledgeCrossClusterPrivateBGPSecretRevocation(peerScope, deleted) && deleted,
+                  "masque_gateway_bilateral_revocation_deletes_secret");
+    CrossClusterMasqueGatewayAuthority peerWithdrawn = {};
+    suite.expect(registry.withdrawCrossClusterMasqueGateway(enrollment.pairUUID, peerMachine.uuid, 2, peerWithdrawn, &failure),
+                  "masque_gateway_peer_withdraw_monotone");
+    auto nextActive = recorded; nextActive.state = CrossClusterMasqueGatewayState::active; nextActive.generation = 3;
+    auto rotated = nextActive;
+    rotated.privateSessionCredentialSHA256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv;
+    suite.expect(prodigyCrossClusterMasqueGatewayAuthorityCanAdvance(withdrawn, rotated),
+                 "masque_gateway_reactivation_accepts_fresh_vault_credential");
+    suite.expect(!prodigyCrossClusterMasqueGatewayAuthorityCanAdvance(recorded, rotated),
+                 "masque_gateway_active_replacement_rejects_credential_rotation");
+    auto staleReactivation = rotated; staleReactivation.generation = withdrawn.generation;
+    suite.expect(!prodigyCrossClusterMasqueGatewayAuthorityCanAdvance(withdrawn, staleReactivation),
+                 "masque_gateway_reactivation_rejects_equal_generation");
+    --staleReactivation.generation;
+    suite.expect(!prodigyCrossClusterMasqueGatewayAuthorityCanAdvance(withdrawn, staleReactivation),
+                 "masque_gateway_reactivation_rejects_older_generation");
+    auto changedIdentity = rotated; ++changedIdentity.peerMachineUUID;
+    suite.expect(!prodigyCrossClusterMasqueGatewayAuthorityCanAdvance(withdrawn, changedIdentity),
+                 "masque_gateway_reactivation_rejects_changed_machine");
+    auto changedSlot = rotated; ++changedSlot.gatewaySlot;
+    suite.expect(!prodigyCrossClusterMasqueGatewayAuthorityCanAdvance(withdrawn, changedSlot),
+                 "masque_gateway_reactivation_rejects_changed_slot");
+    auto repeatedWithdrawal = withdrawn; ++repeatedWithdrawal.generation;
+    suite.expect(!prodigyCrossClusterMasqueGatewayAuthorityCanAdvance(withdrawn, repeatedWithdrawal),
+                 "masque_gateway_reactivation_rejects_withdrawn_to_withdrawn");
+
+    {
+      // A cluster replacement preserves the enrolled pair but removes the
+      // retired peer before its withdrawn local authority can be reactivated.
+      String replacementPath = {}; replacementPath.snprintf<"{}/masque-peer-replacement"_ctv>(dbPath);
+      MothershipClusterRegistry replacementRegistry(replacementPath); String replacementFailure = {};
+      auto replacementEnrollment = enrollment; replacementEnrollment.pairUUID = 0xa001;
+      replacementEnrollment.operationUUID = 0xa007;
+      auto replacementIntent = privateIntent; replacementIntent.pairUUID = replacementEnrollment.pairUUID;
+      replacementIntent.operationUUID = replacementEnrollment.operationUUID;
+      MothershipClusterPairEnrollmentIntent replacementIntentRecorded = {}; bool replacementIntentResumed = false;
+      suite.expect(replacementRegistry.recordClusterPairEnrollmentIntent(replacementIntent, replacementIntentRecorded,
+                       replacementIntentResumed, &replacementFailure) && !replacementIntentResumed,
+                   "masque_gateway_peer_replacement_pair_root_durable");
+
+      auto replacementRequested = requested; replacementRequested.generation = 1;
+      CrossClusterMasqueGatewayAuthority replacementInitial = {}; bool replacementResumed = false;
+      suite.expect(replacementRegistry.putCrossClusterMasqueGateway(replacementRequested, replacementEnrollment,
+                       local, peer, replacementInitial, replacementResumed, &replacementFailure) && !replacementResumed,
+                   "masque_gateway_peer_replacement_initial_local_durable");
+      auto replacementPeerRequested = peerRequested; replacementPeerRequested.generation = 1;
+      auto replacementPeerEnrollment = peerEnrollment; replacementPeerEnrollment.pairUUID = replacementEnrollment.pairUUID;
+      replacementPeerEnrollment.operationUUID = replacementEnrollment.operationUUID;
+      CrossClusterMasqueGatewayAuthority replacementPeerInitial = {};
+      suite.expect(replacementRegistry.putCrossClusterMasqueGateway(replacementPeerRequested, replacementPeerEnrollment,
+                       peer, local, replacementPeerInitial, replacementResumed, &replacementFailure) && !replacementResumed,
+                   "masque_gateway_peer_replacement_initial_peer_durable");
+
+      ProdigyPairPrivateBGPSecretScope replacementLocalScope = {};
+      replacementLocalScope.pairUUID = replacementEnrollment.pairUUID;
+      replacementLocalScope.operationUUID = replacementEnrollment.operationUUID;
+      replacementLocalScope.keyEpoch = replacementEnrollment.agreedKeyEpoch;
+      replacementLocalScope.tunnelSlot = replacementRequested.tunnelSlot;
+      replacementLocalScope.clusterUUID = local.clusterUUID; replacementLocalScope.machineUUID = localMachine.uuid;
+      replacementLocalScope.authorityGeneration = replacementEnrollment.localAuthorityGeneration;
+      replacementLocalScope.gatewayGeneration = 1;
+      auto replacementPeerScope = replacementLocalScope;
+      replacementPeerScope.clusterUUID = peer.clusterUUID; replacementPeerScope.machineUUID = peerMachine.uuid;
+      bool replacementDeleted = false;
+      suite.expect(replacementRegistry.acknowledgeCrossClusterPrivateBGPSecretRevocation(
+                       replacementLocalScope, replacementDeleted) && !replacementDeleted,
+                   "masque_gateway_peer_replacement_local_secret_revoked");
+      CrossClusterMasqueGatewayAuthority replacementWithdrawn = {};
+      suite.expect(replacementRegistry.withdrawCrossClusterMasqueGateway(replacementEnrollment.pairUUID,
+                       localMachine.uuid, 2, replacementWithdrawn, &replacementFailure) &&
+                       replacementWithdrawn.state == CrossClusterMasqueGatewayState::withdrawn,
+                   "masque_gateway_peer_replacement_local_withdrawn");
+      suite.expect(replacementRegistry.acknowledgeCrossClusterPrivateBGPSecretRevocation(
+                       replacementPeerScope, replacementDeleted) && replacementDeleted,
+                   "masque_gateway_peer_replacement_bilateral_secret_deleted");
+      CrossClusterMasqueGatewayAuthority replacementPeerWithdrawn = {};
+      suite.expect(replacementRegistry.withdrawCrossClusterMasqueGateway(replacementEnrollment.pairUUID,
+                       peerMachine.uuid, 2, replacementPeerWithdrawn, &replacementFailure),
+                   "masque_gateway_peer_replacement_peer_withdrawn");
+
+      ClusterMachine replacementPeerMachine = peerMachine; replacementPeerMachine.uuid = 0x9008;
+      replacementPeerMachine.addresses.publicAddresses.clear();
+      replacementPeerMachine.addresses.publicAddresses.push_back(ClusterMachineAddress {"2001:db8::8"_ctv, 128, {}});
+      auto peerWithRetiredMachine = peer; peerWithRetiredMachine.topology.machines.push_back(replacementPeerMachine);
+      auto replacementPeerRequest = replacementRequested;
+      replacementPeerRequest.peerMachineUUID = replacementPeerMachine.uuid; replacementPeerRequest.generation = 3;
+      CrossClusterMasqueGatewayAuthority replacementRecorded = {};
+      suite.expect(!replacementRegistry.putCrossClusterMasqueGateway(replacementPeerRequest, replacementEnrollment,
+                       local, peerWithRetiredMachine, replacementRecorded, replacementResumed, &replacementFailure) &&
+                       replacementFailure.equals("cross-cluster MASQUE gateway replacement peer remains commissioned"_ctv),
+                   "masque_gateway_peer_replacement_rejects_retained_peer");
+      auto peerAfterReplacement = peer;
+      peerAfterReplacement.topology.machines[0] = replacementPeerMachine;
+      suite.expect(replacementRegistry.putCrossClusterMasqueGateway(replacementPeerRequest, replacementEnrollment,
+                       local, peerAfterReplacement, replacementRecorded, replacementResumed, &replacementFailure) &&
+                       !replacementResumed && replacementRecorded.generation == 3 &&
+                       replacementRecorded.peerMachineUUID == replacementPeerMachine.uuid,
+                   "masque_gateway_peer_replacement_reactivates_with_current_commissioned_peer");
+      suite.expect(prodigyCrossClusterMasqueGatewayAuthorityCanAdvance(replacementWithdrawn, replacementRecorded),
+                   "masque_gateway_peer_replacement_is_shared_monotone_transition");
+      CrossClusterMasqueGatewayAuthority replacementReloaded = {};
+      suite.expect(replacementRegistry.putCrossClusterMasqueGateway(replacementPeerRequest, replacementEnrollment,
+                       local, peerAfterReplacement, replacementReloaded, replacementResumed, &replacementFailure) &&
+                       replacementResumed,
+                   "masque_gateway_peer_replacement_exact_retry");
+      suite.expect(!prodigyCrossClusterMasqueGatewayAuthorityCanAdvance(replacementInitial, replacementRecorded),
+                   "masque_gateway_peer_replacement_rejects_active_predecessor");
+      auto equalReplacement = replacementRecorded; equalReplacement.generation = replacementWithdrawn.generation;
+      suite.expect(!prodigyCrossClusterMasqueGatewayAuthorityCanAdvance(replacementWithdrawn, equalReplacement),
+                   "masque_gateway_peer_replacement_rejects_equal_generation");
+      --equalReplacement.generation;
+      suite.expect(!prodigyCrossClusterMasqueGatewayAuthorityCanAdvance(replacementWithdrawn, equalReplacement),
+                   "masque_gateway_peer_replacement_rejects_stale_generation");
+      auto changedLocal = replacementRecorded; ++changedLocal.localMachineUUID;
+      { const String credential = changedLocal.privateSessionCredentialSHA256;
+        (void)prodigyDeriveCrossClusterMasquePrivateBGPTuple(changedLocal);
+        changedLocal.privateSessionCredentialSHA256 = credential; }
+      suite.expect(!prodigyCrossClusterMasqueGatewayAuthorityCanAdvance(replacementWithdrawn, changedLocal),
+                   "masque_gateway_peer_replacement_rejects_local_machine_change");
+      auto changedPair = replacementRecorded; ++changedPair.pairUUID;
+      { const String credential = changedPair.privateSessionCredentialSHA256;
+        (void)prodigyDeriveCrossClusterMasquePrivateBGPTuple(changedPair);
+        changedPair.privateSessionCredentialSHA256 = credential; }
+      suite.expect(!prodigyCrossClusterMasqueGatewayAuthorityCanAdvance(replacementWithdrawn, changedPair),
+                   "masque_gateway_peer_replacement_rejects_pair_change");
+      auto changedSlot = replacementRecorded; ++changedSlot.gatewaySlot;
+      { const String credential = changedSlot.privateSessionCredentialSHA256;
+        (void)prodigyDeriveCrossClusterMasquePrivateBGPTuple(changedSlot);
+        changedSlot.privateSessionCredentialSHA256 = credential; }
+      suite.expect(!prodigyCrossClusterMasqueGatewayAuthorityCanAdvance(replacementWithdrawn, changedSlot),
+                   "masque_gateway_peer_replacement_rejects_slot_change");
+      auto changedRole = replacementRecorded;
+      changedRole.localRole = CrossClusterMasqueGatewayRole::connector;
+      suite.expect(!prodigyCrossClusterMasqueGatewayAuthorityCanAdvance(replacementWithdrawn, changedRole),
+                   "masque_gateway_peer_replacement_rejects_role_change");
+      auto malformedTuple = replacementRecorded; ++malformedTuple.privatePeerBGPID;
+      suite.expect(!prodigyCrossClusterMasqueGatewayAuthorityCanAdvance(replacementWithdrawn, malformedTuple),
+                   "masque_gateway_peer_replacement_rejects_noncanonical_tuple");
+    }
+    const String priorCredentialDigest = recorded.privateSessionCredentialSHA256;
+    auto restart = requested; restart.generation = 3;
+    suite.expect(registry.putCrossClusterMasqueGateway(restart, enrollment, local, peer, recorded, resumed, &failure) &&
+                     !resumed && recorded.generation == 3 && recorded.state == CrossClusterMasqueGatewayState::active,
+                 "masque_gateway_reactivation_persists_same_scope");
+    suite.expect(recorded.privateSessionCredentialSHA256 != priorCredentialDigest,
+                 "masque_gateway_reactivation_mints_new_vault_credential");
+    suite.expect(registry.putCrossClusterMasqueGateway(restart, enrollment, local, peer, loaded, resumed, &failure) && resumed,
+                 "masque_gateway_reactivation_exact_retry");
+    suite.expect(!prodigyCrossClusterMasqueGatewayAuthorityCanAdvance(recorded, withdrawn),
+                 "masque_gateway_reactivation_rejects_stale_withdrawn_authority");
+  }
+
+  {
+    MothershipClusterRegistry reopened(pathFaultReopenPath);
+    ProdigyCrossClusterPathFaultGatewayLifecycleRecord lifecycle = {};
+    String failure = {};
+    suite.expect(pathFaultReopenExpectedRecorded &&
+                     reopened.loadCrossClusterPathFaultLifecycle(
+                         pathFaultReopenExpected.request, lifecycle, &failure) &&
+                     MothershipClusterRegistry::crossClusterPathFaultLifecycleEqual(
+                         lifecycle, pathFaultReopenExpected),
+                 "masque_gateway_path_fault_lifecycle_reopens_exact_restored_record");
   }
 
   std::error_code cleanupError;

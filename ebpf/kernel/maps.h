@@ -34,3 +34,10 @@ struct {
   __type(value, __u8);
   __uint(max_entries, CONTAINER_EGRESS_ALLOWLIST_MAX_ENTRIES);
 } ct_egress_allow SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __type(key, struct container_egress_allow6_key);
+  __type(value, __u8);
+  __uint(max_entries, CONTAINER_EGRESS_ALLOWLIST_MAX_ENTRIES);
+} ct_egr_allow6 SEC(".maps");

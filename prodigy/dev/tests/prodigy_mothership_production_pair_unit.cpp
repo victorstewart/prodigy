@@ -2,12 +2,43 @@
 #include <cstdio>
 
 #include <prodigy/mothership/mothership.production.pair.h>
+#include <prodigy/mothership/mothership.nametag.all.masters.h>
 
 static String digest(char value)
 {
   String result = {};
   for (uint32_t index = 0; index < 64; ++index) result.append(value);
   return result;
+}
+
+static DeploymentIdentityStatefulMember allMastersMember(DeploymentIdentityStoreKind kind,
+    uint128_t clusterUUID, uint32_t shardGroup, uint128_t containerUUID)
+{
+  DeploymentIdentityStatefulMember member = {};
+  member.storeKind = kind; member.shardGroup = shardGroup;
+  member.replicaUUID = member.containerUUID = containerUUID; member.clusterUUID = clusterUUID;
+  member.machineUUID = containerUUID + 100; member.writable = member.clientServing = member.allMasters = true;
+  member.siblingSessionUUID = containerUUID + 200; member.siblingSessionGeneration = 1; member.siblingSessionHealthy = true;
+  member.seededFromClusterUUID = clusterUUID + 1; member.seededFromContainerUUID = containerUUID + 300;
+  member.seedCatchupSHA256 = digest('a'); member.seedCatchupGeneration = 1;
+  member.replayWatermarkSHA256 = digest('b'); member.catchupWatermarkSHA256 = digest('c');
+  member.sourceContentWatermarkSHA256 = digest('d'); member.sourceCatchupWatermarkSHA256 = digest('e');
+  return member;
+}
+
+static DeploymentIdentityReport allMastersReport(uint128_t clusterUUID, uint64_t deploymentID,
+    uint16_t applicationID, uint32_t groups, DeploymentIdentityStoreKind kind)
+{
+  DeploymentIdentityReport report = {};
+  report.version = 4; report.found = report.live = report.isStateful = true;
+  report.clusterUUID = clusterUUID; report.deploymentID = deploymentID; report.applicationID = applicationID;
+  report.nShardGroups = groups; report.nTarget = report.nDeployed = report.nHealthy = groups * 3;
+  report.statefulRuntimeCohortConverged = true;
+  for (uint32_t group = 0; group < groups; ++group)
+    for (uint32_t replica = 0; replica < 3; ++replica)
+      report.statefulRuntimeCohort.push_back(allMastersMember(kind, clusterUUID, group,
+          clusterUUID * 1000 + group * 3 + replica));
+  return report;
 }
 
 static CousinRouteRecord route()
@@ -111,7 +142,7 @@ static MothershipProductionPairIntent statefulIntent()
   value.ingressWitnessMachineUUID = value.ingressWitnessLocalVMBoundaryUUID = 0; value.ingressWitnessCloudID.clear();
   auto& data = value.stateful;
   data.contractSHA256 = digest('a'); data.shardManifestSHA256 = digest('b');
-  data.datasetUUID = 0x701; data.snapshotUUID = 0x702; data.shardGroup = 3;
+  data.datasetUUID = 0x701; data.snapshotUUID = 0x702; data.shardGroup = 2; data.nShardGroups = 3;
   data.snapshotPreparingEpoch = 1; data.initialCatchupEpoch = 2; data.sourceFenceEpoch = 3;
   data.fencedCatchupEpoch = 4; data.targetOwnershipEpoch = 5; data.sourceRetainedEpoch = 6;
   String credentialBytes; auto credentials = data.credentials;
@@ -123,12 +154,41 @@ static MothershipProductionPairIntent statefulIntent()
   targetPlan.config.containerBlobSHA256 = value.targetWorkload.artifactSHA256;
   targetPlan.config.containerBlobBytes = value.targetWorkload.artifactBytes;
   targetPlan.isStateful = true;
+  targetPlan.stateful.cousinPrefix = MeshServices::generateStatefulService(3, 3);
+  targetPlan.whiteholes.emplace_back();
   BitseryEngine::serialize(data.targetDeploymentPlan, targetPlan);
   assert(prodigyComputeSHA256Hex(data.targetDeploymentPlan, value.targetWorkload.canonicalPlanSHA256));
+  value.route.sourceClusterUUID = value.targetWorkload.clusterUUID;
+  value.route.destinationClusterUUID = value.sourceWorkload.clusterUUID;
+  value.route.sourceApplicationID = value.route.destinationApplicationID = 3;
+  value.route.sourceCousinServicePrefix = value.route.destinationCousinServicePrefix =
+      MeshServices::generateStatefulService(3, 3);
+  value.route.slots = {};
+  for (uint16_t slot = 0; slot < nStatefulServiceGroupSlots; ++slot)
+    if (statefulServiceGroupOwnerForSlot(slot, uint16_t(data.nShardGroups)) == data.shardGroup) {
+      value.route.slots.insert(slot); break;
+    }
+  auto bindPermission = [&](bool routeSource, const MothershipProductionWorkloadIdentity& local,
+                            const MothershipProductionWorkloadIdentity& peer) {
+    auto result = permission(value.route, routeSource);
+    result.protocolVersion = ProdigyLocalCousinServicePermission::purposeVersion;
+    result.localDeploymentID = local.deploymentID; result.canonicalPlanSHA256 = local.canonicalPlanSHA256;
+    result.artifactSHA256 = local.artifactSHA256; result.artifactBytes = local.artifactBytes;
+    result.purpose = ProdigyCousinServicePurpose::statefulCousin;
+    result.peerDeploymentID = peer.deploymentID; result.peerCanonicalPlanSHA256 = peer.canonicalPlanSHA256;
+    result.peerArtifactSHA256 = peer.artifactSHA256; result.peerArtifactBytes = peer.artifactBytes;
+    result.authorizedService = MeshServices::constrainPrefixToGroup(result.peerCousinServicePrefix, data.shardGroup);
+    result.transportSourcePolicy = ProdigyCousinTransportSourcePolicy::authenticatedNAT;
+    return result;
+  };
+  value.sourcePermission = bindPermission(true, value.targetWorkload, value.sourceWorkload);
+  value.destinationPermission = bindPermission(false, value.sourceWorkload, value.targetWorkload);
+  value.sourceRouteReceipt = receipt(value.route, CousinRouteHalf::source);
+  value.destinationRouteReceipt = receipt(value.route, CousinRouteHalf::destination);
   for (unsigned index = 0; index < 3; ++index) {
     ProdigyStatefulServingAuthorityMember member;
     member.containerUUID = 0x801 + index; member.machineUUID = 0x901 + index;
-    member.shardGroup = 3; member.isSource = true; member.advertiseClient = index == 0;
+    member.shardGroup = data.shardGroup; member.isSource = true; member.advertiseClient = index == 0;
     member.planSHA256 = digest('d'); data.cohort.push_back(member);
     data.targetMachineUUIDs.push_back(0xa01 + index);
   }
@@ -155,11 +215,11 @@ static MothershipProductionStatefulReceipt statefulProof(const MothershipProduct
     auto& receipt = member.receipt;
     auto& authority = receipt.authority;
     authority.operationUUID = intent.operationUUID;
-    authority.sourceClusterUUID = intent.route.sourceClusterUUID; authority.targetClusterUUID = intent.route.destinationClusterUUID;
+    authority.sourceClusterUUID = intent.sourceWorkload.clusterUUID; authority.targetClusterUUID = intent.targetWorkload.clusterUUID;
     authority.localClusterUUID = source ? authority.sourceClusterUUID : authority.targetClusterUUID;
     authority.writeOwnerClusterUUID = active || postCleanup ? authority.targetClusterUUID : authority.sourceClusterUUID;
     authority.datasetUUID = intent.stateful.datasetUUID; authority.snapshotUUID = intent.stateful.snapshotUUID;
-    authority.shardGroup = intent.stateful.shardGroup;
+    authority.shardGroup = intent.stateful.shardGroup; authority.nShardGroups = intent.stateful.nShardGroups;
     authority.contractSHA256 = intent.stateful.contractSHA256; authority.shardManifestSHA256 = intent.stateful.shardManifestSHA256;
     authority.mode = retained ? StatefulDataAuthorityMode::retainedSource : (preparing ? StatefulDataAuthorityMode::snapshotPreparing :
         (source ? StatefulDataAuthorityMode::fenced : (active ? StatefulDataAuthorityMode::writeOwner : StatefulDataAuthorityMode::catchupOnly)));
@@ -174,10 +234,127 @@ static MothershipProductionStatefulReceipt statefulProof(const MothershipProduct
     proof.members.push_back(member);
     ProdigyStatefulServingAuthorityMember identity;
     identity.containerUUID = member.containerUUID; identity.machineUUID = member.machineUUID;
-    identity.shardGroup = 3; identity.isSource = source; identity.advertiseClient = (preparing || (retained && !postCleanup) || active) && index == 0;
+    identity.shardGroup = intent.stateful.shardGroup; identity.isSource = source; identity.advertiseClient = (preparing || (retained && !postCleanup) || active) && index == 0;
     identity.planSHA256 = digest('3'); proof.cohort.push_back(identity);
   }
   return proof;
+}
+
+static StatefulDataAuthorityPreparation preparationRequest()
+{
+  StatefulDataAuthorityPreparation value = {};
+  value.requestUUID = 0xd001; value.clusterUUID = 0x201;
+  value.applicationID = 3; value.deploymentID = (uint64_t(3) << 48) | 11;
+  value.shardGroup = 2; value.nShardGroups = 3;
+  return value;
+}
+
+static void testStatefulPreparationEvidence()
+{
+  const auto request = preparationRequest();
+  Vector<ProdigyStatefulServingAuthorityMember> cohort;
+  Vector<StatefulDataAuthorityPreparationMember> observations;
+  for (uint32_t index = 0; index < 3; ++index) {
+    StatefulDataAuthorityPreparationMember observed = {};
+    observed.member.containerUUID = 0xe001 + index; observed.member.machineUUID = 0xf001 + index;
+    observed.member.shardGroup = request.shardGroup; observed.member.isSource = true;
+    observed.member.advertiseClient = index == 0; observed.member.planSHA256 = digest('a');
+    observed.preparation = request; observed.preparation.response = true;
+    observed.preparation.memberRequestUUID = 0x1001 + index; observed.preparation.supported = true;
+    observed.preparation.contractSHA256 = digest('b'); observed.preparation.shardManifestSHA256 = digest('c');
+    observed.preparation.datasetUUID = 0x1101; observed.preparation.hasAuthority = true;
+    observed.preparation.currentAuthority.operationUUID = 0x1201;
+    observed.preparation.currentAuthority.sourceClusterUUID = 0x201;
+    observed.preparation.currentAuthority.targetClusterUUID = 0x202;
+    observed.preparation.currentAuthority.localClusterUUID = request.clusterUUID;
+    observed.preparation.currentAuthority.writeOwnerClusterUUID = request.clusterUUID;
+    observed.preparation.currentAuthority.datasetUUID = observed.preparation.datasetUUID;
+    observed.preparation.currentAuthority.snapshotUUID = 0x1301;
+    observed.preparation.currentAuthority.shardGroup = request.shardGroup;
+    observed.preparation.currentAuthority.nShardGroups = request.nShardGroups;
+    observed.preparation.currentAuthority.contractSHA256 = observed.preparation.contractSHA256;
+    observed.preparation.currentAuthority.shardManifestSHA256 = observed.preparation.shardManifestSHA256;
+    observed.preparation.currentAuthority.snapshotBoundarySHA256 = digest('e');
+    observed.preparation.currentAuthority.requiredAppliedWatermarkSHA256 = digest('f');
+    observed.preparation.currentAuthority.mode = StatefulDataAuthorityMode::writeOwner;
+    observed.preparation.currentAuthority.authorityEpoch = 1;
+    observed.preparation.mode = StatefulDataAuthorityMode::writeOwner;
+    observed.preparation.writeOwnerClusterUUID = request.clusterUUID;
+    observed.preparation.hasDurableWatermark = true; observed.preparation.durableWatermark = 9;
+    observed.preparation.durableWatermarkSHA256 = digest('d');
+    cohort.push_back(observed.member); observations.push_back(observed);
+  }
+  assert(prodigyStatefulDataAuthorityPreparationMembersAgree(request, cohort, observations));
+  auto disagreement = observations; disagreement[1].preparation.durableWatermark++;
+  assert(!prodigyStatefulDataAuthorityPreparationMembersAgree(request, cohort, disagreement));
+  auto replay = observations; replay[1].preparation.requestUUID++;
+  assert(!prodigyStatefulDataAuthorityPreparationMembersAgree(request, cohort, replay));
+  auto missing = observations; missing.pop_back();
+  assert(!prodigyStatefulDataAuthorityPreparationMembersAgree(request, cohort, missing));
+  auto identity = observations; identity[1].member.machineUUID++;
+  assert(!prodigyStatefulDataAuthorityPreparationMembersAgree(request, cohort, identity));
+  auto unsupported = observations; unsupported[2].preparation.supported = false;
+  assert(!prodigyStatefulDataAuthorityPreparationMembersAgree(request, cohort, unsupported));
+  auto virgin = observations;
+  for (auto& observed : virgin) {
+    observed.preparation.hasAuthority = false; observed.preparation.currentAuthority = {};
+    observed.preparation.datasetUUID = 0;
+  }
+  assert(prodigyStatefulDataAuthorityPreparationMembersAgree(request, cohort, virgin));
+  auto virginLineage = virgin; virginLineage[1].preparation.datasetUUID = 0x1401;
+  assert(!prodigyStatefulDataAuthorityPreparationMembersAgree(request, cohort, virginLineage));
+  auto source = statefulIntent();
+  MothershipNametagStatefulPreparationRequest operatorRequest = {};
+  operatorRequest.operationUUID = source.operationUUID; operatorRequest.routeUUID = source.route.routeUUID;
+  operatorRequest.sourceClusterUUID = source.sourceWorkload.clusterUUID;
+  operatorRequest.targetClusterUUID = source.targetWorkload.clusterUUID;
+  operatorRequest.sourceDeploymentID = source.sourceWorkload.deploymentID;
+  operatorRequest.shardGroup = request.shardGroup;
+  operatorRequest.targetDeploymentPlan = source.stateful.targetDeploymentPlan;
+  assert(operatorRequest.protocolVersion == 3 && mothershipNametagStatefulPreparationRequestValid(operatorRequest));
+  String operatorBytes = {}; auto operatorCopy = operatorRequest;
+  MothershipNametagStatefulPreparationRequest decodedOperatorRequest = {};
+  assert(BitseryEngine::serialize(operatorBytes, operatorCopy) &&
+      BitseryEngine::deserializeSafe(operatorBytes, decodedOperatorRequest) &&
+      decodedOperatorRequest.shardGroup == request.shardGroup &&
+      decodedOperatorRequest.protocolVersion == MothershipNametagStatefulPreparationRequest::version);
+  MothershipProductionPairIntent prepared = {};
+  assert(mothershipSynthesizeNametagStatefulPreparation(operatorRequest, source.route, source.sourcePermission,
+      source.destinationPermission, source.sourceRouteReceipt, source.destinationRouteReceipt, source.sourceWorkload,
+      source.targetWorkload, request, cohort, virgin, source.stateful.targetMachineUUIDs, 0x1501, 0x1502, prepared));
+  assert(prepared.stateful.datasetUUID == 0x1501 && prepared.stateful.snapshotUUID == 0x1502 &&
+      prepared.stateful.previousOperationUUID == 0 && prepared.stateful.snapshotBoundarySHA256.empty() &&
+      prepared.stateful.sourceDurableWatermark == 9 && prepared.stateful.shardGroup == request.shardGroup &&
+      prepared.stateful.nShardGroups == request.nShardGroups);
+  assert(mothershipSynthesizeNametagStatefulPreparation(operatorRequest, source.route, source.sourcePermission,
+      source.destinationPermission, source.sourceRouteReceipt, source.destinationRouteReceipt, source.sourceWorkload,
+      source.targetWorkload, request, cohort, observations, source.stateful.targetMachineUUIDs, 0, 0x1502, prepared));
+  assert(prepared.stateful.datasetUUID == 0x1101 && prepared.stateful.previousOperationUUID == 0x1201 &&
+      prepared.stateful.previousAuthorityEpoch == 1 && prepared.stateful.snapshotPreparingEpoch == 2);
+  for (uint32_t rejected : {1u, 2u, 4u}) {
+    auto wrongCardinality = request;
+    wrongCardinality.nShardGroups = rejected;
+    wrongCardinality.shardGroup = 0;
+    auto wrongRequest = operatorRequest;
+    wrongRequest.shardGroup = 0;
+    assert(!mothershipSynthesizeNametagStatefulPreparation(wrongRequest, source.route, source.sourcePermission,
+        source.destinationPermission, source.sourceRouteReceipt, source.destinationRouteReceipt, source.sourceWorkload,
+        source.targetWorkload, wrongCardinality, cohort, observations, source.stateful.targetMachineUUIDs, 0, 0x1502, prepared));
+  }
+  auto wrongSelectedShard = operatorRequest;
+  wrongSelectedShard.shardGroup = request.shardGroup - 1;
+  assert(!mothershipSynthesizeNametagStatefulPreparation(wrongSelectedShard, source.route, source.sourcePermission,
+      source.destinationPermission, source.sourceRouteReceipt, source.destinationRouteReceipt, source.sourceWorkload,
+      source.targetWorkload, request, cohort, observations, source.stateful.targetMachineUUIDs, 0, 0x1502, prepared));
+  auto outOfRangeShard = operatorRequest;
+  outOfRangeShard.shardGroup = request.nShardGroups;
+  assert(mothershipNametagStatefulPreparationRequestValid(outOfRangeShard));
+  assert(!mothershipSynthesizeNametagStatefulPreparation(outOfRangeShard, source.route, source.sourcePermission,
+      source.destinationPermission, source.sourceRouteReceipt, source.destinationRouteReceipt, source.sourceWorkload,
+      source.targetWorkload, request, cohort, observations, source.stateful.targetMachineUUIDs, 0, 0x1502, prepared));
+  auto unrepresentableShard = operatorRequest;
+  unrepresentableShard.shardGroup = UINT16_MAX + 1u;
+  assert(!mothershipNametagStatefulPreparationRequestValid(unrepresentableShard));
 }
 
 static void testStatefulPair()
@@ -185,6 +362,56 @@ static void testStatefulPair()
   String failure;
   auto request = statefulIntent();
   assert(mothershipProductionPairIntentValid(request, &failure));
+  assert(request.route.sourceClusterUUID == request.targetWorkload.clusterUUID &&
+      request.route.destinationClusterUUID == request.sourceWorkload.clusterUUID);
+  auto forwardTransport = request;
+  std::swap(forwardTransport.route.sourceClusterUUID, forwardTransport.route.destinationClusterUUID);
+  auto routeSourcePermission = forwardTransport.destinationPermission;
+  auto routeDestinationPermission = forwardTransport.sourcePermission;
+  routeSourcePermission.localHalf = CousinRouteHalf::source;
+  routeSourcePermission.permissionUUID = forwardTransport.route.sourcePermissionUUID;
+  routeSourcePermission.localClusterUUID = forwardTransport.route.sourceClusterUUID;
+  routeSourcePermission.peerClusterUUID = forwardTransport.route.destinationClusterUUID;
+  routeDestinationPermission.localHalf = CousinRouteHalf::destination;
+  routeDestinationPermission.permissionUUID = forwardTransport.route.destinationPermissionUUID;
+  routeDestinationPermission.localClusterUUID = forwardTransport.route.destinationClusterUUID;
+  routeDestinationPermission.peerClusterUUID = forwardTransport.route.sourceClusterUUID;
+  forwardTransport.sourcePermission = routeSourcePermission;
+  forwardTransport.destinationPermission = routeDestinationPermission;
+  forwardTransport.sourceRouteReceipt = receipt(forwardTransport.route, CousinRouteHalf::source);
+  forwardTransport.destinationRouteReceipt = receipt(forwardTransport.route, CousinRouteHalf::destination);
+  assert(!mothershipProductionPairIntentValid(forwardTransport));
+
+  auto mutateTargetPlan = [](MothershipProductionPairIntent& candidate, DeploymentPlan plan) {
+    candidate.stateful.targetDeploymentPlan.clear();
+    assert(BitseryEngine::serialize(candidate.stateful.targetDeploymentPlan, plan));
+    assert(prodigyComputeSHA256Hex(candidate.stateful.targetDeploymentPlan,
+        candidate.targetWorkload.canonicalPlanSHA256));
+    candidate.sourcePermission.canonicalPlanSHA256 = candidate.targetWorkload.canonicalPlanSHA256;
+    candidate.destinationPermission.peerCanonicalPlanSHA256 = candidate.targetWorkload.canonicalPlanSHA256;
+  };
+  DeploymentPlan targetPlan;
+  assert(BitseryEngine::deserializeSafe(request.stateful.targetDeploymentPlan, targetPlan));
+  auto noWhitehole = request; auto noWhiteholePlan = targetPlan; noWhiteholePlan.whiteholes.clear();
+  mutateTargetPlan(noWhitehole, noWhiteholePlan);
+  assert(!mothershipProductionPairIntentValid(noWhitehole));
+  auto duplicateWhitehole = request; auto duplicateWhiteholePlan = targetPlan;
+  duplicateWhiteholePlan.whiteholes.push_back(duplicateWhiteholePlan.whiteholes.front());
+  mutateTargetPlan(duplicateWhitehole, duplicateWhiteholePlan);
+  assert(!mothershipProductionPairIntentValid(duplicateWhitehole));
+  auto ipv4Whitehole = request; auto ipv4WhiteholePlan = targetPlan;
+  ipv4WhiteholePlan.whiteholes.front().family = ExternalAddressFamily::ipv4;
+  mutateTargetPlan(ipv4Whitehole, ipv4WhiteholePlan);
+  assert(!mothershipProductionPairIntentValid(ipv4Whitehole));
+  auto wrongSlot = request; wrongSlot.route.slots = {};
+  for (uint16_t slot = 0; slot < nStatefulServiceGroupSlots; ++slot)
+    if (statefulServiceGroupOwnerForSlot(slot, uint16_t(wrongSlot.stateful.nShardGroups)) != wrongSlot.stateful.shardGroup) {
+      wrongSlot.route.slots.insert(slot); break;
+    }
+  wrongSlot.sourcePermission.slots = wrongSlot.destinationPermission.slots = wrongSlot.route.slots;
+  wrongSlot.sourceRouteReceipt = receipt(wrongSlot.route, CousinRouteHalf::source);
+  wrongSlot.destinationRouteReceipt = receipt(wrongSlot.route, CousinRouteHalf::destination);
+  assert(!mothershipProductionPairIntentValid(wrongSlot));
   for (uint16_t retained : {2, 5, 10}) {
     auto forbidden = request;
     forbidden.sourceWorkload.applicationID = forbidden.targetWorkload.applicationID = retained;
@@ -211,7 +438,9 @@ static void testStatefulPair()
   for (unsigned index = 0; index < 5; ++index) {
     StatefulDataAuthorityOperation command;
     assert(mothershipProductionPairStatefulCommand(record, phases[index], command));
-    assert(command.authority.shardGroup == request.stateful.shardGroup && command.authority.operationUUID == request.operationUUID);
+    assert(command.authority.shardGroup == request.stateful.shardGroup &&
+        command.authority.nShardGroups == request.stateful.nShardGroups &&
+        command.authority.operationUUID == request.operationUUID);
     if (index == 0) assert(command.authority.snapshotBoundarySHA256.empty());
     if (index == 2) assert(command.authority.requiredAppliedWatermarkSHA256.empty());
     if (index >= 3) assert(command.authority.requiredAppliedWatermarkSHA256 == digest('f'));
@@ -227,6 +456,8 @@ static void testStatefulPair()
     if (index != 0) assert(!mothershipProductionPairApplyStatefulReceipt(record, wrong, 102 + index));
     wrong = proof; wrong.members[0].receipt.authority.shardGroup = 4;
     assert(!mothershipProductionPairApplyStatefulReceipt(record, wrong, 102 + index));
+    wrong = proof; ++wrong.members[0].receipt.authority.nShardGroups;
+    assert(!mothershipProductionPairApplyStatefulReceipt(record, wrong, 102 + index));
     wrong = proof; wrong.members[0].receipt.authority.operationUUID++;
     assert(!mothershipProductionPairApplyStatefulReceipt(record, wrong, 102 + index));
     assert(mothershipProductionPairApplyStatefulReceipt(record, proof, 102 + index, &failure));
@@ -239,12 +470,70 @@ static void testStatefulPair()
     if (index != 0) assert(!mothershipProductionPairApplyStatefulReceipt(record, statefulProof(request, phases[index - 1]), 110));
   }
   assert(!mothershipProductionPairMarkTransitApplied(record, digest('5'), 111));
+
+  for (uint32_t selected = 0; selected < 3; ++selected) {
+    auto cardinality = statefulIntent();
+    cardinality.stateful.shardGroup = selected; cardinality.stateful.nShardGroups = 3;
+    cardinality.route.slots = {};
+    for (uint16_t slot = 0; slot < nStatefulServiceGroupSlots; ++slot)
+      if (statefulServiceGroupOwnerForSlot(slot, 3) == selected) { cardinality.route.slots.insert(slot); break; }
+    cardinality.sourcePermission.slots = cardinality.route.slots;
+    cardinality.destinationPermission.slots = cardinality.route.slots;
+    cardinality.sourceRouteReceipt = receipt(cardinality.route, CousinRouteHalf::source);
+    cardinality.destinationRouteReceipt = receipt(cardinality.route, CousinRouteHalf::destination);
+    for (auto& member : cardinality.stateful.cohort) member.shardGroup = selected;
+    assert(mothershipProductionPairIntentValid(cardinality));
+    MothershipProductionPairRecord cardinalityRecord;
+    assert(mothershipProductionPairBegin(cardinality, 100, cardinalityRecord));
+    assert(mothershipProductionPairAdvance(cardinalityRecord, MothershipProductionPairPhase::targetAdmitted, digest('4'), 101));
+    StatefulDataAuthorityOperation snapshotCommand;
+    assert(mothershipProductionPairStatefulCommand(cardinalityRecord,
+        MothershipProductionPairPhase::snapshotVerified, snapshotCommand));
+    cardinalityRecord.hasPendingStatefulCommand = true;
+    cardinalityRecord.pendingStatefulPhase = MothershipProductionPairPhase::snapshotVerified;
+    assert(mothershipProductionPairApplyStatefulReceipt(cardinalityRecord,
+        statefulProof(cardinality, MothershipProductionPairPhase::snapshotVerified), 102));
+    StatefulDataAuthorityOperation cardinalityCommand;
+    assert(mothershipProductionPairStatefulCommand(cardinalityRecord,
+        MothershipProductionPairPhase::catchupVerified, cardinalityCommand));
+    assert(cardinalityCommand.authority.shardGroup == selected && cardinalityCommand.authority.nShardGroups == 3);
+  }
+  auto missingCardinality = request; missingCardinality.stateful.nShardGroups = 0;
+  assert(!mothershipProductionPairIntentValid(missingCardinality));
+  for (uint32_t rejected : {1u, 2u, 4u}) {
+    auto wrongCardinality = request;
+    wrongCardinality.stateful.nShardGroups = rejected;
+    wrongCardinality.stateful.shardGroup = 0;
+    wrongCardinality.route.slots = {};
+    for (uint16_t slot = 0; slot < nStatefulServiceGroupSlots; ++slot)
+      if (statefulServiceGroupOwnerForSlot(slot, uint16_t(rejected)) == 0) { wrongCardinality.route.slots.insert(slot); break; }
+    wrongCardinality.sourcePermission.slots = wrongCardinality.route.slots;
+    wrongCardinality.destinationPermission.slots = wrongCardinality.route.slots;
+    wrongCardinality.sourcePermission.authorizedService = MeshServices::constrainPrefixToGroup(
+        wrongCardinality.sourcePermission.peerCousinServicePrefix, 0);
+    wrongCardinality.destinationPermission.authorizedService = MeshServices::constrainPrefixToGroup(
+        wrongCardinality.destinationPermission.peerCousinServicePrefix, 0);
+    wrongCardinality.sourceRouteReceipt = receipt(wrongCardinality.route, CousinRouteHalf::source);
+    wrongCardinality.destinationRouteReceipt = receipt(wrongCardinality.route, CousinRouteHalf::destination);
+    for (auto& member : wrongCardinality.stateful.cohort) member.shardGroup = 0;
+    assert(!mothershipProductionPairIntentValid(wrongCardinality));
+    MothershipNametagStatefulPreparationRecord persisted = {};
+    persisted.requestSHA256 = digest('c'); persisted.intent = wrongCardinality;
+    assert(!mothershipNametagStatefulPreparationRecordValid(persisted));
+    String encoded; auto copy = persisted;
+    MothershipNametagStatefulPreparationRecord resumed = {};
+    assert(BitseryEngine::serialize(encoded, copy));
+    assert(BitseryEngine::deserializeSafe(encoded, resumed));
+    assert(!mothershipNametagStatefulPreparationRecordValid(resumed));
+  }
+  auto outOfRangeCardinality = request; outOfRangeCardinality.stateful.nShardGroups = request.stateful.shardGroup;
+  assert(!mothershipProductionPairIntentValid(outOfRangeCardinality));
   assert(mothershipProductionPairAdvance(record, MothershipProductionPairPhase::targetSelected, digest('5'), 111));
   assert(!mothershipProductionPairAdvance(record, MothershipProductionPairPhase::sourceRetired, digest('6'), 112));
   StatefulDataAuthorityOperation cleanupCommand;
   assert(mothershipProductionPairStatefulCommand(record, MothershipProductionPairPhase::sourceCleanupVerified, cleanupCommand));
   assert(cleanupCommand.authority.mode == StatefulDataAuthorityMode::retainedSource &&
-      cleanupCommand.authority.writeOwnerClusterUUID == request.route.destinationClusterUUID &&
+      cleanupCommand.authority.writeOwnerClusterUUID == request.targetWorkload.clusterUUID &&
       cleanupCommand.authority.requiredAppliedWatermarkSHA256 == digest('f'));
   auto sourceCleanup = statefulProof(request, MothershipProductionPairPhase::sourceCleanupVerified);
   auto wrongCleanup = sourceCleanup; wrongCleanup.members[0].receipt.fenceReceiptSHA256 = digest('8');
@@ -312,6 +601,9 @@ static void testStatefulPair()
   StatefulTopology sourceTopology; sourceTopology.servingMode = StatefulTopologyServingMode::applicationDataAuthority;
   sourceTopology.dataAuthority = postCleanup;
   assert(!prodigyStatefulTopologyServesClients(sourceTopology));
+  auto cardinalityMutation = fenced;
+  ++cardinalityMutation.nShardGroups;
+  assert(!prodigyStatefulDataAuthorityCanAdvance(prior, cardinalityMutation));
   auto target = statefulProof(request, phases[4]).members[0].receipt.authority;
   auto reverse = prior;
   reverse.operationUUID++; reverse.previousOperationUUID = target.operationUUID; reverse.previousAuthorityEpoch = target.authorityEpoch;
@@ -330,7 +622,295 @@ static void testStatefulPair()
 
 int main()
 {
+  testStatefulPreparationEvidence();
   testStatefulPair();
+  constexpr uint128_t allMastersCluster = 0xA11;
+  auto hotObservation = allMastersReport(allMastersCluster, 301, MeshRegistry::Hot::applicationID, 3,
+      DeploymentIdentityStoreKind::kv);
+  assert(mothershipNametagAllMastersDeploymentObserved(hotObservation, allMastersCluster, 301,
+      MeshRegistry::Hot::applicationID, 3, DeploymentIdentityStoreKind::kv));
+  auto preSeedHotObservation = hotObservation;
+  for (auto& member : preSeedHotObservation.statefulRuntimeCohort) {
+    member.writable = member.clientServing = false;
+    member.seededFromClusterUUID = member.seededFromContainerUUID = 0;
+    member.seedCatchupSHA256 = {}; member.catchupWatermarkSHA256 = {};
+  }
+  assert(mothershipNametagAllMastersDeploymentReadyForSeedSelection(preSeedHotObservation, allMastersCluster, 301,
+      MeshRegistry::Hot::applicationID, 3, DeploymentIdentityStoreKind::kv));
+  assert(!mothershipNametagAllMastersDeploymentObserved(preSeedHotObservation, allMastersCluster, 301,
+      MeshRegistry::Hot::applicationID, 3, DeploymentIdentityStoreKind::kv));
+  hotObservation.statefulRuntimeCohort.pop_back();
+  assert(!mothershipNametagAllMastersDeploymentObserved(hotObservation, allMastersCluster, 301,
+      MeshRegistry::Hot::applicationID, 3, DeploymentIdentityStoreKind::kv));
+  auto truthObservation = allMastersReport(allMastersCluster, 302, MeshRegistry::Truth::applicationID, 1,
+      DeploymentIdentityStoreKind::truth);
+  // Three normal replicas with one selected client-serving writer. No remote
+  // seed receipt exists or is required for Truth's EWR-only placement.
+  truthObservation.statefulRuntimeCohortConverged = false;
+  for (auto& member : truthObservation.statefulRuntimeCohort) {
+    const uint128_t container = member.containerUUID, machine = member.machineUUID;
+    member = {};
+    member.storeKind = DeploymentIdentityStoreKind::truth; member.shardGroup = 0;
+    member.clusterUUID = allMastersCluster; member.containerUUID = member.replicaUUID = container;
+    member.machineUUID = machine;
+  }
+  auto& truthMember = truthObservation.statefulRuntimeCohort[1];
+  truthMember.clientServing = true;
+  for (uint32_t remote = 0; remote < 3; ++remote) {
+    DeploymentIdentityApp6TruthMeshReceipt mesh = {};
+    mesh.localClusterUUID = allMastersCluster; mesh.remoteClusterUUID = 0xB11 + remote;
+    mesh.truthWriterContainerUUID = truthMember.containerUUID; mesh.sessionUUID = 0xD00 + remote;
+    mesh.commandGeneration = remote + 1; mesh.reconnectGeneration = remote + 1;
+    mesh.lastSuccessfulRequestWatermarkSHA256 = digest('d'); mesh.reverseCarrierUUID = 0xE00 + remote; mesh.healthy = true;
+    truthObservation.app6TruthMeshReceipts.push_back(mesh);
+  }
+  MothershipNametagAllMastersSite allMastersSite = {};
+  allMastersSite.clusterUUID = allMastersCluster; allMastersSite.truthDeploymentID = 302;
+  assert(mothershipNametagTruthWriterObserved(truthObservation, allMastersSite));
+  assert(mothershipNametagTruthWriterContainerObserved(truthObservation, allMastersSite) == truthMember.containerUUID);
+  auto invalidTruth = truthObservation;
+  invalidTruth.statefulRuntimeCohort[0].clientServing = true;
+  assert(!mothershipNametagTruthWriterObserved(invalidTruth, allMastersSite));
+  invalidTruth = truthObservation; invalidTruth.statefulRuntimeCohort[1].clientServing = false;
+  assert(!mothershipNametagTruthWriterObserved(invalidTruth, allMastersSite));
+  invalidTruth = truthObservation; invalidTruth.statefulRuntimeCohort[2].allMasters = true;
+  assert(!mothershipNametagTruthWriterObserved(invalidTruth, allMastersSite));
+  invalidTruth = truthObservation; invalidTruth.statefulRuntimeCohort[2].machineUUID = invalidTruth.statefulRuntimeCohort[0].machineUUID;
+  assert(!mothershipNametagTruthWriterObserved(invalidTruth, allMastersSite));
+  invalidTruth = truthObservation; invalidTruth.statefulRuntimeCohort[2].containerUUID = invalidTruth.statefulRuntimeCohort[2].replicaUUID = invalidTruth.statefulRuntimeCohort[0].containerUUID;
+  assert(!mothershipNametagTruthWriterObserved(invalidTruth, allMastersSite));
+  invalidTruth = truthObservation; invalidTruth.statefulRuntimeCohort[2].clusterUUID += 1;
+  assert(!mothershipNametagTruthWriterObserved(invalidTruth, allMastersSite));
+  invalidTruth = truthObservation; invalidTruth.nHealthy = 2;
+  assert(!mothershipNametagTruthWriterObserved(invalidTruth, allMastersSite));
+  invalidTruth = truthObservation;
+  invalidTruth.nTarget = invalidTruth.nDeployed = invalidTruth.nHealthy = 1;
+  invalidTruth.statefulRuntimeCohort.resize(1); invalidTruth.statefulRuntimeCohort.front().clientServing = true;
+  assert(!mothershipNametagTruthWriterObserved(invalidTruth, allMastersSite));
+  allMastersSite.app6DeploymentID = 303;
+  auto app6Observation = allMastersReport(allMastersCluster, 303, MeshRegistry::Nametag::applicationID, 1,
+      DeploymentIdentityStoreKind::graph);
+  app6Observation.isStateful = false; app6Observation.statefulRuntimeCohort.clear();
+  app6Observation.app6TruthMeshReceipts.push_back(truthObservation.app6TruthMeshReceipts.front());
+  app6Observation.app6TruthMeshReceipts.front().localClusterUUID = allMastersCluster;
+  app6Observation.app6TruthMeshReceipts.front().remoteClusterUUID = allMastersCluster;
+  app6Observation.app6TruthMeshReceipts.front().truthWriterContainerUUID = truthMember.containerUUID;
+  assert(mothershipNametagApp6TruthMeshObserved(app6Observation, allMastersSite, allMastersCluster, truthMember.containerUUID));
+  app6Observation.app6TruthMeshReceipts.front().healthy = false;
+  assert(!mothershipNametagApp6TruthMeshObserved(app6Observation, allMastersSite, allMastersCluster, truthMember.containerUUID));
+
+  MothershipNametagAllMastersIntent allMastersIntent = {};
+  allMastersIntent.operationUUID = 0xA110;
+  for (uint32_t site = 0; site < 3; ++site) {
+    auto& topologySite = allMastersIntent.sites.emplace_back();
+    topologySite.clusterUUID = allMastersCluster + site;
+    topologySite.pulseDeploymentID = 100 + site * 10; topologySite.hotDeploymentID = 101 + site * 10;
+    topologySite.coldDeploymentID = 102 + site * 10; topologySite.radarDeploymentID = 103 + site * 10;
+    topologySite.app6DeploymentID = 104 + site * 10;
+    if (site == 0) topologySite.truthDeploymentID = 105;
+  }
+  for (uint32_t left = 0; left < 3; ++left) for (uint32_t right = left + 1; right < 3; ++right) {
+    for (uint32_t path = 0; path < 3; ++path) for (uint32_t direction = 0; direction < 2; ++direction) {
+      const uint32_t local = direction == 0 ? left : right;
+      const uint32_t peer = direction == 0 ? right : left;
+      auto& authority = allMastersIntent.directGatewayAuthorities.emplace_back();
+      authority.pairUUID = 0xC000 + left * 3 + right;
+      authority.pairOperationUUID = 0xD000 + left * 3 + right;
+      authority.localClusterUUID = allMastersIntent.sites[local].clusterUUID;
+      authority.peerClusterUUID = allMastersIntent.sites[peer].clusterUUID;
+      // Host slot N is reused for both remote site pairs.  The path slot is
+      // pair-scoped, while gatewaySlot binds this authority to the durable
+      // local host identity.
+      authority.localMachineUUID = 0xE000 + local * 10 + path;
+      authority.peerMachineUUID = 0xE000 + peer * 10 + path;
+      authority.tunnelSlot = uint8_t(path);
+      authority.gatewaySlot = uint8_t(path);
+    }
+  }
+  assert(allMastersIntent.directGatewayAuthorities.size() == 18);
+  assert(mothershipNametagAllMastersIntentValid(allMastersIntent));
+  auto cutRouteIntent = allMastersIntent;
+  cutRouteIntent.protocolVersion = MothershipNametagAllMastersIntent::seedRouteVersion;
+  cutRouteIntent.sourceBaselineOperationUUID = 0x1234;
+  for (uint8_t site = 1; site <= 2; ++site) for (uint16_t application : {uint16_t(2), uint16_t(3), uint16_t(4), uint16_t(5)})
+    for (uint32_t group = 0; group < ((application == 3 || application == 4) ? 3u : 1u); ++group) {
+      MothershipNametagSeedRouteReference reference = {};
+      reference.site = site; reference.applicationID = application; reference.shardGroup = group;
+      reference.routeUUID = 0x1000 + cutRouteIntent.seedRoutes.size();
+      cutRouteIntent.seedRoutes.push_back(reference);
+    }
+  assert(mothershipNametagAllMastersIntentValid(cutRouteIntent));
+  String routeIntentBytes; assert(BitseryEngine::serialize(routeIntentBytes, cutRouteIntent));
+  MothershipNametagAllMastersIntent routeIntentDecoded = {};
+  assert(BitseryEngine::deserializeSafe(routeIntentBytes, routeIntentDecoded));
+  assert(mothershipNametagAllMastersIntentValid(routeIntentDecoded));
+  auto invalidRoutes = cutRouteIntent; invalidRoutes.seedRoutes.pop_back();
+  assert(!mothershipNametagAllMastersIntentValid(invalidRoutes));
+  invalidRoutes = cutRouteIntent; invalidRoutes.seedRoutes[1].routeUUID = invalidRoutes.seedRoutes[0].routeUUID;
+  assert(!mothershipNametagAllMastersIntentValid(invalidRoutes));
+  invalidRoutes = cutRouteIntent; invalidRoutes.seedRoutes[1].site = invalidRoutes.seedRoutes[0].site;
+  invalidRoutes.seedRoutes[1].applicationID = invalidRoutes.seedRoutes[0].applicationID;
+  invalidRoutes.seedRoutes[1].shardGroup = invalidRoutes.seedRoutes[0].shardGroup;
+  assert(!mothershipNametagAllMastersIntentValid(invalidRoutes));
+  MothershipProdigyCluster siteIdentity = {};
+  siteIdentity.clusterUUID = allMastersCluster;
+  siteIdentity.name.assign("nametag-ewr-unique-run"_ctv);
+  siteIdentity.deploymentMode = MothershipClusterDeploymentMode::remote;
+  siteIdentity.provider = MothershipClusterProvider::vultr;
+  siteIdentity.providerScope.assign("ewr"_ctv);
+  assert(mothershipNametagAllMastersSiteIdentityMatches(0, allMastersCluster, siteIdentity));
+  assert(!mothershipNametagAllMastersSiteIdentityMatches(0, allMastersCluster + 1, siteIdentity));
+  assert(!mothershipNametagAllMastersSiteIdentityMatches(0, 0, siteIdentity));
+  assert(!mothershipNametagAllMastersSiteIdentityMatches(1, allMastersCluster, siteIdentity));
+  siteIdentity.name.assign("ord"_ctv); // A cosmetic label cannot change the site.
+  assert(!mothershipNametagAllMastersSiteIdentityMatches(1, allMastersCluster, siteIdentity));
+  siteIdentity.providerScope.assign("ord"_ctv);
+  assert(mothershipNametagAllMastersSiteIdentityMatches(1, allMastersCluster, siteIdentity));
+  siteIdentity.deploymentMode = MothershipClusterDeploymentMode::test;
+  assert(!mothershipNametagAllMastersSiteIdentityMatches(1, allMastersCluster, siteIdentity));
+  siteIdentity.deploymentMode = MothershipClusterDeploymentMode::local;
+  assert(!mothershipNametagAllMastersSiteIdentityMatches(1, allMastersCluster, siteIdentity));
+  assert(!mothershipNametagAllMastersSiteIdentityMatches(2, allMastersCluster, siteIdentity));
+  siteIdentity.name.assign("g6-20261017-lan-r41"_ctv);
+  siteIdentity.provider = MothershipClusterProvider::unknown;
+  assert(!mothershipNametagAllMastersSiteIdentityMatches(2, allMastersCluster, siteIdentity));
+  siteIdentity.providerScope.clear();
+  assert(mothershipNametagAllMastersSiteIdentityMatches(2, allMastersCluster, siteIdentity));
+  assert(!mothershipNametagAllMastersSiteIdentityMatches(3, allMastersCluster, siteIdentity));
+  siteIdentity.deploymentMode = MothershipClusterDeploymentMode::remote;
+  assert(!mothershipNametagAllMastersSiteIdentityMatches(2, allMastersCluster, siteIdentity));
+  ClusterStatusReport truthStatus = {};
+  auto& truthApplication = truthStatus.applicationReports.emplace_back();
+  truthApplication.applicationID = MeshRegistry::Truth::applicationID;
+  truthApplication.deploymentReports.emplace_back();
+  assert(mothershipNametagAllMastersTruthDeploymentCardinalityObserved(truthStatus, true));
+  assert(!mothershipNametagAllMastersTruthDeploymentCardinalityObserved(truthStatus, false));
+  truthApplication.deploymentReports.emplace_back();
+  assert(!mothershipNametagAllMastersTruthDeploymentCardinalityObserved(truthStatus, true));
+  auto missingGatewayDirection = allMastersIntent;
+  missingGatewayDirection.directGatewayAuthorities.pop_back();
+  assert(!mothershipNametagAllMastersIntentValid(missingGatewayDirection));
+  // The same EWR slot-zero host appears in both EWR peer pairs, exactly once
+  // in each pair direction; that is the intended two-authority reuse.
+  assert(allMastersIntent.directGatewayAuthorities[0].localMachineUUID ==
+      allMastersIntent.directGatewayAuthorities[6].localMachineUUID);
+  auto overusedGatewayMachine = allMastersIntent;
+  overusedGatewayMachine.directGatewayAuthorities[8].localMachineUUID =
+      overusedGatewayMachine.directGatewayAuthorities[6].localMachineUUID;
+  overusedGatewayMachine.directGatewayAuthorities[9].peerMachineUUID =
+      overusedGatewayMachine.directGatewayAuthorities[7].peerMachineUUID;
+  overusedGatewayMachine.directGatewayAuthorities[8].gatewaySlot = 0;
+  overusedGatewayMachine.directGatewayAuthorities[9].gatewaySlot = 0;
+  assert(!mothershipNametagAllMastersIntentValid(overusedGatewayMachine));
+  auto duplicateGatewaySlot = allMastersIntent;
+  duplicateGatewaySlot.directGatewayAuthorities[2].tunnelSlot = 0;
+  duplicateGatewaySlot.directGatewayAuthorities[3].tunnelSlot = 0;
+  assert(!mothershipNametagAllMastersIntentValid(duplicateGatewaySlot));
+  auto mismatchedReverseGatewaySlot = allMastersIntent;
+  mismatchedReverseGatewaySlot.directGatewayAuthorities[1].tunnelSlot = 1;
+  assert(!mothershipNametagAllMastersIntentValid(mismatchedReverseGatewaySlot));
+  auto duplicateDeployment = allMastersIntent;
+  duplicateDeployment.sites[1].radarDeploymentID = duplicateDeployment.sites[1].pulseDeploymentID;
+  assert(!mothershipNametagAllMastersIntentValid(duplicateDeployment));
+
+  Vector<DeploymentIdentityReport> allPulse, allHot, allCold, allRadar;
+  for (uint32_t site = 0; site < 3; ++site) {
+    const auto& topologySite = allMastersIntent.sites[site];
+    allPulse.push_back(allMastersReport(topologySite.clusterUUID, topologySite.pulseDeploymentID,
+        MeshRegistry::Pulse::applicationID, 1, DeploymentIdentityStoreKind::graph));
+    allHot.push_back(allMastersReport(topologySite.clusterUUID, topologySite.hotDeploymentID,
+        MeshRegistry::Hot::applicationID, 3, DeploymentIdentityStoreKind::kv));
+    allCold.push_back(allMastersReport(topologySite.clusterUUID, topologySite.coldDeploymentID,
+        MeshRegistry::Cold::applicationID, 3, DeploymentIdentityStoreKind::kv));
+    allRadar.push_back(allMastersReport(topologySite.clusterUUID, topologySite.radarDeploymentID,
+        MeshRegistry::Radar::applicationID, 1, DeploymentIdentityStoreKind::graph));
+  }
+  MothershipNametagAllMastersRecord allMastersRecord = {};
+  allMastersRecord.requestSHA256 = digest('f'); allMastersRecord.intent = allMastersIntent;
+  assert(mothershipNametagAllMastersSeedPlacementsSynthesize(allMastersIntent, allPulse, allHot, allCold,
+      allRadar, allMastersRecord.seedPlacements));
+  assert(allMastersRecord.seedPlacements.size() == 48 && mothershipNametagAllMastersRecordValid(allMastersRecord));
+  uint32_t ewrSourceGroups = 0;
+  uint128_t sourceByStoreGroup[4][3] = {};
+  for (const auto& row : allMastersRecord.seedPlacements) {
+    const uint32_t store = row.applicationID == MeshRegistry::Pulse::applicationID ? 0 :
+        (row.applicationID == MeshRegistry::Hot::applicationID ? 1 :
+         (row.applicationID == MeshRegistry::Cold::applicationID ? 2 : 3));
+    uint128_t& source = sourceByStoreGroup[store][row.shardGroup];
+    if (source == 0) { source = row.sourceContainerUUID; ++ewrSourceGroups; }
+    else assert(source == row.sourceContainerUUID);
+    assert(row.site == 1 || row.site == 2);
+    assert(row.targetClusterUUID != row.sourceClusterUUID && row.targetContainerUUID != row.sourceContainerUUID);
+    assert(row.sourceClusterUUID == allMastersIntent.sites[0].clusterUUID);
+    assert(row.fixtureSHA256 == digest('a'));
+    assert(row.expectedCatchupWatermarkSHA256 == digest('c'));
+    assert(row.sourceContentWatermarkSHA256 == digest('d'));
+    assert(row.sourceCatchupWatermarkSHA256 == digest('e'));
+  }
+  assert(ewrSourceGroups == 8);
+  auto receiptPulse = allPulse, receiptHot = allHot, receiptCold = allCold, receiptRadar = allRadar;
+  for (const auto& row : allMastersRecord.seedPlacements) {
+    Vector<DeploymentIdentityReport> *reports = row.applicationID == MeshRegistry::Pulse::applicationID ? &receiptPulse :
+        (row.applicationID == MeshRegistry::Hot::applicationID ? &receiptHot :
+         (row.applicationID == MeshRegistry::Cold::applicationID ? &receiptCold : &receiptRadar));
+    bool found = false;
+    for (auto& member : (*reports)[row.site].statefulRuntimeCohort) {
+      if (member.containerUUID != row.targetContainerUUID || member.shardGroup != row.shardGroup) continue;
+      member.seededFromClusterUUID = row.sourceClusterUUID;
+      member.seededFromContainerUUID = row.sourceContainerUUID;
+      member.seedCatchupSHA256 = row.fixtureSHA256;
+      member.catchupWatermarkSHA256 = row.expectedCatchupWatermarkSHA256;
+      member.sourceContentWatermarkSHA256 = row.sourceContentWatermarkSHA256;
+      member.sourceCatchupWatermarkSHA256 = row.sourceCatchupWatermarkSHA256;
+      found = true;
+      break;
+    }
+    assert(found);
+  }
+  assert(mothershipNametagAllMastersSeedPlacementsObserved(allMastersRecord.seedPlacements,
+      receiptPulse, receiptHot, receiptCold, receiptRadar));
+  auto mismatchedRemoteBoundary = receiptCold;
+  mismatchedRemoteBoundary[2].statefulRuntimeCohort.front().sourceContentWatermarkSHA256 = digest('z');
+  assert(!mothershipNametagAllMastersSeedPlacementsObserved(allMastersRecord.seedPlacements,
+      receiptPulse, receiptHot, mismatchedRemoteBoundary, receiptRadar));
+  auto staleEwr = receiptPulse;
+  staleEwr[0].statefulRuntimeCohort.front().sourceCatchupWatermarkSHA256 = digest('z');
+  assert(!mothershipNametagAllMastersSeedPlacementsObserved(allMastersRecord.seedPlacements,
+      staleEwr, receiptHot, receiptCold, receiptRadar));
+  receiptHot[1].statefulRuntimeCohort.front().seedCatchupSHA256 = digest('z');
+  assert(!mothershipNametagAllMastersSeedPlacementsObserved(allMastersRecord.seedPlacements,
+      receiptPulse, receiptHot, receiptCold, receiptRadar));
+  auto splitSource = allMastersRecord;
+  splitSource.seedPlacements[1].sourceContainerUUID++;
+  assert(!mothershipNametagAllMastersRecordValid(splitSource));
+  auto unboundReceipt = allMastersRecord;
+  unboundReceipt.seedPlacements[0].sourceContentWatermarkSHA256 = digest('z');
+  assert(!mothershipNametagAllMastersRecordValid(unboundReceipt));
+  auto selfSeed = allMastersRecord;
+  selfSeed.seedPlacements[0].targetContainerUUID = selfSeed.seedPlacements[0].sourceContainerUUID;
+  assert(!mothershipNametagAllMastersRecordValid(selfSeed));
+  auto remotelyDelivering = allMastersRecord;
+  remotelyDelivering.seedPlacements.front().deliveryApplied = true;
+  remotelyDelivering.phase = MothershipNametagAllMastersRecord::Phase::remoteSeeding;
+  assert(mothershipNametagAllMastersRecordValid(remotelyDelivering));
+  auto remoteComplete = remotelyDelivering;
+  for (auto& row : remoteComplete.seedPlacements) row.deliveryApplied = row.catchupObserved = true;
+  remoteComplete.phase = MothershipNametagAllMastersRecord::Phase::remoteSeeded;
+  assert(mothershipNametagAllMastersRecordValid(remoteComplete));
+  auto prematureComplete = allMastersRecord;
+  prematureComplete.phase = MothershipNametagAllMastersRecord::Phase::remoteSeeded;
+  assert(!mothershipNametagAllMastersRecordValid(prematureComplete));
+  String allMastersBytes = {}; auto allMastersCopy = allMastersRecord;
+  MothershipNametagAllMastersRecord decodedAllMasters = {};
+  assert(BitseryEngine::serialize(allMastersBytes, allMastersCopy) &&
+      BitseryEngine::deserializeSafe(allMastersBytes, decodedAllMasters) &&
+      mothershipNametagAllMastersRecordValid(decodedAllMasters));
+  auto unsupportedLegacyRecord = allMastersRecord;
+  unsupportedLegacyRecord.protocolVersion = 2;
+  String legacyBytes = {}; assert(BitseryEngine::serialize(legacyBytes, unsupportedLegacyRecord));
+  MothershipNametagAllMastersRecord decodedLegacyRecord = {};
+  assert(BitseryEngine::deserializeSafe(legacyBytes, decodedLegacyRecord) &&
+      !mothershipNametagAllMastersRecordValid(decodedLegacyRecord));
   String failure = {};
   MothershipProductionPairIntent request = intent();
   assert(request.protocolVersion == 6);

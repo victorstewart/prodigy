@@ -3,7 +3,7 @@
 #include <array>
 #include <cstdint>
 
-#include <networking/includes.h>
+#include <basics/includes.h>
 #include <services/bitsery.h>
 #include <services/prodigy.h>
 
@@ -66,12 +66,36 @@ enum class ProdigyLocalCousinServicePermissionState : uint8_t {
   revoked = 2
 };
 
+enum class ProdigyCousinServicePurpose : uint8_t {
+  statefulCousin = 0,
+  clientAuthority = 1,
+  sibling = 2,
+  seeding = 3
+};
+
+enum class ProdigyCousinTransportSourcePolicy : uint8_t {
+  exact = 0,
+  authenticatedNAT = 1
+};
+
+static inline const char *prodigyCousinServicePurposeName(ProdigyCousinServicePurpose purpose)
+{
+  switch (purpose) {
+    case ProdigyCousinServicePurpose::statefulCousin: return "stateful-cousin";
+    case ProdigyCousinServicePurpose::clientAuthority: return "client-authority";
+    case ProdigyCousinServicePurpose::sibling: return "sibling";
+    case ProdigyCousinServicePurpose::seeding: return "seeding";
+  }
+  return "invalid";
+}
+
 constexpr inline uint32_t ProdigyLocalCousinServicePermissionMaximumRecords = 256;
 
 class ProdigyLocalCousinServicePermission {
 public:
-  static constexpr uint32_t version = 2;
+  static constexpr uint32_t version = 3;
   static constexpr uint32_t baselineVersion = 2;
+  static constexpr uint32_t purposeVersion = 3;
 
   uint32_t protocolVersion = 1;
   uint128_t permissionUUID = 0;
@@ -93,10 +117,20 @@ public:
   uint64_t generation = 0;
   uint64_t acceptedAuthorityGeneration = 0;
   ProdigyLocalCousinServicePermissionState state = ProdigyLocalCousinServicePermissionState::active;
-  // v2 only: immutable resources from the full plan that the Brain verified.
+  // v2+: immutable resources from the full plan that the Brain verified.
   uint32_t baselineLogicalCores = 0;
   uint32_t baselineMemoryMB = 0;
   uint32_t baselineStorageMB = 0;
+  // v3: exact peer deployment and one remote service, never a wildcard grant.
+  ProdigyCousinServicePurpose purpose = ProdigyCousinServicePurpose::statefulCousin;
+  uint64_t peerDeploymentID = 0;
+  String peerCanonicalPlanSHA256 = {};
+  String peerArtifactSHA256 = {};
+  uint64_t peerArtifactBytes = 0;
+  uint64_t authorizedService = 0;
+  ProdigyCousinTransportSourcePolicy transportSourcePolicy = ProdigyCousinTransportSourcePolicy::exact;
+  uint16_t destinationShardGroup = 0;
+  uint16_t destinationShardGroups = 0;
 };
 
 class ProdigyLocalCousinServicePermissionRequest {
@@ -163,6 +197,18 @@ static void serialize(S&& serializer, ProdigyLocalCousinServicePermission& permi
     serializer.value4b(permission.baselineMemoryMB);
     serializer.value4b(permission.baselineStorageMB);
   }
+  // v1 and v2 end above, byte-for-byte unchanged.
+  if (permission.protocolVersion >= ProdigyLocalCousinServicePermission::purposeVersion) {
+    serializer.value1b(permission.purpose);
+    serializer.value8b(permission.peerDeploymentID);
+    serializer.text1b(permission.peerCanonicalPlanSHA256, 64);
+    serializer.text1b(permission.peerArtifactSHA256, 64);
+    serializer.value8b(permission.peerArtifactBytes);
+    serializer.value8b(permission.authorizedService);
+    serializer.value1b(permission.transportSourcePolicy);
+    serializer.value2b(permission.destinationShardGroup);
+    serializer.value2b(permission.destinationShardGroups);
+  }
 }
 
 template <typename S>
@@ -204,6 +250,121 @@ static inline bool prodigyLocalCousinServicePermissionStateValid(
          state == ProdigyLocalCousinServicePermissionState::revoked;
 }
 
+static inline uint64_t prodigyCousinClientAuthorityPrefix(uint16_t applicationID)
+{
+  switch (applicationID) {
+    case 2: return MeshRegistry::Pulse::clients;
+    case 3: return MeshRegistry::Hot::clients;
+    case 4: return MeshRegistry::Cold::clients;
+    case 5: return MeshRegistry::Radar::clients;
+    case 10: return MeshRegistry::Truth::clients;
+  }
+  return 0;
+}
+
+static inline bool prodigyCousinServicePermissionSingleSlot(
+    const ProdigyLocalCousinServicePermission& permission, uint16_t& slot)
+{
+  bool found = false;
+  for (uint16_t candidate = 0; candidate < CousinRouteSlotBitmap::slotCount; ++candidate) {
+    if (!permission.slots.contains(candidate)) continue;
+    if (found) return false;
+    found = true; slot = candidate;
+  }
+  return found;
+}
+
+static inline bool prodigyCousinServicePermissionPurposeValid(
+    const ProdigyLocalCousinServicePermission& permission)
+{
+  if (permission.protocolVersion < ProdigyLocalCousinServicePermission::purposeVersion)
+    return permission.purpose == ProdigyCousinServicePurpose::statefulCousin &&
+        permission.peerDeploymentID == 0 && permission.peerCanonicalPlanSHA256.empty() &&
+        permission.peerArtifactSHA256.empty() && permission.peerArtifactBytes == 0 && permission.authorizedService == 0 &&
+        permission.transportSourcePolicy == ProdigyCousinTransportSourcePolicy::exact &&
+        permission.destinationShardGroup == 0 && permission.destinationShardGroups == 0;
+  if (uint8_t(permission.purpose) > uint8_t(ProdigyCousinServicePurpose::seeding) ||
+      permission.peerDeploymentID == 0 || uint16_t(permission.peerDeploymentID >> 48) != permission.peerApplicationID ||
+      (permission.peerDeploymentID & UINT64_C(0x0000ffffffffffff)) == 0 ||
+      !prodigyIsSHA256HexDigest(permission.peerCanonicalPlanSHA256) ||
+      !prodigyIsSHA256HexDigest(permission.peerArtifactSHA256) || permission.peerArtifactBytes == 0 ||
+      !MeshServices::isShard(permission.authorizedService) ||
+      uint8_t(permission.transportSourcePolicy) > uint8_t(ProdigyCousinTransportSourcePolicy::authenticatedNAT)) return false;
+  const bool source = permission.localHalf == CousinRouteHalf::source;
+  const uint16_t sourceApp = source ? permission.localApplicationID : permission.peerApplicationID;
+  const uint16_t destinationApp = source ? permission.peerApplicationID : permission.localApplicationID;
+  const uint64_t sourcePrefix = source ? permission.localCousinServicePrefix : permission.peerCousinServicePrefix;
+  const uint64_t destinationPrefix = source ? permission.peerCousinServicePrefix : permission.localCousinServicePrefix;
+  if (MeshServices::convertShardToPrefix(permission.authorizedService) != destinationPrefix) return false;
+  if (permission.purpose == ProdigyCousinServicePurpose::statefulCousin)
+    return (permission.transportSourcePolicy == ProdigyCousinTransportSourcePolicy::exact ||
+            permission.transportSourcePolicy == ProdigyCousinTransportSourcePolicy::authenticatedNAT) &&
+        permission.destinationShardGroup == 0 && permission.destinationShardGroups == 0;
+  if (permission.destinationShardGroups == 0 || permission.destinationShardGroups > nStatefulServiceGroupSlots ||
+      permission.destinationShardGroup >= permission.destinationShardGroups ||
+      permission.authorizedService != MeshServices::constrainPrefixToGroup(destinationPrefix, permission.destinationShardGroup)) return false;
+  uint16_t slot = 0;
+  if (!prodigyCousinServicePermissionSingleSlot(permission, slot) ||
+      statefulServiceGroupOwnerForSlot(slot, permission.destinationShardGroups) != permission.destinationShardGroup) return false;
+  if (permission.purpose == ProdigyCousinServicePurpose::clientAuthority) {
+    // The source prefix is an authentication identity only, not an advertisement.
+    const bool sharded = destinationApp == 3 || destinationApp == 4;
+    return (sourceApp == 6 || sourceApp == 11) && prodigyCousinClientAuthorityPrefix(destinationApp) != 0 &&
+        sourcePrefix == (sourceApp == 6 ? MeshServices::generateStatefulService(6, 1) :
+                         MeshServices::generateStatefulService(11, 1)) &&
+        destinationPrefix == prodigyCousinClientAuthorityPrefix(destinationApp) &&
+        (sharded || (permission.destinationShardGroup == 0 && permission.destinationShardGroups == 1));
+  }
+  // KV seeding is a same-group pull from the retained source's seeding role.
+  if (permission.purpose == ProdigyCousinServicePurpose::seeding && (sourceApp == 3 || sourceApp == 4)) {
+    const uint64_t expected = sourceApp == 3 ? MeshRegistry::Hot::seeding : MeshRegistry::Cold::seeding;
+    return sourceApp == destinationApp && sourcePrefix == expected && destinationPrefix == expected;
+  }
+  // Retained graph peers are one-group, same-application, non-client roles.
+  if (sourceApp != destinationApp || (sourceApp != 2 && sourceApp != 5) || sourcePrefix != destinationPrefix ||
+      permission.destinationShardGroup != 0 || permission.destinationShardGroups != 1 || slot != 0) return false;
+  const uint64_t expected = permission.purpose == ProdigyCousinServicePurpose::sibling ?
+      (sourceApp == 2 ? MeshRegistry::Pulse::siblings : MeshRegistry::Radar::siblings) :
+      (sourceApp == 2 ? MeshRegistry::Pulse::seeding : MeshRegistry::Radar::seeding);
+  return sourcePrefix == expected;
+}
+
+static inline bool prodigyCousinServicePermissionGroupValid(
+    const ProdigyLocalCousinServicePermission& permission, uint32_t group, uint32_t groups)
+{
+  if (permission.purpose == ProdigyCousinServicePurpose::statefulCousin) return true;
+  if (permission.purpose == ProdigyCousinServicePurpose::seeding &&
+      (permission.localApplicationID == 3 || permission.localApplicationID == 4))
+    return group == permission.destinationShardGroup && groups == permission.destinationShardGroups;
+  if (permission.localHalf == CousinRouteHalf::source) return group == 0 && groups == 1;
+  return group == permission.destinationShardGroup && groups == permission.destinationShardGroups;
+}
+
+static inline bool prodigyCousinServicePermissionPeerScopeMatches(
+    const ProdigyLocalCousinServicePermission& source, const ProdigyLocalCousinServicePermission& destination)
+{
+  if (source.protocolVersion < ProdigyLocalCousinServicePermission::purposeVersion &&
+      destination.protocolVersion < ProdigyLocalCousinServicePermission::purposeVersion) return true;
+  return source.protocolVersion == ProdigyLocalCousinServicePermission::purposeVersion &&
+      destination.protocolVersion == source.protocolVersion && source.purpose == destination.purpose &&
+      source.authorizedService == destination.authorizedService && source.transportSourcePolicy == destination.transportSourcePolicy &&
+      source.destinationShardGroup == destination.destinationShardGroup && source.destinationShardGroups == destination.destinationShardGroups &&
+      source.peerDeploymentID == destination.localDeploymentID && destination.peerDeploymentID == source.localDeploymentID &&
+      source.peerCanonicalPlanSHA256 == destination.canonicalPlanSHA256 && destination.peerCanonicalPlanSHA256 == source.canonicalPlanSHA256 &&
+      source.peerArtifactSHA256 == destination.artifactSHA256 && destination.peerArtifactSHA256 == source.artifactSHA256 &&
+      source.peerArtifactBytes == destination.artifactBytes && destination.peerArtifactBytes == source.artifactBytes;
+}
+
+// One source binding may serve distinct exact nonlegacy services, but changing
+// the permission UUID must not create two leases for the same remote service.
+static inline bool prodigyCousinSourcePermissionsConflict(
+    const ProdigyLocalCousinServicePermission& left, const ProdigyLocalCousinServicePermission& right)
+{
+  return left.purpose == ProdigyCousinServicePurpose::statefulCousin ||
+      right.purpose == ProdigyCousinServicePurpose::statefulCousin || left.permissionUUID == right.permissionUUID ||
+      (left.peerClusterUUID == right.peerClusterUUID && left.authorizedService == right.authorizedService);
+}
+
 // A caller submits an unassigned permission (acceptedAuthorityGeneration == 0).
 // A durable owner record must instead carry the nonzero authority generation
 // that accepted it.  The rest of the scope is identical in both forms.
@@ -211,7 +372,7 @@ static inline bool prodigyLocalCousinServicePermissionValid(
     const ProdigyLocalCousinServicePermission& permission,
     bool requireAcceptedAuthorityGeneration = true)
 {
-  if ((permission.protocolVersion != 1 && permission.protocolVersion != ProdigyLocalCousinServicePermission::baselineVersion) ||
+  if ((permission.protocolVersion < 1 || permission.protocolVersion > ProdigyLocalCousinServicePermission::version) ||
       permission.permissionUUID == 0 || permission.pairUUID == 0 ||
       permission.logicalWorkloadUUID == 0 || permission.logicalServiceUUID == 0 ||
       permission.localClusterUUID == 0 || permission.peerClusterUUID == 0 ||
@@ -227,12 +388,15 @@ static inline bool prodigyLocalCousinServicePermissionValid(
       (permission.localDeploymentID & UINT64_C(0x0000ffffffffffff)) == 0 ||
       !prodigyIsSHA256HexDigest(permission.canonicalPlanSHA256) ||
       !prodigyIsSHA256HexDigest(permission.artifactSHA256) || permission.artifactBytes == 0 ||
-      !prodigyLocalCousinServicePermissionStateValid(permission.state))
+      !prodigyLocalCousinServicePermissionStateValid(permission.state) ||
+      !prodigyCousinServicePermissionPurposeValid(permission))
   {
     return false;
   }
   if ((permission.protocolVersion == 1 && (permission.baselineLogicalCores != 0 || permission.baselineMemoryMB != 0 || permission.baselineStorageMB != 0)) ||
-      (permission.protocolVersion == ProdigyLocalCousinServicePermission::baselineVersion &&
+      (permission.protocolVersion >= ProdigyLocalCousinServicePermission::baselineVersion &&
+       !(permission.protocolVersion == ProdigyLocalCousinServicePermission::purposeVersion && !requireAcceptedAuthorityGeneration &&
+         permission.baselineLogicalCores == 0 && permission.baselineMemoryMB == 0 && permission.baselineStorageMB == 0) &&
        (permission.baselineLogicalCores == 0 || permission.baselineLogicalCores > UINT16_MAX ||
         permission.baselineMemoryMB == 0 || permission.baselineStorageMB == 0))) return false;
   if (permission.state == ProdigyLocalCousinServicePermissionState::active) {
@@ -254,7 +418,12 @@ static inline bool prodigyLocalCousinServicePermissionIdentityScopeMatches(
          left.peerApplicationID == right.peerApplicationID && left.localCousinServicePrefix == right.localCousinServicePrefix &&
          left.peerCousinServicePrefix == right.peerCousinServicePrefix && left.slots == right.slots &&
          left.localDeploymentID == right.localDeploymentID && left.canonicalPlanSHA256 == right.canonicalPlanSHA256 &&
-         left.artifactSHA256 == right.artifactSHA256 && left.artifactBytes == right.artifactBytes;
+         left.artifactSHA256 == right.artifactSHA256 && left.artifactBytes == right.artifactBytes &&
+         left.purpose == right.purpose && left.peerDeploymentID == right.peerDeploymentID &&
+         left.peerCanonicalPlanSHA256 == right.peerCanonicalPlanSHA256 && left.peerArtifactSHA256 == right.peerArtifactSHA256 &&
+         left.peerArtifactBytes == right.peerArtifactBytes && left.authorizedService == right.authorizedService &&
+         left.transportSourcePolicy == right.transportSourcePolicy &&
+         left.destinationShardGroup == right.destinationShardGroup && left.destinationShardGroups == right.destinationShardGroups;
 }
 
 static inline bool prodigyLocalCousinServicePermissionScopeMatches(
@@ -278,8 +447,8 @@ static inline bool prodigyLocalCousinServicePermissionEqual(
 }
 
 // A controller request has no acceptance generation.  The only permitted
-// owner enrichment is converting a baseline-free legacy v1 request into the
-// validated v2 record that carries Brain-owned resource baselines.
+// owner enrichment supplies verified resource baselines: legacy v1 becomes v2,
+// while an explicitly purpose-bound v3 request retains its exact v3 identity.
 static inline bool prodigyLocalCousinServicePermissionRequestAccepted(
     const ProdigyLocalCousinServicePermission& requested,
     const ProdigyLocalCousinServicePermission& observed)
@@ -293,6 +462,9 @@ static inline bool prodigyLocalCousinServicePermissionRequestAccepted(
     if (observed.protocolVersion == 1) return prodigyLocalCousinServicePermissionScopeMatches(requested, observed);
     return observed.protocolVersion == ProdigyLocalCousinServicePermission::baselineVersion;
   }
+  if (requested.protocolVersion == ProdigyLocalCousinServicePermission::purposeVersion &&
+      observed.protocolVersion == requested.protocolVersion && requested.baselineLogicalCores == 0 &&
+      requested.baselineMemoryMB == 0 && requested.baselineStorageMB == 0) return true;
   return prodigyLocalCousinServicePermissionScopeMatches(requested, observed);
 }
 

@@ -133,7 +133,7 @@ __attribute__((__always_inline__)) static inline bool setContainerIDFromDistribu
   __u8 machine_fragment2 = bytes[14];
   __u8 container_fragment = bytes[15];
 
-  if (datacenter_fragment == 0 || container_fragment == 0)
+  if (datacenter_fragment == 0 || (machine_fragment0 == 0 && machine_fragment1 == 0 && machine_fragment2 == 0) || container_fragment == 0)
   {
     return false;
   }
@@ -172,13 +172,13 @@ __attribute__((__always_inline__)) static inline bool overlayRouteKeyFromIPv6(co
     return false;
   }
 
-  __u32 fragment = 0;
-  if (switchboardExtractOverlayMachineFragmentFromIPv6((const __u8 *)dstv6, &fragment) == false)
+  __u32 identity = 0;
+  if (switchboardExtractOverlayMachineIdentityFromIPv6((const __u8 *)dstv6, &identity) == false)
   {
     return false;
   }
 
-  key->fragment = fragment;
+  key->fragment = identity;
   return true;
 }
 
@@ -202,9 +202,57 @@ __attribute__((__always_inline__)) static inline struct switchboard_overlay_mach
   return bpf_map_lookup_elem(&ovl_mach_low8, key);
 }
 
+__attribute__((__always_inline__)) static inline bool overlaySiteRouteSetValid(const struct switchboard_overlay_site_route_set *routes)
+{
+  if (routes == NULL || routes->version != SWITCHBOARD_OVERLAY_SITE_ROUTE_SET_VERSION ||
+      routes->count == 0 || routes->count > SWITCHBOARD_OVERLAY_SITE_ROUTE_SET_MAX_CANDIDATES) return false;
+#pragma unroll
+  for (__u32 i = 0; i < SWITCHBOARD_OVERLAY_SITE_ROUTE_SET_MAX_CANDIDATES; ++i)
+  {
+    if (i >= routes->count) break;
+    const struct switchboard_overlay_machine_route *candidate = &routes->candidates[i];
+    if ((candidate->family != SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV4 &&
+         candidate->family != SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV6) ||
+        candidate->use_gateway_mac > SWITCHBOARD_OVERLAY_ROUTE_ACTION_LOCAL_CONTAINER_REDIRECT) return false;
+    if (candidate->use_gateway_mac == SWITCHBOARD_OVERLAY_ROUTE_ACTION_LOCAL_CONTAINER_REDIRECT &&
+        (candidate->next_hop_mac[0] != SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST &&
+         candidate->next_hop_mac[0] != SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_SECOND)) return false;
+    if (candidate->use_gateway_mac == SWITCHBOARD_OVERLAY_ROUTE_ACTION_LOCAL_CONTAINER_REDIRECT)
+    {
+#pragma unroll
+      for (__u32 j = 1; j < sizeof(candidate->next_hop_mac); ++j)
+        if (candidate->next_hop_mac[j] != 0) return false;
+    }
+  }
+  return true;
+}
+
+// The destination machine identity is stable for a flow and available at all
+// existing overlay call sites.  Exact machine routes bypass this entirely.
+__attribute__((__always_inline__)) static inline struct switchboard_overlay_machine_route *lookupOverlaySiteRoute(__u32 machine_fragment)
+{
+  struct switchboard_overlay_machine_route_key key = {
+      .fragment = switchboardMakeOverlayDatacenterRouteKey((__u8)(machine_fragment >> 24)),
+  };
+  struct switchboard_overlay_site_route_set *routes = bpf_map_lookup_elem(&ovl_site_rts_v2, &key);
+  if (overlaySiteRouteSetValid(routes) == false) return NULL;
+  const __u32 count = routes->count;
+  // Keep the fixed array bound explicit for the verifier; the validator above
+  // remains responsible for candidate contents and the count contract.
+  if (count == 0 || count > SWITCHBOARD_OVERLAY_SITE_ROUTE_SET_MAX_CANDIDATES) return NULL;
+  __u32 hash = machine_fragment ^ (machine_fragment >> 16) ^ 0x9e3779b9u;
+  __u32 candidateIndex = hash % count;
+  // LLVM can prove the following check from modulo arithmetic and discard it,
+  // while the verifier cannot carry that proof into map-value pointer math.
+  // Keep the existing policy, but retain a verifier-visible array bound.
+  barrier_var(candidateIndex);
+  if (candidateIndex >= SWITCHBOARD_OVERLAY_SITE_ROUTE_SET_MAX_CANDIDATES) return NULL;
+  return &routes->candidates[candidateIndex];
+}
+
 __attribute__((__always_inline__)) static inline struct switchboard_overlay_machine_route *lookupOverlayMachineRouteByFragment(__u32 machine_fragment)
 {
-  if (machine_fragment == 0)
+  if (switchboardOverlayMachineIdentityIsValid(machine_fragment) == false)
   {
     return NULL;
   }
@@ -219,6 +267,14 @@ __attribute__((__always_inline__)) static inline struct switchboard_overlay_mach
     return route;
   }
 
-  key.fragment = (machine_fragment & 0xFFu);
-  return lookupOverlayMachineRouteLow8(&key);
+  // A nonzero datacenter owns a container-network /96.  A site route may
+  // serve an exact-machine miss, but a low-8 alias cannot prove the same
+  // datacenter and must not route a withdrawn remote site to a local machine.
+  route = lookupOverlaySiteRoute(machine_fragment);
+  if (route != NULL)
+  {
+    return route;
+  }
+
+  return NULL;
 }

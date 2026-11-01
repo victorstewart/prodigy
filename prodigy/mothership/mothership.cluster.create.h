@@ -673,7 +673,8 @@ static inline void mothershipProvisionCreatedSeedMachine(
     bool& provisioned,
     BrainIaaSMachineProvisioningProgressSink *progressSink = nullptr,
     ProdigyTimingAttribution *timingAttribution = nullptr,
-    String *failure = nullptr)
+    String *failure = nullptr,
+    bool preserveSnapshotsOnFailure = false)
 {
   provisioned = false;
   seedMachine = {};
@@ -839,11 +840,14 @@ static inline void mothershipProvisionCreatedSeedMachine(
     for (Machine *snapshot : createdSnapshots)
     {
       String destroyFailure;
-      if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
-            iaas.destroyMachine(coro, snapshot->cloudID, destroyFailure);
-          }))
+      if (!preserveSnapshotsOnFailure)
       {
-        co_await coro->suspendAtIndex(suspendIndex);
+        if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+              iaas.destroyMachine(coro, snapshot->cloudID, destroyFailure);
+            }))
+        {
+          co_await coro->suspendAtIndex(suspendIndex);
+        }
       }
       if (failure && failure->empty() && destroyFailure.empty() == false)
       {
@@ -1024,7 +1028,16 @@ static inline bool mothershipBuildRemoteSeedInitialTransportCredentialProjection
       clusterUUID, seedMachine, seedTopology, localState, resolvedTopology, output, failure);
 }
 
-static inline bool mothershipStandUpCluster(MothershipProdigyCluster& cluster, const MothershipProviderCredential *credential, MothershipClusterCreateHooks& hooks, MothershipClusterCreateTimingSummary *timingSummary = nullptr, String *failure = nullptr, const MothershipProviderCredential *dnsCredential = nullptr)
+static inline bool mothershipCanResumeVultrSeedCreation(const MothershipProdigyCluster& cluster, uint128_t requestedUUID)
+{
+  return requestedUUID != 0 && cluster.clusterUUID == requestedUUID &&
+      cluster.deploymentMode == MothershipClusterDeploymentMode::remote &&
+      cluster.provider == MothershipClusterProvider::vultr && !cluster.environmentConfigured &&
+      cluster.topology.machines.empty() && cluster.machines.empty() &&
+      cluster.mothershipConnectivity.kind != MothershipConnectivityKind::tunnelProvider;
+}
+
+static inline bool mothershipStandUpCluster(MothershipProdigyCluster& cluster, const MothershipProviderCredential *credential, MothershipClusterCreateHooks& hooks, MothershipClusterCreateTimingSummary *timingSummary = nullptr, String *failure = nullptr, const MothershipProviderCredential *dnsCredential = nullptr, bool preserveCreatedSeedOnFailure = false)
 {
   if (failure)
   {
@@ -1107,7 +1120,7 @@ static inline bool mothershipStandUpCluster(MothershipProdigyCluster& cluster, c
     }
 
     String cleanupFailure = {};
-    if (destroyCreatedSeedOnFailure && hooks.destroyCreatedSeedMachine(cluster, seedPlan.seedMachine, &cleanupFailure) == false && cleanupFailure.size() > 0)
+    if (destroyCreatedSeedOnFailure && !preserveCreatedSeedOnFailure && hooks.destroyCreatedSeedMachine(cluster, seedPlan.seedMachine, &cleanupFailure) == false && cleanupFailure.size() > 0)
     {
       if (failure)
       {

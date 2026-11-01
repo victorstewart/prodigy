@@ -2,6 +2,8 @@
 """Regression contract for Mothership-owned local KVM launcher execution."""
 
 from pathlib import Path
+import importlib.util
+import tempfile
 import unittest
 
 
@@ -20,6 +22,97 @@ class LocalVMBoundaryOwnerContract(unittest.TestCase):
         help_line = next(line for line in MOTHERSHIP.splitlines() if line.startswith('    message.append("registerLocalVMBoundary'))
         self.assertNotIn("executorPath", help_line)
         self.assertNotIn("executorSHA256", help_line)
+
+    def test_cluster_lan_ipv6_is_one_exact_serialized_boundary_action(self):
+        begin = MOTHERSHIP.index("void runConfigureLocalVMClusterLANIPv6")
+        end = MOTHERSHIP.index("void runFaultLocalClusterMachine", begin)
+        command = MOTHERSHIP[begin:end]
+        self.assertIn('argc == 1', command)
+        self.assertIn('activeLocalVMBoundariesExactForMachines', command)
+        self.assertIn('reconcileLocalVMBoundaryExecutorBinding(boundary, failure)', command)
+        self.assertIn('arguments.emplace_back("configure-cluster-lan-ipv6"_ctv)', command)
+        self.assertIn('runLocalVMBoundarySealedLauncher(boundary, arguments', command)
+        self.assertIn('/etc/systemd/network/10-cloud-init-lan0.network.d/50-prodigy-cluster-lan-ipv6.conf', command)
+        self.assertIn('afterPID != observedPIDs[index]', command)
+        self.assertIn('{"configureLocalVMClusterLANIPv6",  &Mothership::runConfigureLocalVMClusterLANIPv6', MOTHERSHIP)
+        self.assertNotIn('guest command', command.lower())
+
+    def test_fresh_local_vm_launch_is_a_fixed_persistent_sealed_boundary_action(self):
+        begin = MOTHERSHIP.index("[[noreturn]] void runLaunchLocalVM")
+        end = MOTHERSHIP.index("void runPrepareRetainedRecoveryArtifactLocal", begin)
+        command = MOTHERSHIP[begin:end]
+        self.assertIn('arguments.emplace_back("launch"_ctv)', command)
+        self.assertIn('arguments.emplace_back("--state"_ctv); arguments.emplace_back(argv[0])', command)
+        self.assertIn('arguments.emplace_back("--task-id"_ctv); arguments.emplace_back(argv[1])', command)
+        self.assertIn('arguments.emplace_back("--"_ctv)', command)
+        self.assertIn('arguments.emplace_back("--qemu"_ctv); arguments.emplace_back("qemu-system-x86_64"_ctv)', command)
+        self.assertIn('arguments.emplace_back("--qemu-img"_ctv); arguments.emplace_back("qemu-img"_ctv)', command)
+        self.assertIn('arguments.emplace_back("--ssh"_ctv); arguments.emplace_back("ssh"_ctv)', command)
+        caller_arguments = command.index('for (int index = 2; index < argc; ++index) arguments.emplace_back(argv[index])')
+        fixed_qemu = command.index('arguments.emplace_back("--qemu"_ctv)', caller_arguments)
+        delimiter = command.index('arguments.emplace_back("--"_ctv)')
+        self.assertEqual(command.count('arguments.emplace_back("--"_ctv)'), 1)
+        self.assertLess(delimiter, caller_arguments)
+        self.assertLess(caller_arguments, fixed_qemu)
+        self.assertIn('mothershipRunSealedPythonProvider("mothership-local-vm-boundary"', command)
+        self.assertIn('sizeof(mothershipLocalVMBoundarySource)', command)
+        self.assertIn('std::strcmp(argv[index], "--") == 0', command)
+        self.assertNotIn('runLocalVMBoundaryExecutorAction', command)
+        self.assertNotIn('recover-stopped', command)
+        self.assertIn('{"launchLocalVM",                   &Mothership::runLaunchLocalVM', MOTHERSHIP)
+        help_line = next(line for line in MOTHERSHIP.splitlines() if line.startswith('    message.append("launchLocalVM'))
+        self.assertIn("boundary launch arguments", help_line)
+
+    def test_fresh_launch_vector_reaches_the_existing_parser_and_pins_executables(self):
+        spec = importlib.util.spec_from_file_location("local_vm_launch_contract",
+            ROOT / "prodigy/dev/tests/prodigy_dev_kvm_boundary.py")
+        boundary = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(boundary)
+        with tempfile.TemporaryDirectory() as temporary:
+            caller = ["--base-image", "base", "--base-sha256", "0" * 64,
+                "--ovmf-code", "code", "--ovmf-code-sha256", "0" * 64,
+                "--ovmf-vars", "vars", "--ovmf-vars-sha256", "0" * 64,
+                "--guest-uuid", "12345678-1234-4234-9234-123456789abc",
+                "--expected-machine-id", "1" * 32, "--known-hosts", "known",
+                "--ssh-private-key", "key", "--ssh-port", "22223",
+                "--work-dir", temporary, "--evidence-dir", temporary,
+                "--memory-mb", "16384", "--disk-size-gb", "64",
+                "--qemu", "unowned-qemu", "--qemu-i", "unowned-img", "--ssh", "unowned-ssh"]
+            pinned = ["--qemu", "qemu-system-x86_64", "--qemu-img", "qemu-img", "--ssh", "ssh"]
+            operation, _, _, remainder = boundary.lifecycle_arguments([
+                "launch", "--state", str(Path(temporary) / "boundary.json"),
+                "--task-id", "nametag-unit", "--", *caller, *pinned])
+            self.assertEqual(operation, "launch")
+            self.assertEqual(remainder[0], "--")
+            parsed = boundary.parse_args(remainder[1:] + ["--", "true"])
+            self.assertEqual((parsed.qemu, parsed.qemu_img, parsed.ssh),
+                             ("qemu-system-x86_64", "qemu-img", "ssh"))
+            self.assertEqual((parsed.memory_mb, parsed.disk_size_gb), (16384, 64))
+            self.assertEqual(parsed.guest_command, ["true"])
+
+    def test_remove_local_vm_is_the_fixed_sealed_idempotent_boundary_action(self):
+        begin = MOTHERSHIP.index("[[noreturn]] void runRemoveLocalVM")
+        end = MOTHERSHIP.index("void runPrepareRetainedRecoveryArtifactLocal", begin)
+        command = MOTHERSHIP[begin:end]
+        self.assertIn('argc != 2 || argv[0][0] != \'/\'', command)
+        self.assertIn('arguments.emplace_back("remove"_ctv)', command)
+        self.assertIn('arguments.emplace_back("--state"_ctv); arguments.emplace_back(argv[0])', command)
+        self.assertIn('arguments.emplace_back("--task-id"_ctv); arguments.emplace_back(argv[1])', command)
+        self.assertIn('mothershipRunSealedPythonProvider("mothership-local-vm-boundary"', command)
+        self.assertNotIn('runLocalVMBoundaryExecutorAction', command)
+        self.assertNotIn('recover-stopped', command)
+        self.assertIn('{"removeLocalVM",                   &Mothership::runRemoveLocalVM', MOTHERSHIP)
+        self.assertIn('if operation == "remove" and not state_path.exists():\n        return 0', KVM_BOUNDARY)
+
+        spec = importlib.util.spec_from_file_location("local_vm_remove_contract",
+            ROOT / "prodigy/dev/tests/prodigy_dev_kvm_boundary.py")
+        boundary = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(boundary)
+        with tempfile.TemporaryDirectory() as temporary:
+            operation, _, task_id, remainder = boundary.lifecycle_arguments([
+                "remove", "--state", str(Path(temporary) / "boundary.json"),
+                "--task-id", "nametag-unit"])
+        self.assertEqual((operation, task_id, remainder), ("remove", "nametag-unit", []))
 
     def test_hash_and_execution_share_one_opened_remote_descriptor(self):
         begin = MOTHERSHIP.index("bool runCurrentLocalVMBoundarySealedLauncher")
@@ -120,12 +213,19 @@ class LocalVMBoundaryOwnerContract(unittest.TestCase):
             "          existingCohortRecord.request.topologyVersion : cluster.topology.version;",
             owner,
         )
+        admitted_runtime = owner.index(
+            "request.admittedRuntime=existingCohortRecord.request.admittedRuntime;"
+        )
+        prepare_runtime = owner.index("valid=prepareLocalRecoveryRuntimeIntent", admitted_runtime)
+        self.assertLess(admitted_runtime, prepare_runtime)
         self.assertIn(
-            "mothershipLocalAuthorityRecoveryTopologyMatches(existingCohortRecord.request, cluster.topology)",
+            "if (valid && existingCohort &&\n"
+            "          !mothershipLocalAuthorityRecoveryTopologyMatches(existingCohortRecord.request, cluster.topology)",
             owner,
         )
         self.assertIn(
-            "mothershipPhysicalFaultExactSerializedEqual(existingCohortRecord.request, request)",
+            "else if (valid && existingCohort &&\n"
+            "               !mothershipPhysicalFaultExactSerializedEqual(existingCohortRecord.request, request)",
             owner,
         )
 
@@ -133,7 +233,7 @@ class LocalVMBoundaryOwnerContract(unittest.TestCase):
         self.assertIn('re.fullmatch(r"[0-9a-f]{32}", value) is not None', KVM_BOUNDARY)
         self.assertIn('canonical_cold_reboot_id(options.get("--operation-id"), "operation ID")', KVM_BOUNDARY)
         begin = MOTHERSHIP.index("bool runLocalVMBoundaryExecutorAction")
-        end = MOTHERSHIP.index("void runPrepareProductionPair", begin)
+        end = MOTHERSHIP.index("enum class LocalAuthorityRecoveryExecutorPhase", begin)
         helper = MOTHERSHIP[begin:end]
         self.assertIn("mothershipAssignProviderHex128(operationUUID, operation);", helper)
         self.assertNotIn("operation.assignItoh", helper)
@@ -174,6 +274,81 @@ class LocalVMBoundaryOwnerContract(unittest.TestCase):
         self.assertIn("exit(75)", owner)
         self.assertIn("COLD_REBOOT_RELEASE_GRACE_MS", KVM_BOUNDARY)
         self.assertIn('current["notBeforeUnixMs"] = max', KVM_BOUNDARY)
+
+    def test_interrupted_upgrade_keeps_existing_executor_and_installs_before_release(self):
+        begin = MOTHERSHIP.index("void runRecoverLocalClusterAuthority")
+        end = MOTHERSHIP.index("void runPrepareProductionPair", begin)
+        owner = MOTHERSHIP[begin:end]
+        self.assertIn('(argc == 3 || interruptedUpgrade)', owner)
+        self.assertIn('"--complete-interrupted-upgrade"', owner)
+        install = owner.index("!installLocalRecoveryRuntime(cluster,targets[index]")
+        release = owner.index('"release-cold-reboot"', install)
+        observed = owner.index("!awaitLocalAuthorityRecoveryNonSeed", release)
+        activate = owner.index("!activateLocalRecoveryRuntime(cluster,targets[index]", observed)
+        self.assertLess(install, release)
+        self.assertLess(observed, activate)
+        seed_install = owner.index("!installLocalRecoveryRuntime(cluster,targets[seedIndex]")
+        self.assertLess(seed_install, owner.index('"release-cold-reboot"', seed_install))
+        completion = owner.index("localRecoveryRuntimeFreshAuthority(cluster,request,repairBundle,true,failure)",
+                                 owner.index("ClusterStatusReport status"))
+        self.assertLess(completion, owner.index("MothershipLocalAuthorityRecoveryPhase::recovered, completedReceiptSHA256s", completion))
+        self.assertNotIn("qemu-system", owner)
+        self.assertNotIn("beginUpdateSelfBundle", owner)
+
+    def test_admitted_active_runtime_reuses_the_guarded_recovery_owner(self):
+        begin = MOTHERSHIP.index("bool prepareLocalRecoveryRuntimeIntent")
+        end = MOTHERSHIP.index("bool installLocalRecoveryRuntime", begin)
+        prepare = MOTHERSHIP[begin:end]
+        self.assertIn('"--admitted-active-runtime"', prepare)
+        self.assertIn("admittedRuntimeUpgradeVersion", prepare)
+        self.assertIn("loadUpgradeAdmission", prepare)
+        self.assertIn("captureLocalRecoveryWorkloads", prepare)
+        self.assertIn("localRecoveryRuntimeFreshAuthority", prepare)
+        owner_begin = MOTHERSHIP.index("void runRecoverLocalClusterAuthority")
+        owner_end = MOTHERSHIP.index("void runPrepareProductionPair", owner_begin)
+        owner = MOTHERSHIP[owner_begin:owner_end]
+        self.assertIn("prepareLocalRecoveryRuntimeIntent", owner)
+        self.assertIn("reconcileLocalVMBoundaryExecutorBinding", owner)
+        self.assertIn('"arm-cold-reboot"', owner)
+        self.assertIn("installLocalRecoveryRuntime", owner)
+        self.assertIn('"release-cold-reboot"', owner)
+        self.assertIn("activateLocalRecoveryRuntime", owner)
+        fault_begin = MOTHERSHIP.index("void runFaultLocalClusterMachine")
+        fault_end = MOTHERSHIP.index("struct PhysicalFaultProviderRequest", fault_begin)
+        self.assertNotIn("admitted-active-runtime", MOTHERSHIP[fault_begin:fault_end])
+
+    def test_interrupted_install_and_activation_reconcile_durable_progress(self):
+        begin = MOTHERSHIP.index("bool installLocalRecoveryRuntime")
+        end = MOTHERSHIP.index("bool activateLocalRecoveryRuntime", begin)
+        install = MOTHERSHIP[begin:end]
+        self.assertLess(install.index('"query",0,request.timeoutMilliseconds'),
+                        install.index("if(!progress.installDispatched)"))
+        self.assertIn("if(reboot.phase!=LocalAuthorityRecoveryExecutorPhase::armed)", install)
+        dispatched = install.index("progress.installDispatched=true")
+        checkpoint = install.index("checkpointLocalRecoveryRuntime", dispatched)
+        self.assertLess(checkpoint, install.index("runtimeStartupFenceCommand", checkpoint))
+        baseline = install.index("progress.stateSHA256=stateSHA")
+        self.assertLess(install.index("checkpointLocalRecoveryRuntime", baseline),
+                        install.index("retainedRuntimePublicationCommand", baseline))
+        self.assertIn("stateSHA==progress.stateSHA256 && secretsSHA==progress.secretsSHA256", install)
+        activation = MOTHERSHIP[end:MOTHERSHIP.index("void runRecoverLocalClusterAuthority", end)]
+        self.assertIn("progress.activationBootID!=boot", activation)
+        self.assertLess(activation.index("progress.activationBootID=boot"), activation.index("systemctl start prodigy"))
+        self.assertIn("localRecoveryGatewayInventory(record.request,member.machineUUID,true)", activation)
+
+    def test_seed_runtime_install_uses_verified_local_owner_and_observation_program_parses(self):
+        begin = MOTHERSHIP.index("bool localRecoveryRuntimeCommand")
+        end = MOTHERSHIP.index("static std::string localRecoveryRuntimeRoot", begin)
+        transport = MOTHERSHIP[begin:end]
+        self.assertIn("resolveVerifiedDisposableLocalVMIdentity", transport)
+        self.assertIn("local!=target.executor.machineUUID", transport)
+        self.assertIn("mothershipConnectSSHSession", transport)
+        self.assertIn("machine.ssh.hostPublicKeyOpenSSH.empty()", transport)
+        self.assertNotIn("StrictHostKeyChecking=no", transport)
+        self.assertNotIn("qemu", transport)
+        program = MOTHERSHIP.split("python3 - <<'LOCAL_RUNTIME'\n", 1)[1].split("\nLOCAL_RUNTIME\n", 1)[0]
+        compile(program, "embedded-local-runtime-observation", "exec")
+        self.assertIn("split(b'\\0')", program)
 
 
 if __name__ == "__main__":

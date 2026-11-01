@@ -964,6 +964,72 @@ int main(void)
   TestSuite suite;
   Mothership mothership = {};
 
+  {
+    constexpr std::string_view dropIn =
+        "/etc/systemd/network/10-cloud-init-lan0.network.d/50-prodigy-cluster-lan-ipv6.conf";
+    const uint32_t exactReceiptFailures =
+        Mothership::unitTestLocalVMClusterLANIPv6ReceiptFailureMask(
+            "lan0", "02:67:00:00:00:13", "fd91:6ddb:71b::/64",
+            "fd91:6ddb:71b:0:cef7:c0ba:3de3:eeea/64", dropIn);
+    if (exactReceiptFailures != 0)
+      std::fprintf(stderr, "exact LAN receipt failure mask=%u\n", exactReceiptFailures);
+    suite.expect(exactReceiptFailures == 0,
+                 "local_vm_cluster_lan_ipv6_exact_owner_receipt_accepted");
+    const uint32_t publicReceiptFailures =
+        Mothership::unitTestLocalVMClusterLANIPv6ReceiptFailureMask(
+            "lan0", "02:67:00:00:00:13", "2001:db8::/64",
+            "2001:db8::13/64", dropIn);
+    if (publicReceiptFailures != (1u << 8))
+      std::fprintf(stderr, "public LAN receipt failure mask=%u\n", publicReceiptFailures);
+    suite.expect(publicReceiptFailures == (1u << 8),
+                 "local_vm_cluster_lan_ipv6_public_subnet_rejected_exactly");
+  }
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && std::strcmp(only, "lan-receipt-validation") == 0)
+  {
+    std::fprintf(stderr, "lan-receipt-validation failed=%d\n", suite.failed);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+
+  {
+    MothershipProdigyCluster cluster = {};
+    cluster.clusterUUID = 123;
+    cluster.deploymentMode = MothershipClusterDeploymentMode::local;
+    MothershipUpgradeAdmissionReport report = {};
+    report.clusterUUID = cluster.clusterUUID;
+    suite.expect(Mothership::unitTestNoManagedPublicWorkloads(&cluster, report),
+                 "upgrade_local_empty_exact_registered_cluster");
+    report.clusterUUID = 124;
+    suite.expect(!Mothership::unitTestNoManagedPublicWorkloads(&cluster, report),
+                 "upgrade_local_empty_wrong_cluster_rejected");
+    report.clusterUUID = cluster.clusterUUID;
+    report.activeDeploymentCount = 1;
+    suite.expect(!Mothership::unitTestNoManagedPublicWorkloads(&cluster, report),
+                 "upgrade_local_nonempty_rejected");
+    suite.expect(!Mothership::unitTestActiveWorkloadInterruptionAccepted(&cluster, report, false),
+                 "upgrade_local_nonempty_requires_explicit_interruption_acceptance");
+    suite.expect(Mothership::unitTestActiveWorkloadInterruptionAccepted(&cluster, report, true),
+                 "upgrade_local_nonempty_explicit_interruption_acceptance");
+    report.activeDeploymentCount = 0;
+    suite.expect(!Mothership::unitTestActiveWorkloadInterruptionAccepted(&cluster, report, true),
+                 "upgrade_local_empty_cannot_claim_active_workload_interruption");
+    suite.expect(!Mothership::unitTestNoManagedPublicWorkloads(nullptr, report),
+                 "upgrade_unregistered_cluster_rejected");
+    report.activeDeploymentCount = 1;
+    suite.expect(!Mothership::unitTestActiveWorkloadInterruptionAccepted(nullptr, report, true),
+                 "upgrade_unregistered_cluster_cannot_accept_active_workload_interruption");
+    report.activeDeploymentCount = 0;
+    cluster.deploymentMode = MothershipClusterDeploymentMode::remote;
+    suite.expect(Mothership::unitTestNoManagedPublicWorkloads(&cluster, report),
+                 "upgrade_remote_empty_receipt_preserved");
+  }
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && std::strcmp(only, "empty-local-upgrade") == 0)
+  {
+    std::fprintf(stderr, "empty-local-upgrade failed=%d\n", suite.failed);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+
 #if PRODIGY_DEBUG
   {
     MothershipConnectivity connectivity = {};

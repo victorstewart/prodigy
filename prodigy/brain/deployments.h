@@ -3,6 +3,7 @@
 #include <services/debug.h>
 #include <prodigy/debug.h>
 #include <prodigy/container.services.h>
+#include <prodigy/retained.container.recovery.h>
 #include <prodigy/brain/timing.knobs.h>
 #include <algorithm>
 #include <cstdio>
@@ -1403,6 +1404,8 @@ static bool prodigyTakeAssignedGPUsForScheduling(
 class ApplicationDeployment : public TimeoutDispatcher {
 private:
 
+  friend struct ProdigyDeploymentTargetTestAccess;
+
   static inline Pool<DeploymentWork, true> workPool;
 
   TimeoutPacket canaryTimer;
@@ -1506,6 +1509,8 @@ private:
     {
       return;
     }
+    std::fprintf(stderr, "Prodigy durable container launch failed for deployment %llu: %s\n",
+                 static_cast<unsigned long long>(deferred.deploymentID), reason.c_str());
     state = DeploymentState::failed;
     stateChangedAtMs = Time::now<TimeResolution::ms>();
     waitingOnContainers.erase(container);
@@ -3416,15 +3421,25 @@ private:
     Ring::queueCancelTimeout(&autoscaleTimer);
   }
 
-  void setDeploymentRunning(void)
+  bool statelessRetirementCompletionPending = false;
+
+  bool setDeploymentRunning(void)
   {
+    if (!thisBrain->prepareStatelessDeploymentRetirement(this))
+    {
+      statelessRetirementCompletionPending = true;
+      thisBrain->pushSpinApplicationProgressToMothership(
+          this, "waiting for durable stateless predecessor retirement authority"_ctv);
+      return false;
+    }
+    statelessRetirementCompletionPending = false;
     materializedStatefulRecoveryOwnsTransition = false;
     materializedStatefulRecoveryHealthFailed = false;
     state = DeploymentState::running;
     stateChangedAtMs = Time::now<TimeResolution::ms>();
     if (plan.config.type == ApplicationType::task)
     {
-      return;
+      return true;
     }
     autoscaleTimer.setTimeoutSeconds(configuredAutoscalePeriodSeconds());
     autoscaleTimer.dispatcher = this;
@@ -3441,7 +3456,7 @@ private:
       {
         thisBrain->releaseRoutableResourceLeasesForDeployment(previous->plan.config.deploymentID());
         thisBrain->queueBrainReplication(BrainTopic::cullDeployment, previous->plan.config.deploymentID());
-        ContainerStore::destroy(previous->plan.config.deploymentID());
+        thisBrain->cleanupStatelessRetiredArtifact(previous->plan.config.deploymentID());
       }
 
       delete previous;
@@ -3449,6 +3464,7 @@ private:
     }
 
     dispatchDeferredStatefulScaleIntent();
+    return true;
   }
 
   void consumeSchedulingExecution(void)
@@ -3623,10 +3639,48 @@ private:
     return recovered;
   }
 
+  void horizontalScalerBounds(uint32_t& baseMin, uint32_t& baseMax,
+                              uint32_t& surgeMin, uint32_t& surgeMax) const
+  {
+    baseMin = baseMax = surgeMin = surgeMax = 0;
+    auto mergeBounds = [](const HorizontalScaler& scaler, uint32_t& minBound, uint32_t& maxBound) {
+      minBound = std::max(minBound, scaler.minValue);
+      if (scaler.maxValue > 0 && (maxBound == 0 || scaler.maxValue < maxBound))
+        maxBound = scaler.maxValue;
+    };
+    for (const HorizontalScaler& scaler : plan.horizontalScalers)
+    {
+      if (scaler.lifetime == ApplicationLifetime::base) mergeBounds(scaler, baseMin, baseMax);
+      else if (scaler.lifetime == ApplicationLifetime::surge) mergeBounds(scaler, surgeMin, surgeMax);
+    }
+  }
+
+  uint32_t statefulFloorShardGroups(uint32_t baseMin, uint32_t baseMax) const
+  {
+    if (!plan.isStateful || plan.stateful.neverShard ||
+        plan.config.applicationID == 2 || plan.config.applicationID == 5) return 0;
+    uint32_t groups = uint32_t((uint64_t(baseMin) + 2ull) / 3ull);
+    // A partial group is not constructible, so the maximum wins over an
+    // incompatible minimum at the next complete group.
+    if (baseMax > 0) groups = std::min(groups, baseMax / 3u);
+    return groups;
+  }
+
   void calculateTargets(void)
   {
     if (plan.isStateful)
     {
+      if (plan.config.applicationID == 2 || plan.config.applicationID == 5) {
+        if ((!prodigyGraphDeploymentPlanCanonical(plan, false) && !prodigyGraphDeploymentPlanCanonical(plan, true)) ||
+            (previous && previous->nShardGroups > 1) ||
+            std::any_of(containers.begin(), containers.end(), [](const auto *container) {
+              return container && container->shardGroup != 0;
+            })) {
+          nShardGroups = nTargetBase = 0;
+          state = DeploymentState::failed;
+          return;
+        }
+      }
       if (previous)
       {
         nShardGroups = previous->nShardGroups;
@@ -3652,7 +3706,29 @@ private:
         }
       }
 
-      if (thisBrain) nShardGroups = std::max(nShardGroups, thisBrain->desiredStatefulShardGroupCount(plan.config.deploymentID()));
+      uint32_t authoritativeGroups = 0;
+      if (plan.config.applicationID == 2 || plan.config.applicationID == 5) nShardGroups = 1;
+      else if (thisBrain) {
+        authoritativeGroups = thisBrain->desiredStatefulShardGroupCount(plan.config.deploymentID());
+        if (authoritativeGroups == UINT32_MAX) {
+          nShardGroups = nTargetBase = 0;
+          state = DeploymentState::failed;
+          return;
+        }
+        nShardGroups = std::max(nShardGroups, authoritativeGroups);
+      }
+      // Only a genuinely empty genesis can choose its final floor before any
+      // server advertises ownership. Existing and authority-owned topologies
+      // retain their current recovery and growth paths.
+      if (state == DeploymentState::none && previous == nullptr && containers.empty() &&
+          toSchedule.empty() && waitingOnContainers.empty() &&
+          !materializedStatefulRecoveryOwnsTransition && !hasRetainedStorageRecoverySource &&
+          deferredStatefulTargetShardGroups == 0 && authoritativeGroups == 0)
+      {
+        uint32_t baseMin, baseMax, surgeMin, surgeMax;
+        horizontalScalerBounds(baseMin, baseMax, surgeMin, surgeMax);
+        nShardGroups = std::max(nShardGroups, statefulFloorShardGroups(baseMin, baseMax));
+      }
       nTargetBase = 0;
       for (uint32_t shardGroup = 0; shardGroup < nShardGroups; ++shardGroup)
       {
@@ -6083,44 +6159,8 @@ private:
       bool surgeUp = false;
       bool surgeDown = false;
 
-      uint32_t baseMin = 0;
-      uint32_t baseMax = 0;
-      uint32_t surgeMin = 0;
-      uint32_t surgeMax = 0;
-
-      auto mergeBounds = [](const HorizontalScaler& scaler, uint32_t& minBound, uint32_t& maxBound) -> void {
-        if (scaler.minValue > minBound)
-        {
-          minBound = scaler.minValue;
-        }
-
-        if (scaler.maxValue > 0)
-        {
-          if (maxBound == 0 || scaler.maxValue < maxBound)
-          {
-            maxBound = scaler.maxValue;
-          }
-        }
-      };
-
-      for (const HorizontalScaler& scaler : plan.horizontalScalers)
-      {
-        switch (scaler.lifetime)
-        {
-          case ApplicationLifetime::base:
-            {
-              mergeBounds(scaler, baseMin, baseMax);
-              break;
-            }
-          case ApplicationLifetime::surge:
-            {
-              mergeBounds(scaler, surgeMin, surgeMax);
-              break;
-            }
-          default:
-            break;
-        }
-      }
+      uint32_t baseMin, baseMax, surgeMin, surgeMax;
+      horizontalScalerBounds(baseMin, baseMax, surgeMin, surgeMax);
 
       reapResponses(plan.horizontalScalers, [&](const HorizontalScaler& scaler, bool scaleUp) -> void {
         if (scaleUp)
@@ -6165,6 +6205,32 @@ private:
       {
         baseDown = false;
         surgeDown = false;
+
+        // A stateful base floor is a topology requirement, not evidence of
+        // current load.  Preserve the normal metric path below, but request
+        // the required shard groups through the durable deferred-growth owner
+        // even when no metric has arrived (or its observed value is zero).
+        // Stateful shard groups have exactly three replicas.  Graph services
+        // and never-shard deployments retain their canonical one-group shape.
+        const uint32_t floorShardGroups = statefulFloorShardGroups(baseMin, baseMax);
+        if (floorShardGroups > nShardGroups)
+        {
+          uint32_t queuedShardGroups = std::max(deferredStatefulTargetShardGroups, nShardGroups);
+          if (queuedShardGroups < floorShardGroups)
+          {
+            requestDeferredStatefulShardGrowth(floorShardGroups - queuedShardGroups);
+          }
+
+          // The deferred owner creates one group only after the preceding
+          // group reaches its readiness/culling barrier.  Do not construct a
+          // second group directly from this autoscale tick.
+          dispatchDeferredStatefulScaleIntent();
+          // A queued floor owns this evaluation even when the deferred owner
+          // cannot dispatch yet (for example, a topology upgrade or a prior
+          // group is still pending).  Falling through to metric scaling here
+          // would append a second request beyond the bounded floor.
+          co_return;
+        }
       }
 
       if (baseUp || baseDown || surgeUp || surgeDown)
@@ -6720,6 +6786,13 @@ private:
   }
 
 public:
+
+  void resumeStatelessRetirementCompletion()
+  {
+    if (!statelessRetirementCompletionPending || state == DeploymentState::failed ||
+        nDeployed() < nTarget() || nHealthy() < nTarget()) return;
+    if (setDeploymentRunning()) thisBrain->spinApplicationFin(this);
+  }
 
   ~ApplicationDeployment()
   {
@@ -7277,7 +7350,21 @@ public:
 
   DeploymentWork *planStatefulConstruction(Machine *machine, ContainerView *container, DataStrategy dataStrategy)
   {
+    if (prodigyGraphDeploymentPlanCanonical(plan, true)) {
+      container->explicitStatefulTopology = {};
+      prodigyPopulateDefaultStatefulTopology(container->explicitStatefulTopology, 0, plan.config);
+      container->explicitStatefulTopology.servingMode = StatefulTopologyServingMode::catchupOnly;
+    }
     StatefulDataAuthority desired;
+    ProdigyAllMastersSeedBootstrap bootstrap;
+    if (thisBrain && thisBrain->desiredAllMastersSeedBootstrap(plan.config.deploymentID(), container->shardGroup, bootstrap)) {
+      prodigyPopulateDefaultStatefulTopology(container->explicitStatefulTopology, container->shardGroup, plan.config);
+      container->explicitStatefulTopology.servingMode = StatefulTopologyServingMode::allMastersSeedBootstrap;
+      container->explicitStatefulTopology.allMastersSeedBootstrap = bootstrap;
+      // The empty successor launches normally; authenticated remote seeding is
+      // started separately after the process has reached ordinary readiness.
+      dataStrategy = DataStrategy::genesis;
+    }
     if (thisBrain && thisBrain->desiredStatefulDataAuthority(plan.config.deploymentID(), desired, container->shardGroup) &&
         desired.shardGroup == container->shardGroup) {
       prodigyPopulateDefaultStatefulTopology(container->explicitStatefulTopology, container->shardGroup, plan.config);
@@ -7971,7 +8058,7 @@ public:
     return owner;
   }
 
-  bool reserveWhiteholeAddressPortLease(const Whitehole& whitehole, const RoutableResourceLeaseOwner& owner)
+  static bool reserveWhiteholeAddressPortLease(const Whitehole& whitehole, const RoutableResourceLeaseOwner& owner)
   {
     if (whitehole.hasAddress == false || whitehole.address.isNull() || whitehole.sourcePort == 0)
     {
@@ -7998,7 +8085,7 @@ public:
     }
     for (const RoutableResourceLease& existing : thisBrain->routableResourceLeaseRuntimeState)
     {
-      if (existing.kind == lease.kind && existing.sourcePort == lease.sourcePort && existing.address.equals(lease.address) && routableResourceLeaseOwnersCompatible(existing.owner, lease.owner))
+      if (existing.kind == lease.kind && existing.sourcePort == lease.sourcePort && existing.address.equals(lease.address) && (existing.owner == lease.owner || routableResourceLeaseOwnersCompatible(existing.owner, lease.owner)))
       {
         return true;
       }
@@ -10123,7 +10210,8 @@ public:
         {
           definitionContext.roles = container->effectiveStatefulMeshRoles(plan);
           definitionContext.topology = container->effectiveStatefulTopology(plan);
-          definitionContext.advertiseClient = plan.stateful.allMasters || !masterForShardGroup.contains(container->shardGroup);
+          definitionContext.advertiseClient = definitionContext.roles.client != 0 &&
+              (plan.stateful.allMasters || !masterForShardGroup.contains(container->shardGroup));
           definitionContext.seedingAlways = plan.stateful.seedingAlways;
           definitionContext.dataStrategy = work.data;
           definitionContext.nShardGroups = nShardGroups;
@@ -10299,7 +10387,22 @@ public:
 
             if constexpr (std::is_same_v<T, StatefulWork>)
             {
+              if (prodigyGraphDeploymentPlanCanonical(plan, true)) {
+                container->explicitStatefulTopology = {};
+                prodigyPopulateDefaultStatefulTopology(container->explicitStatefulTopology, 0, plan.config);
+                container->explicitStatefulTopology.servingMode = StatefulTopologyServingMode::catchupOnly;
+              }
               StatefulDataAuthority desired;
+              ProdigyAllMastersSeedBootstrap bootstrap;
+              if (thisBrain->desiredAllMastersSeedBootstrap(plan.config.deploymentID(), container->shardGroup, bootstrap)) {
+                prodigyPopulateDefaultStatefulTopology(container->explicitStatefulTopology, container->shardGroup, plan.config);
+                container->explicitStatefulTopology.servingMode = StatefulTopologyServingMode::allMastersSeedBootstrap;
+                container->explicitStatefulTopology.allMastersSeedBootstrap = bootstrap;
+                container->declaredStatefulClientService = StatefulMeshRoles::forShardGroup(plan.stateful,
+                    plan.config.applicationID, container->shardGroup).client;
+                if (!container->declaredStatefulClientPort) container->declaredStatefulClientPort = container->getRandomAdvertisementPort();
+                work.data = DataStrategy::genesis;
+              }
               if (thisBrain->desiredStatefulDataAuthority(plan.config.deploymentID(), desired, container->shardGroup)) {
                 // This must precede mesh declarations, ContainerPlan creation
                 // and bootstrap serialization. Catchup is the first target mode.
@@ -10611,9 +10714,9 @@ public:
       else
       {
         thisBrain->pushSpinApplicationProgressToMothership(this, "all containers are deployed and healthy"_ctv);
-        thisBrain->spinApplicationFin(this);
       }
-      setDeploymentRunning();
+      if (setDeploymentRunning() && plan.config.type != ApplicationType::task)
+        thisBrain->spinApplicationFin(this);
     }
 
     if (isDecommissioning())
@@ -10651,6 +10754,22 @@ public:
 #endif
     }
 
+    auto replacementFit = [&](ContainerView *container, const MachineResourcesDelta& existing, MachineResourcesDelta& credited) -> uint32_t {
+      if (previous == nullptr || container == nullptr || container->machine == nullptr ||
+          previous->containers.contains(container) == false || container->plannedWork != nullptr)
+        return 0;
+      Machine *machine = container->machine;
+      auto indexed = machine->containersByDeploymentID.find(previous->plan.config.deploymentID());
+      if (indexed == machine->containersByDeploymentID.end() ||
+          std::find(indexed->second.begin(), indexed->second.end(), container) == indexed->second.end())
+        return 0;
+      credited = existing;
+      prodigyApplyPlannedMachineScalarDelta(credited, previous->plan.config, -1);
+      prodigyAppendGPUMemoryMBs(credited.gpuMemoryMBs, container->assignedGPUMemoryMBs);
+      prodigyAppendAssignedGPUDevices(credited.gpuDevices, container->assignedGPUDevices);
+      return nFitOnMachine(this, machine, 1, credited);
+    };
+
     if (materializedStatefulRecoveryOwnsTransition)
     {
       if (materializedStatefulRecoveryHealthFailed || previous == nullptr)
@@ -10661,9 +10780,10 @@ public:
       // Capacity or control loss must not fall through to destructive relocation.
       for (ContainerView *container : previous->containers)
       {
+        MachineResourcesDelta credited;
         if (container == nullptr || container->machine == nullptr ||
             BrainBase::neuronControlStreamActive(container->machine) == false ||
-            nFitOnMachine(this, container->machine, 1) == 0)
+            replacementFit(container, MachineResourcesDelta {}, credited) == 0)
         {
           co_return;
         }
@@ -10747,7 +10867,8 @@ public:
 
               Machine *machine = container->machine;
               const bool controlActive = BrainBase::neuronControlStreamActive(machine);
-              const uint32_t fit = controlActive ? nFitOnMachine(this, machine, 1) : 0;
+              MachineResourcesDelta credited;
+              const uint32_t fit = controlActive ? replacementFit(container, deltasByMachine[machine], credited) : 0;
 #if PRODIGY_DEBUG
               PRODIGY_DEBUG_LOG("stateful inplace candidate deploymentID=%llu head=%llu previous=%llu oldContainer=%llu host=%u controlActive=%d runtimeReady=%d nFit=%u\n",
                                 (unsigned long long)plan.config.deploymentID(),
@@ -10766,9 +10887,7 @@ public:
               if (fit > 0)
               {
                 MachineResourcesDelta& deltas = deltasByMachine[machine];
-                prodigyApplyPlannedMachineScalarDelta(deltas, previous->plan.config, -1);
-                prodigyAppendGPUMemoryMBs(deltas.gpuMemoryMBs, container->assignedGPUMemoryMBs);
-                prodigyAppendAssignedGPUDevices(deltas.gpuDevices, container->assignedGPUDevices);
+                deltas = std::move(credited);
 
                 if (onlyMeasure)
                 {
@@ -11221,6 +11340,15 @@ public:
   // called on the head deployment after new master
   void evaluateAfterNewMaster(void)
   {
+    if ((plan.config.applicationID == 2 || plan.config.applicationID == 5) &&
+        ((!prodigyGraphDeploymentPlanCanonical(plan, false) && !prodigyGraphDeploymentPlanCanonical(plan, true)) ||
+         std::any_of(containers.begin(), containers.end(), [](const auto *container) {
+           return container && container->shardGroup != 0;
+         }))) {
+      nShardGroups = nTargetBase = 0;
+      state = DeploymentState::failed;
+      return;
+    }
     state = DeploymentState::deploying;
     stateChangedAtMs = Time::now<TimeResolution::ms>();
 
@@ -11228,7 +11356,7 @@ public:
 
     if (plan.isStateful)
     {
-      nShardGroups = containersByShardGroup.size();
+      nShardGroups = (plan.config.applicationID == 2 || plan.config.applicationID == 5) ? 1 : containersByShardGroup.size();
       nTargetBase = 0;
       for (uint32_t shardGroup = 0; shardGroup < nShardGroups; ++shardGroup)
       {
@@ -11721,6 +11849,7 @@ public:
 
   void rollForward(void)
   {
+    if (next && thisBrain && thisBrain->allMastersSeedBootstrapAwaitingCancellation(next->plan.config.deploymentID())) return;
     if (next && next->plan.canaryCount == 0)
     {
       beginDecommissioningForRollForward();
@@ -11802,6 +11931,29 @@ public:
     state = DeploymentState::deploying;
     stateChangedAtMs = Time::now<TimeResolution::ms>();
     operatorCancellationOwnsTransition = true;
+    return true;
+  }
+
+  // The qualification owner has already durably recorded this exact cohort.
+  // Never infer a replaceable cohort from deployment size alone.
+  bool qualificationStatefulCancellationIsSafe(const ProdigyQualificationStatefulCancellation& scope, bool requireSuccessor = true) const
+  {
+    if (!plan.isStateful || plan.config.type == ApplicationType::task || (requireSuccessor && !next) ||
+        (state != DeploymentState::running && state != DeploymentState::none) ||
+        containers.size() != scope.members.size() || containers.empty() ||
+        !waitingOnContainers.empty() || waitingOnCompactions || canaryStack || currentlyExecutingWork ||
+        !toSchedule.empty() || schedulingStack.execution || retiredSchedulingExecution ||
+        !schedulingStack.waiters.empty() || nSuspended || consumingSchedulingExecution) return false;
+    for (const auto& member : scope.members) {
+      size_t matches = 0;
+      for (const auto *container : containers) {
+        if (container && container->machine && container->uuid == member.containerUUID &&
+            container->machine->uuid == member.machineUUID && container->deploymentID == plan.config.deploymentID() &&
+            !container->plannedWork && container->state != ContainerState::aboutToDestroy &&
+            container->state != ContainerState::destroying && container->state != ContainerState::destroyed) ++matches;
+      }
+      if (matches != 1) return false;
+    }
     return true;
   }
 

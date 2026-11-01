@@ -1,0 +1,4 @@
+FROM @PRODIGY_MASQUE_GATEWAY_RUNTIME_BASE@
+COPY {gateway} ./masque-tunnel /gateway/masque-tunnel
+SURVIVE /gateway/masque-tunnel
+EXECUTE ["/gateway/masque-tunnel"]

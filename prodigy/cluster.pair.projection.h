@@ -5,6 +5,13 @@
 
 constexpr inline uint32_t ProdigyLocalClusterPairControlProjectionLegacyMaximumCredentials = 256;
 constexpr inline uint32_t ProdigyLocalClusterPairControlProjectionMaximumCredentials = 512;
+enum class ProdigyPairPrivateDiscoveryPhase : uint8_t { none = 0, prepared = 1, active = 2 };
+class ProdigyPairPrivateDiscoveryStatus {
+public:
+  uint128_t pairUUID = 0, peerClusterUUID = 0, activationUUID = 0;
+  uint64_t rootGeneration = 0;
+  ProdigyPairPrivateDiscoveryPhase phase = ProdigyPairPrivateDiscoveryPhase::none;
+};
 class ProdigyLocalClusterPairControlCredential {
 public:
   uint128_t pairUUID = 0; uint64_t rootGeneration = 0; uint64_t keyEpoch = 0;
@@ -17,10 +24,12 @@ class ProdigyLocalClusterPairControlProjection {
 public:
   static constexpr uint32_t legacyVersion1 = 1;
   static constexpr uint32_t version = 2;
+  static constexpr uint32_t privateDiscoveryVersion = 3;
   uint32_t protocolVersion = 0; uint128_t localClusterUUID = 0, nodeUUID = 0;
   uint64_t committedAuthorityGeneration = 0;
   Vector<ProdigyLocalClusterPairControlCredential> credentials;
   Vector<ProdigyClusterPairEpochStatus> epochStatuses;
+  Vector<ProdigyPairPrivateDiscoveryStatus> privateDiscoveryStatuses;
 };
 static inline bool prodigyLocalClusterPairControlCredentialValid(const ProdigyLocalClusterPairControlCredential& credential,
                                                                   uint128_t clusterUUID, uint128_t nodeUUID, bool requireSecret)
@@ -76,12 +85,27 @@ static inline bool prodigyLocalClusterPairControlCredentialAllowedByEpoch(
 static inline bool prodigyLocalClusterPairControlProjectionValid(const ProdigyLocalClusterPairControlProjection& projection, bool requireSecret)
 {
   if ((projection.protocolVersion != ProdigyLocalClusterPairControlProjection::legacyVersion1 &&
-       projection.protocolVersion != ProdigyLocalClusterPairControlProjection::version) || projection.localClusterUUID == 0 ||
+       projection.protocolVersion != ProdigyLocalClusterPairControlProjection::version &&
+       projection.protocolVersion != ProdigyLocalClusterPairControlProjection::privateDiscoveryVersion) || projection.localClusterUUID == 0 ||
       projection.nodeUUID == 0 || projection.committedAuthorityGeneration == 0 ||
       projection.credentials.size() > ProdigyLocalClusterPairControlProjectionMaximumCredentials ||
       projection.epochStatuses.size() > ProdigyClusterPairEpochMaximumStatuses ||
+      projection.privateDiscoveryStatuses.size() > ProdigyClusterPairEpochMaximumStatuses ||
+      (projection.protocolVersion < ProdigyLocalClusterPairControlProjection::privateDiscoveryVersion && !projection.privateDiscoveryStatuses.empty()) ||
       (projection.protocolVersion == ProdigyLocalClusterPairControlProjection::legacyVersion1 &&
        (projection.credentials.size() > ProdigyLocalClusterPairControlProjectionLegacyMaximumCredentials || !projection.epochStatuses.empty()))) return false;
+  for (uint32_t index = 0; index < projection.privateDiscoveryStatuses.size(); ++index) {
+    const auto& status = projection.privateDiscoveryStatuses[index];
+    if (!status.pairUUID || !status.rootGeneration || !status.peerClusterUUID ||
+        status.peerClusterUUID == projection.localClusterUUID || !status.activationUUID ||
+        (status.phase != ProdigyPairPrivateDiscoveryPhase::prepared && status.phase != ProdigyPairPrivateDiscoveryPhase::active)) return false;
+    if (std::none_of(projection.credentials.begin(), projection.credentials.end(), [&](const auto& credential) {
+          return credential.pairUUID == status.pairUUID && credential.rootGeneration == status.rootGeneration &&
+            (credential.initiator.clusterUUID == status.peerClusterUUID || credential.responder.clusterUUID == status.peerClusterUUID);
+        })) return false;
+    for (uint32_t prior = 0; prior < index; ++prior)
+      if (projection.privateDiscoveryStatuses[prior].pairUUID == status.pairUUID) return false;
+  }
   for (uint32_t index = 0; index < projection.epochStatuses.size(); ++index)
   {
     const auto& status = projection.epochStatuses[index];
@@ -140,7 +164,11 @@ static inline bool prodigyLocalClusterPairControlProjectionValid(const ProdigyLo
 }
 static inline bool prodigyLocalClusterPairControlProjectionEqual(const ProdigyLocalClusterPairControlProjection& left, const ProdigyLocalClusterPairControlProjection& right)
 {
-  if (left.protocolVersion != right.protocolVersion || left.localClusterUUID != right.localClusterUUID || left.nodeUUID != right.nodeUUID || left.committedAuthorityGeneration != right.committedAuthorityGeneration || left.credentials.size() != right.credentials.size() || left.epochStatuses.size() != right.epochStatuses.size()) return false;
+  if (left.protocolVersion != right.protocolVersion || left.localClusterUUID != right.localClusterUUID || left.nodeUUID != right.nodeUUID || left.committedAuthorityGeneration != right.committedAuthorityGeneration || left.credentials.size() != right.credentials.size() || left.epochStatuses.size() != right.epochStatuses.size() || left.privateDiscoveryStatuses.size() != right.privateDiscoveryStatuses.size()) return false;
+  for (uint32_t index = 0; index < left.privateDiscoveryStatuses.size(); ++index) {
+    const auto& a = left.privateDiscoveryStatuses[index]; const auto& b = right.privateDiscoveryStatuses[index];
+    if (a.pairUUID != b.pairUUID || a.rootGeneration != b.rootGeneration || a.peerClusterUUID != b.peerClusterUUID || a.activationUUID != b.activationUUID || a.phase != b.phase) return false;
+  }
   for (uint32_t index = 0; index < left.credentials.size(); ++index) {
     const auto& a = left.credentials[index]; const auto& b = right.credentials[index];
     if (a.pairUUID != b.pairUUID || a.rootGeneration != b.rootGeneration || a.keyEpoch != b.keyEpoch || a.initiator != b.initiator || a.responder != b.responder || a.localClaim != b.localClaim || a.remoteClaim != b.remoteClaim || a.canonicalContext != b.canonicalContext || CRYPTO_memcmp(a.psk, b.psk, sizeof(a.psk)) != 0) return false;
@@ -162,10 +190,16 @@ template <typename S> static void serialize(S&& serializer, ProdigyLocalClusterP
   serializer.text1b(credential.remoteClaim, 222); serializer.text1b(credential.canonicalContext, 1024);
   for (auto& byte: credential.psk) serializer.value1b(byte);
 }
+template <typename S> static void serialize(S&& serializer, ProdigyPairPrivateDiscoveryStatus& status) {
+  serializer.value16b(status.pairUUID); serializer.value8b(status.rootGeneration);
+  serializer.value16b(status.peerClusterUUID); serializer.value16b(status.activationUUID);
+  uint8_t phase = uint8_t(status.phase); serializer.value1b(phase); status.phase = ProdigyPairPrivateDiscoveryPhase(phase);
+}
 template <typename S> static void serialize(S&& serializer, ProdigyLocalClusterPairControlProjection& projection) {
   // Empty ordinary projections retain the v1 wire shape until rotation needs
   // a status record. The value read from a v1 record remains v1 in memory.
-  uint32_t wireVersion = projection.epochStatuses.empty() ? ProdigyLocalClusterPairControlProjection::legacyVersion1 : projection.protocolVersion;
+  uint32_t wireVersion = !projection.privateDiscoveryStatuses.empty() ? ProdigyLocalClusterPairControlProjection::privateDiscoveryVersion :
+      (projection.epochStatuses.empty() ? ProdigyLocalClusterPairControlProjection::legacyVersion1 : ProdigyLocalClusterPairControlProjection::version);
   serializer.value4b(wireVersion); projection.protocolVersion = wireVersion;
   serializer.value16b(projection.localClusterUUID); serializer.value16b(projection.nodeUUID);
   serializer.value8b(projection.committedAuthorityGeneration);
@@ -175,5 +209,8 @@ template <typename S> static void serialize(S&& serializer, ProdigyLocalClusterP
       [](auto& nested, auto& credential) { nested.object(credential); });
   if (projection.protocolVersion >= ProdigyLocalClusterPairControlProjection::version)
     serializer.container(projection.epochStatuses, ProdigyClusterPairEpochMaximumStatuses,
+        [](auto& nested, auto& status) { nested.object(status); });
+  if (projection.protocolVersion >= ProdigyLocalClusterPairControlProjection::privateDiscoveryVersion)
+    serializer.container(projection.privateDiscoveryStatuses, ProdigyClusterPairEpochMaximumStatuses,
         [](auto& nested, auto& status) { nested.object(status); });
 }

@@ -110,6 +110,8 @@ int main(void)
     ~ScopedTestDirectory() { std::filesystem::remove_all(path); }
   } ownedDirectory {directory};
   String path(directory);
+  MothershipUpgradeAdmissionRecord expectedEligibleAdmission = {};
+  MothershipUpgradeAdmissionRecord expectedIneligibleAdmission = {};
   {
   MothershipClusterRegistry registry(path);
   MothershipUpgradeAdmissionRecord request = {};
@@ -139,11 +141,18 @@ int main(void)
   assert(!resumed && recorded.firstStopGate == request.firstStopGate);
   assert(registry.recordUpgradeAdmission(request, recorded, resumed, &failure));
   assert(resumed);
+  MothershipUpgradeAdmissionRecord ineligible = request;
+  ineligible.operationID = uint128_t(0xB23);
+  assert(registry.recordUpgradeAdmission(ineligible, expectedIneligibleAdmission, resumed, &failure));
+  assert(!resumed && !expectedIneligibleAdmission.eligible);
   request.observationReceiptVersion = 2;
   request.observationReportSHA256 = digest('4');
   request.plannerInputSHA256 = digest('5');
+  request.eligible = true;
+  request.firstStopGate.clear();
   assert(registry.recordUpgradeAdmission(request, recorded, resumed, &failure));
-  assert(!resumed && recorded.rejectedObservations.size() == 1);
+  assert(!resumed && recorded.eligible && recorded.rejectedObservations.size() == 1);
+  expectedEligibleAdmission = recorded;
   MothershipUpgradeAdmissionRecord loaded = {};
   assert(registry.loadUpgradeAdmission(request.clusterUUID, request.operationID, loaded, &failure));
   assert(loaded.semanticObservationSHA256 == request.semanticObservationSHA256 &&
@@ -269,6 +278,36 @@ int main(void)
   rejectedReceipt = receipt; rejectedReceipt.admission.acceptedMasterUUID += 1;
   assert(!registry.recordTestPairTargetAdmission(pairStored, rejectedReceipt, pairLoaded, &failure));
   assert(registry.advanceTestPairBoundary(pairStored, 1, false, pairLoaded, &failure));
+  }
+  { // A fresh registry handle must observe the exact durable admission state.
+    MothershipClusterRegistry registry(path);
+    String failure = {}, expectedBytes = {}, loadedBytes = {};
+    MothershipUpgradeAdmissionRecord loaded = {};
+    assert(registry.loadUpgradeAdmission(
+        expectedEligibleAdmission.clusterUUID, expectedEligibleAdmission.operationID, loaded, &failure));
+    auto expectedCopy = expectedEligibleAdmission;
+    auto loadedCopy = loaded;
+    assert(BitseryEngine::serialize(expectedBytes, expectedCopy));
+    assert(BitseryEngine::serialize(loadedBytes, loadedCopy));
+    assert(expectedBytes == loadedBytes && loaded.eligible);
+
+    expectedBytes.clear(); loadedBytes.clear(); loaded = {};
+    assert(registry.loadUpgradeAdmission(
+        expectedIneligibleAdmission.clusterUUID, expectedIneligibleAdmission.operationID, loaded, &failure));
+    expectedCopy = expectedIneligibleAdmission;
+    loadedCopy = loaded;
+    assert(BitseryEngine::serialize(expectedBytes, expectedCopy));
+    assert(BitseryEngine::serialize(loadedBytes, loadedCopy));
+    assert(expectedBytes == loadedBytes && !loaded.eligible);
+
+    MothershipUpgradeAdmissionRecord missing = {};
+    assert(!registry.loadUpgradeAdmission(
+        expectedEligibleAdmission.clusterUUID, uint128_t(0xB24), missing, &failure));
+    auto conflicting = expectedEligibleAdmission;
+    conflicting.targetBundleSHA256 = digest('9');
+    bool resumed = false;
+    assert(!registry.recordUpgradeAdmission(conflicting, loaded, resumed, &failure));
+    assert(failure == "upgrade admission operation identity conflicts with existing immutable record"_ctv);
   }
   { // Cold registry reopen retains the exact target and selector; no second request owner.
     MothershipClusterRegistry registry(path);

@@ -11,6 +11,22 @@ enum {
   SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV6 = 6,
 };
 
+// Keep the existing route value ABI: `use_gateway_mac` was a bool on the
+// wire, and value 2 occupies its previously-invalid range.  The redirect
+// target lives in byte zero of next_hop_mac, which is unused by gateway-MAC
+// routes.  This lets site-route candidates gain a local netkit action without
+// reinterpreting old pinned ovl_mach_full values.
+enum {
+  SWITCHBOARD_OVERLAY_ROUTE_ACTION_DIRECT_MAC = 0,
+  SWITCHBOARD_OVERLAY_ROUTE_ACTION_GATEWAY_MAC = 1,
+  SWITCHBOARD_OVERLAY_ROUTE_ACTION_LOCAL_CONTAINER_REDIRECT = 2,
+};
+
+enum {
+  SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST = 252,
+  SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_SECOND = 253,
+};
+
 enum {
   SWITCHBOARD_IP_PROTOCOL_IPIP = 4,
   SWITCHBOARD_IP_PROTOCOL_TCP = 6,
@@ -212,6 +228,18 @@ struct switchboard_overlay_machine_route {
   __u8 next_hop6[16];
   __be32 source4;
   __u8 source6[16];
+};
+
+// A separate, versioned map value for remote datacenter (/96) fallbacks.
+// Do not change switchboard_overlay_machine_route: old ovl_mach_full pins
+// retain that value ABI and continue to serve exact machine routes.
+#define SWITCHBOARD_OVERLAY_SITE_ROUTE_SET_VERSION 1u
+#define SWITCHBOARD_OVERLAY_SITE_ROUTE_SET_MAX_CANDIDATES 3u
+struct switchboard_overlay_site_route_set {
+  __u8 version;
+  __u8 count;
+  __u8 reserved[2];
+  struct switchboard_overlay_machine_route candidates[SWITCHBOARD_OVERLAY_SITE_ROUTE_SET_MAX_CANDIDATES];
 };
 
 struct switchboard_overlay_ingress_peer4_key {

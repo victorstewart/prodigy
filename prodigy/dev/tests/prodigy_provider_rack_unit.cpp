@@ -29,7 +29,7 @@ public:
     }
     else
     {
-      basics_log("FAIL: %s\n", name);
+      std::fprintf(stderr, "FAIL: %s\n", name);
       failed += 1;
     }
   }
@@ -854,6 +854,11 @@ int main(void)
       String recoveredID = {};
       suite.expect(vultrFindMachineIDByLabel(doc, MachineConfig::MachineKind::vm, "ntg-vultr-vx1-g-2c-8g-123", recoveredID), "vultr_create_recovery_finds_machine_by_label");
       suite.expect(recoveredID == "instance-b"_ctv, "vultr_create_recovery_returns_matching_id");
+      suite.expect(vultrRecoverySeedIdentityMatches("instance-b"_ctv, 1, recoveredID), "vultr_recovery_exact_seed_id_accepts_unique_match");
+      suite.expect(!vultrRecoverySeedIdentityMatches("instance-a"_ctv, 1, recoveredID) &&
+                   !vultrRecoverySeedIdentityMatches("instance-b"_ctv, 0, recoveredID) &&
+                   !vultrRecoverySeedIdentityMatches("instance-b"_ctv, 2, recoveredID), "vultr_recovery_rejects_wrong_missing_or_duplicate_seed");
+      suite.expect(vultrRecoverySeedIdentityMatches({ }, 0, recoveredID), "vultr_normal_create_keeps_existing_behavior");
       suite.expect(vultrFindMachineIDByLabel(doc, MachineConfig::MachineKind::vm, "missing", recoveredID) == false, "vultr_create_recovery_rejects_missing_label");
     }
   }
@@ -1018,8 +1023,73 @@ int main(void)
                      http.requests[2].method == MultiCurlClient::Method::delete_,
                  "vultr_delete_verified_machine_submits_exact_vm_delete");
     http.complete(MultiCurlClient::Status::success, 404);
+    suite.expect(stack.hasSuspendedCoroutines() && http.requests.size() == 4 &&
+                     http.requests[3].method == MultiCurlClient::Method::get,
+                 "vultr_delete_race_requires_verified_absence");
+    http.complete(MultiCurlClient::Status::success, 404);
     suite.expect(stack.hasSuspendedCoroutines() == false && failure.empty(),
                  "vultr_delete_raced_verified_not_found_is_idempotent");
+  }
+
+  {
+    ScriptedVultrHttp http = {};
+    ScriptedVultrDelay delay = {};
+    VultrBrainIaaS provider = {};
+    configureVultrProviderForTest(provider, http, {}, &delay);
+    CoroutineStack stack = {};
+    String failure = {};
+    provider.destroyMachine(&stack, "pending-machine"_ctv, failure);
+    http.complete(MultiCurlClient::Status::success, 404);
+    http.complete(MultiCurlClient::Status::success, 200, R"json({"instance":{"id":"pending-machine"}})json"_ctv);
+    http.complete(MultiCurlClient::Status::success, 204);
+    suite.expect(stack.hasSuspendedCoroutines() && http.requests.size() == 4 &&
+                     http.requests[3].method == MultiCurlClient::Method::get &&
+                     http.requests[3].url == "https://api.vultr.com/v2/instances/pending-machine"_ctv,
+                 "vultr_delete_accepted_requires_exact_machine_readback");
+    http.complete(MultiCurlClient::Status::success, 200, R"json({"instance":{"id":"pending-machine"}})json"_ctv);
+    suite.expect(delay.pending != nullptr && delay.complete(), "vultr_delete_pending_machine_retries");
+    http.complete(MultiCurlClient::Status::success, 404);
+    suite.expect(!stack.hasSuspendedCoroutines() && failure.empty(), "vultr_delete_succeeds_only_after_absence");
+  }
+
+  for (unsigned scenario = 0; scenario < 4; ++scenario)
+  {
+    ScriptedVultrHttp http = {};
+    VultrBrainIaaS provider = {};
+    configureVultrProviderForTest(provider, http);
+    CoroutineStack stack = {};
+    String failure = {};
+    provider.destroyMachine(&stack, "verify-machine"_ctv, failure);
+    http.complete(MultiCurlClient::Status::success, 404);
+    http.complete(MultiCurlClient::Status::success, 200, R"json({"instance":{"id":"verify-machine"}})json"_ctv);
+    http.complete(MultiCurlClient::Status::success, 204);
+    if (scenario == 0) http.complete(MultiCurlClient::Status::transportFailure, 404);
+    else if (scenario == 1) http.complete(MultiCurlClient::Status::success, 403);
+    else if (scenario == 2) http.complete(MultiCurlClient::Status::success, 200, "not-json"_ctv);
+    else http.complete(MultiCurlClient::Status::success, 200, R"json({"instance":{"id":"other-machine"}})json"_ctv);
+    suite.expect(!stack.hasSuspendedCoroutines() && !failure.empty(),
+                 "vultr_delete_verification_fails_closed_on_untrusted_response");
+  }
+
+  {
+    ScriptedVultrHttp http = {};
+    ScriptedVultrDelay delay = {};
+    VultrBrainIaaS provider = {};
+    configureVultrProviderForTest(provider, http, {}, &delay);
+    CoroutineStack stack = {};
+    String failure = {};
+    provider.destroyMachine(&stack, "stuck-machine"_ctv, failure);
+    http.complete(MultiCurlClient::Status::success, 404);
+    http.complete(MultiCurlClient::Status::success, 200, R"json({"instance":{"id":"stuck-machine"}})json"_ctv);
+    http.complete(MultiCurlClient::Status::success, 204);
+    for (uint32_t attempt = 0; attempt < vultrMachineDeleteMaxAttempts; ++attempt)
+    {
+      http.complete(MultiCurlClient::Status::success, 200, R"json({"instance":{"id":"stuck-machine"}})json"_ctv);
+      if (attempt + 1 < vultrMachineDeleteMaxAttempts)
+        suite.expect(delay.complete(), "vultr_delete_timeout_retry_is_scheduled");
+    }
+    suite.expect(!stack.hasSuspendedCoroutines() && failure == "timed out waiting for vultr machine deletion"_ctv,
+                 "vultr_delete_persistent_machine_times_out");
   }
 
   {
