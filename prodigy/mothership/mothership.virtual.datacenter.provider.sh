@@ -329,6 +329,22 @@ valid_workspace()
    [[ "${canonical}" == "$1" && "$1" == /*/* && "$1" != */ ]]
 }
 
+disable_owned_boundary_host_tx_checksum()
+{
+   local runtime="$1" parent_ns="$2" suffix="${1: -8}" host_ifindex host_iflink parent_ifindex parent_iflink
+   local host_edge="vdh${suffix}" parent_edge="vdp${suffix}"
+   [[ "$runtime" =~ ^[1-9][0-9]*$ && "$parent_ns" == "pvd-p-${runtime}" ]] || return 2
+   command -v ethtool >/dev/null && command -v ip >/dev/null || return 1
+   ip -d -j link show dev "$host_edge" | python3 -c 'import json,sys; x=json.load(sys.stdin); assert len(x)==1 and x[0]["linkinfo"]["info_kind"]=="veth"'
+   ip netns exec "$parent_ns" ip -d -j link show dev "$parent_edge" | python3 -c 'import json,sys; x=json.load(sys.stdin); assert len(x)==1 and x[0]["linkinfo"]["info_kind"]=="veth"'
+   host_ifindex="$(<"/sys/class/net/${host_edge}/ifindex")"; host_iflink="$(<"/sys/class/net/${host_edge}/iflink")"
+   parent_ifindex="$(ip netns exec "$parent_ns" cat "/sys/class/net/${parent_edge}/ifindex")"
+   parent_iflink="$(ip netns exec "$parent_ns" cat "/sys/class/net/${parent_edge}/iflink")"
+   [[ "$host_ifindex" =~ ^[1-9][0-9]*$ && "$host_iflink" == "$parent_ifindex" && "$parent_iflink" == "$host_ifindex" ]] || return 1
+   ethtool -K "$host_edge" tx off
+   ethtool -k "$host_edge" | grep -Eq '^[[:space:]]*tx-checksum-ip-generic: off([[:space:]]|$)'
+}
+
 valid_control_socket_path()
 {
    [[ "$1" =~ ^/tmp/prodigy-vdc-0x[0-9a-fA-F]{1,32}(-d([1-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5]))?/mothership\.sock$ ]]
@@ -670,6 +686,92 @@ fault_datacenter()
       sleep 0.1
    done
    return 1
+}
+
+repair_transport()
+{
+   [[ "$#" -eq 3 && "${EUID}" -eq 0 ]] || return 2
+   local workspace="$1" pass_elf="$2" expected_sha="$3" provider_pid="" runtime=""
+   valid_workspace "${workspace}" || return 2
+   [[ "${pass_elf}" == /* && -f "${pass_elf}" && ! -L "${pass_elf}" && "${expected_sha}" =~ ^[0-9a-f]{64}$ ]] || return 2
+   [[ -r "${workspace}/virtual-datacenter.pid" && -r "${workspace}/virtual-datacenter.runtime" && -r "${workspace}/test-cluster-manifest.json" ]] || return 1
+   provider_pid="$(<"${workspace}/virtual-datacenter.pid")"
+   provider_process "${provider_pid}" "${workspace}" || return 1
+   runtime="$(runtime_identity_for_workspace "${workspace}" "${provider_pid}")" || return 1
+   command -v bpftool >/dev/null && command -v nsenter >/dev/null && command -v sha256sum >/dev/null || return 1
+   # The retained provider is the namespace owner; a new provider invocation
+   # must enter that exact mount namespace before resolving its netns handles.
+   { declare -f disable_owned_boundary_host_tx_checksum; cat <<'VDC_REPAIR'; } | nsenter -t "${provider_pid}" -m -- bash -s -- "${workspace}" "${pass_elf}" "${expected_sha}" "${runtime}" "${provider_pid}"
+set -Eeuo pipefail
+workspace="$1"; pass_elf="$2"; expected_sha="$3"; runtime="$4"; provider_pid="$5"
+[[ "$(stat -Lc %i /proc/self/ns/mnt)" == "$(stat -Lc %i "/proc/${provider_pid}/ns/mnt")" ]]
+[[ "$(sha256sum "${pass_elf}" | awk '{print $1}')" == "${expected_sha}" ]]
+parent="pvd-p-${runtime}"; bpffs="${workspace}/boundary-bpffs"
+[[ -d /run/netns && ! -L /run/netns && -e "/run/netns/${parent}" && ! -L "/run/netns/${parent}" ]]
+[[ -d "${bpffs}" && ! -L "${bpffs}" && "$(findmnt -n -o FSTYPE -T "${bpffs}")" == bpf ]]
+[[ "$(ip netns exec "${parent}" stat -Lc %i /proc/self/ns/net)" == "$(stat -Lc %i "/run/netns/${parent}")" ]]
+[[ "$(stat -Lc %i "/run/netns/${parent}")" != "$(stat -Lc %i "/proc/${provider_pid}/ns/net")" ]]
+mapfile -t pids < "${workspace}/virtual-datacenter.runtime"
+[[ "${#pids[@]}" -gt 0 ]]
+for i in "${!pids[@]}"; do
+  index=$((i + 1)); pid="${pids[$i]}"
+  [[ "${pid}" =~ ^[1-9][0-9]*$ && -e "/proc/${pid}/ns/net" && -e "/run/netns/pvd-m${index}-${runtime}" ]]
+  [[ "$(stat -Lc %i "/proc/${pid}/ns/net")" == "$(stat -Lc %i "/run/netns/pvd-m${index}-${runtime}")" ]]
+  ip netns exec "${parent}" ip link show "vp${index}" >/dev/null
+done
+python3 - "${workspace}/test-cluster-manifest.json" "${workspace}" "${parent}" "${provider_pid}" "${pids[@]}" <<'PY'
+import json,sys
+m=json.load(open(sys.argv[1])); workspace,parent,provider_pid,pids=sys.argv[2],sys.argv[3],int(sys.argv[4]),sys.argv[5:]
+assert m['workspaceRoot']==workspace and m['parentNamespace']==parent and m['parentPid']==provider_pid and len(m['nodes'])==len(pids)
+for index,pid in enumerate(pids, 1):
+    node=next(n for n in m['nodes'] if n['index']==index)
+    assert node['pid']==int(pid) and node['namespace']==f'pvd-m{index}-{parent[6:]}'
+PY
+pin_dir="${bpffs}/transport-peer-pass-${runtime}"
+if [[ ! -e "${pin_dir}" && ! -L "${pin_dir}" ]]; then
+  mkdir -m 0700 "${pin_dir}"
+fi
+[[ -d "${pin_dir}" && ! -L "${pin_dir}" ]]
+pin="${pin_dir}/vdc_peer_pass"
+if [[ ! -e "${pin}" ]]; then
+  bpftool prog loadall "${pass_elf}" "${pin_dir}"
+fi
+[[ -r "${pin}" ]]
+meta="$(bpftool -j prog show pinned "${pin}")"
+program_id="$(printf '%s' "${meta}" | python3 -c 'import json,sys; p=json.load(sys.stdin); p=p[0] if isinstance(p,list) else p; assert p["name"]=="vdc_peer_pass" and p["type"]=="xdp" and not p.get("map_ids",[]) and int(p.get("bytes_xlated",0))==16; print(p["id"])')"
+umask 077
+raw="${workspace}/transport-peer-pass.xlated.$$.bin"
+: > "${raw}"
+bpftool prog dump xlated pinned "${pin}" file "${raw}"
+chmod 0600 "${raw}"
+[[ "$(wc -c < "${raw}")" == 16 ]] && cmp -s "${raw}" <(printf '\xb4\x00\x00\x00\x02\x00\x00\x00\x95\x00\x00\x00\x00\x00\x00\x00')
+rm -f "${raw}"
+xdp_program_id()
+{
+  ip netns exec "${parent}" ip -j link show dev "$1" | python3 -c 'import json,sys
+x=json.load(sys.stdin)[0].get("xdp", {}); p=x.get("prog"); attached=x.get("attached", [])
+if not isinstance(p, dict): print("foreign" if attached else 0)
+elif len(attached)==1 and attached[0].get("mode")==1 and attached[0].get("prog", {}).get("id")==p.get("id"): print(p["id"])
+else: print("foreign")'
+}
+for i in "${!pids[@]}"; do
+  dev="vp$((i + 1))"
+  attached="$(xdp_program_id "${dev}")"
+  [[ "${attached}" == 0 || "${attached}" == "${program_id}" ]]
+done
+disable_owned_boundary_host_tx_checksum "${runtime}" "${parent}"
+for i in "${!pids[@]}"; do
+  dev="vp$((i + 1))"
+  attached="$(xdp_program_id "${dev}")"
+  if [[ "${attached}" == 0 ]]; then
+    # No force/replace flag: an intervening or pre-existing XDP owner fails closed.
+    ip netns exec "${parent}" ip link set dev "${dev}" xdpdrv pinned "${pin}"
+  fi
+  [[ "$(xdp_program_id "${dev}")" == "${program_id}" ]]
+done
+printf 'version=1 runtimeIdentity=%s parentNamespace=%s programID=%s programSHA256=%s parentVethCount=%s\n' "${runtime}" "${parent}" "${program_id}" "${expected_sha}" "${#pids[@]}" > "${workspace}/transport-peer-pass.receipt.$$.tmp"
+mv -f "${workspace}/transport-peer-pass.receipt.$$.tmp" "${workspace}/transport-peer-pass.receipt"
+VDC_REPAIR
 }
 
 
@@ -3362,6 +3464,11 @@ case "${1:-}" in
       fault_datacenter "$@"
       exit
       ;;
+   --repair-transport)
+      shift
+      repair_transport "$@"
+      exit
+      ;;
    --probe)
       shift
       probe_datacenter "$@"
@@ -3492,6 +3599,13 @@ then
 fi
 underlay_mtu=$((inter_container_mtu + 40))
 public_ingress_mtu=1500
+# Public wormholes require a standard 1500-byte underlay even when their
+# containers use the 1448-byte inner budget. Private-only fixtures retain the
+# selected inner MTU plus IPv6 encapsulation overhead.
+if [[ "${fake_boundary}" == "1" && "${underlay_mtu}" -lt "${public_ingress_mtu}" ]]
+then
+   underlay_mtu="${public_ingress_mtu}"
+fi
 parent_ns="pvd-p-${runtime_identity}"
 filesystem_root="/mnt/prodigy-vdc-${runtime_identity}"
 filesystem_image="${workspace}/virtual-datacenter.btrfs"
@@ -3865,6 +3979,7 @@ then
    # This synthetic 1500-byte public boundary belongs only to deploymentMode=test; production clusters never execute this provider.
    ip route replace 198.18.0.0/16 via 172.31.0.2 dev "${host_edge}" mtu "${public_ingress_mtu}"
    ip netns exec "${parent_ns}" ip link set "${parent_edge}" up
+   disable_owned_boundary_host_tx_checksum "${runtime_identity}" "${parent_ns}"
    ip netns exec "${parent_ns}" ip addr add 172.31.0.2/30 dev "${parent_edge}"
    ip netns exec "${parent_ns}" ip -6 addr add fd00:31::2/126 dev "${parent_edge}"
    ip netns exec "${parent_ns}" ip route replace default via 172.31.0.1 dev "${parent_edge}"
