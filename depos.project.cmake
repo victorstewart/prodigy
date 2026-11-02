@@ -1,7 +1,9 @@
 # Copyright 2026 Victor Stewart
 # SPDX-License-Identifier: Apache-2.0
 
-set(DEPOS_BOOTSTRAP_VERSION "0.5.0" CACHE STRING "Pinned depos version used by prodigy" FORCE)
+# Depos 0.5.5 supplies the SOURCE_VARIANT parser required by the pinned Rust
+# toolchain DepoFile.
+set(DEPOS_BOOTSTRAP_VERSION "0.5.5" CACHE STRING "Pinned depos version used by prodigy" FORCE)
 
 set(
   PRODIGY_RELEASE_DEPOFILE_CACHE_DIR

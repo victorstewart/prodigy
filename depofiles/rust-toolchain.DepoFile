@@ -28,4 +28,4 @@ EOF
 ARTIFACT bin/rustc
 ARTIFACT bin/rustdoc
 ARTIFACT bin/cargo
-ARTIFACT lib
+TARGET rust_toolchain::sysroot INTERFACE lib

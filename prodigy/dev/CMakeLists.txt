@@ -491,19 +491,6 @@ set(PRODIGY_CROSS_CLUSTER_MASQUE_GATEWAY_ARTIFACT "${CMAKE_BINARY_DIR}/prodigy-c
 set(PRODIGY_MASQUE_GATEWAY_RUNTIME_BASE "" CACHE STRING "Pinned Discombobulator FROM source for a non-x86_64 MASQUE gateway runtime")
 if (PRODIGY_RESOLVED_TARGET_ARCH STREQUAL "x86_64")
    set(PRODIGY_MASQUE_GATEWAY_RUNTIME_BASE "remote dockerhub library/archlinux@sha256:5b0bb8064e4fcb1b2092fdee45e959c3c2d18dc7fb986a046aaddaae4d731993 for x86_64")
-elseif (PRODIGY_MASQUE_GATEWAY_RUNTIME_BASE STREQUAL "")
-   message(FATAL_ERROR "Cross-cluster MASQUE gateway requires an explicit digest-pinned PRODIGY_MASQUE_GATEWAY_RUNTIME_BASE for ${PRODIGY_RESOLVED_TARGET_ARCH}.")
-else()
-   string(REGEX MATCH "^remote[ \t]+dockerhub[ \t]+[^ \t@]+@sha256:([0-9a-f]+)[ \t]+for[ \t]+${PRODIGY_RESOLVED_TARGET_ARCH}$"
-      _prodigy_masque_gateway_runtime_base_match "${PRODIGY_MASQUE_GATEWAY_RUNTIME_BASE}")
-   if (_prodigy_masque_gateway_runtime_base_match STREQUAL "")
-      message(FATAL_ERROR "PRODIGY_MASQUE_GATEWAY_RUNTIME_BASE must be exactly a dockerhub repository@sha256 digest pinned for ${PRODIGY_RESOLVED_TARGET_ARCH}.")
-   endif()
-   set(_prodigy_masque_gateway_runtime_digest "${CMAKE_MATCH_1}")
-   string(LENGTH "${_prodigy_masque_gateway_runtime_digest}" _prodigy_masque_gateway_runtime_digest_length)
-   if (NOT _prodigy_masque_gateway_runtime_digest_length EQUAL 64)
-      message(FATAL_ERROR "PRODIGY_MASQUE_GATEWAY_RUNTIME_BASE must contain a 64-character lowercase sha256 digest.")
-   endif()
 endif()
 set(PRODIGY_PINGPONG_UNREADY_DISCOMBOBUFILE "${CMAKE_BINARY_DIR}/prodigy-pingpong-unready.DiscombobuFile")
 set(PRODIGY_PINGPONG_UNREADY_CONTAINER_ARTIFACT "${CMAKE_BINARY_DIR}/prodigy-pingpong-unready.${PRODIGY_RESOLVED_TARGET_ARCH}.container.zst")
@@ -1370,10 +1357,6 @@ add_dependencies(prodigy_switchboard_whitehole_unit
 
 add_dependencies(prodigy_mothership_artifact_responsiveness_unit host_ingress_router host_egress_router)
 
-add_dependencies(prodigy_brain_replication_credentials_unit
-   host_ingress_router
-   host_egress_router)
-
 # Build the boundary fake-ipv4 NAT object used by netns ingress/egress testing.
 add_custom_command(OUTPUT fake_ipv4_boundary_nat.ebpf.o
                    COMMAND "${PRODIGY_CLANG_EXECUTABLE}" ${PRODIGY_EBPF_COMPILE_FLAGS} -MMD -MF fake_ipv4_boundary_nat.ebpf.o.d -c ${CMAKE_CURRENT_SOURCE_DIR}/fake_ipv4_boundary_nat.ebpf.c -o fake_ipv4_boundary_nat.ebpf.o
@@ -1542,6 +1525,10 @@ add_custom_target(prodigy_mothership_tunnel_provider_artifact DEPENDS "${PRODIGY
 
 add_custom_command(
    OUTPUT "${PRODIGY_CROSS_CLUSTER_MASQUE_GATEWAY_ARTIFACT}"
+   COMMAND "${CMAKE_COMMAND}"
+           "-DPRODIGY_MASQUE_GATEWAY_RUNTIME_BASE=${PRODIGY_MASQUE_GATEWAY_RUNTIME_BASE}"
+           "-DPRODIGY_RESOLVED_TARGET_ARCH=${PRODIGY_RESOLVED_TARGET_ARCH}"
+           -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/require_masque_gateway_runtime_base.cmake"
    COMMAND "${CMAKE_COMMAND}" -E env
            CARGO_TARGET_DIR=${DISCOMBOBULATOR_CARGO_TARGET_DIR}
            cargo run --quiet --manifest-path "${DISCOMBOBULATOR_MANIFEST}" --
@@ -1557,6 +1544,7 @@ add_custom_command(
    DEPENDS "${PRODIGY_MASQUE_TUNNEL_BINARY}"
            "${CMAKE_CURRENT_SOURCE_DIR}/tests/cross_cluster_masque_gateway.DiscombobuFile.in"
            "${PRODIGY_CROSS_CLUSTER_MASQUE_GATEWAY_DISCOMBOBUFILE}"
+           "${CMAKE_CURRENT_SOURCE_DIR}/tests/require_masque_gateway_runtime_base.cmake"
            "${DISCOMBOBULATOR_MANIFEST}"
            "${DISCOMBOBULATOR_CARGO_LOCK}"
            ${DISCOMBOBULATOR_SOURCE_FILES}
@@ -1681,11 +1669,6 @@ add_dependencies(prodigy_bundle_artifact_unit prodigy_bundle prodigy_bundle_sha2
 add_dependencies(prodigy_pingpong_container_artifact prodigy_bundle)
 add_dependencies(prodigy_pingpong_isolation_container_artifact prodigy_bundle)
 add_dependencies(prodigy_pingpong_unready_container_artifact prodigy_bundle)
-add_dependencies(prodigy_brain_replication_credentials_unit
-   prodigy_bundle
-   prodigy_mothership_tunnel_provider_artifact
-   prodigy_cross_cluster_masque_gateway_artifact
-   prodigy_pingpong_container_artifact)
 foreach(_prodigy_artifact_test IN ITEMS
    prodigy_artifact_io_unit
    prodigy_mothership_artifact_responsiveness_unit
@@ -2329,6 +2312,21 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
               -DPRODIGY_DEPOS_MANIFEST_NAMESPACE=${_prodigy_depos_store_namespace}
               -DPRODIGY_MASQUE_TUNNEL_VERSION=${_prodigy_masque_tunnel_version}
               -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_dependency_materialization_contract.cmake
+   )
+   add_test(
+      NAME prodigy_public_header_basics_contract
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT}
+              -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_public_header_basics_contract.cmake
+   )
+   add_test(
+      NAME prodigy_focused_credential_unit_contract
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT}
+              -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_focused_credential_unit_contract.cmake
+   )
+   add_test(
+      NAME prodigy_source_dependency_release_contract
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT}
+              -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_source_dependency_release_contract.cmake
    )
    add_test(
       NAME prodigy_container_cgroup_bounds_contract

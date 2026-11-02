@@ -25,6 +25,10 @@ REQUIRED = {
     "tools/evaluation/session.py",
     "tools/evaluation/verify.py",
     "prodigy/dev/tests/prodigy_dev_test_cluster.sh",
+    "include/prodigy/cousin.session.h",
+    "include/prodigy/cousin.discovery.h",
+    "include/prodigy/cousin.route.h",
+    "include/prodigy/cluster.pair.keys.h",
     "examples/hello-prodigy/hello-prodigy-v1.aarch64.container.zst",
     "examples/hello-prodigy/hello-prodigy-v2.aarch64.container.zst",
     "examples/hello-prodigy/hello-prodigy-v1.deployment.plan.v1.json",
@@ -55,6 +59,17 @@ class VerifyRejectsInvalidInputs(unittest.TestCase):
             (root / "evaluation.json").write_text(json.dumps({
                 "formatVersion": 1, "version": "test", "architecture": "aarch64", "files": {},
             }))
+            with self.assertRaisesRegex(ValueError, "incomplete evaluation manifest"):
+                VERIFY.verify(root)
+
+    def test_rejects_missing_pairing_header(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_rejected_bundle(root)
+            manifest_path = root / "evaluation.json"
+            manifest = json.loads(manifest_path.read_text())
+            del manifest["files"]["include/prodigy/cluster.pair.keys.h"]
+            manifest_path.write_text(json.dumps(manifest))
             with self.assertRaisesRegex(ValueError, "incomplete evaluation manifest"):
                 VERIFY.verify(root)
 

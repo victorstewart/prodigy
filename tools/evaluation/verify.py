@@ -21,6 +21,8 @@ def verify(root):
     required = {"try-prodigy", "bin/prodigy", "bin/mothership", "bin/discombobulator",
                 "tools/evaluation/session.py", "tools/evaluation/verify.py",
                 "prodigy/dev/tests/prodigy_dev_test_cluster.sh",
+                "include/prodigy/cousin.session.h", "include/prodigy/cousin.discovery.h",
+                "include/prodigy/cousin.route.h", "include/prodigy/cluster.pair.keys.h",
                 f"bin/prodigy.{manifest['architecture']}.bundle.tar.zst",
                 f"bin/prodigy.{manifest['architecture']}.bundle.tar.zst.sha256"}
     if not isinstance(files, dict) or not required.issubset(files):

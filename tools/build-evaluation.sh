@@ -29,8 +29,8 @@ if [[ ! -f "${repo_root}/.depos.cmake" ]]; then
   bootstrap="$(mktemp "${repo_root}/.depos-bootstrap.XXXXXX")"
   trap 'rm -f "${bootstrap}"' EXIT
   curl --fail --location --silent --show-error --connect-timeout 15 --max-time 120 \
-    https://raw.githubusercontent.com/victorstewart/depos/v0.5.0/.depos.cmake --output "${bootstrap}"
-  [[ "$(sha256sum "${bootstrap}" | awk '{print $1}')" == 8d8ae162d8efbee29ad70773f42751d44124129a22563978c9208fde2cef1d02 ]] || {
+    https://raw.githubusercontent.com/victorstewart/depos/v0.5.5/.depos.cmake --output "${bootstrap}"
+  [[ "$(sha256sum "${bootstrap}" | awk '{print $1}')" == dcf232d697ca8250871a33d9a5d58b135f03d09b3081bf9d1bd7a2d44e383497 ]] || {
     echo "build-evaluation: Depos CMake module checksum mismatch." >&2; exit 1;
   }
   mv "${bootstrap}" "${repo_root}/.depos.cmake"
