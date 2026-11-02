@@ -25,7 +25,7 @@ set(
 )
 set(
   PRODIGY_BASICS_RELEASE_DEPOFILE_SHA256
-  "0d9343147640e59f5ee68dc1110fbc74b0817d1443dd49338e09ad8ea8afe3f6"
+  "0d97ac4ca094897c2798357a55fcdab2e311f0fa1941fdbbecc48a51d1df5d00"
   CACHE STRING
   "SHA256 for the published Basics detached DepoFile asset"
 )

@@ -13,7 +13,7 @@ foreach(_prodigy_basics_release_contract IN ITEMS
    [[PRODIGY_BASICS_RELEASE_VERSION
   "0.4.14-rc.1"]]
    [[https://github.com/victorstewart/basics/releases/download/v0.4.14-rc.1/basics.DepoFile]]
-   [[0d9343147640e59f5ee68dc1110fbc74b0817d1443dd49338e09ad8ea8afe3f6]]
+   [[0d97ac4ca094897c2798357a55fcdab2e311f0fa1941fdbbecc48a51d1df5d00]]
 )
    string(FIND "${_prodigy_depos_project}" "${_prodigy_basics_release_contract}"
       _prodigy_basics_release_contract_index)
