@@ -8,6 +8,21 @@ if (NOT EXISTS "${_prodigy_source_dependency_packager}")
    message(FATAL_ERROR "Missing Prodigy source-dependency release producer.")
 endif()
 
+file(READ "${PRODIGY_ROOT}/depos.project.cmake" _prodigy_depos_project)
+foreach(_prodigy_basics_release_contract IN ITEMS
+   [[PRODIGY_BASICS_RELEASE_VERSION
+  "0.4.14-rc.1"]]
+   [[https://github.com/victorstewart/basics/releases/download/v0.4.14-rc.1/basics.DepoFile]]
+   [[0d9343147640e59f5ee68dc1110fbc74b0817d1443dd49338e09ad8ea8afe3f6]]
+)
+   string(FIND "${_prodigy_depos_project}" "${_prodigy_basics_release_contract}"
+      _prodigy_basics_release_contract_index)
+   if (_prodigy_basics_release_contract_index EQUAL -1)
+      message(FATAL_ERROR
+         "Prodigy dev does not select the release-tested Basics candidate: ${_prodigy_basics_release_contract}")
+   endif()
+endforeach()
+
 file(READ "${_prodigy_source_dependency_packager}" _prodigy_source_dependency_script)
 if (NOT _prodigy_source_dependency_script MATCHES
    "for public_root in prodigy switchboard macros enums services; do")
