@@ -447,6 +447,201 @@ static void serialize(S&& serializer, RearmRetainedStatefulDeployment& payload)
   serializer.text1b(payload.failure, 4096);
 }
 
+enum class ProdigyLocalBundleRecoveryWitnessRepairAction : uint8_t {
+  query = 1,
+  retire = 2
+};
+
+class ProdigyLocalBundleRecoveryWitnessMachineScope {
+public:
+  uint128_t machineUUID = 0;
+  bool bundleRegistered = false;
+  uint32_t bootstrapCount = 0;
+  String bootstrapInventorySHA256;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyLocalBundleRecoveryWitnessMachineScope& scope)
+{
+  serializer.value16b(scope.machineUUID);
+  serializer.value1b(scope.bundleRegistered);
+  serializer.value4b(scope.bootstrapCount);
+  serializer.text1b(scope.bootstrapInventorySHA256, 64);
+}
+
+// This scope contains only non-secret identities and fingerprints. The raw
+// captured bootstraps remain in the existing updateSelf authority owner.
+class ProdigyLocalBundleRecoveryWitnessRepairScope {
+public:
+  uint128_t operationUUID = 0;
+  uint128_t clusterUUID = 0;
+  uint64_t expectedAuthorityGeneration = 0;
+  uint128_t expectedMasterUUID = 0;
+  int64_t expectedMasterBootNs = 0;
+  String installedBundleSHA256;
+  String witnessExpectedBundleSHA256;
+  Vector<ProdigyLocalBundleRecoveryWitnessMachineScope> machines;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyLocalBundleRecoveryWitnessRepairScope& scope)
+{
+  serializer.value16b(scope.operationUUID);
+  serializer.value16b(scope.clusterUUID);
+  serializer.value8b(scope.expectedAuthorityGeneration);
+  serializer.value16b(scope.expectedMasterUUID);
+  serializer.value8b(scope.expectedMasterBootNs);
+  serializer.text1b(scope.installedBundleSHA256, 64);
+  serializer.text1b(scope.witnessExpectedBundleSHA256, 64);
+  serializer.container(scope.machines, 3, [](auto& nested, auto& machine) { nested.object(machine); });
+}
+
+static inline bool prodigyLocalBundleRecoveryWitnessRepairScopeValid(
+    const ProdigyLocalBundleRecoveryWitnessRepairScope& scope)
+{
+  if (scope.operationUUID == 0 || scope.clusterUUID == 0 ||
+      scope.expectedAuthorityGeneration == 0 || scope.expectedAuthorityGeneration == UINT64_MAX ||
+      scope.expectedMasterUUID == 0 || scope.expectedMasterBootNs <= 0 ||
+      !prodigyIsSHA256HexDigest(scope.installedBundleSHA256) ||
+      !scope.installedBundleSHA256.equals(scope.witnessExpectedBundleSHA256) ||
+      scope.machines.size() != 3)
+  {
+    return false;
+  }
+  uint128_t previousMachine = 0;
+  for (const auto& machine : scope.machines)
+  {
+    if (machine.machineUUID == 0 || machine.machineUUID <= previousMachine ||
+        !machine.bundleRegistered ||
+        !prodigyIsSHA256HexDigest(machine.bootstrapInventorySHA256))
+    {
+      return false;
+    }
+    previousMachine = machine.machineUUID;
+  }
+  return true;
+}
+
+static inline bool prodigyLocalBundleRecoveryWitnessRepairScopeSHA256(
+    const ProdigyLocalBundleRecoveryWitnessRepairScope& scope, String& digest)
+{
+  if (!prodigyLocalBundleRecoveryWitnessRepairScopeValid(scope)) return false;
+  String encoded = {};
+  auto copy = scope;
+  return BitseryEngine::serialize(encoded, copy) && prodigyComputeSHA256Hex(encoded, digest);
+}
+
+class ProdigyLocalBundleRecoveryWitnessRepairReceipt {
+public:
+  ProdigyLocalBundleRecoveryWitnessRepairScope scope;
+  String scopeSHA256;
+  int64_t acceptedAtMs = 0;
+  uint64_t retiredAtAuthorityGeneration = 0;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyLocalBundleRecoveryWitnessRepairReceipt& receipt)
+{
+  serializer.object(receipt.scope);
+  serializer.text1b(receipt.scopeSHA256, 64);
+  serializer.value8b(receipt.acceptedAtMs);
+  serializer.value8b(receipt.retiredAtAuthorityGeneration);
+}
+
+static inline bool prodigyLocalBundleRecoveryWitnessRepairReceiptValid(
+    const ProdigyLocalBundleRecoveryWitnessRepairReceipt& receipt)
+{
+  String digest = {};
+  return prodigyLocalBundleRecoveryWitnessRepairScopeSHA256(receipt.scope, digest) &&
+      digest.equals(receipt.scopeSHA256) && receipt.acceptedAtMs > 0 &&
+      receipt.retiredAtAuthorityGeneration == receipt.scope.expectedAuthorityGeneration + 1;
+}
+
+class ProdigyLocalBundleRecoveryWitnessRepairJournal {
+public:
+  static constexpr uint32_t version = 1;
+  uint32_t protocolVersion = version;
+  Vector<ProdigyLocalBundleRecoveryWitnessRepairReceipt> receipts;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyLocalBundleRecoveryWitnessRepairJournal& journal)
+{
+  serializer.value4b(journal.protocolVersion);
+  serializer.container(journal.receipts, 64, [](auto& nested, auto& receipt) { nested.object(receipt); });
+}
+
+static inline bool prodigyLocalBundleRecoveryWitnessRepairJournalValid(
+    const ProdigyLocalBundleRecoveryWitnessRepairJournal& journal)
+{
+  if (journal.protocolVersion != ProdigyLocalBundleRecoveryWitnessRepairJournal::version ||
+      journal.receipts.size() > 64)
+  {
+    return false;
+  }
+  for (uint32_t index = 0; index < journal.receipts.size(); ++index)
+  {
+    const auto& receipt = journal.receipts[index];
+    if (!prodigyLocalBundleRecoveryWitnessRepairReceiptValid(receipt)) return false;
+    for (uint32_t earlier = 0; earlier < index; ++earlier)
+      if (journal.receipts[earlier].scope.operationUUID == receipt.scope.operationUUID ||
+          journal.receipts[earlier].scopeSHA256 == receipt.scopeSHA256)
+        return false;
+  }
+  return true;
+}
+
+// Reserved task-execution identities are the existing schema-neutral carrier
+// for replicated maintenance journals. Deployment IDs always include a
+// nonzero application ID in their high bits, so this identity cannot collide.
+constexpr static uint64_t prodigyLocalBundleRecoveryWitnessRepairJournalExecutionID = 2;
+constexpr static uint64_t prodigyLocalBundleRecoveryWitnessRepairJournalVersionID = 0x4c4257520001ULL;
+constexpr static uint64_t prodigyLocalBundleRecoveryWitnessRepairJournalMaximumPayloadBytes =
+    64 * 1024;
+
+// One shared payload serves query and retire in both directions. `response`
+// prevents a reflected request from being accepted as a durable receipt.
+class RepairLocalBundleRecoveryWitness {
+public:
+  static constexpr uint32_t version = 1;
+  uint32_t protocolVersion = version;
+  bool response = false;
+  ProdigyLocalBundleRecoveryWitnessRepairAction action =
+      ProdigyLocalBundleRecoveryWitnessRepairAction::query;
+  uint128_t operationUUID = 0;
+  uint128_t clusterUUID = 0;
+  ProdigyLocalBundleRecoveryWitnessRepairScope scope;
+  String scopeSHA256;
+  bool witnessPresent = false;
+  bool eligible = false;
+  bool success = false;
+  bool idempotent = false;
+  bool completed = false;
+  uint64_t durableGeneration = 0;
+  int64_t acceptedAtMs = 0;
+  String failure;
+};
+
+template <typename S>
+static void serialize(S&& serializer, RepairLocalBundleRecoveryWitness& payload)
+{
+  serializer.value4b(payload.protocolVersion);
+  serializer.value1b(payload.response);
+  serializer.value1b(payload.action);
+  serializer.value16b(payload.operationUUID);
+  serializer.value16b(payload.clusterUUID);
+  serializer.object(payload.scope);
+  serializer.text1b(payload.scopeSHA256, 64);
+  serializer.value1b(payload.witnessPresent);
+  serializer.value1b(payload.eligible);
+  serializer.value1b(payload.success);
+  serializer.value1b(payload.idempotent);
+  serializer.value1b(payload.completed);
+  serializer.value8b(payload.durableGeneration);
+  serializer.value8b(payload.acceptedAtMs);
+  serializer.text1b(payload.failure, 4096);
+}
+
 template <typename S>
 static void serialize(S&& serializer, MothershipResponse& response)
 {

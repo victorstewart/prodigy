@@ -42524,6 +42524,281 @@ public:
     return machineBundleInventoryIncludesCapturedBootstraps(machine, witness.containerBootstraps, inventory);
   }
 
+  static bool localBundleRecoveryWitnessRepairJournalCarrier(
+      const TaskExecutionRecord& record)
+  {
+    return record.executionID == prodigyLocalBundleRecoveryWitnessRepairJournalExecutionID &&
+        record.applicationID == 0 &&
+        record.versionID == prodigyLocalBundleRecoveryWitnessRepairJournalVersionID &&
+        record.policy == TaskExecutionPolicy::runOnce && record.terminal() &&
+        record.expiresAtMs == 0;
+  }
+
+  static bool decodeLocalBundleRecoveryWitnessRepairJournal(
+      const ProdigyMasterAuthorityRuntimeState& state,
+      ProdigyLocalBundleRecoveryWitnessRepairJournal& journal)
+  {
+    journal = {};
+    const auto carrier = state.taskExecutions.find(
+        prodigyLocalBundleRecoveryWitnessRepairJournalExecutionID);
+    if (carrier == state.taskExecutions.end()) return true;
+    return localBundleRecoveryWitnessRepairJournalCarrier(carrier->second) &&
+        carrier->second.fingerprint.size() <=
+            prodigyLocalBundleRecoveryWitnessRepairJournalMaximumPayloadBytes &&
+        BitseryEngine::deserializeSafe(carrier->second.fingerprint, journal) &&
+        prodigyLocalBundleRecoveryWitnessRepairJournalValid(journal);
+  }
+
+  bool storeLocalBundleRecoveryWitnessRepairJournal(
+      const ProdigyLocalBundleRecoveryWitnessRepairJournal& journal,
+      int64_t nowMs)
+  {
+    if (nowMs <= 0 || !prodigyLocalBundleRecoveryWitnessRepairJournalValid(journal)) return false;
+    const auto existing = masterAuthorityRuntimeState.taskExecutions.find(
+        prodigyLocalBundleRecoveryWitnessRepairJournalExecutionID);
+    if (existing != masterAuthorityRuntimeState.taskExecutions.end() &&
+        !localBundleRecoveryWitnessRepairJournalCarrier(existing->second)) return false;
+    TaskExecutionRecord carrier = existing == masterAuthorityRuntimeState.taskExecutions.end()
+        ? TaskExecutionRecord{} : existing->second;
+    carrier.executionID = prodigyLocalBundleRecoveryWitnessRepairJournalExecutionID;
+    carrier.applicationID = 0;
+    carrier.versionID = prodigyLocalBundleRecoveryWitnessRepairJournalVersionID;
+    carrier.policy = TaskExecutionPolicy::runOnce;
+    carrier.state = TaskExecutionState::cancelled;
+    carrier.acceptedAtMs = carrier.acceptedAtMs > 0 ? carrier.acceptedAtMs : nowMs;
+    carrier.updatedAtMs = nowMs;
+    carrier.completedAtMs = nowMs;
+    carrier.expiresAtMs = 0;
+    auto copy = journal;
+    carrier.fingerprint.clear();
+    if (!BitseryEngine::serialize(carrier.fingerprint, copy) ||
+        carrier.fingerprint.size() >
+            prodigyLocalBundleRecoveryWitnessRepairJournalMaximumPayloadBytes) return false;
+    masterAuthorityRuntimeState.taskExecutions.insert_or_assign(
+        prodigyLocalBundleRecoveryWitnessRepairJournalExecutionID, std::move(carrier));
+    ProdigyLocalBundleRecoveryWitnessRepairJournal validated = {};
+    return decodeLocalBundleRecoveryWitnessRepairJournal(masterAuthorityRuntimeState, validated);
+  }
+
+  bool localBundleRecoveryWitnessCoordinatorIsDormant(String& failure) const
+  {
+    failure.clear();
+    const ProdigyPersistentUpdateSelfState state = capturePersistentUpdateSelfState();
+    if (state.state != uint8_t(UpdateSelfState::idle) || state.expectedEchos != 0 ||
+        state.bundleEchos != 0 || state.relinquishEchos != 0 || state.plannedMasterPeerKey != 0 ||
+        state.pendingDesignatedMasterPeerKey != 0 || state.useStagedBundleOnly || !state.bundleBlob.empty() ||
+        !state.bundleEchoPeerKeys.empty() || !state.relinquishEchoPeerKeys.empty() ||
+        !state.followerBootNsByPeerKey.empty() || !state.followerRebootedPeerKeys.empty())
+    {
+      failure.assign("local bundle coordinator phase or peer progress is active"_ctv);
+      return false;
+    }
+    if (!state.workerFailure.empty() || !state.workerMachineUUIDs.empty() ||
+        !state.workerStagedMachineUUIDs.empty() ||
+        !state.workerTransitionIssuedMachineUUIDs.empty() ||
+        !state.workerRebootedMachineUUIDs.empty() ||
+        !state.workerStateUploadedMachineUUIDs.empty())
+    {
+      failure.assign("local bundle worker progress is active or failed"_ctv);
+      return false;
+    }
+    if (state.localMachineUUID != 0 || state.localBundleRegistered ||
+        !state.localContainerBootstraps.empty())
+    {
+      failure.assign("legacy local bundle recovery witness is present"_ctv);
+      return false;
+    }
+    if (state.machineRecoveryWitnesses.size() != 3 ||
+        !prodigyIsSHA256HexDigest(state.workerExpectedBundleSHA256))
+    {
+      failure.assign("exact three-machine bundle recovery witness is unavailable"_ctv);
+      return false;
+    }
+    if (updateSelfTransitionAfterMothershipAck || updateSelfWorkerMothership != nullptr ||
+        bundleExecRetryTickQueued || bundlePersistencePreparing || bundlePersistenceReady ||
+        !bundleExecExpectedSHA256.empty() || updateSelfPersistencePending != 0 ||
+        updateSelfPersistenceFailed || updateSelfPersistenceTickQueued || updateSelfPersistenceQueued ||
+        updateSelfPersistenceReady || !updateSelfDurableContinuations.empty() ||
+        !deferredUpdateSelfArtifactReceiptContinuations.empty())
+    {
+      failure.assign("local bundle persistence or exec continuation is active"_ctv);
+      return false;
+    }
+    if (!updateSelfBundleIssuedPeerKeys.empty() || !updateSelfFollowerReconnectedPeerKeys.empty() ||
+        updateSelfFollowerConcurrency != 0 || !updateSelfTransitionIssuedPeerKeys.empty() ||
+        !updateSelfFollowerReadyPeerKeys.empty() || !updateSelfTransitionSentPeerKeys.empty() ||
+        !updateSelfRelinquishIssuedPeerKeys.empty())
+    {
+      failure.assign("local bundle follower transition is active"_ctv);
+      return false;
+    }
+    if (pendingHandoffAuthoritySource.peerUUID != 0 || pendingHandoffAuthoritySource.peerBootTime != 0 ||
+        pendingHandoffAuthoritySource.peerGeneration != 0 || pendingHandoffAuthoritySource.peerFileSlot != -1 ||
+        pendingHandoffAuthoritySource.transportEpoch != 0 || pendingHandoffAuthoritySource.authorityEpoch != 0)
+    {
+      failure.assign("local bundle master handoff source is active"_ctv);
+      return false;
+    }
+    if (pendingMothershipUpdateArtifact != nullptr || recoveringPersistedNeuronInventory ||
+        recoveryPersistencePending || recoveryPersistenceRetryPending ||
+        !pendingMaterializedRecoveryPersistence.empty())
+    {
+      failure.assign("bundle artifact or recovery persistence is active"_ctv);
+      return false;
+    }
+    if (!masterAuthorityRuntimeState.statefulWorkerTopologyUpgradeOperations.empty() ||
+        !masterAuthorityRuntimeState.deferredStatefulScaleIntents.empty() ||
+        std::any_of(masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.begin(),
+                    masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.end(),
+                    [](const auto& operation) {
+                      return operation.accepted && operation.started && !operation.completed;
+                    }) ||
+        std::any_of(masterAuthorityRuntimeState.materializedStatefulRecoveryRetries.begin(),
+                    masterAuthorityRuntimeState.materializedStatefulRecoveryRetries.end(),
+                    [](const auto& retry) {
+                      return retry.phase != ProdigyMaterializedStatefulRecoveryRetryPhase::completed;
+                    }))
+    {
+      failure.assign("another durable deployment recovery operation is active"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  bool inspectLocalBundleRecoveryWitnessRepairScope(
+      uint128_t operationUUID,
+      ProdigyLocalBundleRecoveryWitnessRepairScope& scope,
+      bool& witnessPresent,
+      String& failure)
+  {
+    scope = {};
+    witnessPresent = false;
+    failure.clear();
+    if (operationUUID == 0)
+    {
+      failure.assign("repair operation UUID is required"_ctv);
+      return false;
+    }
+    const ProdigyPersistentUpdateSelfState state = capturePersistentUpdateSelfState();
+    witnessPresent = hasUpdateSelfRecoveryWitness(state);
+    scope.operationUUID = operationUUID;
+    scope.clusterUUID = brainConfig.clusterUUID;
+    scope.expectedAuthorityGeneration = masterAuthorityRuntimeState.generation;
+    scope.expectedMasterUUID = selfBrainUUID();
+    scope.expectedMasterBootNs = boottimens;
+    scope.witnessExpectedBundleSHA256 = state.workerExpectedBundleSHA256;
+    if (!witnessPresent)
+    {
+      failure.assign("local bundle recovery witness is absent"_ctv);
+      return false;
+    }
+    if (!weAreMaster || !ignited || masterAuthorityEpoch == 0 ||
+        !recoveryAuthoritySnapshotDurable() || masterAuthorityPersistencePending != 0)
+    {
+      failure.assign("local bundle recovery witness authority is not ready"_ctv);
+      return false;
+    }
+    if (masterAuthorityRuntimeState.updateSelf != state)
+    {
+      failure.assign("live local bundle witness differs from the durable authority"_ctv);
+      return false;
+    }
+    if (!localBundleRecoveryWitnessCoordinatorIsDormant(failure)) return false;
+
+    Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness> witnesses = state.machineRecoveryWitnesses;
+    std::sort(witnesses.begin(), witnesses.end(), [](const auto& left, const auto& right) {
+      return left.machineUUID < right.machineUUID;
+    });
+    uint128_t previousMachine = 0;
+    for (const auto& witness : witnesses)
+    {
+      if (witness.machineUUID == 0 || witness.machineUUID <= previousMachine ||
+          !witness.bundleRegistered ||
+          !machineBundleInventoryMatchesWitness(findMachineByUUID(witness.machineUUID), witness))
+      {
+        failure.assign("captured machine inventory does not match its registered bundle witness"_ctv);
+        return false;
+      }
+      String encodedBootstraps = {}, digest = {};
+      auto bootstraps = witness.containerBootstraps;
+      if (!BitseryEngine::serialize(encodedBootstraps, bootstraps) ||
+          !prodigyComputeSHA256Hex(encodedBootstraps, digest))
+      {
+        failure.assign("captured machine inventory fingerprint failed"_ctv);
+        return false;
+      }
+      ProdigyLocalBundleRecoveryWitnessMachineScope machine = {};
+      machine.machineUUID = witness.machineUUID;
+      machine.bundleRegistered = witness.bundleRegistered;
+      if (witness.containerBootstraps.size() > UINT32_MAX)
+      {
+        failure.assign("captured machine inventory is too large"_ctv);
+        return false;
+      }
+      machine.bootstrapCount = uint32_t(witness.containerBootstraps.size());
+      machine.bootstrapInventorySHA256 = std::move(digest);
+      scope.machines.push_back(std::move(machine));
+      previousMachine = witness.machineUUID;
+    }
+    if (!allMachineBundleInventoriesMatch())
+    {
+      failure.assign("all-machine bundle inventory witness is not authoritative"_ctv);
+      return false;
+    }
+
+    MothershipUpgradeAdmissionReport report = {};
+    collectUpgradeAdmissionReport(report);
+    if (!report.master || !report.observationComplete || !report.authorityQuorumHealthy ||
+        !report.authorityAcknowledged || !report.recoveryWitnessAcknowledged ||
+        !report.commissionedPeerTransportVerified || !report.fleetBundleDigestsFresh ||
+        !report.fleetInventoriesFresh || report.clusterUUID != scope.clusterUUID ||
+        report.authorityGeneration != scope.expectedAuthorityGeneration ||
+        report.masterUUID != scope.expectedMasterUUID || report.masterBootNs != scope.expectedMasterBootNs ||
+        report.commissionedBrainCount != 3 || report.healthyCommissionedBrainCount != 3 ||
+        report.peers.size() != 3 || !masterAuthorityRuntimeStateAcknowledgedByRegisteredPeers())
+    {
+      failure.assign("fresh authenticated three-machine fleet observation is incomplete"_ctv);
+      return false;
+    }
+    Vector<uint128_t> observedMachines = {};
+    String installedBundle = {};
+    for (const auto& peer : report.peers)
+    {
+      if (peer.machineUUID == 0 || !peer.localInstalledBundleVerified || !peer.stateUploadFresh ||
+          !peer.authorityAcknowledged || !peer.recoveryWitnessAcknowledged ||
+          !prodigyIsSHA256HexDigest(peer.installedBundleSHA256))
+      {
+        failure.assign("fleet member lacks a fresh installed-bundle or inventory receipt"_ctv);
+        return false;
+      }
+      if (installedBundle.empty()) installedBundle = peer.installedBundleSHA256;
+      else if (!installedBundle.equals(peer.installedBundleSHA256))
+      {
+        failure.assign("fleet installed bundle digests differ"_ctv);
+        return false;
+      }
+      observedMachines.push_back(peer.machineUUID);
+    }
+    std::sort(observedMachines.begin(), observedMachines.end());
+    Vector<uint128_t> witnessedMachines = {};
+    for (const auto& machine : scope.machines) witnessedMachines.push_back(machine.machineUUID);
+    if (observedMachines != witnessedMachines ||
+        !installedBundle.equals(scope.witnessExpectedBundleSHA256) ||
+        !report.masterApprovedBundleSHA256.equals(installedBundle))
+    {
+      failure.assign("fleet identity or installed bundle differs from the durable witness"_ctv);
+      return false;
+    }
+    scope.installedBundleSHA256 = std::move(installedBundle);
+    String digest = {};
+    if (!prodigyLocalBundleRecoveryWitnessRepairScopeSHA256(scope, digest))
+    {
+      failure.assign("local bundle recovery witness scope is invalid"_ctv);
+      return false;
+    }
+    return true;
+  }
+
   bool allMachineBundleInventoriesMatch(void) const
   {
     if (updateSelfMachineRecoveryWitnesses.empty()) return false;
@@ -53940,6 +54215,220 @@ public:
                 BitseryEngine::serialize(payload, response);
                 Message::construct(mothership->wBuffer, MothershipTopic::rearmRetainedStatefulDeployment, payload);
                 (void)flushActiveMothershipSendBuffer(mothership, "retained-rearm-durable");
+              });
+          break;
+        }
+      case MothershipTopic::repairLocalBundleRecoveryWitness:
+        {
+          String serializedRequest = {};
+          Message::extractToStringView(args, serializedRequest);
+          RepairLocalBundleRecoveryWitness request = {};
+          RepairLocalBundleRecoveryWitness response = {};
+          auto reply = [&]() {
+            String payload = {};
+            BitseryEngine::serialize(payload, response);
+            Message::construct(mothership->wBuffer,
+                               MothershipTopic::repairLocalBundleRecoveryWitness,
+                               payload);
+          };
+          auto reject = [&](const char *reason) {
+            response = request;
+            response.response = true;
+            response.scope = {};
+            response.witnessPresent = false;
+            response.eligible = false;
+            response.success = false;
+            response.idempotent = false;
+            response.completed = false;
+            response.durableGeneration = 0;
+            response.acceptedAtMs = 0;
+            response.failure.assign(reason);
+            reply();
+          };
+          const bool decodedRequest =
+              args == message->terminal() &&
+              BitseryEngine::deserializeSafe(serializedRequest, request);
+          const bool validAction =
+              request.action == ProdigyLocalBundleRecoveryWitnessRepairAction::query ||
+              request.action == ProdigyLocalBundleRecoveryWitnessRepairAction::retire;
+          const auto& emptyScope = request.scope;
+          const bool scopeEmpty = emptyScope.operationUUID == 0 && emptyScope.clusterUUID == 0 &&
+              emptyScope.expectedAuthorityGeneration == 0 && emptyScope.expectedMasterUUID == 0 &&
+              emptyScope.expectedMasterBootNs == 0 && emptyScope.installedBundleSHA256.empty() &&
+              emptyScope.witnessExpectedBundleSHA256.empty() && emptyScope.machines.empty();
+          if (!decodedRequest ||
+              request.protocolVersion != RepairLocalBundleRecoveryWitness::version ||
+              request.response || !validAction || request.operationUUID == 0 ||
+              request.clusterUUID == 0 || !scopeEmpty || request.witnessPresent || request.eligible ||
+              request.success || request.idempotent || request.completed ||
+              request.durableGeneration != 0 || request.acceptedAtMs != 0 || !request.failure.empty() ||
+              (request.action == ProdigyLocalBundleRecoveryWitnessRepairAction::query &&
+               !request.scopeSHA256.empty()) ||
+              (request.action == ProdigyLocalBundleRecoveryWitnessRepairAction::retire &&
+               !prodigyIsSHA256HexDigest(request.scopeSHA256)))
+          {
+            reject("invalid local bundle recovery witness repair request");
+            break;
+          }
+          response = request;
+          response.response = true;
+          if (request.clusterUUID != brainConfig.clusterUUID)
+          {
+            reject("local bundle recovery witness repair cluster identity differs");
+            break;
+          }
+          if (!weAreMaster || !ignited || masterAuthorityEpoch == 0 ||
+              !recoveryAuthoritySnapshotDurable() || masterAuthorityPersistencePending != 0)
+          {
+            reject("local bundle recovery witness repair authority is not ready");
+            break;
+          }
+
+          ProdigyLocalBundleRecoveryWitnessRepairJournal journal = {};
+          if (!decodeLocalBundleRecoveryWitnessRepairJournal(
+                  masterAuthorityRuntimeState, journal))
+          {
+            reject("local bundle recovery witness repair journal is corrupt");
+            break;
+          }
+          const auto existing = std::find_if(
+              journal.receipts.begin(), journal.receipts.end(), [&](const auto& receipt) {
+                return receipt.scope.operationUUID == request.operationUUID;
+              });
+          if (existing != journal.receipts.end())
+          {
+            if (existing->scope.clusterUUID != request.clusterUUID ||
+                (request.action == ProdigyLocalBundleRecoveryWitnessRepairAction::retire &&
+                 !existing->scopeSHA256.equals(request.scopeSHA256)))
+            {
+              reject("local bundle recovery witness repair operation UUID collision");
+              break;
+            }
+            response.scope = existing->scope;
+            response.scopeSHA256 = existing->scopeSHA256;
+            response.witnessPresent = false;
+            response.eligible = false;
+            response.success = true;
+            response.idempotent = true;
+            response.completed = true;
+            response.durableGeneration = existing->retiredAtAuthorityGeneration;
+            response.acceptedAtMs = existing->acceptedAtMs;
+            response.failure.clear();
+            reply();
+            break;
+          }
+
+          ProdigyLocalBundleRecoveryWitnessRepairScope inspected = {};
+          bool witnessPresent = false;
+          String predicateFailure = {};
+          const bool eligible = inspectLocalBundleRecoveryWitnessRepairScope(
+              request.operationUUID, inspected, witnessPresent, predicateFailure);
+          response.scope = inspected;
+          response.witnessPresent = witnessPresent;
+          response.eligible = eligible;
+          if (eligible && !prodigyLocalBundleRecoveryWitnessRepairScopeSHA256(
+                              inspected, response.scopeSHA256))
+          {
+            reject("local bundle recovery witness repair scope fingerprint failed");
+            break;
+          }
+          if (request.action == ProdigyLocalBundleRecoveryWitnessRepairAction::query)
+          {
+            response.success = true;
+            response.failure = std::move(predicateFailure);
+            reply();
+            break;
+          }
+          if (!eligible)
+          {
+            response.failure = std::move(predicateFailure);
+            reply();
+            break;
+          }
+          if (!response.scopeSHA256.equals(request.scopeSHA256))
+          {
+            reject("local bundle recovery witness repair query receipt is stale or mismatched");
+            break;
+          }
+          const ProdigyMasterAuthorityRuntimeState before = masterAuthorityRuntimeState;
+          const ProdigyPersistentUpdateSelfState beforeCoordinator =
+              capturePersistentUpdateSelfState();
+          const bool beforeDurable = masterAuthorityRuntimeStateDurable;
+          const uint64_t beforeDurableGeneration =
+              durableMasterAuthorityRuntimeStateGeneration;
+          const uint64_t generation = before.generation + 1;
+          const int64_t acceptedAtMs = Time::now<TimeResolution::ms>();
+          ProdigyLocalBundleRecoveryWitnessRepairReceipt receipt = {};
+          receipt.scope = inspected;
+          receipt.scopeSHA256 = response.scopeSHA256;
+          receipt.acceptedAtMs = acceptedAtMs;
+          receipt.retiredAtAuthorityGeneration = generation;
+          journal.receipts.push_back(receipt);
+          if (!prodigyLocalBundleRecoveryWitnessRepairJournalValid(journal) ||
+              !storeLocalBundleRecoveryWitnessRepairJournal(journal, acceptedAtMs))
+          {
+            masterAuthorityRuntimeState = before;
+            reject("local bundle recovery witness repair journal cannot accept the receipt");
+            break;
+          }
+          // The strict predicate proved every other coordinator field empty.
+          // Clear only the two durable recovery-witness fields, in the same
+          // authority commit that records the immutable terminal receipt.
+          updateSelfWorkerExpectedBundleSHA256.clear();
+          updateSelfMachineRecoveryWitnesses.clear();
+
+          const uint64_t epoch = masterAuthorityEpoch;
+          const uint64_t incarnation = mothership->connectionIncarnation;
+          const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+          commitMasterAuthorityStateChangeAsync(
+              [this, lifetime, mothership, epoch, incarnation, operationUUID = request.operationUUID,
+               receipt, before, beforeCoordinator, beforeDurable,
+               beforeDurableGeneration, generation](bool durable) mutable {
+                if (lifetime.expired()) return;
+                if (masterAuthorityEpoch != epoch) return;
+                ProdigyLocalBundleRecoveryWitnessRepairJournal currentJournal = {};
+                const bool decoded = decodeLocalBundleRecoveryWitnessRepairJournal(
+                    masterAuthorityRuntimeState, currentJournal);
+                auto current = decoded ? std::find_if(
+                    currentJournal.receipts.begin(), currentJournal.receipts.end(),
+                    [&](const auto& candidate) {
+                      return candidate.scope.operationUUID == operationUUID &&
+                          candidate.scopeSHA256.equals(receipt.scopeSHA256);
+                    }) : currentJournal.receipts.end();
+                const bool candidateCurrent = decoded && current != currentJournal.receipts.end();
+                if (!durable && masterAuthorityRuntimeState.generation == generation)
+                {
+                  masterAuthorityRuntimeState = before;
+                  restorePersistentUpdateSelfState(beforeCoordinator);
+                  masterAuthorityRuntimeStateDurable = beforeDurable;
+                  durableMasterAuthorityRuntimeStateGeneration = beforeDurableGeneration;
+                }
+                if (!activeMotherships.contains(mothership) ||
+                    mothership->connectionIncarnation != incarnation ||
+                    !streamIsActive(mothership) || Ring::socketIsClosing(mothership)) return;
+                RepairLocalBundleRecoveryWitness response = {};
+                response.response = true;
+                response.action = ProdigyLocalBundleRecoveryWitnessRepairAction::retire;
+                response.operationUUID = operationUUID;
+                response.clusterUUID = receipt.scope.clusterUUID;
+                response.scope = receipt.scope;
+                response.scopeSHA256 = receipt.scopeSHA256;
+                response.witnessPresent = !durable;
+                response.eligible = durable && candidateCurrent;
+                response.success = durable && candidateCurrent;
+                response.completed = response.success;
+                response.durableGeneration = response.success
+                    ? receipt.retiredAtAuthorityGeneration : 0;
+                response.acceptedAtMs = response.success ? receipt.acceptedAtMs : 0;
+                if (!response.success)
+                  response.failure.assign("local bundle recovery witness repair durable commit failed"_ctv);
+                String payload = {};
+                BitseryEngine::serialize(payload, response);
+                Message::construct(mothership->wBuffer,
+                                   MothershipTopic::repairLocalBundleRecoveryWitness,
+                                   payload);
+                (void)flushActiveMothershipSendBuffer(
+                    mothership, "local-bundle-witness-repair-durable");
               });
           break;
         }

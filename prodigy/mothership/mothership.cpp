@@ -30651,6 +30651,145 @@ LOCAL_RUNTIME
     if (!response.success) exit(EXIT_FAILURE);
   }
 
+  void runRepairLocalBundleRecoveryWitness(int argc, char *argv[])
+  {
+    const bool query = argc == 3 && std::strcmp(argv[2], "--query") == 0;
+    const bool retire = argc == 4 && std::strcmp(argv[2], "--retire") == 0;
+    uint128_t operationUUID = 0;
+    String failure = {}, operationText = {};
+    if ((!query && !retire) || !prodigyParseCanonicalHex128(String(argv[1]), operationUUID) ||
+        operationUUID == 0 || (retire && !prodigyIsSHA256HexDigest(String(argv[3]))))
+    {
+      basics_log("repairLocalBundleRecoveryWitness success=0 failure=usage: repairLocalBundleRecoveryWitness TARGET OPERATION_UUID --query|--retire SCOPE_SHA256\n");
+      exit(EXIT_FAILURE);
+    }
+    operationText.assignItoh(operationUUID);
+
+    MothershipProdigyCluster cluster = {};
+    Vector<uint128_t> registeredMachines = {};
+    {
+      auto registry = openClusterRegistry();
+      if (!registry.getClusterByIdentity(String(argv[0]), cluster, &failure))
+      {
+        basics_log("repairLocalBundleRecoveryWitness success=0 operationUUID=%s failure=%s\n",
+                   operationText.c_str(), failure.c_str());
+        exit(EXIT_FAILURE);
+      }
+    }
+    for (const ClusterMachine& machine : cluster.topology.machines)
+    {
+      if (!machine.isBrain || machine.uuid == 0)
+      {
+        basics_log("repairLocalBundleRecoveryWitness success=0 operationUUID=%s failure=registered topology is not an exact Brain set\n",
+                   operationText.c_str());
+        exit(EXIT_FAILURE);
+      }
+      registeredMachines.push_back(machine.uuid);
+    }
+    std::sort(registeredMachines.begin(), registeredMachines.end());
+    if (registeredMachines.size() != 3 ||
+        std::adjacent_find(registeredMachines.begin(), registeredMachines.end()) != registeredMachines.end() ||
+        !configureControlTarget(argv[0], &failure))
+    {
+      basics_log("repairLocalBundleRecoveryWitness success=0 operationUUID=%s failure=%s\n",
+                 operationText.c_str(),
+                 failure.empty() ? "registered topology is not the exact three-Brain cohort" : failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    RepairLocalBundleRecoveryWitness request = {};
+    request.action = query ? ProdigyLocalBundleRecoveryWitnessRepairAction::query
+                           : ProdigyLocalBundleRecoveryWitnessRepairAction::retire;
+    request.operationUUID = operationUUID;
+    request.clusterUUID = cluster.clusterUUID;
+    if (retire) request.scopeSHA256.assign(argv[3]);
+    String serializedRequest = {};
+    BitseryEngine::serialize(serializedRequest, request);
+    if (!socket.ensureConnected())
+    {
+      failure = socket.connectFailureDetail();
+      basics_log("repairLocalBundleRecoveryWitness success=0 operationUUID=%s failure=%s\n",
+                 operationText.c_str(), failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    Message::construct(socket.wBuffer,
+                       MothershipTopic::repairLocalBundleRecoveryWitness,
+                       serializedRequest);
+    if (!socket.send()) exit(EXIT_FAILURE);
+    Message *message = socket.recvExpectedTopic(
+        MothershipTopic::repairLocalBundleRecoveryWitness, 16 * 1024);
+    if (message == nullptr)
+    {
+      failure = socket.ioFailureDetail();
+      basics_log("repairLocalBundleRecoveryWitness success=0 operationUUID=%s failure=%s\n",
+                 operationText.c_str(), failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    String serializedResponse = {};
+    uint8_t *args = message->args;
+    Message::extractToStringView(args, serializedResponse);
+    RepairLocalBundleRecoveryWitness response = {};
+    bool valid = args == message->terminal() &&
+        BitseryEngine::deserializeSafe(serializedResponse, response) &&
+        response.protocolVersion == RepairLocalBundleRecoveryWitness::version && response.response &&
+        response.action == request.action && response.operationUUID == request.operationUUID &&
+        response.clusterUUID == request.clusterUUID;
+    const bool hasCompleteScope = prodigyLocalBundleRecoveryWitnessRepairScopeValid(response.scope);
+    if (valid && hasCompleteScope)
+    {
+      String digest = {};
+      valid = response.scope.operationUUID == operationUUID &&
+          response.scope.clusterUUID == cluster.clusterUUID &&
+          prodigyLocalBundleRecoveryWitnessRepairScopeSHA256(response.scope, digest) &&
+          digest.equals(response.scopeSHA256);
+      Vector<uint128_t> scopedMachines = {};
+      for (const auto& machine : response.scope.machines) scopedMachines.push_back(machine.machineUUID);
+      valid = valid && scopedMachines == registeredMachines;
+    }
+    if (valid && response.completed)
+    {
+      ProdigyLocalBundleRecoveryWitnessRepairReceipt receipt = {};
+      receipt.scope = response.scope;
+      receipt.scopeSHA256 = response.scopeSHA256;
+      receipt.acceptedAtMs = response.acceptedAtMs;
+      receipt.retiredAtAuthorityGeneration = response.durableGeneration;
+      valid = response.success && prodigyLocalBundleRecoveryWitnessRepairReceiptValid(receipt);
+    }
+    if (valid && response.eligible)
+      valid = hasCompleteScope && !response.scopeSHA256.empty();
+    if (!valid)
+    {
+      basics_log("repairLocalBundleRecoveryWitness success=0 operationUUID=%s failure=invalid response payload\n",
+                 operationText.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    String masterUUID = {};
+    masterUUID.assignItoh(response.scope.expectedMasterUUID);
+    basics_log(
+        "repairLocalBundleRecoveryWitness success=%u action=%s witnessPresent=%u eligible=%u idempotent=%u completed=%u operationUUID=%s clusterUUID=%s scopeSHA256=%s authorityGeneration=%llu masterUUID=%s masterBootNs=%lld installedBundleSHA256=%s witnessExpectedBundleSHA256=%s durableGeneration=%llu acceptedAtMs=%lld failure=%s\n",
+        unsigned(response.success), query ? "query" : "retire", unsigned(response.witnessPresent),
+        unsigned(response.eligible), unsigned(response.idempotent), unsigned(response.completed),
+        operationText.c_str(), String::toHex(response.clusterUUID).c_str(), response.scopeSHA256.c_str(),
+        (unsigned long long)response.scope.expectedAuthorityGeneration, masterUUID.c_str(),
+        (long long)response.scope.expectedMasterBootNs,
+        response.scope.installedBundleSHA256.c_str(),
+        response.scope.witnessExpectedBundleSHA256.c_str(),
+        (unsigned long long)response.durableGeneration, (long long)response.acceptedAtMs,
+        response.failure.c_str());
+    for (auto machine : response.scope.machines)
+    {
+      String machineUUID = {};
+      machineUUID.assignItoh(machine.machineUUID);
+      basics_log(
+          "repairLocalBundleRecoveryWitness machineUUID=%s bundleRegistered=%u bootstrapCount=%u bootstrapInventorySHA256=%s\n",
+          machineUUID.c_str(), unsigned(machine.bundleRegistered), unsigned(machine.bootstrapCount),
+          machine.bootstrapInventorySHA256.c_str());
+    }
+    if (!response.success || (query && !response.eligible && !response.completed) ||
+        (retire && !response.completed)) exit(EXIT_FAILURE);
+  }
+
   void runReserveApplicationID(int argc, char *argv[])
   {
     if (argc < 2)
@@ -35789,6 +35928,7 @@ public:
         {"removeCluster",                   &Mothership::runRemoveCluster                  },
         {"removeLocalVM",                   &Mothership::runRemoveLocalVM                  },
         {"removeProviderCredential",        &Mothership::runRemoveProviderCredential       },
+        {"repairLocalBundleRecoveryWitness", &Mothership::runRepairLocalBundleRecoveryWitness},
         {"repairRemoteCloudMachineRuntime", &Mothership::runRepairRemoteCloudMachineRuntime},
         {"repairTestClusterTransport",      &Mothership::runRepairTestClusterTransport     },
         {"reserveApplicationID",            &Mothership::runReserveApplicationID           },
@@ -35866,7 +36006,7 @@ int main(int argc, char *argv[])
   if (argc < 2)
   {
     constexpr static char usage[] =
-        "must be called like: ./mothership [operation: help, bootstrapNametagAllMasters, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, repairRemoteCloudMachineRuntime, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, checkClusterProviderPlan, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultClusterNetwork, faultLocalClusterMachine, faultRemoteCloudMachine, faultTestCluster, faultTestClusters, prepareProductionPair, productionPair, launchLocalVM, removeLocalVM, registerLocalVMBoundary, inspectLocalVMBoundaries, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, rearmRetainedStatefulDeployment, recoverLocalClusterAuthority, recoverMaterializedStatefulDeployment, recoverTestClusterBundle, recoverTestClusterFollowerBrain, taskReport, containerLogs, credentialExpiryNotifications, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, authorizeBGPOriginPrefix, revokeBGPOriginPrefix, listBGPOriginPrefixes, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
+        "must be called like: ./mothership [operation: help, bootstrapNametagAllMasters, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, repairLocalBundleRecoveryWitness, repairRemoteCloudMachineRuntime, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, checkClusterProviderPlan, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultClusterNetwork, faultLocalClusterMachine, faultRemoteCloudMachine, faultTestCluster, faultTestClusters, prepareProductionPair, productionPair, launchLocalVM, removeLocalVM, registerLocalVMBoundary, inspectLocalVMBoundaries, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, rearmRetainedStatefulDeployment, recoverLocalClusterAuthority, recoverMaterializedStatefulDeployment, recoverTestClusterBundle, recoverTestClusterFollowerBrain, taskReport, containerLogs, credentialExpiryNotifications, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, authorizeBGPOriginPrefix, revokeBGPOriginPrefix, listBGPOriginPrefixes, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
     std::fwrite(usage, 1, sizeof(usage) - 1, stdout);
     exit(EXIT_FAILURE);
   }
@@ -35931,6 +36071,8 @@ int main(int argc, char *argv[])
     message.append("recoverLocalClusterAuthority [operationUUID] [cluster] [timeoutMs] [--complete-interrupted-upgrade upgradeOperation approvedBundle predecessorRecovery|--admitted-active-runtime]\n");
     message.append("rearmRetainedStatefulDeployment [cluster] [proof JSON|-|@path]\n");
     message.append("\tdurably re-arms only the exact target-zero, two-member all-masters deployment named by an immutable three-machine authority proof\n");
+    message.append("repairLocalBundleRecoveryWitness [cluster] [operation UUID] --query|--retire [scope SHA256]\n");
+    message.append("\tinspects and conditionally retires only an idle exact-three-machine local bundle recovery witness, with one durable idempotent authority receipt\n");
     message.append("recoverStoppedLocalVM [absolute state path] [taskID] [operationUUID canonical hex] [expected guest UUID] [expected state SHA256]\n");
     message.append("\trecovers one stopped local VM through its sealed boundary owner without requiring the in-guest registry\n");
     message.append("\tdurably arms and releases one exact three-VM local recovery cohort, then seals it only after all distinct reboots and normal one-master health are observed\n");

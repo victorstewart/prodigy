@@ -45265,6 +45265,7 @@ int main(void)
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "async-recovery") == 0)
   {
     testAsyncMaterializedRecoveryAcceptance(suite);
+    testAsyncLocalBundleRecoveryWitnessRepair(suite);
     testAsyncRetainedStatefulRearmAcceptance(suite);
     testMaterializedRecoveryBlockers(suite);
     testDurableWitnessReplaysThreeRetainedMachinesAfterProjectionReload(suite);
@@ -45294,6 +45295,7 @@ int main(void)
     runAsyncAddMachinesTests(suite);
     testAsyncAddMachinesRecoveryPersistence(suite);
     testAsyncMaterializedRecoveryAcceptance(suite);
+    testAsyncLocalBundleRecoveryWitnessRepair(suite);
     testAsyncRetainedStatefulRearmAcceptance(suite);
     testMaterializedRecoveryBlockers(suite);
     testAsyncMachineRetirementJournalDurability(suite);

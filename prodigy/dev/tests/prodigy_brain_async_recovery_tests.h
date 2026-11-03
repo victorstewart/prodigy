@@ -146,6 +146,316 @@ static void testAsyncMaterializedRecoveryAcceptance(TestSuite& suite)
  }
 }
 
+static void testAsyncLocalBundleRecoveryWitnessRepair(TestSuite& suite)
+{
+  ScopedFreshRing ring = {};
+  StreamingTestBrain brain = {};
+  NoopBrainIaaS iaas = {};
+  TestNeuron self = {};
+  BrainBase *savedBrain = thisBrain;
+  NeuronBase *savedNeuron = thisNeuron;
+  thisBrain = &brain;
+  thisNeuron = &self;
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
+  brain.ignited = true;
+  brain.nBrains = 3;
+  brain.masterAuthorityEpoch = 17;
+  brain.boottimens = 700'100'001;
+  brain.masterAuthorityRuntimeState.generation = 51;
+  brain.masterAuthorityRuntimeState.hasCompletedInitialMasterElection = true;
+  brain.masterAuthorityRuntimeStateDurable = true;
+  brain.durableMasterAuthorityRuntimeStateGeneration = 51;
+  brain.hasAuthoritativeTopology = true;
+  brain.brainConfig.clusterUUID = uint128_t(0x7300);
+  const String installedBundle =
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv;
+  self.uuid = uint128_t(0x7301);
+  self.setInstalledBundleDigestForTest(installedBundle);
+
+  Machine machines[3] = {};
+  ScopedSocketPair neuronSockets[3] = {};
+  const uint128_t machineUUIDs[3] = {
+      self.uuid, uint128_t(0x7302), uint128_t(0x7303)};
+  bool fixtureReady = true;
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    fixtureReady = neuronSockets[index].create(
+        suite, "local_bundle_witness_repair_neuron_control_socket") && fixtureReady;
+    Machine& machine = machines[index];
+    machine.uuid = machineUUIDs[index];
+    machine.state = MachineState::healthy;
+    machine.lifetime = MachineLifetime::owned;
+    machine.isBrain = true;
+    machine.isThisMachine = index == 0;
+    machine.runtimeReady = true;
+    machine.storageMB_available = 8192;
+    machine.neuron.machine = &machine;
+    machine.neuron.isFixedFile = true;
+    machine.neuron.fslot = neuronSockets[index].adoptLeftIntoFixedFileSlot();
+    machine.neuron.connected = machine.neuron.fslot >= 0;
+    brain.machines.insert(&machine);
+    brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+    brain.persistedMachineInventoryUploaded.insert(machine.uuid);
+    brain.persistedMachineStateUploadPlansByMachine.insert_or_assign(
+        machine.uuid, Vector<String>{});
+    ClusterMachine topologyMember = {};
+    topologyMember.uuid = machine.uuid;
+    topologyMember.isBrain = true;
+    brain.authoritativeTopology.machines.push_back(topologyMember);
+
+    ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
+    witness.machineUUID = machine.uuid;
+    witness.bundleRegistered = true;
+    brain.updateSelfMachineRecoveryWitnesses.push_back(std::move(witness));
+    fixtureReady = machine.neuron.connected && fixtureReady;
+  }
+  brain.updateSelfWorkerExpectedBundleSHA256.assign(installedBundle);
+  brain.masterAuthorityRuntimeState.updateSelf = brain.capturePersistentUpdateSelfState();
+  suite.require(fixtureReady, "local_bundle_witness_repair_arms_exact_machine_cohort");
+
+  BrainView peers[2] = {};
+  ProdigyTransportTLSStream peerTransports[2] = {};
+  std::array<uint8_t, 32> peerPSK = {};
+  peerPSK.fill(0x73);
+  for (uint32_t index = 0; index < 2; ++index)
+  {
+    BrainView& peer = peers[index];
+    peer.uuid = machineUUIDs[index + 1];
+    peer.machine = &machines[index + 1];
+    peer.boottimens = 730'000'010 + index;
+    peer.ioGeneration = 1;
+    peer.transportEpoch = 1;
+    peer.version = ProdigyBinaryVersion;
+    peer.connected = true;
+    peer.isFixedFile = true;
+    peer.fslot = 60 + index;
+    peer.registrationFresh = true;
+    peer.existingMasterUUID = self.uuid;
+    reserveTransportStream(peer);
+    reserveTransportStream(peerTransports[index]);
+    fixtureReady = peer.beginTransportAEGIS(
+                       false, peerPSK.data(), "local-bundle-witness-repair-peer"_ctv,
+                       self.uuid, peer.uuid) &&
+        peerTransports[index].beginTransportAEGIS(
+            true, peerPSK.data(), "local-bundle-witness-repair-peer"_ctv,
+            peer.uuid, self.uuid) &&
+        completeTransportHandshake(peer, peerTransports[index]) && fixtureReady;
+    peer.containerRetirementCapabilityAcknowledged = true;
+    peer.containerRetirementCapabilityUUID = peer.uuid;
+    peer.containerRetirementCapabilityBootNs = peer.boottimens;
+    peer.containerRetirementCapabilityIOGeneration = peer.ioGeneration;
+    brain.brains.insert(&peer);
+  }
+  suite.require(fixtureReady, "local_bundle_witness_repair_authenticates_exact_brain_cohort");
+
+  brain.beginUpgradeAdmissionObservation();
+  auto& observation = brain.upgradeAdmissionObservation;
+  for (BrainView& peer : peers)
+  {
+    ProdigyUpgradeAdmissionPeerObservation response = {};
+    response.brainUUID = peer.uuid;
+    response.machineUUID = peer.uuid;
+    response.receiptVersion = observation.receiptVersion;
+    response.authorityGeneration = observation.authorityGeneration;
+    response.requesterTransportGeneration = peer.ioGeneration;
+    response.masterUUID = self.uuid;
+    response.masterBootNs = brain.boottimens;
+    response.nonce = observation.nonce;
+    response.observedAtMs = observation.requestedAtMs;
+    response.codeSupportsSerialFollowers = true;
+    response.localInstalledBundleVerified = true;
+    response.stateUploadFresh = true;
+    response.authorityAcknowledged = true;
+    response.recoveryWitnessAcknowledged = true;
+    response.installedBundleSHA256.assign(installedBundle);
+    observation.received.insert_or_assign(peer.uuid, std::move(response));
+  }
+  String serializedAuthority = {}, authorityDigest = {};
+  suite.require(brain.serializeCurrentMasterAuthorityTransition(
+                    serializedAuthority, authorityDigest),
+                "local_bundle_witness_repair_serializes_current_authority");
+  for (BrainView& peer : peers)
+  {
+    brain.noteMasterAuthorityTransitionSentToPeer(
+        &peer, brain.masterAuthorityRuntimeState, authorityDigest);
+    ProdigyMasterAuthorityStateTransitionAck acknowledgement = {};
+    acknowledgement.generation = brain.masterAuthorityRuntimeState.generation;
+    acknowledgement.peerUUID = peer.uuid;
+    acknowledgement.peerBootNs = peer.boottimens;
+    acknowledgement.transitionDigest.assign(authorityDigest);
+    brain.acknowledgeMasterAuthorityTransition(&peer, acknowledgement);
+  }
+  MothershipUpgradeAdmissionReport admission = {};
+  brain.collectUpgradeAdmissionReport(admission);
+  suite.require(admission.observationComplete && admission.authorityAcknowledged &&
+                    admission.recoveryWitnessAcknowledged &&
+                    admission.commissionedPeerTransportVerified &&
+                    admission.fleetBundleDigestsFresh && admission.fleetInventoriesFresh &&
+                    admission.peers.size() == 3 &&
+                    admission.masterApprovedBundleSHA256.equals(installedBundle),
+                "local_bundle_witness_repair_starts_from_fresh_exact_fleet_receipt");
+
+  Mothership mothership = {};
+  mothership.isFixedFile = true;
+  mothership.fslot = 27;
+  brain.activeMotherships.insert(&mothership);
+  RepairLocalBundleRecoveryWitness query = {};
+  query.action = ProdigyLocalBundleRecoveryWitnessRepairAction::query;
+  query.operationUUID = uint128_t(0x7304);
+  query.clusterUUID = brain.brainConfig.clusterUUID;
+  RepairLocalBundleRecoveryWitness queryResponse = {};
+  suite.require(
+      issueDeploymentLifecycleOperationForTest<
+          MothershipTopic::repairLocalBundleRecoveryWitness>(
+          brain, mothership, query, queryResponse) &&
+          queryResponse.success && queryResponse.witnessPresent && queryResponse.eligible &&
+          !queryResponse.completed &&
+          prodigyLocalBundleRecoveryWitnessRepairScopeValid(queryResponse.scope) &&
+          queryResponse.scope.operationUUID == query.operationUUID &&
+          queryResponse.scope.clusterUUID == query.clusterUUID &&
+          queryResponse.scope.machines.size() == 3,
+      "local_bundle_witness_repair_query_returns_exact_eligible_scope");
+  String queryDigest = {};
+  suite.require(
+      prodigyLocalBundleRecoveryWitnessRepairScopeSHA256(
+          queryResponse.scope, queryDigest) &&
+          queryDigest.equals(queryResponse.scopeSHA256),
+      "local_bundle_witness_repair_query_scope_is_canonical");
+
+  RepairLocalBundleRecoveryWitness retire = query;
+  retire.action = ProdigyLocalBundleRecoveryWitnessRepairAction::retire;
+  retire.scopeSHA256.assign(
+      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"_ctv);
+  RepairLocalBundleRecoveryWitness stale = {};
+  suite.expect(
+      issueDeploymentLifecycleOperationForTest<
+          MothershipTopic::repairLocalBundleRecoveryWitness>(
+          brain, mothership, retire, stale) &&
+          !stale.success &&
+          stale.failure.equal(
+              "local bundle recovery witness repair query receipt is stale or mismatched"_ctv) &&
+          brain.updateSelfMachineRecoveryWitnesses.size() == 3,
+      "local_bundle_witness_repair_rejects_stale_scope_without_mutation");
+
+  retire.scopeSHA256 = queryResponse.scopeSHA256;
+  const ProdigyPersistentUpdateSelfState before = brain.capturePersistentUpdateSelfState();
+  brain.holdRuntimePersistence = true;
+  auto dispatchRetire = [&]() {
+    mothership.wBuffer.clear();
+    String payload = {}, frame = {};
+    auto mutableRequest = retire;
+    BitseryEngine::serialize(payload, mutableRequest);
+    brain.mothershipHandler(
+        &mothership,
+        buildMothershipMessage(
+            frame, MothershipTopic::repairLocalBundleRecoveryWitness, payload));
+  };
+  dispatchRetire();
+  suite.require(mothership.wBuffer.empty() &&
+                    brain.pendingRuntimePersistence.size() == 1 &&
+                    brain.updateSelfWorkerExpectedBundleSHA256.empty() &&
+                    brain.updateSelfMachineRecoveryWitnesses.empty(),
+                "local_bundle_witness_repair_waits_for_durable_commit");
+  brain.finishRuntimePersistence(false);
+  RepairLocalBundleRecoveryWitness failed = {};
+  suite.expect(
+      extractAsyncRequestResponse(
+          mothership.wBuffer,
+          MothershipTopic::repairLocalBundleRecoveryWitness,
+          failed) &&
+          !failed.success && !failed.completed && failed.witnessPresent &&
+          failed.failure.equal(
+              "local bundle recovery witness repair durable commit failed"_ctv) &&
+          equalSerializedObjects(before, brain.capturePersistentUpdateSelfState()) &&
+          !brain.masterAuthorityRuntimeState.taskExecutions.contains(
+              prodigyLocalBundleRecoveryWitnessRepairJournalExecutionID),
+      "local_bundle_witness_repair_failed_commit_restores_witness_and_receipt");
+
+  dispatchRetire();
+  suite.require(mothership.wBuffer.empty() &&
+                    brain.pendingRuntimePersistence.size() == 1,
+                "local_bundle_witness_repair_lost_response_waits_for_commit");
+  brain.activeMotherships.erase(&mothership);
+  brain.finishRuntimePersistence(true);
+  suite.require(mothership.wBuffer.empty() &&
+                    brain.updateSelfWorkerExpectedBundleSHA256.empty() &&
+                    brain.updateSelfMachineRecoveryWitnesses.empty(),
+                "local_bundle_witness_repair_lost_response_commits_only_witness_retirement");
+
+  String authorityBytes = {};
+  auto authorityCopy = brain.masterAuthorityRuntimeState;
+  ProdigyMasterAuthorityRuntimeState reloadedAuthority = {};
+  ProdigyLocalBundleRecoveryWitnessRepairJournal reloadedJournal = {};
+  suite.require(
+      BitseryEngine::serialize(authorityBytes, authorityCopy) &&
+          BitseryEngine::deserializeSafe(authorityBytes, reloadedAuthority) &&
+          brain.decodeLocalBundleRecoveryWitnessRepairJournal(
+              reloadedAuthority, reloadedJournal) &&
+          reloadedJournal.receipts.size() == 1 &&
+          prodigyLocalBundleRecoveryWitnessRepairReceiptValid(
+              reloadedJournal.receipts.front()) &&
+          !brain.hasUpdateSelfRecoveryWitness(reloadedAuthority.updateSelf),
+      "local_bundle_witness_repair_receipt_and_retirement_survive_authority_reload");
+  brain.masterAuthorityRuntimeState = std::move(reloadedAuthority);
+  brain.masterAuthorityRuntimeStateDurable = true;
+  brain.durableMasterAuthorityRuntimeStateGeneration =
+      brain.masterAuthorityRuntimeState.generation;
+  brain.activeMotherships.insert(&mothership);
+
+  RepairLocalBundleRecoveryWitness replay = {};
+  suite.expect(
+      issueDeploymentLifecycleOperationForTest<
+          MothershipTopic::repairLocalBundleRecoveryWitness>(
+          brain, mothership, retire, replay) &&
+          replay.success && replay.idempotent && replay.completed &&
+          replay.scopeSHA256.equals(retire.scopeSHA256) &&
+          replay.durableGeneration ==
+              reloadedJournal.receipts.front().retiredAtAuthorityGeneration,
+      "local_bundle_witness_repair_lost_response_retry_replays_exact_receipt");
+
+  auto collision = retire;
+  collision.scopeSHA256.assign(
+      "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"_ctv);
+  RepairLocalBundleRecoveryWitness collisionResponse = {};
+  suite.expect(
+      issueDeploymentLifecycleOperationForTest<
+          MothershipTopic::repairLocalBundleRecoveryWitness>(
+          brain, mothership, collision, collisionResponse) &&
+          !collisionResponse.success &&
+          collisionResponse.failure.equal(
+              "local bundle recovery witness repair operation UUID collision"_ctv),
+      "local_bundle_witness_repair_rejects_operation_uuid_scope_collision");
+
+  auto absentQuery = query;
+  absentQuery.operationUUID = uint128_t(0x7305);
+  RepairLocalBundleRecoveryWitness absent = {};
+  suite.expect(
+      issueDeploymentLifecycleOperationForTest<
+          MothershipTopic::repairLocalBundleRecoveryWitness>(
+          brain, mothership, absentQuery, absent) &&
+          absent.success && !absent.witnessPresent && !absent.eligible &&
+          !absent.completed &&
+          absent.failure.equal("local bundle recovery witness is absent"_ctv) &&
+          !brain.pruneExpiredTaskExecutionRecords(INT64_MAX) &&
+          brain.masterAuthorityRuntimeState.taskExecutions.contains(
+              prodigyLocalBundleRecoveryWitnessRepairJournalExecutionID),
+      "local_bundle_witness_repair_terminal_journal_is_nonexpiring");
+
+  brain.activeMotherships.erase(&mothership);
+  for (uint32_t index = 0; index < 2; ++index) brain.brains.erase(&peers[index]);
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    brain.persistedMachineStateUploadPlansByMachine.erase(machines[index].uuid);
+    brain.persistedMachineInventoryUploaded.erase(machines[index].uuid);
+    brain.machinesByUUID.erase(machines[index].uuid);
+    brain.machines.erase(&machines[index]);
+  }
+  thisBrain = savedBrain;
+  thisNeuron = savedNeuron;
+}
+
 static void testAsyncRetainedStatefulRearmAcceptance(TestSuite& suite)
 {
   ScopedFreshRing ring = {};

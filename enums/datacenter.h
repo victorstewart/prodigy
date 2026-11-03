@@ -117,7 +117,10 @@ enum class MothershipTopic : uint16_t {
   // Durable target restoration for one exact retained stateful deployment.
   // Appended so older Brains reject it instead of decoding another lifecycle
   // payload. Request and response use one shared proof type on this topic.
-  rearmRetainedStatefulDeployment
+  rearmRetainedStatefulDeployment,
+  // Read-only inspection and narrowly fenced retirement of a dormant local
+  // bundle recovery witness. Appended so older Brains fail closed.
+  repairLocalBundleRecoveryWitness
 };
 
 constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
@@ -262,6 +265,8 @@ constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
       return "crossClusterPathFault";
     case MothershipTopic::rearmRetainedStatefulDeployment:
       return "rearmRetainedStatefulDeployment";
+    case MothershipTopic::repairLocalBundleRecoveryWitness:
+      return "repairLocalBundleRecoveryWitness";
   }
 
   return "unknown";
