@@ -9835,6 +9835,17 @@ static void testCrossClusterMasqueGatewayConnectorLeaseLifecycle(TestSuite& suit
   applicationUpload.state = ContainerState::scheduled;
   applicationUpload.runtimeReady = true;
   applicationUpload.fragment = 1;
+  IPPrefix applicationAddress = {};
+  applicationAddress.network.is6 = true;
+  applicationAddress.cidr = 128;
+  std::memcpy(applicationAddress.network.v6, container_network_subnet6.value,
+              sizeof(container_network_subnet6.value));
+  applicationAddress.network.v6[11] = promoted.brainConfig.datacenterFragment;
+  applicationAddress.network.v6[12] = uint8_t((host.fragment >> 16) & 0xffu);
+  applicationAddress.network.v6[13] = uint8_t((host.fragment >> 8) & 0xffu);
+  applicationAddress.network.v6[14] = uint8_t(host.fragment & 0xffu);
+  applicationAddress.network.v6[15] = applicationUpload.fragment;
+  applicationUpload.addresses.push_back(applicationAddress);
   String serializedApplicationUpload = {};
   BitseryEngine::serialize(serializedApplicationUpload, applicationUpload);
   ContainerView applicationContainer = {};
@@ -9915,6 +9926,56 @@ static void testCrossClusterMasqueGatewayConnectorLeaseLifecycle(TestSuite& suit
   suite.expect(witnessRoundTrip &&
       promoted.machineBundleInventoryMatchesWitness(&host, restoredWitness),
       "masque_connector_bundle_recovery_round_trips_and_matches_ready_application_and_gateway_inventory");
+
+  // A replacement Brain has only durable plan/authority state when it emits
+  // these witnesses. System gateways are deliberately absent from the
+  // application deployment index, so validate them through their durable
+  // gateway authority while still requiring the ordinary application plan.
+  promoted.deploymentPlans.insert_or_assign(applicationDeploymentID, applicationPlan);
+  const auto fragmentAssignment = std::lower_bound(
+      promoted.masterAuthorityRuntimeState.machineFragmentAssignments.begin(),
+      promoted.masterAuthorityRuntimeState.machineFragmentAssignments.end(),
+      host.uuid,
+      [](const ProdigyMachineFragmentAssignment& assignment, uint128_t uuid) {
+        return assignment.machineUUID < uuid;
+      });
+  if (fragmentAssignment ==
+          promoted.masterAuthorityRuntimeState.machineFragmentAssignments.end() ||
+      fragmentAssignment->machineUUID != host.uuid)
+    promoted.masterAuthorityRuntimeState.machineFragmentAssignments.insert(
+        fragmentAssignment, {host.uuid, host.fragment});
+  auto savedGatewayRuntimes = std::move(promoted.crossClusterMasqueGatewayBrainRuntimes);
+  promoted.deployments.clear();
+  promoted.deploymentsByApp.clear();
+  String replayFailure = {};
+  suite.expect(promoted.durableRecoveryWitnessBootstrapsProjectable(
+                   &host, restoredWitness.containerBootstraps, replayFailure) &&
+                   replayFailure.empty(),
+               "masque_connector_durable_witness_projects_application_and_gateway_after_brain_reload");
+
+  Vector<String> staleGatewayWitness = restoredWitness.containerBootstraps;
+  bool mutatedGateway = false;
+  for (String& serialized : staleGatewayWitness)
+  {
+    NeuronContainerBootstrap bootstrap = {};
+    if (!BitseryEngine::deserializeSafe(serialized, bootstrap) ||
+        bootstrap.plan.system.kind != SystemContainerKind::crossClusterMasqueGateway)
+      continue;
+    ++bootstrap.plan.system.gatewayGeneration;
+    serialized.clear();
+    mutatedGateway = BitseryEngine::serialize(serialized, bootstrap);
+    break;
+  }
+  replayFailure.clear();
+  suite.expect(mutatedGateway &&
+                   !promoted.durableRecoveryWitnessBootstrapsProjectable(
+                       &host, staleGatewayWitness, replayFailure) &&
+                   replayFailure == "durable retained gateway bootstrap does not match canonical authority"_ctv,
+               "masque_connector_durable_witness_rejects_non_authoritative_gateway_fields");
+  promoted.crossClusterMasqueGatewayBrainRuntimes = std::move(savedGatewayRuntimes);
+  promoted.deployments.insert_or_assign(applicationDeploymentID, &applicationDeployment);
+  promoted.deploymentsByApp.insert_or_assign(
+      applicationPlan.config.applicationID, &applicationDeployment);
 
   const uint64_t acceptedIOGeneration = host.neuron.ioGeneration;
   ++host.neuron.ioGeneration;
@@ -34965,6 +35026,324 @@ static void testBundleCheckpointCapturesOnlyAcknowledgedNeuronInventory(TestSuit
   thisNeuron = previousNeuron;
 }
 
+class BrainWitnessRetainedCgroupNeuron final : public Neuron {
+public:
+  String root = {};
+  bool restore = false;
+
+  void seed(const String& cgroupRoot, uint8_t datacenterFragment, uint32_t machineFragment)
+  {
+    root = cgroupRoot;
+    lcsubnet6 = {};
+    lcsubnet6.dpfx = datacenterFragment;
+    lcsubnet6.mpfx[0] = uint8_t((machineFragment >> 16) & 0xffu);
+    lcsubnet6.mpfx[1] = uint8_t((machineFragment >> 8) & 0xffu);
+    lcsubnet6.mpfx[2] = uint8_t(machineFragment & 0xffu);
+    brain = new NeuronBrainControlStream();
+    brain->isFixedFile = true;
+    brain->fslot = 1;
+    brain->connected = true;
+  }
+
+  void receiveBootstrap(const String& serialized)
+  {
+    String frame = {};
+    uint32_t header = Message::appendHeader(frame, NeuronTopic::stateUpload);
+    Message::appendAlignedBuffer<Alignment::one>(
+        frame, reinterpret_cast<const uint8_t*>(&lcsubnet6), sizeof(lcsubnet6));
+    Message::appendValue(frame, serialized);
+    Message::finish(frame, header);
+    neuronHandler(reinterpret_cast<Message*>(frame.data()));
+  }
+
+  bool adopted(uint128_t uuid, pid_t pid) const
+  {
+    auto found = containers.find(uuid);
+    return found != containers.end() && found->second != nullptr && found->second->pid == pid &&
+        containerByPid.find(pid) != containerByPid.end() && containerByPid.find(pid)->second == found->second;
+  }
+
+  bool inventoryComplete()
+  {
+    String failure = {};
+    return liveContainerInventoryComplete(failure);
+  }
+
+protected:
+  String containerCgroupInventoryRoot(void) const override { return root; }
+
+  ProdigyHostTask<bool> restoreStateUploadNetworkAsync(
+      Container *, CoroutineStack *, String *, std::function<bool()> current) override
+  {
+    co_return restore && current();
+  }
+
+  void queueRestoredStateUploadContainerWaitid(Container *) override {}
+
+  void pushContainer(Container *container) override
+  {
+    if (container == nullptr) return;
+    containers.insert_or_assign(container->plan.uuid, container);
+    containerByPid.insert_or_assign(container->pid, container);
+  }
+};
+
+static String makeBrainWitnessCgroupRoot(uint32_t index)
+{
+  const auto base = std::filesystem::current_path() / ".run";
+  std::filesystem::create_directories(base);
+  std::string pattern = (base / ("prodigy-brain-witness-" + std::to_string(index) + "-XXXXXX")).string();
+  char *created = mkdtemp(pattern.data());
+  return created == nullptr ? String{} : String(created);
+}
+
+static bool writeBrainWitnessRetainedCgroup(String root, uint128_t uuid, pid_t pid)
+{
+  if (root.empty()) return false;
+  const auto leaf = std::filesystem::path(root.c_str()) /
+      (std::to_string(uint64_t(uuid)) + ".slice") / "leaf";
+  std::filesystem::create_directories(leaf);
+  std::ofstream(leaf.parent_path() / "cgroup.events") << "populated 1\nfrozen 0\n";
+  std::ofstream(leaf.parent_path() / "cpuset.cpus") << "0\n";
+  std::ofstream(leaf.parent_path() / "cpuset.cpus.effective") << "0\n";
+  std::ofstream(leaf / "cgroup.procs") << pid << "\n";
+  return bool(std::ifstream(leaf / "cgroup.procs"));
+}
+
+static void testDurableWitnessReplaysThreeRetainedMachinesAfterProjectionReload(TestSuite& suite)
+{
+  ScopedFreshRing ring = {};
+  constexpr uint16_t applicationID = 0x5221;
+  constexpr uint8_t datacenterFragment = 1;
+  const pid_t self = getpid();
+
+  // This is the durable side of the handoff: it intentionally has no live
+  // deployment/container projections.  Only the persisted plan, canonical
+  // machine fragments, and exact all-machine witnesses survive the reload.
+  StreamingTestBrain reloaded = {};
+  Mesh mesh = {};
+  reloaded.mesh = &mesh;
+  reloaded.weAreMaster = true;
+  reloaded.nBrains = 1;
+  reloaded.brainConfig.datacenterFragment = datacenterFragment;
+  reloaded.masterAuthorityRuntimeState.generation = 7;
+  reloaded.masterAuthorityRuntimeStateDurable = true;
+  reloaded.durableMasterAuthorityRuntimeStateGeneration = 7;
+  reloaded.recoveringPersistedNeuronInventory = true;
+  reloaded.persistedMachineInventoryEnumerated = true;
+  TestNeuron selfBrain = {};
+  selfBrain.uuid = uint128_t(0x522100ffu);
+  NeuronBase *previousNeuron = thisNeuron;
+  BrainBase *previousBrain = thisBrain;
+  thisNeuron = &selfBrain;
+  thisBrain = &reloaded;
+  reloaded.hasAuthoritativeTopology = true;
+  ClusterMachine commissionedBrain = {};
+  commissionedBrain.uuid = selfBrain.uuid;
+  commissionedBrain.isBrain = true;
+  reloaded.authoritativeTopology.machines.push_back(commissionedBrain);
+
+  DeploymentPlan plan = makeDeploymentPlan(applicationID, 1);
+  plan.config.type = ApplicationType::stateless;
+  plan.isStateful = false;
+  const uint64_t deploymentID = plan.config.deploymentID();
+  reloaded.deploymentPlans.insert_or_assign(deploymentID, plan);
+
+  ApplicationDeployment projectedDeployment = {};
+  projectedDeployment.plan = plan;
+  projectedDeployment.state = DeploymentState::running;
+
+  Machine machines[3] = {};
+  BrainWitnessRetainedCgroupNeuron neurons[3] = {};
+  Vector<String> roots = {};
+  Vector<String> emittedBootstraps = {};
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    Machine& machine = machines[index];
+    machine.uuid = uint128_t(0x52210001u + index);
+    machine.fragment = 0x110001u + index;
+    machine.state = MachineState::healthy;
+    machine.neuron.machine = &machine;
+    machine.neuron.isFixedFile = true;
+    machine.neuron.fslot = int(70 + index);
+    machine.neuron.connected = true;
+    reloaded.machines.insert(&machine);
+    reloaded.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+    reloaded.neurons.insert(&machine.neuron);
+    reloaded.masterAuthorityRuntimeState.machineFragmentAssignments.push_back({machine.uuid, machine.fragment});
+
+    ContainerPlan retained = {};
+    retained.uuid = uint128_t(0x52211001u + index);
+    retained.config = plan.config;
+    retained.state = ContainerState::scheduled;
+    retained.runtimeReady = true;
+    retained.fragment = uint8_t(index + 1);
+    IPPrefix address = {};
+    address.network.is6 = true;
+    address.cidr = 128;
+    std::memcpy(address.network.v6, container_network_subnet6.value, sizeof(container_network_subnet6.value));
+    address.network.v6[11] = datacenterFragment;
+    address.network.v6[12] = uint8_t((machine.fragment >> 16) & 0xffu);
+    address.network.v6[13] = uint8_t((machine.fragment >> 8) & 0xffu);
+    address.network.v6[14] = uint8_t(machine.fragment & 0xffu);
+    address.network.v6[15] = retained.fragment;
+    retained.addresses.push_back(address);
+    NeuronContainerBootstrap bootstrap = {};
+    bootstrap.plan = retained;
+    String serialized = {};
+    suite.require(BitseryEngine::serialize(serialized, bootstrap), "durable_witness_three_machine_serializes_exact_bootstrap");
+    ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
+    witness.machineUUID = machine.uuid;
+    witness.bundleRegistered = true;
+    witness.containerBootstraps.push_back(std::move(serialized));
+    reloaded.updateSelfMachineRecoveryWitnesses.push_back(std::move(witness));
+  }
+  reloaded.masterAuthorityRuntimeState.updateSelf.machineRecoveryWitnesses = reloaded.updateSelfMachineRecoveryWitnesses;
+
+  bool exactBrainReplay = true;
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    Machine& machine = machines[index];
+    reloaded.queueNeuronStateUploadForMachine(&machine);
+    String bootstrap = {};
+    bool foundFrame = false;
+    forEachMessageInBuffer(machine.neuron.wBuffer, [&](Message *frame) {
+      if (NeuronTopic(frame->topic) != NeuronTopic::stateUpload || foundFrame) return;
+      uint8_t *args = frame->args;
+      local_container_subnet6 fragment = {};
+      Message::extractBytes<Alignment::one>(args, reinterpret_cast<uint8_t*>(&fragment), sizeof(fragment));
+      String candidate = {};
+      Message::extractToStringView(args, candidate);
+      if (args == frame->terminal() && fragment.dpfx == datacenterFragment &&
+          ((uint32_t(fragment.mpfx[0]) << 16) | (uint32_t(fragment.mpfx[1]) << 8) | fragment.mpfx[2]) == machine.fragment)
+      {
+        bootstrap = candidate;
+        foundFrame = true;
+      }
+    });
+    NeuronContainerBootstrap decoded = {};
+    exactBrainReplay = exactBrainReplay && foundFrame && BitseryEngine::deserializeSafe(bootstrap, decoded) &&
+        decoded.plan.uuid == uint128_t(0x52211001u + index) && decoded.plan.config.deploymentID() == deploymentID;
+    emittedBootstraps.push_back(std::move(bootstrap));
+  }
+  suite.require(exactBrainReplay,
+                "durable_witness_three_machine_brain_emits_exact_same_uuid_replays_after_projection_reload");
+
+  bool cgroupsAdopted = true;
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    roots.push_back(makeBrainWitnessCgroupRoot(index));
+    NeuronContainerBootstrap decoded = {};
+    const bool decodedBootstrap = BitseryEngine::deserializeSafe(emittedBootstraps[index], decoded);
+    const bool wrote = decodedBootstrap && writeBrainWitnessRetainedCgroup(roots.back(), decoded.plan.uuid, self);
+    neurons[index].seed(roots.back(), datacenterFragment, machines[index].fragment);
+    neurons[index].receiveBootstrap(emittedBootstraps[index]);
+    const bool pendingOwnerHoldsInventoryFence = neurons[index].inventoryComplete() &&
+        !neurons[index].adopted(decoded.plan.uuid, self);
+    neurons[index].restore = true;
+    neurons[index].receiveBootstrap(emittedBootstraps[index]);
+    cgroupsAdopted = cgroupsAdopted && wrote && pendingOwnerHoldsInventoryFence &&
+        neurons[index].adopted(decoded.plan.uuid, self);
+  }
+  suite.expect(cgroupsAdopted,
+               "durable_witness_three_machine_neurons_adopt_exact_fake_retained_cgroups_without_new_uuid");
+
+  // Feed the three post-adoption inventories back through the real Brain
+  // stateUpload handler. The deployment projection is reconstructed only here;
+  // it was absent when Brain emitted the durable witness replays above.
+  reloaded.deployments.insert_or_assign(deploymentID, &projectedDeployment);
+  reloaded.deploymentsByApp.insert_or_assign(applicationID, &projectedDeployment);
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    String upload = {};
+    uint32_t header = Message::appendHeader(upload, NeuronTopic::stateUpload);
+    local_container_subnet6 fragment = {};
+    fragment.dpfx = datacenterFragment;
+    fragment.mpfx[0] = uint8_t((machines[index].fragment >> 16) & 0xffu);
+    fragment.mpfx[1] = uint8_t((machines[index].fragment >> 8) & 0xffu);
+    fragment.mpfx[2] = uint8_t(machines[index].fragment & 0xffu);
+    Message::appendAlignedBuffer<Alignment::one>(upload, reinterpret_cast<uint8_t*>(&fragment), sizeof(fragment));
+    NeuronContainerBootstrap returned = {};
+    String returnedPlan = {};
+    suite.require(BitseryEngine::deserializeSafe(emittedBootstraps[index], returned) &&
+                      BitseryEngine::serialize(returnedPlan, returned.plan),
+                  "durable_witness_three_machine_serializes_returned_neuron_inventory");
+    Message::appendValue(upload, returnedPlan);
+    Message::finish(upload, header);
+    reloaded.neuronHandler(&machines[index].neuron, reinterpret_cast<Message*>(upload.data()));
+  }
+  String blocker = {};
+  const bool uploadedEveryMachine = reloaded.persistedMachineInventoryUploaded.size() == 3;
+  const bool everyMachineReady = std::all_of(std::begin(machines), std::end(machines),
+      [](const Machine& machine) { return machine.runtimeReady; });
+  const bool indexedEveryContainer = reloaded.containers.size() == 3;
+  const bool durableWitnessMatches = reloaded.allMachineBundleInventoriesMatch();
+  suite.expect(uploadedEveryMachine,
+               "durable_witness_three_machine_records_every_returned_inventory");
+  suite.expect(everyMachineReady,
+               "durable_witness_three_machine_marks_every_inventory_authoritative");
+  suite.expect(indexedEveryContainer,
+               "durable_witness_three_machine_rebuilds_every_canonical_container");
+  suite.expect(durableWitnessMatches,
+               "durable_witness_three_machine_returned_inventory_matches_durable_witness");
+  // Open the barrier through the production recovery owner rather than the
+  // stateUpload callback. This proves a quiet fleet still consumes and
+  // durably clears the witness when some other prerequisite opens last.
+  reloaded.ignited = true;
+  reloaded.holdRuntimePersistence = true;
+  reloaded.recoverDeploymentsAfterNeuronState();
+  const bool finalized = reloaded.recoveringPersistedNeuronInventory == false;
+  if (!finalized)
+  {
+    (void)reloaded.finalizePersistedNeuronInventoryRecovery(&blocker);
+    std::fprintf(stderr, "three-machine retained-cgroup finalizer blocker=%s\n", blocker.c_str());
+  }
+  const bool cleanupReceiptHeld = reloaded.pendingRuntimePersistence.size() == 1 &&
+      !reloaded.recoveryAuthoritySnapshotDurable();
+  reloaded.finishRuntimePersistence(false);
+  const bool cleanupFailureHeldRecovery =
+      reloaded.recoveryPersistenceRetryPending && !reloaded.recoveryAuthoritySnapshotDurable();
+  reloaded.retryMasterAuthorityRuntimeStatePersistence();
+  const bool cleanupRetryHeld = reloaded.pendingRuntimePersistence.size() == 1 &&
+      reloaded.masterAuthorityPersistencePending == 1;
+  reloaded.retryDeferredRecoveryPersistence();
+  const bool nondurableRetryDidNotResume = reloaded.recoveryPersistenceRetryPending;
+  reloaded.finishRuntimePersistence(true);
+  reloaded.retryDeferredRecoveryPersistence();
+  const bool cleanupRetryDurable = reloaded.recoveryAuthoritySnapshotDurable() &&
+      !reloaded.recoveryPersistenceRetryPending;
+  const bool bundleRecoveryReleased =
+      reloaded.updateSelfMachineRecoveryWitnesses.empty() &&
+      reloaded.updateSelfLocalContainerBootstraps.empty();
+  const bool opened = uploadedEveryMachine && everyMachineReady && indexedEveryContainer &&
+      durableWitnessMatches && finalized && cleanupReceiptHeld && cleanupFailureHeldRecovery &&
+      cleanupRetryHeld && nondurableRetryDidNotResume && cleanupRetryDurable &&
+      bundleRecoveryReleased;
+  suite.expect(opened && reloaded.recoveringPersistedNeuronInventory == false &&
+                   reloaded.containers.size() == 3 &&
+                   reloaded.containers.contains(uint128_t(0x52211001)) &&
+                   reloaded.containers.contains(uint128_t(0x52211002)) &&
+                   reloaded.containers.contains(uint128_t(0x52211003)),
+               "durable_witness_three_machine_returned_uploads_open_finalizer_without_duplicate_uuid");
+
+  for (String root : roots)
+    if (!root.empty()) std::filesystem::remove_all(root.c_str());
+  Vector<ContainerView*> cleanup = {};
+  for (const auto& [uuid, container] : reloaded.containers) { (void)uuid; cleanup.push_back(container); }
+  for (ContainerView *container : cleanup) delete container;
+  reloaded.containers.clear();
+  reloaded.deploymentsByApp.erase(applicationID);
+  reloaded.deployments.erase(deploymentID);
+  for (Machine& machine : machines)
+  {
+    reloaded.neurons.erase(&machine.neuron);
+    reloaded.machinesByUUID.erase(machine.uuid);
+    reloaded.machines.erase(&machine);
+  }
+  thisNeuron = previousNeuron;
+  thisBrain = previousBrain;
+}
+
 static void testReplicatedAllMachineBundleRecoveryWitnessIsUUIDIndexed(TestSuite& suite)
 {
   TestBrain successor = {};
@@ -44886,6 +45265,8 @@ int main(void)
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "async-recovery") == 0)
   {
     testAsyncMaterializedRecoveryAcceptance(suite);
+    testMaterializedRecoveryBlockers(suite);
+    testDurableWitnessReplaysThreeRetainedMachinesAfterProjectionReload(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "async-retirement") == 0)
@@ -44912,6 +45293,7 @@ int main(void)
     runAsyncAddMachinesTests(suite);
     testAsyncAddMachinesRecoveryPersistence(suite);
     testAsyncMaterializedRecoveryAcceptance(suite);
+    testMaterializedRecoveryBlockers(suite);
     testAsyncMachineRetirementJournalDurability(suite);
     testAsyncStaticRoutableRegistryPersistenceGates(suite);
     testAsyncElasticRoutablePersistenceGates(suite);

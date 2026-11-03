@@ -145,3 +145,109 @@ static void testAsyncMaterializedRecoveryAcceptance(TestSuite& suite)
   delete successor; delete active; thisBrain = savedBrain;
  }
 }
+
+static void testMaterializedRecoveryBlockers(TestSuite& suite)
+{
+  ScopedRing scopedRing;
+  TestBrain brain = {};
+  String blocker = {};
+  brain.recoveringPersistedNeuronInventory = true;
+  suite.expect(!brain.finalizePersistedNeuronInventoryRecovery(&blocker) &&
+                   blocker.equal("persisted machine inventory is not enumerated"_ctv),
+               "materialized_recovery_reports_unenumerated_inventory_blocker");
+
+  brain.persistedMachineInventoryEnumerated = true;
+  blocker.clear();
+  suite.expect(!brain.finalizePersistedNeuronInventoryRecovery(&blocker) &&
+                   blocker.equal("no machine inventory is available"_ctv),
+               "materialized_recovery_reports_empty_machine_inventory_blocker");
+
+  constexpr uint16_t applicationID = 63113;
+  constexpr uint64_t deploymentID = (uint64_t(applicationID) << 48) | 1;
+  ApplicationDeployment retained = {};
+  retained.plan = makeDeploymentPlan(applicationID, 1);
+  retained.plan.config.type = ApplicationType::stateful;
+  retained.plan.isStateful = true;
+  ContainerView retainedRuntimes[3] = {};
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    retainedRuntimes[index].uuid = uint128_t(0x63113001 + index);
+    retainedRuntimes[index].deploymentID = deploymentID;
+    retainedRuntimes[index].applicationID = applicationID;
+    retained.containers.insert(&retainedRuntimes[index]);
+  }
+  brain.deploymentsByApp.insert_or_assign(applicationID, &retained);
+  blocker.clear();
+  suite.expect(!brain.materializedRecoveryCanonicalActiveDeployment(applicationID, deploymentID, blocker) &&
+                   blocker.equal("canonical active deployment owner is missing while the application report retains runtimes"_ctv),
+               "materialized_recovery_rejects_retained_report_without_canonical_owner");
+
+  ApplicationDeployment canonicalEmpty = {};
+  canonicalEmpty.plan = retained.plan;
+  brain.deployments.insert_or_assign(deploymentID, &canonicalEmpty);
+  blocker.clear();
+  suite.expect(!brain.materializedRecoveryCanonicalActiveDeployment(applicationID, deploymentID, blocker) &&
+                   blocker.equal("application report and canonical active deployment owners differ"_ctv),
+               "materialized_recovery_rejects_three_reported_runtimes_against_empty_canonical_cohort");
+
+  Machine machine = {};
+  machine.uuid = 0x63113002;
+  blocker.clear();
+  suite.expect(!brain.durableRecoveryWitnessBootstrapsProjectable(&machine, {}, blocker) &&
+                   blocker.equal("durable retained bootstrap machine identity or fragment is unavailable"_ctv),
+               "materialized_recovery_rejects_zero_fragment_durable_witness_projection");
+  machine.fragment = 0x6311;
+  brain.masterAuthorityRuntimeState.machineFragmentAssignments.push_back({machine.uuid, machine.fragment});
+  blocker.clear();
+  suite.expect(brain.durableRecoveryWitnessBootstrapsProjectable(&machine, {}, blocker) && blocker.empty(),
+               "materialized_recovery_accepts_authoritative_empty_machine_witness");
+
+  BrainBase *savedBrain = thisBrain;
+  thisBrain = &brain;
+  brain.weAreMaster = true;
+  brain.ignited = true;
+  String name = "materialized-recovery-blocker-test"_ctv;
+  brain.reservedApplicationNamesByID.insert_or_assign(applicationID, name);
+  Mothership mothership = {};
+  mothership.isFixedFile = true;
+  mothership.fslot = 99;
+  brain.activeMotherships.insert(&mothership);
+  RecoverMaterializedStatefulDeployment request = {};
+  request.applicationName = name;
+  request.applicationID = applicationID;
+  request.activeVersionID = 1;
+  request.successorVersionID = 2;
+  request.operationID.assign("123e4567-e89b-42d3-a456-426614174011"_ctv);
+  request.successorBlobSHA256.assign("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
+  String payload = {}, frame = {};
+  BitseryEngine::serialize(payload, request);
+  brain.mothershipHandler(&mothership, buildMothershipMessage(
+      frame, MothershipTopic::recoverMaterializedStatefulDeployment, payload));
+  RecoverMaterializedStatefulDeployment response = {};
+  suite.expect(extractAsyncRequestResponse(mothership.wBuffer,
+                   MothershipTopic::recoverMaterializedStatefulDeployment, response) && !response.success &&
+                   response.failure.equal("materialized stateful recovery inventory is not authoritative: no machine inventory is available"_ctv),
+               "materialized_recovery_returns_exact_inventory_blocker_to_mothership");
+  mothership.wBuffer.clear();
+  request.retryFailedSuccessor = true;
+  request.replacementSuccessorVersionID = 3;
+  request.replacementSuccessorBlobSHA256.assign("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"_ctv);
+  request.sourceContainerUUID = 1;
+  request.failedSuccessorContainerUUID = 2;
+  request.sourceMachineUUID = 3;
+  request.sourceDevice = 4;
+  request.sourceInode = 5;
+  request.sourcePID = 6;
+  request.captureSHA256.assign("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"_ctv);
+  payload.clear(); frame.clear();
+  BitseryEngine::serialize(payload, request);
+  brain.mothershipHandler(&mothership, buildMothershipMessage(
+      frame, MothershipTopic::recoverMaterializedStatefulDeployment, payload));
+  response = {};
+  suite.expect(extractAsyncRequestResponse(mothership.wBuffer,
+                   MothershipTopic::recoverMaterializedStatefulDeployment, response) && !response.success &&
+                   response.failure.equal("materialized stateful recovery retry inventory is not authoritative: no machine inventory is available"_ctv),
+               "materialized_recovery_retry_returns_exact_inventory_blocker_to_mothership");
+  brain.activeMotherships.erase(&mothership);
+  thisBrain = savedBrain;
+}

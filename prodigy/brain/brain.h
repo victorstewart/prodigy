@@ -9067,7 +9067,8 @@ public:
     }
   }
 
-  void noteMasterAuthorityRuntimeStateChanged(bool replicate = true, bool persist = true)
+  void noteMasterAuthorityRuntimeStateChanged(bool replicate = true, bool persist = true,
+                                              PersistenceCompletion completion = {})
   {
     refreshMasterAuthorityRuntimeStateFromLiveFields();
     if (masterAuthorityRuntimeState.generation < UINT64_MAX)
@@ -9082,19 +9083,24 @@ public:
       const uint64_t generation = masterAuthorityRuntimeState.generation;
       const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
       ++masterAuthorityPersistencePending;
-      persistLocalRuntimeStateAsync([this, lifetime, epoch, generation, replicate](bool durable) {
+      persistLocalRuntimeStateAsync([this, lifetime, epoch, generation, replicate,
+                                    completion = std::move(completion)](bool durable) mutable {
         if (lifetime.expired()) return;
         --masterAuthorityPersistencePending;
-        if (!durable || masterAuthorityEpoch != epoch ||
-            masterAuthorityRuntimeState.generation != generation) return;
-        masterAuthorityRuntimeStateDurable = true;
-        durableMasterAuthorityRuntimeStateGeneration = generation;
-        captureDurableElasticAddressOperations();
-        finalizePendingMachineFragmentAssignmentPersistence();
-        if (replicate) queueMasterAuthorityRuntimeStateReplication();
-        // A connector's source-port reservation defers launch until this
-        // exact authority state is durable. Wake its existing reconciler.
-        reconcileCrossClusterMasqueGatewayRuntimeState();
+        const bool current = durable && masterAuthorityEpoch == epoch &&
+            masterAuthorityRuntimeState.generation == generation;
+        if (current)
+        {
+          masterAuthorityRuntimeStateDurable = true;
+          durableMasterAuthorityRuntimeStateGeneration = generation;
+          captureDurableElasticAddressOperations();
+          finalizePendingMachineFragmentAssignmentPersistence();
+          if (replicate) queueMasterAuthorityRuntimeStateReplication();
+          // A connector's source-port reservation defers launch until this
+          // exact authority state is durable. Wake its existing reconciler.
+          reconcileCrossClusterMasqueGatewayRuntimeState();
+        }
+        if (completion) completion(current);
       });
       return;
     }
@@ -9103,6 +9109,7 @@ public:
     {
       queueMasterAuthorityRuntimeStateReplication();
     }
+    if (completion) completion(true);
   }
 
   bool commitMasterAuthorityStateChange(bool advanceGeneration = true)
@@ -20051,8 +20058,16 @@ public:
     return receipt->completed && receipt->durable;
   }
 
-  bool finalizePersistedNeuronInventoryRecovery(void)
+  // Keep the established boolean API. Callers that have to explain a rejected
+  // Mothership operation may request the first deterministic fail-closed
+  // blocker instead of flattening the inventory barrier into "unsafe".
+  bool finalizePersistedNeuronInventoryRecovery(String *blocker = nullptr)
   {
+    const auto reject = [blocker](const char *reason) {
+      if (blocker != nullptr) blocker->assign(reason);
+      return false;
+    };
+    if (blocker != nullptr) blocker->clear();
     if (recoveringPersistedNeuronInventory == false)
     {
       return true;
@@ -20060,12 +20075,14 @@ public:
 
     if (persistedMachineInventoryEnumerated == false)
     {
-      return false;
+      return reject("persisted machine inventory is not enumerated");
     }
 
     if (!pendingReplicatedContainerRuntimeStates.empty() || !replayRestoredContainerInventory())
     {
-      return false;
+      return reject(pendingReplicatedContainerRuntimeStates.empty()
+          ? "restored container inventory replay is incomplete"
+          : "replicated container runtime materialization is pending");
     }
 
     bool haveMachineInventory = false;
@@ -20088,13 +20105,13 @@ public:
       if (machine->uuid == 0 || machine->runtimeReady == false ||
           persistedMachineInventoryUploaded.contains(machine->uuid) == false)
       {
-        return false;
+        return reject("live machine inventory is not authoritative");
       }
     }
 
     if (haveMachineInventory == false)
     {
-      return false;
+      return reject("no machine inventory is available");
     }
 
     // A restarted Neuron can announce an empty in-memory inventory before
@@ -20105,7 +20122,7 @@ public:
     {
       if (allMachineBundleInventoriesMatch() == false)
       {
-        return false;
+        return reject("captured machine inventory does not match its durable witness");
       }
     }
     // A legacy singleton record is insufficient for a multi-Brain recovery.
@@ -20114,7 +20131,7 @@ public:
     if (machines.size() > 1 && (updateSelfLocalMachineUUID != 0 ||
                                 updateSelfLocalContainerBootstraps.empty() == false))
     {
-      return false;
+      return reject("legacy singleton inventory cannot recover a multi-machine fleet");
     }
     if (updateSelfLocalMachineUUID != 0 && updateSelfLocalContainerBootstraps.empty() == false)
     {
@@ -20123,7 +20140,7 @@ public:
       if (local == nullptr || local->runtimeReady == false ||
           persistedMachineInventoryUploaded.contains(updateSelfLocalMachineUUID) == false)
       {
-        return false;
+        return reject("legacy local machine inventory is not authoritative");
       }
       for (const auto& [deploymentID, localContainers] : local->containersByDeploymentID)
       {
@@ -20138,13 +20155,13 @@ public:
       }
       if (localBundleInventoryIncludesCapturedBootstraps(local, localInventory) == false)
       {
-        return false;
+        return reject("legacy local inventory does not match captured bootstraps");
       }
     }
 
     if (mesh == nullptr)
     {
-      return false;
+      return reject("recovered neuron mesh is unavailable");
     }
 
     // Per-machine absence is not a fleet deficit.  A successor launched by the
@@ -20196,12 +20213,12 @@ public:
       auto deployment = deployments.find(container->deploymentID);
       if (deployment == deployments.end() || deployment->second == nullptr)
       {
-        return false;
+        return reject("confirmed absent runtime has no canonical deployment owner");
       }
       prodigyCancelWormholeRuntimeAckDeadline(container);
       if (deployment->second->discardConfirmedAbsentRecoveredContainer(container) == false)
       {
-        return false;
+        return reject("confirmed absent runtime cannot be retired safely");
       }
       resolvedAbsentContainers.push_back(uuid);
     }
@@ -20211,7 +20228,7 @@ public:
     }
     if (persistedInventoryConfirmedAbsentContainers.empty() == false)
     {
-      return false;
+      return reject("confirmed absent runtime reconciliation is incomplete");
     }
 
     if (recoveredNeuronPairingsUnified == false)
@@ -20245,7 +20262,7 @@ public:
       if (container->wormholeRuntimePendingMachines.empty() == false ||
           container->wormholeRuntimeFailedMachines.empty() == false)
       {
-        return false;
+        return reject("recovered wormhole runtime acknowledgement is pending or failed");
       }
     }
     // Only after every live Neuron has attested may the optional stale-lease
@@ -20253,11 +20270,99 @@ public:
     // failure leaves the inventory gate closed for retry.
     if (pruneRecoveredInventoryOrphanWhiteholeLeases() == false)
     {
-      return false;
+      return reject("recovered orphan lease reconciliation is not durable");
     }
-    if (!reconcileContainerRetirements()) return false;
+    if (!reconcileContainerRetirements()) return reject("container retirement reconciliation is incomplete");
     recoveringPersistedNeuronInventory = false;
     persistedInventoryConfirmedAbsentContainers.clear();
+    return true;
+  }
+
+  // Application reports intentionally retain the whole version chain for
+  // operator forensics.  Recovery, however, can act only on the exact
+  // deployment owner in the canonical index.  Do not let a retained report
+  // row stand in for that owner after a Brain reload.
+  bool materializedRecoveryCanonicalActiveDeployment(uint16_t applicationID,
+                                                     uint64_t deploymentID,
+                                                     String& failure) const
+  {
+    failure.clear();
+    const auto canonical = deployments.find(deploymentID);
+    const auto head = deploymentsByApp.find(applicationID);
+    ApplicationDeployment *reported = nullptr;
+    bytell_hash_set<const ApplicationDeployment *> visited = {};
+    if (head != deploymentsByApp.end())
+    {
+      for (ApplicationDeployment *candidate = head->second; candidate != nullptr; candidate = candidate->previous)
+      {
+        if (visited.insert(candidate).second == false)
+        {
+          failure.assign("application deployment report chain is cyclic");
+          return false;
+        }
+        if (candidate->plan.config.applicationID != applicationID)
+        {
+          failure.assign("application deployment report chain has a foreign application owner");
+          return false;
+        }
+        if (candidate->plan.config.deploymentID() == deploymentID)
+        {
+          reported = candidate;
+          break;
+        }
+      }
+    }
+    if (canonical == deployments.end() || canonical->second == nullptr)
+    {
+      failure.assign(reported != nullptr && reported->containers.empty() == false
+          ? "canonical active deployment owner is missing while the application report retains runtimes"
+          : "canonical active deployment owner is missing");
+      return false;
+    }
+    if (canonical->second->plan.config.applicationID != applicationID ||
+        canonical->second->plan.config.deploymentID() != deploymentID)
+    {
+      failure.assign("canonical active deployment owner has a conflicting identity");
+      return false;
+    }
+    if (reported == nullptr)
+    {
+      failure.assign("application report omits the canonical active deployment");
+      return false;
+    }
+    if (reported != canonical->second)
+    {
+      failure.assign("application report and canonical active deployment owners differ");
+      return false;
+    }
+    bytell_hash_set<uint128_t> canonicalUUIDs = {}, reportedUUIDs = {};
+    for (ContainerView *container : canonical->second->containers)
+    {
+      if (container == nullptr || container->uuid == 0 || container->deploymentID != deploymentID ||
+          containers.contains(container->uuid) == false || containers.at(container->uuid) != container ||
+          canonicalUUIDs.insert(container->uuid).second == false)
+      {
+        failure.assign("canonical active deployment cohort is malformed");
+        return false;
+      }
+    }
+    for (ContainerView *container : reported->containers)
+    {
+      if (container == nullptr || container->uuid == 0 || container->deploymentID != deploymentID ||
+          reportedUUIDs.insert(container->uuid).second == false)
+      {
+        failure.assign("application report active deployment cohort is malformed");
+        return false;
+      }
+    }
+    if (canonicalUUIDs.size() != reportedUUIDs.size() ||
+        std::any_of(canonicalUUIDs.begin(), canonicalUUIDs.end(), [&](uint128_t uuid) {
+          return reportedUUIDs.contains(uuid) == false;
+        }))
+    {
+      failure.assign("application report and canonical active deployment runtime UUID sets differ");
+      return false;
+    }
     return true;
   }
 
@@ -20382,10 +20487,17 @@ public:
     return true;
   }
 
+  bool recoveryAuthoritySnapshotDurable(void) const
+  {
+    return masterAuthorityPersistencePending == 0 &&
+           masterAuthorityRuntimeStateDurable &&
+           durableMasterAuthorityRuntimeStateGeneration == masterAuthorityRuntimeState.generation;
+  }
+
   void retryDeferredRecoveryPersistence(void)
   {
     if (recoveryPersistenceRetryPending == false || recoveryPersistencePending ||
-        weAreMaster == false || ignited == false)
+        weAreMaster == false || ignited == false || !recoveryAuthoritySnapshotDurable())
     {
       return;
     }
@@ -20407,11 +20519,19 @@ public:
 
   void recoverDeploymentsAfterNeuronState(void)
   {
-    if (recoveryPersistencePending || !pendingMaterializedRecoveryPersistence.empty() || weAreMaster == false || ignited == false ||
+    if (recoveryPersistencePending || !pendingMaterializedRecoveryPersistence.empty() ||
+        !recoveryAuthoritySnapshotDurable() ||
+        weAreMaster == false || ignited == false ||
         finalizePersistedNeuronInventoryRecovery() == false || !reconcileContainerRetirements())
     {
       return;
     }
+
+    // The exact retained inventory has opened the finalizer. Persist removal
+    // of its update-self witness before any recovered scheduler can act, then
+    // re-enter this owner from the durability receipt. This also handles a
+    // quiet fleet whose last prerequisite was not another stateUpload.
+    if (completeLocalBundleExecRecoveryIfReady(true)) return;
 
     resumeOperatorCancellations();
 
@@ -23417,12 +23537,90 @@ public:
     return true;
   }
 
-  bool collectNeuronStateUploadBootstraps(Machine *machine, Vector<String>& serializedBootstraps)
+  // This is the one bridge from durable update-self recovery evidence back to
+  // a restarted Neuron.  It deliberately does not synthesize a plan from an
+  // application-report row: every byte must decode to an exact retained plan
+  // whose deployment identity is still present in durable authority state.
+  bool durableRecoveryWitnessBootstrapsProjectable(
+      const Machine *machine, const Vector<String>& bootstraps, String& failure) const
   {
+    failure.clear();
+    if (machine == nullptr || machine->uuid == 0 || machine->fragment == 0)
+    {
+      failure.assign("durable retained bootstrap machine identity or fragment is unavailable");
+      return false;
+    }
+    const ProdigyMachineFragmentAssignment *assignment = findMachineFragmentAssignment(
+        masterAuthorityRuntimeState.machineFragmentAssignments, machine->uuid);
+    if (assignment == nullptr || assignment->fragment != machine->fragment)
+    {
+      failure.assign("durable retained bootstrap fragment is not bound by canonical authority");
+      return false;
+    }
+    // An all-machine witness may authoritatively prove that this machine owns
+    // no retained containers.  It is an exact zero set, not an absent witness.
+    if (bootstraps.empty()) return true;
+    uint32_t capturedFragment = 0;
+    if (deriveMachineFragmentFromCapturedBootstraps(bootstraps, capturedFragment) == false ||
+        capturedFragment != machine->fragment)
+    {
+      failure.assign("durable retained bootstrap fragment does not match the machine");
+      return false;
+    }
+    bytell_hash_set<uint128_t> seen = {};
+    for (const String& serialized : bootstraps)
+    {
+      NeuronContainerBootstrap bootstrap = {};
+      if (BitseryEngine::deserializeSafe(serialized, bootstrap) == false || bootstrap.plan.uuid == 0 ||
+          bootstrap.plan.fragment == 0 || seen.insert(bootstrap.plan.uuid).second == false)
+      {
+        failure.assign("durable retained bootstrap identity is invalid or ambiguous");
+        return false;
+      }
+      if (bootstrap.plan.system.kind == SystemContainerKind::crossClusterMasqueGateway)
+      {
+        const auto *authority = desiredCrossClusterMasqueGatewayAuthority(
+            bootstrap.plan.system.gatewayPairUUID, machine->uuid);
+        const auto effective = effectiveCrossClusterMasqueGatewayAuthorities(machine->uuid);
+        const uint8_t fragment = authority == nullptr ? 0 :
+            prodigyCrossClusterMasqueGatewayRuntimeFragment(
+                effective, authority->pairUUID, authority->localMachineUUID);
+        if (!masterAuthorityRuntimeStateDurable ||
+            durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation ||
+            authority == nullptr ||
+            !crossClusterMasqueGatewayPlanMatchesAuthority(
+                bootstrap.plan, *authority, fragment))
+        {
+          failure.assign("durable retained gateway bootstrap does not match canonical authority");
+          return false;
+        }
+        continue;
+      }
+      const auto authority = deploymentPlans.find(bootstrap.plan.config.deploymentID());
+      if (authority == deploymentPlans.end() || authority->second.config.applicationID != bootstrap.plan.config.applicationID ||
+          authority->second.config.versionID != bootstrap.plan.config.versionID ||
+          authority->second.config.containerBlobSHA256 != bootstrap.plan.config.containerBlobSHA256 ||
+          authority->second.config.containerBlobBytes != bootstrap.plan.config.containerBlobBytes)
+      {
+        failure.assign("durable retained bootstrap does not match canonical deployment authority");
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool collectNeuronStateUploadBootstraps(Machine *machine, Vector<String>& serializedBootstraps,
+                                          String *failure = nullptr)
+  {
+    const auto reject = [failure](const char *reason) {
+      if (failure != nullptr) failure->assign(reason);
+      return false;
+    };
+    if (failure != nullptr) failure->clear();
     serializedBootstraps.clear();
     if (machine == nullptr)
     {
-      return false;
+      return reject("machine is unavailable");
     }
 
     for (const auto& [deploymentID, machineContainers] : machine->containersByDeploymentID)
@@ -23430,7 +23628,7 @@ public:
       auto deploymentIt = deployments.find(deploymentID);
       if (deploymentIt == deployments.end() || deploymentIt->second == nullptr)
       {
-        return false;
+        return reject("deployment owner is unavailable");
       }
 
       ApplicationDeployment *deployment = deploymentIt->second;
@@ -23444,13 +23642,13 @@ public:
             deployment->plan.config.deploymentID(),
             credentialFailure.size() ? credentialFailure : String("credential policy unavailable for container replay"_ctv),
             deployment->generateReport());
-        return false;
+        return reject("deployment credentials are unavailable");
       }
       for (ContainerView *container : machineContainers)
       {
         if (container == nullptr)
         {
-          return false;
+          return reject("container view is unavailable");
         }
         // A planned view is only a scheduler reservation.  Its fragment and
         // mesh identity are assigned when scheduling commits, so it is not a
@@ -23460,13 +23658,13 @@ public:
         if (container->state == ContainerState::scheduled && container->isStateful &&
             deployment->hydrateOwnedRecoveryWhiteholeBindings(machine, container) == false)
         {
-          return false;
+          return reject("recovered stateful whitehole bindings are unavailable");
         }
         ApplicationConfig replayConfig = deployment->resourceConfigForContainer(container);
         ContainerPlan planToReplay = container->generatePlan(deployment->plan, deployment->nShardGroups, &replayConfig);
         if (planToReplay.fragment == 0)
         {
-          return false;
+          return reject("container replay fragment is zero");
         }
         if (planToReplay.isStateful)
         {
@@ -23481,7 +23679,7 @@ public:
               deployment->plan.config.deploymentID(),
               "credential policy unavailable for container replay"_ctv,
               deployment->generateReport());
-          return false;
+          return reject("container replay credentials are unavailable");
         }
 
         NeuronContainerBootstrap bootstrap = {};
@@ -23506,7 +23704,7 @@ public:
       if (!BitseryEngine::deserializeSafe(serializedBootstrap, bootstrap) ||
           bootstrap.plan.uuid == 0 || !replayedUUIDs.insert(bootstrap.plan.uuid).second)
       {
-        return false;
+        return reject("replayed bootstrap identity is invalid or duplicated");
       }
     }
     for (const auto& runtime : crossClusterMasqueGatewayBrainRuntimes)
@@ -23527,15 +23725,17 @@ public:
           !crossClusterMasqueGatewayPlanMatchesAuthority(runtime.plan, *authority, fragment) ||
           !replayedUUIDs.insert(runtime.plan.uuid).second)
       {
-        return false;
+        return reject("gateway replay authority is unavailable or conflicts");
       }
       NeuronContainerBootstrap bootstrap = {};
       bootstrap.plan = runtime.plan;
       String serializedBootstrap = {};
-      if (!BitseryEngine::serialize(serializedBootstrap, bootstrap)) return false;
+      if (!BitseryEngine::serialize(serializedBootstrap, bootstrap)) return reject("gateway replay bootstrap serialization failed");
       serializedBootstraps.push_back(std::move(serializedBootstrap));
     }
-    return mergeContainerRetirementBootstraps(machine, serializedBootstraps);
+    if (!mergeContainerRetirementBootstraps(machine, serializedBootstraps))
+      return reject("container retirement bootstrap merge rejected");
+    return true;
   }
 
   bool crossClusterMasqueGatewayAuthenticatedInventoryCurrent(
@@ -23839,10 +24039,23 @@ public:
     Vector<String> liveBootstraps = {};
     const Vector<String> *bootstraps = nullptr;
     const char *bootstrapSource = "none";
+    String bootstrapFailure = {};
     if (const auto *witness = findUpdateSelfMachineRecoveryWitness(machine->uuid))
     {
-      bootstraps = &witness->containerBootstraps;
-      bootstrapSource = "update-self-witness";
+      String witnessFailure = {};
+      if (witness->machineUUID == machine->uuid &&
+          durableRecoveryWitnessBootstrapsProjectable(machine, witness->containerBootstraps, witnessFailure))
+      {
+        bootstraps = &witness->containerBootstraps;
+        bootstrapSource = "durable-recovery-witness";
+      }
+      else
+      {
+        // A durable witness with a stale fragment, absent authority plan, or
+        // ambiguous UUID must not become a synthetic live owner.
+        bootstrapSource = "durable-recovery-witness-rejected";
+        bootstrapFailure = std::move(witnessFailure);
+      }
     }
     else if (updateSelfMachineRecoveryWitnesses.empty() == false)
     {
@@ -23866,7 +24079,7 @@ public:
       bootstraps = &updateSelfLocalContainerBootstraps;
       bootstrapSource = "update-self-local";
     }
-    else if (collectNeuronStateUploadBootstraps(machine, liveBootstraps))
+    else if (collectNeuronStateUploadBootstraps(machine, liveBootstraps, &bootstrapFailure))
     {
       bootstraps = &liveBootstraps;
       bootstrapSource = "live-projection";
@@ -23887,6 +24100,7 @@ public:
       {
         bootstraps = nullptr;
         bootstrapSource = "retirement-merge-rejected";
+        bootstrapFailure.assign("container retirement bootstrap merge rejected"_ctv);
       }
     }
 
@@ -23900,8 +24114,8 @@ public:
     {
       machine->neuron.wBuffer.resize(headerOffset);
       std::fprintf(stderr,
-                   "brain stateUpload no-bootstraps reason=%s machineUUID=%llu localUUID=%llu epoch=%llu readyBefore=%d controlActive=%d witnesses=%zu\n",
-                   bootstrapSource, (unsigned long long)machine->uuid,
+                   "brain stateUpload no-bootstraps reason=%s detail=%s machineUUID=%llu localUUID=%llu epoch=%llu readyBefore=%d controlActive=%d witnesses=%zu\n",
+                   bootstrapSource, bootstrapFailure.c_str(), (unsigned long long)machine->uuid,
                    (unsigned long long)updateSelfLocalMachineUUID,
                    (unsigned long long)masterAuthorityEpoch, int(runtimeReadyBeforeInvalidation), int(controlActive),
                    size_t(updateSelfMachineRecoveryWitnesses.size()));
@@ -42198,8 +42412,44 @@ public:
            localBundleInventoryIncludesCapturedBootstraps(machine, reportedContainerUUIDs);
   }
 
-  void completeLocalBundleExecRecovery(void)
+  bool localBundleExecRecoveryReadyAfterInventoryFinalized(void) const
   {
+    if (recoveringPersistedNeuronInventory) return false;
+    if (updateSelfMachineRecoveryWitnesses.empty() == false)
+    {
+      return allMachineBundleInventoriesMatch();
+    }
+    if (updateSelfLocalMachineUUID == 0 || updateSelfLocalBundleRegistered == false ||
+        updateSelfWorkerStateUploadedMachineUUIDs.size() != updateSelfWorkerMachineUUIDs.size())
+    {
+      return false;
+    }
+    Machine *local = findMachineByUUID(updateSelfLocalMachineUUID);
+    if (local == nullptr || local->runtimeReady == false ||
+        persistedMachineInventoryUploaded.contains(local->uuid) == false)
+    {
+      return false;
+    }
+    bytell_hash_set<uint128_t> localInventory = {};
+    for (const auto& [deploymentID, localContainers] : local->containersByDeploymentID)
+    {
+      (void)deploymentID;
+      for (const ContainerView *container : localContainers)
+      {
+        if (container != nullptr) localInventory.insert(container->uuid);
+      }
+    }
+    return localBundleInventoryIncludesCapturedBootstraps(local, localInventory);
+  }
+
+  void completeLocalBundleExecRecovery(bool resumeRecoveryWhenDurable = false)
+  {
+    // The captured bootstraps are also the durable proof consumed by the
+    // persisted-inventory finalizer after a Brain restart.  A complete bundle
+    // upload must not erase that proof while another recovery prerequisite is
+    // still closed; the same accepted inventory can complete the exec fence
+    // once the finalizer has opened.
+    if (recoveringPersistedNeuronInventory) return;
     resetUpdateSelfState();
     updateSelfTransitionAfterMothershipAck = false;
     updateSelfWorkerExpectedBundleSHA256.clear();
@@ -42214,7 +42464,22 @@ public:
     updateSelfLocalBundleRegistered = false;
     updateSelfLocalContainerBootstraps.clear();
     updateSelfMachineRecoveryWitnesses.clear();
-    noteMasterAuthorityRuntimeStateChanged();
+    noteMasterAuthorityRuntimeStateChanged(true, true,
+        [this, resumeRecoveryWhenDurable](bool durable) {
+          if (!durable)
+          {
+            recoveryPersistenceRetryPending = true;
+            return;
+          }
+          if (resumeRecoveryWhenDurable) recoverDeploymentsAfterNeuronState();
+        });
+  }
+
+  bool completeLocalBundleExecRecoveryIfReady(bool resumeRecoveryWhenDurable = false)
+  {
+    if (!localBundleExecRecoveryReadyAfterInventoryFinalized()) return false;
+    completeLocalBundleExecRecovery(resumeRecoveryWhenDurable);
+    return true;
   }
 
   void completeWorkerBundleUpgradeIfReady(void)
@@ -53181,9 +53446,29 @@ public:
             }
             const uint64_t replacementID = (uint64_t(request.applicationID) << 48) | request.replacementSuccessorVersionID;
             response.successorDeploymentID = replacementID;
-            if (finalizePersistedNeuronInventoryRecovery() == false)
+            String inventoryBlocker = {};
+            if (finalizePersistedNeuronInventoryRecovery(&inventoryBlocker) == false)
             {
-              reject("materialized stateful recovery retry inventory is not authoritative");
+              response.failure.assign("materialized stateful recovery retry inventory is not authoritative: "_ctv);
+              response.failure.append(inventoryBlocker);
+              reply();
+              break;
+            }
+            if (completeLocalBundleExecRecoveryIfReady(true) &&
+                (!masterAuthorityRuntimeStateDurable ||
+                 durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation))
+            {
+              response.failure.assign(
+                  "materialized stateful recovery retry inventory finalization is becoming durable"_ctv);
+              reply();
+              break;
+            }
+            String authorityFailure = {};
+            if (materializedRecoveryCanonicalActiveDeployment(request.applicationID, activeID, authorityFailure) == false)
+            {
+              response.failure.assign("materialized stateful recovery retry canonical authority mismatch: "_ctv);
+              response.failure.append(authorityFailure);
+              reply();
               break;
             }
             ProdigyMaterializedStatefulRecoveryOperation *original = nullptr;
@@ -53376,9 +53661,29 @@ public:
           {
             break;
           }
-          if (finalizePersistedNeuronInventoryRecovery() == false)
+          String inventoryBlocker = {};
+          if (finalizePersistedNeuronInventoryRecovery(&inventoryBlocker) == false)
           {
-            reject("materialized stateful recovery safety precondition failed");
+            response.failure.assign("materialized stateful recovery inventory is not authoritative: "_ctv);
+            response.failure.append(inventoryBlocker);
+            reply();
+            break;
+          }
+          if (completeLocalBundleExecRecoveryIfReady(true) &&
+              (!masterAuthorityRuntimeStateDurable ||
+               durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation))
+          {
+            response.failure.assign(
+                "materialized stateful recovery inventory finalization is becoming durable"_ctv);
+            reply();
+            break;
+          }
+          String authorityFailure = {};
+          if (materializedRecoveryCanonicalActiveDeployment(request.applicationID, activeID, authorityFailure) == false)
+          {
+            response.failure.assign("materialized stateful recovery canonical authority mismatch: "_ctv);
+            response.failure.append(authorityFailure);
+            reply();
             break;
           }
           auto active = deployments.find(activeID);

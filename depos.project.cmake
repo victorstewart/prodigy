@@ -1,9 +1,9 @@
 # Copyright 2026 Victor Stewart
 # SPDX-License-Identifier: Apache-2.0
 
-# Depos 0.5.5 supplies the SOURCE_VARIANT parser required by the pinned Rust
-# toolchain DepoFile.
-set(DEPOS_BOOTSTRAP_VERSION "0.5.5" CACHE STRING "Pinned depos version used by prodigy" FORCE)
+# Depos 0.5.6 supplies the SOURCE_VARIANT parser required by the pinned Rust
+# toolchain DepoFile and partitions bootstrap runtimes by host OS/architecture.
+set(DEPOS_BOOTSTRAP_VERSION "0.5.6" CACHE STRING "Pinned depos version used by prodigy" FORCE)
 
 set(
   PRODIGY_RELEASE_DEPOFILE_CACHE_DIR
@@ -13,21 +13,24 @@ set(
 )
 set(
   PRODIGY_BASICS_RELEASE_VERSION
-  "0.4.14-rc.1"
+  "0.4.14-rc.3"
   CACHE STRING
   "Pinned Basics release version consumed through the published detached DepoFile asset"
+  FORCE
 )
 set(
   PRODIGY_BASICS_RELEASE_DEPOFILE_URL
-  "https://github.com/victorstewart/basics/releases/download/v0.4.14-rc.1/basics.DepoFile"
+  "https://github.com/victorstewart/basics/releases/download/v0.4.14-rc.3/basics.DepoFile"
   CACHE STRING
   "Published Basics detached DepoFile asset URL"
+  FORCE
 )
 set(
   PRODIGY_BASICS_RELEASE_DEPOFILE_SHA256
-  "0d97ac4ca094897c2798357a55fcdab2e311f0fa1941fdbbecc48a51d1df5d00"
+  "633d69b068058eff30a37f081127680be5ac12708c5943967f8bfb8f79aef8dd"
   CACHE STRING
   "SHA256 for the published Basics detached DepoFile asset"
+  FORCE
 )
 set(
   PRODIGY_BASICS_TIDESDB_PACKAGE_NAME
@@ -38,7 +41,7 @@ set(
 )
 set(
   PRODIGY_BASICS_TIDESDB_DEPENDENCY_VERSION
-  "10.2.1.20261031.1"
+  "10.2.1.20261102.2"
   CACHE STRING
   "Pinned TidesDB package version used when deriving the Basics-with-TidesDB release DepoFile variant"
   FORCE

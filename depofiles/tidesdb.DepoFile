@@ -1,13 +1,13 @@
-# Task-local, non-published candidate. Source is immutable task-local archive.
+# Published Nametag-qualified TidesDB 10.2.1 recovery foundation.
 NAME tidesdb
-VERSION 10.2.1.20261031.1
+VERSION 10.2.1.20261102.2
 SYSTEM_LIBS ALLOW
 # Upstream v10.2.1 abd8900c plus retained descriptor, no-preallocation, and clean-tail recovery fixes.
 DEPENDS zstd VERSION 1.5.7
 DEPENDS snappy VERSION 1.2.2
 DEPENDS lz4 VERSION 1.10.0
-SOURCE URL file:///root/.run/nametag-three-cluster-20261019/.run/n24-runtime-repair-tidesdb/tidesdb-v10.2.1-f858-de64-candidate.tar.gz
-SHA256 eda4a3515689ede79370fa3def8ca234d8d4f11bebfe03fb39ba1792cb1e5ede
+SOURCE URL https://github.com/victorstewart/tidesdb/releases/download/v10.2.1.20261102.2/tidesdb-10.2.1.20261102.2.tar.gz
+SHA256 3b559b5aa3bf662919e5e763db6ace49be2f23581583bcfdc77c45c63c6ebb52
 BUILD_SYSTEM CMAKE
 CMAKE_ARG "-DCMAKE_PREFIX_PATH=${dep:zstd};${dep:snappy};${dep:lz4}"
 CMAKE_ARG "-DCMAKE_C_FLAGS=-I${dep:zstd}/include -I${dep:snappy}/include -I${dep:lz4}/include"

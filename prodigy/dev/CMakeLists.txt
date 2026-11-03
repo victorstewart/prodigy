@@ -206,14 +206,19 @@ if (NOT _prodigy_masque_tunnel_version_count EQUAL 1)
 endif()
 list(GET _prodigy_masque_tunnel_version_lines 0 _prodigy_masque_tunnel_version_line)
 string(REGEX REPLACE "^VERSION[ \t]+([^ \t\r\n]+)$" "\\1" _prodigy_masque_tunnel_version "${_prodigy_masque_tunnel_version_line}")
+set(_prodigy_masque_tunnel_manifest_namespace_suffix "")
+if (NOT "${_prodigy_depos_namespace}" STREQUAL "")
+   set(_prodigy_masque_tunnel_manifest_namespace_suffix
+      " NAMESPACE ${_prodigy_depos_namespace}")
+endif()
 file(STRINGS "${DEPOS_MANIFEST_FILE}" _prodigy_masque_tunnel_manifest_lines
-   REGEX "^depos_require\\(masque_tunnel NAMESPACE ${_prodigy_depos_store_namespace} VERSION [^ )]+\\)$")
+   REGEX "^depos_require\\(masque_tunnel VERSION [^ )]+${_prodigy_masque_tunnel_manifest_namespace_suffix}\\)$")
 list(LENGTH _prodigy_masque_tunnel_manifest_lines _prodigy_masque_tunnel_manifest_count)
 if (NOT _prodigy_masque_tunnel_manifest_count EQUAL 1)
-   message(FATAL_ERROR "${DEPOS_MANIFEST_FILE} must materialize exactly one masque_tunnel request for namespace ${_prodigy_depos_store_namespace}.")
+   message(FATAL_ERROR "${DEPOS_MANIFEST_FILE} must materialize exactly one masque_tunnel request for visible namespace '${_prodigy_depos_namespace}'.")
 endif()
 list(GET _prodigy_masque_tunnel_manifest_lines 0 _prodigy_masque_tunnel_manifest_line)
-string(REGEX REPLACE "^depos_require\\(masque_tunnel NAMESPACE ${_prodigy_depos_store_namespace} VERSION ([^ )]+)\\)$" "\\1"
+string(REGEX REPLACE "^depos_require\\(masque_tunnel VERSION ([^ )]+)${_prodigy_masque_tunnel_manifest_namespace_suffix}\\)$" "\\1"
    _prodigy_masque_tunnel_materialized_version "${_prodigy_masque_tunnel_manifest_line}")
 if (NOT _prodigy_masque_tunnel_materialized_version STREQUAL _prodigy_masque_tunnel_version)
    message(FATAL_ERROR "${DEPOS_MANIFEST_FILE} materialized masque_tunnel ${_prodigy_masque_tunnel_materialized_version}, expected ${_prodigy_masque_tunnel_version} from ${_prodigy_masque_tunnel_depofile}.")
@@ -774,6 +779,8 @@ add_executable(prodigy_mothership_cluster_report_unit ${CMAKE_CURRENT_SOURCE_DIR
 add_executable(prodigy_mothership_restart_persistence_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_restart_persistence_unit.cpp)
 add_executable(prodigy_retained_container_recovery_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_retained_container_recovery_unit.cpp)
 target_compile_options(prodigy_retained_container_recovery_unit PRIVATE -UNDEBUG)
+add_executable(prodigy_retained_cgroup_adoption_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_retained_cgroup_adoption_unit.cpp)
+target_compile_options(prodigy_retained_cgroup_adoption_unit PRIVATE -UNDEBUG)
 add_executable(prodigy_mothership_retained_recovery_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_retained_recovery_unit.cpp)
 target_compile_options(prodigy_mothership_retained_recovery_unit PRIVATE -UNDEBUG)
 add_executable(prodigy_container_retirement_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_container_retirement_unit.cpp)
@@ -900,6 +907,7 @@ set(PRODIGY_ALL_BUILD_TARGETS
    prodigy_mothership_cluster_report_unit
    prodigy_mothership_restart_persistence_unit
    prodigy_retained_container_recovery_unit
+   prodigy_retained_cgroup_adoption_unit
    prodigy_mothership_retained_recovery_unit
    prodigy_container_retirement_unit
    prodigy_mothership_upgrade_contract_unit
@@ -2309,7 +2317,7 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       COMMAND ${CMAKE_COMMAND}
               -DPRODIGY_ROOT=${PRODIGY_ROOT}
               -DPRODIGY_DEPOS_MANIFEST_FILE=${DEPOS_MANIFEST_FILE}
-              -DPRODIGY_DEPOS_MANIFEST_NAMESPACE=${_prodigy_depos_store_namespace}
+              -DPRODIGY_DEPOS_MANIFEST_VISIBLE_NAMESPACE=${_prodigy_depos_namespace}
               -DPRODIGY_MASQUE_TUNNEL_VERSION=${_prodigy_masque_tunnel_version}
               -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_dependency_materialization_contract.cmake
    )
@@ -2377,6 +2385,9 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=reservation-profile-snapshot ${CMAKE_BINARY_DIR}/prodigy_runtime_persistence_unit)
    add_test(NAME prodigy_async_persistence_callers
       COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=async-persistence-callers ${CMAKE_BINARY_DIR}/prodigy_brain_replication_credentials_unit)
+   add_test(NAME prodigy_brain_async_recovery_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=async-recovery ${CMAKE_BINARY_DIR}/prodigy_brain_replication_credentials_unit)
+   set_tests_properties(prodigy_brain_async_recovery_unit PROPERTIES TIMEOUT 60)
    add_test(NAME prodigy_brain_reservation_profile
       COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=hardware-reservation-profile ${CMAKE_BINARY_DIR}/prodigy_brain_replication_credentials_unit)
    add_test(NAME prodigy_machine_schema_persistence_backpressure
@@ -2769,6 +2780,7 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
               $<TARGET_FILE:prodigy_tidesdb9_fixture> $<TARGET_FILE:prodigy_tidesdb9_export> $<TARGET_FILE:prodigy_tidesdb10_import>
    )
    add_test(NAME prodigy_retained_container_recovery_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_retained_container_recovery_unit)
+   add_test(NAME prodigy_retained_cgroup_adoption_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_retained_cgroup_adoption_unit)
    add_test(NAME prodigy_mothership_retained_recovery_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_retained_recovery_unit)
    add_test(NAME prodigy_retained_quorum_observer_unit
       COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_retained_quorum_observer_unit.py)

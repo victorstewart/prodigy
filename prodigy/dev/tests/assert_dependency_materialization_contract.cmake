@@ -35,7 +35,7 @@ foreach(contract IN ITEMS
    "ARTIFACT bin/rustc"
    "ARTIFACT bin/rustdoc"
    "ARTIFACT bin/cargo"
-   "ARTIFACT lib"
+   "TARGET rust_toolchain::sysroot INTERFACE lib"
 )
    require_contains("${rust_toolchain}" "${contract}")
 endforeach()
@@ -54,10 +54,10 @@ endforeach()
 set(masque_tunnel "${PRODIGY_ROOT}/depofiles/masque-tunnel.DepoFile")
 foreach(contract IN ITEMS
    "NAME masque_tunnel"
-   "VERSION 0.18.3-mtls-site-routing-8"
+   "VERSION 0.18.3-mtls-site-routing-12"
    "SOURCE URL https://github.com/ferneast/masque-tunnel/archive/17d7282d0638d742e1302ac2219e35376bcdc7e2.tar.gz"
    "SHA256 ee9decc7d06316d41856dbfbdf623f8291998c82e0ec8ab6dbb7633331e795ec"
-   "873f4900b7af61fd2de2afcfa239d178f932728f91dc781839de15a6f2de2632"
+   "e2a1aa35820269d70cea5730330167647896d1b42d9135fd5a50f168afdbdc19"
    "115605ce3f2c8e456336ae8c57780c5ccca68d6217fa57dc414dc88b90c25b63"
    "Cargo.lock is generated from immutable upstream v0.18.3 plus this verified patch."
    "| gzip -dc > \"$lock_file\""
@@ -71,15 +71,15 @@ foreach(contract IN ITEMS
 endforeach()
 
 file(SIZE "${masque_tunnel}" masque_tunnel_depofile_bytes)
-if (masque_tunnel_depofile_bytes GREATER 65536)
-   message(FATAL_ERROR "masque-tunnel DepoFile payload must remain below the isolated runner argument limit")
+if (masque_tunnel_depofile_bytes GREATER 131072)
+   message(FATAL_ERROR "masque-tunnel DepoFile payload must remain below the Linux per-argument safety bound")
 endif()
 
 set(prodigy_dev "${PRODIGY_ROOT}/prodigy/dev/CMakeLists.txt")
 foreach(contract IN ITEMS
    "\${PRODIGY_DEPOFILES_DIR}/masque-tunnel.DepoFile"
    "file(STRINGS \"\${DEPOS_MANIFEST_FILE}\" _prodigy_masque_tunnel_manifest_lines"
-   "masque_tunnel NAMESPACE \${_prodigy_depos_store_namespace} VERSION [^ )]+"
+   "masque_tunnel VERSION [^ )]+\${_prodigy_masque_tunnel_manifest_namespace_suffix}"
    "_prodigy_masque_tunnel_materialized_version"
    "expected \${_prodigy_masque_tunnel_version} from \${_prodigy_masque_tunnel_depofile}"
    "\${_prodigy_masque_tunnel_version}/bin/masque-tunnel"
@@ -100,11 +100,16 @@ if (DEFINED PRODIGY_DEPOS_MANIFEST_FILE)
    if (NOT EXISTS "${PRODIGY_DEPOS_MANIFEST_FILE}")
       message(FATAL_ERROR "PRODIGY_DEPOS_MANIFEST_FILE does not exist: ${PRODIGY_DEPOS_MANIFEST_FILE}")
    endif()
-   if (NOT DEFINED PRODIGY_DEPOS_MANIFEST_NAMESPACE OR NOT DEFINED PRODIGY_MASQUE_TUNNEL_VERSION)
+   if (NOT DEFINED PRODIGY_DEPOS_MANIFEST_VISIBLE_NAMESPACE OR NOT DEFINED PRODIGY_MASQUE_TUNNEL_VERSION)
       message(FATAL_ERROR "Generated Depos manifest regression requires its namespace and masque-tunnel version.")
    endif()
+   set(materialized_masque_tunnel_namespace_suffix "")
+   if (NOT "${PRODIGY_DEPOS_MANIFEST_VISIBLE_NAMESPACE}" STREQUAL "")
+      set(materialized_masque_tunnel_namespace_suffix
+         " NAMESPACE ${PRODIGY_DEPOS_MANIFEST_VISIBLE_NAMESPACE}")
+   endif()
    file(STRINGS "${PRODIGY_DEPOS_MANIFEST_FILE}" materialized_masque_tunnel_lines
-      REGEX "^depos_require\\(masque_tunnel NAMESPACE ${PRODIGY_DEPOS_MANIFEST_NAMESPACE} VERSION ${PRODIGY_MASQUE_TUNNEL_VERSION}\\)$")
+      REGEX "^depos_require\\(masque_tunnel VERSION ${PRODIGY_MASQUE_TUNNEL_VERSION}${materialized_masque_tunnel_namespace_suffix}\\)$")
    list(LENGTH materialized_masque_tunnel_lines materialized_masque_tunnel_count)
    if (NOT materialized_masque_tunnel_count EQUAL 1)
       message(FATAL_ERROR "Generated Depos manifest must contain exactly one current masque_tunnel request for the configured namespace and version.")

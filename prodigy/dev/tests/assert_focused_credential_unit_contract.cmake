@@ -17,21 +17,42 @@ foreach(_prodigy_forbidden_dependency IN ITEMS
          "prodigy_brain_replication_credentials_unit must not depend on ${_prodigy_forbidden_dependency}.")
    endif()
 endforeach()
+string(FIND "${_prodigy_cmake}"
+   "PRODIGY_TEST_ONLY=async-recovery" _prodigy_async_recovery_ctest_index)
+if (_prodigy_async_recovery_ctest_index EQUAL -1)
+   message(FATAL_ERROR
+      "The three-Neuron durable recovery composition must be registered with CTest.")
+endif()
 
 file(READ "${PRODIGY_ROOT}/depos.project.cmake" _prodigy_depos_project)
+file(SHA256 "${PRODIGY_ROOT}/.depos.cmake" _prodigy_depos_interface_sha256)
+if (NOT _prodigy_depos_interface_sha256 STREQUAL
+   "3443771f5f90ad5b600dbb7f763ce963e69adcee2a7d77d35a3b3f2b5feb9923")
+   message(FATAL_ERROR "Prodigy's Depos interface must match the published 0.5.6 helper byte-for-byte.")
+endif()
 if (NOT _prodigy_depos_project MATCHES
-   "set\\(DEPOS_BOOTSTRAP_VERSION \"0\\.5\\.5\" CACHE STRING \"Pinned depos version used by prodigy\" FORCE\\)")
-   message(FATAL_ERROR "Prodigy must pin Depos bootstrap 0.5.5.")
+   "set\\(DEPOS_BOOTSTRAP_VERSION \"0\\.5\\.6\" CACHE STRING \"Pinned depos version used by prodigy\" FORCE\\)")
+   message(FATAL_ERROR "Prodigy must pin Depos bootstrap 0.5.6.")
 endif()
 
 file(READ "${PRODIGY_ROOT}/tools/build-evaluation.sh" _prodigy_build_evaluation)
 if (NOT _prodigy_build_evaluation MATCHES
-   "raw.githubusercontent.com/victorstewart/depos/v0\\.5\\.5/.depos.cmake")
-   message(FATAL_ERROR "build-evaluation must bootstrap Depos 0.5.5.")
+   "raw.githubusercontent.com/victorstewart/depos/v0\\.5\\.6/.depos.cmake")
+   message(FATAL_ERROR "build-evaluation must bootstrap Depos 0.5.6.")
 endif()
 if (NOT _prodigy_build_evaluation MATCHES
-   "dcf232d697ca8250871a33d9a5d58b135f03d09b3081bf9d1bd7a2d44e383497")
-   message(FATAL_ERROR "build-evaluation must verify the Depos 0.5.5 helper checksum.")
+   "3443771f5f90ad5b600dbb7f763ce963e69adcee2a7d77d35a3b3f2b5feb9923")
+   message(FATAL_ERROR "build-evaluation must verify the Depos 0.5.6 helper checksum.")
+endif()
+string(FIND "${_prodigy_build_evaluation}"
+   [[sha256sum "${depos_interface}"]] _prodigy_existing_depos_checksum_index)
+if (_prodigy_existing_depos_checksum_index EQUAL -1)
+   message(FATAL_ERROR "build-evaluation must validate an existing Depos helper before reusing it.")
+endif()
+string(FIND "${_prodigy_build_evaluation}"
+   [[mv "${bootstrap}" "${depos_interface}"]] _prodigy_depos_atomic_replace_index)
+if (_prodigy_depos_atomic_replace_index EQUAL -1)
+   message(FATAL_ERROR "build-evaluation must atomically replace a missing or stale Depos helper.")
 endif()
 
 file(READ "${PRODIGY_ROOT}/depofiles/rust-toolchain.DepoFile" _prodigy_rust_toolchain)

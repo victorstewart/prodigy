@@ -7,7 +7,7 @@ if [[ "$(uname -s)" != "Linux" ]]; then
   echo "build-evaluation: run this from the verified Apple Containers Linux guest; do not build evaluation artifacts on macOS." >&2
   exit 1
 fi
-for command in cmake cargo clang clang++ nproc; do
+for command in cmake cargo clang clang++ nproc sha256sum; do
   if ! command -v "${command}" >/dev/null 2>&1; then
     echo "build-evaluation: missing required command '${command}'. Run this from the already-entered verified Linux development guest; prodigy_dev_test_cluster.sh launches test sessions and does not open a contributor shell." >&2
     exit 1
@@ -22,18 +22,21 @@ if ! bash "${boundary_launcher}" --check-boundary; then
   echo "build-evaluation: no verified Linux guest boundary is active. Use the documented Apple Containers development guest, then rerun this command there." >&2
   exit 1
 fi
-if [[ ! -f "${repo_root}/.depos.cmake" ]]; then
-  command -v curl >/dev/null && command -v sha256sum >/dev/null || {
-    echo "build-evaluation: curl and sha256sum are required to fetch the pinned Depos CMake module." >&2; exit 1;
+depos_interface="${repo_root}/.depos.cmake"
+depos_interface_sha256="3443771f5f90ad5b600dbb7f763ce963e69adcee2a7d77d35a3b3f2b5feb9923"
+if [[ ! -f "${depos_interface}" ]] ||
+   [[ "$(sha256sum "${depos_interface}" | awk '{print $1}')" != "${depos_interface_sha256}" ]]; then
+  command -v curl >/dev/null || {
+    echo "build-evaluation: curl is required to refresh the pinned Depos CMake module." >&2; exit 1;
   }
   bootstrap="$(mktemp "${repo_root}/.depos-bootstrap.XXXXXX")"
   trap 'rm -f "${bootstrap}"' EXIT
   curl --fail --location --silent --show-error --connect-timeout 15 --max-time 120 \
-    https://raw.githubusercontent.com/victorstewart/depos/v0.5.5/.depos.cmake --output "${bootstrap}"
-  [[ "$(sha256sum "${bootstrap}" | awk '{print $1}')" == dcf232d697ca8250871a33d9a5d58b135f03d09b3081bf9d1bd7a2d44e383497 ]] || {
+    https://raw.githubusercontent.com/victorstewart/depos/v0.5.6/.depos.cmake --output "${bootstrap}"
+  [[ "$(sha256sum "${bootstrap}" | awk '{print $1}')" == "${depos_interface_sha256}" ]] || {
     echo "build-evaluation: Depos CMake module checksum mismatch." >&2; exit 1;
   }
-  mv "${bootstrap}" "${repo_root}/.depos.cmake"
+  mv "${bootstrap}" "${depos_interface}"
   trap - EXIT
 fi
 jobs="${PRODIGY_EVALUATION_JOBS:-$(nproc)}"

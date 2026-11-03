@@ -7355,17 +7355,51 @@ public:
     }
   }
 
+  // The live cgroup root is virtual solely so the retained-owner regression
+  // can exercise the production scanner against an isolated filesystem tree.
+  virtual String containerCgroupInventoryRoot(void) const
+  {
+    return "/sys/fs/cgroup/containers.slice"_ctv;
+  }
+
+  bool liveContainerInventoryProcessOwned(const std::string& name, pid_t pid) const
+  {
+    const auto found = containerByPid.find(pid);
+    if (found != containerByPid.end() && found->second != nullptr)
+    {
+      const Container *container = found->second;
+      if (container->pendingDestroy == false &&
+          container->name.equal(String(name.c_str())) &&
+          containers.contains(container->plan.uuid)) return true;
+    }
+
+    // An authenticated Brain bootstrap creates this unpublished owner before
+    // asynchronous network recovery can publish it.  It is enough to retain
+    // the inventory fence only while every identity fence still names the
+    // exact live cgroup process; a directory name alone is never ownership.
+    for (const auto& [uuid, operation] : pendingStateUploadRestores)
+    {
+      if (operation == nullptr || operation->container == nullptr ||
+          operation->terminalRetirementPending || operation->coldRestart ||
+          uuid != operation->container->plan.uuid ||
+          operation->container->pid != pid ||
+          operation->container->pidfd < 0 || operation->container->cgroup < 0 ||
+          operation->container->name.equal(String(name.c_str())) == false ||
+          stateUploadRestoreCurrent(*operation, uuid) == false)
+      {
+        continue;
+      }
+      return true;
+    }
+    return false;
+  }
+
   virtual bool liveContainerInventoryComplete(String& failure) const
   {
     return prodigyContainerInventoryCgroupsOwned(
-        "/sys/fs/cgroup/containers.slice",
+        containerCgroupInventoryRoot().c_str(),
         [this](const std::string& name, pid_t pid) {
-          const auto found = containerByPid.find(pid);
-          if (found == containerByPid.end() || found->second == nullptr) return false;
-          const Container *container = found->second;
-          return container->pendingDestroy == false &&
-                 container->name.equal(String(name.c_str())) &&
-                 containers.contains(container->plan.uuid);
+          return liveContainerInventoryProcessOwned(name, pid);
         }, failure);
   }
 
@@ -9122,7 +9156,8 @@ public:
 
             String output;
             String path;
-            path.snprintf<"/sys/fs/cgroup/containers.slice/{}.slice/leaf"_ctv>(container->name);
+            const String cgroupRoot = containerCgroupInventoryRoot();
+            path.snprintf<"{}/{}.slice/leaf"_ctv>(cgroupRoot, container->name);
 
             container->cgroup = Filesystem::openDirectoryAt(-1, path);
             const int cgroupLookupErrno = container->cgroup < 0 ? errno : 0;
@@ -9140,9 +9175,9 @@ public:
             {
               String configuredCPUs = {};
               String effectiveCPUs = {};
-              path.snprintf<"/sys/fs/cgroup/containers.slice/{}.slice/cpuset.cpus"_ctv>(container->name);
+              path.snprintf<"{}/{}.slice/cpuset.cpus"_ctv>(cgroupRoot, container->name);
               Filesystem::openReadAtClose(-1, path, configuredCPUs);
-              path.snprintf<"/sys/fs/cgroup/containers.slice/{}.slice/cpuset.cpus.effective"_ctv>(container->name);
+              path.snprintf<"{}/{}.slice/cpuset.cpus.effective"_ctv>(cgroupRoot, container->name);
               Filesystem::openReadAtClose(-1, path, effectiveCPUs);
               if (prodigyResolveRestoredLogicalCores(
                       configuredCPUs,
