@@ -8429,7 +8429,10 @@ public:
   bool localRecoveryRuntimeAuthorityMatches(const MothershipLocalAuthorityRecoveryCohortRequest& requested,
                                             String *failure=nullptr)
   {
-    if (!mothershipLocalRecoveryRuntimeIntentValid(requested)) return false;
+    if (!mothershipLocalRecoveryRuntimeIntentValid(requested)) {
+      if (failure) failure->assign("local runtime recovery durable intent is invalid"_ctv);
+      return false;
+    }
     const auto& runtime=requested.runtime;
     MothershipUpgradeAdmissionRecord admission;
     if (!loadUpgradeAdmission(requested.clusterUUID,runtime.upgradeOperationUUID,admission,failure)) return false;
@@ -8482,7 +8485,10 @@ public:
     if (!db.listValues(localAuthorityRecoveryCohortsColumnFamily,values,failure)) return false;
     for (const auto& bytes:values) {
       MothershipLocalAuthorityRecoveryCohortRecord other;
-      if (!BitseryEngine::deserializeSafe(bytes,other) || !mothershipLocalAuthorityRecoveryCohortRecordValid(other)) return false;
+      if (!BitseryEngine::deserializeSafe(bytes,other) || !mothershipLocalAuthorityRecoveryCohortRecordValid(other)) {
+        if (failure) failure->assign("local runtime recovery encountered an invalid prior cohort"_ctv);
+        return false;
+      }
       if (other.request.clusterUUID==requested.clusterUUID && other.request.operationUUID!=requested.operationUUID &&
           other.phase!=MothershipLocalAuthorityRecoveryPhase::recovered) {
         if(failure) failure->assign("local runtime recovery has an unresolved prior cohort"_ctv);
@@ -8527,7 +8533,10 @@ public:
     if(!db.listValues(crossClusterMasqueGatewaysColumnFamily,values,failure))return false;
     for(const auto& bytes:values) {
       CrossClusterMasqueGatewayAuthority authority;
-      if(!BitseryEngine::deserializeSafe(bytes,authority) || !prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(authority))return false;
+      if(!BitseryEngine::deserializeSafe(bytes,authority) || !prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(authority)) {
+        if(failure)failure->assign("local runtime recovery encountered an invalid persisted gateway authority"_ctv);
+        return false;
+      }
       if(authority.localClusterUUID==clusterUUID && authority.state==CrossClusterMasqueGatewayState::active)
         gateways.push_back(std::move(authority));
     }

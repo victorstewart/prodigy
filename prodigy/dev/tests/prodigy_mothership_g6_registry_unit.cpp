@@ -692,6 +692,38 @@ static void interruptedLocalUpgradeRegressions(const String& path)
     assert(registry.loadLocalAuthorityRecoveryCohort(predecessor.operationUUID,retained,&failure));
     assert(objectSHA(retained)==intent.predecessorRecoverySHA256); // original completed record is immutable
   }
+  {
+    // A completed protocol-two cohort is durable history, not an admission for
+    // the release-specific migration compiled into a later Mothership.  Its
+    // structural proof must remain readable without authorizing a replay of
+    // that historical request or poisoning a new protocol-three admission.
+    auto historical=record;
+    historical.request.operationUUID=0xc0ff;
+    historical.request.runtime.upgradeOperationUUID=0xd001;
+    historical.request.runtime.predecessorRecoveryUUID=0xd002;
+    historical.request.runtime.targetContractSHA256=digest('8');
+    assert(!mothershipLocalAuthorityRecoveryCohortRequestValid(historical.request,&failure));
+    assert(mothershipLocalAuthorityRecoveryCohortRecordValid(historical,&failure));
+    auto unfinished=historical;unfinished.request.operationUUID=0xc0fe;
+    unfinished.phase=MothershipLocalAuthorityRecoveryPhase::armed;
+    for(auto& boundary:unfinished.boundaries)boundary.phase=MothershipLocalAuthorityRecoveryPhase::armed;
+    assert(!mothershipLocalAuthorityRecoveryCohortRecordValid(unfinished,&failure));
+    String unfinishedPath;unfinishedPath.snprintf<"{}-unfinished-history"_ctv>(path);
+    String unfinishedKey,unfinishedBytes;unfinishedKey.assignItoh(unfinished.request.operationUUID);
+    assert(BitseryEngine::serialize(unfinishedBytes,unfinished));
+    { TidesDB db(unfinishedPath,TidesDB::Durability::full);
+      assert(db.write("local_authority_recovery_cohorts"_ctv,unfinishedKey,unfinishedBytes,&failure)); }
+    { MothershipClusterRegistry registry(unfinishedPath);MothershipLocalAuthorityRecoveryCohortRecord loaded;
+      assert(!registry.loadLocalAuthorityRecoveryCohort(unfinished.request.operationUUID,loaded,&failure)); }
+    String key,bytes;key.assignItoh(historical.request.operationUUID);
+    assert(BitseryEngine::serialize(bytes,historical));
+    { TidesDB db(path,TidesDB::Durability::full);
+      assert(db.write("local_authority_recovery_cohorts"_ctv,key,bytes,&failure)); }
+    MothershipLocalAuthorityRecoveryCohortRecord loaded;
+    MothershipClusterRegistry registry(path);
+    assert(registry.loadLocalAuthorityRecoveryCohort(historical.request.operationUUID,loaded,&failure));
+    assert(loaded.phase==MothershipLocalAuthorityRecoveryPhase::recovered);
+  }
   ClusterStatusReport report={};report.hasTopology=true;report.topology.version=request.topologyVersion;
   report.nMachines=3;report.nApplications=0;
   for(const auto& m:intent.members) {

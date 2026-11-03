@@ -1040,31 +1040,27 @@ static void serialize(S&& serializer, MothershipLocalAuthorityRecoveryCohortRequ
     serializer.object(value.admittedRuntime);
 }
 
-static inline bool mothershipLocalInterruptedRecoveryRuntimeIntentValid(
+// Protocol-two records outlive the one release-specific recovery that created
+// them.  Keep their durable shape independently valid so a later Mothership
+// can prove a completed historical cohort without reopening that old rollout.
+static inline bool mothershipLocalInterruptedRecoveryRuntimeIntentStructurallyValid(
     const MothershipLocalAuthorityRecoveryCohortRequest& r)
 {
   const auto& v = r.runtime;
-  if (r.clusterUUID != mothershipLocalInterruptedUpgradeClusterUUID() ||
-      v.upgradeOperationUUID != mothershipLocalInterruptedUpgradeOperationUUID() ||
-      v.predecessorRecoveryUUID != mothershipLocalInterruptedUpgradePredecessorUUID() ||
+  if (r.clusterUUID == 0 || v.upgradeOperationUUID == 0 || v.predecessorRecoveryUUID == 0 ||
+      v.upgradeOperationUUID == v.predecessorRecoveryUUID ||
       r.operationUUID == v.upgradeOperationUUID || r.operationUUID == v.predecessorRecoveryUUID ||
       !mothershipPhysicalFaultDigestValid(v.admissionSHA256) ||
       !mothershipPhysicalFaultDigestValid(v.predecessorRecoverySHA256) ||
       !mothershipPhysicalFaultSafeAbsolutePath(v.bundlePath) ||
-      v.targetContractSHA256 != "9148f79b5ea66f6ff3d17831ddc487498181549bc77b547c427a9e35f8fa35ac"_ctv ||
+      !mothershipPhysicalFaultDigestValid(v.targetContractSHA256) ||
       v.members.size() != 3 || v.gateways.size() != 6 || r.executors.size() != 3 ||
       !prodigyCrossClusterMasqueGatewayAuthoritiesValid(v.gateways,r.clusterUUID)) return false;
-  const uint128_t expected[] = {
-    (uint128_t(0x0bf4487bf41a4eccULL)<<64)|0x9f3e5e316ff23a88ULL,
-    (uint128_t(0x88e88d94e0de497dULL)<<64)|0x9ef43113fd04909bULL,
-    (uint128_t(0xcbba7c68cf034a26ULL)<<64)|0xb1062449e8572b8aULL};
-  const char *linuxIDs[] = {"081d00c431314065990ff533082074f7", "cc8defd48fde42c8b304c77971e19a29",
-                           "0ef2a43f92fd48b8a04e3dd8e4eaf80d"};
   unsigned installs = 0;
   for (uint32_t i=0;i<3;++i) {
     const auto& m=v.members[i];
-    if (m.machineUUID!=expected[i] || m.machineUUID!=r.executors[i].machineUUID ||
-        m.linuxMachineID!=String(linuxIDs[i]) || m.beforeBootID.size()!=36 ||
+    if (m.machineUUID==0 || m.machineUUID!=r.executors[i].machineUUID || m.linuxMachineID.size()!=32 ||
+        m.beforeBootID.size()!=36 ||
         m.runtimeRoot!="/root/prodigy"_ctv || m.gatewayInventory.empty() || m.gatewayInventory.size()>65536 ||
         m.installRequired!=(i!=0)) return false;
     for (char c:m.linuxMachineID) if (!((c>='a' && c<='f') || (c>='0' && c<='9'))) return false;
@@ -1072,14 +1068,37 @@ static inline bool mothershipLocalInterruptedRecoveryRuntimeIntentValid(
     uint32_t gateways=0;
     for (const auto& g:v.gateways) if (g.localMachineUUID==m.machineUUID) {
       if (!prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(g) ||
-          g.localClusterUUID!=r.clusterUUID || g.state!=CrossClusterMasqueGatewayState::active ||
-          g.artifactSHA256!="a31d6be8fd338c5d9056822ca4eb42dc7f5cee9a2a60a08672847b016a92f631"_ctv ||
-          g.artifactBytes!=4260945) return false;
+          g.localClusterUUID!=r.clusterUUID || g.state!=CrossClusterMasqueGatewayState::active) return false;
       ++gateways;
     }
     if (gateways!=2) return false;
   }
   return installs==2;
+}
+
+static inline bool mothershipLocalInterruptedRecoveryRuntimeIntentValid(
+    const MothershipLocalAuthorityRecoveryCohortRequest& r)
+{
+  if (!mothershipLocalInterruptedRecoveryRuntimeIntentStructurallyValid(r)) return false;
+  const auto& v = r.runtime;
+  if (r.clusterUUID != mothershipLocalInterruptedUpgradeClusterUUID() ||
+      v.upgradeOperationUUID != mothershipLocalInterruptedUpgradeOperationUUID() ||
+      v.predecessorRecoveryUUID != mothershipLocalInterruptedUpgradePredecessorUUID() ||
+      v.targetContractSHA256 != "9148f79b5ea66f6ff3d17831ddc487498181549bc77b547c427a9e35f8fa35ac"_ctv) return false;
+  const uint128_t expected[] = {
+    (uint128_t(0x0bf4487bf41a4eccULL)<<64)|0x9f3e5e316ff23a88ULL,
+    (uint128_t(0x88e88d94e0de497dULL)<<64)|0x9ef43113fd04909bULL,
+    (uint128_t(0xcbba7c68cf034a26ULL)<<64)|0xb1062449e8572b8aULL};
+  const char *linuxIDs[] = {"081d00c431314065990ff533082074f7", "cc8defd48fde42c8b304c77971e19a29",
+                           "0ef2a43f92fd48b8a04e3dd8e4eaf80d"};
+  for (uint32_t i=0;i<3;++i) {
+    const auto& member=v.members[i];
+    if (member.machineUUID!=expected[i] || member.linuxMachineID!=String(linuxIDs[i])) return false;
+    for (const auto& gateway:v.gateways) if (gateway.localMachineUUID==member.machineUUID &&
+        (gateway.artifactSHA256!="a31d6be8fd338c5d9056822ca4eb42dc7f5cee9a2a60a08672847b016a92f631"_ctv ||
+         gateway.artifactBytes!=4260945)) return false;
+  }
+  return true;
 }
 
 static inline bool mothershipLocalRecoveryWorkloadIdentityValid(
@@ -1282,7 +1301,7 @@ static inline bool mothershipLocalAuthorityRecoveryPhaseValid(MothershipLocalAut
       value == MothershipLocalAuthorityRecoveryPhase::recovered;
 }
 
-static inline bool mothershipLocalAuthorityRecoveryCohortRequestValid(
+static inline bool mothershipLocalAuthorityRecoveryCohortEnvelopeValid(
     const MothershipLocalAuthorityRecoveryCohortRequest& value, String *failure = nullptr)
 {
   if (failure) failure->clear();
@@ -1314,6 +1333,13 @@ static inline bool mothershipLocalAuthorityRecoveryCohortRequestValid(
         return false;
       }
   }
+  return true;
+}
+
+static inline bool mothershipLocalAuthorityRecoveryCohortRequestValid(
+    const MothershipLocalAuthorityRecoveryCohortRequest& value, String *failure = nullptr)
+{
+  if (!mothershipLocalAuthorityRecoveryCohortEnvelopeValid(value, failure)) return false;
   if (value.protocolVersion >= MothershipLocalAuthorityRecoveryCohortRequest::interruptedUpgradeVersion &&
       !mothershipLocalRecoveryRuntimeIntentValid(value)) {
     if (failure) failure->assign("local authority recovery runtime intent differs from its exact admitted rollout"_ctv);
@@ -1394,11 +1420,23 @@ static inline bool mothershipLocalAuthorityRecoveryCohortRecordValid(
        value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRecord::interruptedUpgradeVersion &&
        value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRecord::admittedRuntimeUpgradeVersion) ||
       value.protocolVersion != value.request.protocolVersion ||
-      !mothershipLocalAuthorityRecoveryCohortRequestValid(value.request, failure) ||
+      !mothershipLocalAuthorityRecoveryCohortEnvelopeValid(value.request, failure) ||
       !mothershipLocalAuthorityRecoveryPhaseValid(value.phase) || value.boundaries.size() != 3)
   {
     if (failure && failure->empty()) failure->assign("local authority recovery record is invalid"_ctv);
     return false;
+  }
+  if (value.protocolVersion >= MothershipLocalAuthorityRecoveryCohortRecord::interruptedUpgradeVersion) {
+    const bool completedHistoricalV2 = value.protocolVersion ==
+        MothershipLocalAuthorityRecoveryCohortRecord::interruptedUpgradeVersion &&
+        value.phase == MothershipLocalAuthorityRecoveryPhase::recovered;
+    const bool runtimeValid = completedHistoricalV2 ?
+        mothershipLocalInterruptedRecoveryRuntimeIntentStructurallyValid(value.request) :
+        mothershipLocalRecoveryRuntimeIntentValid(value.request);
+    if (!runtimeValid) {
+      if (failure) failure->assign("local authority recovery record runtime intent is invalid"_ctv);
+      return false;
+    }
   }
   MothershipLocalAuthorityRecoveryPhase minimum = MothershipLocalAuthorityRecoveryPhase::recovered;
   for (uint32_t index = 0; index < value.boundaries.size(); ++index)

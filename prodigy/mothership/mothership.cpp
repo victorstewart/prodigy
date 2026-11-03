@@ -16066,9 +16066,18 @@ LOCAL_RUNTIME
     }
     auto registry=openClusterRegistry();
     Vector<CrossClusterMasqueGatewayAuthority> gateways;
-    if(!registry.localRecoveryRuntimeAuthorityMatches(request,&failure) ||
-        !registry.loadLocalRecoveryGateways(cluster.clusterUUID,gateways,&failure) ||
-        !mothershipPhysicalFaultExactSerializedEqual(gateways,intent.gateways))return false;
+    if(!registry.localRecoveryRuntimeAuthorityMatches(request,&failure)) {
+      if(failure.empty())failure.assign("local runtime recovery durable admission validation failed"_ctv);
+      return false;
+    }
+    if(!registry.loadLocalRecoveryGateways(cluster.clusterUUID,gateways,&failure)) {
+      if(failure.empty())failure.assign("local runtime recovery durable gateway inventory is invalid"_ctv);
+      return false;
+    }
+    if(!mothershipPhysicalFaultExactSerializedEqual(gateways,intent.gateways)) {
+      failure.assign("local runtime recovery durable gateway inventory changed during admission"_ctv);
+      return false;
+    }
     return true;
   }
 
