@@ -53395,7 +53395,8 @@ public:
             }
 
             const uint64_t executionID = fingerprintPlan.config.deploymentID();
-            if (executionID == machineRetirementJournalExecutionID)
+            if (executionID == machineRetirementJournalExecutionID ||
+                executionID == prodigyLocalBundleRecoveryWitnessRepairJournalExecutionID)
             {
               rejectInvalidPlan("invalid plan: deploymentID is reserved"_ctv);
               return;

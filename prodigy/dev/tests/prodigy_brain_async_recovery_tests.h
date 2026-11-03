@@ -250,7 +250,42 @@ static void testAsyncLocalBundleRecoveryWitnessRepair(TestSuite& suite)
   }
   suite.require(fixtureReady, "local_bundle_witness_repair_authenticates_exact_brain_cohort");
 
-  brain.beginUpgradeAdmissionObservation();
+  String serializedAuthority = {}, authorityDigest = {};
+  suite.require(brain.serializeCurrentMasterAuthorityTransition(
+                    serializedAuthority, authorityDigest),
+                "local_bundle_witness_repair_serializes_current_authority");
+  for (BrainView& peer : peers)
+  {
+    brain.noteMasterAuthorityTransitionSentToPeer(
+        &peer, brain.masterAuthorityRuntimeState, authorityDigest);
+    ProdigyMasterAuthorityStateTransitionAck acknowledgement = {};
+    acknowledgement.generation = brain.masterAuthorityRuntimeState.generation;
+    acknowledgement.peerUUID = peer.uuid;
+    acknowledgement.peerBootNs = peer.boottimens;
+    acknowledgement.transitionDigest.assign(authorityDigest);
+    brain.acknowledgeMasterAuthorityTransition(&peer, acknowledgement);
+  }
+  Mothership mothership = {};
+  mothership.isFixedFile = true;
+  mothership.fslot = 27;
+  brain.activeMotherships.insert(&mothership);
+  RepairLocalBundleRecoveryWitness query = {};
+  query.action = ProdigyLocalBundleRecoveryWitnessRepairAction::query;
+  query.operationUUID = uint128_t(0x7304);
+  query.clusterUUID = brain.brainConfig.clusterUUID;
+  RepairLocalBundleRecoveryWitness pendingObservation = {};
+  suite.require(
+      issueDeploymentLifecycleOperationForTest<
+          MothershipTopic::repairLocalBundleRecoveryWitness>(
+          brain, mothership, query, pendingObservation) &&
+          pendingObservation.success && pendingObservation.witnessPresent &&
+          !pendingObservation.eligible && !pendingObservation.completed &&
+          pendingObservation.failure.equal(
+              "fresh authenticated three-machine fleet observation is incomplete"_ctv) &&
+          brain.upgradeAdmissionObservation.receiptVersion != 0 &&
+          brain.upgradeAdmissionObservation.expectedPeerGenerations.size() == 2,
+      "local_bundle_witness_repair_query_owns_fresh_fleet_observation");
+
   auto& observation = brain.upgradeAdmissionObservation;
   for (BrainView& peer : peers)
   {
@@ -272,21 +307,6 @@ static void testAsyncLocalBundleRecoveryWitnessRepair(TestSuite& suite)
     response.installedBundleSHA256.assign(installedBundle);
     observation.received.insert_or_assign(peer.uuid, std::move(response));
   }
-  String serializedAuthority = {}, authorityDigest = {};
-  suite.require(brain.serializeCurrentMasterAuthorityTransition(
-                    serializedAuthority, authorityDigest),
-                "local_bundle_witness_repair_serializes_current_authority");
-  for (BrainView& peer : peers)
-  {
-    brain.noteMasterAuthorityTransitionSentToPeer(
-        &peer, brain.masterAuthorityRuntimeState, authorityDigest);
-    ProdigyMasterAuthorityStateTransitionAck acknowledgement = {};
-    acknowledgement.generation = brain.masterAuthorityRuntimeState.generation;
-    acknowledgement.peerUUID = peer.uuid;
-    acknowledgement.peerBootNs = peer.boottimens;
-    acknowledgement.transitionDigest.assign(authorityDigest);
-    brain.acknowledgeMasterAuthorityTransition(&peer, acknowledgement);
-  }
   MothershipUpgradeAdmissionReport admission = {};
   brain.collectUpgradeAdmissionReport(admission);
   suite.require(admission.observationComplete && admission.authorityAcknowledged &&
@@ -295,16 +315,7 @@ static void testAsyncLocalBundleRecoveryWitnessRepair(TestSuite& suite)
                     admission.fleetBundleDigestsFresh && admission.fleetInventoriesFresh &&
                     admission.peers.size() == 3 &&
                     admission.masterApprovedBundleSHA256.equals(installedBundle),
-                "local_bundle_witness_repair_starts_from_fresh_exact_fleet_receipt");
-
-  Mothership mothership = {};
-  mothership.isFixedFile = true;
-  mothership.fslot = 27;
-  brain.activeMotherships.insert(&mothership);
-  RepairLocalBundleRecoveryWitness query = {};
-  query.action = ProdigyLocalBundleRecoveryWitnessRepairAction::query;
-  query.operationUUID = uint128_t(0x7304);
-  query.clusterUUID = brain.brainConfig.clusterUUID;
+                "local_bundle_witness_repair_completes_fresh_exact_fleet_receipt");
   RepairLocalBundleRecoveryWitness queryResponse = {};
   suite.require(
       issueDeploymentLifecycleOperationForTest<

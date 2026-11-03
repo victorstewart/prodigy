@@ -30712,56 +30712,70 @@ LOCAL_RUNTIME
                  operationText.c_str(), failure.c_str());
       exit(EXIT_FAILURE);
     }
-    Message::construct(socket.wBuffer,
-                       MothershipTopic::repairLocalBundleRecoveryWitness,
-                       serializedRequest);
-    if (!socket.send()) exit(EXIT_FAILURE);
-    Message *message = socket.recvExpectedTopic(
-        MothershipTopic::repairLocalBundleRecoveryWitness, 16 * 1024);
-    if (message == nullptr)
-    {
-      failure = socket.ioFailureDetail();
-      basics_log("repairLocalBundleRecoveryWitness success=0 operationUUID=%s failure=%s\n",
-                 operationText.c_str(), failure.c_str());
-      exit(EXIT_FAILURE);
-    }
-    String serializedResponse = {};
-    uint8_t *args = message->args;
-    Message::extractToStringView(args, serializedResponse);
     RepairLocalBundleRecoveryWitness response = {};
-    bool valid = args == message->terminal() &&
-        BitseryEngine::deserializeSafe(serializedResponse, response) &&
-        response.protocolVersion == RepairLocalBundleRecoveryWitness::version && response.response &&
-        response.action == request.action && response.operationUUID == request.operationUUID &&
-        response.clusterUUID == request.clusterUUID;
-    const bool hasCompleteScope = prodigyLocalBundleRecoveryWitnessRepairScopeValid(response.scope);
-    if (valid && hasCompleteScope)
+    const uint64_t queryStartedAtMs = Time::msSinceBoot();
+    constexpr uint64_t queryObservationDeadlineMs = 30'000;
+    for (;;)
     {
-      String digest = {};
-      valid = response.scope.operationUUID == operationUUID &&
-          response.scope.clusterUUID == cluster.clusterUUID &&
-          prodigyLocalBundleRecoveryWitnessRepairScopeSHA256(response.scope, digest) &&
-          digest.equals(response.scopeSHA256);
-      Vector<uint128_t> scopedMachines = {};
-      for (const auto& machine : response.scope.machines) scopedMachines.push_back(machine.machineUUID);
-      valid = valid && scopedMachines == registeredMachines;
-    }
-    if (valid && response.completed)
-    {
-      ProdigyLocalBundleRecoveryWitnessRepairReceipt receipt = {};
-      receipt.scope = response.scope;
-      receipt.scopeSHA256 = response.scopeSHA256;
-      receipt.acceptedAtMs = response.acceptedAtMs;
-      receipt.retiredAtAuthorityGeneration = response.durableGeneration;
-      valid = response.success && prodigyLocalBundleRecoveryWitnessRepairReceiptValid(receipt);
-    }
-    if (valid && response.eligible)
-      valid = hasCompleteScope && !response.scopeSHA256.empty();
-    if (!valid)
-    {
-      basics_log("repairLocalBundleRecoveryWitness success=0 operationUUID=%s failure=invalid response payload\n",
-                 operationText.c_str());
-      exit(EXIT_FAILURE);
+      Message::construct(socket.wBuffer,
+                         MothershipTopic::repairLocalBundleRecoveryWitness,
+                         serializedRequest);
+      if (!socket.send()) exit(EXIT_FAILURE);
+      Message *message = socket.recvExpectedTopic(
+          MothershipTopic::repairLocalBundleRecoveryWitness, 16 * 1024);
+      if (message == nullptr)
+      {
+        failure = socket.ioFailureDetail();
+        basics_log("repairLocalBundleRecoveryWitness success=0 operationUUID=%s failure=%s\n",
+                   operationText.c_str(), failure.c_str());
+        exit(EXIT_FAILURE);
+      }
+      String serializedResponse = {};
+      uint8_t *args = message->args;
+      Message::extractToStringView(args, serializedResponse);
+      response = {};
+      bool valid = args == message->terminal() &&
+          BitseryEngine::deserializeSafe(serializedResponse, response) &&
+          response.protocolVersion == RepairLocalBundleRecoveryWitness::version && response.response &&
+          response.action == request.action && response.operationUUID == request.operationUUID &&
+          response.clusterUUID == request.clusterUUID;
+      const bool hasCompleteScope = prodigyLocalBundleRecoveryWitnessRepairScopeValid(response.scope);
+      if (valid && hasCompleteScope)
+      {
+        String digest = {};
+        valid = response.scope.operationUUID == operationUUID &&
+            response.scope.clusterUUID == cluster.clusterUUID &&
+            prodigyLocalBundleRecoveryWitnessRepairScopeSHA256(response.scope, digest) &&
+            digest.equals(response.scopeSHA256);
+        Vector<uint128_t> scopedMachines = {};
+        for (const auto& machine : response.scope.machines) scopedMachines.push_back(machine.machineUUID);
+        valid = valid && scopedMachines == registeredMachines;
+      }
+      if (valid && response.completed)
+      {
+        ProdigyLocalBundleRecoveryWitnessRepairReceipt receipt = {};
+        receipt.scope = response.scope;
+        receipt.scopeSHA256 = response.scopeSHA256;
+        receipt.acceptedAtMs = response.acceptedAtMs;
+        receipt.retiredAtAuthorityGeneration = response.durableGeneration;
+        valid = response.success && prodigyLocalBundleRecoveryWitnessRepairReceiptValid(receipt);
+      }
+      if (valid && response.eligible)
+        valid = hasCompleteScope && !response.scopeSHA256.empty();
+      if (!valid)
+      {
+        basics_log("repairLocalBundleRecoveryWitness success=0 operationUUID=%s failure=invalid response payload\n",
+                   operationText.c_str());
+        exit(EXIT_FAILURE);
+      }
+      const bool observationPending = query && response.success && response.witnessPresent &&
+          !response.eligible && !response.completed &&
+          response.failure.equal(
+              "fresh authenticated three-machine fleet observation is incomplete"_ctv);
+      if (!observationPending) break;
+      const uint64_t nowMs = Time::msSinceBoot();
+      if (nowMs < queryStartedAtMs || nowMs - queryStartedAtMs >= queryObservationDeadlineMs) break;
+      ::usleep(250'000);
     }
 
     String masterUUID = {};
