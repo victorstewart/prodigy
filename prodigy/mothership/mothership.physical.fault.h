@@ -1018,6 +1018,12 @@ public:
   static constexpr uint32_t version = 1;
   static constexpr uint32_t interruptedUpgradeVersion = 2;
   static constexpr uint32_t admittedRuntimeUpgradeVersion = 3;
+  // Version four is byte-compatible with version three, but binds one exact
+  // released predecessor whose installed target is the new source. It lets a
+  // successor repair the deployment inventory that prevented the predecessor
+  // from producing its final authority receipt without discarding either
+  // cohort's durable audit record.
+  static constexpr uint32_t admittedRuntimeSupersedingUpgradeVersion = 4;
   uint32_t protocolVersion = version;
   uint128_t operationUUID = 0;
   uint128_t clusterUUID = 0;
@@ -1130,10 +1136,16 @@ static inline bool mothershipLocalAdmittedRuntimeUpgradeIdentityValid(
 {
   const auto& runtime = request.runtime;
   const auto& identity = request.admittedRuntime;
-  if (request.protocolVersion != MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion ||
+  const bool superseding = request.protocolVersion ==
+      MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeSupersedingUpgradeVersion;
+  if ((request.protocolVersion != MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion &&
+       !superseding) ||
       request.clusterUUID == 0 || runtime.upgradeOperationUUID == 0 ||
-      request.operationUUID == runtime.upgradeOperationUUID || runtime.predecessorRecoveryUUID != 0 ||
-      !runtime.predecessorRecoverySHA256.empty() ||
+      request.operationUUID == runtime.upgradeOperationUUID ||
+      (superseding ?
+        (runtime.predecessorRecoveryUUID == 0 || request.operationUUID == runtime.predecessorRecoveryUUID ||
+         !mothershipPhysicalFaultDigestValid(runtime.predecessorRecoverySHA256)) :
+        (runtime.predecessorRecoveryUUID != 0 || !runtime.predecessorRecoverySHA256.empty())) ||
       !mothershipPhysicalFaultDigestValid(runtime.admissionSHA256) ||
       !mothershipPhysicalFaultSafeAbsolutePath(runtime.bundlePath) ||
       !mothershipPhysicalFaultDigestValid(runtime.targetContractSHA256) ||
@@ -1307,7 +1319,8 @@ static inline bool mothershipLocalAuthorityRecoveryCohortEnvelopeValid(
   if (failure) failure->clear();
   if ((value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRequest::version &&
        value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRequest::interruptedUpgradeVersion &&
-       value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion) ||
+       value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion &&
+       value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeSupersedingUpgradeVersion) ||
       value.operationUUID == 0 || value.clusterUUID == 0 || value.topologyVersion == 0 ||
       value.timeoutMilliseconds < mothershipLocalAuthorityRecoveryMinimumTimeoutMilliseconds ||
       value.timeoutMilliseconds > mothershipLocalVMFaultMaximumRecoveryMilliseconds || value.executors.size() != 3)
@@ -1397,6 +1410,7 @@ public:
   static constexpr uint32_t version = 1;
   static constexpr uint32_t interruptedUpgradeVersion = 2;
   static constexpr uint32_t admittedRuntimeUpgradeVersion = 3;
+  static constexpr uint32_t admittedRuntimeSupersedingUpgradeVersion = 4;
   uint32_t protocolVersion = version;
   MothershipLocalAuthorityRecoveryCohortRequest request;
   MothershipLocalAuthorityRecoveryPhase phase = MothershipLocalAuthorityRecoveryPhase::admitted;
@@ -1418,7 +1432,8 @@ static inline bool mothershipLocalAuthorityRecoveryCohortRecordValid(
   if (failure) failure->clear();
   if ((value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRecord::version &&
        value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRecord::interruptedUpgradeVersion &&
-       value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRecord::admittedRuntimeUpgradeVersion) ||
+       value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRecord::admittedRuntimeUpgradeVersion &&
+       value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRecord::admittedRuntimeSupersedingUpgradeVersion) ||
       value.protocolVersion != value.request.protocolVersion ||
       !mothershipLocalAuthorityRecoveryCohortEnvelopeValid(value.request, failure) ||
       !mothershipLocalAuthorityRecoveryPhaseValid(value.phase) || value.boundaries.size() != 3)
@@ -1473,6 +1488,74 @@ static inline bool mothershipLocalAuthorityRecoveryCohortRecordValid(
           (value.boundaries[i].phase==MothershipLocalAuthorityRecoveryPhase::recovered && p.activationBootID.empty())) return false;
     }
   } else if (!value.runtimeProgress.empty()) return false;
+  return true;
+}
+
+static inline bool mothershipLocalReleasedRuntimeRecoveryCanBeSuperseded(
+    const MothershipLocalAuthorityRecoveryCohortRecord& predecessor,
+    const String& predecessorSHA256,
+    const MothershipLocalAuthorityRecoveryCohortRequest& successor,
+    String *failure = nullptr)
+{
+  if (failure) failure->clear();
+  const auto reject = [&](const char *reason) {
+    if (failure) failure->assign(reason);
+    return false;
+  };
+  if (successor.protocolVersion !=
+          MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeSupersedingUpgradeVersion ||
+      predecessor.protocolVersion <
+          MothershipLocalAuthorityRecoveryCohortRecord::admittedRuntimeUpgradeVersion ||
+      predecessor.phase != MothershipLocalAuthorityRecoveryPhase::released ||
+      predecessor.request.operationUUID != successor.runtime.predecessorRecoveryUUID ||
+      predecessorSHA256 != successor.runtime.predecessorRecoverySHA256 ||
+      predecessor.request.clusterUUID != successor.clusterUUID ||
+      predecessor.request.executors.size() != 3 || predecessor.boundaries.size() != 3 ||
+      predecessor.runtimeProgress.size() != 3 || successor.executors.size() != 3 ||
+      successor.runtime.members.size() != 3)
+    return reject("superseding local runtime recovery is not bound to one released predecessor");
+
+  const auto& before = predecessor.request.admittedRuntime;
+  const auto& after = successor.admittedRuntime;
+  if (before.targetBundleSHA256 != after.sourceBundleSHA256 ||
+      predecessor.request.runtime.targetContractSHA256 != after.sourceContractSHA256 ||
+      before.targetReleaseID != after.sourceReleaseID ||
+      before.targetProdigySHA256 != after.sourceProdigySHA256 ||
+      before.targetMothershipSHA256 != after.sourceMothershipSHA256 ||
+      before.targetBinaryVersion != after.sourceBinaryVersion ||
+      before.workloads.size() != after.workloads.size())
+    return reject("superseding local runtime recovery source differs from the predecessor target");
+  for (uint32_t index = 0; index < before.workloads.size(); ++index) {
+    const auto& left = before.workloads[index];
+    const auto& right = after.workloads[index];
+    if (left.applicationID != right.applicationID || left.deploymentID != right.deploymentID ||
+        left.stateful != right.stateful || left.shardGroups != right.shardGroups ||
+        left.target != right.target || left.targetBase != right.targetBase ||
+        left.targetSurge != right.targetSurge)
+      return reject("superseding local runtime recovery changed the predecessor workload intent");
+  }
+  auto predecessorGateways = predecessor.request.runtime.gateways;
+  auto successorGateways = successor.runtime.gateways;
+  String predecessorGatewayBytes, successorGatewayBytes;
+  if (!BitseryEngine::serialize(predecessorGatewayBytes, predecessorGateways) ||
+      !BitseryEngine::serialize(successorGatewayBytes, successorGateways) ||
+      predecessorGatewayBytes != successorGatewayBytes)
+    return reject("superseding local runtime recovery changed gateway authority");
+  for (uint32_t index = 0; index < 3; ++index) {
+    const auto& oldExecutor = predecessor.request.executors[index];
+    const auto& newExecutor = successor.executors[index];
+    const auto& oldMember = predecessor.request.runtime.members[index];
+    const auto& newMember = successor.runtime.members[index];
+    if (predecessor.boundaries[index].phase < MothershipLocalAuthorityRecoveryPhase::released ||
+        predecessor.runtimeProgress[index].activationBootID.empty() ||
+        predecessor.runtimeProgress[index].activationBootID != newMember.beforeBootID ||
+        oldExecutor.machineUUID != newExecutor.machineUUID ||
+        oldExecutor.boundaryUUID != newExecutor.boundaryUUID ||
+        oldExecutor.immutableBoundarySHA256 != newExecutor.immutableBoundarySHA256 ||
+        oldMember.machineUUID != newMember.machineUUID ||
+        oldMember.linuxMachineID != newMember.linuxMachineID)
+      return reject("superseding local runtime recovery changed a recovered VM boundary or boot");
+  }
   return true;
 }
 

@@ -8481,16 +8481,46 @@ public:
         return false;
       }
     }
+    if (requested.protocolVersion ==
+        MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeSupersedingUpgradeVersion) {
+      MothershipLocalAuthorityRecoveryCohortRecord predecessor;
+      String predecessorBytes,predecessorSHA;
+      if (!loadLocalAuthorityRecoveryCohort(
+              runtime.predecessorRecoveryUUID,predecessor,failure) ||
+          !BitseryEngine::serialize(predecessorBytes,predecessor) ||
+          !prodigyComputeSHA256Hex(predecessorBytes,predecessorSHA,failure) ||
+          !mothershipLocalReleasedRuntimeRecoveryCanBeSuperseded(
+              predecessor,predecessorSHA,requested,failure)) return false;
+    }
     Vector<String> values;
     if (!db.listValues(localAuthorityRecoveryCohortsColumnFamily,values,failure)) return false;
+    Vector<MothershipLocalAuthorityRecoveryCohortRecord> cohorts;
     for (const auto& bytes:values) {
-      MothershipLocalAuthorityRecoveryCohortRecord other;
-      if (!BitseryEngine::deserializeSafe(bytes,other) || !mothershipLocalAuthorityRecoveryCohortRecordValid(other)) {
+      MothershipLocalAuthorityRecoveryCohortRecord cohort;
+      if (!BitseryEngine::deserializeSafe(bytes,cohort) ||
+          !mothershipLocalAuthorityRecoveryCohortRecordValid(cohort)) {
         if (failure) failure->assign("local runtime recovery encountered an invalid prior cohort"_ctv);
         return false;
       }
-      if (other.request.clusterUUID==requested.clusterUUID && other.request.operationUUID!=requested.operationUUID &&
-          other.phase!=MothershipLocalAuthorityRecoveryPhase::recovered) {
+      cohorts.push_back(std::move(cohort));
+    }
+    for (const auto& other:cohorts) {
+      if (other.request.clusterUUID!=requested.clusterUUID ||
+          other.request.operationUUID==requested.operationUUID ||
+          other.phase==MothershipLocalAuthorityRecoveryPhase::recovered) continue;
+      String otherBytes,otherSHA;
+      if (!BitseryEngine::serialize(otherBytes,other) ||
+          !prodigyComputeSHA256Hex(otherBytes,otherSHA,failure)) return false;
+      bool superseded=mothershipLocalReleasedRuntimeRecoveryCanBeSuperseded(
+          other,otherSHA,requested,nullptr);
+      for (const auto& successor:cohorts) {
+        if (superseded) break;
+        superseded=successor.request.clusterUUID==requested.clusterUUID &&
+            successor.request.operationUUID!=other.request.operationUUID &&
+            mothershipLocalReleasedRuntimeRecoveryCanBeSuperseded(
+                other,otherSHA,successor.request,nullptr);
+      }
+      if (!superseded) {
         if(failure) failure->assign("local runtime recovery has an unresolved prior cohort"_ctv);
         return false;
       }

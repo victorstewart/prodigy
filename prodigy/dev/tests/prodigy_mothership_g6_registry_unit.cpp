@@ -830,6 +830,155 @@ static void interruptedLocalUpgradeRegressions(const String& path)
     status.approvedBundleSHA256=identity.targetBundleSHA256;
   }
   assert(mothershipLocalRecoveryRuntimeReportValid(active,activeReport,true));
+
+  // A released protocol-three cohort remains immutable history. A completed
+  // protocol-four successor may discharge it for later admissions only when
+  // the durable predecessor hash and every runtime boundary remain exact.
+  const String activeBoots[]={"00000000-0000-4000-8000-000000000011"_ctv,
+                              "00000000-0000-4000-8000-000000000012"_ctv,
+                              "00000000-0000-4000-8000-000000000013"_ctv};
+  {
+    MothershipClusterRegistry registry(path);
+    for(const auto& executor:active.executors)
+      assert(registry.advanceLocalAuthorityRecoveryCohort(active.operationUUID,executor.boundaryUUID,
+          MothershipLocalAuthorityRecoveryPhase::armed,digest('a'),activeRecord,resumed,&failure));
+    for(uint32_t index=0;index<3;++index) {
+      auto progress=activeRecord.runtimeProgress[index];progress.installDispatched=true;
+      progress.stateSHA256=digest('b');progress.secretsSHA256=digest('c');
+      assert(registry.checkpointLocalRecoveryRuntime(active.operationUUID,progress,activeRecord,&failure));
+    }
+    for(const auto& executor:active.executors)
+      assert(registry.advanceLocalAuthorityRecoveryCohort(active.operationUUID,executor.boundaryUUID,
+          MothershipLocalAuthorityRecoveryPhase::released,digest('d'),activeRecord,resumed,&failure));
+    for(uint32_t index=0;index<3;++index) {
+      auto progress=activeRecord.runtimeProgress[index];progress.activationBootID=activeBoots[index];
+      assert(registry.checkpointLocalRecoveryRuntime(active.operationUUID,progress,activeRecord,&failure));
+    }
+    assert(activeRecord.phase==MothershipLocalAuthorityRecoveryPhase::released);
+  }
+  const String releasedActiveSHA=objectSHA(activeRecord);
+
+  auto superseding=active;
+  superseding.protocolVersion=
+      MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeSupersedingUpgradeVersion;
+  superseding.operationUUID=0xc103;superseding.runtime.upgradeOperationUUID=0xe103;
+  superseding.runtime.predecessorRecoveryUUID=active.operationUUID;
+  superseding.runtime.predecessorRecoverySHA256=releasedActiveSHA;
+  superseding.runtime.targetContractSHA256=digest('4');
+  for(uint32_t index=0;index<3;++index)
+    superseding.runtime.members[index].beforeBootID=activeBoots[index];
+  auto& supersedingIdentity=superseding.admittedRuntime;
+  supersedingIdentity.sourceBundleSHA256=identity.targetBundleSHA256;
+  supersedingIdentity.sourceContractSHA256=active.runtime.targetContractSHA256;
+  supersedingIdentity.sourceReleaseID=identity.targetReleaseID;
+  supersedingIdentity.sourceProdigySHA256=identity.targetProdigySHA256;
+  supersedingIdentity.sourceMothershipSHA256=identity.targetMothershipSHA256;
+  supersedingIdentity.sourceBinaryVersion=identity.targetBinaryVersion;
+  supersedingIdentity.targetBundleSHA256=digest('5');
+  supersedingIdentity.targetReleaseID="target55"_ctv;
+  supersedingIdentity.targetProdigySHA256=digest('6');
+  supersedingIdentity.targetMothershipSHA256=digest('7');
+  supersedingIdentity.targetBinaryVersion="55"_ctv;
+  MothershipUpgradeAdmissionRecord supersedingAdmission=admission;
+  supersedingAdmission.operationID=superseding.runtime.upgradeOperationUUID;
+  supersedingAdmission.sourceBundleSHA256=supersedingIdentity.sourceBundleSHA256;
+  supersedingAdmission.sourceContractSHA256=supersedingIdentity.sourceContractSHA256;
+  supersedingAdmission.sourceReleaseID=supersedingIdentity.sourceReleaseID;
+  supersedingAdmission.sourceProdigySHA256=supersedingIdentity.sourceProdigySHA256;
+  supersedingAdmission.sourceMothershipSHA256=supersedingIdentity.sourceMothershipSHA256;
+  supersedingAdmission.targetBundleSHA256=supersedingIdentity.targetBundleSHA256;
+  supersedingAdmission.targetContractSHA256=superseding.runtime.targetContractSHA256;
+  MothershipLocalAuthorityRecoveryCohortRecord supersedingRecord;
+  {
+    MothershipClusterRegistry registry(path);MothershipUpgradeAdmissionRecord stored;
+    assert(registry.recordUpgradeAdmission(supersedingAdmission,stored,resumed,&failure));
+    superseding.runtime.admissionSHA256=objectSHA(stored);
+    assert(mothershipLocalAuthorityRecoveryCohortRequestValid(superseding,&failure));
+    assert(mothershipLocalReleasedRuntimeRecoveryCanBeSuperseded(
+        activeRecord,releasedActiveSHA,superseding,&failure));
+
+    auto rejects=[&](auto mutation) {auto changed=superseding;mutation(changed);
+      assert(!mothershipLocalReleasedRuntimeRecoveryCanBeSuperseded(
+          activeRecord,releasedActiveSHA,changed,&failure));};
+    rejects([](auto& value){value.runtime.predecessorRecoverySHA256=digest('0');});
+    rejects([](auto& value){value.admittedRuntime.sourceBundleSHA256=digest('0');});
+    rejects([](auto& value){++value.admittedRuntime.workloads[0].target;
+                            ++value.admittedRuntime.workloads[0].targetBase;});
+    rejects([](auto& value){value.runtime.gateways[0].artifactSHA256=digest('0');});
+    rejects([](auto& value){value.executors[0].immutableBoundarySHA256=digest('0');});
+
+    auto missing=superseding;missing.runtime.predecessorRecoverySHA256=digest('0');
+    assert(mothershipLocalAuthorityRecoveryCohortRequestValid(missing,&failure));
+    assert(!registry.admitLocalAuthorityRecoveryCohort(missing,supersedingRecord,resumed,&failure));
+    assert(registry.admitLocalAuthorityRecoveryCohort(superseding,supersedingRecord,resumed,&failure) && !resumed);
+    assert(registry.admitLocalAuthorityRecoveryCohort(superseding,supersedingRecord,resumed,&failure) && resumed);
+  }
+
+  const String supersedingBoots[]={"00000000-0000-4000-8000-000000000021"_ctv,
+                                    "00000000-0000-4000-8000-000000000022"_ctv,
+                                    "00000000-0000-4000-8000-000000000023"_ctv};
+  {
+    MothershipClusterRegistry registry(path);
+    for(const auto& executor:superseding.executors)
+      assert(registry.advanceLocalAuthorityRecoveryCohort(superseding.operationUUID,executor.boundaryUUID,
+          MothershipLocalAuthorityRecoveryPhase::armed,digest('8'),supersedingRecord,resumed,&failure));
+    for(uint32_t index=0;index<3;++index) {
+      auto progress=supersedingRecord.runtimeProgress[index];progress.installDispatched=true;
+      progress.stateSHA256=digest('9');progress.secretsSHA256=digest('a');
+      assert(registry.checkpointLocalRecoveryRuntime(superseding.operationUUID,progress,supersedingRecord,&failure));
+    }
+    for(const auto& executor:superseding.executors)
+      assert(registry.advanceLocalAuthorityRecoveryCohort(superseding.operationUUID,executor.boundaryUUID,
+          MothershipLocalAuthorityRecoveryPhase::released,digest('b'),supersedingRecord,resumed,&failure));
+    for(uint32_t index=0;index<3;++index) {
+      auto progress=supersedingRecord.runtimeProgress[index];
+      progress.activationBootID=supersedingBoots[index];
+      assert(registry.checkpointLocalRecoveryRuntime(
+          superseding.operationUUID,progress,supersedingRecord,&failure));
+    }
+    for(const auto& executor:superseding.executors)
+      assert(registry.advanceLocalAuthorityRecoveryCohort(superseding.operationUUID,executor.boundaryUUID,
+          MothershipLocalAuthorityRecoveryPhase::recovered,digest('c'),supersedingRecord,resumed,&failure));
+    assert(supersedingRecord.phase==MothershipLocalAuthorityRecoveryPhase::recovered);
+    MothershipLocalAuthorityRecoveryCohortRecord loaded;
+    assert(registry.loadLocalAuthorityRecoveryCohort(superseding.operationUUID,loaded,&failure));
+    assert(mothershipLocalAuthorityRecoveryCohortRecordValid(loaded,&failure));
+  }
+
+  auto future=superseding;
+  future.protocolVersion=MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion;
+  future.operationUUID=0xc104;future.runtime.upgradeOperationUUID=0xe104;
+  future.runtime.predecessorRecoveryUUID=0;future.runtime.predecessorRecoverySHA256.clear();
+  future.runtime.targetContractSHA256=digest('d');
+  for(uint32_t index=0;index<3;++index)
+    future.runtime.members[index].beforeBootID=supersedingBoots[index];
+  auto& futureIdentity=future.admittedRuntime;
+  futureIdentity.sourceBundleSHA256=supersedingIdentity.targetBundleSHA256;
+  futureIdentity.sourceContractSHA256=superseding.runtime.targetContractSHA256;
+  futureIdentity.sourceReleaseID=supersedingIdentity.targetReleaseID;
+  futureIdentity.sourceProdigySHA256=supersedingIdentity.targetProdigySHA256;
+  futureIdentity.sourceMothershipSHA256=supersedingIdentity.targetMothershipSHA256;
+  futureIdentity.sourceBinaryVersion=supersedingIdentity.targetBinaryVersion;
+  futureIdentity.targetBundleSHA256=digest('e');futureIdentity.targetReleaseID="target56"_ctv;
+  futureIdentity.targetProdigySHA256=digest('f');futureIdentity.targetMothershipSHA256=digest('1');
+  futureIdentity.targetBinaryVersion="56"_ctv;
+  MothershipUpgradeAdmissionRecord futureAdmission=supersedingAdmission;
+  futureAdmission.operationID=future.runtime.upgradeOperationUUID;
+  futureAdmission.sourceBundleSHA256=futureIdentity.sourceBundleSHA256;
+  futureAdmission.sourceContractSHA256=futureIdentity.sourceContractSHA256;
+  futureAdmission.sourceReleaseID=futureIdentity.sourceReleaseID;
+  futureAdmission.sourceProdigySHA256=futureIdentity.sourceProdigySHA256;
+  futureAdmission.sourceMothershipSHA256=futureIdentity.sourceMothershipSHA256;
+  futureAdmission.targetBundleSHA256=futureIdentity.targetBundleSHA256;
+  futureAdmission.targetContractSHA256=future.runtime.targetContractSHA256;
+  {
+    MothershipClusterRegistry registry(path);MothershipUpgradeAdmissionRecord stored;
+    assert(registry.recordUpgradeAdmission(futureAdmission,stored,resumed,&failure));
+    future.runtime.admissionSHA256=objectSHA(stored);
+    assert(mothershipLocalAuthorityRecoveryCohortRequestValid(future,&failure));
+    MothershipLocalAuthorityRecoveryCohortRecord futureRecord;
+    assert(registry.admitLocalAuthorityRecoveryCohort(future,futureRecord,resumed,&failure) && !resumed);
+  }
 }
 
 static void unreadyUpgradeReportRegressions()
