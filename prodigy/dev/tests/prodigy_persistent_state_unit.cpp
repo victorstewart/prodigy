@@ -1062,6 +1062,68 @@ static void testMasterAuthorityRuntimeStateRecoveryCodec(TestSuite& suite)
   suite.expect(BitseryEngine::deserializeSafe(retryBytes, retryDecoded) && retryDecoded == retryState,
                "master_authority_runtime_state_roundtrips_v4_retained_storage_retry");
 
+  ProdigyMasterAuthorityRuntimeState retainedRearmState = legacy.state;
+  retainedRearmState.generation = 20;
+  ProdigyMaterializedStatefulRecoveryOperation retainedOperation = {};
+  retainedOperation.operationID.assign("00000000-0000-4000-8000-000000000022"_ctv);
+  retainedOperation.activeDeploymentID = 0;
+  retainedOperation.successorDeploymentID = 0x7101000000000002ULL;
+  retainedOperation.successorBlobSHA256 = operation.successorBlobSHA256;
+  retainedOperation.accepted = retainedOperation.started = true;
+  retainedOperation.updatedAtMs = 123460;
+  retainedRearmState.materializedStatefulRecoveryOperations.push_back(retainedOperation);
+  ProdigyRetainedStatefulRearmProof retainedProof = {};
+  retainedProof.scope.operationID = retainedOperation.operationID;
+  retainedProof.scope.clusterUUID = 0x100;
+  retainedProof.scope.applicationName.assign("retained-rearm"_ctv);
+  retainedProof.scope.applicationID = 0x7101;
+  retainedProof.scope.versionID = 2;
+  retainedProof.scope.deploymentID = retainedOperation.successorDeploymentID;
+  retainedProof.scope.canonicalPlanSHA256.assign(
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
+  retainedProof.scope.artifactSHA256 = retainedOperation.successorBlobSHA256;
+  retainedProof.scope.artifactBytes = 4096;
+  retainedProof.scope.machineUUIDs = {uint128_t(0x101), uint128_t(0x102), uint128_t(0x103)};
+  retainedProof.scope.retainedMembers.push_back({
+      .containerUUID = uint128_t(0x201), .machineUUID = uint128_t(0x101), .shardGroup = 0,
+      .state = ContainerState::healthy, .runtimeReady = true});
+  retainedProof.scope.retainedMembers.push_back({
+      .containerUUID = uint128_t(0x202), .machineUUID = uint128_t(0x102), .shardGroup = 0,
+      .state = ContainerState::healthy, .runtimeReady = true});
+  retainedProof.scope.expectedState = DeploymentState::none;
+  retainedProof.scope.expectedTarget = 0;
+  retainedProof.scope.expectedDeployed = 0;
+  retainedProof.scope.expectedHealthy = 2;
+  retainedProof.scope.expectedAcknowledgedPeers = 2;
+  retainedProof.scope.expectedRuntimeMembers = 2;
+  retainedProof.scope.expectedRuntimeStateRecords = 0;
+  retainedProof.scope.desiredReplicas = 3;
+  retainedProof.scope.expectedAuthorityGeneration = 19;
+  retainedProof.scope.expectedMasterUUID = 0x101;
+  retainedProof.scope.expectedMasterBootNs = 123456789;
+  retainedProof.scope.expectedIPv6Only = true;
+  retainedProof.acceptedAtMs = 123460;
+  suite.expect(prodigyRetainedStatefulRearmScopeSHA256(
+                   retainedProof.scope, retainedProof.retainedStateSHA256) &&
+                   prodigyRetainedStatefulRearmProofValid(retainedProof),
+               "retained_stateful_rearm_proof_accepts_exact_target_zero_scope");
+  retainedRearmState.retainedStatefulRearmProofs.push_back(retainedProof);
+  String retainedRearmBytes = {};
+  BitseryEngine::serialize(retainedRearmBytes, retainedRearmState);
+  ProdigyMasterAuthorityRuntimeState retainedRearmDecoded = {};
+  suite.expect(BitseryEngine::deserializeSafe(retainedRearmBytes, retainedRearmDecoded) &&
+                   retainedRearmDecoded == retainedRearmState &&
+                   prodigyRetainedStatefulRearmProofsValid(retainedRearmDecoded),
+               "master_authority_runtime_state_roundtrips_v22_retained_rearm_proof");
+  auto changedProof = retainedProof;
+  changedProof.scope.retainedMembers[0].machineUUID = uint128_t(0x103);
+  suite.expect(!prodigyRetainedStatefulRearmProofValid(changedProof),
+               "retained_stateful_rearm_proof_rejects_changed_storage_owner");
+  auto missingProof = retainedRearmState;
+  missingProof.retainedStatefulRearmProofs.clear();
+  suite.expect(!prodigyRetainedStatefulRearmProofsValid(missingProof),
+               "retained_stateful_rearm_operation_rejects_missing_proof_sidecar");
+
   ProdigyPersistentMasterAuthorityPackage v5Package = {};
   v5Package.runtimeState.generation = 23;
   BrainReplicatedContainerRuntimeState v5Runtime = {};

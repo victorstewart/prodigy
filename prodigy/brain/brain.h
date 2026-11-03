@@ -9757,6 +9757,82 @@ public:
     return true;
   }
 
+  bool observeAllMastersDeploymentIdentityCohort(
+      uint64_t deploymentID,
+      DeploymentIdentityReport& report)
+  {
+    auto reject = [&](const char *reason) {
+      report.statefulCohort.clear();
+      report.statefulCohortRuntimeStates.clear();
+      report.statefulCohortReady = false;
+      report.statefulCohortFailure.assign(reason);
+      return false;
+    };
+    auto deployed = deployments.find(deploymentID);
+    if (!weAreMaster || deployed == deployments.end() || deployed->second == nullptr ||
+        !statefulServingPeersCapable() || !statefulServingRecoveryReady() ||
+        masterAuthorityPersistencePending != 0 || !containerRetirementAuthorityAcknowledged())
+      return reject("all-masters identity requires settled current replicated authority");
+    ApplicationDeployment *deployment = deployed->second;
+    const DeploymentPlan& plan = deployment->plan;
+    if (!plan.isStateful || plan.config.type != ApplicationType::stateful ||
+        !plan.stateful.allMasters || plan.useHostNetworkNamespace ||
+        deployment->nShardGroups != 1 || deployment->containers.size() != 3 ||
+        deployment->nTarget() != 3 || deployment->nDeployed() != 3 || deployment->nHealthy() != 3)
+      return reject("all-masters identity requires one complete three-member IPv6 shard");
+    report.selectedShardGroup = 0;
+    report.nShardGroups = 1;
+    report.normalizedDeploymentPlan.clear();
+    DeploymentPlan planCopy = plan;
+    if (!BitseryEngine::serialize(report.normalizedDeploymentPlan, planCopy))
+      return reject("all-masters identity plan serialization failed");
+    uint32_t clients = 0;
+    for (ContainerView *container : deployment->containers)
+    {
+      if (container == nullptr || container->machine == nullptr ||
+          container->deploymentID != deploymentID || !container->isStateful ||
+          container->lifetime != ApplicationLifetime::base || container->shardGroup != 0 ||
+          container->state != ContainerState::healthy || !container->runtimeReady ||
+          container->plannedWork != nullptr ||
+          !statefulServingResourceObservationSupported(container->machine))
+        return reject("all-masters identity member is not freshly healthy");
+      BrainReplicatedContainerRuntimeState state = {};
+      ProdigyStatefulServingAuthorityMember member = {};
+      if (!captureReplicatedContainerRuntimeState(container, state) ||
+          state.plan.config.deploymentID() != deploymentID || state.plan.uuid != container->uuid ||
+          state.machineUUID != container->machine->uuid || state.plan.nShardGroups != 1 ||
+          state.plan.shardGroup != 0 || !state.plan.isStateful || state.plan.useHostNetworkNamespace)
+        return reject("all-masters identity member has no exact retained launch projection");
+      member.containerUUID = container->uuid;
+      member.machineUUID = container->machine->uuid;
+      member.shardGroup = 0;
+      member.isSource = true;
+      member.advertiseClient = state.plan.statefulMeshRoles.client != 0 &&
+          state.plan.advertisements.contains(state.plan.statefulMeshRoles.client);
+      if (!member.advertiseClient || !prodigyStatefulServingRuntimeDigest(state, member.planSHA256))
+        return reject("all-masters identity member is not client-serving");
+      ++clients;
+      report.statefulCohort.push_back(member);
+      String bytes = {};
+      if (!BitseryEngine::serialize(bytes, state))
+        return reject("all-masters identity runtime serialization failed");
+      report.statefulCohortRuntimeStates.push_back(std::move(bytes));
+    }
+    if (clients != 3 || report.statefulCohort.size() != 3 ||
+        report.statefulCohortRuntimeStates.size() != 3)
+      return reject("all-masters identity requires exactly three client-serving members");
+    for (uint32_t i = 0; i < 3; ++i)
+      for (uint32_t j = i + 1; j < 3; ++j)
+        if (report.statefulCohort[j].containerUUID < report.statefulCohort[i].containerUUID)
+        {
+          std::swap(report.statefulCohort[i], report.statefulCohort[j]);
+          std::swap(report.statefulCohortRuntimeStates[i], report.statefulCohortRuntimeStates[j]);
+        }
+    report.statefulCohortReady = true;
+    report.statefulCohortFailure.clear();
+    return true;
+  }
+
   bool statefulSourceCutIncarnation(const ProdigyStatefulStoreSourceCut& cut,
       ContainerView *&container, String& digest)
   {
@@ -20487,6 +20563,205 @@ public:
     return true;
   }
 
+  const ProdigyRetainedStatefulRearmProof *retainedStatefulRearmProof(
+      uint64_t deploymentID,
+      const String *operationID = nullptr) const
+  {
+    for (const auto& proof : masterAuthorityRuntimeState.retainedStatefulRearmProofs)
+    {
+      if (proof.scope.deploymentID == deploymentID &&
+          (operationID == nullptr || proof.scope.operationID.equals(*operationID)))
+      {
+        return &proof;
+      }
+    }
+    return nullptr;
+  }
+
+  bool retainedStatefulRearmScopeMatchesCurrent(
+      const ProdigyRetainedStatefulRearmScope& scope,
+      String& failure)
+  {
+    auto reject = [&](const char *reason) {
+      failure.assign(reason);
+      return false;
+    };
+    failure.clear();
+
+    if (!prodigyRetainedStatefulRearmScopeValid(scope))
+      return reject("retained stateful re-arm proof scope is invalid");
+    if (!weAreMaster || !ignited || masterAuthorityEpoch == 0 ||
+        !recoveryAuthoritySnapshotDurable() || masterAuthorityPersistencePending != 0 ||
+        getExistingMasterUUID() != selfBrainUUID() ||
+        scope.expectedAuthorityGeneration != masterAuthorityRuntimeState.generation ||
+        scope.expectedMasterUUID != selfBrainUUID() || scope.expectedMasterBootNs != boottimens)
+      return reject("retained stateful re-arm authority observation is stale");
+    if (scope.clusterUUID != brainConfig.clusterUUID)
+      return reject("retained stateful re-arm cluster identity differs");
+    auto reserved = reservedApplicationNamesByID.find(scope.applicationID);
+    if (reserved == reservedApplicationNamesByID.end() ||
+        !reserved->second.equals(scope.applicationName))
+      return reject("retained stateful re-arm application reservation differs");
+
+    ClusterTopology topology = {};
+    Vector<uint128_t> observedMachines = {};
+    if (!loadAuthoritativeClusterTopology(topology) || topology.machines.size() != 3)
+      return reject("retained stateful re-arm requires the exact three-machine topology");
+    for (const ClusterMachine& member : topology.machines)
+    {
+      Machine *machine = member.uuid == 0 ? nullptr : findMachineByUUID(member.uuid);
+      if (!member.isBrain || machine == nullptr || !machines.contains(machine) ||
+          !machine->runtimeReady || !neuronControlStreamActive(machine))
+        return reject("retained stateful re-arm topology is not fully runtime-ready");
+      observedMachines.push_back(member.uuid);
+    }
+    std::sort(observedMachines.begin(), observedMachines.end());
+    if (observedMachines != scope.machineUUIDs)
+      return reject("retained stateful re-arm machine identity set differs");
+
+    auto deployed = deployments.find(scope.deploymentID);
+    auto indexed = deploymentsByApp.find(scope.applicationID);
+    if (deployed == deployments.end() || deployed->second == nullptr ||
+        indexed == deploymentsByApp.end() || indexed->second != deployed->second)
+      return reject("retained stateful re-arm target is not the canonical application head");
+    ApplicationDeployment *head = deployed->second;
+    if (head->previous != nullptr || head->next != nullptr)
+      return reject("retained stateful re-arm target has a predecessor or successor");
+    if (head->plan.config.applicationID != scope.applicationID ||
+        head->plan.config.versionID != scope.versionID ||
+        head->plan.config.deploymentID() != scope.deploymentID)
+      return reject("retained stateful re-arm deployment identity differs");
+    DeploymentPlan plan = head->plan;
+    String planBytes = {}, planSHA256 = {};
+    if (!BitseryEngine::serialize(planBytes, plan) ||
+        !prodigyComputeSHA256Hex(planBytes, planSHA256) ||
+        !planSHA256.equals(scope.canonicalPlanSHA256))
+      return reject("retained stateful re-arm canonical plan digest differs");
+    if (!head->plan.config.containerBlobSHA256.equals(scope.artifactSHA256) ||
+        head->plan.config.containerBlobBytes != scope.artifactBytes)
+      return reject("retained stateful re-arm artifact identity differs");
+    if (!head->plan.isStateful || head->plan.config.type != ApplicationType::stateful ||
+        !head->plan.stateful.allMasters || head->plan.useHostNetworkNamespace ||
+        !scope.expectedIPv6Only || head->nShardGroups != 1 ||
+        head->desiredReplicaCountForShardGroup(0) != scope.desiredReplicas)
+      return reject("retained stateful re-arm plan is not the exact IPv6 all-masters topology");
+
+    for (const auto& [deploymentID, candidate] : deploymentPlans)
+      if (deploymentID != scope.deploymentID &&
+          candidate.config.applicationID == scope.applicationID &&
+          candidate.config.versionID > scope.versionID)
+        return reject("retained stateful re-arm application has a newer persisted plan");
+    for (const auto& [deploymentID, failed] : failedDeployments)
+    {
+      if (deploymentID == scope.deploymentID)
+        return reject("retained stateful re-arm target has a terminal tombstone");
+      if ((failed.hasOperatorCancellation || failed.hasQualificationCancellation) &&
+          (failed.successorDeploymentID == scope.deploymentID ||
+           failed.deploymentID == scope.deploymentID))
+        return reject("retained stateful re-arm target is owned by a cancellation");
+    }
+
+    for (const auto& operation : masterAuthorityRuntimeState.statefulWorkerTopologyUpgradeOperations)
+      if (operation.deploymentID == scope.deploymentID)
+        return reject("retained stateful re-arm target has a topology upgrade operation");
+    for (const auto& intent : masterAuthorityRuntimeState.deferredStatefulScaleIntents)
+      if (intent.deploymentID == scope.deploymentID)
+        return reject("retained stateful re-arm target has a deferred scale intent");
+    for (const auto& operation : masterAuthorityRuntimeState.materializedStatefulRecoveryOperations)
+      if (!operation.completed &&
+          (operation.activeDeploymentID == scope.deploymentID ||
+           operation.successorDeploymentID == scope.deploymentID))
+        return reject("retained stateful re-arm target has another recovery operation");
+    for (const auto& retry : masterAuthorityRuntimeState.materializedStatefulRecoveryRetries)
+      if (retry.phase != ProdigyMaterializedStatefulRecoveryRetryPhase::completed &&
+          (retry.activeDeploymentID == scope.deploymentID ||
+           retry.failedSuccessorDeploymentID == scope.deploymentID ||
+           retry.replacementSuccessorDeploymentID == scope.deploymentID))
+        return reject("retained stateful re-arm target has a recovery retry");
+    if (pendingMothershipSpinArtifacts.contains(scope.deploymentID) ||
+        pendingStatefulDeploymentAdmissionRequests.contains(scope.deploymentID) ||
+        pendingReplicatedContainerRuntimeStates.contains(scope.deploymentID) ||
+        recoveryPersistencePending || head->materializedStatefulRecoveryOwnsTransition ||
+        head->materializedStatefulRecoveryHealthFailed || head->waitingOnCompactions ||
+        head->canaryStack != nullptr || head->currentlyExecutingWork != nullptr ||
+        head->schedulingStack.execution != nullptr || head->retiredSchedulingExecution != nullptr ||
+        head->consumingSchedulingExecution || !head->schedulingStack.waiters.empty() ||
+        !head->toSchedule.empty() || !head->waitingOnContainers.empty() || head->nSuspended != 0)
+      return reject("retained stateful re-arm target has active lifecycle work");
+    if (deploymentLaunchFenced(scope.deploymentID) || !deploymentDNSReady(scope.deploymentID))
+      return reject("retained stateful re-arm target launch authority is fenced");
+    if (!containerRetirementAuthorityAcknowledged())
+      return reject("retained stateful re-arm authority is not acknowledged by the exact brain cohort");
+
+    DeploymentStatusReport status = head->generateReport();
+    if (status.state != scope.expectedState || status.nTarget != scope.expectedTarget ||
+        status.nDeployed != scope.expectedDeployed || status.nHealthy != scope.expectedHealthy ||
+        head->containers.size() != scope.retainedMembers.size())
+      return reject("retained stateful re-arm deployment counts differ");
+    uint32_t acknowledgedPeers = 0;
+    for (BrainView *peer : brains)
+      if (peer != nullptr && head->brainBlobEchoPeerKeys.contains(peer->uuid)) ++acknowledgedPeers;
+    if (acknowledgedPeers != scope.expectedAcknowledgedPeers ||
+        !deploymentReplicationAcknowledgedByAuthoritativePeers(head))
+      return reject("retained stateful re-arm peer acknowledgements differ");
+
+    Vector<ProdigyRetainedStatefulRearmMember> retained = {};
+    uint32_t runtimeMembers = 0;
+    for (ContainerView *container : head->containers)
+    {
+      if (container == nullptr || container->machine == nullptr ||
+          container->deploymentID != scope.deploymentID || !container->isStateful ||
+          container->lifetime != ApplicationLifetime::base || container->shardGroup != 0 ||
+          container->state != ContainerState::healthy || !container->runtimeReady ||
+          container->plannedWork != nullptr || !head->containers.contains(container))
+        return reject("retained stateful re-arm live cohort is malformed");
+      auto canonical = containers.find(container->uuid);
+      if (canonical == containers.end() || canonical->second != container ||
+          !std::binary_search(scope.machineUUIDs.begin(), scope.machineUUIDs.end(), container->machine->uuid))
+        return reject("retained stateful re-arm live cohort is not canonical");
+      const uint64_t clientService = container->effectiveStatefulMeshRoles(head->plan).client;
+      if (clientService == 0 || !container->advertisements.contains(clientService))
+        return reject("retained stateful re-arm all-masters member is not client-serving");
+      retained.push_back({
+          .containerUUID = container->uuid,
+          .machineUUID = container->machine->uuid,
+          .shardGroup = container->shardGroup,
+          .state = container->state,
+          .runtimeReady = container->runtimeReady});
+      ++runtimeMembers;
+    }
+    std::sort(retained.begin(), retained.end(), [](const auto& left, const auto& right) {
+      return left.containerUUID < right.containerUUID;
+    });
+    if (runtimeMembers != scope.expectedRuntimeMembers || retained.size() != scope.retainedMembers.size())
+      return reject("retained stateful re-arm runtime member count differs");
+    for (uint32_t index = 0; index < retained.size(); ++index)
+    {
+      const auto& observed = retained[index];
+      const auto& expected = scope.retainedMembers[index];
+      if (observed.containerUUID != expected.containerUUID ||
+          observed.machineUUID != expected.machineUUID ||
+          observed.shardGroup != expected.shardGroup || observed.state != expected.state ||
+          observed.runtimeReady != expected.runtimeReady)
+        return reject("retained stateful re-arm retained storage identity differs");
+    }
+
+    uint32_t runtimeStateRecords = 0;
+    bytell_hash_set<uint128_t> runtimeStateUUIDs = {};
+    for (const auto& state : statefulServingRuntimeStates)
+    {
+      if (state.plan.config.deploymentID() != scope.deploymentID) continue;
+      if (state.machineUUID == 0 || state.plan.uuid == 0 || !state.plan.isStateful ||
+          state.plan.shardGroup != 0 || state.plan.useHostNetworkNamespace ||
+          !runtimeStateUUIDs.insert(state.plan.uuid).second)
+        return reject("retained stateful re-arm serving runtime record is malformed");
+      ++runtimeStateRecords;
+    }
+    if (runtimeStateRecords != scope.expectedRuntimeStateRecords)
+      return reject("retained stateful re-arm serving runtime record count differs");
+    return true;
+  }
+
   bool recoveryAuthoritySnapshotDurable(void) const
   {
     return masterAuthorityPersistencePending == 0 &&
@@ -20690,9 +20965,48 @@ public:
       auto active = deployments.find(operation.activeDeploymentID);
       if (active == deployments.end())
       {
+        const ProdigyRetainedStatefulRearmProof *retainedRearm =
+            retainedStatefulRearmProof(operation.successorDeploymentID, &operation.operationID);
+        bool retainedRearmValid = retainedRearm != nullptr &&
+            prodigyRetainedStatefulRearmProofValid(*retainedRearm) &&
+            operation.activeDeploymentID == 0 &&
+            retainedRearm->scope.deploymentID == operation.successorDeploymentID &&
+            retainedRearm->scope.artifactSHA256.equals(operation.successorBlobSHA256);
+        if (retainedRearmValid)
+        {
+          const auto& scope = retainedRearm->scope;
+          DeploymentPlan replayPlan = head->plan;
+          String replayPlanBytes = {}, replayPlanSHA256 = {};
+          auto reserved = reservedApplicationNamesByID.find(scope.applicationID);
+          ClusterTopology topology = {};
+          Vector<uint128_t> topologyMachines = {};
+          retainedRearmValid = scope.clusterUUID == brainConfig.clusterUUID &&
+              reserved != reservedApplicationNamesByID.end() && reserved->second.equals(scope.applicationName) &&
+              head->plan.config.applicationID == scope.applicationID &&
+              head->plan.config.versionID == scope.versionID &&
+              head->plan.config.deploymentID() == scope.deploymentID &&
+              head->plan.config.containerBlobSHA256.equals(scope.artifactSHA256) &&
+              head->plan.config.containerBlobBytes == scope.artifactBytes &&
+              head->plan.isStateful && head->plan.config.type == ApplicationType::stateful &&
+              head->plan.stateful.allMasters && !head->plan.useHostNetworkNamespace &&
+              head->nShardGroups == 1 && head->desiredReplicaCountForShardGroup(0) == scope.desiredReplicas &&
+              BitseryEngine::serialize(replayPlanBytes, replayPlan) &&
+              prodigyComputeSHA256Hex(replayPlanBytes, replayPlanSHA256) &&
+              replayPlanSHA256.equals(scope.canonicalPlanSHA256) &&
+              loadAuthoritativeClusterTopology(topology) && topology.machines.size() == 3;
+          for (const ClusterMachine& member : topology.machines)
+          {
+            if (!member.isBrain || member.uuid == 0) retainedRearmValid = false;
+            topologyMachines.push_back(member.uuid);
+          }
+          std::sort(topologyMachines.begin(), topologyMachines.end());
+          retainedRearmValid = retainedRearmValid && topologyMachines == scope.machineUUIDs;
+        }
+        const bool ordinaryMissingPredecessor = operation.activeDeploymentID != 0;
         // A completed rollout may have culled its predecessor before restart.
         // Restore only a fully healthy three-replica successor in that case.
-        if (head->previous == nullptr && head->containers.size() == 3 &&
+        if ((ordinaryMissingPredecessor || retainedRearmValid) &&
+            head->previous == nullptr && head->containers.size() == 3 &&
             std::all_of(head->containers.begin(), head->containers.end(), [](ContainerView *container) {
               return container && container->state == ContainerState::healthy && container->shardGroup == 0;
             }))
@@ -20707,7 +21021,7 @@ public:
         // head: those retain their existing materialized-recovery barriers.
         else if (head->previous == nullptr && head->next == nullptr && head->state == DeploymentState::none &&
                  head->plan.isStateful && head->plan.config.type == ApplicationType::stateful &&
-                 head->plan.stateful.allMasters == false &&
+                 ((!head->plan.stateful.allMasters && ordinaryMissingPredecessor) || retainedRearmValid) &&
                  head->materializedStatefulRecoveryOwnsTransition == false &&
                  head->materializedStatefulRecoveryHealthFailed == false &&
                  head->waitingOnCompactions == false && head->canaryStack == nullptr &&
@@ -20720,6 +21034,7 @@ public:
         {
           uint32_t clientMasters = 0;
           bool canonicalCohort = true;
+          Vector<ProdigyRetainedStatefulRearmMember> retainedMembers = {};
           for (ContainerView *container : head->containers)
           {
             if (container == nullptr || container->machine == nullptr ||
@@ -20733,8 +21048,31 @@ public:
             }
             const uint64_t clientService = container->effectiveStatefulMeshRoles(head->plan).client;
             clientMasters += clientService != 0 && container->advertisements.contains(clientService);
+            retainedMembers.push_back({
+                .containerUUID = container->uuid,
+                .machineUUID = container->machine->uuid,
+                .shardGroup = container->shardGroup,
+                .state = container->state,
+                .runtimeReady = container->runtimeReady});
           }
-          if (canonicalCohort && clientMasters == 1)
+          std::sort(retainedMembers.begin(), retainedMembers.end(), [](const auto& left, const auto& right) {
+            return left.containerUUID < right.containerUUID;
+          });
+          if (retainedRearmValid)
+          {
+            canonicalCohort = canonicalCohort && head->plan.stateful.allMasters &&
+                retainedMembers.size() == retainedRearm->scope.retainedMembers.size();
+            for (uint32_t index = 0; canonicalCohort && index < retainedMembers.size(); ++index)
+            {
+              const auto& observed = retainedMembers[index];
+              const auto& expected = retainedRearm->scope.retainedMembers[index];
+              canonicalCohort = observed.containerUUID == expected.containerUUID &&
+                  observed.machineUUID == expected.machineUUID &&
+                  observed.shardGroup == expected.shardGroup && observed.state == expected.state &&
+                  observed.runtimeReady == expected.runtimeReady;
+            }
+          }
+          if (canonicalCohort && clientMasters == (retainedRearmValid ? 2u : 1u))
           {
             // The recovered owner initializes a missing target from the
             // canonical cohort.  Accept only that fresh count or its exact
@@ -49877,6 +50215,13 @@ public:
                   if (peer != nullptr && liveDeployment->brainBlobEchoPeerKeys.contains(peer->uuid))
                     ++report.acknowledgedPeerCount;
 
+                // All-masters deployments use the same authenticated runtime
+                // projection as the existing stateful preparation owner, but
+                // every member is client-serving. Expose that complete cohort
+                // only after all three current Neuron identities converge.
+                if (observedPlan->isStateful && observedPlan->stateful.allMasters)
+                  (void)observeAllMastersDeploymentIdentityCohort(deploymentID, report);
+
                 // This is an observation of the existing live runtime and
                 // COUSIN/data-authority state, never a new receipt channel.
                 // Refuse to mark the cohort converged when a member cannot be
@@ -53384,6 +53729,218 @@ public:
             Message::construct(mothership->wBuffer, MothershipTopic::commitDeploymentPlacementPolicy, payload);
             (void)flushActiveMothershipSendBuffer(mothership, "placement-policy-durable");
           });
+          break;
+        }
+      case MothershipTopic::rearmRetainedStatefulDeployment:
+        {
+          String serializedRequest = {};
+          Message::extractToStringView(args, serializedRequest);
+          RearmRetainedStatefulDeployment request = {};
+          RearmRetainedStatefulDeployment response = {};
+          auto reply = [&]() {
+            String payload = {};
+            BitseryEngine::serialize(payload, response);
+            Message::construct(mothership->wBuffer, MothershipTopic::rearmRetainedStatefulDeployment, payload);
+          };
+          auto reject = [&](const char *reason) {
+            response = request;
+            response.response = true;
+            response.success = false;
+            response.idempotent = false;
+            response.completed = false;
+            response.durableGeneration = 0;
+            response.failure.assign(reason);
+            reply();
+          };
+          if (args != message->terminal() ||
+              !BitseryEngine::deserializeSafe(serializedRequest, request) ||
+              request.protocolVersion != RearmRetainedStatefulDeployment::version || request.response ||
+              request.success || request.idempotent || request.completed || request.durableGeneration != 0 ||
+              !request.failure.empty() || request.proof.acceptedAtMs != 0 ||
+              !prodigyRetainedStatefulRearmProofValid(request.proof, false))
+          {
+            reject("invalid retained stateful re-arm request");
+            break;
+          }
+          response = request;
+          response.response = true;
+          if (pendingMaterializedRecoveryPersistence.contains(request.proof.scope.operationID))
+          {
+            // The first request still owns the sole persistence receipt. A
+            // lost client response is retried against the durable ledger once
+            // that receipt completes; never queue a second candidate.
+            break;
+          }
+          if (!weAreMaster || !ignited || masterAuthorityEpoch == 0 ||
+              !recoveryAuthoritySnapshotDurable() || masterAuthorityPersistencePending != 0)
+          {
+            reject("retained stateful re-arm authority is not ready");
+            break;
+          }
+
+          const auto& requestedScope = request.proof.scope;
+          const auto existingOperation = std::find_if(
+              masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.begin(),
+              masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.end(),
+              [&](const ProdigyMaterializedStatefulRecoveryOperation& operation) {
+                return operation.operationID.equals(requestedScope.operationID);
+              });
+          const auto existingProof = std::find_if(
+              masterAuthorityRuntimeState.retainedStatefulRearmProofs.begin(),
+              masterAuthorityRuntimeState.retainedStatefulRearmProofs.end(),
+              [&](const ProdigyRetainedStatefulRearmProof& proof) {
+                return proof.scope.operationID.equals(requestedScope.operationID);
+              });
+          if (existingOperation != masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.end() ||
+              existingProof != masterAuthorityRuntimeState.retainedStatefulRearmProofs.end())
+          {
+            if (existingOperation == masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.end() ||
+                existingProof == masterAuthorityRuntimeState.retainedStatefulRearmProofs.end() ||
+                existingOperation->activeDeploymentID != 0 ||
+                existingOperation->successorDeploymentID != requestedScope.deploymentID ||
+                !existingOperation->successorBlobSHA256.equals(requestedScope.artifactSHA256) ||
+                !existingOperation->accepted || !existingOperation->started ||
+                !prodigyRetainedStatefulRearmProofEqual(*existingProof, request.proof, false))
+            {
+              reject("retained stateful re-arm operationID collision");
+              break;
+            }
+            recoverDeploymentsAfterNeuronState();
+            response.proof = *existingProof;
+            response.success = true;
+            response.idempotent = true;
+            response.completed = existingOperation->completed;
+            response.durableGeneration = masterAuthorityRuntimeState.generation;
+            response.failure.clear();
+            reply();
+            break;
+          }
+          if (std::any_of(masterAuthorityRuntimeState.retainedStatefulRearmProofs.begin(),
+                          masterAuthorityRuntimeState.retainedStatefulRearmProofs.end(),
+                          [&](const auto& proof) {
+                            return proof.scope.deploymentID == requestedScope.deploymentID;
+                          }) ||
+              std::any_of(masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.begin(),
+                          masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.end(),
+                          [&](const auto& operation) {
+                            return operation.activeDeploymentID == requestedScope.deploymentID ||
+                                   operation.successorDeploymentID == requestedScope.deploymentID;
+                          }))
+          {
+            reject("retained stateful deployment is already owned by another recovery operation");
+            break;
+          }
+
+          String inventoryBlocker = {};
+          if (!finalizePersistedNeuronInventoryRecovery(&inventoryBlocker))
+          {
+            response.failure.assign("retained stateful re-arm inventory is not authoritative: "_ctv);
+            response.failure.append(inventoryBlocker);
+            reply();
+            break;
+          }
+          if (completeLocalBundleExecRecoveryIfReady(true) &&
+              (!masterAuthorityRuntimeStateDurable ||
+               durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation))
+          {
+            reject("retained stateful re-arm inventory finalization is becoming durable");
+            break;
+          }
+          String predicateFailure = {};
+          if (!retainedStatefulRearmScopeMatchesCurrent(requestedScope, predicateFailure))
+          {
+            response.failure.assign("retained stateful re-arm predicate mismatch: "_ctv);
+            response.failure.append(predicateFailure);
+            reply();
+            break;
+          }
+
+          const auto before = masterAuthorityRuntimeState;
+          const bool wasDurable = masterAuthorityRuntimeStateDurable;
+          const uint64_t durableGeneration = durableMasterAuthorityRuntimeStateGeneration;
+          const uint64_t generation = before.generation + 1;
+          ProdigyMaterializedStatefulRecoveryOperation operation = {};
+          operation.operationID = requestedScope.operationID;
+          operation.activeDeploymentID = 0;
+          operation.successorDeploymentID = requestedScope.deploymentID;
+          operation.successorBlobSHA256 = requestedScope.artifactSHA256;
+          operation.accepted = true;
+          operation.started = true;
+          operation.updatedAtMs = Time::now<TimeResolution::ms>();
+          ProdigyRetainedStatefulRearmProof acceptedProof = request.proof;
+          acceptedProof.acceptedAtMs = operation.updatedAtMs;
+          masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.push_back(std::move(operation));
+          masterAuthorityRuntimeState.retainedStatefulRearmProofs.push_back(acceptedProof);
+
+          const uint64_t epoch = masterAuthorityEpoch;
+          const uint64_t incarnation = mothership->connectionIncarnation;
+          const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+          String operationID(requestedScope.operationID.data(), requestedScope.operationID.size(),
+                             Copy::yes, requestedScope.operationID.size());
+          pendingMaterializedRecoveryPersistence.insert(operationID);
+          commitMasterAuthorityStateChangeAsync(
+              [this, lifetime, mothership, epoch, incarnation, operationID = std::move(operationID),
+               before, wasDurable, durableGeneration, generation](bool durable) mutable {
+                if (lifetime.expired()) return;
+                pendingMaterializedRecoveryPersistence.erase(operationID);
+                if (masterAuthorityEpoch != epoch) return;
+                auto operation = std::find_if(
+                    masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.begin(),
+                    masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.end(),
+                    [&](const auto& candidate) { return candidate.operationID.equals(operationID); });
+                auto proof = std::find_if(
+                    masterAuthorityRuntimeState.retainedStatefulRearmProofs.begin(),
+                    masterAuthorityRuntimeState.retainedStatefulRearmProofs.end(),
+                    [&](const auto& candidate) { return candidate.scope.operationID.equals(operationID); });
+                const bool candidateCurrent =
+                    operation != masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.end() &&
+                    proof != masterAuthorityRuntimeState.retainedStatefulRearmProofs.end();
+                if (!durable && candidateCurrent)
+                {
+                  if (masterAuthorityRuntimeState.generation == generation)
+                  {
+                    masterAuthorityRuntimeState = before;
+                    masterAuthorityRuntimeStateDurable = wasDurable;
+                    durableMasterAuthorityRuntimeStateGeneration = durableGeneration;
+                  }
+                  else
+                  {
+                    masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.erase(operation);
+                    masterAuthorityRuntimeState.retainedStatefulRearmProofs.erase(proof);
+                  }
+                }
+                if (durable && candidateCurrent) recoverDeploymentsAfterNeuronState();
+                if (!activeMotherships.contains(mothership) ||
+                    mothership->connectionIncarnation != incarnation || !streamIsActive(mothership) ||
+                    Ring::socketIsClosing(mothership)) return;
+                RearmRetainedStatefulDeployment response = {};
+                response.response = true;
+                response.success = durable && candidateCurrent;
+                if (response.success)
+                {
+                  operation = std::find_if(
+                      masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.begin(),
+                      masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.end(),
+                      [&](const auto& candidate) { return candidate.operationID.equals(operationID); });
+                  proof = std::find_if(
+                      masterAuthorityRuntimeState.retainedStatefulRearmProofs.begin(),
+                      masterAuthorityRuntimeState.retainedStatefulRearmProofs.end(),
+                      [&](const auto& candidate) { return candidate.scope.operationID.equals(operationID); });
+                  if (operation == masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.end() ||
+                      proof == masterAuthorityRuntimeState.retainedStatefulRearmProofs.end()) return;
+                  response.proof = *proof;
+                  response.completed = operation->completed;
+                  response.durableGeneration = masterAuthorityRuntimeState.generation;
+                }
+                else
+                {
+                  response.failure.assign("retained stateful re-arm durable acceptance failed"_ctv);
+                }
+                String payload = {};
+                BitseryEngine::serialize(payload, response);
+                Message::construct(mothership->wBuffer, MothershipTopic::rearmRetainedStatefulDeployment, payload);
+                (void)flushActiveMothershipSendBuffer(mothership, "retained-rearm-durable");
+              });
           break;
         }
       case MothershipTopic::recoverMaterializedStatefulDeployment:

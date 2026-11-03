@@ -27469,6 +27469,10 @@ LOCAL_RUNTIME
     if (!valid) exit(EXIT_FAILURE);
     for (const auto& member : report.statefulRuntimeCohort) {
       const auto* selected = nametagSourceCutMember(report, member.shardGroup);
+      // A single-writer shard has one deterministic cut source. Every
+      // all-masters replica is independently writable and carries its own
+      // authenticated native cut receipt, so each is selected evidence even
+      // though migration placement still uses nametagSourceCutMember().
       uint32_t sourceCutSlot = UINT32_MAX;
       if (report.nShardGroups > 0 && report.nShardGroups <= UINT16_MAX && member.shardGroup < report.nShardGroups)
         forEachStatefulServiceSlotOwnedByGroup(uint16_t(member.shardGroup), uint16_t(report.nShardGroups),
@@ -27479,7 +27483,7 @@ LOCAL_RUNTIME
           unsigned(report.nShardGroups), unsigned(sourceCutSlot),
           (unsigned long long)(member.containerUUID >> 64), (unsigned long long)member.containerUUID,
           (unsigned long long)(member.machineUUID >> 64), (unsigned long long)member.machineUUID,
-          unsigned(selected == &member));
+          unsigned(member.allMasters || selected == &member));
     }
     if (seedDetails) {
       String serializedReport, reportSHA256, reportHex;
@@ -27512,7 +27516,8 @@ LOCAL_RUNTIME
             unsigned(member.shardGroup), unsigned(report.nShardGroups), unsigned(member.storeKind),
             (unsigned long long)(member.containerUUID >> 64), (unsigned long long)member.containerUUID,
             (unsigned long long)(member.machineUUID >> 64), (unsigned long long)member.machineUUID,
-            unsigned(member.writable), unsigned(member.clientServing), unsigned(member.allMasters), unsigned(selected == &member),
+            unsigned(member.writable), unsigned(member.clientServing), unsigned(member.allMasters),
+            unsigned(member.allMasters || selected == &member),
             unsigned(prodigyStatefulStoreReceiptValid(receipt)), unsigned(receipt.protocolVersion), unsigned(receipt.state),
             (unsigned long long)receipt.seedGeneration, unsigned(receipt.siblingSessionHealthy), unsigned(receipt.cutMaterialized),
             unsigned(receipt.committedHeadsDominateCut), receipt.materializedContentSHA256.c_str(), receipt.materializedHeadsSHA256.c_str());
@@ -30375,6 +30380,275 @@ LOCAL_RUNTIME
                (unsigned long long)response.successorDeploymentID,
                (unsigned long long)response.durableGeneration, response.failure.c_str());
     if (response.success == false) exit(EXIT_FAILURE);
+  }
+
+  void runRearmRetainedStatefulDeployment(int argc, char *argv[])
+  {
+    String failure = {}, json = {};
+    if (argc != 2 || !resolveJSONArgument("rearmRetainedStatefulDeployment", argv[1], json))
+    {
+      basics_log("rearmRetainedStatefulDeployment success=0 failure=usage: rearmRetainedStatefulDeployment TARGET JSON_OR_AT_PATH\n");
+      exit(EXIT_FAILURE);
+    }
+    json.need(simdjson::SIMDJSON_PADDING);
+    simdjson::dom::parser parser;
+    simdjson::dom::element doc;
+    if (parser.parse(json.data(), json.size()).get(doc) ||
+        doc.type() != simdjson::dom::element_type::OBJECT)
+    {
+      basics_log("rearmRetainedStatefulDeployment success=0 failure=invalid proof JSON\n");
+      exit(EXIT_FAILURE);
+    }
+    RearmRetainedStatefulDeployment request = {};
+    auto& scope = request.proof.scope;
+    bool sawOperation = false, sawCluster = false, sawApplicationName = false;
+    bool sawApplicationID = false, sawDeploymentID = false, sawVersionID = false;
+    bool sawPlan = false, sawArtifact = false, sawArtifactBytes = false;
+    bool sawMachines = false, sawMembers = false, sawState = false, sawTarget = false;
+    bool sawDeployed = false, sawHealthy = false, sawPeers = false, sawRuntimeMembers = false;
+    bool sawRuntimeRecords = false, sawDesired = false, sawGeneration = false;
+    bool sawMaster = false, sawBoot = false, sawIPv6 = false;
+    auto parseUUID = [&](simdjson::dom::element value, uint128_t& uuid) {
+      if (value.type() != simdjson::dom::element_type::STRING) return false;
+      String text = {};
+      text.assign(value.get_c_str());
+      return prodigyParseCanonicalHex128(text, uuid) && uuid != 0;
+    };
+    auto parseUnsigned = [&](simdjson::dom::element value, uint64_t& number) {
+      return (value.type() == simdjson::dom::element_type::UINT64 ||
+              value.type() == simdjson::dom::element_type::INT64) &&
+          value.get(number) == simdjson::SUCCESS;
+    };
+    auto invalidField = [&](String& key) {
+      basics_log("rearmRetainedStatefulDeployment success=0 failure=invalid or duplicate field %.*s\n",
+                 int(key.size()), key.data());
+      exit(EXIT_FAILURE);
+    };
+    for (auto field : doc.get_object())
+    {
+      String key = {};
+      key.setInvariant(field.key.data(), field.key.size());
+      if (key.equal("operationID"_ctv) || key.equal("applicationName"_ctv) ||
+          key.equal("canonicalPlanSHA256"_ctv) || key.equal("artifactSHA256"_ctv))
+      {
+        bool *seen = key.equal("operationID"_ctv) ? &sawOperation :
+                     key.equal("applicationName"_ctv) ? &sawApplicationName :
+                     key.equal("canonicalPlanSHA256"_ctv) ? &sawPlan : &sawArtifact;
+        if (*seen || field.value.type() != simdjson::dom::element_type::STRING) invalidField(key);
+        *seen = true;
+        if (key.equal("operationID"_ctv)) scope.operationID.assign(field.value.get_c_str());
+        else if (key.equal("applicationName"_ctv)) scope.applicationName.assign(field.value.get_c_str());
+        else if (key.equal("canonicalPlanSHA256"_ctv)) scope.canonicalPlanSHA256.assign(field.value.get_c_str());
+        else scope.artifactSHA256.assign(field.value.get_c_str());
+      }
+      else if (key.equal("clusterUUID"_ctv) || key.equal("expectedMasterUUID"_ctv))
+      {
+        bool *seen = key.equal("clusterUUID"_ctv) ? &sawCluster : &sawMaster;
+        uint128_t *target = key.equal("clusterUUID"_ctv) ? &scope.clusterUUID : &scope.expectedMasterUUID;
+        if (*seen || !parseUUID(field.value, *target)) invalidField(key);
+        *seen = true;
+      }
+      else if (key.equal("machineUUIDs"_ctv))
+      {
+        if (sawMachines || field.value.type() != simdjson::dom::element_type::ARRAY) invalidField(key);
+        sawMachines = true;
+        for (auto item : field.value.get_array())
+        {
+          uint128_t uuid = 0;
+          if (scope.machineUUIDs.size() >= 3 || !parseUUID(item, uuid)) invalidField(key);
+          scope.machineUUIDs.push_back(uuid);
+        }
+        std::sort(scope.machineUUIDs.begin(), scope.machineUUIDs.end());
+      }
+      else if (key.equal("retainedMembers"_ctv))
+      {
+        if (sawMembers || field.value.type() != simdjson::dom::element_type::ARRAY) invalidField(key);
+        sawMembers = true;
+        for (auto item : field.value.get_array())
+        {
+          if (scope.retainedMembers.size() >= 2 || item.type() != simdjson::dom::element_type::OBJECT)
+            invalidField(key);
+          ProdigyRetainedStatefulRearmMember member = {};
+          bool container = false, machine = false, shard = false, state = false, ready = false;
+          for (auto memberField : item.get_object())
+          {
+            String memberKey = {};
+            memberKey.setInvariant(memberField.key.data(), memberField.key.size());
+            if (memberKey.equal("containerUUID"_ctv))
+            {
+              if (container || !parseUUID(memberField.value, member.containerUUID)) invalidField(memberKey);
+              container = true;
+            }
+            else if (memberKey.equal("machineUUID"_ctv))
+            {
+              if (machine || !parseUUID(memberField.value, member.machineUUID)) invalidField(memberKey);
+              machine = true;
+            }
+            else if (memberKey.equal("shardGroup"_ctv) || memberKey.equal("state"_ctv))
+            {
+              uint64_t value = 0;
+              bool *seen = memberKey.equal("shardGroup"_ctv) ? &shard : &state;
+              if (*seen || !parseUnsigned(memberField.value, value) || value > UINT32_MAX ||
+                  (memberKey.equal("state"_ctv) && value > UINT8_MAX)) invalidField(memberKey);
+              *seen = true;
+              if (memberKey.equal("shardGroup"_ctv)) member.shardGroup = uint32_t(value);
+              else member.state = ContainerState(uint8_t(value));
+            }
+            else if (memberKey.equal("runtimeReady"_ctv))
+            {
+              if (ready || memberField.value.type() != simdjson::dom::element_type::BOOL ||
+                  memberField.value.get(member.runtimeReady) != simdjson::SUCCESS) invalidField(memberKey);
+              ready = true;
+            }
+            else invalidField(memberKey);
+          }
+          if (!container || !machine || !shard || !state || !ready) invalidField(key);
+          scope.retainedMembers.push_back(member);
+        }
+        std::sort(scope.retainedMembers.begin(), scope.retainedMembers.end(), [](const auto& left, const auto& right) {
+          return left.containerUUID < right.containerUUID;
+        });
+      }
+      else if (key.equal("expectedIPv6Only"_ctv))
+      {
+        if (sawIPv6 || field.value.type() != simdjson::dom::element_type::BOOL ||
+            field.value.get(scope.expectedIPv6Only) != simdjson::SUCCESS) invalidField(key);
+        sawIPv6 = true;
+      }
+      else
+      {
+        uint64_t value = 0;
+        if (!parseUnsigned(field.value, value)) invalidField(key);
+        bool *seen = nullptr;
+        if (key.equal("applicationID"_ctv)) seen = &sawApplicationID;
+        else if (key.equal("deploymentID"_ctv)) seen = &sawDeploymentID;
+        else if (key.equal("versionID"_ctv)) seen = &sawVersionID;
+        else if (key.equal("artifactBytes"_ctv)) seen = &sawArtifactBytes;
+        else if (key.equal("expectedState"_ctv)) seen = &sawState;
+        else if (key.equal("expectedTarget"_ctv)) seen = &sawTarget;
+        else if (key.equal("expectedDeployed"_ctv)) seen = &sawDeployed;
+        else if (key.equal("expectedHealthy"_ctv)) seen = &sawHealthy;
+        else if (key.equal("expectedAcknowledgedPeers"_ctv)) seen = &sawPeers;
+        else if (key.equal("expectedRuntimeMembers"_ctv)) seen = &sawRuntimeMembers;
+        else if (key.equal("expectedRuntimeStateRecords"_ctv)) seen = &sawRuntimeRecords;
+        else if (key.equal("desiredReplicas"_ctv)) seen = &sawDesired;
+        else if (key.equal("expectedAuthorityGeneration"_ctv)) seen = &sawGeneration;
+        else if (key.equal("expectedMasterBootNs"_ctv)) seen = &sawBoot;
+        else invalidField(key);
+        if (*seen) invalidField(key);
+        if ((key.equal("expectedTarget"_ctv) || key.equal("expectedDeployed"_ctv) ||
+             key.equal("expectedHealthy"_ctv) || key.equal("expectedAcknowledgedPeers"_ctv) ||
+             key.equal("expectedRuntimeMembers"_ctv) || key.equal("expectedRuntimeStateRecords"_ctv) ||
+             key.equal("desiredReplicas"_ctv)) && value > UINT32_MAX)
+        {
+          invalidField(key);
+        }
+        *seen = true;
+        if (key.equal("applicationID"_ctv))
+        {
+          if (value > UINT16_MAX) invalidField(key);
+          scope.applicationID = uint16_t(value);
+        }
+        else if (key.equal("deploymentID"_ctv)) scope.deploymentID = value;
+        else if (key.equal("versionID"_ctv)) scope.versionID = value;
+        else if (key.equal("artifactBytes"_ctv)) scope.artifactBytes = value;
+        else if (key.equal("expectedState"_ctv))
+        {
+          if (value > UINT8_MAX) invalidField(key);
+          scope.expectedState = DeploymentState(uint8_t(value));
+        }
+        else if (key.equal("expectedTarget"_ctv)) scope.expectedTarget = uint32_t(value);
+        else if (key.equal("expectedDeployed"_ctv)) scope.expectedDeployed = uint32_t(value);
+        else if (key.equal("expectedHealthy"_ctv)) scope.expectedHealthy = uint32_t(value);
+        else if (key.equal("expectedAcknowledgedPeers"_ctv)) scope.expectedAcknowledgedPeers = uint32_t(value);
+        else if (key.equal("expectedRuntimeMembers"_ctv)) scope.expectedRuntimeMembers = uint32_t(value);
+        else if (key.equal("expectedRuntimeStateRecords"_ctv)) scope.expectedRuntimeStateRecords = uint32_t(value);
+        else if (key.equal("desiredReplicas"_ctv)) scope.desiredReplicas = uint32_t(value);
+        else if (key.equal("expectedAuthorityGeneration"_ctv)) scope.expectedAuthorityGeneration = value;
+        else
+        {
+          if (value > uint64_t(INT64_MAX)) invalidField(key);
+          scope.expectedMasterBootNs = int64_t(value);
+        }
+      }
+    }
+    const bool complete = sawOperation && sawCluster && sawApplicationName && sawApplicationID &&
+        sawDeploymentID && sawVersionID && sawPlan && sawArtifact && sawArtifactBytes && sawMachines &&
+        sawMembers && sawState && sawTarget && sawDeployed && sawHealthy && sawPeers &&
+        sawRuntimeMembers && sawRuntimeRecords && sawDesired && sawGeneration && sawMaster && sawBoot && sawIPv6;
+    if (!complete || !prodigyRetainedStatefulRearmScopeSHA256(scope, request.proof.retainedStateSHA256))
+    {
+      basics_log("rearmRetainedStatefulDeployment success=0 failure=incomplete or non-canonical immutable proof\n");
+      exit(EXIT_FAILURE);
+    }
+
+    MothershipProdigyCluster cluster = {};
+    {
+      auto registry = openClusterRegistry();
+      if (!registry.getClusterByIdentity(String(argv[0]), cluster, &failure))
+      {
+        basics_log("rearmRetainedStatefulDeployment success=0 failure=%s\n", failure.c_str());
+        exit(EXIT_FAILURE);
+      }
+    }
+    Vector<uint128_t> registeredMachines = {};
+    for (const ClusterMachine& machine : cluster.topology.machines)
+    {
+      if (!machine.isBrain || machine.uuid == 0)
+      {
+        basics_log("rearmRetainedStatefulDeployment success=0 failure=cluster registry topology is not an exact Brain set\n");
+        exit(EXIT_FAILURE);
+      }
+      registeredMachines.push_back(machine.uuid);
+    }
+    std::sort(registeredMachines.begin(), registeredMachines.end());
+    if (cluster.clusterUUID != scope.clusterUUID || registeredMachines != scope.machineUUIDs ||
+        !configureControlTarget(argv[0], &failure))
+    {
+      basics_log("rearmRetainedStatefulDeployment success=0 failure=%s\n",
+                 failure.empty() ? "proof differs from the registered cluster identity" : failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    String serializedRequest = {};
+    BitseryEngine::serialize(serializedRequest, request);
+    if (!socket.ensureConnected())
+    {
+      failure = socket.connectFailureDetail();
+      basics_log("rearmRetainedStatefulDeployment success=0 operationID=%s proofSHA256=%s failure=%s\n",
+                 scope.operationID.c_str(), request.proof.retainedStateSHA256.c_str(), failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    Message::construct(socket.wBuffer, MothershipTopic::rearmRetainedStatefulDeployment, serializedRequest);
+    if (!socket.send()) exit(EXIT_FAILURE);
+    Message *message = socket.recvExpectedTopic(MothershipTopic::rearmRetainedStatefulDeployment, 16 * 1024);
+    if (message == nullptr)
+    {
+      failure = socket.ioFailureDetail();
+      basics_log("rearmRetainedStatefulDeployment success=0 operationID=%s proofSHA256=%s failure=%s\n",
+                 scope.operationID.c_str(), request.proof.retainedStateSHA256.c_str(), failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    String serializedResponse = {};
+    uint8_t *args = message->args;
+    Message::extractToStringView(args, serializedResponse);
+    RearmRetainedStatefulDeployment response = {};
+    if (args != message->terminal() || !BitseryEngine::deserializeSafe(serializedResponse, response) ||
+        response.protocolVersion != RearmRetainedStatefulDeployment::version || !response.response ||
+        (response.success && (!prodigyRetainedStatefulRearmProofValid(response.proof) ||
+          !prodigyRetainedStatefulRearmProofEqual(response.proof, request.proof, false) ||
+          response.durableGeneration == 0)))
+    {
+      basics_log("rearmRetainedStatefulDeployment success=0 operationID=%s proofSHA256=%s failure=invalid response payload\n",
+                 scope.operationID.c_str(), request.proof.retainedStateSHA256.c_str());
+      exit(EXIT_FAILURE);
+    }
+    basics_log("rearmRetainedStatefulDeployment success=%u idempotent=%u completed=%u operationID=%s deploymentID=%llu proofSHA256=%s durableGeneration=%llu acceptedAtMs=%lld failure=%s\n",
+               unsigned(response.success), unsigned(response.idempotent), unsigned(response.completed),
+               scope.operationID.c_str(), (unsigned long long)scope.deploymentID,
+               request.proof.retainedStateSHA256.c_str(),
+               (unsigned long long)response.durableGeneration,
+               (long long)response.proof.acceptedAtMs, response.failure.c_str());
+    if (!response.success) exit(EXIT_FAILURE);
   }
 
   void runReserveApplicationID(int argc, char *argv[])
@@ -35502,6 +35776,7 @@ public:
         {"pullProviderCredentials",         &Mothership::runPullProviderCredentials        },
         {"pullRoutableResourceLeases",      &Mothership::runPullRoutableResourceLeases     },
         {"pullRoutableSubnets",             &Mothership::runPullRoutableSubnets            },
+        {"rearmRetainedStatefulDeployment", &Mothership::runRearmRetainedStatefulDeployment},
         {"recommendClusterForApplications", &Mothership::runRecommendClusterForApplications},
         {"recoverLocalClusterAuthority",    &Mothership::runRecoverLocalClusterAuthority   },
         {"recoverMaterializedStatefulDeployment", &Mothership::runRecoverMaterializedStatefulDeployment },
@@ -35591,7 +35866,7 @@ int main(int argc, char *argv[])
   if (argc < 2)
   {
     constexpr static char usage[] =
-        "must be called like: ./mothership [operation: help, bootstrapNametagAllMasters, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, repairRemoteCloudMachineRuntime, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, checkClusterProviderPlan, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultClusterNetwork, faultLocalClusterMachine, faultRemoteCloudMachine, faultTestCluster, faultTestClusters, prepareProductionPair, productionPair, launchLocalVM, removeLocalVM, registerLocalVMBoundary, inspectLocalVMBoundaries, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, recoverLocalClusterAuthority, recoverMaterializedStatefulDeployment, recoverTestClusterBundle, recoverTestClusterFollowerBrain, taskReport, containerLogs, credentialExpiryNotifications, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, authorizeBGPOriginPrefix, revokeBGPOriginPrefix, listBGPOriginPrefixes, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
+        "must be called like: ./mothership [operation: help, bootstrapNametagAllMasters, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, repairRemoteCloudMachineRuntime, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, checkClusterProviderPlan, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultClusterNetwork, faultLocalClusterMachine, faultRemoteCloudMachine, faultTestCluster, faultTestClusters, prepareProductionPair, productionPair, launchLocalVM, removeLocalVM, registerLocalVMBoundary, inspectLocalVMBoundaries, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, rearmRetainedStatefulDeployment, recoverLocalClusterAuthority, recoverMaterializedStatefulDeployment, recoverTestClusterBundle, recoverTestClusterFollowerBrain, taskReport, containerLogs, credentialExpiryNotifications, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, authorizeBGPOriginPrefix, revokeBGPOriginPrefix, listBGPOriginPrefixes, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
     std::fwrite(usage, 1, sizeof(usage) - 1, stdout);
     exit(EXIT_FAILURE);
   }
@@ -35654,6 +35929,8 @@ int main(int argc, char *argv[])
     message.append("faultLocalClusterMachine [operationUUID] [localVMBoundaryUUID] recover-unready-upgrade [timeoutMs] [upgradeOperationUUID] [approvedTargetBundle]\n");
     message.append("\tcold-reboots one exact registered VM in a three-Brain deploymentMode=local cluster and proves its new healthy boot identity; the recovery form additionally requires an exact admitted peer-inventory phase and a newer complete post-reboot inventory\n");
     message.append("recoverLocalClusterAuthority [operationUUID] [cluster] [timeoutMs] [--complete-interrupted-upgrade upgradeOperation approvedBundle predecessorRecovery|--admitted-active-runtime]\n");
+    message.append("rearmRetainedStatefulDeployment [cluster] [proof JSON|-|@path]\n");
+    message.append("\tdurably re-arms only the exact target-zero, two-member all-masters deployment named by an immutable three-machine authority proof\n");
     message.append("recoverStoppedLocalVM [absolute state path] [taskID] [operationUUID canonical hex] [expected guest UUID] [expected state SHA256]\n");
     message.append("\trecovers one stopped local VM through its sealed boundary owner without requiring the in-guest registry\n");
     message.append("\tdurably arms and releases one exact three-VM local recovery cohort, then seals it only after all distinct reboots and normal one-master health are observed\n");

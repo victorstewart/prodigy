@@ -1438,6 +1438,7 @@ static void assertInitialSeedRuntimeRepair()
   rejects([](auto& s){++s.topology.machines[0].uuid;});
   rejects([](auto& s){++s.masterAuthority.runtimeState.crossClusterMasqueGatewayAuthorities[0].generation;});
   rejects([](auto& s){++s.masterAuthority.runtimeState.statefulServingAuthorities[0].initialAllMastersSeedBootstrap.bootstrap.sourceClusterUUID;});
+  rejects([](auto& s){s.masterAuthority.runtimeState.retainedStatefulRearmProofs.push_back({});});
   auto wrong=binding;wrong.followerGeneration=UINT64_MAX;wrong.masterGeneration=0;
   assert(!mothershipInitialSeedRuntimeRepairSnapshotValid(snapshot,wrong));
   wrong=binding;wrong.masterMachineUUID=11;assert(!mothershipInitialSeedRuntimeRepairSnapshotValid(snapshot,wrong));

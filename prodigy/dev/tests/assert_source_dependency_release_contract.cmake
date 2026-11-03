@@ -66,10 +66,10 @@ endif()
 
 file(READ "${_prodigy_source_dependency_packager}" _prodigy_source_dependency_script)
 string(FIND "${_prodigy_source_dependency_script}"
-   [[version="${PRODIGY_SOURCE_DEPENDENCY_VERSION:-0.4.5-rc.2}"]]
+   [[version="${PRODIGY_SOURCE_DEPENDENCY_VERSION:-0.4.5-rc.3}"]]
    _prodigy_source_release_identity_index)
 if (_prodigy_source_release_identity_index EQUAL -1)
-   message(FATAL_ERROR "The source-dependency release producer must own Prodigy 0.4.5-rc.2.")
+   message(FATAL_ERROR "The source-dependency release producer must own Prodigy 0.4.5-rc.3.")
 endif()
 if (NOT _prodigy_source_dependency_script MATCHES
    "for public_root in prodigy switchboard macros enums services; do")

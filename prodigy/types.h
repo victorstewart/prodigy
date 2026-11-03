@@ -245,6 +245,208 @@ static inline bool prodigyCanonicalOperationUUID(const String& value)
   return true;
 }
 
+// A retained stateful deployment is re-armed only from an exact observation of
+// its existing identity.  Container UUID is also the durable storage owner, so
+// pairing it with the registered machine UUID binds the retained runtime and
+// storage lineage without accepting an operator-selected filesystem path.
+class ProdigyRetainedStatefulRearmMember {
+public:
+  uint128_t containerUUID = 0;
+  uint128_t machineUUID = 0;
+  uint32_t shardGroup = UINT32_MAX;
+  ContainerState state = ContainerState::none;
+  bool runtimeReady = false;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyRetainedStatefulRearmMember& member)
+{
+  serializer.value16b(member.containerUUID);
+  serializer.value16b(member.machineUUID);
+  serializer.value4b(member.shardGroup);
+  serializer.value1b(member.state);
+  serializer.value1b(member.runtimeReady);
+}
+
+// Immutable request scope.  The canonical digest below covers every field in
+// this object; acceptedAtMs deliberately lives outside it so retries compare
+// only operator-supplied and freshly observed authority.
+class ProdigyRetainedStatefulRearmScope {
+public:
+  String operationID;
+  uint128_t clusterUUID = 0;
+  String applicationName;
+  uint16_t applicationID = 0;
+  uint64_t deploymentID = 0;
+  uint64_t versionID = 0;
+  String canonicalPlanSHA256;
+  String artifactSHA256;
+  uint64_t artifactBytes = 0;
+  Vector<uint128_t> machineUUIDs;
+  Vector<ProdigyRetainedStatefulRearmMember> retainedMembers;
+  DeploymentState expectedState = DeploymentState::none;
+  uint32_t expectedTarget = 0;
+  uint32_t expectedDeployed = 0;
+  uint32_t expectedHealthy = 0;
+  uint32_t expectedAcknowledgedPeers = 0;
+  uint32_t expectedRuntimeMembers = 0;
+  uint32_t expectedRuntimeStateRecords = 0;
+  uint32_t desiredReplicas = 0;
+  uint64_t expectedAuthorityGeneration = 0;
+  uint128_t expectedMasterUUID = 0;
+  int64_t expectedMasterBootNs = 0;
+  bool expectedIPv6Only = true;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyRetainedStatefulRearmScope& scope)
+{
+  serializer.text1b(scope.operationID, 36);
+  serializer.value16b(scope.clusterUUID);
+  serializer.text1b(scope.applicationName, 128);
+  serializer.value2b(scope.applicationID);
+  serializer.value8b(scope.deploymentID);
+  serializer.value8b(scope.versionID);
+  serializer.text1b(scope.canonicalPlanSHA256, 64);
+  serializer.text1b(scope.artifactSHA256, 64);
+  serializer.value8b(scope.artifactBytes);
+  serializer.container(scope.machineUUIDs, 3, [](auto& nested, uint128_t& uuid) { nested.value16b(uuid); });
+  serializer.container(scope.retainedMembers, 3,
+      [](auto& nested, ProdigyRetainedStatefulRearmMember& member) { nested.object(member); });
+  serializer.value1b(scope.expectedState);
+  serializer.value4b(scope.expectedTarget);
+  serializer.value4b(scope.expectedDeployed);
+  serializer.value4b(scope.expectedHealthy);
+  serializer.value4b(scope.expectedAcknowledgedPeers);
+  serializer.value4b(scope.expectedRuntimeMembers);
+  serializer.value4b(scope.expectedRuntimeStateRecords);
+  serializer.value4b(scope.desiredReplicas);
+  serializer.value8b(scope.expectedAuthorityGeneration);
+  serializer.value16b(scope.expectedMasterUUID);
+  serializer.value8b(scope.expectedMasterBootNs);
+  serializer.value1b(scope.expectedIPv6Only);
+}
+
+class ProdigyRetainedStatefulRearmProof {
+public:
+  ProdigyRetainedStatefulRearmScope scope;
+  String retainedStateSHA256;
+  int64_t acceptedAtMs = 0;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyRetainedStatefulRearmProof& proof)
+{
+  serializer.object(proof.scope);
+  serializer.text1b(proof.retainedStateSHA256, 64);
+  serializer.value8b(proof.acceptedAtMs);
+}
+
+static inline bool prodigyRetainedStatefulRearmScopeValid(
+    const ProdigyRetainedStatefulRearmScope& scope)
+{
+  if (!prodigyCanonicalOperationUUID(scope.operationID) || scope.clusterUUID == 0 ||
+      scope.applicationName.empty() || scope.applicationName.size() > 128 || scope.applicationID == 0 ||
+      scope.versionID == 0 || scope.versionID >= (uint64_t(1) << 48) ||
+      scope.deploymentID != ((uint64_t(scope.applicationID) << 48) | scope.versionID) ||
+      !prodigyIsSHA256HexDigest(scope.canonicalPlanSHA256) ||
+      !prodigyIsSHA256HexDigest(scope.artifactSHA256) || scope.artifactBytes == 0 ||
+      scope.machineUUIDs.size() != 3 || scope.retainedMembers.size() != 2 ||
+      scope.expectedState != DeploymentState::none || scope.expectedTarget != 0 ||
+      scope.expectedDeployed != 0 || scope.expectedHealthy != 2 || scope.desiredReplicas != 3 ||
+      scope.expectedAcknowledgedPeers != 2 || scope.expectedRuntimeMembers != 2 ||
+      // The retained predecessor predates a sealed serving-authority package.
+      // Its three fresh runtime rows are a post-recovery identity observation,
+      // not an authority record that may be inferred before the missing replica
+      // is launched.
+      scope.expectedRuntimeStateRecords != 0 || scope.expectedAuthorityGeneration == 0 ||
+      scope.expectedMasterUUID == 0 || scope.expectedMasterBootNs <= 0 || !scope.expectedIPv6Only)
+  {
+    return false;
+  }
+  uint128_t previousMachine = 0;
+  for (uint128_t machineUUID : scope.machineUUIDs)
+  {
+    if (machineUUID == 0 || (previousMachine != 0 && machineUUID <= previousMachine)) return false;
+    previousMachine = machineUUID;
+  }
+  uint128_t previousContainer = 0;
+  uint32_t runtimeReady = 0;
+  for (const auto& member : scope.retainedMembers)
+  {
+    if (member.containerUUID == 0 || member.machineUUID == 0 || member.shardGroup != 0 ||
+        member.state != ContainerState::healthy ||
+        (previousContainer != 0 && member.containerUUID <= previousContainer) ||
+        !std::binary_search(scope.machineUUIDs.begin(), scope.machineUUIDs.end(), member.machineUUID))
+    {
+      return false;
+    }
+    for (const auto& other : scope.retainedMembers)
+      if (&other != &member && other.machineUUID == member.machineUUID) return false;
+    previousContainer = member.containerUUID;
+    runtimeReady += member.runtimeReady;
+  }
+  return runtimeReady == scope.expectedRuntimeMembers;
+}
+
+static inline bool prodigyRetainedStatefulRearmScopeSHA256(
+    const ProdigyRetainedStatefulRearmScope& scope, String& digest)
+{
+  if (!prodigyRetainedStatefulRearmScopeValid(scope)) return false;
+  String encoded = {};
+  auto copy = scope;
+  return BitseryEngine::serialize(encoded, copy) && prodigyComputeSHA256Hex(encoded, digest);
+}
+
+static inline bool prodigyRetainedStatefulRearmProofValid(
+    const ProdigyRetainedStatefulRearmProof& proof, bool requireAccepted = true)
+{
+  String digest = {};
+  return prodigyRetainedStatefulRearmScopeSHA256(proof.scope, digest) &&
+      digest.equals(proof.retainedStateSHA256) && (!requireAccepted || proof.acceptedAtMs > 0);
+}
+
+static inline bool prodigyRetainedStatefulRearmProofEqual(
+    const ProdigyRetainedStatefulRearmProof& left,
+    const ProdigyRetainedStatefulRearmProof& right,
+    bool includeAcceptanceTime = true)
+{
+  String a = {}, b = {};
+  auto leftScope = left.scope, rightScope = right.scope;
+  return BitseryEngine::serialize(a, leftScope) && BitseryEngine::serialize(b, rightScope) && a == b &&
+      left.retainedStateSHA256.equals(right.retainedStateSHA256) &&
+      (!includeAcceptanceTime || left.acceptedAtMs == right.acceptedAtMs);
+}
+
+// One shared payload is used for request and response on the bidirectional
+// re-arm topic.  `response` prevents a shifted or reflected request from being
+// interpreted as an acceptance receipt.
+class RearmRetainedStatefulDeployment {
+public:
+  static constexpr uint32_t version = 1;
+  uint32_t protocolVersion = version;
+  bool response = false;
+  ProdigyRetainedStatefulRearmProof proof;
+  bool success = false;
+  bool idempotent = false;
+  bool completed = false;
+  uint64_t durableGeneration = 0;
+  String failure;
+};
+
+template <typename S>
+static void serialize(S&& serializer, RearmRetainedStatefulDeployment& payload)
+{
+  serializer.value4b(payload.protocolVersion);
+  serializer.value1b(payload.response);
+  serializer.object(payload.proof);
+  serializer.value1b(payload.success);
+  serializer.value1b(payload.idempotent);
+  serializer.value1b(payload.completed);
+  serializer.value8b(payload.durableGeneration);
+  serializer.text1b(payload.failure, 4096);
+}
+
 template <typename S>
 static void serialize(S&& serializer, MothershipResponse& response)
 {
@@ -11401,6 +11603,11 @@ public:
   Vector<ProdigyDeferredStatefulScaleIntent> deferredStatefulScaleIntents;
   Vector<ProdigyMaterializedStatefulRecoveryOperation> materializedStatefulRecoveryOperations;
   Vector<ProdigyMaterializedStatefulRecoveryRetry> materializedStatefulRecoveryRetries;
+  // Immutable proof sidecars for the retained-deployment mode of the existing
+  // materialized recovery operation ledger.  Lifecycle phase remains owned by
+  // materializedStatefulRecoveryOperations; this vector is not another state
+  // machine.
+  Vector<ProdigyRetainedStatefulRearmProof> retainedStatefulRearmProofs;
   Vector<ApiCredentialExpiryNotice> apiCredentialExpiryNotices;
   Vector<ProdigyManagedMachineSchema> machineSchemas;
   Vector<RoutableResourceLease> routableResourceLeases;
@@ -11443,7 +11650,7 @@ public:
 
   bool operator==(const ProdigyMasterAuthorityRuntimeState& other) const
   {
-    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || nextPendingElasticAddressOperationID != other.nextPendingElasticAddressOperationID || nextDNSIntentRevision != other.nextDNSIntentRevision || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || pendingAddMachinesProvisioningIntents.size() != other.pendingAddMachinesProvisioningIntents.size() || pendingAutonomousProvisioningOperations.size() != other.pendingAutonomousProvisioningOperations.size() || pendingElasticAddressAssignments.size() != other.pendingElasticAddressAssignments.size() || pendingElasticAddressReleases.size() != other.pendingElasticAddressReleases.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || statefulServingAuthorities.size() != other.statefulServingAuthorities.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || materializedStatefulRecoveryOperations.size() != other.materializedStatefulRecoveryOperations.size() || materializedStatefulRecoveryRetries.size() != other.materializedStatefulRecoveryRetries.size() || apiCredentialExpiryNotices.size() != other.apiCredentialExpiryNotices.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || taskExecutions.size() != other.taskExecutions.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf || updateSelfFollowerConcurrency != other.updateSelfFollowerConcurrency || updateSelfFollowerTransitionIssuedPeerKeys != other.updateSelfFollowerTransitionIssuedPeerKeys || updateSelfFollowerReadyPeerKeys != other.updateSelfFollowerReadyPeerKeys ||
+    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || nextPendingElasticAddressOperationID != other.nextPendingElasticAddressOperationID || nextDNSIntentRevision != other.nextDNSIntentRevision || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || pendingAddMachinesProvisioningIntents.size() != other.pendingAddMachinesProvisioningIntents.size() || pendingAutonomousProvisioningOperations.size() != other.pendingAutonomousProvisioningOperations.size() || pendingElasticAddressAssignments.size() != other.pendingElasticAddressAssignments.size() || pendingElasticAddressReleases.size() != other.pendingElasticAddressReleases.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || statefulServingAuthorities.size() != other.statefulServingAuthorities.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || materializedStatefulRecoveryOperations.size() != other.materializedStatefulRecoveryOperations.size() || materializedStatefulRecoveryRetries.size() != other.materializedStatefulRecoveryRetries.size() || retainedStatefulRearmProofs.size() != other.retainedStatefulRearmProofs.size() || apiCredentialExpiryNotices.size() != other.apiCredentialExpiryNotices.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || taskExecutions.size() != other.taskExecutions.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf || updateSelfFollowerConcurrency != other.updateSelfFollowerConcurrency || updateSelfFollowerTransitionIssuedPeerKeys != other.updateSelfFollowerTransitionIssuedPeerKeys || updateSelfFollowerReadyPeerKeys != other.updateSelfFollowerReadyPeerKeys ||
         prodigyDeploymentPlacementPoliciesEqual(deploymentPlacementPolicies, other.deploymentPlacementPolicies) == false ||
         prodigyStatelessDeploymentAdmissionsEqual(statelessDeploymentAdmissions, other.statelessDeploymentAdmissions) == false ||
         prodigyStatelessDeploymentRetirementsEqual(statelessDeploymentRetirements, other.statelessDeploymentRetirements) == false ||
@@ -11587,6 +11794,15 @@ public:
       }
     }
 
+    for (uint32_t index = 0; index < retainedStatefulRearmProofs.size(); ++index)
+    {
+      if (!prodigyRetainedStatefulRearmProofEqual(
+              retainedStatefulRearmProofs[index], other.retainedStatefulRearmProofs[index]))
+      {
+        return false;
+      }
+    }
+
     for (uint32_t index = 0; index < apiCredentialExpiryNotices.size(); ++index)
     {
       const auto& a = apiCredentialExpiryNotices[index];
@@ -11657,6 +11873,53 @@ public:
 };
 
 class BrainReplicatedContainerRuntimeState;
+
+static inline bool prodigyRetainedStatefulRearmProofsValid(
+    const ProdigyMasterAuthorityRuntimeState& state)
+{
+  if (state.retainedStatefulRearmProofs.size() > 4096) return false;
+  for (const auto& operation : state.materializedStatefulRecoveryOperations)
+  {
+    if (operation.activeDeploymentID != 0) continue;
+    uint32_t matchingProofs = 0;
+    for (const auto& proof : state.retainedStatefulRearmProofs)
+      matchingProofs += proof.scope.operationID.equals(operation.operationID);
+    if (matchingProofs != 1) return false;
+  }
+  for (uint32_t index = 0; index < state.retainedStatefulRearmProofs.size(); ++index)
+  {
+    const auto& proof = state.retainedStatefulRearmProofs[index];
+    if (!prodigyRetainedStatefulRearmProofValid(proof) ||
+        proof.scope.expectedAuthorityGeneration >= state.generation)
+    {
+      return false;
+    }
+    uint32_t matchingOperations = 0;
+    for (const auto& operation : state.materializedStatefulRecoveryOperations)
+    {
+      if (!operation.operationID.equals(proof.scope.operationID)) continue;
+      if (operation.activeDeploymentID != 0 ||
+          operation.successorDeploymentID != proof.scope.deploymentID ||
+          !operation.successorBlobSHA256.equals(proof.scope.artifactSHA256) ||
+          !operation.accepted || !operation.started)
+      {
+        return false;
+      }
+      ++matchingOperations;
+    }
+    if (matchingOperations != 1) return false;
+    for (uint32_t earlier = 0; earlier < index; ++earlier)
+    {
+      const auto& prior = state.retainedStatefulRearmProofs[earlier].scope;
+      if (prior.operationID.equals(proof.scope.operationID) ||
+          prior.deploymentID == proof.scope.deploymentID)
+      {
+        return false;
+      }
+    }
+  }
+  return true;
+}
 
 template <typename S>
 static void prodigySerializeMasterAuthorityRuntimeState(
@@ -12584,9 +12847,11 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   // appends canonical replicated COUSIN route authority records; version 19
   // appends durable managed-machine create intent outside the legacy pending
   // add-machines record. Version 20 appends the Mothership-created local
-  // MASQUE gateway authority ledger.
+  // MASQUE gateway authority ledger. Version 21 appends durable stateless
+  // retirement receipts; version 22 appends immutable retained-deployment
+  // re-arm proofs beside the existing recovery-operation ledger.
   // Older readers reject before consuming either newer operation layout.
-  constexpr uint64_t explicitVersion = 21;
+  constexpr uint64_t explicitVersion = 22;
   using Serializer = std::remove_cv_t<std::remove_reference_t<S>>;
   if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
     state.transportCredentialAuthorityRoot = {};
@@ -12611,6 +12876,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   bool hasPendingAddMachinesProvisioningIntents = false;
   bool hasCrossClusterMasqueGatewayAuthorities = false;
   bool hasStatelessDeploymentRetirements = false;
+  bool hasRetainedStatefulRearmProofs = false;
 
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
@@ -12648,7 +12914,15 @@ static void prodigySerializeMasterAuthorityRuntimeState(
     hasCousinRoutes = state.cousinRoutes.empty() == false;
     hasPendingAddMachinesProvisioningIntents = state.pendingAddMachinesProvisioningIntents.empty() == false;
     hasStatelessDeploymentRetirements = !state.statelessDeploymentRetirements.empty();
+    hasRetainedStatefulRearmProofs = !state.retainedStatefulRearmProofs.empty();
     hasCrossClusterMasqueGatewayAuthorities = !state.crossClusterMasqueGatewayAuthorities.empty() || hasStatelessDeploymentRetirements;
+    // Version 22 is cumulative through the v21 retirement container. Emit
+    // every earlier tail, even when empty, before the re-arm proof sidecar.
+    if (hasRetainedStatefulRearmProofs)
+    {
+      hasStatelessDeploymentRetirements = true;
+      hasCrossClusterMasqueGatewayAuthorities = true;
+    }
     if (hasCrossClusterMasqueGatewayAuthorities) hasPendingAddMachinesProvisioningIntents = true;
     // Version nineteen is cumulative through the v18 route container.
     if (hasPendingAddMachinesProvisioningIntents) hasCousinRoutes = true;
@@ -12718,6 +12992,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
       if (hasPendingAddMachinesProvisioningIntents) version = 19;
       if (hasCrossClusterMasqueGatewayAuthorities) version = 20;
       if (hasStatelessDeploymentRetirements) version = 21;
+      if (hasRetainedStatefulRearmProofs) version = 22;
       serializer.value8b(version);
     }
     serializer.value8b(state.generation);
@@ -12767,6 +13042,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
       hasPendingAddMachinesProvisioningIntents = version >= 19;
       hasCrossClusterMasqueGatewayAuthorities = version >= 20;
       hasStatelessDeploymentRetirements = version >= 21;
+      hasRetainedStatefulRearmProofs = version >= 22;
     }
   }
 
@@ -13023,6 +13299,18 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   else if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
     state.statelessDeploymentRetirements.clear();
+  }
+  if (hasRetainedStatefulRearmProofs)
+  {
+    serializer.container(state.retainedStatefulRearmProofs, 4096,
+        [](auto& nested, ProdigyRetainedStatefulRearmProof& proof) { nested.object(proof); });
+    if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
+      if (!prodigyRetainedStatefulRearmProofsValid(state))
+        serializer.adapter().error(bitsery::ReaderError::InvalidData);
+  }
+  else if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
+  {
+    state.retainedStatefulRearmProofs.clear();
   }
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
   {

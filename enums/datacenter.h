@@ -113,7 +113,11 @@ enum class MothershipTopic : uint16_t {
   statefulStoreProofRecovery,
   // One authenticated request/response payload controls a bounded fault on
   // an already-enrolled gateway. Never accepts an arbitrary host/interface.
-  crossClusterPathFault
+  crossClusterPathFault,
+  // Durable target restoration for one exact retained stateful deployment.
+  // Appended so older Brains reject it instead of decoding another lifecycle
+  // payload. Request and response use one shared proof type on this topic.
+  rearmRetainedStatefulDeployment
 };
 
 constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
@@ -256,6 +260,8 @@ constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
       return "statefulStoreProofRecovery";
     case MothershipTopic::crossClusterPathFault:
       return "crossClusterPathFault";
+    case MothershipTopic::rearmRetainedStatefulDeployment:
+      return "rearmRetainedStatefulDeployment";
   }
 
   return "unknown";

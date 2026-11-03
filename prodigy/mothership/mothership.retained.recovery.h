@@ -120,7 +120,8 @@ static inline bool mothershipInitialSeedRuntimeRepairSnapshotValid(
       !r.pendingAutonomousProvisioningOperations.empty() || !r.pendingElasticAddressAssignments.empty() ||
       !r.pendingElasticAddressReleases.empty() || !r.statefulWorkerTopologyUpgradeOperations.empty() ||
       !r.deferredStatefulScaleIntents.empty() || !r.materializedStatefulRecoveryOperations.empty() ||
-      !r.materializedStatefulRecoveryRetries.empty() || !r.taskExecutions.empty() ||
+      !r.materializedStatefulRecoveryRetries.empty() || !r.retainedStatefulRearmProofs.empty() ||
+      !r.taskExecutions.empty() ||
       !r.statelessDeploymentAdmissions.empty() || !r.statelessDeploymentRetirements.empty() ||
       r.statefulServingAuthorities.size()!=1 || b.gateways.size()!=6 ||
       r.crossClusterMasqueGatewayAuthorities.size()!=b.gateways.size()) return false;

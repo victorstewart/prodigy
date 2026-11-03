@@ -533,6 +533,19 @@ inline void Brain::acknowledgeMasterAuthorityTransition(
   reapRetiringMachines();
   maybeTransitionFollowersForUpdateSelf();
   maybeRelinquishMasterForUpdateSelf();
+  const bool retainedRearmPending =
+      std::any_of(masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.begin(),
+          masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.end(), [&](const auto& operation) {
+            return operation.accepted && operation.started && !operation.completed &&
+                   operation.activeDeploymentID == 0 &&
+                   retainedStatefulRearmProof(operation.successorDeploymentID, &operation.operationID) != nullptr;
+          });
+  // A retained re-arm advances the authority generation before it may launch.
+  // The final peer receipt is therefore the event that opens the ordinary
+  // recovered-deployment scheduler; a quiet retained fleet has no later
+  // inventory event to wake that owner.
+  if (retainedRearmPending && containerRetirementAuthorityAcknowledged())
+    recoverDeploymentsAfterNeuronState();
 }
 
 inline void Brain::sendMasterAuthorityTransitionAcknowledgement(

@@ -146,6 +146,460 @@ static void testAsyncMaterializedRecoveryAcceptance(TestSuite& suite)
  }
 }
 
+static void testAsyncRetainedStatefulRearmAcceptance(TestSuite& suite)
+{
+  ScopedFreshRing ring = {};
+  StreamingTestBrain brain = {};
+  NoopBrainIaaS iaas = {};
+  TestNeuron self = {};
+  BrainBase *savedBrain = thisBrain;
+  NeuronBase *savedNeuron = thisNeuron;
+  thisBrain = &brain;
+  thisNeuron = &self;
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
+  brain.ignited = true;
+  brain.nBrains = 3;
+  brain.masterAuthorityEpoch = 7;
+  brain.boottimens = 700'000'001;
+  brain.masterAuthorityRuntimeState.generation = 41;
+  brain.masterAuthorityRuntimeState.hasCompletedInitialMasterElection = true;
+  brain.masterAuthorityRuntimeStateDurable = true;
+  brain.durableMasterAuthorityRuntimeStateGeneration = 41;
+  brain.hasAuthoritativeTopology = true;
+  brain.brainConfig.clusterUUID = uint128_t(0x7100);
+
+  constexpr uint16_t applicationID = 63'114;
+  constexpr uint64_t versionID = 91;
+  const uint64_t deploymentID = (uint64_t(applicationID) << 48) | versionID;
+  String applicationName = "retained-rearm-test"_ctv;
+  brain.reservedApplicationIDsByName.insert_or_assign(applicationName, applicationID);
+  brain.reservedApplicationNamesByID.insert_or_assign(applicationID, applicationName);
+
+  Rack racks[3] = {};
+  Machine machines[3] = {};
+  ScopedSocketPair neuronSockets[3] = {};
+  const uint128_t machineUUIDs[3] = {uint128_t(0x7101), uint128_t(0x7102), uint128_t(0x7103)};
+  self.uuid = machineUUIDs[0];
+  bool fixtureReady = true;
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    fixtureReady = neuronSockets[index].create(suite, "retained_rearm_neuron_control_socket") && fixtureReady;
+    racks[index].uuid = 0x7110 + index;
+    Machine& machine = machines[index];
+    machine.uuid = machineUUIDs[index];
+    machine.private4 = 0x0a710001 + index;
+    machine.rack = &racks[index];
+    machine.state = MachineState::healthy;
+    machine.lifetime = MachineLifetime::owned;
+    machine.isBrain = true;
+    machine.isThisMachine = index == 0;
+    machine.hardware.inventoryComplete = true;
+    machine.hardware.cpu.architecture = nametagCurrentBuildMachineArchitecture();
+    machine.hardware.cpu.logicalCores = machine.ownedLogicalCores = machine.totalLogicalCores =
+        machine.nLogicalCores_available = 8;
+    machine.hardware.memory.totalMB = machine.ownedMemoryMB = machine.totalMemoryMB =
+        machine.memoryMB_available = 8192;
+    machine.ownedStorageMB = machine.totalStorageMB = machine.storageMB_available = 8192;
+    machine.neuron.machine = &machine;
+    machine.neuron.isFixedFile = true;
+    machine.neuron.fslot = neuronSockets[index].adoptLeftIntoFixedFileSlot();
+    machine.neuron.connected = machine.neuron.fslot >= 0;
+    machine.runtimeReady = machine.neuron.connected;
+    racks[index].machines.insert(&machine);
+    brain.racks.insert_or_assign(racks[index].uuid, &racks[index]);
+    brain.machines.insert(&machine);
+    brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+    ClusterMachine topologyMember = {};
+    topologyMember.uuid = machine.uuid;
+    topologyMember.isBrain = true;
+    brain.authoritativeTopology.machines.push_back(topologyMember);
+    fixtureReady = machine.runtimeReady && fixtureReady;
+  }
+  suite.require(fixtureReady, "retained_rearm_arms_exact_three_neuron_controls");
+
+  BrainView peers[2] = {};
+  ProdigyTransportTLSStream peerTransports[2] = {};
+  std::array<uint8_t, 32> peerPSK = {};
+  peerPSK.fill(0x71);
+  for (uint32_t index = 0; index < 2; ++index)
+  {
+    BrainView& peer = peers[index];
+    peer.uuid = machineUUIDs[index + 1];
+    peer.boottimens = 710'000'010 + index;
+    peer.ioGeneration = 1;
+    peer.transportEpoch = 1;
+    peer.version = ProdigyBinaryVersion;
+    peer.connected = true;
+    peer.isFixedFile = true;
+    peer.fslot = 50 + index;
+    peer.registrationFresh = true;
+    peer.existingMasterUUID = self.uuid;
+    reserveTransportStream(peer);
+    reserveTransportStream(peerTransports[index]);
+    fixtureReady = peer.beginTransportAEGIS(false, peerPSK.data(), "retained-rearm-peer"_ctv,
+                       self.uuid, peer.uuid) &&
+        peerTransports[index].beginTransportAEGIS(true, peerPSK.data(), "retained-rearm-peer"_ctv,
+            peer.uuid, self.uuid) &&
+        completeTransportHandshake(peer, peerTransports[index]) && fixtureReady;
+    peer.containerRetirementCapabilityAcknowledged = true;
+    peer.containerRetirementCapabilityUUID = peer.uuid;
+    peer.containerRetirementCapabilityBootNs = peer.boottimens;
+    peer.containerRetirementCapabilityIOGeneration = peer.ioGeneration;
+    brain.brains.insert(&peer);
+  }
+  suite.require(fixtureReady, "retained_rearm_authenticates_exact_brain_cohort");
+
+  auto *deployment = new ApplicationDeployment();
+  deployment->plan = makeDeploymentPlan(applicationID, versionID);
+  deployment->plan.config.type = ApplicationType::stateful;
+  deployment->plan.config.containerBlobSHA256.assign(
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
+  deployment->plan.config.containerBlobBytes = 4096;
+  deployment->plan.isStateful = true;
+  deployment->plan.canaryCount = 0;
+  deployment->plan.useHostNetworkNamespace = false;
+  deployment->plan.stateful.allMasters = true;
+  deployment->plan.stateful.allowUpdateInPlace = true;
+  deployment->plan.stateful.clientPrefix = (uint64_t(applicationID) << 48) | (uint64_t(1) << 40);
+  deployment->plan.stateful.siblingPrefix = (uint64_t(applicationID) << 48) | (uint64_t(2) << 40);
+  deployment->plan.stateful.cousinPrefix = (uint64_t(applicationID) << 48) | (uint64_t(3) << 40);
+  deployment->plan.stateful.seedingPrefix = (uint64_t(applicationID) << 48) | (uint64_t(4) << 40);
+  deployment->plan.stateful.shardingPrefix = (uint64_t(applicationID) << 48) | (uint64_t(5) << 40);
+  deployment->state = DeploymentState::none;
+  deployment->nShardGroups = 1;
+  deployment->nTargetBase = 0;
+  deployment->nDeployedBase = 0;
+  deployment->nHealthyBase = 2;
+  deployment->brainBlobEchoPeerKeys.insert(machineUUIDs[1]);
+  deployment->brainBlobEchoPeerKeys.insert(machineUUIDs[2]);
+  const StatefulMeshRoles roles =
+      StatefulMeshRoles::forShardGroup(deployment->plan.stateful, applicationID, 0);
+  ContainerView retained[2] = {};
+  for (uint32_t index = 0; index < 2; ++index)
+  {
+    retained[index].uuid = uint128_t(0x7201 + index);
+    retained[index].deploymentID = deploymentID;
+    retained[index].applicationID = applicationID;
+    retained[index].machine = &machines[index];
+    retained[index].lifetime = ApplicationLifetime::base;
+    retained[index].isStateful = true;
+    retained[index].shardGroup = 0;
+    retained[index].state = ContainerState::healthy;
+    retained[index].runtimeReady = true;
+    retained[index].explicitStatefulMeshRoles = roles;
+    retained[index].advertisements.emplace(
+        roles.client, Advertisement(roles.client, ContainerState::healthy, ContainerState::destroying,
+                                    uint16_t(19'210 + index)));
+    retained[index].advertisingOnPorts.insert(uint16_t(19'210 + index));
+    deployment->containers.insert(&retained[index]);
+    deployment->containersByShardGroup.insert(0, &retained[index]);
+    deployment->countPerMachine[&machines[index]] = 1;
+    deployment->countPerRack[&racks[index]] = 1;
+    deployment->racksByShardGroup[0].insert(&racks[index]);
+    brain.containers.insert_or_assign(retained[index].uuid, &retained[index]);
+    machines[index].upsertContainerIndexEntry(deploymentID, &retained[index]);
+  }
+  brain.deployments.insert_or_assign(deploymentID, deployment);
+  brain.deploymentsByApp.insert_or_assign(applicationID, deployment);
+  brain.deploymentPlans.insert_or_assign(deploymentID, deployment->plan);
+
+  RearmRetainedStatefulDeployment request = {};
+  auto& scope = request.proof.scope;
+  scope.operationID.assign("123e4567-e89b-42d3-a456-426614174013"_ctv);
+  scope.clusterUUID = brain.brainConfig.clusterUUID;
+  scope.applicationName = applicationName;
+  scope.applicationID = applicationID;
+  scope.deploymentID = deploymentID;
+  scope.versionID = versionID;
+  DeploymentPlan planCopy = deployment->plan;
+  String planBytes = {};
+  BitseryEngine::serialize(planBytes, planCopy);
+  prodigyComputeSHA256Hex(planBytes, scope.canonicalPlanSHA256);
+  scope.artifactSHA256 = deployment->plan.config.containerBlobSHA256;
+  scope.artifactBytes = deployment->plan.config.containerBlobBytes;
+  scope.machineUUIDs = {machineUUIDs[0], machineUUIDs[1], machineUUIDs[2]};
+  for (uint32_t index = 0; index < 2; ++index)
+    scope.retainedMembers.push_back({
+        .containerUUID = retained[index].uuid, .machineUUID = machines[index].uuid, .shardGroup = 0,
+        .state = ContainerState::healthy, .runtimeReady = true});
+  scope.expectedState = DeploymentState::none;
+  scope.expectedTarget = 0;
+  scope.expectedDeployed = 0;
+  scope.expectedHealthy = 2;
+  scope.expectedAcknowledgedPeers = 2;
+  scope.expectedRuntimeMembers = 2;
+  scope.expectedRuntimeStateRecords = 0;
+  scope.desiredReplicas = 3;
+  scope.expectedAuthorityGeneration = 41;
+  scope.expectedMasterUUID = self.uuid;
+  scope.expectedMasterBootNs = brain.boottimens;
+  scope.expectedIPv6Only = true;
+  suite.require(prodigyRetainedStatefulRearmScopeSHA256(scope, request.proof.retainedStateSHA256),
+                "retained_rearm_builds_canonical_proof_digest");
+
+  auto acknowledgeCurrentAuthority = [&]() {
+    String serialized = {}, digest = {};
+    if (!brain.serializeCurrentMasterAuthorityTransition(serialized, digest)) return false;
+    for (BrainView& peer : peers)
+    {
+      brain.noteMasterAuthorityTransitionSentToPeer(&peer, brain.masterAuthorityRuntimeState, digest);
+      ProdigyMasterAuthorityStateTransitionAck acknowledgement = {};
+      acknowledgement.generation = brain.masterAuthorityRuntimeState.generation;
+      acknowledgement.peerUUID = peer.uuid;
+      acknowledgement.peerBootNs = peer.boottimens;
+      acknowledgement.transitionDigest.assign(digest);
+      brain.acknowledgeMasterAuthorityTransition(&peer, acknowledgement);
+    }
+    return brain.containerRetirementAuthorityAcknowledged();
+  };
+  const bool initialAuthorityAcknowledged = acknowledgeCurrentAuthority();
+  suite.require(initialAuthorityAcknowledged,
+                "retained_rearm_starts_from_exact_acknowledged_authority");
+
+  Mothership mothership = {};
+  mothership.isFixedFile = true;
+  mothership.fslot = 27;
+  brain.activeMotherships.insert(&mothership);
+  auto rehash = [](RearmRetainedStatefulDeployment& candidate) {
+    candidate.proof.acceptedAtMs = 0;
+    candidate.proof.retainedStateSHA256.clear();
+    return prodigyRetainedStatefulRearmScopeSHA256(
+        candidate.proof.scope, candidate.proof.retainedStateSHA256);
+  };
+  auto rejects = [&](RearmRetainedStatefulDeployment candidate, auto expectedFailure, const char *name) {
+    RearmRetainedStatefulDeployment response = {};
+    const bool canonical = rehash(candidate);
+    suite.expect(canonical &&
+                     issueDeploymentLifecycleOperationForTest<MothershipTopic::rearmRetainedStatefulDeployment>(
+                         brain, mothership, candidate, response) &&
+                     !response.success && response.failure.equal(expectedFailure) &&
+                     brain.masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.empty() &&
+                     brain.masterAuthorityRuntimeState.retainedStatefulRearmProofs.empty(),
+                 name);
+  };
+
+  auto mismatched = request;
+  mismatched.proof.scope.clusterUUID += 1;
+  rejects(mismatched,
+          "retained stateful re-arm predicate mismatch: retained stateful re-arm cluster identity differs"_ctv,
+          "retained_rearm_rejects_cluster_mismatch_with_exact_predicate");
+  mismatched = request;
+  --mismatched.proof.scope.applicationID;
+  mismatched.proof.scope.deploymentID =
+      (uint64_t(mismatched.proof.scope.applicationID) << 48) | mismatched.proof.scope.versionID;
+  rejects(mismatched,
+          "retained stateful re-arm predicate mismatch: retained stateful re-arm application reservation differs"_ctv,
+          "retained_rearm_rejects_application_mismatch_with_exact_predicate");
+  mismatched = request;
+  ++mismatched.proof.scope.versionID;
+  mismatched.proof.scope.deploymentID =
+      (uint64_t(mismatched.proof.scope.applicationID) << 48) | mismatched.proof.scope.versionID;
+  rejects(mismatched,
+          "retained stateful re-arm predicate mismatch: retained stateful re-arm target is not the canonical application head"_ctv,
+          "retained_rearm_rejects_deployment_version_mismatch_with_exact_predicate");
+  mismatched = request;
+  mismatched.proof.scope.canonicalPlanSHA256.assign(
+      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"_ctv);
+  rejects(mismatched,
+          "retained stateful re-arm predicate mismatch: retained stateful re-arm canonical plan digest differs"_ctv,
+          "retained_rearm_rejects_plan_mismatch_with_exact_predicate");
+  mismatched = request;
+  mismatched.proof.scope.artifactSHA256.assign(
+      "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"_ctv);
+  rejects(mismatched,
+          "retained stateful re-arm predicate mismatch: retained stateful re-arm artifact identity differs"_ctv,
+          "retained_rearm_rejects_artifact_digest_mismatch_with_exact_predicate");
+  mismatched = request;
+  ++mismatched.proof.scope.artifactBytes;
+  rejects(mismatched,
+          "retained stateful re-arm predicate mismatch: retained stateful re-arm artifact identity differs"_ctv,
+          "retained_rearm_rejects_artifact_size_mismatch_with_exact_predicate");
+  mismatched = request;
+  mismatched.proof.scope.machineUUIDs[2] = uint128_t(0x7104);
+  rejects(mismatched,
+          "retained stateful re-arm predicate mismatch: retained stateful re-arm machine identity set differs"_ctv,
+          "retained_rearm_rejects_machine_set_mismatch_with_exact_predicate");
+  mismatched = request;
+  mismatched.proof.scope.retainedMembers[0].containerUUID = uint128_t(0x7200);
+  rejects(mismatched,
+          "retained stateful re-arm predicate mismatch: retained stateful re-arm retained storage identity differs"_ctv,
+          "retained_rearm_rejects_storage_owner_mismatch_with_exact_predicate");
+
+  ApplicationDeployment successor = {};
+  deployment->next = &successor;
+  rejects(request,
+          "retained stateful re-arm predicate mismatch: retained stateful re-arm target has a predecessor or successor"_ctv,
+          "retained_rearm_rejects_existing_successor_with_exact_predicate");
+  deployment->next = nullptr;
+  FailedDeploymentRecord tombstone = {};
+  tombstone.deploymentID = deploymentID;
+  brain.failedDeployments.insert_or_assign(deploymentID, tombstone);
+  rejects(request,
+          "retained stateful re-arm predicate mismatch: retained stateful re-arm target has a terminal tombstone"_ctv,
+          "retained_rearm_rejects_terminal_tombstone_with_exact_predicate");
+  brain.failedDeployments.erase(deploymentID);
+  ProdigyMaterializedStatefulRecoveryOperation conflicting = {};
+  conflicting.operationID.assign("123e4567-e89b-42d3-a456-426614174014"_ctv);
+  conflicting.successorDeploymentID = deploymentID;
+  conflicting.successorBlobSHA256 = scope.artifactSHA256;
+  conflicting.accepted = conflicting.started = true;
+  brain.masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.push_back(conflicting);
+  RearmRetainedStatefulDeployment conflictResponse = {};
+  suite.expect(issueDeploymentLifecycleOperationForTest<MothershipTopic::rearmRetainedStatefulDeployment>(
+                   brain, mothership, request, conflictResponse) && !conflictResponse.success &&
+                   conflictResponse.failure.equal(
+                       "retained stateful deployment is already owned by another recovery operation"_ctv),
+               "retained_rearm_rejects_conflicting_recovery_operation");
+  brain.masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.clear();
+  mismatched = request;
+  mismatched.proof.scope.expectedIPv6Only = false;
+  RearmRetainedStatefulDeployment networkResponse = {};
+  suite.expect(issueDeploymentLifecycleOperationForTest<MothershipTopic::rearmRetainedStatefulDeployment>(
+                   brain, mothership, mismatched, networkResponse) && !networkResponse.success &&
+                   networkResponse.failure.equal("invalid retained stateful re-arm request"_ctv),
+               "retained_rearm_rejects_non_ipv6_scope");
+  peers[0].containerRetirementCapabilityAcknowledged = false;
+  RearmRetainedStatefulDeployment staleAuthorityResponse = {};
+  suite.expect(issueDeploymentLifecycleOperationForTest<MothershipTopic::rearmRetainedStatefulDeployment>(
+                   brain, mothership, request, staleAuthorityResponse) && !staleAuthorityResponse.success &&
+                   staleAuthorityResponse.failure.equal(
+                       "retained stateful re-arm predicate mismatch: retained stateful re-arm authority is not acknowledged by the exact brain cohort"_ctv),
+               "retained_rearm_rejects_unacknowledged_brain_authority");
+  peers[0].containerRetirementCapabilityAcknowledged = true;
+
+  auto dispatch = [&]() {
+    mothership.wBuffer.clear();
+    RearmRetainedStatefulDeployment mutableRequest = request;
+    String payload = {}, frame = {};
+    BitseryEngine::serialize(payload, mutableRequest);
+    brain.mothershipHandler(&mothership,
+        buildMothershipMessage(frame, MothershipTopic::rearmRetainedStatefulDeployment, payload));
+  };
+  brain.holdRuntimePersistence = true;
+  dispatch();
+  suite.expect(mothership.wBuffer.empty() && brain.pendingRuntimePersistence.size() == 1 &&
+                   deployment->containers.size() == 2,
+               "retained_rearm_waits_for_durable_acceptance_before_mutation");
+  brain.finishRuntimePersistence(false);
+  RearmRetainedStatefulDeployment failedPersistence = {};
+  suite.expect(extractAsyncRequestResponse(mothership.wBuffer,
+                   MothershipTopic::rearmRetainedStatefulDeployment, failedPersistence) &&
+                   !failedPersistence.success &&
+                   failedPersistence.failure.equal("retained stateful re-arm durable acceptance failed"_ctv) &&
+                   brain.masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.empty() &&
+                   brain.masterAuthorityRuntimeState.retainedStatefulRearmProofs.empty() &&
+                   deployment->containers.size() == 2,
+               "retained_rearm_failed_receipt_rolls_back_without_launch");
+
+  // The second durable receipt is deliberately delivered after the client
+  // disappears. The exact request must then resume from the saved operation
+  // without admitting or scheduling a second candidate.
+  dispatch();
+  suite.require(mothership.wBuffer.empty() && brain.pendingRuntimePersistence.size() == 1,
+                "retained_rearm_lost_response_fixture_waits_for_receipt");
+  brain.activeMotherships.erase(&mothership);
+  brain.finishRuntimePersistence(true);
+  suite.expect(mothership.wBuffer.empty() &&
+                   brain.masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.size() == 1 &&
+                   brain.masterAuthorityRuntimeState.retainedStatefulRearmProofs.size() == 1 &&
+                   deployment->nTarget() == 0 && deployment->containers.size() == 2,
+               "retained_rearm_lost_response_still_persists_one_operation");
+  String authorityBytes = {};
+  auto authorityCopy = brain.masterAuthorityRuntimeState;
+  ProdigyMasterAuthorityRuntimeState reloadedAuthority = {};
+  suite.require(BitseryEngine::serialize(authorityBytes, authorityCopy) &&
+                    BitseryEngine::deserializeSafe(authorityBytes, reloadedAuthority) &&
+                    prodigyRetainedStatefulRearmProofsValid(reloadedAuthority),
+                "retained_rearm_operation_survives_authority_process_reload");
+  brain.masterAuthorityRuntimeState = std::move(reloadedAuthority);
+  brain.masterAuthorityRuntimeStateDurable = true;
+  brain.durableMasterAuthorityRuntimeStateGeneration = brain.masterAuthorityRuntimeState.generation;
+  deployment->plan.stateful.allowUpdateInPlace = false;
+  suite.require(acknowledgeCurrentAuthority(),
+                "retained_rearm_final_peer_receipt_wakes_recovered_scheduler");
+  suite.expect(deployment->nTarget() == 0 && deployment->containers.size() == 2,
+               "retained_rearm_reloaded_operation_rejects_plan_semantic_drift");
+  deployment->plan.stateful.allowUpdateInPlace = true;
+  const uint128_t originalTopologyMachine = brain.authoritativeTopology.machines[2].uuid;
+  brain.authoritativeTopology.machines[2].uuid = uint128_t(0x7104);
+  brain.recoverDeploymentsAfterNeuronState();
+  suite.expect(deployment->nTarget() == 0 && deployment->containers.size() == 2,
+               "retained_rearm_reloaded_operation_rejects_vm_identity_drift");
+  brain.authoritativeTopology.machines[2].uuid = originalTopologyMachine;
+  brain.recoverDeploymentsAfterNeuronState();
+  brain.activeMotherships.insert(&mothership);
+  RearmRetainedStatefulDeployment replay = {};
+  const bool replayIssued =
+      issueDeploymentLifecycleOperationForTest<MothershipTopic::rearmRetainedStatefulDeployment>(
+          brain, mothership, request, replay);
+  const bool replayExact = replayIssued && replay.success && replay.idempotent &&
+      replay.proof.acceptedAtMs > 0 && replay.durableGeneration >= 42 && deployment->nTarget() == 3 &&
+      brain.masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.size() == 1 &&
+      brain.masterAuthorityRuntimeState.retainedStatefulRearmProofs.size() == 1;
+  suite.expect(replayExact,
+               "retained_rearm_nonzero_target_lost_response_retry_is_exactly_idempotent");
+  auto changed = request;
+  changed.proof.scope.retainedMembers[0].machineUUID = machineUUIDs[2];
+  changed.proof.retainedStateSHA256.clear();
+  prodigyRetainedStatefulRearmScopeSHA256(changed.proof.scope, changed.proof.retainedStateSHA256);
+  RearmRetainedStatefulDeployment rejected = {};
+  suite.expect(issueDeploymentLifecycleOperationForTest<MothershipTopic::rearmRetainedStatefulDeployment>(
+                   brain, mothership, changed, rejected) && !rejected.success &&
+                   rejected.failure.equal("retained stateful re-arm operationID collision"_ctv),
+               "retained_rearm_rejects_changed_storage_owner_on_replay");
+
+  ContainerView *replacement = nullptr;
+  for (ContainerView *container : deployment->containers)
+    if (container != &retained[0] && container != &retained[1]) replacement = container;
+  suite.require(replacement != nullptr, "retained_rearm_schedules_one_missing_replica");
+  if (replacement != nullptr)
+  {
+    suite.expect(deployment->containers.size() == 3 && deployment->waitingOnContainers.size() == 1,
+                 "retained_rearm_schedules_exactly_one_missing_replica");
+    suite.expect(replacement->machine == &machines[2] &&
+                     replacement->machine->uuid == scope.machineUUIDs[2],
+                 "retained_rearm_schedules_the_exact_missing_vm_identity");
+    brain.recoverDeploymentsAfterNeuronState();
+    suite.expect(deployment->containers.size() == 3 && deployment->waitingOnContainers.size() == 1,
+                 "retained_rearm_partial_launch_does_not_duplicate_replica");
+    suite.expect(deployment->containers.size() == 3 && deployment->waitingOnContainers.size() == 1 &&
+                     brain.containers.at(retained[0].uuid) == &retained[0] &&
+                     brain.containers.at(retained[1].uuid) == &retained[1] &&
+                     retained[0].machine == &machines[0] && retained[1].machine == &machines[1] &&
+                     deployment->plan.config.applicationID == applicationID &&
+                     deployment->plan.config.versionID == versionID &&
+                     deployment->plan.config.deploymentID() == deploymentID &&
+                     deployment->plan.stateful.allMasters && !deployment->plan.useHostNetworkNamespace,
+                 "retained_rearm_preserves_deployment_storage_vm_and_ipv6_identity");
+    brain.recoverDeploymentsAfterNeuronState();
+    suite.expect(deployment->containers.size() == 3 && deployment->waitingOnContainers.size() == 1,
+                 "retained_rearm_reloaded_operation_partial_launch_remains_exactly_once");
+    deployment->destructContainer(replacement);
+    deployment->containerDestroyed(replacement);
+  }
+  brain.activeMotherships.erase(&mothership);
+  brain.containers.clear();
+  deployment->containers.clear();
+  brain.deployments.clear();
+  brain.deploymentsByApp.clear();
+  brain.deploymentPlans.clear();
+  brain.statefulServingRuntimeStates.clear();
+  for (uint32_t index = 0; index < 2; ++index) brain.brains.erase(&peers[index]);
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    machines[index].containersByDeploymentID.clear();
+    racks[index].machines.erase(&machines[index]);
+    brain.machines.erase(&machines[index]);
+    brain.machinesByUUID.erase(machines[index].uuid);
+    brain.racks.erase(racks[index].uuid);
+  }
+  delete deployment;
+  thisBrain = savedBrain;
+  thisNeuron = savedNeuron;
+}
+
 static void testMaterializedRecoveryBlockers(TestSuite& suite)
 {
   ScopedRing scopedRing;
