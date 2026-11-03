@@ -747,6 +747,14 @@ static void interruptedLocalUpgradeRegressions(const String& path)
     MothershipLocalRecoveryWorkloadIdentity observed;
     assert(mothershipLocalRecoveryWorkloadIdentityFromReport(4,deployment,observed));
     assert(observed.applicationID==4 && observed.deploymentID==((uint64_t(4)<<48)|2026102708));
+    // Retained deployments are intentionally dormant while their healthy
+    // containers remain materialized. Preserve that exact zero-target intent.
+    deployment.nTarget=0;deployment.nTargetBase=0;
+    assert(mothershipLocalRecoveryWorkloadIdentityFromReport(4,deployment,observed));
+    assert(observed.target==0 && observed.targetBase==0 && observed.targetSurge==0);
+    deployment.nTargetSurge=1;
+    assert(!mothershipLocalRecoveryWorkloadIdentityFromReport(4,deployment,observed));
+    deployment.nTargetSurge=0;
     deployment.versionID=uint64_t(1)<<48;
     assert(!mothershipLocalRecoveryWorkloadIdentityFromReport(4,deployment,observed));
   }

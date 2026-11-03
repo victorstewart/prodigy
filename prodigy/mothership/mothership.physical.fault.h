@@ -1086,7 +1086,7 @@ static inline bool mothershipLocalRecoveryWorkloadIdentityValid(
     const MothershipLocalRecoveryWorkloadIdentity& value)
 {
   return value.applicationID != 0 && value.deploymentID != 0 &&
-      uint16_t(value.deploymentID >> 48) == value.applicationID && value.target != 0 &&
+      uint16_t(value.deploymentID >> 48) == value.applicationID &&
       value.target == value.targetBase + value.targetSurge &&
       (value.stateful ? value.shardGroups != 0 : value.shardGroups == 0);
 }
