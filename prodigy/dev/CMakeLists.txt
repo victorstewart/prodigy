@@ -5,7 +5,41 @@ include(CheckCXXCompilerFlag)
 project(prodigy LANGUAGES C CXX)
 
 get_filename_component(PRODIGY_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+if (NOT DEFINED DEPOS_ROOT OR "${DEPOS_ROOT}" STREQUAL "")
+   if (DEFINED ENV{DEPOS_ROOT} AND NOT "$ENV{DEPOS_ROOT}" STREQUAL "")
+      set(
+         DEPOS_ROOT
+         "$ENV{DEPOS_ROOT}"
+         CACHE PATH
+         "Prodigy Depos root inherited from ENV{DEPOS_ROOT}"
+      )
+   else()
+      set(
+         DEPOS_ROOT
+         "${CMAKE_BINARY_DIR}/depos-root"
+         CACHE PATH
+         "Prodigy build-local Depos root"
+      )
+   endif()
+endif()
+if (NOT DEFINED DEPOS_BOOTSTRAP_DIR OR "${DEPOS_BOOTSTRAP_DIR}" STREQUAL "")
+   set(
+      DEPOS_BOOTSTRAP_DIR
+      "${CMAKE_BINARY_DIR}/depos-bootstrap"
+      CACHE PATH
+      "Prodigy build-local Depos bootstrap state"
+   )
+endif()
 include("${PRODIGY_ROOT}/.depos.cmake")
+
+option(
+   PRODIGY_VALIDATE_DEPOS_STATE_PATHS_ONLY
+   "Configure only far enough to validate Prodigy's Depos state-path defaults"
+   OFF
+)
+if (PRODIGY_VALIDATE_DEPOS_STATE_PATHS_ONLY)
+   return()
+endif()
 
 if (NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
    message(FATAL_ERROR "Prodigy dev requires Clang for C builds.")
@@ -1893,7 +1927,10 @@ if (PROJECT_ENABLE_TESTS)
 
    add_test(
       NAME prodigy_dev_sdk_mesh_e2e_matrix_smoke
-      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_sdk_mesh_e2e_matrix.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership --languages=rust,python,typescript,cpp
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_sdk_mesh_e2e_matrix.sh
+              ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership
+              "--depos-root=${PRODIGY_DEPOS_ROOT}"
+              --languages=rust,python,typescript,cpp
    )
    set_tests_properties(prodigy_dev_sdk_mesh_e2e_matrix_smoke PROPERTIES SKIP_RETURN_CODE 77)
 
@@ -2320,6 +2357,13 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
               -DPRODIGY_DEPOS_MANIFEST_VISIBLE_NAMESPACE=${_prodigy_depos_namespace}
               -DPRODIGY_MASQUE_TUNNEL_VERSION=${_prodigy_masque_tunnel_version}
               -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_dependency_materialization_contract.cmake
+   )
+   add_test(
+      NAME prodigy_depos_state_path_contract
+      COMMAND ${CMAKE_COMMAND}
+              -DPRODIGY_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+              -DPRODIGY_STATE_PATH_TEST_ROOT=${CMAKE_BINARY_DIR}/depos-state-path-contract
+              -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_depos_state_paths.cmake
    )
    add_test(
       NAME prodigy_public_header_basics_contract

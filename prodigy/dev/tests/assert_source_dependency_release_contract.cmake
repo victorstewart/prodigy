@@ -33,9 +33,9 @@ endforeach()
 file(READ "${PRODIGY_ROOT}/depos.project.cmake" _prodigy_depos_project)
 foreach(_prodigy_basics_release_contract IN ITEMS
    [[PRODIGY_BASICS_RELEASE_VERSION
-  "0.4.14-rc.3"]]
-   [[https://github.com/victorstewart/basics/releases/download/v0.4.14-rc.3/basics.DepoFile]]
-   [[633d69b068058eff30a37f081127680be5ac12708c5943967f8bfb8f79aef8dd]]
+  "0.4.14-rc.5"]]
+   [[https://github.com/victorstewart/basics/releases/download/v0.4.14-rc.5/basics.DepoFile]]
+   [[0ee234242c236b5bddc8e0da7b5024b5f2b5c65aa2e7cd5ac0f1eba9b8db50a2]]
 )
    string(FIND "${_prodigy_depos_project}" "${_prodigy_basics_release_contract}"
       _prodigy_basics_release_contract_index)
@@ -92,8 +92,8 @@ if (NOT _prodigy_source_dependency_script MATCHES
    message(FATAL_ERROR "The source-dependency release producer must declare its Basics dependency.")
 endif()
 if (NOT _prodigy_source_dependency_script MATCHES
-   "basics_version=\"0\\.4\\.14-rc\\.3\"")
-   message(FATAL_ERROR "The source-dependency release producer must pin Basics 0.4.14-rc.3.")
+   "basics_version=\"0\\.4\\.14-rc\\.5\"")
+   message(FATAL_ERROR "The source-dependency release producer must pin Basics 0.4.14-rc.5.")
 endif()
 if (NOT _prodigy_source_dependency_script MATCHES
    "basics_package=\"basics\"")
@@ -103,7 +103,7 @@ foreach(_prodigy_basics_release_input IN ITEMS
    PRODIGY_SOURCE_DEPENDENCY_BASICS_ARCHIVE
    PRODIGY_SOURCE_DEPENDENCY_BASICS_ARCHIVE_SHA256
    PRODIGY_SOURCE_DEPENDENCY_BASICS_RELEASE_URL
-   BASICS_RELEASE_INPUT
+   RELEASE-RECEIPT.txt
 )
    if (NOT _prodigy_source_dependency_script MATCHES "${_prodigy_basics_release_input}")
       message(FATAL_ERROR "The source-dependency release producer must require ${_prodigy_basics_release_input}.")
@@ -132,4 +132,29 @@ endif()
 if (NOT _prodigy_source_dependency_script MATCHES
    "libprodigy_noise\\.a")
    message(FATAL_ERROR "The source-dependency release producer must package the Noise static library.")
+endif()
+foreach(_prodigy_release_receipt_contract IN ITEMS
+   [[FORMAT=prodigy-source-dependency-release-v1]]
+   [[SOURCE_MANIFEST_SHA256=]]
+   [[NOISE_PREFLIGHT_ARCHIVE_SHA256=]]
+   [[NOISE_PREFLIGHT_ELF_CLASS=]]
+   [[NOISE_PREFLIGHT_ELF_MACHINE=]]
+   [[BASICS_ARCHIVE_NAME=]]
+   [[CARGO_EXECUTABLE_SHA256=]]
+   [[RUSTC_EXECUTABLE_SHA256=]]
+   [[RELEASE-RECEIPT.txt SOURCE-MANIFEST.sha256 > SHA256SUMS]]
+)
+   string(FIND "${_prodigy_source_dependency_script}" "${_prodigy_release_receipt_contract}"
+      _prodigy_release_receipt_contract_index)
+   if (_prodigy_release_receipt_contract_index EQUAL -1)
+      message(FATAL_ERROR
+         "The source-dependency release receipt is missing: ${_prodigy_release_receipt_contract}")
+   endif()
+endforeach()
+if (_prodigy_source_dependency_script MATCHES
+   [[sha256sum "\$\{archive\}" "\$\{depofile\}" "\$\{local_depofile\}"]])
+   message(FATAL_ERROR "Published source-dependency checksums must not include a host-specific local DepoFile.")
+endif()
+if (_prodigy_source_dependency_script MATCHES [[BASICS_ARCHIVE=\$\{basics_archive\}]])
+   message(FATAL_ERROR "The source-dependency release receipt must not disclose a producer-local Basics path.")
 endif()

@@ -9,7 +9,7 @@ mkdir -p "$(dirname "${output_root}")"
 output_root="$(cd "$(dirname "${output_root}")" && pwd)/$(basename "${output_root}")"
 version="${PRODIGY_SOURCE_DEPENDENCY_VERSION:-0.4.5-rc.2}"
 basics_package="basics"
-basics_version="0.4.14-rc.3"
+basics_version="0.4.14-rc.5"
 basics_archive="${PRODIGY_SOURCE_DEPENDENCY_BASICS_ARCHIVE:-}"
 basics_archive_sha256="${PRODIGY_SOURCE_DEPENDENCY_BASICS_ARCHIVE_SHA256:-}"
 basics_release_url="${PRODIGY_SOURCE_DEPENDENCY_BASICS_RELEASE_URL:-}"
@@ -19,7 +19,7 @@ if [[ "$(uname -s)" != "Linux" ]]; then
   echo "package-source-dependency: run in the verified Linux guest." >&2
   exit 1
 fi
-for command in gzip sha256sum tar; do
+for command in awk basename cat find gzip paste readelf sha256sum sort stat tar xargs; do
   command -v "${command}" >/dev/null 2>&1 || {
     echo "package-source-dependency: missing required command '${command}'." >&2
     exit 1
@@ -68,11 +68,15 @@ candidate_root="${output_root}/prodigy-${version}"
 asset_name="prodigy-${version}.tar.gz"
 archive="${output_root}/${asset_name}"
 depofile="${output_root}/prodigy.DepoFile"
-local_depofile="${output_root}/prodigy.local.DepoFile"
-if [[ -e "${candidate_root}" || -e "${archive}" || -e "${depofile}" || -e "${local_depofile}" ]]; then
+receipt="${output_root}/RELEASE-RECEIPT.txt"
+source_manifest="${output_root}/SOURCE-MANIFEST.sha256"
+checksums="${output_root}/SHA256SUMS"
+if [[ -e "${candidate_root}" || -e "${archive}" || -e "${depofile}" ||
+      -e "${receipt}" || -e "${source_manifest}" || -e "${checksums}" ]]; then
   echo "package-source-dependency: candidate output already exists; choose a new output root." >&2
   exit 1
 fi
+mkdir -p "${output_root}"
 
 stage="$(mktemp -d "${output_root}.stage.XXXXXX")"
 trap 'rm -rf "${stage}"' EXIT
@@ -107,6 +111,18 @@ RUSTC="${rustc_bin}" "${cargo_bin}" build --offline --locked --release \
   --manifest-path "${source_root}/prodigy/crypto/noise/Cargo.toml" \
   --target-dir "${stage}/noise-target"
 test -f "${stage}/noise-target/release/libprodigy_noise.a"
+noise_archive="${stage}/noise-target/release/libprodigy_noise.a"
+noise_archive_sha256="$(sha256sum "${noise_archive}" | awk '{print $1}')"
+noise_archive_bytes="$(stat -c %s "${noise_archive}")"
+noise_elf_class="$(readelf -h "${noise_archive}" | awk -F: '/Class:/{gsub(/^[[:space:]]+/, "", $2); print $2}' | sort -u | paste -sd, -)"
+noise_elf_machine="$(readelf -h "${noise_archive}" | awk -F: '/Machine:/{gsub(/^[[:space:]]+/, "", $2); print $2}' | sort -u | paste -sd, -)"
+if [[ -z "${noise_elf_class}" || -z "${noise_elf_machine}" ]]; then
+  echo "package-source-dependency: unable to inspect the preflight Noise archive's ELF members." >&2
+  exit 1
+fi
+
+(cd "${source_root}" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "${source_manifest}"
+source_manifest_sha256="$(sha256sum "${source_manifest}" | awk '{print $1}')"
 
 # The mounted detached worktree may have a host-only gitdir.  Keep the
 # candidate reproducible without requiring Git metadata inside the guest.
@@ -115,7 +131,6 @@ source_date_epoch="${SOURCE_DATE_EPOCH:-0}"
   echo "package-source-dependency: SOURCE_DATE_EPOCH must be an unsigned integer." >&2
   exit 1
 }
-mkdir -p "${output_root}"
 tar --sort=name --mtime="@${source_date_epoch}" --owner=0 --group=0 --numeric-owner \
   -C "${stage}" -cf - source-root | gzip -n > "${archive}"
 archive_members="${stage}/archive-members.txt"
@@ -154,13 +169,43 @@ TARGET prodigy::noise STATIC lib/libprodigy_noise.a
 TARGET prodigy::prodigy INTERFACE include
 LINK prodigy::prodigy prodigy::noise basics::basics dl
 EOF
-sed "s|https://github.com/victorstewart/prodigy/releases/download/v${version}/${asset_name}|file://${archive}|" \
-  "${depofile}" > "${local_depofile}"
-
 cp -a "${source_root}" "${candidate_root}"
-sha256sum "${archive}" "${depofile}" "${local_depofile}" > "${output_root}/SHA256SUMS"
-printf 'BASICS_VERSION=%s\nBASICS_ARCHIVE=%s\nBASICS_ARCHIVE_SHA256=%s\nBASICS_RELEASE_URL=%s\n' \
-  "${basics_version}" "${basics_archive}" "${basics_archive_sha256}" "${basics_release_url}" \
-  > "${output_root}/BASICS_RELEASE_INPUT"
-printf 'source dependency candidate: %s\nPublishable DepoFile: %s\nLocal verification DepoFile: %s\n' \
-  "${archive}" "${depofile}" "${local_depofile}"
+depofile_sha256="$(sha256sum "${depofile}" | awk '{print $1}')"
+cargo_version="$("${cargo_bin}" --version)"
+rustc_version="$("${rustc_bin}" --version)"
+rustc_verbose="$("${rustc_bin}" -vV)"
+rustc_host="$(printf '%s\n' "${rustc_verbose}" | awk -F': ' '$1 == "host" {print $2}')"
+rustc_commit="$(printf '%s\n' "${rustc_verbose}" | awk -F': ' '$1 == "commit-hash" {print $2}')"
+rustc_llvm="$(printf '%s\n' "${rustc_verbose}" | awk -F': ' '$1 == "LLVM version" {print $2}')"
+cat > "${receipt}" <<EOF
+FORMAT=prodigy-source-dependency-release-v1
+PRODIGY_VERSION=${version}
+SOURCE_DATE_EPOCH=${source_date_epoch}
+PRODIGY_ARCHIVE=${asset_name}
+PRODIGY_ARCHIVE_SHA256=${archive_sha256}
+PRODIGY_DEPOFILE=prodigy.DepoFile
+PRODIGY_DEPOFILE_SHA256=${depofile_sha256}
+SOURCE_MANIFEST=SOURCE-MANIFEST.sha256
+SOURCE_MANIFEST_SHA256=${source_manifest_sha256}
+NOISE_CARGO_LOCK_SHA256=$(sha256sum "${noise_stage}/Cargo.lock" | awk '{print $1}')
+NOISE_PREFLIGHT_ARCHIVE_SHA256=${noise_archive_sha256}
+NOISE_PREFLIGHT_ARCHIVE_BYTES=${noise_archive_bytes}
+NOISE_PREFLIGHT_ELF_CLASS=${noise_elf_class}
+NOISE_PREFLIGHT_ELF_MACHINE=${noise_elf_machine}
+BASICS_VERSION=${basics_version}
+BASICS_ARCHIVE_NAME=$(basename "${basics_archive}")
+BASICS_ARCHIVE_SHA256=${basics_archive_sha256}
+BASICS_RELEASE_URL=${basics_release_url}
+RUST_TOOLCHAIN_VERSION=${rust_toolchain_version}
+CARGO_VERSION=${cargo_version}
+CARGO_EXECUTABLE_SHA256=$(sha256sum "${cargo_bin}" | awk '{print $1}')
+RUSTC_VERSION=${rustc_version}
+RUSTC_HOST=${rustc_host}
+RUSTC_COMMIT_HASH=${rustc_commit}
+RUSTC_LLVM_VERSION=${rustc_llvm}
+RUSTC_EXECUTABLE_SHA256=$(sha256sum "${rustc_bin}" | awk '{print $1}')
+EOF
+(cd "${output_root}" && sha256sum \
+  "${asset_name}" prodigy.DepoFile RELEASE-RECEIPT.txt SOURCE-MANIFEST.sha256 > SHA256SUMS)
+printf 'source dependency candidate: %s\nPublishable DepoFile: %s\nRelease receipt: %s\n' \
+  "${archive}" "${depofile}" "${receipt}"

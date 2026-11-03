@@ -77,6 +77,10 @@ endif()
 
 set(prodigy_dev "${PRODIGY_ROOT}/prodigy/dev/CMakeLists.txt")
 foreach(contract IN ITEMS
+   "Prodigy build-local Depos root"
+   "Prodigy Depos root inherited from ENV{DEPOS_ROOT}"
+   "Prodigy build-local Depos bootstrap state"
+   [["$ENV{DEPOS_ROOT}"]]
    "\${PRODIGY_DEPOFILES_DIR}/masque-tunnel.DepoFile"
    "file(STRINGS \"\${DEPOS_MANIFEST_FILE}\" _prodigy_masque_tunnel_manifest_lines"
    "masque_tunnel VERSION [^ )]+\${_prodigy_masque_tunnel_manifest_namespace_suffix}"
@@ -86,9 +90,22 @@ foreach(contract IN ITEMS
    "unset(PRODIGY_MASQUE_TUNNEL_BINARY CACHE)"
    "PRODIGY_MASQUE_TUNNEL_BINARY"
    "add_executable(prodigy::masque_tunnel IMPORTED GLOBAL)"
+   "--depos-root=\${PRODIGY_DEPOS_ROOT}"
 )
    require_contains("${prodigy_dev}" "${contract}")
 endforeach()
+
+set(prodigy_sdk_mesh "${PRODIGY_ROOT}/prodigy/dev/tests/prodigy_dev_sdk_mesh_e2e_matrix.sh")
+foreach(contract IN ITEMS
+   [[--depos-root=*)]]
+   [[local dep_store_root="${depos_root}/store"]]
+)
+   require_contains("${prodigy_sdk_mesh}" "${contract}")
+endforeach()
+file(READ "${prodigy_sdk_mesh}" prodigy_sdk_mesh_contents)
+if (prodigy_sdk_mesh_contents MATCHES "REPO_ROOT}/\\.depos/\\.root")
+   message(FATAL_ERROR "SDK mesh must consume the configured Depos root, not source-adjacent state.")
+endif()
 
 file(READ "${prodigy_dev}" prodigy_dev_contents)
 string(FIND "${prodigy_dev_contents}" "0.18.3-mtls-site-routing-3" stale_masque_tunnel_version)

@@ -23,7 +23,7 @@ if ! bash "${boundary_launcher}" --check-boundary; then
   exit 1
 fi
 depos_interface="${repo_root}/.depos.cmake"
-depos_interface_sha256="3443771f5f90ad5b600dbb7f763ce963e69adcee2a7d77d35a3b3f2b5feb9923"
+depos_interface_sha256="a0809260842cd2b7cdc7390134f814c8ec75208fe43a13eb8b7a08ca9f35a3f8"
 if [[ ! -f "${depos_interface}" ]] ||
    [[ "$(sha256sum "${depos_interface}" | awk '{print $1}')" != "${depos_interface_sha256}" ]]; then
   command -v curl >/dev/null || {
@@ -32,7 +32,7 @@ if [[ ! -f "${depos_interface}" ]] ||
   bootstrap="$(mktemp "${repo_root}/.depos-bootstrap.XXXXXX")"
   trap 'rm -f "${bootstrap}"' EXIT
   curl --fail --location --silent --show-error --connect-timeout 15 --max-time 120 \
-    https://raw.githubusercontent.com/victorstewart/depos/v0.5.6/.depos.cmake --output "${bootstrap}"
+    https://raw.githubusercontent.com/victorstewart/depos/v0.5.7/.depos.cmake --output "${bootstrap}"
   [[ "$(sha256sum "${bootstrap}" | awk '{print $1}')" == "${depos_interface_sha256}" ]] || {
     echo "build-evaluation: Depos CMake module checksum mismatch." >&2; exit 1;
   }

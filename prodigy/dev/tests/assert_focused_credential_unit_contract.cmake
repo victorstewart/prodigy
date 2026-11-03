@@ -27,22 +27,22 @@ endif()
 file(READ "${PRODIGY_ROOT}/depos.project.cmake" _prodigy_depos_project)
 file(SHA256 "${PRODIGY_ROOT}/.depos.cmake" _prodigy_depos_interface_sha256)
 if (NOT _prodigy_depos_interface_sha256 STREQUAL
-   "3443771f5f90ad5b600dbb7f763ce963e69adcee2a7d77d35a3b3f2b5feb9923")
-   message(FATAL_ERROR "Prodigy's Depos interface must match the published 0.5.6 helper byte-for-byte.")
+   "a0809260842cd2b7cdc7390134f814c8ec75208fe43a13eb8b7a08ca9f35a3f8")
+   message(FATAL_ERROR "Prodigy's Depos interface must match the published 0.5.7 helper byte-for-byte.")
 endif()
 if (NOT _prodigy_depos_project MATCHES
-   "set\\(DEPOS_BOOTSTRAP_VERSION \"0\\.5\\.6\" CACHE STRING \"Pinned depos version used by prodigy\" FORCE\\)")
-   message(FATAL_ERROR "Prodigy must pin Depos bootstrap 0.5.6.")
+   "set\\(DEPOS_BOOTSTRAP_VERSION \"0\\.5\\.7\" CACHE STRING \"Pinned depos version used by prodigy\" FORCE\\)")
+   message(FATAL_ERROR "Prodigy must pin Depos bootstrap 0.5.7.")
 endif()
 
 file(READ "${PRODIGY_ROOT}/tools/build-evaluation.sh" _prodigy_build_evaluation)
 if (NOT _prodigy_build_evaluation MATCHES
-   "raw.githubusercontent.com/victorstewart/depos/v0\\.5\\.6/.depos.cmake")
-   message(FATAL_ERROR "build-evaluation must bootstrap Depos 0.5.6.")
+   "raw.githubusercontent.com/victorstewart/depos/v0\\.5\\.7/.depos.cmake")
+   message(FATAL_ERROR "build-evaluation must bootstrap Depos 0.5.7.")
 endif()
 if (NOT _prodigy_build_evaluation MATCHES
-   "3443771f5f90ad5b600dbb7f763ce963e69adcee2a7d77d35a3b3f2b5feb9923")
-   message(FATAL_ERROR "build-evaluation must verify the Depos 0.5.6 helper checksum.")
+   "a0809260842cd2b7cdc7390134f814c8ec75208fe43a13eb8b7a08ca9f35a3f8")
+   message(FATAL_ERROR "build-evaluation must verify the Depos 0.5.7 helper checksum.")
 endif()
 string(FIND "${_prodigy_build_evaluation}"
    [[sha256sum "${depos_interface}"]] _prodigy_existing_depos_checksum_index)

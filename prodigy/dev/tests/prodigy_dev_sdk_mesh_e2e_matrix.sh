@@ -6,7 +6,7 @@ MOTHERSHIP_BIN="${2:-}"
 
 if [[ -z "${PRODIGY_BIN}" || -z "${MOTHERSHIP_BIN}" ]]
 then
-   echo "usage: $0 /path/to/prodigy /path/to/mothership [--languages=rust,python,typescript,cpp]"
+   echo "usage: $0 /path/to/prodigy /path/to/mothership --depos-root=/path/to/depos-root [--languages=rust,python,typescript,cpp]"
    exit 2
 fi
 
@@ -23,6 +23,7 @@ TYPESCRIPT_SDK_PROJECT="${REPO_ROOT}/prodigy/sdk/typescript"
 TYPESCRIPT_DEPENDENCY_CACHE_ROOT="${REPO_ROOT}/.run/sdk-typescript-deps"
 
 languages="rust,python,typescript,cpp"
+depos_root=""
 sdk_mesh_machine_count="${PRODIGY_DEV_SDK_MESH_MACHINE_COUNT:-3}"
 sdk_mesh_enable_fake_ipv4_boundary="${PRODIGY_DEV_SDK_MESH_ENABLE_FAKE_IPV4_BOUNDARY:-0}"
 mothership_cli_timeout="${PRODIGY_DEV_SDK_MESH_MOTHERSHIP_TIMEOUT:-20s}"
@@ -38,6 +39,9 @@ do
    case "${arg}" in
       --languages=*)
          languages="${arg#*=}"
+         ;;
+      --depos-root=*)
+         depos_root="${arg#*=}"
          ;;
       *)
          echo "FAIL: unknown argument: ${arg}"
@@ -65,6 +69,12 @@ done
 if [[ ! -f "${DISCOMBOBULATOR_MANIFEST}" ]]
 then
    echo "FAIL: discombobulator manifest not found: ${DISCOMBOBULATOR_MANIFEST}"
+   exit 1
+fi
+
+if [[ -z "${depos_root}" || ! -d "${depos_root}/store" ]]
+then
+   echo "FAIL: --depos-root must name the configured Depos root with a materialized store" >&2
    exit 1
 fi
 
@@ -203,7 +213,7 @@ build_rust_artifact()
 build_cpp_artifact()
 {
    local output="${tmpdir}/io_uring_mesh_pingpong_cpp"
-   local dep_store_root="${REPO_ROOT}/.depos/.root/store"
+   local dep_store_root="${depos_root}/store"
    local liburing_static=""
    local liburing_include=""
 
