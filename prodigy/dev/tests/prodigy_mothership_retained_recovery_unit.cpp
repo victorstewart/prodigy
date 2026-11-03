@@ -1638,11 +1638,35 @@ static void assertInitialSeedRuntimeRepair()
     String failure;return prodigyRunLocalShellCommand(text(command),&failure);
   };
   auto observe=[&](bool present=true) { return observeCommand(initialSeedRepairInventoryProgram(manifest,10,present)); };
+  auto observeGatewaySubset=[&] {
+    return observeCommand(initialSeedRepairInventoryProgram(manifest,10,true,false,true,true));
+  };
   auto preflight=[&](const InitialSeedRuntimeRepairManifest& selected) {
     return observeCommand(initialSeedRepairPreflightInventoryProgram(selected,10));
   };
   auto coldManifest=manifest;coldManifest.binding.masterGeneration=coldManifest.binding.followerGeneration=40;
-  assert(observe());
+  assert(observe() && observeGatewaySubset());
+  // Active deployments share containers.slice with the optional gateway pair.
+  // The gateway observer ignores ordinary application leaves, still rejects a
+  // gateway-marked impostor and refuses a partially materialized pair.
+  const auto applicationPID=std::string("102"),applicationLeaf=std::string("202.slice/leaf");
+  write(cgroup/applicationLeaf/"cgroup.procs",applicationPID+"\n");
+  write(proc/applicationPID/"exe","ordinary application fixture");
+  write(proc/applicationPID/"cgroup","0::/containers.slice/"+applicationLeaf+"\n");
+  std::string applicationStat=applicationPID+" (application fixture) S ";
+  for(int i=0;i<18;++i)applicationStat+="0 ";applicationStat+="778";
+  write(proc/applicationPID/"stat",applicationStat);
+  write(proc/applicationPID/"environ",std::string("PRODIGY_PARAMS_FD=9")+std::string(1,'\0'));
+  assert(!observe() && observeGatewaySubset());
+  write(proc/applicationPID/"environ",std::string("PRODIGY_MASQUE_PAIR_UUID=rogue")+std::string(1,'\0'));
+  assert(!observeGatewaySubset());
+  write(proc/applicationPID/"environ",std::string("PRODIGY_PARAMS_FD=9")+std::string(1,'\0'));
+  write(cgroup/"200.slice/leaf/cgroup.procs","");assert(!observeGatewaySubset());
+  write(cgroup/"201.slice/leaf/cgroup.procs","");assert(observeGatewaySubset());
+  write(cgroup/"200.slice/leaf/cgroup.procs","100\n");
+  write(cgroup/"201.slice/leaf/cgroup.procs","101\n");
+  fs::remove_all(cgroup/"202.slice");fs::remove_all(proc/applicationPID);
+  assert(observe() && observeGatewaySubset());
   assert(preflight(manifest) && !preflight(coldManifest));
   write(proc/"100/exe","unapproved user executable");assert(!observe());
   assert(!preflight(manifest) && !preflight(coldManifest));write(proc/"100/exe",exe);

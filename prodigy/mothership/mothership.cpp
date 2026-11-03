@@ -15827,10 +15827,20 @@ private:
     manifest.gatewayExecutableBytes=6441168;manifest.binding.gateways=request.runtime.gateways;
     const auto empty=initialSeedRepairInventoryProgram(manifest,machine,false);
     if(emptyOnly)return empty;
+    // Admitted active-runtime recovery owns ordinary application containers
+    // through its frozen deployment identities. They are unrelated to this
+    // gateway-specific snapshot and must not make two exact gateway leaves
+    // appear malformed. Any gateway-marked process still has to match the
+    // typed authority and executable, and a partial pair remains invalid.
+    const bool admittedRuntime=request.protocolVersion==
+        MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion;
+    const auto occupied=admittedRuntime ?
+        initialSeedRepairInventoryProgram(manifest,machine,true,false,true,true) :
+        initialSeedRepairInventoryProgram(manifest,machine);
     // Absence after the preceding cold recovery is valid. Otherwise the same
     // typed gateway environment/executable/cgroup owner must prove both leaves.
     return "if test -z \"$(find /sys/fs/cgroup/containers.slice -name cgroup.procs -exec cat {} + 2>/dev/null)\"; then\n"+
-        empty+"\nelse\n"+initialSeedRepairInventoryProgram(manifest,machine)+"\nfi";
+        empty+"\nelse\n"+occupied+"\nfi";
   }
 
   bool localRecoveryRuntimeObservation(const MothershipProdigyCluster& cluster,

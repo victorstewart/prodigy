@@ -1563,7 +1563,8 @@ inline InitialSeedRuntimeRepairManifest parseInitialSeedRepairManifest(const std
   return m;
 }
 inline std::string initialSeedRepairInventoryProgram(const InitialSeedRuntimeRepairManifest& m,uint128_t machine,
-                                                    bool gatewaysPresent=true,bool populatedPresent=false) {
+                                                    bool gatewaysPresent=true,bool populatedPresent=false,
+                                                    bool ignoreUnrelatedProcesses=false,bool allowAbsentGateways=false) {
   std::string config="{\"sha256\":"+repairJSON(m.gatewayExecutableSHA)+",\"bytes\":"+std::to_string(m.gatewayExecutableBytes)+",\"authorities\":[";
   bool comma=false;
   for (const auto& authority:m.binding.gateways) if (gatewaysPresent && authority.localMachineUUID==machine) {
@@ -1588,18 +1589,24 @@ inline std::string initialSeedRepairInventoryProgram(const InitialSeedRuntimeRep
         std::to_string(p.storageDevice)+","+std::to_string(p.storageInode)+","+std::to_string(p.storageUID)+","+
         std::to_string(p.storageGID)+"]}";
   } else config+="null";
+  config+=",\"ignoreUnrelatedProcesses\":";
+  config+=ignoreUnrelatedProcesses ? "true" : "false";
+  config+=",\"allowAbsentGateways\":";
+  config+=allowAbsentGateways ? "true" : "false";
   config+="}";
   return "python3 - "+quote(config)+R"PY( <<'ISRR_PY'
 import hashlib,json,os,pathlib,re,sys
 cfg=json.loads(sys.argv[1]); expected=[dict(v.split('=',1) for v in a) for a in cfg['authorities']]
 assert len(expected) in (0,2)
 pulse=cfg['pulse']; pulse_seen=False
+ignore_unrelated=cfg['ignoreUnrelatedProcesses']; allow_absent=cfg['allowAbsentGateways']
+assert not allow_absent or (ignore_unrelated and expected and not pulse)
 if pulse:
     assert not expected
     assert pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()==pulse['bootID']
     assert pathlib.Path('/etc/machine-id').read_text().strip()==pulse['machineID']
 root=pathlib.Path('/sys/fs/cgroup/containers.slice'); rows=[]; matched=set(); seen=set()
-assert not root.is_symlink() and (root.is_dir() or (not expected and not pulse))
+assert not root.is_symlink() and (root.is_dir() or (not expected and not pulse) or allow_absent)
 for directory,dirs,files in os.walk(root,followlinks=False):
     assert all(not pathlib.Path(directory,d).is_symlink() for d in dirs)
     if 'cgroup.procs' not in files: continue
@@ -1647,13 +1654,19 @@ for directory,dirs,files in os.walk(root,followlinks=False):
                          'parametersSHA256':pulse['paramsSHA256'],'storage':pulse['storage'],'kind':'initialPulse'})
             continue
         matches=[i for i,e in enumerate(expected) if all(env.get(k.encode())==v.encode() for k,v in e.items())]
+        if ignore_unrelated and not matches:
+            assert not any(key.startswith(b'PRODIGY_MASQUE_') for key in env)
+            continue
         assert len(matches)==1 and matches[0] not in matched; matched.add(matches[0])
         with proc.joinpath('exe').open('rb') as f:
             digest=hashlib.file_digest(f,'sha256').hexdigest(); size=f.tell()
         assert digest==cfg['sha256'] and size==cfg['bytes']
         assert proc.joinpath('stat').read_text().rsplit(') ',1)[1].split()[19]==start
         rows.append({'cgroup':relative,'pid':int(pid),'startTicks':start,'exeSHA256':digest,'authority':matches[0]})
-assert len(rows)==len(expected)+(1 if pulse else 0) and len(matched)==len(expected) and pulse_seen==bool(pulse)
+if allow_absent:
+    assert len(rows) in (0,len(expected)) and len(matched)==len(rows)
+else:
+    assert len(rows)==len(expected)+(1 if pulse else 0) and len(matched)==len(expected) and pulse_seen==bool(pulse)
 print(json.dumps({'bootID':pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
  'linuxMachineID':pathlib.Path('/etc/machine-id').read_text().strip(),'processes':sorted(rows,key=lambda r:r['cgroup'])},sort_keys=True,separators=(',',':')))
 ISRR_PY
