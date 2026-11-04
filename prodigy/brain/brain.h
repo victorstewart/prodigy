@@ -42927,6 +42927,31 @@ public:
       String& failure) const
   {
     failure.clear();
+    const auto freshAuthenticatedFleetProvesContainerAbsent =
+        [&](uint128_t containerUUID) {
+          bool absent = containerUUID != 0 && recoveringPersistedNeuronInventory &&
+              witnesses.size() == 3 && machines.size() == 3 && nBrains == 3;
+          for (const auto& observedWitness : witnesses)
+          {
+            Machine *observed = absent
+                ? findMachineByUUID(observedWitness.machineUUID) : nullptr;
+            const auto inventory = observed == nullptr
+                ? containerRetirementInventoryByMachine.end()
+                : containerRetirementInventoryByMachine.find(observed->uuid);
+            if (observed == nullptr || !machines.contains(observed) ||
+                !observed->runtimeReady || !neuronControlStreamActive(observed) ||
+                !persistedMachineInventoryUploaded.contains(observed->uuid) ||
+                inventory == containerRetirementInventoryByMachine.end() ||
+                inventory->second.authorityEpoch != masterAuthorityEpoch ||
+                inventory->second.ioGeneration != observed->neuron.ioGeneration ||
+                inventory->second.present.contains(containerUUID))
+            {
+              absent = false;
+              break;
+            }
+          }
+          return absent;
+        };
     bool rejectedStaleProjection = false;
     uint32_t capturedCount = 0;
     bytell_hash_set<uint128_t> captured = {};
@@ -42969,6 +42994,24 @@ public:
                 return runtime.authority.localMachineUUID == witness.machineUUID &&
                     runtime.plan.uuid == bootstrap.plan.uuid;
               });
+          if (!canonicalOwner)
+          {
+            const auto *authority = desiredCrossClusterMasqueGatewayAuthority(
+                bootstrap.plan.system.gatewayPairUUID, witness.machineUUID);
+            const auto effective =
+                effectiveCrossClusterMasqueGatewayAuthorities(witness.machineUUID);
+            const uint8_t fragment = authority == nullptr ? 0 :
+                prodigyCrossClusterMasqueGatewayRuntimeFragment(
+                    effective, authority->pairUUID, authority->localMachineUUID);
+            canonicalOwner = masterAuthorityRuntimeStateDurable &&
+                durableMasterAuthorityRuntimeStateGeneration ==
+                    masterAuthorityRuntimeState.generation &&
+                authority != nullptr &&
+                crossClusterMasqueGatewayPlanMatchesAuthority(
+                    bootstrap.plan, *authority, fragment) &&
+                freshAuthenticatedFleetProvesContainerAbsent(
+                    bootstrap.plan.uuid);
+          }
         }
         else if (bootstrap.plan.system.kind == SystemContainerKind::none)
         {
@@ -42992,29 +43035,9 @@ public:
                     bootstrap.plan.config.containerBlobSHA256) &&
                 deployment->second->plan.config.containerBlobBytes ==
                     bootstrap.plan.config.containerBlobBytes;
-            bool absentFromFreshCohort = canonicalDeployment &&
-                recoveringPersistedNeuronInventory && witnesses.size() == 3 &&
-                machines.size() == 3 && nBrains == 3;
-            for (const auto& observedWitness : witnesses)
-            {
-              Machine *observed = absentFromFreshCohort
-                  ? findMachineByUUID(observedWitness.machineUUID) : nullptr;
-              const auto inventory = observed == nullptr
-                  ? containerRetirementInventoryByMachine.end()
-                  : containerRetirementInventoryByMachine.find(observed->uuid);
-              if (observed == nullptr || !machines.contains(observed) ||
-                  !observed->runtimeReady || !neuronControlStreamActive(observed) ||
-                  !persistedMachineInventoryUploaded.contains(observed->uuid) ||
-                  inventory == containerRetirementInventoryByMachine.end() ||
-                  inventory->second.authorityEpoch != masterAuthorityEpoch ||
-                  inventory->second.ioGeneration != observed->neuron.ioGeneration ||
-                  inventory->second.present.contains(bootstrap.plan.uuid))
-              {
-                absentFromFreshCohort = false;
-                break;
-              }
-            }
-            canonicalOwner = absentFromFreshCohort;
+            canonicalOwner = canonicalDeployment &&
+                freshAuthenticatedFleetProvesContainerAbsent(
+                    bootstrap.plan.uuid);
           }
         }
         if (!canonicalOwner)

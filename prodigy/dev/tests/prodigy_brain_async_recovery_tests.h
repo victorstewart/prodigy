@@ -505,6 +505,137 @@ static void testAsyncLocalBundleRecoveryWitnessRepair(TestSuite& suite)
     brain.masterAuthorityRuntimeState.machineFragmentAssignments.push_back(
         {machines[index].uuid, machines[index].fragment});
   }
+
+  CrossClusterMasqueGatewayAuthority retainedGatewayAuthority = {};
+  retainedGatewayAuthority.pairUUID = uint128_t(0x7310);
+  retainedGatewayAuthority.pairOperationUUID = uint128_t(0x7311);
+  retainedGatewayAuthority.localClusterUUID = brain.brainConfig.clusterUUID;
+  retainedGatewayAuthority.peerClusterUUID = uint128_t(0x7400);
+  retainedGatewayAuthority.localMachineUUID = machines[0].uuid;
+  retainedGatewayAuthority.peerMachineUUID = uint128_t(0x7401);
+  retainedGatewayAuthority.localDatacenterFragment = 0x73;
+  retainedGatewayAuthority.peerDatacenterFragment = 0x74;
+  retainedGatewayAuthority.localSitePrefix =
+      prodigyContainerDatacenterSitePrefix(0x73);
+  retainedGatewayAuthority.peerSitePrefix =
+      prodigyContainerDatacenterSitePrefix(0x74);
+  retainedGatewayAuthority.artifactSHA256.assign(
+      "abababababababababababababababababababababababababababababababab"_ctv);
+  retainedGatewayAuthority.artifactBytes = 4096;
+  retainedGatewayAuthority.listenerPublicUDPEndpoint =
+      IPAddress("198.51.100.73", false);
+  retainedGatewayAuthority.listenerPublicUDPPort = 4433;
+  retainedGatewayAuthority.privateTunnelInterface.assign("mtbgprepair"_ctv);
+  retainedGatewayAuthority.privateTunnelLocalIPv6 = IPAddress("fd00::1", true);
+  retainedGatewayAuthority.privateTunnelPeerIPv6 = IPAddress("fd00::2", true);
+  retainedGatewayAuthority.privateLocalASN = 42001;
+  retainedGatewayAuthority.privatePeerASN = 42002;
+  retainedGatewayAuthority.privateLocalBGPID = 1;
+  retainedGatewayAuthority.privatePeerBGPID = 2;
+  retainedGatewayAuthority.privateSessionCredentialSHA256.assign(
+      "bcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc"_ctv);
+  retainedGatewayAuthority.localIdentitySHA256.assign(
+      "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"_ctv);
+  retainedGatewayAuthority.peerIdentitySHA256.assign(
+      "dededededededededededededededededededededededededededededededede"_ctv);
+  retainedGatewayAuthority.peerTrustSHA256.assign(
+      "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"_ctv);
+  retainedGatewayAuthority.generation = 1;
+  retainedGatewayAuthority.pairAuthorityGeneration = 7;
+  retainedGatewayAuthority.keyGeneration = 3;
+  retainedGatewayAuthority.localRole =
+      CrossClusterMasqueGatewayRole::listener;
+  retainedGatewayAuthority.state = CrossClusterMasqueGatewayState::active;
+  ProdigyClusterPairEnrollment retainedGatewayEnrollment = {};
+  retainedGatewayEnrollment.pairUUID = retainedGatewayAuthority.pairUUID;
+  retainedGatewayEnrollment.localClusterUUID =
+      retainedGatewayAuthority.localClusterUUID;
+  retainedGatewayEnrollment.peerClusterUUID =
+      retainedGatewayAuthority.peerClusterUUID;
+  retainedGatewayEnrollment.operationUUID =
+      retainedGatewayAuthority.pairOperationUUID;
+  retainedGatewayEnrollment.rootGeneration = 1;
+  retainedGatewayEnrollment.agreedKeyEpoch =
+      retainedGatewayAuthority.keyGeneration;
+  retainedGatewayEnrollment.localAuthorityGeneration =
+      retainedGatewayAuthority.pairAuthorityGeneration;
+  retainedGatewayEnrollment.state = ProdigyClusterPairEnrollmentState::active;
+  for (uint32_t byte = 0; byte < sizeof(retainedGatewayEnrollment.root); ++byte)
+    retainedGatewayEnrollment.root[byte] = uint8_t(byte + 1);
+  ProdigyClusterPairEnrollmentOperation retainedGatewayOperation = {};
+  retainedGatewayOperation.pairUUID = retainedGatewayAuthority.pairUUID;
+  retainedGatewayOperation.operationUUID =
+      retainedGatewayAuthority.pairOperationUUID;
+  retainedGatewayOperation.localAuthorityGeneration =
+      retainedGatewayAuthority.pairAuthorityGeneration;
+  retainedGatewayOperation.transitionGeneration =
+      brain.masterAuthorityRuntimeState.generation + 1;
+  retainedGatewayOperation.pinnedMasterAuthorityEpoch =
+      brain.masterAuthorityEpoch;
+  retainedGatewayOperation.initialProjectionDelivered = true;
+  retainedGatewayOperation.frozenElectorate = {
+      machineUUIDs[0], machineUUIDs[1], machineUUIDs[2]};
+  ClusterPairControlEndpoint retainedGatewayLocalEndpoint = {};
+  retainedGatewayLocalEndpoint.clusterUUID =
+      retainedGatewayAuthority.localClusterUUID;
+  retainedGatewayLocalEndpoint.nodeUUID = machineUUIDs[0];
+  retainedGatewayLocalEndpoint.address = IPAddress("fd00:73::1", true);
+  retainedGatewayLocalEndpoint.port =
+      uint16_t(ReservedPorts::clusterPairControl);
+  ClusterPairControlEndpoint retainedGatewayPeerEndpoint = {};
+  retainedGatewayPeerEndpoint.clusterUUID =
+      retainedGatewayAuthority.peerClusterUUID;
+  retainedGatewayPeerEndpoint.nodeUUID = retainedGatewayAuthority.peerMachineUUID;
+  retainedGatewayPeerEndpoint.address = IPAddress("fd00:74::1", true);
+  retainedGatewayPeerEndpoint.port =
+      uint16_t(ReservedPorts::clusterPairControl);
+  retainedGatewayOperation.localEndpoints = {retainedGatewayLocalEndpoint};
+  retainedGatewayOperation.peerEndpoints = {retainedGatewayPeerEndpoint};
+  auto& transportRoot =
+      brain.masterAuthorityRuntimeState.transportCredentialAuthorityRoot;
+  transportRoot.authorityEpoch = 1;
+  transportRoot.keyEpoch = 1;
+  transportRoot.authorityGeneration =
+      brain.masterAuthorityRuntimeState.generation;
+  for (uint32_t byte = 0; byte < sizeof(transportRoot.root); ++byte)
+    transportRoot.root[byte] = uint8_t(byte + 1);
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    ProdigyTransportCredentialEnrollment enrollment = {};
+    enrollment.operationUUID = uint128_t(0x7320 + index);
+    enrollment.nodeUUID = machineUUIDs[index];
+    enrollment.clusterUUID = brain.brainConfig.clusterUUID;
+    enrollment.authorityEpoch = transportRoot.authorityEpoch;
+    enrollment.keyEpoch = transportRoot.keyEpoch;
+    enrollment.authorityGeneration = transportRoot.authorityGeneration;
+    enrollment.role = ProdigyTransportCredentialNodeRole::brain;
+    enrollment.state = ProdigyTransportCredentialEnrollmentState::active;
+    brain.masterAuthorityRuntimeState.transportCredentialEnrollments.push_back(
+        std::move(enrollment));
+  }
+  for (BrainView& peer : peers)
+  {
+    peer.clusterPairEnrollmentCapabilityAcknowledged = true;
+    peer.clusterPairOperationsCapabilityAcknowledged = true;
+  }
+  brain.masterAuthorityRuntimeState.clusterPairEnrollments.push_back(
+      retainedGatewayEnrollment);
+  brain.masterAuthorityRuntimeState.clusterPairEnrollmentOperations.push_back(
+      retainedGatewayOperation);
+  brain.masterAuthorityRuntimeState.crossClusterMasqueGatewayAuthorities.push_back(
+      retainedGatewayAuthority);
+  NeuronContainerBootstrap absentGatewayBootstrap = {};
+  suite.require(
+      brain.buildCrossClusterMasqueGatewayPlan(
+          retainedGatewayAuthority,
+          prodigyCrossClusterMasqueGatewayRuntimeFragmentFirst,
+          uint128_t(0x7309), absentGatewayBootstrap.plan),
+      "local_bundle_witness_repair_builds_semantically_current_gateway_bootstrap");
+  String serializedAbsentGatewayBootstrap = {};
+  suite.require(
+      BitseryEngine::serialize(
+          serializedAbsentGatewayBootstrap, absentGatewayBootstrap),
+      "local_bundle_witness_repair_serializes_absent_gateway_bootstrap");
   retainedContainer.setMeshAddress(
       container_network_subnet6,
       brain.brainConfig.datacenterFragment,
@@ -562,6 +693,8 @@ static void testAsyncLocalBundleRecoveryWitnessRepair(TestSuite& suite)
     {
       witness.containerBootstraps.push_back(serializedStaleBootstrap);
       witness.containerBootstraps.push_back(serializedAbsentBootstrap);
+      witness.containerBootstraps.push_back(
+          serializedAbsentGatewayBootstrap);
     }
     brain.updateSelfMachineRecoveryWitnesses.push_back(std::move(witness));
     if (index != 0)
@@ -661,6 +794,22 @@ static void testAsyncLocalBundleRecoveryWitnessRepair(TestSuite& suite)
       "local_bundle_witness_repair_rejects_identity_reported_by_another_machine");
   brain.containerRetirementInventoryByMachine[machines[2].uuid].present.erase(
       absentBootstrap.plan.uuid);
+  brain.containerRetirementInventoryByMachine[machines[2].uuid].present.insert(
+      absentGatewayBootstrap.plan.uuid);
+  RepairLocalBundleRecoveryWitness conflictingGatewayAbsenceProof = {};
+  suite.expect(
+      issueDeploymentLifecycleOperationForTest<
+          MothershipTopic::repairLocalBundleRecoveryWitness>(
+          brain, mothership, supersededQuery,
+          conflictingGatewayAbsenceProof) &&
+          conflictingGatewayAbsenceProof.success &&
+          conflictingGatewayAbsenceProof.witnessPresent &&
+          !conflictingGatewayAbsenceProof.eligible &&
+          conflictingGatewayAbsenceProof.failure.equal(
+              "superseded local bundle witness identity lacks a canonical retained owner or fresh authenticated fleet-absence proof"_ctv),
+      "local_bundle_witness_repair_rejects_gateway_identity_reported_by_another_machine");
+  brain.containerRetirementInventoryByMachine[machines[2].uuid].present.erase(
+      absentGatewayBootstrap.plan.uuid);
   RepairLocalBundleRecoveryWitness supersededResponse = {};
   suite.require(
       issueDeploymentLifecycleOperationForTest<
