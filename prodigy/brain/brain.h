@@ -29414,7 +29414,7 @@ public:
     return false;
   }
 
-  bool crossClusterMasqueGatewayPlanMatchesAuthority(
+  bool crossClusterMasqueGatewayPlanCarriesAuthority(
       const ContainerPlan& plan,
       const CrossClusterMasqueGatewayAuthority& authority,
       uint8_t fragment) const
@@ -29434,9 +29434,7 @@ public:
         plan.system.gatewayGeneration != authority.generation ||
         !plan.system.gatewayTunnelInterface.equal(authority.privateTunnelInterface) ||
         !prodigyCrossClusterMasqueGatewayWormholesMatch(authority, plan.wormholes) ||
-        !prodigyCrossClusterMasqueGatewayWhiteholesValid(authority, plan.whiteholes) ||
-        (authority.localRole == CrossClusterMasqueGatewayRole::connector &&
-         !crossClusterMasqueGatewayWhiteholeLeaseMatches(authority, plan.whiteholes[0])))
+        !prodigyCrossClusterMasqueGatewayWhiteholesValid(authority, plan.whiteholes))
       return false;
 
     const SystemContainerEgressPolicy expected =
@@ -29451,6 +29449,21 @@ public:
                     sizeof(observed.address6)) != 0)
       return false;
     return true;
+  }
+
+  bool crossClusterMasqueGatewayPlanMatchesAuthority(
+      const ContainerPlan& plan,
+      const CrossClusterMasqueGatewayAuthority& authority,
+      uint8_t fragment) const
+  {
+    // The lease is current runtime ownership, not part of the authority carried
+    // by a historical plan. Runtime admission still requires it; recovery-witness
+    // identity checks may use the durable plan/authority binding above.
+    return crossClusterMasqueGatewayPlanCarriesAuthority(
+               plan, authority, fragment) &&
+        (authority.localRole != CrossClusterMasqueGatewayRole::connector ||
+         crossClusterMasqueGatewayWhiteholeLeaseMatches(
+             authority, plan.whiteholes[0]));
   }
 
   bool buildCrossClusterMasqueGatewayPlan(
@@ -43007,7 +43020,7 @@ public:
                 durableMasterAuthorityRuntimeStateGeneration ==
                     masterAuthorityRuntimeState.generation &&
                 authority != nullptr &&
-                crossClusterMasqueGatewayPlanMatchesAuthority(
+                crossClusterMasqueGatewayPlanCarriesAuthority(
                     bootstrap.plan, *authority, fragment) &&
                 freshAuthenticatedFleetProvesContainerAbsent(
                     bootstrap.plan.uuid);

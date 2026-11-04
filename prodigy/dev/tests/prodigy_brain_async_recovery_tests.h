@@ -544,7 +544,7 @@ static void testAsyncLocalBundleRecoveryWitnessRepair(TestSuite& suite)
   retainedGatewayAuthority.pairAuthorityGeneration = 7;
   retainedGatewayAuthority.keyGeneration = 3;
   retainedGatewayAuthority.localRole =
-      CrossClusterMasqueGatewayRole::listener;
+      CrossClusterMasqueGatewayRole::connector;
   retainedGatewayAuthority.state = CrossClusterMasqueGatewayState::active;
   ProdigyClusterPairEnrollment retainedGatewayEnrollment = {};
   retainedGatewayEnrollment.pairUUID = retainedGatewayAuthority.pairUUID;
@@ -625,12 +625,44 @@ static void testAsyncLocalBundleRecoveryWitnessRepair(TestSuite& suite)
   brain.masterAuthorityRuntimeState.crossClusterMasqueGatewayAuthorities.push_back(
       retainedGatewayAuthority);
   NeuronContainerBootstrap absentGatewayBootstrap = {};
+  CrossClusterMasqueGatewayAuthority gatewayPlanFixtureAuthority =
+      retainedGatewayAuthority;
+  gatewayPlanFixtureAuthority.localRole =
+      CrossClusterMasqueGatewayRole::listener;
   suite.require(
       brain.buildCrossClusterMasqueGatewayPlan(
-          retainedGatewayAuthority,
+          gatewayPlanFixtureAuthority,
           prodigyCrossClusterMasqueGatewayRuntimeFragmentFirst,
           uint128_t(0x7309), absentGatewayBootstrap.plan),
       "local_bundle_witness_repair_builds_semantically_current_gateway_bootstrap");
+  absentGatewayBootstrap.plan.wormholes.clear();
+  Whitehole retiredConnectorSource = {};
+  retiredConnectorSource.transport = ExternalAddressTransport::quic;
+  retiredConnectorSource.family = ExternalAddressFamily::ipv4;
+  retiredConnectorSource.source = ExternalAddressSource::hostPublicAddress;
+  retiredConnectorSource.hasAddress = true;
+  retiredConnectorSource.address = IPAddress("203.0.113.73", false);
+  retiredConnectorSource.sourcePort = 47373;
+  retiredConnectorSource.bindingNonce = 1;
+  absentGatewayBootstrap.plan.whiteholes.push_back(
+      std::move(retiredConnectorSource));
+  absentGatewayBootstrap.plan.system.egress =
+      prodigyCrossClusterMasqueGatewayEgressPolicy(retainedGatewayAuthority);
+  suite.require(
+      brain.crossClusterMasqueGatewayPlanCarriesAuthority(
+          absentGatewayBootstrap.plan, retainedGatewayAuthority,
+          prodigyCrossClusterMasqueGatewayRuntimeFragmentFirst) &&
+          !brain.crossClusterMasqueGatewayPlanMatchesAuthority(
+              absentGatewayBootstrap.plan, retainedGatewayAuthority,
+              prodigyCrossClusterMasqueGatewayRuntimeFragmentFirst),
+      "local_bundle_witness_repair_connector_plan_carries_authority_without_current_runtime_lease");
+  ContainerPlan foreignGatewayAuthority = absentGatewayBootstrap.plan;
+  ++foreignGatewayAuthority.system.gatewayGeneration;
+  suite.expect(
+      !brain.crossClusterMasqueGatewayPlanCarriesAuthority(
+          foreignGatewayAuthority, retainedGatewayAuthority,
+          prodigyCrossClusterMasqueGatewayRuntimeFragmentFirst),
+      "local_bundle_witness_repair_connector_plan_still_requires_exact_durable_authority");
   String serializedAbsentGatewayBootstrap = {};
   suite.require(
       BitseryEngine::serialize(
