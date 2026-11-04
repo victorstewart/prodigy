@@ -29636,6 +29636,32 @@ public:
       if (runtime->authority.localMachineUUID == machine->uuid &&
           !reportedUUIDs.contains(runtime->plan.uuid))
       {
+        const auto *desired = desiredCrossClusterMasqueGatewayAuthority(
+            runtime->authority.pairUUID, machine->uuid);
+        const auto effective =
+            effectiveCrossClusterMasqueGatewayAuthorities(machine->uuid);
+        const uint8_t fragment = desired == nullptr ? 0 :
+            prodigyCrossClusterMasqueGatewayRuntimeFragment(
+                effective, desired->pairUUID, desired->localMachineUUID);
+        if (!runtime->killPending && desired != nullptr &&
+            crossClusterMasqueGatewayAuthoritiesExactlyEqual(
+                runtime->authority, *desired) &&
+            crossClusterMasqueGatewayPlanMatchesAuthority(
+                runtime->plan, *desired, fragment))
+        {
+          // Inventory absence retires only the process observation. The exact
+          // active authority still owns this UUID and (for a connector) its
+          // durable source-port lease. Replay the same plan; minting a new UUID
+          // and releasing/reallocating the lease here creates an unbounded
+          // authority-generation loop while unrelated state uploads continue.
+          runtime->authenticatedInventoryPlan = {};
+          runtime->neuronIOGeneration = 0;
+          runtime->authenticatedInventoryIOGeneration = 0;
+          runtime->authenticatedInventory = false;
+          runtime->launchDispatched = false;
+          ++runtime;
+          continue;
+        }
         retiredOwners.push_back(
             crossClusterMasqueGatewayWhiteholeOwner(runtime->authority));
         runtime = crossClusterMasqueGatewayBrainRuntimes.erase(runtime);
@@ -56514,7 +56540,7 @@ public:
             break;
           }
           // This accepted upload is authoritative for the complete local
-          // process set.  Drop an ephemeral Brain owner that is absent before
+          // process set. Reconcile absent gateway observations before
           // considering any reported gateway for adoption.
           noteCrossClusterMasqueGatewayInventory(
               neuron->machine, reportedMachineContainerUUIDs);

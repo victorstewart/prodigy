@@ -9702,6 +9702,77 @@ static void testCrossClusterMasqueGatewayConnectorLeaseLifecycle(TestSuite& suit
       promoted.crossClusterMasqueGatewayBrainRuntimes[0].plan.whiteholes[0].bindingNonce == original.bindingNonce,
       "masque_connector_full_upload_adopts_same_uuid_after_durable_authority_retry");
 
+  // A complete inventory can prove that the process is absent, but the exact
+  // active authority remains the durable owner of its UUID and source-port
+  // lease. Replay that same plan instead of releasing/reallocating authority
+  // state and minting a replacement UUID on every unrelated upload.
+  const uint128_t stableRuntimeUUID =
+      promoted.crossClusterMasqueGatewayBrainRuntimes[0].plan.uuid;
+  const uint64_t stableAuthorityGeneration =
+      promoted.masterAuthorityRuntimeState.generation;
+  const uint64_t stableDurableAuthorityGeneration =
+      promoted.durableMasterAuthorityRuntimeStateGeneration;
+  const uint32_t stablePersistCalls = promoted.persistCalls;
+  const size_t stableLeaseCount =
+      promoted.routableResourceLeaseRuntimeState.size();
+  auto requireStableAbsentReplay = [&](const char *name) {
+    bytell_hash_set<uint128_t> emptyInventory = {};
+    host.neuron.wBuffer.clear();
+    promoted.noteCrossClusterMasqueGatewayInventory(
+        &host, emptyInventory);
+    promoted.reconcileCrossClusterMasqueGatewayRuntimeState();
+    uint32_t spins = 0;
+    uint128_t spunUUID = 0;
+    forEachMessageInBuffer(host.neuron.wBuffer, [&](Message *queued) {
+      if (NeuronTopic(queued->topic) != NeuronTopic::spinContainer) return;
+      uint8_t *args = queued->args;
+      uint128_t replaced = 0;
+      String encoded = {};
+      NeuronContainerBootstrap bootstrap = {};
+      Message::extractArg<ArgumentNature::fixed>(args, replaced);
+      Message::extractToStringView(args, encoded);
+      if (replaced == 0 &&
+          BitseryEngine::deserializeSafe(encoded, bootstrap))
+      {
+        ++spins;
+        spunUUID = bootstrap.plan.uuid;
+      }
+    });
+    return suite.require(
+        promoted.crossClusterMasqueGatewayBrainRuntimes.size() == 1 &&
+            promoted.crossClusterMasqueGatewayBrainRuntimes[0].plan.uuid ==
+                stableRuntimeUUID &&
+            promoted.crossClusterMasqueGatewayBrainRuntimes[0].launchDispatched &&
+            !promoted.crossClusterMasqueGatewayBrainRuntimes[0].authenticatedInventory &&
+            promoted.pendingCrossClusterMasqueGatewayRetirements.empty() &&
+            promoted.masterAuthorityRuntimeState.generation ==
+                stableAuthorityGeneration &&
+            promoted.durableMasterAuthorityRuntimeStateGeneration ==
+                stableDurableAuthorityGeneration &&
+            promoted.persistCalls == stablePersistCalls &&
+            promoted.routableResourceLeaseRuntimeState.size() == stableLeaseCount &&
+            promoted.crossClusterMasqueGatewayWhiteholeLeaseMatches(a, original) &&
+            spins == 1 && spunUUID == stableRuntimeUUID,
+        name);
+  };
+  if (!requireStableAbsentReplay(
+          "masque_connector_first_absence_replays_exact_owner_without_authority_churn") ||
+      !requireStableAbsentReplay(
+          "masque_connector_repeated_absence_replays_exact_owner_without_authority_churn"))
+  {
+    thisBrain = savedBrain;
+    return;
+  }
+  host.neuron.wBuffer.clear();
+  uploadGatewayInventory();
+  suite.require(
+      promoted.crossClusterMasqueGatewayBrainRuntimes.size() == 1 &&
+          promoted.crossClusterMasqueGatewayBrainRuntimes[0].plan.uuid ==
+              stableRuntimeUUID &&
+          promoted.crossClusterMasqueGatewayAuthenticatedInventoryCurrent(
+              promoted.crossClusterMasqueGatewayBrainRuntimes[0], &host),
+      "masque_connector_replayed_exact_owner_reauthenticates_from_fresh_inventory");
+
   ContainerView retainedGatewayView = {};
   retainedGatewayView.machine = &host;
   retainedGatewayView.fragment = plan.fragment;
