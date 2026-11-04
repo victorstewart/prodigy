@@ -1069,6 +1069,120 @@ static void testAsyncLocalBundleRecoveryWitnessRepair(TestSuite& suite)
               completedJournal.receipts.back().scope),
       "local_bundle_witness_repair_commits_superseded_receipt_and_requeues_fresh_inventory");
 
+  // A completed superseded receipt must also retire the stale witness if an
+  // old local snapshot projects it again. Its cached bundle payload alone is
+  // not an active coordinator: it belongs to the installed release, not the
+  // superseded expected bundle recorded by the witness.
+  ProdigyPersistentUpdateSelfState retiredWitness = supersededBefore;
+  retiredWitness.state = uint8_t(ProdigyPersistentUpdateSelfState::Phase::idle);
+  retiredWitness.expectedEchos = retiredWitness.bundleEchos = retiredWitness.relinquishEchos = 0;
+  retiredWitness.plannedMasterPeerKey = retiredWitness.pendingDesignatedMasterPeerKey = 0;
+  retiredWitness.useStagedBundleOnly = false;
+  retiredWitness.bundleEchoPeerKeys.clear();
+  retiredWitness.relinquishEchoPeerKeys.clear();
+  retiredWitness.followerBootNsByPeerKey.clear();
+  retiredWitness.followerRebootedPeerKeys.clear();
+  retiredWitness.workerFailure.clear();
+  retiredWitness.workerMachineUUIDs.clear();
+  retiredWitness.workerStagedMachineUUIDs.clear();
+  retiredWitness.workerTransitionIssuedMachineUUIDs.clear();
+  retiredWitness.workerRebootedMachineUUIDs.clear();
+  retiredWitness.workerStateUploadedMachineUUIDs.clear();
+  retiredWitness.bundleBlob.assign("retired installed bundle cache"_ctv);
+  suite.expect(
+      brain.localBundleRecoveryWitnessRetiredByAuthority(
+          brain.masterAuthorityRuntimeState, retiredWitness),
+      "local_bundle_witness_repair_completed_receipt_retires_idle_stale_witness_with_cached_bundle");
+  auto activeRetiredWitness = retiredWitness;
+  activeRetiredWitness.state = uint8_t(ProdigyPersistentUpdateSelfState::Phase::waitingForBundleEchos);
+  suite.expect(
+      !brain.localBundleRecoveryWitnessRetiredByAuthority(
+          brain.masterAuthorityRuntimeState, activeRetiredWitness),
+      "local_bundle_witness_repair_completed_receipt_preserves_active_stale_coordinator");
+  String matchingCacheDigest = {};
+  suite.require(
+      prodigyComputeSHA256Hex(retiredWitness.bundleBlob, matchingCacheDigest),
+      "local_bundle_witness_repair_hashes_cached_bundle_for_active_target_guard");
+  auto targetMatchingCache = retiredWitness;
+  targetMatchingCache.workerExpectedBundleSHA256 = matchingCacheDigest;
+  auto targetJournal = completedJournal;
+  targetJournal.receipts.back().scope.witnessExpectedBundleSHA256 = matchingCacheDigest;
+  suite.require(prodigyLocalBundleRecoveryWitnessRepairScopeSHA256(
+                    targetJournal.receipts.back().scope, targetJournal.receipts.back().scopeSHA256),
+                "local_bundle_witness_repair_binds_reused_target_receipt");
+  auto targetAuthority = brain.masterAuthorityRuntimeState;
+  targetAuthority.taskExecutions.at(
+      prodigyLocalBundleRecoveryWitnessRepairJournalExecutionID).fingerprint.clear();
+  suite.require(BitseryEngine::serialize(
+                    targetAuthority.taskExecutions.at(
+                        prodigyLocalBundleRecoveryWitnessRepairJournalExecutionID).fingerprint,
+                    targetJournal),
+                "local_bundle_witness_repair_encodes_reused_target_receipt");
+  suite.expect(
+      !brain.localBundleRecoveryWitnessRetiredByAuthority(
+          targetAuthority, targetMatchingCache),
+      "local_bundle_witness_repair_completed_receipt_preserves_cached_target_bundle");
+  auto futureReceiptAuthority = brain.masterAuthorityRuntimeState;
+  futureReceiptAuthority.generation = completedJournal.receipts.back().retiredAtAuthorityGeneration - 1;
+  suite.expect(!brain.localBundleRecoveryWitnessRetiredByAuthority(
+                   futureReceiptAuthority, retiredWitness),
+               "local_bundle_witness_repair_rejects_future_retirement_generation");
+  auto corruptReceiptAuthority = brain.masterAuthorityRuntimeState;
+  corruptReceiptAuthority.taskExecutions.at(
+      prodigyLocalBundleRecoveryWitnessRepairJournalExecutionID).fingerprint.assign("invalid-journal"_ctv);
+  suite.expect(!brain.localBundleRecoveryWitnessRetiredByAuthority(
+                   corruptReceiptAuthority, retiredWitness),
+               "local_bundle_witness_repair_rejects_invalid_retirement_journal");
+  auto wrongBootstrap = retiredWitness;
+  suite.require(!wrongBootstrap.machineRecoveryWitnesses.empty() &&
+                    !wrongBootstrap.machineRecoveryWitnesses.front().containerBootstraps.empty(),
+                "local_bundle_witness_repair_retired_witness_has_bootstrap_guard_fixture");
+  if (!wrongBootstrap.machineRecoveryWitnesses.empty() &&
+      !wrongBootstrap.machineRecoveryWitnesses.front().containerBootstraps.empty())
+  {
+    wrongBootstrap.machineRecoveryWitnesses.front().containerBootstraps.front().assign("wrong-bootstrap"_ctv);
+    suite.expect(
+        !brain.localBundleRecoveryWitnessRetiredByAuthority(
+            brain.masterAuthorityRuntimeState, wrongBootstrap),
+        "local_bundle_witness_repair_completed_receipt_rejects_wrong_bootstrap_scope");
+  }
+  ProdigyPersistentMasterAuthorityPackage staleColdPackage = {};
+  staleColdPackage.runtimeState = brain.masterAuthorityRuntimeState;
+  staleColdPackage.runtimeState.updateSelf = retiredWitness;
+  staleColdPackage.runtimeState.updateSelfFollowerConcurrency = 1;
+  StreamingTestBrain coldRestore = {};
+  coldRestore.brainConfig = brain.brainConfig;
+  suite.require(
+      coldRestore.applyPersistentMasterAuthorityPackage(staleColdPackage),
+      "local_bundle_witness_repair_cold_restore_accepts_completed_superseded_receipt");
+  suite.expect(
+      !coldRestore.hasUpdateSelfRecoveryWitness(
+          coldRestore.capturePersistentUpdateSelfState()) &&
+          coldRestore.updateSelfFollowerConcurrency == 0 &&
+          coldRestore.updateSelfTransitionIssuedPeerKeys.empty() &&
+          coldRestore.updateSelfFollowerReadyPeerKeys.empty(),
+      "local_bundle_witness_repair_cold_restore_discards_retired_witness_and_follower_residue");
+  StreamingTestBrain followerProjection = {};
+  followerProjection.brainConfig = brain.brainConfig;
+  followerProjection.masterAuthorityRuntimeState.generation =
+      brain.masterAuthorityRuntimeState.generation - 1;
+  followerProjection.restorePersistentUpdateSelfState(retiredWitness);
+  followerProjection.updateSelfFollowerConcurrency = 1;
+  Brain::PreparedMasterAuthorityRuntimeState preparedFollowerProjection = {};
+  suite.require(
+      followerProjection.prepareReplicatedMasterAuthorityRuntimeState(
+          brain.masterAuthorityRuntimeState, preparedFollowerProjection) &&
+          followerProjection.applyPreparedMasterAuthorityRuntimeState(
+              std::move(preparedFollowerProjection), false, true),
+      "local_bundle_witness_repair_follower_projection_accepts_completed_superseded_receipt");
+  suite.expect(
+      !followerProjection.hasUpdateSelfRecoveryWitness(
+          followerProjection.capturePersistentUpdateSelfState()) &&
+          followerProjection.updateSelfFollowerConcurrency == 0 &&
+          followerProjection.updateSelfTransitionIssuedPeerKeys.empty() &&
+          followerProjection.updateSelfFollowerReadyPeerKeys.empty(),
+      "local_bundle_witness_repair_follower_projection_discards_retired_witness_and_follower_residue");
+
   RepairLocalBundleRecoveryWitness supersededReplay = {};
   suite.expect(
       issueDeploymentLifecycleOperationForTest<

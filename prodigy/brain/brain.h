@@ -13016,6 +13016,14 @@ public:
   bool applyPersistentMasterAuthorityPackage(const ProdigyPersistentMasterAuthorityPackage& package)
   {
     ProdigyMasterAuthorityRuntimeState restoredRuntimeState = package.runtimeState;
+    if (localBundleRecoveryWitnessRetiredByAuthority(
+            restoredRuntimeState, restoredRuntimeState.updateSelf))
+    {
+      restoredRuntimeState.updateSelf = {};
+      restoredRuntimeState.updateSelfFollowerConcurrency = 0;
+      restoredRuntimeState.updateSelfFollowerTransitionIssuedPeerKeys.clear();
+      restoredRuntimeState.updateSelfFollowerReadyPeerKeys.clear();
+    }
     if (!prodigyPendingAddMachinesProvisioningIntentsValid(
             restoredRuntimeState.pendingAddMachinesOperations,
             restoredRuntimeState.pendingAddMachinesProvisioningIntents) ||
@@ -13527,9 +13535,30 @@ public:
           container->plannedWork != nullptr) return false;
     }
     const ProdigyPersistentUpdateSelfState incomingRecoveryWitness =
-        projectUpdateSelfRecoveryWitness(incoming.updateSelf);
+        localBundleRecoveryWitnessRetiredByAuthority(incoming, incoming.updateSelf)
+            ? ProdigyPersistentUpdateSelfState{}
+            : projectUpdateSelfRecoveryWitness(incoming.updateSelf);
     ProdigyPersistentUpdateSelfState localUpdateCoordinator =
         capturePersistentUpdateSelfState();
+    // A follower's idle cached bundle cannot resurrect a witness whose exact
+    // inventory was retired by this authenticated durable authority. Active
+    // update continuations retain their existing owner and are never cleared.
+    const bool retiredLocalCoordinator =
+        !updateSelfTransitionAfterMothershipAck && updateSelfWorkerMothership == nullptr &&
+        !bundleExecRetryTickQueued && !bundlePersistencePreparing && !bundlePersistenceReady &&
+        bundleExecExpectedSHA256.empty() && updateSelfPersistencePending == 0 &&
+        !updateSelfPersistenceFailed && !updateSelfPersistenceTickQueued &&
+        !updateSelfPersistenceQueued && !updateSelfPersistenceReady &&
+        updateSelfDurableContinuations.empty() && deferredUpdateSelfArtifactReceiptContinuations.empty() &&
+        updateSelfBundleIssuedPeerKeys.empty() && updateSelfFollowerReconnectedPeerKeys.empty() &&
+        updateSelfTransitionIssuedPeerKeys.empty() && updateSelfFollowerReadyPeerKeys.empty() &&
+        updateSelfTransitionSentPeerKeys.empty() && updateSelfRelinquishIssuedPeerKeys.empty() &&
+        pendingHandoffAuthoritySource.peerUUID == 0 && pendingHandoffAuthoritySource.peerBootTime == 0 &&
+        pendingHandoffAuthoritySource.peerGeneration == 0 && pendingHandoffAuthoritySource.peerFileSlot == -1 &&
+        pendingHandoffAuthoritySource.transportEpoch == 0 && pendingHandoffAuthoritySource.authorityEpoch == 0 &&
+        pendingMothershipUpdateArtifact == nullptr &&
+        localBundleRecoveryWitnessRetiredByAuthority(incoming, localUpdateCoordinator);
+    if (retiredLocalCoordinator) localUpdateCoordinator = {};
     const ProdigyPersistentUpdateSelfState preProjectionLocalUpdateCoordinator =
         localUpdateCoordinator;
     const ProdigyPersistentUpdateSelfState localRecoveryWitness =
@@ -13622,11 +13651,19 @@ public:
     // witness. A successor also durably retains that witness. Do not replicate
     // coordinator echos, peer state, or the bundle payload.
     sanitizedIncoming.updateSelf = localUpdateCoordinator;
-    sanitizedIncoming.updateSelfFollowerConcurrency = updateSelfFollowerConcurrency;
-    sanitizedIncoming.updateSelfFollowerTransitionIssuedPeerKeys.assign(
-        updateSelfTransitionIssuedPeerKeys.begin(), updateSelfTransitionIssuedPeerKeys.end());
-    sanitizedIncoming.updateSelfFollowerReadyPeerKeys.assign(
-        updateSelfFollowerReadyPeerKeys.begin(), updateSelfFollowerReadyPeerKeys.end());
+    sanitizedIncoming.updateSelfFollowerConcurrency = retiredLocalCoordinator ? 0 : updateSelfFollowerConcurrency;
+    if (retiredLocalCoordinator)
+    {
+      sanitizedIncoming.updateSelfFollowerTransitionIssuedPeerKeys.clear();
+      sanitizedIncoming.updateSelfFollowerReadyPeerKeys.clear();
+    }
+    else
+    {
+      sanitizedIncoming.updateSelfFollowerTransitionIssuedPeerKeys.assign(
+          updateSelfTransitionIssuedPeerKeys.begin(), updateSelfTransitionIssuedPeerKeys.end());
+      sanitizedIncoming.updateSelfFollowerReadyPeerKeys.assign(
+          updateSelfFollowerReadyPeerKeys.begin(), updateSelfFollowerReadyPeerKeys.end());
+    }
     std::sort(sanitizedIncoming.updateSelfFollowerTransitionIssuedPeerKeys.begin(),
               sanitizedIncoming.updateSelfFollowerTransitionIssuedPeerKeys.end());
     std::sort(sanitizedIncoming.updateSelfFollowerReadyPeerKeys.begin(),
@@ -42622,6 +42659,70 @@ public:
             prodigyLocalBundleRecoveryWitnessRepairJournalMaximumPayloadBytes &&
         BitseryEngine::deserializeSafe(carrier->second.fingerprint, journal) &&
         prodigyLocalBundleRecoveryWitnessRepairJournalValid(journal);
+  }
+
+  bool localBundleRecoveryWitnessRetiredByAuthority(
+      const ProdigyMasterAuthorityRuntimeState& authority,
+      const ProdigyPersistentUpdateSelfState& coordinator) const
+  {
+    // Retirement is an inventory tombstone, not merely a cached RPC response.
+    // Only an idle exact witness may yield to it; a new/active update retains
+    // its phase, payload and progress even if it reuses an older bundle.
+    if (coordinator.state != uint8_t(UpdateSelfState::idle) ||
+        coordinator.expectedEchos != 0 || coordinator.bundleEchos != 0 ||
+        coordinator.relinquishEchos != 0 || coordinator.plannedMasterPeerKey != 0 ||
+        coordinator.pendingDesignatedMasterPeerKey != 0 || coordinator.useStagedBundleOnly ||
+        !coordinator.bundleEchoPeerKeys.empty() || !coordinator.relinquishEchoPeerKeys.empty() ||
+        !coordinator.followerBootNsByPeerKey.empty() || !coordinator.followerRebootedPeerKeys.empty() ||
+        !coordinator.workerMachineUUIDs.empty() || !coordinator.workerStagedMachineUUIDs.empty() ||
+        !coordinator.workerTransitionIssuedMachineUUIDs.empty() ||
+        !coordinator.workerRebootedMachineUUIDs.empty() || !coordinator.workerStateUploadedMachineUUIDs.empty() ||
+        (!coordinator.workerFailure.empty() &&
+         !coordinator.workerFailure.equal("local post-exec bundle digest mismatch"_ctv)) ||
+        coordinator.localMachineUUID != 0 || coordinator.localBundleRegistered ||
+        !coordinator.localContainerBootstraps.empty() || coordinator.machineRecoveryWitnesses.size() != 3 ||
+        !authority.updateSelfFollowerTransitionIssuedPeerKeys.empty() ||
+        !authority.updateSelfFollowerReadyPeerKeys.empty()) return false;
+
+    ProdigyLocalBundleRecoveryWitnessRepairJournal journal = {};
+    if (!decodeLocalBundleRecoveryWitnessRepairJournal(authority, journal)) return false;
+    auto witnesses = coordinator.machineRecoveryWitnesses;
+    std::sort(witnesses.begin(), witnesses.end(), [](const auto& left, const auto& right) {
+      return left.machineUUID < right.machineUUID;
+    });
+    for (const auto& receipt : journal.receipts)
+    {
+      const auto& scope = receipt.scope;
+      if (!prodigyLocalBundleRecoveryWitnessRepairScopeSuperseded(scope) ||
+          receipt.retiredAtAuthorityGeneration > authority.generation ||
+          scope.clusterUUID != brainConfig.clusterUUID ||
+          !scope.witnessExpectedBundleSHA256.equals(coordinator.workerExpectedBundleSHA256)) continue;
+      bool matches = true;
+      for (uint32_t index = 0; matches && index < witnesses.size(); ++index)
+      {
+        const auto& witness = witnesses[index];
+        const auto& retired = scope.machines[index];
+        String encoded = {}, digest = {};
+        auto bootstraps = witness.containerBootstraps;
+        matches = witness.machineUUID == retired.machineUUID &&
+            witness.bundleRegistered == retired.bundleRegistered &&
+            witness.containerBootstraps.size() == retired.bootstrapCount &&
+            BitseryEngine::serialize(encoded, bootstraps) &&
+            prodigyComputeSHA256Hex(encoded, digest) && digest.equals(retired.bootstrapInventorySHA256);
+      }
+      if (!matches) continue;
+      if (!coordinator.bundleBlob.empty())
+      {
+        String payloadSHA256 = {};
+        // A request preparing the retired target again is a distinct active
+        // intent. Its payload matches that target; an obsolete installed-bundle
+        // cache does not. New requests set the target before their first receipt.
+        if (!prodigyComputeSHA256Hex(coordinator.bundleBlob, payloadSHA256) ||
+            payloadSHA256.equals(coordinator.workerExpectedBundleSHA256)) return false;
+      }
+      return true;
+    }
+    return false;
   }
 
   bool storeLocalBundleRecoveryWitnessRepairJournal(
