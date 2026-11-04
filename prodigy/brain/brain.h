@@ -24376,6 +24376,7 @@ public:
 
     Vector<String> liveBootstraps = {};
     const Vector<String> *bootstraps = nullptr;
+    bool inventoryObservationOnly = false;
     const char *bootstrapSource = "none";
     String bootstrapFailure = {};
     if (const auto *witness = findUpdateSelfMachineRecoveryWitness(machine->uuid))
@@ -24391,8 +24392,24 @@ public:
       {
         // A durable witness with a stale fragment, absent authority plan, or
         // ambiguous UUID must not become a synthetic live owner.
-        bootstrapSource = "durable-recovery-witness-rejected";
-        bootstrapFailure = std::move(witnessFailure);
+        // An installed successor can leave this predecessor witness behind.
+        // Ask only for the Neuron's complete current inventory when the
+        // retained application projection is stale: an empty request cannot
+        // recreate any captured UUID, while its authenticated reply supplies
+        // the exact fleet-absence proof used by the exceptional repair.
+        if (recoveringPersistedNeuronInventory && !witness->bundleRegistered &&
+            witnessFailure.equal(
+                "durable retained bootstrap does not match canonical deployment authority"_ctv))
+        {
+          bootstraps = &liveBootstraps;
+          inventoryObservationOnly = true;
+          bootstrapSource = "superseded-witness-inventory-observation";
+        }
+        else
+        {
+          bootstrapSource = "durable-recovery-witness-rejected";
+          bootstrapFailure = std::move(witnessFailure);
+        }
       }
     }
     else if (updateSelfMachineRecoveryWitnesses.empty() == false)
@@ -24427,7 +24444,7 @@ public:
       bootstrapSource = "live-projection-rejected";
     }
 
-    if (bootstraps != nullptr)
+    if (bootstraps != nullptr && !inventoryObservationOnly)
     {
       if (bootstraps != &liveBootstraps) liveBootstraps = *bootstraps;
       if (mergeContainerRetirementBootstraps(machine, liveBootstraps))
@@ -42920,10 +42937,51 @@ public:
           canonicalOwner = owner != containers.end() && owner->second != nullptr &&
               owner->second->machine == machine &&
               owner->second->deploymentID == bootstrap.plan.config.deploymentID();
+          if (!canonicalOwner)
+          {
+            const auto deployment = deployments.find(
+                bootstrap.plan.config.deploymentID());
+            const bool canonicalDeployment =
+                deployment != deployments.end() && deployment->second != nullptr &&
+                deployment->second->plan.config.deploymentID() ==
+                    bootstrap.plan.config.deploymentID() &&
+                deployment->second->plan.config.applicationID ==
+                    bootstrap.plan.config.applicationID &&
+                deployment->second->plan.config.versionID ==
+                    bootstrap.plan.config.versionID &&
+                deployment->second->plan.config.containerBlobSHA256.equals(
+                    bootstrap.plan.config.containerBlobSHA256) &&
+                deployment->second->plan.config.containerBlobBytes ==
+                    bootstrap.plan.config.containerBlobBytes;
+            bool absentFromFreshCohort = canonicalDeployment &&
+                recoveringPersistedNeuronInventory && witnesses.size() == 3 &&
+                machines.size() == 3 && nBrains == 3;
+            for (const auto& observedWitness : witnesses)
+            {
+              Machine *observed = absentFromFreshCohort
+                  ? findMachineByUUID(observedWitness.machineUUID) : nullptr;
+              const auto inventory = observed == nullptr
+                  ? containerRetirementInventoryByMachine.end()
+                  : containerRetirementInventoryByMachine.find(observed->uuid);
+              if (observed == nullptr || !machines.contains(observed) ||
+                  !observed->runtimeReady || !neuronControlStreamActive(observed) ||
+                  !persistedMachineInventoryUploaded.contains(observed->uuid) ||
+                  inventory == containerRetirementInventoryByMachine.end() ||
+                  inventory->second.authorityEpoch != masterAuthorityEpoch ||
+                  inventory->second.ioGeneration != observed->neuron.ioGeneration ||
+                  inventory->second.present.contains(bootstrap.plan.uuid))
+              {
+                absentFromFreshCohort = false;
+                break;
+              }
+            }
+            canonicalOwner = absentFromFreshCohort;
+          }
         }
         if (!canonicalOwner)
         {
-          failure.assign("superseded local bundle witness identity lacks a canonical retained owner"_ctv);
+          failure.assign(
+              "superseded local bundle witness identity lacks a canonical retained owner or fresh authenticated fleet-absence proof"_ctv);
           return false;
         }
         ++capturedCount;

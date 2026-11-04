@@ -530,6 +530,14 @@ static void testAsyncLocalBundleRecoveryWitnessRepair(TestSuite& suite)
       BitseryEngine::serialize(serializedStaleBootstrap, staleBootstrap),
       "local_bundle_witness_repair_serializes_superseded_bootstrap");
 
+  NeuronContainerBootstrap absentBootstrap = staleBootstrap;
+  absentBootstrap.plan.uuid = uint128_t(0x7308);
+  absentBootstrap.plan.config = retainedDeployment.plan.config;
+  String serializedAbsentBootstrap = {};
+  suite.require(
+      BitseryEngine::serialize(serializedAbsentBootstrap, absentBootstrap),
+      "local_bundle_witness_repair_serializes_absent_retained_bootstrap");
+
   const String supersededBundle =
       "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"_ctv;
   brain.updateSelfWorkerExpectedBundleSHA256 = supersededBundle;
@@ -551,7 +559,10 @@ static void testAsyncLocalBundleRecoveryWitnessRepair(TestSuite& suite)
     witness.machineUUID = machines[index].uuid;
     witness.bundleRegistered = false;
     if (index == 0)
+    {
       witness.containerBootstraps.push_back(serializedStaleBootstrap);
+      witness.containerBootstraps.push_back(serializedAbsentBootstrap);
+    }
     brain.updateSelfMachineRecoveryWitnesses.push_back(std::move(witness));
     if (index != 0)
     {
@@ -597,6 +608,59 @@ static void testAsyncLocalBundleRecoveryWitnessRepair(TestSuite& suite)
 
   RepairLocalBundleRecoveryWitness supersededQuery = query;
   supersededQuery.operationUUID = uint128_t(0x7306);
+  for (Machine& machine : machines)
+  {
+    machine.neuron.wBuffer.clear();
+    machine.stateUploadRequestPending = false;
+    machine.stateUploadRequestIOGeneration = 0;
+  }
+  brain.queueNeuronStateUploadForMachine(&machines[0]);
+  suite.expect(
+      machines[0].stateUploadRequestPending &&
+          machines[0].stateUploadRequestIOGeneration ==
+              machines[0].neuron.ioGeneration &&
+          !machines[0].neuron.wBuffer.empty() &&
+          !brain.persistedMachineInventoryUploaded.contains(machines[0].uuid),
+      "local_bundle_witness_repair_requests_observation_without_projecting_stale_bootstraps");
+  machines[0].neuron.wBuffer.clear();
+  machines[0].stateUploadRequestPending = false;
+  machines[0].stateUploadRequestIOGeneration = 0;
+  machines[0].runtimeReady = true;
+
+  RepairLocalBundleRecoveryWitness missingAbsenceProof = {};
+  suite.expect(
+      issueDeploymentLifecycleOperationForTest<
+          MothershipTopic::repairLocalBundleRecoveryWitness>(
+          brain, mothership, supersededQuery, missingAbsenceProof) &&
+          missingAbsenceProof.success && missingAbsenceProof.witnessPresent &&
+          !missingAbsenceProof.eligible &&
+          missingAbsenceProof.failure.equal(
+              "superseded local bundle witness identity lacks a canonical retained owner or fresh authenticated fleet-absence proof"_ctv),
+      "local_bundle_witness_repair_rejects_absent_identity_without_fresh_fleet_proof");
+
+  for (Machine& machine : machines)
+  {
+    machine.runtimeReady = true;
+    brain.persistedMachineInventoryUploaded.insert(machine.uuid);
+    auto& inventory = brain.containerRetirementInventoryByMachine[machine.uuid];
+    inventory.authorityEpoch = brain.masterAuthorityEpoch;
+    inventory.ioGeneration = machine.neuron.ioGeneration;
+    inventory.present.clear();
+  }
+  brain.containerRetirementInventoryByMachine[machines[2].uuid].present.insert(
+      absentBootstrap.plan.uuid);
+  RepairLocalBundleRecoveryWitness conflictingAbsenceProof = {};
+  suite.expect(
+      issueDeploymentLifecycleOperationForTest<
+          MothershipTopic::repairLocalBundleRecoveryWitness>(
+          brain, mothership, supersededQuery, conflictingAbsenceProof) &&
+          conflictingAbsenceProof.success && conflictingAbsenceProof.witnessPresent &&
+          !conflictingAbsenceProof.eligible &&
+          conflictingAbsenceProof.failure.equal(
+              "superseded local bundle witness identity lacks a canonical retained owner or fresh authenticated fleet-absence proof"_ctv),
+      "local_bundle_witness_repair_rejects_identity_reported_by_another_machine");
+  brain.containerRetirementInventoryByMachine[machines[2].uuid].present.erase(
+      absentBootstrap.plan.uuid);
   RepairLocalBundleRecoveryWitness supersededResponse = {};
   suite.require(
       issueDeploymentLifecycleOperationForTest<
