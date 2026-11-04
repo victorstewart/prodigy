@@ -15974,7 +15974,8 @@ LOCAL_RUNTIME
   }
 
   static bool captureLocalRecoveryWorkloads(const ClusterStatusReport& report,
-      Vector<MothershipLocalRecoveryWorkloadIdentity>& workloads,String& failure)
+      Vector<MothershipLocalRecoveryWorkloadIdentity>& workloads,String& failure,
+      bool allowUnmaterializedStateful = false)
   {
     workloads.clear();
     if(report.nApplications!=report.applicationReports.size()) {
@@ -15984,7 +15985,7 @@ LOCAL_RUNTIME
       for(const auto& deployment:application.deploymentReports) {
         MothershipLocalRecoveryWorkloadIdentity identity;
         if(!mothershipLocalRecoveryWorkloadIdentityFromReport(
-            application.applicationID,deployment,identity)) {
+            application.applicationID,deployment,identity,allowUnmaterializedStateful)) {
           failure.assign("local runtime recovery observed a malformed deployment identity"_ctv);return false;
         }
         workloads.push_back(std::move(identity));
@@ -16090,7 +16091,7 @@ LOCAL_RUNTIME
         ClusterStatusReport status;
         Vector<MothershipLocalRecoveryWorkloadIdentity> observedWorkloads;
         if(!readManagedClusterStatus(cluster,status,failure) ||
-            !captureLocalRecoveryWorkloads(status,observedWorkloads,failure))return false;
+            !captureLocalRecoveryWorkloads(status,observedWorkloads,failure,supersedingRuntime))return false;
         if(supersedingRuntime) {
           if(observedWorkloads.size()!=prior.request.admittedRuntime.workloads.size()) {
             failure.assign("superseding local runtime recovery changed the predecessor deployment inventory"_ctv);

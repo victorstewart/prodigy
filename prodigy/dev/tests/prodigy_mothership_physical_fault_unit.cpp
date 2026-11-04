@@ -472,19 +472,86 @@ int main(void)
           dormantWorkload, expectedWorkload) &&
           mothershipLocalRecoveryActiveDeploymentCountCoversRequired(5, 3),
       "authority_recovery_accepts_retained_workload_deficit_and_conservative_count");
+  auto coldRestoredWorkload = dormantWorkload;
+  coldRestoredWorkload.shardGroups = 0;
+  suite.expect(
+      mothershipLocalRecoveryWorkloadCanRecoverTo(
+          coldRestoredWorkload, expectedWorkload),
+      "authority_recovery_accepts_only_zero_target_stateful_cold_shard_derivation");
   auto expandedWorkload = expectedWorkload;
   expandedWorkload.target = 4;
   expandedWorkload.targetBase = 4;
   auto substitutedWorkload = dormantWorkload;
   ++substitutedWorkload.deploymentID;
+  auto changedColdShards = coldRestoredWorkload;
+  changedColdShards.shardGroups = 2;
+  auto nonzeroColdTarget = coldRestoredWorkload;
+  nonzeroColdTarget.target = 1;
+  auto statelessColdRestore = coldRestoredWorkload;
+  statelessColdRestore.stateful = false;
   suite.expect(
       !mothershipLocalRecoveryWorkloadCanRecoverTo(
           expandedWorkload, expectedWorkload) &&
           !mothershipLocalRecoveryWorkloadCanRecoverTo(
               substitutedWorkload, expectedWorkload) &&
+          !mothershipLocalRecoveryWorkloadCanRecoverTo(
+              changedColdShards, expectedWorkload) &&
+          !mothershipLocalRecoveryWorkloadCanRecoverTo(
+              nonzeroColdTarget, expectedWorkload) &&
+          !mothershipLocalRecoveryWorkloadCanRecoverTo(
+              statelessColdRestore, expectedWorkload) &&
           !mothershipLocalRecoveryActiveDeploymentCountCoversRequired(2, 3) &&
           !mothershipLocalRecoveryActiveDeploymentCountCoversRequired(3, 0),
       "authority_recovery_rejects_workload_expansion_substitution_or_missing_count");
+
+  MothershipLocalAuthorityRecoveryCohortRequest terminalCohort = {};
+  terminalCohort.admittedRuntime.workloads.push_back(expectedWorkload);
+  ClusterStatusReport terminalReport = {};
+  terminalReport.nApplications = 1;
+  ApplicationStatusReport terminalApplication = {};
+  terminalApplication.applicationID = expectedWorkload.applicationID;
+  DeploymentStatusReport terminalDeployment = {};
+  terminalDeployment.versionID = expectedWorkload.deploymentID & ((uint64_t(1) << 48) - 1);
+  terminalDeployment.isStateful = expectedWorkload.stateful;
+  terminalDeployment.nShardGroups = 0;
+  terminalDeployment.nTarget = 0;
+  terminalDeployment.nTargetBase = 0;
+  terminalDeployment.nTargetSurge = 0;
+  MothershipLocalRecoveryWorkloadIdentity parsedColdWorkload = {};
+  suite.expect(
+      !mothershipLocalRecoveryWorkloadIdentityFromReport(
+          expectedWorkload.applicationID, terminalDeployment, parsedColdWorkload) &&
+          mothershipLocalRecoveryWorkloadIdentityFromReport(
+              expectedWorkload.applicationID, terminalDeployment, parsedColdWorkload, true) &&
+          parsedColdWorkload.deploymentID == expectedWorkload.deploymentID &&
+          !mothershipLocalRecoveryWorkloadIdentityValid(parsedColdWorkload),
+      "authority_recovery_source_parser_allows_only_explicit_cold_stateful_identity");
+  auto materializedColdDeployment = terminalDeployment;
+  materializedColdDeployment.nDeployed = 1;
+  auto nonNoneColdDeployment = terminalDeployment;
+  nonNoneColdDeployment.state = DeploymentState::waitingToDeploy;
+  auto runtimeBearingColdDeployment = terminalDeployment;
+  runtimeBearingColdDeployment.containerRuntimes.push_back({0x1234, 1, 1, 1});
+  suite.expect(
+      !mothershipLocalRecoveryWorkloadIdentityFromReport(
+          expectedWorkload.applicationID, materializedColdDeployment, parsedColdWorkload, true) &&
+          !mothershipLocalRecoveryWorkloadIdentityFromReport(
+              expectedWorkload.applicationID, nonNoneColdDeployment, parsedColdWorkload, true) &&
+          !mothershipLocalRecoveryWorkloadIdentityFromReport(
+              expectedWorkload.applicationID, runtimeBearingColdDeployment, parsedColdWorkload, true),
+      "authority_recovery_source_parser_rejects_nonempty_non_none_or_runtime_cold_state");
+  terminalApplication.deploymentReports.push_back(terminalDeployment);
+  terminalReport.applicationReports.push_back(std::move(terminalApplication));
+  suite.expect(!mothershipLocalRecoveryWorkloadsMatch(terminalCohort, terminalReport),
+               "authority_recovery_terminal_report_rejects_cold_zero_shard_derivation");
+  terminalCohort.protocolVersion =
+      MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeSupersedingUpgradeVersion;
+  suite.expect(mothershipLocalRecoveryWorkloadsCanRecoverTo(terminalCohort, terminalReport),
+               "authority_recovery_v4_source_accepts_cold_zero_shard_derivation");
+  terminalCohort.protocolVersion =
+      MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion;
+  suite.expect(!mothershipLocalRecoveryWorkloadsCanRecoverTo(terminalCohort, terminalReport),
+               "authority_recovery_v3_source_rejects_cold_zero_shard_derivation");
 
   ClusterTopology recoveryTopology = {};
   recoveryTopology.version = cohort.topologyVersion;

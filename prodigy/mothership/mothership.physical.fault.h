@@ -1120,7 +1120,8 @@ static inline bool mothershipLocalRecoveryWorkloadIdentityValid(
 
 static inline bool mothershipLocalRecoveryWorkloadIdentityFromReport(
     uint16_t applicationID, const DeploymentStatusReport& deployment,
-    MothershipLocalRecoveryWorkloadIdentity& identity)
+    MothershipLocalRecoveryWorkloadIdentity& identity,
+    bool allowUnmaterializedStateful = false)
 {
   if (deployment.versionID == 0 || deployment.versionID >= (uint64_t(1) << 48)) return false;
   identity.applicationID = applicationID;
@@ -1130,7 +1131,18 @@ static inline bool mothershipLocalRecoveryWorkloadIdentityFromReport(
   identity.target = deployment.nTarget;
   identity.targetBase = deployment.nTargetBase;
   identity.targetSurge = deployment.nTargetSurge;
-  return mothershipLocalRecoveryWorkloadIdentityValid(identity);
+  if (mothershipLocalRecoveryWorkloadIdentityValid(identity)) return true;
+  // A released predecessor already owns the immutable shard intent. Its cold
+  // source may not have reconstructed any runtime counts yet; this report-only
+  // shape cannot become a durable identity or satisfy terminal verification.
+  return allowUnmaterializedStateful && applicationID != 0 && deployment.isStateful &&
+      deployment.state == DeploymentState::none && deployment.nShardGroups == 0 &&
+      deployment.nTarget == 0 && deployment.nTargetBase == 0 && deployment.nTargetSurge == 0 &&
+      deployment.nDeployed == 0 && deployment.nDeployedCanary == 0 &&
+      deployment.nDeployedBase == 0 && deployment.nDeployedSurge == 0 &&
+      deployment.nHealthy == 0 && deployment.nHealthyCanary == 0 &&
+      deployment.nHealthyBase == 0 && deployment.nHealthySurge == 0 &&
+      deployment.containerRuntimes.empty();
 }
 
 static inline bool mothershipLocalAdmittedRuntimeUpgradeIdentityValid(
@@ -1267,9 +1279,13 @@ static inline bool mothershipLocalRecoveryWorkloadCanRecoverTo(
     const MothershipLocalRecoveryWorkloadIdentity& observed,
     const MothershipLocalRecoveryWorkloadIdentity& expected)
 {
+  const bool unmaterializedStateful = observed.stateful && expected.shardGroups != 0 &&
+      observed.shardGroups == 0 && observed.target == 0 &&
+      observed.targetBase == 0 && observed.targetSurge == 0;
   return observed.applicationID == expected.applicationID &&
       observed.deploymentID == expected.deploymentID &&
-      observed.stateful == expected.stateful && observed.shardGroups == expected.shardGroups &&
+      observed.stateful == expected.stateful &&
+      (observed.shardGroups == expected.shardGroups || unmaterializedStateful) &&
       observed.target <= expected.target && observed.targetBase <= expected.targetBase &&
       observed.targetSurge <= expected.targetSurge;
 }
@@ -1294,7 +1310,9 @@ static inline bool mothershipLocalRecoveryWorkloadsCanRecoverTo(
     {
       MothershipLocalRecoveryWorkloadIdentity identity;
       if (!mothershipLocalRecoveryWorkloadIdentityFromReport(
-              application.applicationID, deployment, identity)) return false;
+              application.applicationID, deployment, identity,
+              request.protocolVersion == MothershipLocalAuthorityRecoveryCohortRequest::
+                  admittedRuntimeSupersedingUpgradeVersion)) return false;
       observed.push_back(std::move(identity));
     }
   std::sort(observed.begin(), observed.end(), [](const auto& left, const auto& right) {
