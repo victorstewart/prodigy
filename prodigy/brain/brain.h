@@ -42712,6 +42712,64 @@ public:
       failure.assign("superseded local bundle worker progress differs from the exact witness cohort"_ctv);
       return false;
     }
+    const auto durablePeerProgressMatches = [](
+        const Vector<uint128_t>& durable,
+        const bytell_hash_set<uint128_t>& live) {
+      if (durable.size() != live.size()) return false;
+      bytell_hash_set<uint128_t> seen = {};
+      for (uint128_t peerKey : durable)
+        if (peerKey == 0 || !live.contains(peerKey) || !seen.insert(peerKey).second)
+          return false;
+      return true;
+    };
+    const bool followerProgressIsEmpty = updateSelfFollowerConcurrency == 0 &&
+        updateSelfTransitionIssuedPeerKeys.empty() &&
+        updateSelfFollowerReadyPeerKeys.empty();
+    bool followerProgressIsExactDurableResidue =
+        updateSelfFollowerConcurrency ==
+            masterAuthorityRuntimeState.updateSelfFollowerConcurrency &&
+        durablePeerProgressMatches(
+            masterAuthorityRuntimeState.updateSelfFollowerTransitionIssuedPeerKeys,
+            updateSelfTransitionIssuedPeerKeys) &&
+        durablePeerProgressMatches(
+            masterAuthorityRuntimeState.updateSelfFollowerReadyPeerKeys,
+            updateSelfFollowerReadyPeerKeys);
+    if (!followerProgressIsEmpty)
+    {
+      followerProgressIsExactDurableResidue = followerProgressIsExactDurableResidue &&
+          cohort.size() == 3 &&
+          updateSelfFollowerConcurrency >= ProdigyUpdateSelfMinimumConcurrency &&
+          updateSelfFollowerConcurrency <= ProdigyUpdateSelfMaximumConcurrency &&
+          updateSelfTransitionIssuedPeerKeys.size() <= cohort.size() - 1 &&
+          updateSelfFollowerReadyPeerKeys.size() <=
+              updateSelfTransitionIssuedPeerKeys.size() &&
+          updateSelfTransitionIssuedPeerKeys.size() -
+                  updateSelfFollowerReadyPeerKeys.size() <=
+              updateSelfFollowerConcurrency;
+      for (uint128_t peerKey : updateSelfTransitionIssuedPeerKeys)
+      {
+        BrainView *peer = findBrainViewByUpdateSelfPeerKey(peerKey);
+        if (peer == nullptr || peer->uuid == 0 || peer->machine == nullptr ||
+            peer->machine->uuid != peer->uuid ||
+            !cohort.contains(peer->machine->uuid) ||
+            !updateSelfPeerKeyMatchesBrain(peerKey, peer))
+        {
+          followerProgressIsExactDurableResidue = false;
+          break;
+        }
+      }
+      for (uint128_t peerKey : updateSelfFollowerReadyPeerKeys)
+        if (!updateSelfTransitionIssuedPeerKeys.contains(peerKey))
+        {
+          followerProgressIsExactDurableResidue = false;
+          break;
+        }
+    }
+    if (!followerProgressIsExactDurableResidue)
+    {
+      failure.assign("superseded local bundle follower progress differs from durable witness cohort"_ctv);
+      return false;
+    }
     if (updateSelfTransitionAfterMothershipAck || updateSelfWorkerMothership != nullptr ||
         bundleExecRetryTickQueued || bundlePersistencePreparing || bundlePersistenceReady ||
         !bundleExecExpectedSHA256.empty() || updateSelfPersistencePending != 0 ||
@@ -42719,8 +42777,7 @@ public:
         updateSelfPersistenceReady || !updateSelfDurableContinuations.empty() ||
         !deferredUpdateSelfArtifactReceiptContinuations.empty() ||
         !updateSelfBundleIssuedPeerKeys.empty() || !updateSelfFollowerReconnectedPeerKeys.empty() ||
-        updateSelfFollowerConcurrency != 0 || !updateSelfTransitionIssuedPeerKeys.empty() ||
-        !updateSelfFollowerReadyPeerKeys.empty() || !updateSelfTransitionSentPeerKeys.empty() ||
+        !updateSelfTransitionSentPeerKeys.empty() ||
         !updateSelfRelinquishIssuedPeerKeys.empty())
     {
       failure.assign("superseded local bundle persistence or transition continuation is active"_ctv);
@@ -54627,11 +54684,16 @@ public:
           }
           // The same-bundle predicate proves every other coordinator field
           // empty. The superseded predicate separately proves that any worker
-          // residue belongs to this exact three-machine witness and that the
-          // persisted-inventory barrier is already holding scheduling. Clear
-          // the complete durable coordinator in the same authority commit as
-          // the immutable receipt; stale bootstraps are never projected.
+          // and follower-concurrency residue belongs to this exact durable
+          // three-machine witness and that the persisted-inventory barrier is
+          // already holding scheduling. Clear the complete durable coordinator
+          // in the same authority commit as the immutable receipt; stale
+          // bootstraps are never projected.
           restorePersistentUpdateSelfState(ProdigyPersistentUpdateSelfState{});
+          updateSelfFollowerConcurrency = 0;
+          updateSelfTransitionIssuedPeerKeys.clear();
+          updateSelfFollowerReadyPeerKeys.clear();
+          updateSelfTransitionSentPeerKeys.clear();
 
           const uint64_t epoch = masterAuthorityEpoch;
           const uint64_t incarnation = mothership->connectionIncarnation;
@@ -54656,6 +54718,8 @@ public:
                 {
                   masterAuthorityRuntimeState = before;
                   restorePersistentUpdateSelfState(beforeCoordinator);
+                  restoreUpdateSelfFollowerConcurrencyState(
+                      masterAuthorityRuntimeState);
                   masterAuthorityRuntimeStateDurable = beforeDurable;
                   durableMasterAuthorityRuntimeStateGeneration = beforeDurableGeneration;
                 }

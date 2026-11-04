@@ -566,6 +566,13 @@ static void testAsyncLocalBundleRecoveryWitnessRepair(TestSuite& suite)
   ++brain.masterAuthorityRuntimeState.generation;
   brain.masterAuthorityRuntimeState.updateSelf =
       brain.capturePersistentUpdateSelfState();
+  brain.masterAuthorityRuntimeState.updateSelfFollowerConcurrency = 1;
+  brain.masterAuthorityRuntimeState.updateSelfFollowerTransitionIssuedPeerKeys = {
+      peers[0].uuid, peers[1].uuid};
+  brain.masterAuthorityRuntimeState.updateSelfFollowerReadyPeerKeys = {
+      peers[0].uuid};
+  brain.restoreUpdateSelfFollowerConcurrencyState(
+      brain.masterAuthorityRuntimeState);
   brain.masterAuthorityRuntimeStateDurable = true;
   brain.durableMasterAuthorityRuntimeStateGeneration =
       brain.masterAuthorityRuntimeState.generation;
@@ -608,6 +615,56 @@ static void testAsyncLocalBundleRecoveryWitnessRepair(TestSuite& suite)
               [](const auto& machine) { return !machine.bundleRegistered; }),
       "local_bundle_witness_repair_queries_exact_superseded_scope");
 
+  brain.updateSelfTransitionIssuedPeerKeys.erase(peers[0].uuid);
+  brain.masterAuthorityRuntimeState.updateSelfFollowerTransitionIssuedPeerKeys = {
+      peers[1].uuid};
+  RepairLocalBundleRecoveryWitness readyWithoutIssued = {};
+  suite.expect(
+      issueDeploymentLifecycleOperationForTest<
+          MothershipTopic::repairLocalBundleRecoveryWitness>(
+          brain, mothership, supersededQuery, readyWithoutIssued) &&
+          readyWithoutIssued.success && readyWithoutIssued.witnessPresent &&
+          !readyWithoutIssued.eligible &&
+          readyWithoutIssued.failure.equal(
+              "superseded local bundle follower progress differs from durable witness cohort"_ctv),
+      "local_bundle_witness_repair_rejects_ready_follower_without_durable_issue");
+  brain.updateSelfTransitionIssuedPeerKeys.insert(peers[0].uuid);
+  brain.masterAuthorityRuntimeState.updateSelfFollowerTransitionIssuedPeerKeys = {
+      peers[0].uuid, peers[1].uuid};
+
+  const uint128_t unknownFollower = uint128_t(0x73ff);
+  brain.updateSelfTransitionIssuedPeerKeys.erase(peers[1].uuid);
+  brain.updateSelfTransitionIssuedPeerKeys.insert(unknownFollower);
+  brain.masterAuthorityRuntimeState.updateSelfFollowerTransitionIssuedPeerKeys = {
+      peers[0].uuid, unknownFollower};
+  RepairLocalBundleRecoveryWitness foreignFollower = {};
+  suite.expect(
+      issueDeploymentLifecycleOperationForTest<
+          MothershipTopic::repairLocalBundleRecoveryWitness>(
+          brain, mothership, supersededQuery, foreignFollower) &&
+          foreignFollower.success && foreignFollower.witnessPresent &&
+          !foreignFollower.eligible &&
+          foreignFollower.failure.equal(
+              "superseded local bundle follower progress differs from durable witness cohort"_ctv),
+      "local_bundle_witness_repair_rejects_foreign_durable_follower_progress");
+  brain.updateSelfTransitionIssuedPeerKeys.erase(unknownFollower);
+  brain.updateSelfTransitionIssuedPeerKeys.insert(peers[1].uuid);
+  brain.masterAuthorityRuntimeState.updateSelfFollowerTransitionIssuedPeerKeys = {
+      peers[0].uuid, peers[1].uuid};
+
+  brain.updateSelfTransitionSentPeerKeys.insert(peers[1].uuid);
+  RepairLocalBundleRecoveryWitness sentTransition = {};
+  suite.expect(
+      issueDeploymentLifecycleOperationForTest<
+          MothershipTopic::repairLocalBundleRecoveryWitness>(
+          brain, mothership, supersededQuery, sentTransition) &&
+          sentTransition.success && sentTransition.witnessPresent &&
+          !sentTransition.eligible &&
+          sentTransition.failure.equal(
+              "superseded local bundle persistence or transition continuation is active"_ctv),
+      "local_bundle_witness_repair_rejects_process_local_follower_transition");
+  brain.updateSelfTransitionSentPeerKeys.clear();
+
   brain.updateSelfPersistencePending = 1;
   RepairLocalBundleRecoveryWitness activeCoordinator = {};
   suite.expect(
@@ -642,6 +699,38 @@ static void testAsyncLocalBundleRecoveryWitnessRepair(TestSuite& suite)
       "8888888888888888888888888888888888888888888888888888888888888888"_ctv);
   const ProdigyPersistentUpdateSelfState supersededBefore =
       brain.capturePersistentUpdateSelfState();
+  const uint8_t supersededFollowerConcurrencyBefore =
+      brain.updateSelfFollowerConcurrency;
+  const auto supersededIssuedBefore =
+      brain.updateSelfTransitionIssuedPeerKeys;
+  const auto supersededReadyBefore =
+      brain.updateSelfFollowerReadyPeerKeys;
+  const uint8_t supersededDurableFollowerConcurrencyBefore =
+      brain.masterAuthorityRuntimeState.updateSelfFollowerConcurrency;
+  const auto supersededDurableIssuedBefore =
+      brain.masterAuthorityRuntimeState.updateSelfFollowerTransitionIssuedPeerKeys;
+  const auto supersededDurableReadyBefore =
+      brain.masterAuthorityRuntimeState.updateSelfFollowerReadyPeerKeys;
+  const auto samePeerKeys = [](const auto& left, const auto& right) {
+    return left.size() == right.size() &&
+        std::all_of(left.begin(), left.end(), [&](uint128_t peerKey) {
+          return right.contains(peerKey);
+        });
+  };
+  const auto supersededFollowerProgressRestored = [&]() {
+    return brain.updateSelfFollowerConcurrency ==
+            supersededFollowerConcurrencyBefore &&
+        samePeerKeys(brain.updateSelfTransitionIssuedPeerKeys,
+                     supersededIssuedBefore) &&
+        samePeerKeys(brain.updateSelfFollowerReadyPeerKeys,
+                     supersededReadyBefore) &&
+        brain.masterAuthorityRuntimeState.updateSelfFollowerConcurrency ==
+            supersededDurableFollowerConcurrencyBefore &&
+        brain.masterAuthorityRuntimeState.updateSelfFollowerTransitionIssuedPeerKeys ==
+            supersededDurableIssuedBefore &&
+        brain.masterAuthorityRuntimeState.updateSelfFollowerReadyPeerKeys ==
+            supersededDurableReadyBefore;
+  };
   RepairLocalBundleRecoveryWitness staleSuperseded = {};
   suite.expect(
       issueDeploymentLifecycleOperationForTest<
@@ -651,7 +740,8 @@ static void testAsyncLocalBundleRecoveryWitnessRepair(TestSuite& suite)
           staleSuperseded.failure.equal(
               "local bundle recovery witness repair query receipt is stale or mismatched"_ctv) &&
           equalSerializedObjects(
-              supersededBefore, brain.capturePersistentUpdateSelfState()),
+              supersededBefore, brain.capturePersistentUpdateSelfState()) &&
+          supersededFollowerProgressRestored(),
       "local_bundle_witness_repair_rejects_stale_superseded_scope_without_mutation");
 
   supersededRetire.scopeSHA256 = supersededResponse.scopeSHA256;
@@ -671,7 +761,14 @@ static void testAsyncLocalBundleRecoveryWitnessRepair(TestSuite& suite)
       mothership.wBuffer.empty() &&
           brain.pendingRuntimePersistence.size() == 1 &&
           !brain.hasUpdateSelfRecoveryWitness(
-              brain.capturePersistentUpdateSelfState()),
+              brain.capturePersistentUpdateSelfState()) &&
+          brain.updateSelfFollowerConcurrency == 0 &&
+          brain.updateSelfTransitionIssuedPeerKeys.empty() &&
+          brain.updateSelfFollowerReadyPeerKeys.empty() &&
+          brain.masterAuthorityRuntimeState.updateSelfFollowerConcurrency == 0 &&
+          brain.masterAuthorityRuntimeState
+              .updateSelfFollowerTransitionIssuedPeerKeys.empty() &&
+          brain.masterAuthorityRuntimeState.updateSelfFollowerReadyPeerKeys.empty(),
       "local_bundle_witness_repair_superseded_retirement_waits_for_commit");
   brain.finishRuntimePersistence(false);
   RepairLocalBundleRecoveryWitness failedSuperseded = {};
@@ -682,7 +779,8 @@ static void testAsyncLocalBundleRecoveryWitnessRepair(TestSuite& suite)
           failedSuperseded) &&
           !failedSuperseded.success && failedSuperseded.witnessPresent &&
           prodigyPersistentUpdateSelfStatesEquivalent(
-              supersededBefore, brain.capturePersistentUpdateSelfState()),
+              supersededBefore, brain.capturePersistentUpdateSelfState()) &&
+          supersededFollowerProgressRestored(),
       "local_bundle_witness_repair_failed_superseded_commit_restores_full_coordinator");
 
   dispatchSupersededRetire();
@@ -703,6 +801,13 @@ static void testAsyncLocalBundleRecoveryWitnessRepair(TestSuite& suite)
           completedSuperseded.success && completedSuperseded.completed &&
           equalSerializedObjects(
               emptyCoordinator, brain.capturePersistentUpdateSelfState()) &&
+          brain.updateSelfFollowerConcurrency == 0 &&
+          brain.updateSelfTransitionIssuedPeerKeys.empty() &&
+          brain.updateSelfFollowerReadyPeerKeys.empty() &&
+          brain.masterAuthorityRuntimeState.updateSelfFollowerConcurrency == 0 &&
+          brain.masterAuthorityRuntimeState
+              .updateSelfFollowerTransitionIssuedPeerKeys.empty() &&
+          brain.masterAuthorityRuntimeState.updateSelfFollowerReadyPeerKeys.empty() &&
           brain.recoveringPersistedNeuronInventory &&
           std::all_of(
               std::begin(machines), std::end(machines),
