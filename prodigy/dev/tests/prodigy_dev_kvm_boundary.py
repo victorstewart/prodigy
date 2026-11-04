@@ -27,6 +27,10 @@ from typing import Sequence
 MARKER = "/run/prodigy-disposable-linux"
 MARKER_CONTENT = "prodigy-disposable-linux-v1"
 COLD_REBOOT_HISTORY_LIMIT = 16
+PERSISTENT_STATE_MAX_BYTES = 64 * 1024
+RECOVERY_STATE_GROWTH_RESERVE_BYTES = 4 * 1024
+RECOVERY_STORAGE_RESERVE_BYTES = 4 * 1024 * 1024
+RECOVERY_STORAGE_RESERVE_INODES = 8
 COLD_REBOOT_MAX_DELAY_MS = 24 * 60 * 60 * 1000
 COLD_REBOOT_RELEASE_GRACE_MS = 30 * 1000
 QEMU_EXEC_IDENTITY_OBSERVATION_SECONDS = 1.0
@@ -186,13 +190,44 @@ def command_matches(pid: int, starttime: str, command: list[str]) -> bool:
     return actual == [item.encode() for item in command]
 
 
+def fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+
+
+def state_bytes(state: dict[str, object]) -> bytes:
+    return (json.dumps(state, sort_keys=True) + "\n").encode("utf-8")
+
+
+def ensure_recovery_capacity(path: Path, state: dict[str, object]) -> None:
+    """Refuse admission/release before disrupting a VM when receipts cannot fit."""
+    require(len(state_bytes(state)) <= PERSISTENT_STATE_MAX_BYTES - RECOVERY_STATE_GROWTH_RESERVE_BYTES,
+            "cold reboot state exceeds query budget including completion reserve")
+    require(path.parent.stat().st_mode & 0o022 == 0, "state parent must not be group/other writable")
+    capacity = os.statvfs(path.parent)
+    available = capacity.f_bavail * capacity.f_frsize
+    require(available >= RECOVERY_STORAGE_RESERVE_BYTES and
+            (capacity.f_files == 0 or capacity.f_favail >= RECOVERY_STORAGE_RESERVE_INODES),
+            f"insufficient recovery storage: availableBytes={available} availableInodes={capacity.f_favail}; "
+            f"need {RECOVERY_STORAGE_RESERVE_BYTES} bytes and {RECOVERY_STORAGE_RESERVE_INODES} inodes "
+            "before arming or stopping the VM; reclaim staging files or expand the filesystem")
+
+
 def write_persistent_state(path: Path, state: dict[str, object]) -> None:
     require(path.parent.stat().st_mode & 0o022 == 0, "state parent must not be group/other writable")
+    payload = state_bytes(state)
+    require(len(payload) <= PERSISTENT_STATE_MAX_BYTES, "persistent state exceeds query budget")
     temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as output:
-        json.dump(state, output, sort_keys=True); output.write("\n"); output.flush(); os.fsync(output.fileno())
-    os.replace(temporary, path); os.chmod(path, 0o600)
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as output:
+            os.fchmod(output.fileno(), 0o600)
+            output.write(payload); output.flush(); os.fsync(output.fileno())
+        os.replace(temporary, path)
+        fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def load_persistent_state(path: Path, task_id: str) -> dict[str, object]:
@@ -522,12 +557,98 @@ def completed_cold_reboot(receipt: dict[str, object], operation_id: str,
     return receipt
 
 
+def cold_reboot_archive_directory(state_path: Path, create: bool = False) -> Path | None:
+    state_path = safe_state_file(state_path)
+    require(state_path.parent.stat().st_mode & 0o022 == 0, "state parent must not be group/other writable")
+    directory = state_path.with_name(state_path.name + ".completed-cold-reboots")
+    if create:
+        try:
+            directory.mkdir(mode=0o700)
+            fsync_directory(directory.parent)
+        except FileExistsError:
+            pass
+    try: metadata = directory.lstat()
+    except FileNotFoundError: return None
+    require(stat.S_ISDIR(metadata.st_mode) and metadata.st_uid == os.geteuid() and
+            stat.S_IMODE(metadata.st_mode) == 0o700,
+            "cold reboot archive must be a private owned directory")
+    return directory
+
+
+def cold_reboot_receipt_sha256(receipt: dict[str, object]) -> str:
+    return hashlib.sha256(json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def archived_cold_reboot(record: dict[str, object], state_path: Path,
+                         operation_id: str) -> dict[str, object] | None:
+    canonical_cold_reboot_id(operation_id, "archived operation ID")
+    directory = cold_reboot_archive_directory(state_path)
+    if directory is None:
+        return None
+    path = directory / (operation_id + ".json")
+    try: fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError: return None
+    except OSError as error:
+        raise BoundaryError(f"cannot safely open cold reboot archive receipt: {error}") from error
+    with os.fdopen(fd, "rb") as source:
+        metadata = os.fstat(source.fileno())
+        require(stat.S_ISREG(metadata.st_mode) and metadata.st_uid == os.geteuid() and
+                metadata.st_nlink == 1 and stat.S_IMODE(metadata.st_mode) == 0o600 and
+                metadata.st_size <= PERSISTENT_STATE_MAX_BYTES,
+                "cold reboot archive receipt must be a bounded private owned regular file")
+        try: envelope = json.load(source)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise BoundaryError("cold reboot archive receipt is corrupt") from error
+    require(isinstance(envelope, dict) and
+            set(envelope) == {"version", "taskID", "guestUUID", "receipt", "sha256"} and
+            envelope["version"] == 1 and envelope["taskID"] == record.get("taskID") and
+            envelope["guestUUID"] == record.get("guestUUID"),
+            "cold reboot archive boundary identity mismatch")
+    receipt = envelope["receipt"]
+    require(isinstance(receipt, dict) and
+            completed_cold_reboot(receipt, operation_id) is not None and
+            envelope["sha256"] == cold_reboot_receipt_sha256(receipt),
+            "cold reboot archive receipt is corrupt")
+    return receipt
+
+
+def persist_cold_reboot_archive(record: dict[str, object], state_path: Path,
+                                receipt: dict[str, object]) -> None:
+    """Publish an immutable receipt before its only inline copy can be evicted.
+
+    The lifecycle lock covers both files. A crash before the state replacement
+    leaves an identical archive duplicate; retry accepts that duplicate exactly.
+    """
+    operation_id = canonical_cold_reboot_id(receipt.get("operationID"), "archived operation ID")
+    require(completed_cold_reboot(receipt, operation_id) is not None,
+            "cannot archive an unfinished cold reboot")
+    existing = archived_cold_reboot(record, state_path, operation_id)
+    if existing is not None:
+        require(existing == receipt, "cold reboot archive operation ID conflicts with durable receipt")
+        return
+    require(isinstance(record.get("taskID"), str) and isinstance(record.get("guestUUID"), str),
+            "cold reboot archive requires boundary identity")
+    envelope = {"version": 1, "taskID": record["taskID"], "guestUUID": record["guestUUID"],
+                "receipt": receipt, "sha256": cold_reboot_receipt_sha256(receipt)}
+    directory = cold_reboot_archive_directory(state_path, create=True)
+    assert directory is not None
+    write_persistent_state(directory / (operation_id + ".json"), envelope)
+
+
 def completed_cold_reboot_for(record: dict[str, object], operation_id: str,
-                              cohort_id: str | None = None) -> dict[str, object] | None:
-    """Find an exact completed retry, including sealed sequential history."""
+                              cohort_id: str | None = None, *,
+                              state_path: Path | None = None) -> dict[str, object] | None:
+    """Find exact retries in current, recent, then archived durable receipts."""
+    def exact(receipt: dict[str, object]) -> dict[str, object] | None:
+        completed = completed_cold_reboot(receipt, operation_id)
+        if completed is not None:
+            require(cohort_id is None or completed.get("cohortID") == cohort_id,
+                    "cold reboot operation cohort differs from durable receipt")
+        return completed
+
     current = record.get("lastColdReboot")
     if isinstance(current, dict):
-        completed = completed_cold_reboot(current, operation_id, cohort_id)
+        completed = exact(current)
         if completed is not None:
             return completed
     history = record.get("completedColdReboots", [])
@@ -536,15 +657,18 @@ def completed_cold_reboot_for(record: dict[str, object], operation_id: str,
     matches: list[dict[str, object]] = []
     for receipt in history:
         require(isinstance(receipt, dict), "persistent cold reboot history receipt is malformed")
-        completed = completed_cold_reboot(receipt, operation_id, cohort_id)
+        completed = exact(receipt)
         if completed is not None:
             matches.append(completed)
     require(len(matches) <= 1, "persistent cold reboot history has duplicate operation ID")
-    return matches[0] if matches else None
+    if matches:
+        return matches[0]
+    archived = archived_cold_reboot(record, state_path, operation_id) if state_path is not None else None
+    return exact(archived) if archived is not None else None
 
 
-def archive_completed_cold_reboot(record: dict[str, object]) -> None:
-    """Move only a completed current receipt to bounded durable replay history."""
+def archive_completed_cold_reboot(record: dict[str, object], state_path: Path) -> None:
+    """Rotate recent receipts without discarding any exact retry identity."""
     current = record.get("lastColdReboot")
     if current is None:
         return
@@ -553,22 +677,36 @@ def archive_completed_cold_reboot(record: dict[str, object]) -> None:
     require(completed_cold_reboot(current, str(current.get("operationID", "")),
                                   current.get("cohortID") if isinstance(current.get("cohortID"), str) else None) is not None,
             "persistent cold reboot receipt is malformed")
-    history = record.setdefault("completedColdReboots", [])
-    require(isinstance(history, list) and len(history) < COLD_REBOOT_HISTORY_LIMIT,
-            "completed cold reboot history is full")
-    history.append(current)
+    history = record.get("completedColdReboots", [])
+    require(isinstance(history, list) and len(history) <= COLD_REBOOT_HISTORY_LIMIT,
+            "persistent cold reboot history is invalid")
+    seen = {current["operationID"]}
+    for receipt in history:
+        require(isinstance(receipt, dict), "persistent cold reboot history receipt is malformed")
+        operation_id = canonical_cold_reboot_id(receipt.get("operationID"), "archived operation ID")
+        require(operation_id not in seen, "persistent cold reboot history has duplicate operation ID")
+        require(completed_cold_reboot(receipt, operation_id) is not None,
+                "persistent cold reboot history receipt is malformed")
+        seen.add(operation_id)
+    ensure_recovery_capacity(state_path, record)
+    persist_cold_reboot_archive(record, state_path, current)
+    if len(history) == COLD_REBOOT_HISTORY_LIMIT:
+        # Migrate legacy inline-only histories lazily, before their first eviction.
+        persist_cold_reboot_archive(record, state_path, history[0])
+    record["completedColdReboots"] = (history + [current])[-COLD_REBOOT_HISTORY_LIMIT:]
     record.pop("lastColdReboot", None)
 
 
 def cold_reboot_status(record: dict[str, object], operation_id: str | None = None,
-                       cohort_id: str | None = None) -> dict[str, object]:
+                       cohort_id: str | None = None, *,
+                       state_path: Path | None = None) -> dict[str, object]:
     """Return one exact operation state without exposing a different operation as a retry."""
     current = record.get("lastColdReboot")
     if isinstance(current, dict) and (operation_id is None or current.get("operationID") == operation_id) and \
             (cohort_id is None or current.get("cohortID") == cohort_id):
         return current
     if operation_id is not None:
-        completed = completed_cold_reboot_for(record, operation_id, cohort_id)
+        completed = completed_cold_reboot_for(record, operation_id, cohort_id, state_path=state_path)
         require(completed is not None, "cold reboot operation is absent")
         return completed
     return {"phase": "idle", "completed": False}
@@ -577,13 +715,14 @@ def cold_reboot_status(record: dict[str, object], operation_id: str | None = Non
 def resume_cold_reboot(record: dict[str, object], state_path: Path, operation_id: str,
                        cohort_id: str | None = None) -> dict[str, object]:
     """Resume one already durable operation; this is the only stop/start path."""
-    completed = completed_cold_reboot_for(record, operation_id, cohort_id)
+    completed = completed_cold_reboot_for(record, operation_id, cohort_id, state_path=state_path)
     if completed is not None:
         return completed
     prior = record.get("lastColdReboot")
     require(isinstance(prior, dict) and prior.get("operationID") == operation_id and
             (cohort_id is None or prior.get("cohortID") == cohort_id) and prior.get("completed") is False,
             "another cold reboot operation already owns this boundary")
+    ensure_recovery_capacity(state_path, record)
     pid = int(record["qemuPID"]); command = record["qemuCommand"]
     if command_matches(pid, record["qemuStarttime"], command):
         stop_persistent_qemu(record, "cold reboot")
@@ -711,7 +850,7 @@ def released_cold_reboot_child(state_path: Path, task_id: str, operation_id: str
     finally:
         if null > 2: os.close(null)
     record = load_persistent_state(state_path, task_id)
-    current = cold_reboot_status(record, operation_id, cohort_id)
+    current = cold_reboot_status(record, operation_id, cohort_id, state_path=state_path)
     require(current.get("phase") == "released" and current.get("completed") is False,
             "cold reboot release is no longer active")
     not_before = current.get("notBeforeUnixMs")
@@ -734,7 +873,7 @@ def recover_stopped_boundary(record: dict[str, object], state_path: Path, operat
                              observed_state_sha256: str) -> dict[str, object]:
     """Recover one OOM-stopped exact boundary through the existing reboot owner."""
     current = record.get("lastColdReboot")
-    completed = completed_cold_reboot_for(record, operation_id)
+    completed = completed_cold_reboot_for(record, operation_id, state_path=state_path)
     receipt = current if isinstance(current, dict) and current.get("operationID") == operation_id else completed
     if receipt is None:
         require(observed_state_sha256 == expected_state_sha256,
@@ -745,7 +884,7 @@ def recover_stopped_boundary(record: dict[str, object], state_path: Path, operat
         if current is not None:
             require(isinstance(current, dict) and current.get("completed") is True,
                     "another unfinished reboot operation already owns this boundary")
-            archive_completed_cold_reboot(record)
+            archive_completed_cold_reboot(record, state_path)
         receipt = {"operationID": operation_id, "beforePID": pid, "beforeStarttime": starttime,
                    "startedAtMonotonicMs": time.monotonic_ns() // 1_000_000, "completed": False,
                    "recoveryProtocol": "prodigy-kvm-stopped-recovery-v1",
@@ -753,6 +892,7 @@ def recover_stopped_boundary(record: dict[str, object], state_path: Path, operat
                    "recoveryExpectedStateSHA256": expected_state_sha256,
                    "recoveryPriorIdentity": {"pid": pid, "starttime": starttime}}
         record["lastColdReboot"] = receipt
+        ensure_recovery_capacity(state_path, record)
         write_persistent_state(state_path, record)
     else:
         validate_stopped_recovery_boundary(record, expected_guest_uuid)
@@ -880,35 +1020,37 @@ def _lifecycle_main(argv: Sequence[str]) -> int:
     if operation == "query":
         require(command_matches(pid, record["qemuStarttime"], command), "exact QEMU process identity mismatch")
         if operation_id is not None:
-            print(json.dumps(cold_reboot_status(record, operation_id, cohort_id), sort_keys=True)); return 0
+            print(json.dumps(cold_reboot_status(record, operation_id, cohort_id, state_path=state_path), sort_keys=True)); return 0
         print(json.dumps(record, sort_keys=True)); return 0
     if operation == "cold-reboot":
         assert operation_id is not None
-        completed = completed_cold_reboot_for(record, operation_id)
+        completed = completed_cold_reboot_for(record, operation_id, state_path=state_path)
         if completed is not None:
             require(command_matches(pid, record["qemuStarttime"], command), "completed cold reboot no longer owns its exact QEMU process")
             verify_persistent_guest(record, pid, record["qemuStarttime"])
             print(json.dumps(completed, sort_keys=True)); return 0
         prior = record.get("lastColdReboot")
         if isinstance(prior, dict) and prior.get("completed") is True:
-            archive_completed_cold_reboot(record); prior = None
+            archive_completed_cold_reboot(record, state_path); prior = None
         require(prior is None or (isinstance(prior, dict) and prior.get("operationID") == operation_id and
                 prior.get("completed") is False), "another cold reboot operation already owns this boundary")
         if prior is None:
             require(command_matches(pid, record["qemuStarttime"], command), "exact QEMU process identity mismatch")
             prior = {"operationID": operation_id, "beforePID": pid, "beforeStarttime": record["qemuStarttime"],
                      "startedAtMonotonicMs": time.monotonic_ns() // 1_000_000, "completed": False}
-            record["lastColdReboot"] = prior; write_persistent_state(state_path, record)
+            record["lastColdReboot"] = prior
+            ensure_recovery_capacity(state_path, record)
+            write_persistent_state(state_path, record)
         receipt = resume_cold_reboot(record, state_path, operation_id)
         print(json.dumps(receipt, sort_keys=True)); return 0
     if operation == "arm-cold-reboot":
         assert operation_id is not None and cohort_id is not None and not_before_unix_ms is not None
-        completed = completed_cold_reboot_for(record, operation_id, cohort_id)
+        completed = completed_cold_reboot_for(record, operation_id, cohort_id, state_path=state_path)
         if completed is not None:
             print(json.dumps(completed, sort_keys=True)); return 0
         prior = record.get("lastColdReboot")
         if isinstance(prior, dict) and prior.get("completed") is True:
-            archive_completed_cold_reboot(record); prior = None
+            archive_completed_cold_reboot(record, state_path); prior = None
         if isinstance(prior, dict) and prior.get("operationID") == operation_id and prior.get("cohortID") == cohort_id:
             require(prior.get("phase") == "armed" and prior.get("completed") is False,
                     "cold reboot operation state is malformed")
@@ -920,14 +1062,16 @@ def _lifecycle_main(argv: Sequence[str]) -> int:
                  "startedAtMonotonicMs": time.monotonic_ns() // 1_000_000,
                  "armedAtUnixMs": time.time_ns() // 1_000_000,
                  "notBeforeUnixMs": not_before_unix_ms, "phase": "armed", "completed": False}
-        record["lastColdReboot"] = armed; write_persistent_state(state_path, record)
+        record["lastColdReboot"] = armed
+        ensure_recovery_capacity(state_path, record)
+        write_persistent_state(state_path, record)
         print(json.dumps(armed, sort_keys=True)); return 0
     if operation == "release-cold-reboot":
         assert operation_id is not None and cohort_id is not None
-        completed = completed_cold_reboot_for(record, operation_id, cohort_id)
+        completed = completed_cold_reboot_for(record, operation_id, cohort_id, state_path=state_path)
         if completed is not None:
             print(json.dumps(completed, sort_keys=True)); return 0
-        current = cold_reboot_status(record, operation_id, cohort_id)
+        current = cold_reboot_status(record, operation_id, cohort_id, state_path=state_path)
         require(current.get("completed") is False and current.get("phase") in ("armed", "released"),
                 "cold reboot operation is not armed")
         released_at = time.time_ns() // 1_000_000
@@ -940,7 +1084,9 @@ def _lifecycle_main(argv: Sequence[str]) -> int:
         current["notBeforeUnixMs"] = max(int(current["notBeforeUnixMs"]),
                                            released_at + COLD_REBOOT_RELEASE_GRACE_MS)
         current["startedAtMonotonicMs"] = time.monotonic_ns() // 1_000_000
-        record["lastColdReboot"] = current; write_persistent_state(state_path, record)
+        record["lastColdReboot"] = current
+        ensure_recovery_capacity(state_path, record)
+        write_persistent_state(state_path, record)
         child = os.fork()
         if child == 0:
             try: released_cold_reboot_child(state_path, task_id, operation_id, cohort_id)

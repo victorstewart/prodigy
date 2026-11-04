@@ -2,6 +2,8 @@
 """No-QEMU safety tests for the disposable KVM boundary launcher."""
 from __future__ import annotations
 import importlib.util
+import copy
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -598,19 +600,163 @@ class KvmBoundaryUnit(unittest.TestCase):
         with self.assertRaisesRegex(KVM.BoundaryError, "strictly ordered"):
             KVM.completed_cold_reboot(record, "1" * 32)
 
-    def test_completed_reboot_history_replays_exactly_and_refuses_new_admission_at_bound(self):
+    def completed_receipt(self, operation: str, cohort: str | None = None, *, after_pid: int = 5):
+        receipt = {"operationID": operation, "beforePID": 4, "beforeStarttime": "8",
+                   "afterPID": after_pid, "afterStarttime": str(after_pid + 4),
+                   "startedAtMonotonicMs": 10, "completedAtMonotonicMs": 20,
+                   "completed": True, "phase": "completed"}
+        if cohort is not None:
+            receipt["cohortID"] = cohort
+        return receipt
+
+    def archive_record(self, receipt: dict[str, object]):
+        return {"taskID": "archive-task", "guestUUID": "12345678-1234-4234-9234-123456789abc",
+                "lastColdReboot": receipt, "completedColdReboots": []}
+
+    def test_durable_archive_rollover_preserves_old_exact_retries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "boundary.json"
+            total = 100
+            record = self.archive_record(self.completed_receipt(f"{1:032x}", "a" * 32))
+            for number in range(1, total + 1):
+                record["lastColdReboot"] = self.completed_receipt(f"{number:032x}", "a" * 32,
+                                                                    after_pid=number + 10)
+                KVM.archive_completed_cold_reboot(record, state)
+            self.assertEqual(len(record["completedColdReboots"]), KVM.COLD_REBOOT_HISTORY_LIMIT)
+            self.assertEqual(KVM.completed_cold_reboot_for(record, f"{1:032x}", "a" * 32,
+                                                           state_path=state)["afterPID"], 11)
+            self.assertEqual(KVM.completed_cold_reboot_for(record, f"{total:032x}", "a" * 32,
+                                                           state_path=state)["afterPID"], total + 10)
+            with self.assertRaisesRegex(KVM.BoundaryError, "cohort differs"):
+                KVM.completed_cold_reboot_for(record, f"{1:032x}", "b" * 32, state_path=state)
+            archive = state.with_name(state.name + ".completed-cold-reboots")
+            self.assertTrue((archive / f"{1:032x}.json").is_file())
+            self.assertLess(len(KVM.state_bytes(record)), 64 * 1024)
+
+    def test_full_legacy_ledger_arms_and_preserves_evicted_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, state = Path(directory), Path(directory) / "boundary.json"
+            record = self.stopped_recovery_record(root)
+            record["completedColdReboots"] = [self.completed_receipt(f"{n:032x}", "a" * 32)
+                                               for n in range(1, 17)]
+            record["lastColdReboot"] = self.completed_receipt(f"{17:032x}", "a" * 32)
+            KVM.write_persistent_state(state, record)
+            with mock.patch.object(KVM, "command_matches", return_value=True), \
+                 mock.patch.object(KVM, "stop_persistent_qemu") as stop, \
+                 mock.patch.object(KVM.os, "fork") as fork:
+                self.assertEqual(KVM.lifecycle_main([
+                    "arm-cold-reboot", "--state", str(state), "--task-id", "g6-task",
+                    "--operation-id", f"{18:032x}", "--cohort-id", "a" * 32,
+                    "--not-before-unix-ms", str(KVM.time.time_ns() // 1_000_000 + 1_000)]), 0)
+            stop.assert_not_called(); fork.assert_not_called()
+            persisted = KVM.load_persistent_state(state, "g6-task")
+            self.assertEqual(persisted["lastColdReboot"]["phase"], "armed")
+            self.assertEqual(len(persisted["completedColdReboots"]), 16)
+            self.assertEqual(persisted["completedColdReboots"][0]["operationID"], f"{2:032x}")
+            self.assertEqual(KVM.completed_cold_reboot_for(persisted, f"{1:032x}", "a" * 32,
+                                                           state_path=state), record["completedColdReboots"][0])
+            self.assertLess(len(KVM.state_bytes(persisted)), 64 * 1024 - 4096)
+
+    def test_capacity_failure_preserves_released_vm_and_does_not_fork(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, state, operation, cohort = Path(directory), Path(directory) / "boundary.json", "1" * 32, "a" * 32
+            record = self.stopped_recovery_record(root)
+            record["lastColdReboot"] = {"operationID": operation, "cohortID": cohort,
+                "beforePID": 42, "beforeStarttime": "old", "startedAtMonotonicMs": 1,
+                "notBeforeUnixMs": 1000, "phase": "armed", "completed": False}
+            KVM.write_persistent_state(state, record)
+            before = state.read_bytes()
+            low_bytes = mock.Mock(f_bavail=1, f_frsize=4096, f_files=1, f_favail=100)
+            with mock.patch.object(KVM.os, "statvfs", return_value=low_bytes), \
+                 mock.patch.object(KVM, "stop_persistent_qemu") as stop, \
+                 mock.patch.object(KVM.os, "fork") as fork, \
+                 mock.patch.object(KVM.subprocess, "Popen") as spawn:
+                with self.assertRaisesRegex(KVM.BoundaryError, "insufficient recovery storage"):
+                    KVM.lifecycle_main(["release-cold-reboot", "--state", str(state), "--task-id", "g6-task",
+                                        "--operation-id", operation, "--cohort-id", cohort])
+                record["lastColdReboot"]["phase"] = "released"
+                with self.assertRaisesRegex(KVM.BoundaryError, "insufficient recovery storage"):
+                    KVM.resume_cold_reboot(record, state, operation, cohort)
+            stop.assert_not_called(); fork.assert_not_called(); spawn.assert_not_called()
+            self.assertEqual(state.read_bytes(), before)
+
+    def test_archive_persists_before_state_replacement_and_replays_exactly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "boundary.json"
+            receipt = self.completed_receipt("1" * 32, "a" * 32)
+            durable = self.archive_record(copy.deepcopy(receipt))
+            KVM.archive_completed_cold_reboot(durable, state)
+            # Simulated interruption: archive publication completed but the
+            # replacement state still owns the old current receipt.
+            pre_replace = self.archive_record(copy.deepcopy(receipt))
+            self.assertEqual(KVM.completed_cold_reboot_for(pre_replace, "1" * 32, "a" * 32,
+                                                           state_path=state), receipt)
+            post_replace = self.archive_record(copy.deepcopy(receipt))
+            post_replace.pop("lastColdReboot")
+            self.assertEqual(KVM.completed_cold_reboot_for(post_replace, "1" * 32, "a" * 32,
+                                                           state_path=state), receipt)
+
+    def test_archive_rejects_immutable_collision_corruption_symlink_and_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, state, operation = Path(directory), Path(directory) / "boundary.json", "1" * 32
+            record = self.archive_record(self.completed_receipt(operation, "a" * 32))
+            KVM.archive_completed_cold_reboot(record, state)
+            record["lastColdReboot"] = self.completed_receipt(operation, "a" * 32, after_pid=99)
+            with self.assertRaises(KVM.BoundaryError):
+                KVM.archive_completed_cold_reboot(record, state)
+            receipt_path = state.with_name(state.name + ".completed-cold-reboots") / f"{operation}.json"
+            lookup = {"taskID": "archive-task", "guestUUID": record["guestUUID"]}
+            receipt_path.chmod(0o644)
+            with self.assertRaises(KVM.BoundaryError):
+                KVM.completed_cold_reboot_for(lookup, operation, "a" * 32, state_path=state)
+            receipt_path.chmod(0o600); receipt_path.write_text("not-json\n")
+            with self.assertRaises(KVM.BoundaryError):
+                KVM.completed_cold_reboot_for(lookup, operation, "a" * 32, state_path=state)
+            receipt_path.unlink()
+            target = root / "other"; target.write_text(json.dumps({}))
+            receipt_path.symlink_to(target)
+            with self.assertRaises(KVM.BoundaryError):
+                KVM.completed_cold_reboot_for(lookup, operation, "a" * 32, state_path=state)
+
+    def test_recovery_capacity_rejects_disk_inode_and_oversize_before_stop_or_fork(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "boundary.json"
+            record = self.archive_record(self.completed_receipt("1" * 32, "a" * 32))
+            low_bytes = mock.Mock(f_bavail=1023, f_frsize=4096, f_files=1, f_favail=100)
+            with mock.patch.object(KVM.os, "statvfs", return_value=low_bytes), self.assertRaises(KVM.BoundaryError):
+                KVM.ensure_recovery_capacity(state, record)
+            low_inodes = mock.Mock(f_bavail=4096, f_frsize=4096, f_files=1, f_favail=7)
+            with mock.patch.object(KVM.os, "statvfs", return_value=low_inodes), self.assertRaises(KVM.BoundaryError):
+                KVM.ensure_recovery_capacity(state, record)
+            record["qemuCommand"] = ["x" * (64 * 1024)]
+            with self.assertRaises(KVM.BoundaryError):
+                KVM.ensure_recovery_capacity(state, record)
+            lifecycle_record = {"qemuPID": 42, "qemuStarttime": "old", "qemuCommand": ["qemu"], "lastColdReboot": None}
+            with mock.patch.object(KVM, "load_persistent_state", return_value=lifecycle_record), \
+                 mock.patch.object(KVM, "command_matches", return_value=True), \
+                 mock.patch.object(KVM, "ensure_recovery_capacity", side_effect=KVM.BoundaryError("capacity")), \
+                 mock.patch.object(KVM, "stop_persistent_qemu") as stop, \
+                 mock.patch.object(KVM.subprocess, "Popen") as spawn, \
+                 self.assertRaisesRegex(KVM.BoundaryError, "capacity"):
+                KVM._lifecycle_main(["arm-cold-reboot", "--state", str(state), "--task-id", "g6-task",
+                                     "--operation-id", "1" * 32, "--cohort-id", "2" * 32,
+                                     "--not-before-unix-ms", str(KVM.time.time_ns() // 1_000_000 + 1_000)])
+            stop.assert_not_called(); spawn.assert_not_called()
+
+    def test_completed_reboot_history_replays_exactly_and_rejects_changed_cohort(self):
         receipt = {"operationID": "1" * 32, "cohortID": "a" * 32, "beforePID": 4,
                    "beforeStarttime": "8", "afterPID": 5, "afterStarttime": "9",
                    "startedAtMonotonicMs": 10, "completedAtMonotonicMs": 20,
                    "completed": True, "phase": "completed"}
-        record = {"lastColdReboot": dict(receipt), "completedColdReboots": []}
-        KVM.archive_completed_cold_reboot(record)
-        self.assertIsNone(record.get("lastColdReboot"))
-        self.assertEqual(KVM.completed_cold_reboot_for(record, "1" * 32, "a" * 32)["afterPID"], 5)
-        self.assertIsNone(KVM.completed_cold_reboot_for(record, "1" * 32, "b" * 32))
-        record = {"lastColdReboot": dict(receipt), "completedColdReboots": [dict(receipt) for _ in range(KVM.COLD_REBOOT_HISTORY_LIMIT)]}
-        with self.assertRaisesRegex(KVM.BoundaryError, "history is full"):
-            KVM.archive_completed_cold_reboot(record)
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "boundary.json"
+            record = self.archive_record(dict(receipt))
+            KVM.archive_completed_cold_reboot(record, state)
+            self.assertIsNone(record.get("lastColdReboot"))
+            self.assertEqual(KVM.completed_cold_reboot_for(record, "1" * 32, "a" * 32,
+                                                           state_path=state)["afterPID"], 5)
+            with self.assertRaisesRegex(KVM.BoundaryError, "cohort differs"):
+                KVM.completed_cold_reboot_for(record, "1" * 32, "b" * 32, state_path=state)
 
     def test_arm_cold_reboot_persists_exact_identity_before_any_qemu_mutation(self):
         with tempfile.TemporaryDirectory() as directory:
