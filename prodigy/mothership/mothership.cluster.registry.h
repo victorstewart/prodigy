@@ -8437,8 +8437,15 @@ public:
     MothershipUpgradeAdmissionRecord admission;
     if (!loadUpgradeAdmission(requested.clusterUUID,runtime.upgradeOperationUUID,admission,failure)) return false;
     String encoded,admissionSHA;
+    const bool normalAdmission = admission.eligible && admission.approvedPath == 1;
+    const bool incompleteObservationRecovery = requested.protocolVersion >=
+            MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion &&
+        !admission.eligible &&
+        admission.approvedPath == 0 &&
+        admission.firstStopGate ==
+            "generation-fenced peer upgrade observation is incomplete"_ctv;
     if (!BitseryEngine::serialize(encoded,admission) || !prodigyComputeSHA256Hex(encoded,admissionSHA,failure) ||
-        !admission.eligible || admission.approvedPath!=1 || admission.clusterUUID!=requested.clusterUUID ||
+        (!normalAdmission && !incompleteObservationRecovery) || admission.clusterUUID!=requested.clusterUUID ||
         admission.operationID!=runtime.upgradeOperationUUID || admissionSHA!=runtime.admissionSHA256 ||
         admission.targetContractSHA256!=runtime.targetContractSHA256) {
       if (failure) failure->assign("local runtime recovery differs from its admitted upgrade"_ctv);

@@ -104,6 +104,10 @@ int main(void)
       "void physicalFaultProviderArguments", "bool runPhysicalFaultProvider");
   const std::string physicalExecutorBoundary = providerSection(
       "bool describePhysicalFaultExecutorBoundary", "bool resolvePhysicalFaultExecutor");
+  const std::string localRecoveryIntent = providerSection(
+      "bool prepareLocalRecoveryRuntimeIntent", "bool installLocalRecoveryRuntime");
+  const std::string upgradePlanner = providerSection(
+      "void runPlanUpgrade", "void runClusterReport");
   suite.expect(!pairArguments.empty() && pairArguments.find("assignItoh") == std::string::npos &&
                    pairArguments.find("mothershipAssignProviderHex128(record.intent.operationUUID, operation);") != std::string::npos &&
                    pairArguments.find("mothershipAssignProviderHex128(record.intent.sourceWorkload.clusterUUID, executorCluster);") != std::string::npos &&
@@ -171,6 +175,17 @@ int main(void)
   suite.expect(!physicalExecutorBoundary.empty() &&
                    physicalExecutorBoundary.find("topologyMachine->ssh.user != \"root\"_ctv") != std::string::npos,
                "production_physical_fault_provider_requires_a_root_managed_cloud_vm_boundary");
+  suite.expect(!localRecoveryIntent.empty() &&
+                   localRecoveryIntent.find("--supersede-released-runtime=") != std::string::npos &&
+                   localRecoveryIntent.find("admittedRuntimeSupersedingUpgradeVersion") != std::string::npos &&
+                   localRecoveryIntent.find("mothershipLocalRecoveryWorkloadCanRecoverTo") != std::string::npos &&
+                   localRecoveryIntent.find("prior.request.admittedRuntime.workloads") != std::string::npos,
+               "local_runtime_recovery_cli_binds_released_predecessor_and_frozen_workloads");
+  suite.expect(!upgradePlanner.empty() &&
+                   upgradePlanner.find("degradedLocalRecoveryAdmission") != std::string::npos &&
+                   upgradePlanner.find("upgrade admission capacity report is missing commissioned-peer measurements") != std::string::npos &&
+                   upgradePlanner.find("reportReceived = true") != std::string::npos,
+               "local_runtime_recovery_preserves_explicit_rejected_degraded_admission");
   suite.expect(!localAction.empty() && localAction.find("assignItoh") == std::string::npos &&
                    localAction.find("mothershipAssignProviderHex128(operationUUID, operation);") != std::string::npos,
                "local_vm_fault_operation_uses_exact_provider_hex");
@@ -432,6 +447,35 @@ int main(void)
   invalidCohort = cohort; invalidCohort.executors[2].boundaryUUID = invalidCohort.executors[1].boundaryUUID;
   suite.expect(!mothershipLocalAuthorityRecoveryCohortRequestValid(invalidCohort, &failure),
                "authority_recovery_rejects_duplicate_boundary_identity");
+
+  MothershipLocalRecoveryWorkloadIdentity expectedWorkload = {};
+  expectedWorkload.applicationID = 42;
+  expectedWorkload.deploymentID = (uint64_t(42) << 48) | 7;
+  expectedWorkload.stateful = true;
+  expectedWorkload.shardGroups = 3;
+  expectedWorkload.target = 3;
+  expectedWorkload.targetBase = 3;
+  auto dormantWorkload = expectedWorkload;
+  dormantWorkload.target = 0;
+  dormantWorkload.targetBase = 0;
+  suite.expect(
+      mothershipLocalRecoveryWorkloadCanRecoverTo(
+          dormantWorkload, expectedWorkload) &&
+          mothershipLocalRecoveryActiveDeploymentCountCoversRequired(5, 3),
+      "authority_recovery_accepts_retained_workload_deficit_and_conservative_count");
+  auto expandedWorkload = expectedWorkload;
+  expandedWorkload.target = 4;
+  expandedWorkload.targetBase = 4;
+  auto substitutedWorkload = dormantWorkload;
+  ++substitutedWorkload.deploymentID;
+  suite.expect(
+      !mothershipLocalRecoveryWorkloadCanRecoverTo(
+          expandedWorkload, expectedWorkload) &&
+          !mothershipLocalRecoveryWorkloadCanRecoverTo(
+              substitutedWorkload, expectedWorkload) &&
+          !mothershipLocalRecoveryActiveDeploymentCountCoversRequired(2, 3) &&
+          !mothershipLocalRecoveryActiveDeploymentCountCoversRequired(3, 0),
+      "authority_recovery_rejects_workload_expansion_substitution_or_missing_count");
 
   ClusterTopology recoveryTopology = {};
   recoveryTopology.version = cohort.topologyVersion;

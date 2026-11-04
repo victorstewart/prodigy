@@ -38176,7 +38176,7 @@ public:
     });
   }
 
-  bool masterAuthorityRuntimeStateAcknowledgedByRegisteredPeers()
+  bool masterAuthorityRuntimeStateAcknowledgedByRegisteredPeers() const
   {
     if (weAreMaster == false || masterAuthorityRuntimeStateDurable == false ||
         durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation)
@@ -42665,6 +42665,221 @@ public:
     return true;
   }
 
+  bool localBundleRecoveryWitnessSupersededCoordinatorIsDormant(
+      const ProdigyPersistentUpdateSelfState& state,
+      const Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness>& witnesses,
+      String& failure) const
+  {
+    failure.clear();
+    if (state.state != uint8_t(UpdateSelfState::idle) || state.expectedEchos != 0 ||
+        state.bundleEchos != 0 || state.relinquishEchos != 0 || state.plannedMasterPeerKey != 0 ||
+        state.pendingDesignatedMasterPeerKey != 0 || state.useStagedBundleOnly || !state.bundleBlob.empty() ||
+        !state.bundleEchoPeerKeys.empty() || !state.relinquishEchoPeerKeys.empty() ||
+        !state.followerBootNsByPeerKey.empty() || !state.followerRebootedPeerKeys.empty())
+    {
+      failure.assign("superseded local bundle coordinator phase or peer progress is active"_ctv);
+      return false;
+    }
+    if ((!state.workerFailure.empty() &&
+         !state.workerFailure.equal("local post-exec bundle digest mismatch"_ctv)) ||
+        state.localMachineUUID != 0 || state.localBundleRegistered ||
+        !state.localContainerBootstraps.empty())
+    {
+      failure.assign("superseded local bundle worker or legacy witness state is incompatible"_ctv);
+      return false;
+    }
+    bytell_hash_set<uint128_t> cohort = {};
+    for (const auto& witness : witnesses)
+      if (witness.machineUUID == 0 || !cohort.insert(witness.machineUUID).second)
+      {
+        failure.assign("superseded local bundle witness cohort is invalid"_ctv);
+        return false;
+      }
+    const auto progressWithinCohort = [&](const Vector<uint128_t>& progress) {
+      bytell_hash_set<uint128_t> seen = {};
+      for (uint128_t machineUUID : progress)
+        if (!cohort.contains(machineUUID) || !seen.insert(machineUUID).second) return false;
+      return true;
+    };
+    if ((!state.workerMachineUUIDs.empty() &&
+         (state.workerMachineUUIDs.size() != cohort.size() ||
+          !progressWithinCohort(state.workerMachineUUIDs))) ||
+        !progressWithinCohort(state.workerStagedMachineUUIDs) ||
+        !progressWithinCohort(state.workerTransitionIssuedMachineUUIDs) ||
+        !progressWithinCohort(state.workerRebootedMachineUUIDs) ||
+        !progressWithinCohort(state.workerStateUploadedMachineUUIDs))
+    {
+      failure.assign("superseded local bundle worker progress differs from the exact witness cohort"_ctv);
+      return false;
+    }
+    if (updateSelfTransitionAfterMothershipAck || updateSelfWorkerMothership != nullptr ||
+        bundleExecRetryTickQueued || bundlePersistencePreparing || bundlePersistenceReady ||
+        !bundleExecExpectedSHA256.empty() || updateSelfPersistencePending != 0 ||
+        updateSelfPersistenceFailed || updateSelfPersistenceTickQueued || updateSelfPersistenceQueued ||
+        updateSelfPersistenceReady || !updateSelfDurableContinuations.empty() ||
+        !deferredUpdateSelfArtifactReceiptContinuations.empty() ||
+        !updateSelfBundleIssuedPeerKeys.empty() || !updateSelfFollowerReconnectedPeerKeys.empty() ||
+        updateSelfFollowerConcurrency != 0 || !updateSelfTransitionIssuedPeerKeys.empty() ||
+        !updateSelfFollowerReadyPeerKeys.empty() || !updateSelfTransitionSentPeerKeys.empty() ||
+        !updateSelfRelinquishIssuedPeerKeys.empty())
+    {
+      failure.assign("superseded local bundle persistence or transition continuation is active"_ctv);
+      return false;
+    }
+    if (pendingHandoffAuthoritySource.peerUUID != 0 || pendingHandoffAuthoritySource.peerBootTime != 0 ||
+        pendingHandoffAuthoritySource.peerGeneration != 0 || pendingHandoffAuthoritySource.peerFileSlot != -1 ||
+        pendingHandoffAuthoritySource.transportEpoch != 0 || pendingHandoffAuthoritySource.authorityEpoch != 0)
+    {
+      failure.assign("superseded local bundle master handoff source is active"_ctv);
+      return false;
+    }
+    // The inventory barrier is the safety owner for this exceptional repair:
+    // stale bootstraps are discarded only while scheduling is already held,
+    // then every machine is asked for a fresh normal stateUpload after commit.
+    if (pendingMothershipUpdateArtifact != nullptr || !recoveringPersistedNeuronInventory ||
+        recoveryPersistencePending || recoveryPersistenceRetryPending ||
+        !pendingMaterializedRecoveryPersistence.empty())
+    {
+      failure.assign("superseded local bundle repair lacks an idle persisted-inventory barrier"_ctv);
+      return false;
+    }
+    if (!masterAuthorityRuntimeState.statefulWorkerTopologyUpgradeOperations.empty() ||
+        !masterAuthorityRuntimeState.deferredStatefulScaleIntents.empty() ||
+        std::any_of(masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.begin(),
+                    masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.end(),
+                    [](const auto& operation) {
+                      return operation.accepted && operation.started && !operation.completed;
+                    }) ||
+        std::any_of(masterAuthorityRuntimeState.materializedStatefulRecoveryRetries.begin(),
+                    masterAuthorityRuntimeState.materializedStatefulRecoveryRetries.end(),
+                    [](const auto& retry) {
+                      return retry.phase != ProdigyMaterializedStatefulRecoveryRetryPhase::completed;
+                    }))
+    {
+      failure.assign("another durable deployment recovery operation is active"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  bool authenticatedInstalledBundleCohort(
+      const Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness>& witnesses,
+      String& installedBundle,
+      String& failure) const
+  {
+    installedBundle.clear();
+    failure.clear();
+    if (witnesses.size() != 3 || machines.size() != 3 || nBrains != 3 ||
+        !masterAuthorityRuntimeStateAcknowledgedByRegisteredPeers())
+    {
+      failure.assign("fresh authenticated three-machine installed-bundle cohort is incomplete"_ctv);
+      return false;
+    }
+    for (const auto& witness : witnesses)
+    {
+      Machine *machine = findMachineByUUID(witness.machineUUID);
+      if (machine == nullptr || machine->uuid == 0 || !machine->isBrain ||
+          machine->state != MachineState::healthy || !neuronControlStreamActive(machine))
+      {
+        failure.assign("fresh authenticated three-machine installed-bundle cohort is incomplete"_ctv);
+        return false;
+      }
+      const String *digest = nullptr;
+      if (machine->isThisMachine)
+      {
+        digest = thisNeuron == nullptr ? nullptr : thisNeuron->readyInstalledBundleDigest();
+      }
+      else
+      {
+        const NeuronView& neuron = machine->neuron;
+        if (!neuron.artifactCapabilityPending &&
+            neuron.verifiedInstalledBundleIOGeneration == neuron.ioGeneration &&
+            neuron.verifiedInstalledBundleAuthorityEpoch == masterAuthorityEpoch &&
+            prodigyIsSHA256HexDigest(neuron.verifiedInstalledBundleSHA256))
+          digest = &neuron.verifiedInstalledBundleSHA256;
+      }
+      if (digest == nullptr || !prodigyIsSHA256HexDigest(*digest) ||
+          (!installedBundle.empty() && !installedBundle.equals(*digest)))
+      {
+        failure.assign("fresh authenticated machine installed-bundle attestations differ or are unavailable"_ctv);
+        return false;
+      }
+      if (installedBundle.empty()) installedBundle = *digest;
+    }
+    return prodigyIsSHA256HexDigest(installedBundle);
+  }
+
+  bool supersededLocalBundleRecoveryWitnessIdentitiesAreCanonical(
+      const Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness>& witnesses,
+      String& failure) const
+  {
+    failure.clear();
+    bool rejectedStaleProjection = false;
+    uint32_t capturedCount = 0;
+    bytell_hash_set<uint128_t> captured = {};
+    for (const auto& witness : witnesses)
+    {
+      Machine *machine = findMachineByUUID(witness.machineUUID);
+      if (machine == nullptr || witness.bundleRegistered)
+      {
+        failure.assign("superseded local bundle witness registration state is not terminal"_ctv);
+        return false;
+      }
+      String projectionFailure = {};
+      if (!durableRecoveryWitnessBootstrapsProjectable(
+              machine, witness.containerBootstraps, projectionFailure))
+      {
+        if (!projectionFailure.equal(
+                "durable retained bootstrap does not match canonical deployment authority"_ctv))
+        {
+          failure.assign("superseded local bundle witness failed an unrelated projection invariant"_ctv);
+          return false;
+        }
+        rejectedStaleProjection = true;
+      }
+      for (const String& serialized : witness.containerBootstraps)
+      {
+        NeuronContainerBootstrap bootstrap = {};
+        if (!BitseryEngine::deserializeSafe(serialized, bootstrap) || bootstrap.plan.uuid == 0 ||
+            !captured.insert(bootstrap.plan.uuid).second)
+        {
+          failure.assign("superseded local bundle witness contains an invalid or duplicate bootstrap"_ctv);
+          return false;
+        }
+        bool canonicalOwner = false;
+        if (bootstrap.plan.system.kind == SystemContainerKind::crossClusterMasqueGateway)
+        {
+          canonicalOwner = std::any_of(
+              crossClusterMasqueGatewayBrainRuntimes.begin(),
+              crossClusterMasqueGatewayBrainRuntimes.end(),
+              [&](const auto& runtime) {
+                return runtime.authority.localMachineUUID == witness.machineUUID &&
+                    runtime.plan.uuid == bootstrap.plan.uuid;
+              });
+        }
+        else if (bootstrap.plan.system.kind == SystemContainerKind::none)
+        {
+          const auto owner = containers.find(bootstrap.plan.uuid);
+          canonicalOwner = owner != containers.end() && owner->second != nullptr &&
+              owner->second->machine == machine &&
+              owner->second->deploymentID == bootstrap.plan.config.deploymentID();
+        }
+        if (!canonicalOwner)
+        {
+          failure.assign("superseded local bundle witness identity lacks a canonical retained owner"_ctv);
+          return false;
+        }
+        ++capturedCount;
+      }
+    }
+    if (!rejectedStaleProjection || capturedCount == 0)
+    {
+      failure.assign("superseded local bundle witness is not the rejected stale retained inventory"_ctv);
+      return false;
+    }
+    return true;
+  }
+
   bool inspectLocalBundleRecoveryWitnessRepairScope(
       uint128_t operationUUID,
       ProdigyLocalBundleRecoveryWitnessRepairScope& scope,
@@ -42698,25 +42913,29 @@ public:
       failure.assign("local bundle recovery witness authority is not ready"_ctv);
       return false;
     }
-    if (masterAuthorityRuntimeState.updateSelf != state)
+    if (!prodigyPersistentUpdateSelfStatesEquivalent(
+            masterAuthorityRuntimeState.updateSelf, state))
     {
       failure.assign("live local bundle witness differs from the durable authority"_ctv);
       return false;
     }
-    if (!localBundleRecoveryWitnessCoordinatorIsDormant(failure)) return false;
 
     Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness> witnesses = state.machineRecoveryWitnesses;
     std::sort(witnesses.begin(), witnesses.end(), [](const auto& left, const auto& right) {
       return left.machineUUID < right.machineUUID;
     });
+    if (witnesses.size() != 3 ||
+        !prodigyIsSHA256HexDigest(state.workerExpectedBundleSHA256))
+    {
+      failure.assign("exact three-machine bundle recovery witness is unavailable"_ctv);
+      return false;
+    }
     uint128_t previousMachine = 0;
     for (const auto& witness : witnesses)
     {
-      if (witness.machineUUID == 0 || witness.machineUUID <= previousMachine ||
-          !witness.bundleRegistered ||
-          !machineBundleInventoryMatchesWitness(findMachineByUUID(witness.machineUUID), witness))
+      if (witness.machineUUID == 0 || witness.machineUUID <= previousMachine)
       {
-        failure.assign("captured machine inventory does not match its registered bundle witness"_ctv);
+        failure.assign("captured machine inventory has an invalid or duplicate machine identity"_ctv);
         return false;
       }
       String encodedBootstraps = {}, digest = {};
@@ -42739,6 +42958,38 @@ public:
       machine.bootstrapInventorySHA256 = std::move(digest);
       scope.machines.push_back(std::move(machine));
       previousMachine = witness.machineUUID;
+    }
+
+    String directlyInstalledBundle = {}, directFailure = {};
+    const bool directCohort = authenticatedInstalledBundleCohort(
+        witnesses, directlyInstalledBundle, directFailure);
+    const bool superseded = directCohort &&
+        !directlyInstalledBundle.equals(state.workerExpectedBundleSHA256);
+    if (superseded)
+    {
+      if (!localBundleRecoveryWitnessSupersededCoordinatorIsDormant(
+              state, witnesses, failure) ||
+          !supersededLocalBundleRecoveryWitnessIdentitiesAreCanonical(
+              witnesses, failure)) return false;
+      scope.installedBundleSHA256 = std::move(directlyInstalledBundle);
+      String digest = {};
+      if (!prodigyLocalBundleRecoveryWitnessRepairScopeSHA256(scope, digest))
+      {
+        failure.assign("superseded local bundle recovery witness scope is invalid"_ctv);
+        return false;
+      }
+      return true;
+    }
+
+    if (!localBundleRecoveryWitnessCoordinatorIsDormant(failure)) return false;
+    for (const auto& witness : witnesses)
+    {
+      if (!witness.bundleRegistered ||
+          !machineBundleInventoryMatchesWitness(findMachineByUUID(witness.machineUUID), witness))
+      {
+        failure.assign("captured machine inventory does not match its registered bundle witness"_ctv);
+        return false;
+      }
     }
     if (!allMachineBundleInventoriesMatch())
     {
@@ -54364,6 +54615,8 @@ public:
           receipt.scopeSHA256 = response.scopeSHA256;
           receipt.acceptedAtMs = acceptedAtMs;
           receipt.retiredAtAuthorityGeneration = generation;
+          journal.protocolVersion =
+              ProdigyLocalBundleRecoveryWitnessRepairJournal::version;
           journal.receipts.push_back(receipt);
           if (!prodigyLocalBundleRecoveryWitnessRepairJournalValid(journal) ||
               !storeLocalBundleRecoveryWitnessRepairJournal(journal, acceptedAtMs))
@@ -54372,11 +54625,13 @@ public:
             reject("local bundle recovery witness repair journal cannot accept the receipt");
             break;
           }
-          // The strict predicate proved every other coordinator field empty.
-          // Clear only the two durable recovery-witness fields, in the same
-          // authority commit that records the immutable terminal receipt.
-          updateSelfWorkerExpectedBundleSHA256.clear();
-          updateSelfMachineRecoveryWitnesses.clear();
+          // The same-bundle predicate proves every other coordinator field
+          // empty. The superseded predicate separately proves that any worker
+          // residue belongs to this exact three-machine witness and that the
+          // persisted-inventory barrier is already holding scheduling. Clear
+          // the complete durable coordinator in the same authority commit as
+          // the immutable receipt; stale bootstraps are never projected.
+          restorePersistentUpdateSelfState(ProdigyPersistentUpdateSelfState{});
 
           const uint64_t epoch = masterAuthorityEpoch;
           const uint64_t incarnation = mothership->connectionIncarnation;
@@ -54403,6 +54658,17 @@ public:
                   restorePersistentUpdateSelfState(beforeCoordinator);
                   masterAuthorityRuntimeStateDurable = beforeDurable;
                   durableMasterAuthorityRuntimeStateGeneration = beforeDurableGeneration;
+                }
+                if (durable && candidateCurrent &&
+                    prodigyLocalBundleRecoveryWitnessRepairScopeSuperseded(receipt.scope))
+                {
+                  recoveringPersistedNeuronInventory = true;
+                  recoveredNeuronPairingsUnified = false;
+                  persistedInventoryConfirmedAbsentContainers.clear();
+                  for (Machine *machine : machines)
+                    if (machine != nullptr && machine->state != MachineState::hardwareFailure &&
+                        machine->state != MachineState::decommissioning)
+                      queueNeuronStateUploadForMachine(machine);
                 }
                 if (!activeMotherships.contains(mothership) ||
                     mothership->connectionIncarnation != incarnation ||

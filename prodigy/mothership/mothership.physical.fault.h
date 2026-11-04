@@ -1261,6 +1261,51 @@ static inline bool mothershipLocalRecoveryWorkloadsMatch(
   return true;
 }
 
+static inline bool mothershipLocalRecoveryWorkloadCanRecoverTo(
+    const MothershipLocalRecoveryWorkloadIdentity& observed,
+    const MothershipLocalRecoveryWorkloadIdentity& expected)
+{
+  return observed.applicationID == expected.applicationID &&
+      observed.deploymentID == expected.deploymentID &&
+      observed.stateful == expected.stateful && observed.shardGroups == expected.shardGroups &&
+      observed.target <= expected.target && observed.targetBase <= expected.targetBase &&
+      observed.targetSurge <= expected.targetSurge;
+}
+
+// Brain's admission count includes retained failed records, pending artifacts,
+// and unmaterialized plans. It can prove that required deployments are still
+// represented, but must not require exact equality with that conservative set.
+static inline bool mothershipLocalRecoveryActiveDeploymentCountCoversRequired(
+    uint32_t observed, uint32_t required)
+{
+  return required != 0 && observed >= required;
+}
+
+static inline bool mothershipLocalRecoveryWorkloadsCanRecoverTo(
+    const MothershipLocalAuthorityRecoveryCohortRequest& request,
+    const ClusterStatusReport& report)
+{
+  Vector<MothershipLocalRecoveryWorkloadIdentity> observed;
+  if (report.nApplications != report.applicationReports.size()) return false;
+  for (const auto& application : report.applicationReports)
+    for (const auto& deployment : application.deploymentReports)
+    {
+      MothershipLocalRecoveryWorkloadIdentity identity;
+      if (!mothershipLocalRecoveryWorkloadIdentityFromReport(
+              application.applicationID, deployment, identity)) return false;
+      observed.push_back(std::move(identity));
+    }
+  std::sort(observed.begin(), observed.end(), [](const auto& left, const auto& right) {
+    return left.applicationID == right.applicationID ? left.deploymentID < right.deploymentID :
+        left.applicationID < right.applicationID;
+  });
+  if (observed.size() != request.admittedRuntime.workloads.size()) return false;
+  for (uint32_t index = 0; index < observed.size(); ++index)
+    if (!mothershipLocalRecoveryWorkloadCanRecoverTo(
+            observed[index], request.admittedRuntime.workloads[index])) return false;
+  return true;
+}
+
 static inline bool mothershipLocalAdmittedRuntimeUpgradeReportValid(
     const MothershipLocalAuthorityRecoveryCohortRequest& request,
     const ClusterStatusReport& report, bool completed)
@@ -1289,6 +1334,54 @@ static inline bool mothershipLocalAdmittedRuntimeUpgradeReportValid(
           observed.runningProdigyVersion != (target ? identity.targetBinaryVersion : identity.sourceBinaryVersion) ||
           observed.approvedBundleSHA256 != (target ? identity.targetBundleSHA256 : identity.sourceBundleSHA256) ||
           (!completed && observed.currentMaster != (member.machineUUID == identity.masterUUID))) return false;
+      masters += observed.currentMaster;
+    }
+    if (topologyMatches != 1 || reportMatches != 1) return false;
+  }
+  return masters == 1;
+}
+
+// Authority recovery starts precisely when the in-cluster readiness bits can
+// no longer be trusted. The controller separately proves each live service,
+// machine ID, boot ID, installed executable, retained bundle, and VM boundary.
+// This report freezes the remaining cluster-owned facts without converting an
+// unready runtime into an ordinary healthy-upgrade observation.
+static inline bool mothershipLocalAdmittedRuntimeUpgradeRecoverySourceReportValid(
+    const MothershipLocalAuthorityRecoveryCohortRequest& request,
+    const ClusterStatusReport& report)
+{
+  const auto& identity = request.admittedRuntime;
+  if (!mothershipLocalAdmittedRuntimeUpgradeIdentityValid(request) || !report.hasTopology ||
+      report.topology.version < request.topologyVersion || report.topology.machines.size() != 3 ||
+      report.machineReports.size() != 3 || report.nMachines != 3 ||
+      !(request.protocolVersion ==
+            MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeSupersedingUpgradeVersion ?
+          mothershipLocalRecoveryWorkloadsCanRecoverTo(request, report) :
+          mothershipLocalRecoveryWorkloadsMatch(request, report))) return false;
+  unsigned masters = 0;
+  for (const auto& member : request.runtime.members)
+  {
+    unsigned topologyMatches = 0, reportMatches = 0;
+    for (const auto& machine : report.topology.machines)
+      topologyMatches += machine.uuid == member.machineUUID && machine.isBrain &&
+          machine.kind == MachineConfig::MachineKind::vm &&
+          machine.backing == ClusterMachineBacking::owned &&
+          machine.lifetime == MachineLifetime::owned;
+    String machineUUID;
+    machineUUID.assignItoh(member.machineUUID);
+    for (const auto& observed : report.machineReports)
+    {
+      if (observed.machineUUID != machineUUID) continue;
+      ++reportMatches;
+      if (!observed.isBrain || observed.state != "healthy"_ctv || observed.decommissioning ||
+          observed.rebooting || observed.updatingOS || observed.hardwareFailure ||
+          observed.updateStage != "idle"_ctv || !observed.stagedBundleSHA256.empty() ||
+          observed.runningProdigyVersion != identity.sourceBinaryVersion ||
+          (!observed.approvedBundleSHA256.empty() &&
+           observed.approvedBundleSHA256 != identity.sourceBundleSHA256) ||
+          (observed.approvedBundleSHA256.empty() &&
+           (observed.controlPlaneReachable || observed.runtimeReady)) ||
+          observed.currentMaster != (member.machineUUID == identity.masterUUID)) return false;
       masters += observed.currentMaster;
     }
     if (topologyMatches != 1 || reportMatches != 1) return false;

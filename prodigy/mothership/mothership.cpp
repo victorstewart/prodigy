@@ -11929,6 +11929,23 @@ private:
     {
       if (!requestUpgradeAdmissionReport(observationRequest, report, failure))
       {
+        MothershipProdigyCluster degradedLocalCluster = {};
+        const bool degradedLocalRecoveryAdmission =
+            failure.equal(
+                "upgrade admission capacity report is missing commissioned-peer measurements"_ctv) &&
+            tryLoadStoredClusterTarget(argv[0], degradedLocalCluster) &&
+            degradedLocalCluster.deploymentMode == MothershipClusterDeploymentMode::local &&
+            degradedLocalCluster.nBrains == 3 &&
+            degradedLocalCluster.topology.machines.size() == 3 &&
+            report.clusterUUID == degradedLocalCluster.clusterUUID && report.master &&
+            report.masterUUID != 0 && !report.peers.empty();
+        if (degradedLocalRecoveryAdmission)
+        {
+          // Preserve this as an explicitly rejected admission. The protocol-3/4
+          // recovery owner must still prove every registered VM boundary,
+          // source bundle, workload, boot, and gateway before any mutation.
+          reportReceived = true;
+        }
         break;
       }
       reportReceived = true;
@@ -15763,19 +15780,19 @@ private:
     value=value.substr(0,bytes,Copy::yes);return true;
   }
   static String localRecoverySourceBundle(const MothershipLocalAuthorityRecoveryCohortRequest& request) {
-    return request.protocolVersion==MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion ?
+    return request.protocolVersion>=MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion ?
         request.admittedRuntime.sourceBundleSHA256 : String(mothershipLocalInterruptedUpgradeSourceBundle);
   }
   static String localRecoveryTargetBundle(const MothershipLocalAuthorityRecoveryCohortRequest& request) {
-    return request.protocolVersion==MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion ?
+    return request.protocolVersion>=MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion ?
         request.admittedRuntime.targetBundleSHA256 : String(mothershipLocalInterruptedUpgradeTargetBundle);
   }
   static String localRecoverySourceRuntime(const MothershipLocalAuthorityRecoveryCohortRequest& request) {
-    return request.protocolVersion==MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion ?
+    return request.protocolVersion>=MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion ?
         request.admittedRuntime.sourceProdigySHA256 : String(mothershipLocalInterruptedUpgradeSourceRuntime);
   }
   static String localRecoveryTargetRuntime(const MothershipLocalAuthorityRecoveryCohortRequest& request) {
-    return request.protocolVersion==MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion ?
+    return request.protocolVersion>=MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion ?
         request.admittedRuntime.targetProdigySHA256 : String(mothershipLocalInterruptedUpgradeTargetRuntime);
   }
 
@@ -15832,7 +15849,7 @@ private:
     // gateway-specific snapshot and must not make two exact gateway leaves
     // appear malformed. Any gateway-marked process still has to match the
     // typed authority and executable, and a partial pair remains invalid.
-    const bool admittedRuntime=request.protocolVersion==
+    const bool admittedRuntime=request.protocolVersion>=
         MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion;
     const auto occupied=admittedRuntime ?
         initialSeedRepairInventoryProgram(manifest,machine,true,false,true,true) :
@@ -15886,12 +15903,21 @@ LOCAL_RUNTIME
       bool completed,String& failure)
   {
     ClusterStatusReport status;
-    if(!productionClusterHealthy(cluster,status,failure) ||
-       !mothershipLocalAuthorityRecoveryTopologyMatches(request,status.topology) ||
-       !mothershipLocalRecoveryRuntimeReportValid(request,status,completed)) {
+    const bool recoverySource = !completed && request.protocolVersion >=
+        MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion;
+    const bool statusRead = recoverySource ? readManagedClusterStatus(cluster,status,failure) :
+                                             productionClusterHealthy(cluster,status,failure);
+    const bool statusValid = recoverySource ?
+        mothershipLocalAdmittedRuntimeUpgradeRecoverySourceReportValid(request,status) :
+        mothershipLocalRecoveryRuntimeReportValid(request,status,completed);
+    if(!statusRead || !mothershipLocalAuthorityRecoveryTopologyMatches(request,status.topology) || !statusValid) {
       if(failure.empty())failure.assign("local runtime recovery lacks its exact empty healthy runtime cohort"_ctv);
       return false;
     }
+    // Admission plus the direct per-VM observations owns the degraded source
+    // boundary. A complete healthy authority report is mandatory again after
+    // the three exact target activations.
+    if(recoverySource)return true;
     String clusterName=cluster.name;
     if(!configureControlTarget(clusterName.c_str(),&failure))return false;
     ProdigyUpgradeAdmissionReportRequest query;query.operationID.assignItoh(request.runtime.upgradeOperationUUID);
@@ -15899,13 +15925,15 @@ LOCAL_RUNTIME
     query.requiredStagingBytes=bundle.contract.requiredFreeBytes;
     MothershipUpgradeAdmissionReport report;
     if(!requestUpgradeAdmissionReport(query,report,failure))return false;
-    const uint32_t expectedDeployments = request.protocolVersion==
+    const uint32_t expectedDeployments = request.protocolVersion>=
         MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion ?
         request.admittedRuntime.activeDeploymentCount : 0;
     if(report.clusterUUID!=cluster.clusterUUID || !report.master || !report.observationComplete ||
         !report.authorityQuorumHealthy || !report.authorityAcknowledged || !report.recoveryWitnessAcknowledged ||
         !report.commissionedPeerTransportVerified || !report.fleetInventoriesFresh || !report.fleetBundleDigestsFresh ||
-        report.activeDeploymentCount!=expectedDeployments || report.healthyCommissionedBrainCount!=3 || report.peers.size()!=3) {
+        !mothershipLocalRecoveryActiveDeploymentCountCoversRequired(
+            report.activeDeploymentCount,expectedDeployments) ||
+        report.healthyCommissionedBrainCount!=3 || report.peers.size()!=3) {
       failure.assign("local runtime recovery requires fresh exact inventory and current durable authority"_ctv);return false;
     }
     for(uint32_t peerIndex=0;peerIndex<report.peers.size();++peerIndex) {
@@ -15972,9 +16000,15 @@ LOCAL_RUNTIME
       ProdigyApprovedUpgradeBundle& bundle,String& failure)
   {
     using namespace MothershipTidesMigration;
-    const bool admittedRuntime=std::strcmp(predecessorText,"--admitted-active-runtime")==0;
+    const std::string predecessorArgument=predecessorText;
+    const std::string supersedingPrefix="--supersede-released-runtime=";
+    const bool supersedingRuntime=predecessorArgument.starts_with(supersedingPrefix);
+    const bool admittedRuntime=std::strcmp(predecessorText,"--admitted-active-runtime")==0 ||
+        supersedingRuntime;
     uint128_t upgrade=0,predecessor=0;
     if(!prodigyParseCanonicalHex128(String(upgradeText),upgrade) ||
+        (supersedingRuntime && !prodigyParseCanonicalHex128(
+            String(predecessorArgument.substr(supersedingPrefix.size()).c_str()),predecessor)) ||
         (!admittedRuntime && !prodigyParseCanonicalHex128(String(predecessorText),predecessor)))return false;
     if(!admittedRuntime && (upgrade!=mothershipLocalInterruptedUpgradeOperationUUID() ||
         predecessor!=mothershipLocalInterruptedUpgradePredecessorUUID() ||
@@ -15987,9 +16021,10 @@ LOCAL_RUNTIME
         bundle.contract.prodigySHA256!=mothershipLocalInterruptedUpgradeTargetRuntime))return false;
     auto& intent=request.runtime;
     if(existing) {
-      const uint32_t protocol=admittedRuntime ?
-          MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion :
-          MothershipLocalAuthorityRecoveryCohortRequest::interruptedUpgradeVersion;
+      const uint32_t protocol=supersedingRuntime ?
+          MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeSupersedingUpgradeVersion :
+          (admittedRuntime ? MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion :
+                             MothershipLocalAuthorityRecoveryCohortRequest::interruptedUpgradeVersion);
       if(request.protocolVersion!=protocol ||
           intent.upgradeOperationUUID!=upgrade || intent.predecessorRecoveryUUID!=predecessor ||
           intent.bundlePath!=path || intent.targetContractSHA256!=bundle.contract.contractSHA256 ||
@@ -15997,20 +16032,28 @@ LOCAL_RUNTIME
             request.admittedRuntime.targetProdigySHA256!=bundle.contract.prodigySHA256 ||
             request.admittedRuntime.targetMothershipSHA256!=bundle.contract.mothershipSHA256)))return false;
     } else {
-      request.protocolVersion=admittedRuntime ?
-          MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion :
-          MothershipLocalAuthorityRecoveryCohortRequest::interruptedUpgradeVersion;
+      request.protocolVersion=supersedingRuntime ?
+          MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeSupersedingUpgradeVersion :
+          (admittedRuntime ? MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion :
+                             MothershipLocalAuthorityRecoveryCohortRequest::interruptedUpgradeVersion);
       intent.upgradeOperationUUID=upgrade;intent.predecessorRecoveryUUID=predecessor;
       intent.bundlePath=path;intent.targetContractSHA256=bundle.contract.contractSHA256;
       MothershipUpgradeAdmissionRecord admission;MothershipLocalAuthorityRecoveryCohortRecord prior;
       { auto registry=openClusterRegistry();
         if(!registry.loadUpgradeAdmission(cluster.clusterUUID,upgrade,admission,&failure) ||
             !registry.loadLocalRecoveryGateways(cluster.clusterUUID,intent.gateways,&failure) ||
-            (!admittedRuntime && !registry.loadLocalAuthorityRecoveryCohort(predecessor,prior,&failure)))return false;
+            ((!admittedRuntime || supersedingRuntime) &&
+             !registry.loadLocalAuthorityRecoveryCohort(predecessor,prior,&failure)))return false;
       }
       if(!localRecoveryObjectDigest(admission,intent.admissionSHA256,failure) ||
-          (!admittedRuntime && !localRecoveryObjectDigest(prior,intent.predecessorRecoverySHA256,failure)))return false;
-      if(!admission.eligible || admission.approvedPath!=uint8_t(MothershipUpgradePath::sameLogicalRollout) ||
+          ((!admittedRuntime || supersedingRuntime) &&
+           !localRecoveryObjectDigest(prior,intent.predecessorRecoverySHA256,failure)))return false;
+      const bool normalAdmission=admission.eligible &&
+          admission.approvedPath==uint8_t(MothershipUpgradePath::sameLogicalRollout);
+      const bool recoveryAdmission=!admission.eligible &&
+          admission.approvedPath==uint8_t(MothershipUpgradePath::reject) &&
+          admission.firstStopGate=="generation-fenced peer upgrade observation is incomplete"_ctv;
+      if((!normalAdmission && !recoveryAdmission) ||
           admission.clusterUUID!=cluster.clusterUUID || admission.operationID!=upgrade ||
           admission.targetBundleSHA256!=bundle.bundleSHA256 ||
           admission.targetContractSHA256!=bundle.contract.contractSHA256)return false;
@@ -16035,17 +16078,46 @@ LOCAL_RUNTIME
         identity.masterUUID=admission.masterUUID;identity.masterBootNs=admission.masterBootNs;
         identity.semanticObservationSHA256=admission.semanticObservationSHA256;
         ClusterStatusReport status;
-        if(!productionClusterHealthy(cluster,status,failure) ||
-            !captureLocalRecoveryWorkloads(status,identity.workloads,failure))return false;
+        Vector<MothershipLocalRecoveryWorkloadIdentity> observedWorkloads;
+        if(!readManagedClusterStatus(cluster,status,failure) ||
+            !captureLocalRecoveryWorkloads(status,observedWorkloads,failure))return false;
+        if(supersedingRuntime) {
+          if(observedWorkloads.size()!=prior.request.admittedRuntime.workloads.size()) {
+            failure.assign("superseding local runtime recovery changed the predecessor deployment inventory"_ctv);
+            return false;
+          }
+          for(uint32_t index=0;index<observedWorkloads.size();++index)
+            if(!mothershipLocalRecoveryWorkloadCanRecoverTo(
+                observedWorkloads[index],prior.request.admittedRuntime.workloads[index])) {
+              failure.assign("superseding local runtime recovery exceeds or substitutes the predecessor workload intent"_ctv);
+              return false;
+            }
+          identity.workloads=prior.request.admittedRuntime.workloads;
+        } else identity.workloads=std::move(observedWorkloads);
         identity.activeDeploymentCount=identity.workloads.size();
+        Vector<uint128_t> observedMachines;
         for(const auto& observed:status.machineReports) {
           uint128_t machine=0;
-          if(!prodigyParseCanonicalHex128(observed.machineUUID,machine) ||
-              observed.approvedBundleSHA256!=identity.sourceBundleSHA256 ||
+          bool registeredMachine=false;
+          if(prodigyParseCanonicalHex128(observed.machineUUID,machine))
+            for(const auto& target:targets)registeredMachine|=target.executor.machineUUID==machine;
+          bool duplicateMachine=false;
+          for(const auto& priorMachine:observedMachines)duplicateMachine|=priorMachine==machine;
+          if(!registeredMachine || duplicateMachine ||
+              (!observed.approvedBundleSHA256.empty() &&
+               observed.approvedBundleSHA256!=identity.sourceBundleSHA256) ||
+              (observed.approvedBundleSHA256.empty() &&
+               (observed.controlPlaneReachable || observed.runtimeReady)) ||
               observed.runningProdigyVersion.empty() ||
               (observed.currentMaster && machine!=identity.masterUUID) ||
-              (!identity.sourceBinaryVersion.empty() && identity.sourceBinaryVersion!=observed.runningProdigyVersion))return false;
+              (!identity.sourceBinaryVersion.empty() && identity.sourceBinaryVersion!=observed.runningProdigyVersion)) {
+            failure.assign("local runtime recovery cluster report differs from its admitted source"_ctv);return false;
+          }
+          observedMachines.push_back(machine);
           identity.sourceBinaryVersion=observed.runningProdigyVersion;
+        }
+        if(observedMachines.size()!=targets.size()) {
+          failure.assign("local runtime recovery cluster report lacks an exact machine inventory"_ctv);return false;
         }
       }
       for(uint32_t i=0;i<targets.size();++i) {
@@ -16216,7 +16288,7 @@ LOCAL_RUNTIME
         mothershipParseUnsignedArgument(argv[2], mothershipLocalVMFaultMaximumRecoveryMilliseconds, timeout) &&
         timeout >= mothershipLocalAuthorityRecoveryMinimumTimeoutMilliseconds;
     if (!valid)
-      failure.assign("usage: recoverLocalClusterAuthority OPERATION_UUID CLUSTER TIMEOUT_MS [--complete-interrupted-upgrade UPGRADE_OPERATION APPROVED_BUNDLE PREDECESSOR_RECOVERY|--admitted-active-runtime] (timeout must be 120000..300000)"_ctv);
+      failure.assign("usage: recoverLocalClusterAuthority OPERATION_UUID CLUSTER TIMEOUT_MS [--complete-interrupted-upgrade UPGRADE_OPERATION APPROVED_BUNDLE PREDECESSOR_RECOVERY|--admitted-active-runtime|--supersede-released-runtime=RECOVERY_OPERATION] (timeout must be 120000..300000)"_ctv);
 
     MothershipProdigyCluster cluster = {};
     if (valid)
@@ -30799,9 +30871,14 @@ LOCAL_RUNTIME
 
     String masterUUID = {};
     masterUUID.assignItoh(response.scope.expectedMasterUUID);
+    const char *disposition = response.scope.installedBundleSHA256.empty()
+        ? "unavailable"
+        : (prodigyLocalBundleRecoveryWitnessRepairScopeSuperseded(response.scope)
+            ? "superseded-inventory-barrier" : "same-bundle");
     basics_log(
-        "repairLocalBundleRecoveryWitness success=%u action=%s witnessPresent=%u eligible=%u idempotent=%u completed=%u operationUUID=%s clusterUUID=%s scopeSHA256=%s authorityGeneration=%llu masterUUID=%s masterBootNs=%lld installedBundleSHA256=%s witnessExpectedBundleSHA256=%s durableGeneration=%llu acceptedAtMs=%lld failure=%s\n",
-        unsigned(response.success), query ? "query" : "retire", unsigned(response.witnessPresent),
+        "repairLocalBundleRecoveryWitness success=%u action=%s disposition=%s witnessPresent=%u eligible=%u idempotent=%u completed=%u operationUUID=%s clusterUUID=%s scopeSHA256=%s authorityGeneration=%llu masterUUID=%s masterBootNs=%lld installedBundleSHA256=%s witnessExpectedBundleSHA256=%s durableGeneration=%llu acceptedAtMs=%lld failure=%s\n",
+        unsigned(response.success), query ? "query" : "retire", disposition,
+        unsigned(response.witnessPresent),
         unsigned(response.eligible), unsigned(response.idempotent), unsigned(response.completed),
         operationText.c_str(), String::toHex(response.clusterUUID).c_str(), response.scopeSHA256.c_str(),
         (unsigned long long)response.scope.expectedAuthorityGeneration, masterUUID.c_str(),
@@ -36101,7 +36178,7 @@ int main(int argc, char *argv[])
     message.append("faultLocalClusterMachine [operationUUID] [localVMBoundaryUUID] cold-reboot [timeoutMs]\n");
     message.append("faultLocalClusterMachine [operationUUID] [localVMBoundaryUUID] recover-unready-upgrade [timeoutMs] [upgradeOperationUUID] [approvedTargetBundle]\n");
     message.append("\tcold-reboots one exact registered VM in a three-Brain deploymentMode=local cluster and proves its new healthy boot identity; the recovery form additionally requires an exact admitted peer-inventory phase and a newer complete post-reboot inventory\n");
-    message.append("recoverLocalClusterAuthority [operationUUID] [cluster] [timeoutMs] [--complete-interrupted-upgrade upgradeOperation approvedBundle predecessorRecovery|--admitted-active-runtime]\n");
+    message.append("recoverLocalClusterAuthority [operationUUID] [cluster] [timeoutMs] [--complete-interrupted-upgrade upgradeOperation approvedBundle predecessorRecovery|--admitted-active-runtime|--supersede-released-runtime=recoveryOperation]\n");
     message.append("rearmRetainedStatefulDeployment [cluster] [proof JSON|-|@path]\n");
     message.append("\tdurably re-arms only the exact target-zero, two-member all-masters deployment named by an immutable three-machine authority proof\n");
     message.append("repairLocalBundleRecoveryWitness [cluster] [operation UUID] --query|--retire [scope SHA256]\n");

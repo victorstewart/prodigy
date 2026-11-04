@@ -503,16 +503,18 @@ static inline bool prodigyLocalBundleRecoveryWitnessRepairScopeValid(
       scope.expectedAuthorityGeneration == 0 || scope.expectedAuthorityGeneration == UINT64_MAX ||
       scope.expectedMasterUUID == 0 || scope.expectedMasterBootNs <= 0 ||
       !prodigyIsSHA256HexDigest(scope.installedBundleSHA256) ||
-      !scope.installedBundleSHA256.equals(scope.witnessExpectedBundleSHA256) ||
+      !prodigyIsSHA256HexDigest(scope.witnessExpectedBundleSHA256) ||
       scope.machines.size() != 3)
   {
     return false;
   }
+  const bool superseded = !scope.installedBundleSHA256.equals(
+      scope.witnessExpectedBundleSHA256);
   uint128_t previousMachine = 0;
   for (const auto& machine : scope.machines)
   {
     if (machine.machineUUID == 0 || machine.machineUUID <= previousMachine ||
-        !machine.bundleRegistered ||
+        machine.bundleRegistered == superseded ||
         !prodigyIsSHA256HexDigest(machine.bootstrapInventorySHA256))
     {
       return false;
@@ -520,6 +522,13 @@ static inline bool prodigyLocalBundleRecoveryWitnessRepairScopeValid(
     previousMachine = machine.machineUUID;
   }
   return true;
+}
+
+static inline bool prodigyLocalBundleRecoveryWitnessRepairScopeSuperseded(
+    const ProdigyLocalBundleRecoveryWitnessRepairScope& scope)
+{
+  return prodigyLocalBundleRecoveryWitnessRepairScopeValid(scope) &&
+      !scope.installedBundleSHA256.equals(scope.witnessExpectedBundleSHA256);
 }
 
 static inline bool prodigyLocalBundleRecoveryWitnessRepairScopeSHA256(
@@ -559,7 +568,8 @@ static inline bool prodigyLocalBundleRecoveryWitnessRepairReceiptValid(
 
 class ProdigyLocalBundleRecoveryWitnessRepairJournal {
 public:
-  static constexpr uint32_t version = 1;
+  static constexpr uint32_t legacyVersion = 1;
+  static constexpr uint32_t version = 2;
   uint32_t protocolVersion = version;
   Vector<ProdigyLocalBundleRecoveryWitnessRepairReceipt> receipts;
 };
@@ -574,7 +584,8 @@ static void serialize(S&& serializer, ProdigyLocalBundleRecoveryWitnessRepairJou
 static inline bool prodigyLocalBundleRecoveryWitnessRepairJournalValid(
     const ProdigyLocalBundleRecoveryWitnessRepairJournal& journal)
 {
-  if (journal.protocolVersion != ProdigyLocalBundleRecoveryWitnessRepairJournal::version ||
+  if ((journal.protocolVersion != ProdigyLocalBundleRecoveryWitnessRepairJournal::legacyVersion &&
+       journal.protocolVersion != ProdigyLocalBundleRecoveryWitnessRepairJournal::version) ||
       journal.receipts.size() > 64)
   {
     return false;
@@ -582,7 +593,9 @@ static inline bool prodigyLocalBundleRecoveryWitnessRepairJournalValid(
   for (uint32_t index = 0; index < journal.receipts.size(); ++index)
   {
     const auto& receipt = journal.receipts[index];
-    if (!prodigyLocalBundleRecoveryWitnessRepairReceiptValid(receipt)) return false;
+    if (!prodigyLocalBundleRecoveryWitnessRepairReceiptValid(receipt) ||
+        (journal.protocolVersion == ProdigyLocalBundleRecoveryWitnessRepairJournal::legacyVersion &&
+         prodigyLocalBundleRecoveryWitnessRepairScopeSuperseded(receipt.scope))) return false;
     for (uint32_t earlier = 0; earlier < index; ++earlier)
       if (journal.receipts[earlier].scope.operationUUID == receipt.scope.operationUUID ||
           journal.receipts[earlier].scopeSHA256 == receipt.scopeSHA256)
@@ -603,7 +616,7 @@ constexpr static uint64_t prodigyLocalBundleRecoveryWitnessRepairJournalMaximumP
 // prevents a reflected request from being accepted as a durable receipt.
 class RepairLocalBundleRecoveryWitness {
 public:
-  static constexpr uint32_t version = 1;
+  static constexpr uint32_t version = 2;
   uint32_t protocolVersion = version;
   bool response = false;
   ProdigyLocalBundleRecoveryWitnessRepairAction action =
@@ -10427,6 +10440,25 @@ public:
     return (*this == other) == false;
   }
 };
+
+static bool prodigyPersistentUpdateSelfStatesEquivalent(
+    ProdigyPersistentUpdateSelfState lhs,
+    ProdigyPersistentUpdateSelfState rhs)
+{
+  auto canonicalizeWorkerSets = [](ProdigyPersistentUpdateSelfState& state) {
+    std::sort(state.workerMachineUUIDs.begin(), state.workerMachineUUIDs.end());
+    std::sort(state.workerStagedMachineUUIDs.begin(), state.workerStagedMachineUUIDs.end());
+    std::sort(state.workerTransitionIssuedMachineUUIDs.begin(),
+              state.workerTransitionIssuedMachineUUIDs.end());
+    std::sort(state.workerRebootedMachineUUIDs.begin(),
+              state.workerRebootedMachineUUIDs.end());
+    std::sort(state.workerStateUploadedMachineUUIDs.begin(),
+              state.workerStateUploadedMachineUUIDs.end());
+  };
+  canonicalizeWorkerSets(lhs);
+  canonicalizeWorkerSets(rhs);
+  return lhs == rhs;
+}
 
 template <typename S>
 static void serialize(S&& serializer, ProdigyPersistentUpdateSelfState& state)

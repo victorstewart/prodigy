@@ -454,6 +454,298 @@ static void testAsyncLocalBundleRecoveryWitnessRepair(TestSuite& suite)
               prodigyLocalBundleRecoveryWitnessRepairJournalExecutionID),
       "local_bundle_witness_repair_terminal_journal_is_nonexpiring");
 
+  auto legacyJournal = reloadedJournal;
+  legacyJournal.protocolVersion =
+      ProdigyLocalBundleRecoveryWitnessRepairJournal::legacyVersion;
+  String legacyJournalBytes = {};
+  ProdigyLocalBundleRecoveryWitnessRepairJournal decodedLegacyJournal = {};
+  suite.expect(
+      prodigyLocalBundleRecoveryWitnessRepairJournalValid(legacyJournal) &&
+          BitseryEngine::serialize(legacyJournalBytes, legacyJournal) &&
+          BitseryEngine::deserializeSafe(legacyJournalBytes, decodedLegacyJournal) &&
+          prodigyLocalBundleRecoveryWitnessRepairJournalValid(decodedLegacyJournal) &&
+          decodedLegacyJournal.protocolVersion ==
+              ProdigyLocalBundleRecoveryWitnessRepairJournal::legacyVersion,
+      "local_bundle_witness_repair_reads_legacy_same_bundle_journal");
+
+  // Reproduce the post-upgrade deadlock: every current Neuron attests one
+  // newer bundle, while the durable update-self coordinator still owns an
+  // all-machine terminal witness for the released predecessor. One captured
+  // bootstrap retains its UUID and canonical owner but no longer matches the
+  // deployment artifact authority, so it must never be projected.
+  constexpr uint16_t retainedApplicationID = 63114;
+  ApplicationDeployment retainedDeployment = {};
+  retainedDeployment.plan = makeDeploymentPlan(retainedApplicationID, 1);
+  retainedDeployment.plan.config.containerBlobSHA256.assign(
+      "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"_ctv);
+  retainedDeployment.plan.config.containerBlobBytes = 4096;
+  retainedDeployment.state = DeploymentState::running;
+  const uint64_t retainedDeploymentID =
+      retainedDeployment.plan.config.deploymentID();
+  brain.deployments.insert_or_assign(retainedDeploymentID, &retainedDeployment);
+  brain.deploymentsByApp.insert_or_assign(
+      retainedApplicationID, &retainedDeployment);
+  brain.deploymentPlans.insert_or_assign(
+      retainedDeploymentID, retainedDeployment.plan);
+
+  ContainerView retainedContainer = {};
+  retainedContainer.uuid = uint128_t(0x7307);
+  retainedContainer.applicationID = retainedApplicationID;
+  retainedContainer.deploymentID = retainedDeploymentID;
+  retainedContainer.machine = &machines[0];
+  retainedContainer.fragment = 7;
+  retainedContainer.lifetime = ApplicationLifetime::base;
+  retainedContainer.state = ContainerState::healthy;
+  retainedContainer.runtimeReady = true;
+  retainedContainer.createdAtMs = 7'307;
+  brain.brainConfig.datacenterFragment = 0x73;
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    machines[index].fragment = 0x7301 + index;
+    brain.masterAuthorityRuntimeState.machineFragmentAssignments.push_back(
+        {machines[index].uuid, machines[index].fragment});
+  }
+  retainedContainer.setMeshAddress(
+      container_network_subnet6,
+      brain.brainConfig.datacenterFragment,
+      machines[0].fragment,
+      retainedContainer.fragment);
+  retainedContainer.addresses.emplace_back(
+      retainedContainer.meshAddress, uint8_t(128));
+  retainedDeployment.containers.insert(&retainedContainer);
+  machines[0].upsertContainerIndexEntry(
+      retainedDeploymentID, &retainedContainer);
+  brain.containers.insert_or_assign(
+      retainedContainer.uuid, &retainedContainer);
+
+  NeuronContainerBootstrap staleBootstrap = {};
+  staleBootstrap.plan.uuid = retainedContainer.uuid;
+  staleBootstrap.plan.config = retainedDeployment.plan.config;
+  staleBootstrap.plan.fragment = retainedContainer.fragment;
+  staleBootstrap.plan.addresses = retainedContainer.addresses;
+  staleBootstrap.plan.config.containerBlobSHA256.assign(
+      "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"_ctv);
+  String serializedStaleBootstrap = {};
+  suite.require(
+      BitseryEngine::serialize(serializedStaleBootstrap, staleBootstrap),
+      "local_bundle_witness_repair_serializes_superseded_bootstrap");
+
+  const String supersededBundle =
+      "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"_ctv;
+  brain.updateSelfWorkerExpectedBundleSHA256 = supersededBundle;
+  brain.updateSelfWorkerFailure.assign(
+      "local post-exec bundle digest mismatch"_ctv);
+  for (uint128_t machineUUID : machineUUIDs)
+  {
+    brain.updateSelfWorkerMachineUUIDs.insert(machineUUID);
+    brain.updateSelfWorkerStagedMachineUUIDs.insert(machineUUID);
+    brain.updateSelfWorkerTransitionIssuedMachineUUIDs.insert(machineUUID);
+    brain.updateSelfWorkerRebootedMachineUUIDs.insert(machineUUID);
+  }
+  brain.updateSelfWorkerStateUploadedMachineUUIDs.insert(machineUUIDs[1]);
+  brain.updateSelfWorkerStateUploadedMachineUUIDs.insert(machineUUIDs[2]);
+  brain.updateSelfMachineRecoveryWitnesses.clear();
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
+    witness.machineUUID = machines[index].uuid;
+    witness.bundleRegistered = false;
+    if (index == 0)
+      witness.containerBootstraps.push_back(serializedStaleBootstrap);
+    brain.updateSelfMachineRecoveryWitnesses.push_back(std::move(witness));
+    if (index != 0)
+    {
+      machines[index].neuron.verifiedInstalledBundleSHA256.assign(installedBundle);
+      machines[index].neuron.verifiedInstalledBundleIOGeneration =
+          machines[index].neuron.ioGeneration;
+      machines[index].neuron.verifiedInstalledBundleAuthorityEpoch =
+          brain.masterAuthorityEpoch;
+    }
+  }
+  brain.recoveringPersistedNeuronInventory = true;
+  ++brain.masterAuthorityRuntimeState.generation;
+  brain.masterAuthorityRuntimeState.updateSelf =
+      brain.capturePersistentUpdateSelfState();
+  brain.masterAuthorityRuntimeStateDurable = true;
+  brain.durableMasterAuthorityRuntimeStateGeneration =
+      brain.masterAuthorityRuntimeState.generation;
+
+  serializedAuthority.clear();
+  authorityDigest.clear();
+  suite.require(
+      brain.serializeCurrentMasterAuthorityTransition(
+          serializedAuthority, authorityDigest),
+      "local_bundle_witness_repair_serializes_superseded_authority");
+  for (BrainView& peer : peers)
+  {
+    brain.noteMasterAuthorityTransitionSentToPeer(
+        &peer, brain.masterAuthorityRuntimeState, authorityDigest);
+    ProdigyMasterAuthorityStateTransitionAck acknowledgement = {};
+    acknowledgement.generation = brain.masterAuthorityRuntimeState.generation;
+    acknowledgement.peerUUID = peer.uuid;
+    acknowledgement.peerBootNs = peer.boottimens;
+    acknowledgement.transitionDigest.assign(authorityDigest);
+    brain.acknowledgeMasterAuthorityTransition(&peer, acknowledgement);
+  }
+
+  RepairLocalBundleRecoveryWitness supersededQuery = query;
+  supersededQuery.operationUUID = uint128_t(0x7306);
+  RepairLocalBundleRecoveryWitness supersededResponse = {};
+  suite.require(
+      issueDeploymentLifecycleOperationForTest<
+          MothershipTopic::repairLocalBundleRecoveryWitness>(
+          brain, mothership, supersededQuery, supersededResponse) &&
+          supersededResponse.success && supersededResponse.witnessPresent &&
+          supersededResponse.eligible && !supersededResponse.completed &&
+          prodigyLocalBundleRecoveryWitnessRepairScopeSuperseded(
+              supersededResponse.scope) &&
+          supersededResponse.scope.installedBundleSHA256.equals(installedBundle) &&
+          supersededResponse.scope.witnessExpectedBundleSHA256.equals(
+              supersededBundle) &&
+          std::all_of(
+              supersededResponse.scope.machines.begin(),
+              supersededResponse.scope.machines.end(),
+              [](const auto& machine) { return !machine.bundleRegistered; }),
+      "local_bundle_witness_repair_queries_exact_superseded_scope");
+
+  brain.updateSelfPersistencePending = 1;
+  RepairLocalBundleRecoveryWitness activeCoordinator = {};
+  suite.expect(
+      issueDeploymentLifecycleOperationForTest<
+          MothershipTopic::repairLocalBundleRecoveryWitness>(
+          brain, mothership, supersededQuery, activeCoordinator) &&
+          activeCoordinator.success && activeCoordinator.witnessPresent &&
+          !activeCoordinator.eligible &&
+          activeCoordinator.failure.equal(
+              "superseded local bundle persistence or transition continuation is active"_ctv),
+      "local_bundle_witness_repair_rejects_active_superseded_coordinator");
+  brain.updateSelfPersistencePending = 0;
+
+  const String currentThirdDigest =
+      machines[2].neuron.verifiedInstalledBundleSHA256;
+  machines[2].neuron.verifiedInstalledBundleSHA256.assign(
+      "9999999999999999999999999999999999999999999999999999999999999999"_ctv);
+  RepairLocalBundleRecoveryWitness mixedBundle = {};
+  suite.expect(
+      issueDeploymentLifecycleOperationForTest<
+          MothershipTopic::repairLocalBundleRecoveryWitness>(
+          brain, mothership, supersededQuery, mixedBundle) &&
+          mixedBundle.success && mixedBundle.witnessPresent &&
+          !mixedBundle.eligible,
+      "local_bundle_witness_repair_rejects_mixed_current_bundle_cohort");
+  machines[2].neuron.verifiedInstalledBundleSHA256 = currentThirdDigest;
+
+  RepairLocalBundleRecoveryWitness supersededRetire = supersededQuery;
+  supersededRetire.action =
+      ProdigyLocalBundleRecoveryWitnessRepairAction::retire;
+  supersededRetire.scopeSHA256.assign(
+      "8888888888888888888888888888888888888888888888888888888888888888"_ctv);
+  const ProdigyPersistentUpdateSelfState supersededBefore =
+      brain.capturePersistentUpdateSelfState();
+  RepairLocalBundleRecoveryWitness staleSuperseded = {};
+  suite.expect(
+      issueDeploymentLifecycleOperationForTest<
+          MothershipTopic::repairLocalBundleRecoveryWitness>(
+          brain, mothership, supersededRetire, staleSuperseded) &&
+          !staleSuperseded.success &&
+          staleSuperseded.failure.equal(
+              "local bundle recovery witness repair query receipt is stale or mismatched"_ctv) &&
+          equalSerializedObjects(
+              supersededBefore, brain.capturePersistentUpdateSelfState()),
+      "local_bundle_witness_repair_rejects_stale_superseded_scope_without_mutation");
+
+  supersededRetire.scopeSHA256 = supersededResponse.scopeSHA256;
+  auto dispatchSupersededRetire = [&]() {
+    mothership.wBuffer.clear();
+    String payload = {}, frame = {};
+    auto mutableRequest = supersededRetire;
+    BitseryEngine::serialize(payload, mutableRequest);
+    brain.mothershipHandler(
+        &mothership,
+        buildMothershipMessage(
+            frame, MothershipTopic::repairLocalBundleRecoveryWitness, payload));
+  };
+  brain.holdRuntimePersistence = true;
+  dispatchSupersededRetire();
+  suite.require(
+      mothership.wBuffer.empty() &&
+          brain.pendingRuntimePersistence.size() == 1 &&
+          !brain.hasUpdateSelfRecoveryWitness(
+              brain.capturePersistentUpdateSelfState()),
+      "local_bundle_witness_repair_superseded_retirement_waits_for_commit");
+  brain.finishRuntimePersistence(false);
+  RepairLocalBundleRecoveryWitness failedSuperseded = {};
+  suite.expect(
+      extractAsyncRequestResponse(
+          mothership.wBuffer,
+          MothershipTopic::repairLocalBundleRecoveryWitness,
+          failedSuperseded) &&
+          !failedSuperseded.success && failedSuperseded.witnessPresent &&
+          prodigyPersistentUpdateSelfStatesEquivalent(
+              supersededBefore, brain.capturePersistentUpdateSelfState()),
+      "local_bundle_witness_repair_failed_superseded_commit_restores_full_coordinator");
+
+  dispatchSupersededRetire();
+  suite.require(
+      mothership.wBuffer.empty() &&
+          brain.pendingRuntimePersistence.size() == 1,
+      "local_bundle_witness_repair_superseded_retry_waits_for_commit");
+  for (Machine& machine : machines) machine.neuron.connected = false;
+  brain.finishRuntimePersistence(true);
+  RepairLocalBundleRecoveryWitness completedSuperseded = {};
+  const ProdigyPersistentUpdateSelfState emptyCoordinator = {};
+  ProdigyLocalBundleRecoveryWitnessRepairJournal completedJournal = {};
+  suite.expect(
+      extractAsyncRequestResponse(
+          mothership.wBuffer,
+          MothershipTopic::repairLocalBundleRecoveryWitness,
+          completedSuperseded) &&
+          completedSuperseded.success && completedSuperseded.completed &&
+          equalSerializedObjects(
+              emptyCoordinator, brain.capturePersistentUpdateSelfState()) &&
+          brain.recoveringPersistedNeuronInventory &&
+          std::all_of(
+              std::begin(machines), std::end(machines),
+              [](const Machine& machine) {
+                return !machine.runtimeReady &&
+                    machine.stateUploadRequestPending;
+              }) &&
+          brain.decodeLocalBundleRecoveryWitnessRepairJournal(
+              brain.masterAuthorityRuntimeState, completedJournal) &&
+          completedJournal.protocolVersion ==
+              ProdigyLocalBundleRecoveryWitnessRepairJournal::version &&
+          completedJournal.receipts.size() == 2 &&
+          prodigyLocalBundleRecoveryWitnessRepairScopeSuperseded(
+              completedJournal.receipts.back().scope),
+      "local_bundle_witness_repair_commits_superseded_receipt_and_requeues_fresh_inventory");
+
+  RepairLocalBundleRecoveryWitness supersededReplay = {};
+  suite.expect(
+      issueDeploymentLifecycleOperationForTest<
+          MothershipTopic::repairLocalBundleRecoveryWitness>(
+          brain, mothership, supersededRetire, supersededReplay) &&
+          supersededReplay.success && supersededReplay.idempotent &&
+          supersededReplay.completed &&
+          supersededReplay.scopeSHA256.equals(
+              supersededRetire.scopeSHA256),
+      "local_bundle_witness_repair_replays_superseded_terminal_receipt");
+
+  if (brain.artifactIO)
+  {
+    suite.expect(
+        quiesceArtifactIOForTest(brain.artifactIO.get()),
+        "local_bundle_witness_repair_quiesces_artifact_io");
+    brain.artifactIO.reset();
+  }
+
+  machines[0].removeContainerIndexEntry(
+      retainedDeploymentID, &retainedContainer);
+  retainedDeployment.containers.erase(&retainedContainer);
+  brain.containers.erase(retainedContainer.uuid);
+  brain.deploymentPlans.erase(retainedDeploymentID);
+  brain.deploymentsByApp.erase(retainedApplicationID);
+  brain.deployments.erase(retainedDeploymentID);
+
   brain.activeMotherships.erase(&mothership);
   for (uint32_t index = 0; index < 2; ++index) brain.brains.erase(&peers[index]);
   for (uint32_t index = 0; index < 3; ++index)

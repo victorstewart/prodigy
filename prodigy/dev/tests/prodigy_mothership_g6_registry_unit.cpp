@@ -888,6 +888,10 @@ static void interruptedLocalUpgradeRegressions(const String& path)
   supersedingAdmission.sourceMothershipSHA256=supersedingIdentity.sourceMothershipSHA256;
   supersedingAdmission.targetBundleSHA256=supersedingIdentity.targetBundleSHA256;
   supersedingAdmission.targetContractSHA256=superseding.runtime.targetContractSHA256;
+  supersedingAdmission.eligible=false;
+  supersedingAdmission.approvedPath=0;
+  supersedingAdmission.firstStopGate=
+      "generation-fenced peer upgrade observation is incomplete"_ctv;
   MothershipLocalAuthorityRecoveryCohortRecord supersedingRecord;
   {
     MothershipClusterRegistry registry(path);MothershipUpgradeAdmissionRecord stored;
