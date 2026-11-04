@@ -3062,6 +3062,8 @@ int main(void)
     brain.weAreMaster = true;
     brain.ignited = true;
     brain.recoveringPersistedNeuronInventory = true;
+    brain.masterAuthorityRuntimeStateDurable = true;
+    brain.durableMasterAuthorityRuntimeStateGeneration = brain.masterAuthorityRuntimeState.generation;
     brain.brainConfig.datacenterFragment = 0x42;
 
     Machine machine = {};
@@ -3186,21 +3188,35 @@ int main(void)
     const uint32_t failureReplayFrames = countQueuedStateUploads();
     const auto replayAfterFailure =
         brain.restoredContainerInventoryReplayByMachine.find(machine.uuid);
-    suite.expect(container.state == ContainerState::crashedRestarting &&
-                     failureReplayFrames == 2 &&
-                     replayAfterFailure != brain.restoredContainerInventoryReplayByMachine.end() &&
+    suite.expect(container.state == ContainerState::crashedRestarting,
+                 "restored_inventory_restarted_failure_applies_failure_state");
+    suite.expect(failureReplayFrames == 2,
+                 "restored_inventory_restarted_failure_wakes_second_inventory_replay");
+    suite.expect(replayAfterFailure != brain.restoredContainerInventoryReplayByMachine.end() &&
                      replayAfterFailure->second.attempts == 2 &&
-                     replayAfterFailure->second.awaitingInventory,
-                 "restored_inventory_restarted_failure_wakes_recovery_without_resetting_replay_budget");
+                     replayAfterFailure->second.awaitingInventory &&
+                     brain.pendingRestoredContainerInventory.contains(container.uuid) &&
+                     !brain.persistedInventoryConfirmedAbsentContainers.contains(container.uuid),
+                 "restored_inventory_restarted_failure_preserves_bounded_replay_budget");
 
+    // The stack-owned fixture view cannot enter the destructive finalizer.
+    // Holding its durable authority gate also proves the exhausted replay
+    // hands off a candidate without requiring retirement in the same turn.
+    brain.masterAuthorityRuntimeStateDurable = false;
     sendAcceptedEmptyInventory();
-    suite.expect(firstReplayFrames == 1 && countQueuedStateUploads() == 2,
+    suite.expect(firstReplayFrames == 1,
+                 "restored_inventory_restarted_failure_starts_one_inventory_replay");
+    suite.expect(countQueuedStateUploads() == 2,
                  "restored_inventory_restarted_failure_keeps_replay_budget_bounded_after_empty_inventory");
-    suite.expect(Ring::socketIsClosing(&machine.neuron),
-                 "restored_inventory_restarted_failure_closes_exhausted_control_generation");
+    suite.expect(!Ring::socketIsClosing(&machine.neuron) &&
+                     !brain.pendingRestoredContainerInventory.contains(container.uuid) &&
+                     brain.persistedInventoryConfirmedAbsentContainers.contains(container.uuid) &&
+                     !brain.restoredContainerInventoryReplayByMachine.contains(machine.uuid),
+                 "restored_inventory_restarted_failure_hands_exhausted_replay_to_absence_finalizer");
 
     cleanupNeuronSocket(machine.neuron, peerFD);
     brain.pendingRestoredContainerInventory.clear();
+    brain.persistedInventoryConfirmedAbsentContainers.clear();
     brain.persistedMachineStateUploadPlansByMachine.clear();
     brain.containerRetirementInventoryByMachine.clear();
     brain.containers.erase(container.uuid);

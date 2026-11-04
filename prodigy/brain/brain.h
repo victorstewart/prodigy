@@ -24318,6 +24318,7 @@ public:
     }
     bool pendingForMachine = false;
     bool observedProgress = false;
+    Vector<uint128_t> confirmedAbsent = {};
     for (uint128_t uuid : pendingRestoredContainerInventory)
     {
       auto current = containers.find(uuid);
@@ -24331,6 +24332,7 @@ public:
         observedProgress = true;
         break;
       }
+      confirmedAbsent.push_back(uuid);
     }
     if (!pendingForMachine || observedProgress)
     {
@@ -24346,7 +24348,18 @@ public:
                (unsigned long long)machine->uuid,
                (unsigned long long)machine->neuron.ioGeneration,
                unsigned(replayed->second.attempts));
-    queueCloseIfActive(&machine->neuron);
+    // Two accepted inventories on this exact control generation have omitted
+    // every pending owner assigned to the machine. This establishes only a
+    // per-machine absence candidate: the existing recovery finalizer still
+    // requires a current inventory from every live machine before it can
+    // discard a view. Move the exact UUIDs to that owner instead of closing
+    // the stream, which would reset this bounded budget and replay forever.
+    for (uint128_t uuid : confirmedAbsent)
+    {
+      persistedInventoryConfirmedAbsentContainers.insert(uuid);
+      pendingRestoredContainerInventory.erase(uuid);
+    }
+    restoredContainerInventoryReplayByMachine.erase(replayed);
   }
 
   void queueNeuronStateUploadForMachine(Machine *machine)
