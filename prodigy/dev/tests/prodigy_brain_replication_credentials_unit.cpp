@@ -39587,17 +39587,30 @@ static void testInitialSeedLaunchAcknowledgement(TestSuite& suite)
       // authority member is sealed. A cold restart loses its deferred spin
       // callbacks, but retains this exact partial snapshot. Nonmembers must
       // not strand the admitted member behind canonical inventory replay.
-      ProdigyPersistentMasterAuthorityPackage captured, coldPackage;
+      // A planned, unadmitted reservation is not a runtime owner. New
+      // snapshots omit it, while the cold fixture below retains one to model
+      // the legacy snapshots that did persist this shape.
+      plans[2].state = ContainerState::planned;
+      target[2].state = ContainerState::planned;
+      ProdigyPersistentMasterAuthorityPackage captured, legacyPackage, coldPackage;
       brain.capturePersistentMasterAuthorityPackage(captured);
       // This fixture has no surviving scheduler callback. Only the public
       // launch owner can attest an unsent reservation; authority nonmembership
       // alone must not let snapshot capture erase an uncertain scheduled UUID.
       suite.expect(!deployment.hasUnsentStatefulServingLaunch(target[1].uuid, machine.uuid) &&
                        !deployment.hasUnsentStatefulServingLaunch(target[2].uuid, machine.uuid) &&
-                       captured.containerRuntimeStates.size() == 3,
-                   "initial_launch_capture_preserves_scheduled_records_without_unsent_owner_proof");
+                       captured.containerRuntimeStates.size() == 2,
+                   "initial_launch_capture_omits_planned_unadmitted_reservation");
+      BrainReplicatedContainerRuntimeState legacyPlannedReservation = {};
+      suite.require(brain.captureReplicatedContainerRuntimeState(&target[2], legacyPlannedReservation) &&
+                        legacyPlannedReservation.plan.state == ContainerState::planned,
+                    "initial_launch_legacy_planned_reservation_capture");
+      legacyPackage = captured;
+      legacyPackage.containerRuntimeStates.push_back(legacyPlannedReservation);
+      std::sort(legacyPackage.containerRuntimeStates.begin(), legacyPackage.containerRuntimeStates.end(),
+                [](const auto& lhs, const auto& rhs) { return lhs.plan.uuid < rhs.plan.uuid; });
       String snapshotBytes;
-      const bool snapshotRoundtrips = BitseryEngine::serialize(snapshotBytes, captured) &&
+      const bool snapshotRoundtrips = BitseryEngine::serialize(snapshotBytes, legacyPackage) &&
           BitseryEngine::deserializeSafe(snapshotBytes, coldPackage);
       suite.require(snapshotRoundtrips && coldPackage.containerRuntimeStates.size() == 3 &&
                         coldPackage.servingRuntimeStates.size() == 1 &&
@@ -39638,10 +39651,24 @@ static void testInitialSeedLaunchAcknowledgement(TestSuite& suite)
                       "initial_launch_cold_snapshot_authority_is_acknowledged");
         if (applied) {
           const auto& reservation = coldPackage.containerRuntimeStates[1];
+          const auto& plannedReservation = coldPackage.containerRuntimeStates[2];
           suite.require(cold.canDiscardAbsentInitialSeedReservation(reservation),
                         "initial_launch_cold_absent_nonmember_has_exact_recovery_proof");
+          suite.require(cold.canDiscardAbsentInitialSeedReservation(plannedReservation),
+                        "initial_launch_cold_absent_legacy_planned_nonmember_has_exact_recovery_proof");
           suite.expect(!cold.canDiscardAbsentInitialSeedReservation(coldPackage.containerRuntimeStates[0]),
                        "initial_launch_cold_never_discards_admitted_uuid");
+          inventory.present.insert(plannedReservation.plan.uuid);
+          suite.expect(!cold.canDiscardAbsentInitialSeedReservation(plannedReservation),
+                       "initial_launch_cold_never_discards_observed_planned_reservation");
+          suite.expect(!cold.preparePresentInitialSeedReservationRecovery(
+                           &coldDeployment, plannedReservation, &coldMachine),
+                       "initial_launch_cold_never_adopts_unlaunched_planned_reservation");
+          inventory.present.erase(plannedReservation.plan.uuid);
+          auto plannedWrongScope = plannedReservation;
+          ++plannedWrongScope.plan.statefulTopology.allMastersSeedBootstrap.successorOperationUUID;
+          suite.expect(!cold.canDiscardAbsentInitialSeedReservation(plannedWrongScope),
+                       "initial_launch_cold_never_discards_wrong_scope_planned_reservation");
           auto wrong = reservation; wrong.plan.runtimeReady = true;
           suite.expect(!cold.canDiscardAbsentInitialSeedReservation(wrong),
                        "initial_launch_cold_never_discards_runtime_ready_record");
@@ -39743,7 +39770,7 @@ static void testInitialSeedLaunchAcknowledgement(TestSuite& suite)
                             adoptionPending->second.size() == 2 &&
                             cold.containers.contains(target[0].uuid) &&
                             !cold.containers.contains(reservation.plan.uuid),
-                        "initial_launch_cold_present_adoption_seals_before_materialization");
+                        "initial_launch_cold_present_adoption_holds_legacy_planned_until_authority_durable");
           cold.finishRuntimePersistence(true);
           suite.require(cold.masterAuthorityRuntimeStateDurable &&
                             cold.durableMasterAuthorityRuntimeStateGeneration ==
@@ -40104,7 +40131,14 @@ static void testInitialSeedLaunchAcknowledgement(TestSuite& suite)
         if (populatedRoundtrips) exerciseFollowerColdPromotion(decodedPopulated, true);
       }
     }
-    if (i == 0) target[i].runtime_memoryMB = 123;
+    if (i == 0) {
+      // The legacy-snapshot subfixture above intentionally changed only the
+      // captured third reservation. Keep the ordinary scheduled admission
+      // coverage below unchanged.
+      plans[2].state = ContainerState::scheduled;
+      target[2].state = ContainerState::scheduled;
+      target[i].runtime_memoryMB = 123;
+    }
     brain.finishRuntimePersistence(true);
     suite.expect(brain.prepareStatefulServingLaunch(&deployment, &target[i], plans[i], machine.uuid) == Admission::ready,
                  "initial_launch_same_plan_survives_runtime_observation_change");

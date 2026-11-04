@@ -12754,7 +12754,8 @@ public:
       const BrainReplicatedContainerRuntimeState& state) const
   {
     const auto& plan = state.plan;
-    if (!plan.uuid || !plan.isStateful || plan.runtimeReady || plan.state != ContainerState::scheduled ||
+    if (!plan.uuid || !plan.isStateful || plan.runtimeReady ||
+        (plan.state != ContainerState::planned && plan.state != ContainerState::scheduled) ||
         plan.system.kind != SystemContainerKind::none ||
         !prodigyStatefulTopologyIsAllMastersSeedBootstrap(plan.statefulTopology)) return nullptr;
     const ProdigyStatefulServingAuthority *covered = nullptr;
@@ -12807,6 +12808,7 @@ public:
     const ProdigyStatefulServingAuthority *current =
         unadmittedInitialSeedReservationAuthority(state);
     if (!weAreMaster || !recoveringPersistedNeuronInventory ||
+        state.plan.state != ContainerState::scheduled ||
         !persistedMachineInventoryEnumerated || deployment == nullptr ||
         owner == deployments.end() || owner->second != deployment ||
         machine == nullptr || !machines.contains(machine) ||
@@ -12907,6 +12909,10 @@ public:
   {
     if (const auto *initial = unadmittedInitialSeedReservationAuthority(state))
     {
+      // A planned nonmember has never entered the launch owner. Persisting it
+      // as runtime inventory would strand a cold restore behind a UUID that
+      // the durable serving authority does not admit.
+      if (state.plan.state == ContainerState::planned) return true;
       auto owner = deployments.find(initial->deploymentID);
       return owner != deployments.end() && owner->second != nullptr &&
              owner->second->hasUnsentStatefulServingLaunch(state.plan.uuid, state.machineUUID);
