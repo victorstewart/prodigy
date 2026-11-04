@@ -18,6 +18,8 @@ constexpr static uint32_t mothershipLocalVMFaultMaximumRecoveryMilliseconds = 30
 constexpr static uint32_t mothershipLocalAuthorityRecoveryArmDelayMilliseconds = 60'000;
 constexpr static uint32_t mothershipLocalAuthorityRecoveryReleaseGraceMilliseconds = 30'000;
 constexpr static uint32_t mothershipLocalAuthorityRecoveryMinimumTimeoutMilliseconds = 120'000;
+constexpr static uint32_t mothershipLocalRecoveryGatewayQualificationAttempts = 30;
+constexpr static uint32_t mothershipLocalRecoveryGatewayQualificationPollMilliseconds = 100;
 // This is a provider-owned task directory, not caller-controlled execution
 // data. The sealed guest executor creates it only beneath /var/lib/prodigy
 // after proving that parent is root-owned and not group/world writable.
@@ -1689,6 +1691,29 @@ static inline bool mothershipPhysicalFaultExactSerializedEqual(const T& left, co
   T leftCopy = left, rightCopy = right;
   BitseryEngine::serialize(leftBytes, leftCopy); BitseryEngine::serialize(rightBytes, rightCopy);
   return leftBytes == rightBytes;
+}
+
+enum class MothershipLocalRecoveryGatewayAuthorityDisposition : uint8_t {
+  changed = 0,
+  pendingQualification = 1,
+  qualified = 2
+};
+
+static inline MothershipLocalRecoveryGatewayAuthorityDisposition
+mothershipLocalRecoveryGatewayAuthorityDisposition(
+    uint128_t expectedClusterUUID,
+    const CrossClusterMasqueGatewayAuthority& expectedAuthority,
+    const ProdigyCrossClusterMasqueGatewayAuthorityResponse& response)
+{
+  // Qualification can briefly lag the authority projection after a reboot.
+  // The serialized authority remains the identity fence; the response's
+  // current generation is observation metadata and may advance independently.
+  if (!response.success || !response.found ||
+      response.localClusterUUID != expectedClusterUUID ||
+      !mothershipPhysicalFaultExactSerializedEqual(expectedAuthority, response.authority))
+    return MothershipLocalRecoveryGatewayAuthorityDisposition::changed;
+  return response.qualified ? MothershipLocalRecoveryGatewayAuthorityDisposition::qualified :
+                              MothershipLocalRecoveryGatewayAuthorityDisposition::pendingQualification;
 }
 
 // Replaying an operation is legal only when every durable authorization input

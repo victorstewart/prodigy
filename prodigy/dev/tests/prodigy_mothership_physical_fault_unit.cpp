@@ -106,6 +106,8 @@ int main(void)
       "bool describePhysicalFaultExecutorBoundary", "bool resolvePhysicalFaultExecutor");
   const std::string localRecoveryIntent = providerSection(
       "bool prepareLocalRecoveryRuntimeIntent", "bool installLocalRecoveryRuntime");
+  const std::string localRecoveryFreshAuthority = providerSection(
+      "bool localRecoveryRuntimeFreshAuthority", "static bool captureLocalRecoveryWorkloads");
   const std::string upgradePlanner = providerSection(
       "void runPlanUpgrade", "void runClusterReport");
   suite.expect(!pairArguments.empty() && pairArguments.find("assignItoh") == std::string::npos &&
@@ -181,6 +183,13 @@ int main(void)
                    localRecoveryIntent.find("mothershipLocalRecoveryWorkloadCanRecoverTo") != std::string::npos &&
                    localRecoveryIntent.find("prior.request.admittedRuntime.workloads") != std::string::npos,
                "local_runtime_recovery_cli_binds_released_predecessor_and_frozen_workloads");
+  suite.expect(!localRecoveryFreshAuthority.empty() &&
+                   localRecoveryFreshAuthority.find("mothershipLocalRecoveryGatewayQualificationAttempts") != std::string::npos &&
+                   localRecoveryFreshAuthority.find("mothershipLocalRecoveryGatewayQualificationPollMilliseconds") != std::string::npos &&
+                   localRecoveryFreshAuthority.find("local runtime recovery gateway authority remains unqualified") != std::string::npos &&
+                   mothershipLocalRecoveryGatewayQualificationAttempts == 30 &&
+                   mothershipLocalRecoveryGatewayQualificationPollMilliseconds == 100,
+               "local_runtime_recovery_boundedly_polls_exact_unqualified_gateway_authority");
   suite.expect(!upgradePlanner.empty() &&
                    upgradePlanner.find("degradedLocalRecoveryAdmission") != std::string::npos &&
                    upgradePlanner.find("upgrade admission capacity report is missing commissioned-peer measurements") != std::string::npos &&
@@ -501,6 +510,56 @@ int main(void)
   recoveryTopology.machines[1].lifetime = MachineLifetime::reserved;
   suite.expect(!mothershipLocalAuthorityRecoveryTopologyMatches(cohort, recoveryTopology),
                "authority_recovery_rejects_newer_topology_with_boundary_ownership_drift");
+
+  CrossClusterMasqueGatewayAuthority gatewayAuthority = {};
+  gatewayAuthority.pairUUID = 0xa001;
+  gatewayAuthority.localClusterUUID = cohort.clusterUUID;
+  gatewayAuthority.localMachineUUID = cohort.executors[0].machineUUID;
+  ProdigyCrossClusterMasqueGatewayAuthorityResponse gatewayResponse = {};
+  gatewayResponse.success = true;
+  gatewayResponse.found = true;
+  gatewayResponse.localClusterUUID = cohort.clusterUUID;
+  gatewayResponse.currentAuthorityGeneration = 7;
+  gatewayResponse.authority = gatewayAuthority;
+  suite.expect(
+      mothershipLocalRecoveryGatewayAuthorityDisposition(
+          cohort.clusterUUID, gatewayAuthority, gatewayResponse) ==
+          MothershipLocalRecoveryGatewayAuthorityDisposition::pendingQualification,
+      "authority_recovery_retries_byte_exact_unqualified_gateway_authority");
+  gatewayResponse.qualified = true;
+  ++gatewayResponse.currentAuthorityGeneration;
+  suite.expect(
+      mothershipLocalRecoveryGatewayAuthorityDisposition(
+          cohort.clusterUUID, gatewayAuthority, gatewayResponse) ==
+          MothershipLocalRecoveryGatewayAuthorityDisposition::qualified,
+      "authority_recovery_ignores_generation_metadata_for_exact_qualified_gateway_authority");
+  ++gatewayResponse.authority.keyGeneration;
+  suite.expect(
+      mothershipLocalRecoveryGatewayAuthorityDisposition(
+          cohort.clusterUUID, gatewayAuthority, gatewayResponse) ==
+          MothershipLocalRecoveryGatewayAuthorityDisposition::changed,
+      "authority_recovery_rejects_serialized_gateway_authority_drift");
+  gatewayResponse.authority = gatewayAuthority;
+  gatewayResponse.found = false;
+  suite.expect(
+      mothershipLocalRecoveryGatewayAuthorityDisposition(
+          cohort.clusterUUID, gatewayAuthority, gatewayResponse) ==
+          MothershipLocalRecoveryGatewayAuthorityDisposition::changed,
+      "authority_recovery_rejects_missing_gateway_authority");
+  gatewayResponse.found = true;
+  ++gatewayResponse.localClusterUUID;
+  suite.expect(
+      mothershipLocalRecoveryGatewayAuthorityDisposition(
+          cohort.clusterUUID, gatewayAuthority, gatewayResponse) ==
+          MothershipLocalRecoveryGatewayAuthorityDisposition::changed,
+      "authority_recovery_rejects_cross_cluster_gateway_authority_substitution");
+  gatewayResponse.localClusterUUID = cohort.clusterUUID;
+  gatewayResponse.success = false;
+  suite.expect(
+      mothershipLocalRecoveryGatewayAuthorityDisposition(
+          cohort.clusterUUID, gatewayAuthority, gatewayResponse) ==
+          MothershipLocalRecoveryGatewayAuthorityDisposition::changed,
+      "authority_recovery_rejects_failed_gateway_authority_response");
 
   LocalRecoveryRequestV1Fixture legacyRequest;legacyRequest.value=cohort;
   String legacyRequestBytes,currentRequestBytes;

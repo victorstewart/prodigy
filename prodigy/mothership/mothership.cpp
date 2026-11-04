@@ -15953,12 +15953,22 @@ LOCAL_RUNTIME
     }
     for(const auto& authority:request.runtime.gateways) {
       ProdigyCrossClusterMasqueGatewayAuthorityQuery q;q.pairUUID=authority.pairUUID;q.localMachineUUID=authority.localMachineUUID;
-      ProdigyCrossClusterMasqueGatewayAuthorityResponse response;
-      if(!requestTopicRoundTrip(MothershipTopic::pullCrossClusterMasqueGatewayAuthority,q,response,failure) ||
-          !response.success || !response.found || !response.qualified || response.localClusterUUID!=cluster.clusterUUID ||
-          !mothershipPhysicalFaultExactSerializedEqual(authority,response.authority)) {
-        if(failure.empty())failure.assign("local runtime recovery gateway authority changed");return false;
+      bool qualified=false;
+      for(uint32_t attempt=0;attempt<mothershipLocalRecoveryGatewayQualificationAttempts;++attempt) {
+        ProdigyCrossClusterMasqueGatewayAuthorityResponse response;
+        if(!requestTopicRoundTrip(MothershipTopic::pullCrossClusterMasqueGatewayAuthority,q,response,failure))return false;
+        const auto disposition=mothershipLocalRecoveryGatewayAuthorityDisposition(
+            cluster.clusterUUID,authority,response);
+        if(disposition==MothershipLocalRecoveryGatewayAuthorityDisposition::changed) {
+          failure.assign("local runtime recovery gateway authority changed"_ctv);return false;
+        }
+        if(disposition==MothershipLocalRecoveryGatewayAuthorityDisposition::qualified) {
+          qualified=true;break;
+        }
+        if(attempt+1<mothershipLocalRecoveryGatewayQualificationAttempts)
+          ::usleep(mothershipLocalRecoveryGatewayQualificationPollMilliseconds*1000);
       }
+      if(!qualified){failure.assign("local runtime recovery gateway authority remains unqualified"_ctv);return false;}
     }
     return true;
   }
