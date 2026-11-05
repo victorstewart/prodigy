@@ -19810,6 +19810,169 @@ LOCAL_RUNTIME
     return true;
   }
 
+  // Captures one exact native Hot store boundary for diagnosis.  This is not a
+  // deployment, recovery, or seed-authority operation: Brain remains the sole
+  // owner that decides whether the named live member is a healthy incarnation,
+  // and a known cut must be released before reporting success. The existing
+  // expiry owner bounds a cut whose prepare/release response cannot be obtained.
+  void runObserveStatefulStoreSourceCut(int argc, char *argv[])
+  {
+    String failure = {};
+    uint64_t deploymentID = 0, shardGroup = 0, shardCount = 0;
+    uint128_t containerUUID = 0, operationUUID = 0;
+    MothershipProdigyCluster cluster = {};
+    bool valid = argc == 6 &&
+        mothershipParseUnsignedArgument(argv[1], UINT64_MAX, deploymentID) && deploymentID != 0 &&
+        prodigyParseCanonicalHex128(String(argv[2]), containerUUID) && containerUUID != 0 &&
+        prodigyParseCanonicalHex128(String(argv[3]), operationUUID) && operationUUID != 0 &&
+        mothershipParseUnsignedArgument(argv[4], UINT32_MAX, shardGroup) &&
+        mothershipParseUnsignedArgument(argv[5], UINT32_MAX, shardCount) && shardCount == 3 && shardGroup < shardCount;
+    if (!valid)
+    {
+      failure.assign("usage: observeStatefulStoreSourceCut CLUSTER HOT_DEPLOYMENT_ID CONTAINER_UUID OPERATION_UUID SHARD_GROUP SHARD_COUNT (Hot requires SHARD_COUNT=3)"_ctv);
+    }
+    if (valid)
+    {
+      auto registry = openClusterRegistry();
+      valid = registry.getClusterByIdentity(String(argv[0]), cluster, &failure) && cluster.clusterUUID != 0;
+    }
+    // The source-cut validator owns the complete live-incarnation proof. Keep
+    // this CLI narrow: it observes Hot only and cannot be repurposed for a
+    // generic arbitrary-store snapshot request.
+    if (valid && uint16_t(deploymentID >> 48) != MeshRegistry::Hot::applicationID)
+    {
+      valid = false;
+      failure.assign("source deployment is not Hot"_ctv);
+    }
+
+    ProdigyStatefulStoreSourceCut request = {};
+    ProdigyStatefulStoreSourceCut proof = {};
+    bool cutKnown = false;
+    if (valid)
+    {
+      request.operationUUID = operationUUID;
+      request.requestUUID = Random::generateNumberWithNBits<128, uint128_t>();
+      request.sourceClusterUUID = cluster.clusterUUID;
+      request.sourceDeploymentID = deploymentID;
+      request.sourceContainerUUID = containerUUID;
+      request.applicationID = MeshRegistry::Hot::applicationID;
+      request.storeKind = DeploymentIdentityStoreKind::kv;
+      request.shardGroup = uint32_t(shardGroup);
+      request.nShardGroups = uint32_t(shardCount);
+      request.retainUntilMilliseconds = Time::now<TimeResolution::ms>() + 60'000;
+      valid = request.requestUUID != 0 && prodigyStatefulStoreSourceCutValid(request);
+      if (!valid) failure.assign("could not construct canonical Hot source-cut request"_ctv);
+    }
+
+    auto release = [&]() -> bool {
+      if (!cutKnown) return true;
+      auto requestRelease = request;
+      requestRelease.action = ProdigyStatefulStoreSourceCutAction::release;
+      requestRelease.memberRequestUUID = proof.memberRequestUUID;
+      requestRelease.cutUUID = proof.cutUUID;
+      requestRelease.cutGeneration = proof.cutGeneration;
+      const auto releaseDeadline = Time::msSinceBoot() + 15'000;
+      for (uint32_t poll = 0; poll < 150 && Time::msSinceBoot() < releaseDeadline; ++poll)
+      {
+        ProdigyStatefulStoreSourceCut reply = {};
+        String releaseFailure = {};
+        const bool exchanged = configureControlTarget(argv[0], &releaseFailure) &&
+            requestTopicRoundTrip(MothershipTopic::statefulStoreSourceCut, requestRelease, reply, releaseFailure);
+        if (exchanged && prodigyStatefulStoreSourceCutResponseMatches(requestRelease, reply) &&
+            reply.failure.empty() && reply.released)
+        {
+          basics_log("observeStatefulStoreSourceCut release=1 operationUUID=%016llx%016llx requestUUID=%016llx%016llx cutUUID=%016llx%016llx cutGeneration=%llu\n",
+              (unsigned long long)(operationUUID >> 64), (unsigned long long)operationUUID,
+              (unsigned long long)(request.requestUUID >> 64), (unsigned long long)request.requestUUID,
+              (unsigned long long)(proof.cutUUID >> 64), (unsigned long long)proof.cutUUID,
+              (unsigned long long)proof.cutGeneration);
+          return true;
+        }
+        if (!exchanged || !prodigyStatefulStoreSourceCutResponseMatches(requestRelease, reply) ||
+            !reply.failure.empty())
+        {
+          if (failure.empty())
+          {
+            if (!releaseFailure.empty()) failure = releaseFailure;
+            else if (!reply.failure.empty()) failure = reply.failure;
+            else failure.assign("source cut release returned an invalid response"_ctv);
+          }
+          break;
+        }
+        if (poll + 1 < 150) ::usleep(100'000);
+      }
+      if (failure.empty()) failure.assign("source cut proof captured but release did not complete"_ctv);
+      return false;
+    };
+
+    if (valid)
+    {
+      basics_log("observeStatefulStoreSourceCut begin clusterUUID=%016llx%016llx deploymentID=%llu containerUUID=%016llx%016llx operationUUID=%016llx%016llx requestUUID=%016llx%016llx shardGroup=%u shardCount=%u retainUntilMilliseconds=%lld\n",
+          (unsigned long long)(cluster.clusterUUID >> 64), (unsigned long long)cluster.clusterUUID,
+          (unsigned long long)deploymentID, (unsigned long long)(containerUUID >> 64), (unsigned long long)containerUUID,
+          (unsigned long long)(operationUUID >> 64), (unsigned long long)operationUUID,
+          (unsigned long long)(request.requestUUID >> 64), (unsigned long long)request.requestUUID,
+          unsigned(shardGroup), unsigned(shardCount), (long long)request.retainUntilMilliseconds);
+      const auto prepareDeadline = Time::msSinceBoot() + 15'000;
+      for (uint32_t poll = 0; poll < 150 && valid && !proof.ready && Time::msSinceBoot() < prepareDeadline; ++poll)
+      {
+        ProdigyStatefulStoreSourceCut reply = {};
+        valid = configureControlTarget(argv[0], &failure) &&
+            requestTopicRoundTrip(MothershipTopic::statefulStoreSourceCut, request, reply, failure);
+        auto expected = request;
+        if (expected.memberRequestUUID == 0) expected.memberRequestUUID = reply.memberRequestUUID;
+        if (!valid || !prodigyStatefulStoreSourceCutResponseMatches(expected, reply) || !reply.failure.empty())
+        {
+          if (failure.empty())
+          {
+            if (reply.failure.empty()) failure.assign("source cut returned an invalid challenge"_ctv);
+            else failure = reply.failure;
+          }
+          valid = false;
+          break;
+        }
+        request.memberRequestUUID = reply.memberRequestUUID;
+        proof = reply;
+        cutKnown = proof.cutUUID != 0 && proof.cutGeneration != 0;
+        if (!proof.ready && poll + 1 < 150) ::usleep(100'000);
+      }
+      if (valid && !proof.ready)
+      {
+        valid = false;
+        failure.assign("source cut did not become ready within 15 seconds"_ctv);
+      }
+      // Do not trust the asynchronous prepare answer as a final observation:
+      // query the retained exact cut once, while it is still held.
+      if (valid)
+      {
+        auto query = request;
+        query.action = ProdigyStatefulStoreSourceCutAction::query;
+        query.cutUUID = proof.cutUUID;
+        query.cutGeneration = proof.cutGeneration;
+        ProdigyStatefulStoreSourceCut fresh = {};
+        valid = configureControlTarget(argv[0], &failure) &&
+            requestTopicRoundTrip(MothershipTopic::statefulStoreSourceCut, query, fresh, failure) &&
+            prodigyStatefulStoreSourceCutResponseMatches(query, fresh) && fresh.ready && fresh.failure.empty() &&
+            fresh.contentSHA256 == proof.contentSHA256 && fresh.headsSHA256 == proof.headsSHA256 &&
+            fresh.retainUntilMilliseconds > Time::now<TimeResolution::ms>();
+        if (!valid && failure.empty()) failure.assign("fresh retained source-cut query is no longer current"_ctv);
+        if (valid) proof = std::move(fresh);
+      }
+    }
+
+    if (!release()) valid = false;
+    basics_log("observeStatefulStoreSourceCut success=%u clusterUUID=%016llx%016llx deploymentID=%llu containerUUID=%016llx%016llx operationUUID=%016llx%016llx requestUUID=%016llx%016llx memberRequestUUID=%016llx%016llx cutUUID=%016llx%016llx cutGeneration=%llu shardGroup=%u shardCount=%u contentSHA256=%s headsSHA256=%s failure=%s\n",
+        unsigned(valid), (unsigned long long)(cluster.clusterUUID >> 64), (unsigned long long)cluster.clusterUUID,
+        (unsigned long long)deploymentID, (unsigned long long)(containerUUID >> 64), (unsigned long long)containerUUID,
+        (unsigned long long)(operationUUID >> 64), (unsigned long long)operationUUID,
+        (unsigned long long)(request.requestUUID >> 64), (unsigned long long)request.requestUUID,
+        (unsigned long long)(proof.memberRequestUUID >> 64), (unsigned long long)proof.memberRequestUUID,
+        (unsigned long long)(proof.cutUUID >> 64), (unsigned long long)proof.cutUUID,
+        (unsigned long long)proof.cutGeneration, unsigned(shardGroup), unsigned(shardCount),
+        proof.contentSHA256.c_str(), proof.headsSHA256.c_str(), failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
   bool deliverNametagSeedSuccessorAuthority(MothershipNametagSeedSuccessor& recorded,
       const MothershipNametagAllMastersRecord& prior, const Vector<DeploymentIdentityReport>& reports,
       uint32_t index, uint128_t challenge, int64_t deadline, String& failure)
@@ -36015,6 +36178,7 @@ public:
         {"nametagQualificationCapabilities", &Mothership::runNametagQualificationCapabilities},
         {"nametagSourceBaseline",            &Mothership::runNametagSourceBaseline            },
         {"nametagStatefulPair",              &Mothership::runNametagStatefulPair             },
+        {"observeStatefulStoreSourceCut",    &Mothership::runObserveStatefulStoreSourceCut   },
         {"offlineDNSCleanupInventory",      &Mothership::runOfflineDNSCleanupInventory     },
         {"pairBoundary",                    &Mothership::runPairBoundary                   },
         {"placementPolicy",                 &Mothership::runCommitDeploymentPlacementPolicy },
@@ -36141,6 +36305,8 @@ int main(int argc, char *argv[])
     message.append("the following operations are available:\n"_ctv);
     message.append("bootstrapNametagAllMasters [versioned intent path] [eight-plan JSON path]\n");
     message.append("\tjournals and launches the exact remote all-masters cohorts with native client access fenced until their retained source cut is applied\n");
+    message.append("observeStatefulStoreSourceCut [cluster] [Hot deploymentID] [containerUUID] [operationUUID] [shardGroup] [shardCount]\n");
+    message.append("\tcaptures, freshly queries, and releases one exact healthy Hot native source-cut proof; it does not deploy, reseed, reset, or alter serving state\n");
     message.append("configureLocalVMClusterLANIPv6 [cluster]\n");
     message.append("\tconfigures one deterministic private IPv6 /64 on the exact three sealed local-VM cluster LAN owners without changing their QEMU or WAN boundaries\n");
     message.append("createProviderCredential [json|-|@path]\n");
