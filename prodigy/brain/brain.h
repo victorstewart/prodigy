@@ -15037,8 +15037,21 @@ public:
     {
       return ReplicatedContainerRuntimeStateApplyResult::deferred;
     }
+    // The routing revision includes the machine fragment. A legacy cold
+    // restore can materialize its Machine before authenticated inventory
+    // restores that fragment; retain the record until it can be validated.
+    if (machine->fragment == 0 && !state.wormholeRuntimeRevision.empty())
+    {
+      return ReplicatedContainerRuntimeStateApplyResult::deferred;
+    }
     if (replicatedWormholeRuntimeStateValid(state, machine) == false)
     {
+      std::fprintf(stderr,
+                   "Prodigy rejected replicated container routing state uuid=%016llx%016llx deploymentID=%llu machineFragment=%u containerFragment=%u\n",
+                   static_cast<unsigned long long>(state.plan.uuid >> 64),
+                   static_cast<unsigned long long>(state.plan.uuid),
+                   static_cast<unsigned long long>(deploymentID),
+                   unsigned(machine->fragment), unsigned(state.plan.fragment));
       return ReplicatedContainerRuntimeStateApplyResult::rejected;
     }
 
@@ -20195,6 +20208,23 @@ public:
     if (persistedMachineInventoryEnumerated == false)
     {
       return reject("persisted machine inventory is not enumerated");
+    }
+
+    // Fresh inventory can restore a machine fragment after election first
+    // tried these rows. Rejoin the same replay owner before testing its
+    // barrier, while recovery still prevents per-deployment scheduling.
+    if (weAreMaster && ignited && recoveryAuthoritySnapshotDurable() &&
+        !pendingReplicatedContainerRuntimeStates.empty())
+    {
+      Vector<uint64_t> pendingDeploymentIDs;
+      pendingDeploymentIDs.reserve(pendingReplicatedContainerRuntimeStates.size());
+      for (const auto& [deploymentID, states] : pendingReplicatedContainerRuntimeStates)
+      {
+        (void)states;
+        pendingDeploymentIDs.push_back(deploymentID);
+      }
+      for (uint64_t deploymentID : pendingDeploymentIDs)
+        applyPendingReplicatedContainerRuntimeStates(deploymentID);
     }
 
     if (!pendingReplicatedContainerRuntimeStates.empty() || !replayRestoredContainerInventory())

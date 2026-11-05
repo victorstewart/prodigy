@@ -28819,6 +28819,9 @@ static void testBrainReplicatedContainerRuntimeStateRestoresTakeoverView(TestSui
                 "brain_replicated_runtime_state_builds_malformed_desired_digest");
   suite.expect(brain.replicatedWormholeRuntimeStateValid(invalidRuntimeState, &machine) == false,
                "brain_replicated_runtime_state_rejects_malformed_wormhole_desired_state");
+  brain.applyReplicatedContainerRuntimeState(invalidRuntimeState);
+  suite.expect(brain.pendingReplicatedContainerRuntimeStates.empty() && brain.containers.empty(),
+               "brain_replicated_runtime_state_discards_malformed_payload_instead_of_deferring_it");
   invalidRuntimeState = runtimeState;
   invalidRuntimeState.wormholeRuntimeDesired.resize(SwitchboardWormholeOperation::maximumDesiredBytes + 1u);
   suite.expect(brain.replicatedWormholeRuntimeStateValid(invalidRuntimeState, &machine) == false,
@@ -29177,6 +29180,8 @@ static void testPersistentRuntimeInventoryRestoresBeforeNeuronReplay(TestSuite& 
   TestBrain source = {};
   NoopBrainIaaS sourceIaaS = {};
   source.iaas = &sourceIaaS;
+  BrainBase *previousBrain = thisBrain;
+  thisBrain = &source;
 
   Machine sourceMachine = {};
   sourceMachine.uuid = uint128_t(0x5210);
@@ -29201,6 +29206,12 @@ static void testPersistentRuntimeInventoryRestoresBeforeNeuronReplay(TestSuite& 
   sourceContainer.runtime_nLogicalCores = 2;
   sourceContainer.runtime_memoryMB = 768;
   sourceContainer.runtime_storageMB = 2048;
+  Vector<Wormhole> desiredWormholes = {};
+  BitseryEngine::serialize(sourceContainer.wormholeRuntimeDesired, desiredWormholes);
+  suite.require(prodigyComputeWormholeDesiredStateRevision(
+                    sourceContainer.generateContainerID(), sourceContainer.wormholeRuntimeDesired,
+                    sourceContainer.wormholeRuntimeRevision),
+                "persistent_runtime_inventory_captures_revision_bound_to_machine_fragment");
   sourceContainer.hasCredentialBundle = true;
   ApiCredential runtimeCredential = {};
   runtimeCredential.name.assign("runtime-inventory"_ctv);
@@ -29221,6 +29232,7 @@ static void testPersistentRuntimeInventoryRestoresBeforeNeuronReplay(TestSuite& 
   TestBrain restored = {};
   NoopBrainIaaS restoredIaaS = {};
   restored.iaas = &restoredIaaS;
+  thisBrain = &restored;
   suite.require(restored.applyPersistentMasterAuthorityPackage(package),
                 "persistent_runtime_inventory_package_applies_before_replay");
   auto pending = restored.pendingReplicatedContainerRuntimeStates.find(sourceDeployment.plan.config.deploymentID());
@@ -29235,13 +29247,37 @@ static void testPersistentRuntimeInventoryRestoresBeforeNeuronReplay(TestSuite& 
   Machine restoredMachine = {};
   restoredMachine.uuid = sourceMachine.uuid;
   restoredMachine.private4 = sourceMachine.private4;
-  restoredMachine.fragment = sourceMachine.fragment;
+  restoredMachine.fragment = 0;
   restored.machines.insert(&restoredMachine);
   restored.machinesByUUID.insert_or_assign(restoredMachine.uuid, &restoredMachine);
   ApplicationDeployment restoredDeployment = {};
   restoredDeployment.plan = sourceDeployment.plan;
   restored.deployments.insert_or_assign(restoredDeployment.plan.config.deploymentID(), &restoredDeployment);
   restored.applyPendingReplicatedContainerRuntimeStates(restoredDeployment.plan.config.deploymentID());
+  pending = restored.pendingReplicatedContainerRuntimeStates.find(restoredDeployment.plan.config.deploymentID());
+  suite.expect(restored.containers.empty() &&
+                   pending != restored.pendingReplicatedContainerRuntimeStates.end() &&
+                   pending->second.size() == 1 &&
+                   equalSerializedObjects(pending->second[0], package.containerRuntimeStates[0]),
+               "persistent_runtime_inventory_keeps_exact_record_until_machine_fragment_restored");
+
+  restored.weAreMaster = true;
+  restored.ignited = true;
+  restored.recoveringPersistedNeuronInventory = true;
+  restored.persistedMachineInventoryEnumerated = true;
+  restored.recoverDeploymentsAfterNeuronState();
+  suite.expect(restored.containers.empty() &&
+                   restored.pendingReplicatedContainerRuntimeStates.contains(restoredDeployment.plan.config.deploymentID()),
+               "persistent_runtime_inventory_recovery_waits_for_machine_fragment");
+
+  restoredMachine.fragment = sourceMachine.fragment;
+  restored.persistedMachineInventoryEnumerated = false;
+  restored.recoverDeploymentsAfterNeuronState();
+  suite.expect(restored.containers.empty() &&
+                   restored.pendingReplicatedContainerRuntimeStates.contains(restoredDeployment.plan.config.deploymentID()),
+               "persistent_runtime_inventory_does_not_replay_before_inventory_enumeration");
+  restored.persistedMachineInventoryEnumerated = true;
+  restored.recoverDeploymentsAfterNeuronState();
 
   auto restoredContainer = restored.containers.find(sourceContainer.uuid);
   suite.expect(restoredContainer != restored.containers.end() && restoredContainer->second != nullptr &&
@@ -29250,6 +29286,14 @@ static void testPersistentRuntimeInventoryRestoresBeforeNeuronReplay(TestSuite& 
                    restoredContainer->second->credentialBundle.apiCredentials.size() == 1 &&
                    restoredContainer->second->credentialBundle.apiCredentials[0].material.equals("runtime-inventory-secret"_ctv),
                "persistent_runtime_inventory_rebuilds_canonical_view_before_neuron_upload");
+  suite.expect(restored.containers.size() == 1 &&
+                   restored.pendingReplicatedContainerRuntimeStates.empty() &&
+                   restored.pendingRestoredContainerInventory.contains(sourceContainer.uuid) &&
+                   restored.recoveringPersistedNeuronInventory &&
+                   restoredContainer != restored.containers.end() &&
+                   restoredContainer->second->wormholeRuntimeRevision == sourceContainer.wormholeRuntimeRevision &&
+                   restoredContainer->second->wormholeRuntimeDesired == sourceContainer.wormholeRuntimeDesired,
+               "persistent_runtime_inventory_recovery_retries_exact_uuid_and_keeps_neuron_replay_barrier");
 
   if (restoredContainer != restored.containers.end())
   {
@@ -29268,6 +29312,7 @@ static void testPersistentRuntimeInventoryRestoresBeforeNeuronReplay(TestSuite& 
   source.deployments.erase(sourceDeployment.plan.config.deploymentID());
   source.machinesByUUID.erase(sourceMachine.uuid);
   source.machines.erase(&sourceMachine);
+  thisBrain = previousBrain;
 }
 
 static uint32_t countQueuedSpinContainers(NeuronView& neuron)
@@ -45573,6 +45618,13 @@ int main(void)
       only != nullptr && strcmp(only, "failed-deployment-pending-runtime") == 0)
   {
     testFailedDeploymentCleanerDefersPendingCanonicalRuntime(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "runtime-fragment-recovery") == 0)
+  {
+    testPersistentRuntimeInventoryRestoresBeforeNeuronReplay(suite);
+    testBrainReplicatedContainerRuntimeStateRestoresTakeoverView(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
