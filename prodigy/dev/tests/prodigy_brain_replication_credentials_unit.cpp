@@ -29303,6 +29303,59 @@ static void testPersistentRuntimeInventoryRestoresBeforeNeuronReplay(TestSuite& 
     restored.containers.erase(restoredContainer);
     delete container;
   }
+
+  // A peer can supply an already healthy retained row directly while election
+  // is rebuilding machines. Empty routing fields are valid and do not defer
+  // through the queued restoration wrapper, but still require exact replay.
+  restored.pendingRestoredContainerInventory.erase(sourceContainer.uuid);
+  BrainReplicatedContainerRuntimeState direct = package.containerRuntimeStates[0];
+  direct.plan.state = ContainerState::healthy;
+  direct.plan.runtimeReady = true;
+  direct.wormholeRuntimeRevision.clear();
+  direct.wormholeRuntimeDesired.clear();
+  restored.applyReplicatedContainerRuntimeState(direct);
+  restoredContainer = restored.containers.find(sourceContainer.uuid);
+  suite.expect(restoredContainer != restored.containers.end() &&
+                   restoredContainer->second != nullptr &&
+                   restoredContainer->second->state == ContainerState::healthy &&
+                   restoredContainer->second->runtimeReady &&
+                   restoredContainer->second->wormholeRuntimeRevision.empty() &&
+                   restoredContainer->second->wormholeRuntimeDesired.empty() &&
+                   restored.pendingReplicatedContainerRuntimeStates.empty(),
+               "persistent_runtime_inventory_direct_empty_routing_record_applies");
+  suite.expect(restored.pendingRestoredContainerInventory.contains(sourceContainer.uuid),
+               "persistent_runtime_inventory_direct_apply_enrolls_exact_uuid_before_absence");
+
+  // The fleet's earlier empty inventory cannot retire this newly restored
+  // owner. With no active control stream, recovery must retain it for replay.
+  Mesh restoredMesh = {};
+  restored.mesh = &restoredMesh;
+  restoredMachine.state = MachineState::healthy;
+  restoredMachine.runtimeReady = true;
+  restored.persistedMachineInventoryUploaded.insert(restoredMachine.uuid);
+  auto& emptyInventory = restored.containerRetirementInventoryByMachine[restoredMachine.uuid];
+  emptyInventory.authorityEpoch = restored.masterAuthorityEpoch;
+  emptyInventory.ioGeneration = restoredMachine.neuron.ioGeneration;
+  restored.persistedInventoryConfirmedAbsentContainers.insert(sourceContainer.uuid);
+  String replayBlocker = {};
+  const bool finalizedBeforeReplay = restored.finalizePersistedNeuronInventoryRecovery(&replayBlocker);
+  suite.expect(!finalizedBeforeReplay &&
+                   replayBlocker.equals("restored container inventory replay is incomplete"_ctv) &&
+                   restored.recoveringPersistedNeuronInventory &&
+                   restored.pendingRestoredContainerInventory.contains(sourceContainer.uuid) &&
+                   restored.persistedInventoryConfirmedAbsentContainers.contains(sourceContainer.uuid) &&
+                   restored.containers.contains(sourceContainer.uuid),
+               "persistent_runtime_inventory_direct_apply_blocks_absence_cleanup_until_replay");
+
+  restoredContainer = restored.containers.find(sourceContainer.uuid);
+  if (restoredContainer != restored.containers.end())
+  {
+    ContainerView *container = restoredContainer->second;
+    restoredDeployment.containers.erase(container);
+    restoredMachine.removeContainerIndexEntry(container->deploymentID, container);
+    restored.containers.erase(restoredContainer);
+    delete container;
+  }
   restored.deployments.erase(restoredDeployment.plan.config.deploymentID());
   restored.machinesByUUID.erase(restoredMachine.uuid);
   restored.machines.erase(&restoredMachine);
@@ -34872,6 +34925,10 @@ static void testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(Tes
   brain.mesh = &mesh;
   brain.persistedMachineInventoryUploaded.insert(machine.uuid);
   machine.runtimeReady = true;
+  auto& freshInventory = brain.containerRetirementInventoryByMachine[machine.uuid];
+  freshInventory.authorityEpoch = brain.masterAuthorityEpoch;
+  freshInventory.ioGeneration = machine.neuron.ioGeneration;
+  freshInventory.present.insert(retained.uuid);
   suite.expect(Ring::getRingFD() > 0,
                "persisted_inventory_runtime_fixture_has_active_ring");
   suite.expect(Ring::socketIsClosing(&machine.neuron) == false,

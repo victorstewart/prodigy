@@ -15180,6 +15180,14 @@ public:
       deployment->containersByShardGroup.insert(container->shardGroup, container);
     }
 
+    // Direct replication can materialize a retained owner after recovery has
+    // begun, before queued restoration runs. Both paths must join the exact
+    // inventory replay barrier before absence reconciliation.
+    if (weAreMaster && recoveringPersistedNeuronInventory)
+    {
+      pendingRestoredContainerInventory.insert(container->uuid);
+    }
+
     if (uploadedRuntimeReady)
     {
       deployment->containerIsRuntimeReady(container);
@@ -15231,11 +15239,6 @@ public:
       if (result == ReplicatedContainerRuntimeStateApplyResult::deferred)
       {
         pendingReplicatedContainerRuntimeStates[state.plan.config.deploymentID()].push_back(state);
-      }
-      else if (result == ReplicatedContainerRuntimeStateApplyResult::applied &&
-               weAreMaster && recoveringPersistedNeuronInventory)
-      {
-        pendingRestoredContainerInventory.insert(state.plan.uuid);
       }
     }
     (void)replayRestoredContainerInventory();
