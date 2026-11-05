@@ -40,6 +40,24 @@ int main(void)
     Vector<MachineDiskHardwareProfile> disks;
     disks.push_back(makeDisk("/"));
     disks.push_back(makeDisk("/boot"));
+    disks.push_back(makeDisk("/boot/efi"));
+    disks.push_back(makeDisk("/efi"));
+
+    Vector<String> mountPaths;
+    prodigyCollectUniqueContainerStorageMountPaths(disks, mountPaths);
+    Vector<ProdigyContainerStorageDevicePlan> devices;
+    prodigyBuildContainerStorageDevicePlan(mountPaths, "1234"_ctv, 512, devices);
+
+    suite.expect(mountPaths.empty(), "container_storage_boot_only_inventory_has_no_storage_mounts");
+    suite.expect(devices.empty(), "container_storage_boot_only_inventory_preserves_direct_backend");
+  }
+
+  {
+    Vector<MachineDiskHardwareProfile> disks;
+    disks.push_back(makeDisk("/"));
+    disks.push_back(makeDisk("/boot"));
+    disks.push_back(makeDisk("/boot/efi"));
+    disks.push_back(makeDisk("/efi"));
     disks.push_back(makeDisk("/containers"));
     disks.push_back(makeDisk("/mnt/data-b"));
     disks.push_back(makeDisk("/mnt/data-a"));
@@ -51,6 +69,17 @@ int main(void)
     suite.expect(mountPaths.size() == 2, "container_storage_mount_paths_filter_reserved_and_dedupe");
     suite.expect(mountPaths[0] == "/mnt/data-a"_ctv, "container_storage_mount_paths_sorts_first");
     suite.expect(mountPaths[1] == "/mnt/data-b"_ctv, "container_storage_mount_paths_sorts_second");
+
+    Vector<ProdigyContainerStorageDevicePlan> devices;
+    prodigyBuildContainerStorageDevicePlan(mountPaths, "1234"_ctv, 512, devices);
+    suite.expect(devices.size() == 2, "container_storage_mixed_boot_inventory_keeps_data_devices");
+    if (devices.size() == 2)
+    {
+      suite.expect(devices[0].backingFilePath == "/mnt/data-a/.prodigy/container-storage/1234.btrfs.loop"_ctv &&
+                       devices[1].backingFilePath == "/mnt/data-b/.prodigy/container-storage/1234.btrfs.loop"_ctv &&
+                       devices[0].sizeMB == 256 && devices[1].sizeMB == 256,
+                   "container_storage_mixed_boot_inventory_preserves_data_backing_layout");
+    }
   }
 
   suite.expect(prodigySelectContainerStorageDeviceCount(64, 4) == 0, "container_storage_device_count_rejects_too_small_total");
