@@ -14762,15 +14762,28 @@ static void testPostReadyCousinAdmissionFailureRevokesSession(TestSuite& suite)
 // duplicate healthy reports into another recovery pass.
 static void testRetainedStatelessHealthRestoresRunning(TestSuite& suite)
 {
-  TestBrain brain = {};
+  TransportCredentialCohortTestBrain brain = {};
   NoopBrainIaaS iaas = {};
   brain.iaas = &iaas;
   brain.weAreMaster = true;
   brain.ignited = true;
+  brain.nBrains = 1;
+  brain.durableMasterAuthorityRuntimeStateGeneration = brain.masterAuthorityRuntimeState.generation;
+  brain.masterAuthorityRuntimeStateDurable = true;
   brain.brainConfig.datacenterFragment = 1;
 
+  TestNeuron self = {};
+  self.uuid = uint128_t(0xA570);
+  NeuronBase *previousNeuron = thisNeuron;
+  thisNeuron = &self;
+  ClusterMachine selfMember = {};
+  selfMember.uuid = self.uuid;
+  selfMember.isBrain = true;
+  brain.authoritativeTopology.machines.push_back(selfMember);
   BrainBase *previousBrain = thisBrain;
   thisBrain = &brain;
+  suite.expect(brain.containerRetirementAuthorityAcknowledged(),
+               "retained_health_fixture_has_current_authority");
 
   Rack rack = {};
   rack.uuid = 62'571;
@@ -14991,6 +15004,7 @@ static void testRetainedStatelessHealthRestoresRunning(TestSuite& suite)
   deployment.containers.erase(&container);
   brain.machinesByUUID.erase(machine.uuid);
   brain.machines.erase(&machine);
+  thisNeuron = previousNeuron;
   thisBrain = previousBrain;
 }
 
@@ -31179,6 +31193,7 @@ static void testBrainNeuronStateUploadRetiresOnlyUnadmittedTaskOwners(TestSuite&
   NoopBrainIaaS iaas = {};
   brain.iaas = &iaas;
   brain.weAreMaster = true;
+  brain.brainConfig.datacenterFragment = 1;
 
   BrainBase *previousBrain = thisBrain;
   thisBrain = &brain;
@@ -31188,6 +31203,7 @@ static void testBrainNeuronStateUploadRetiresOnlyUnadmittedTaskOwners(TestSuite&
   Machine machine = {};
   machine.uuid = uint128_t(0x5311);
   machine.state = MachineState::healthy;
+  machine.fragment = 0x1235;
   machine.rack = &rack;
   machine.neuron.machine = &machine;
   brain.machines.insert(&machine);
@@ -31219,6 +31235,8 @@ static void testBrainNeuronStateUploadRetiresOnlyUnadmittedTaskOwners(TestSuite&
     container->lifetime = ApplicationLifetime::base;
     container->state = ContainerState::planned;
     container->fragment = fragment;
+    container->setMeshAddress(container_network_subnet6, brain.brainConfig.datacenterFragment, machine.fragment, fragment);
+    container->addresses.emplace_back(container->meshAddress, uint8_t(128));
     container->createdAtMs = 123'460;
     deployment.containers.insert(container);
     brain.containers.insert_or_assign(container->uuid, container);
