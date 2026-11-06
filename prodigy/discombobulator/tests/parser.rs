@@ -1,5 +1,5 @@
 use discombobulator::plan::{
-    parse_build_spec, resolve_build_spec, Architecture, FromSource, OutputKind,
+    parse_build_spec, resolve_build_spec, Architecture, FromSource, Instruction, OutputKind,
 };
 use std::collections::BTreeMap;
 
@@ -219,5 +219,67 @@ fn run_captures_env_and_workdir_state_at_each_step() {
             ("MODE".to_string(), "alpha".to_string()),
             ("MODE".to_string(), "beta".to_string())
         ]
+    );
+}
+
+#[test]
+fn resolves_stateful_store_generation_protocol_one_for_app_only() {
+    let spec = parse_build_spec(
+        r#"
+      FROM scratch for x86_64
+      STATEFUL_STORE_GENERATION_PROTOCOL 1
+      EXECUTE ["/app/server"]
+      "#,
+    )
+    .unwrap();
+    let resolved = resolve_build_spec(&spec, OutputKind::App, &BTreeMap::new()).unwrap();
+    assert_eq!(resolved.stateful_store_generation_protocol, Some(1));
+
+    for output_kind in [
+        OutputKind::MothershipTunnelProvider,
+        OutputKind::CrossClusterMasqueGateway,
+    ] {
+        let error = resolve_build_spec(&spec, output_kind, &BTreeMap::new()).unwrap_err();
+        assert!(format!("{error:#}").contains("only valid for app builds"));
+    }
+
+    let base = parse_build_spec("FROM scratch for x86_64\nSTATEFUL_STORE_GENERATION_PROTOCOL 1\n")
+        .unwrap();
+    let error = resolve_build_spec(&base, OutputKind::Base, &BTreeMap::new()).unwrap_err();
+    assert!(format!("{error:#}").contains("only valid for app builds"));
+}
+
+#[test]
+fn rejects_invalid_or_duplicate_stateful_store_generation_protocol() {
+    let unsupported = parse_build_spec(
+        "FROM scratch for x86_64\nSTATEFUL_STORE_GENERATION_PROTOCOL 2\nEXECUTE [\"/app/server\"]\n",
+    )
+    .unwrap_err();
+    assert!(format!("{unsupported:#}").contains("supports only version 1"));
+
+    let duplicate = parse_build_spec(
+        "FROM scratch for x86_64\nSTATEFUL_STORE_GENERATION_PROTOCOL 1\nSTATEFUL_STORE_GENERATION_PROTOCOL 1\nEXECUTE [\"/app/server\"]\n",
+    )
+    .unwrap();
+    let error = resolve_build_spec(&duplicate, OutputKind::App, &BTreeMap::new()).unwrap_err();
+    assert!(format!("{error:#}").contains("multiple STATEFUL_STORE_GENERATION_PROTOCOL"));
+
+    let mut manually_constructed =
+        parse_build_spec("FROM scratch for x86_64\nEXECUTE [\"/app/server\"]\n").unwrap();
+    manually_constructed
+        .instructions
+        .push(Instruction::StatefulStoreGenerationProtocol { version: 2 });
+    let error =
+        resolve_build_spec(&manually_constructed, OutputKind::App, &BTreeMap::new()).unwrap_err();
+    assert!(format!("{error:#}").contains("supports only version 1"));
+}
+
+#[test]
+fn legacy_resolved_spec_serialization_omits_generation_protocol_bytes() {
+    let spec = parse_build_spec("FROM scratch for x86_64\nEXECUTE [\"/app/server\"]\n").unwrap();
+    let resolved = resolve_build_spec(&spec, OutputKind::App, &BTreeMap::new()).unwrap();
+    assert_eq!(
+        serde_json::to_string(&resolved).unwrap(),
+        r#"{"from":{"source":"Scratch","arch":"X86_64"},"declared_args":[],"env":[],"workdir":"/","steps":[],"copies":[],"runs":[],"survives":[],"execute":["/app/server"]}"#
     );
 }
