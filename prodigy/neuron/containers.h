@@ -2115,14 +2115,27 @@ public:
                                     CousinRouteHalf half, flow_key& flow)
   {
     flow = {};
+    const bool nativeRepair = prodigyCousinNativeRepairSession(session);
     if (!prodigyCousinSessionRecordValid(session) ||
-        !prodigyCousinSessionUsesPrivateContainerEndpoints(session) ||
+        (!nativeRepair && !prodigyCousinSessionUsesPrivateContainerEndpoints(session)) ||
         !cousinRouteHalfValid(half)) return false;
     const bool source = half == CousinRouteHalf::source;
-    std::memcpy(flow.srcv6, source ? session.sourceAddress.v6 : session.destination.publicAddress.v6, 16);
-    std::memcpy(flow.dstv6, source ? session.destination.publicAddress.v6 : session.sourceAddress.v6, 16);
-    flow.port16[0] = htons(source ? session.sourceTCPPort : session.destination.publicTCPPort);
-    flow.port16[1] = htons(source ? session.destination.publicTCPPort : session.sourceTCPPort);
+    const IPAddress& localAddress = nativeRepair ?
+        (source ? session.repairTarget.address : session.repairDonor.address) :
+        (source ? session.sourceAddress : session.destination.publicAddress);
+    const IPAddress& peerAddress = nativeRepair ?
+        (source ? session.repairDonor.address : session.repairTarget.address) :
+        (source ? session.destination.publicAddress : session.sourceAddress);
+    const uint16_t localPort = nativeRepair ?
+        (source ? session.repairTarget.tcpPort : session.repairDonor.tcpPort) :
+        (source ? session.sourceTCPPort : session.destination.publicTCPPort);
+    const uint16_t peerPort = nativeRepair ?
+        (source ? session.repairDonor.tcpPort : session.repairTarget.tcpPort) :
+        (source ? session.destination.publicTCPPort : session.sourceTCPPort);
+    std::memcpy(flow.srcv6, localAddress.v6, 16);
+    std::memcpy(flow.dstv6, peerAddress.v6, 16);
+    flow.port16[0] = htons(localPort);
+    flow.port16[1] = htons(peerPort);
     flow.proto = IPPROTO_TCP;
     return true;
   }
@@ -4612,14 +4625,12 @@ private:
 
 public:
 
-  static String boundedFailureReport(const siginfo_t& infop, int terminalSignal, const String& report, const String& standardError)
+  static String boundedFailureReport(const siginfo_t& infop, int terminalSignal, const String& reportHead,
+                                     const String& standardError, const ProdigyStatefulStoreBootFailure *observed)
   {
     // The Brain stores at most 256 report bytes. Keep the termination identity,
     // beginning of the report, and the end of stderr (where crash PCs land).
-    ProdigyStatefulStoreBootFailure bootFailure = {};
-    String humanReport = {};
-    const bool typed = prodigyStatefulStoreBootFailureDecodeReport(report, bootFailure, humanReport);
-    const String& reportHead = typed ? humanReport : report;
+    const bool typed = observed != nullptr;
     const uint64_t maximumWireReportBytes = typed ? ProdigyStatefulStoreBootFailureHumanMaximumBytes :
         ProdigyStatefulStoreBootFailureReportMaximumBytes;
     String bounded = {};
@@ -4652,9 +4663,17 @@ public:
     if (typed)
     {
       String encoded = {};
-      if (prodigyStatefulStoreBootFailureEncodeReport(bounded, bootFailure, encoded))
+      if (prodigyStatefulStoreBootFailureEncodeReport(bounded, *observed, encoded))
         return encoded;
     }
+    // A normal stderr tail can contain arbitrary bytes, including a second
+    // program's encoded crash report. Only the original crash file may
+    // supply the typed record that the controller will act on.
+    ProdigyStatefulStoreBootFailure ignored = {};
+    String ignoredHuman;
+    if (!bounded.empty() && bounded[bounded.size() - 1] == '\n' &&
+        prodigyStatefulStoreBootFailureDecodeReport(bounded, ignored, ignoredHuman))
+      bounded[bounded.size() - 1] = ' ';
     return bounded;
   }
 
@@ -10068,21 +10087,28 @@ public:
     return repaired;
   }
 
-  static bool armStatefulStoreEnvironmentStorageRepair(
-      Container *container, const siginfo_t& infop, bool restart,
+  static bool nativeStoreBootFailureCurrent(
+      const Container *container, const siginfo_t& infop, bool restart,
       const ProdigyStatefulStoreBootFailure& failure)
   {
-    if (container == nullptr) return false;
-    container->pendingEnvironmentRepairGeneration.reset();
+    if (!container || !prodigyStatefulStoreBootFailureValid(failure)) return false;
     const bool selectedGeneration =
         (container->statefulStoreGenerationSelection.protocolVersion == 0 && failure.generationUUID == 0) ||
         (container->statefulStoreGenerationSelection.protocolVersion != 0 &&
          failure.generationUUID == container->statefulStoreGenerationSelection.generationUUID);
-    if (infop.si_code != CLD_EXITED || infop.si_status != 1 || !restart || container->killedOnPurpose ||
-        container->pendingDestroy || !container->plan.restartOnFailure ||
-        !statefulStoreEnvironmentStorageRepairCandidate(container) ||
-        container->statefulStoreGenerationProtocol != 1 || !selectedGeneration ||
-        !container->statefulStoreGenerationLaunchReady() ||
+    return infop.si_code == CLD_EXITED && infop.si_status == 1 && restart && !container->killedOnPurpose &&
+        !container->pendingDestroy && container->plan.restartOnFailure &&
+        statefulStoreEnvironmentStorageRepairCandidate(container) &&
+        container->statefulStoreGenerationProtocol == 1 && selectedGeneration && container->statefulStoreGenerationLaunchReady();
+  }
+
+  static bool armStatefulStoreEnvironmentStorageRepair(
+      Container *container, const siginfo_t& infop, bool restart,
+      const ProdigyStatefulStoreBootFailure& failure)
+  {
+    if (!container) return false;
+    container->pendingEnvironmentRepairGeneration.reset();
+    if (!nativeStoreBootFailureCurrent(container, infop, restart, failure) ||
         failure.stage != ProdigyStatefulStoreBootFailureStage::environmentInspection ||
         !((failure.kind == ProdigyStatefulStoreBootFailureKind::environment && failure.systemErrno == ENOENT) ||
           (failure.kind == ProdigyStatefulStoreBootFailureKind::permission &&

@@ -4705,6 +4705,25 @@ public:
         transportPeerProjectionControlCurrent(stream, generation, peerUUID);
   }
 
+  // Native store repair deliberately has no pair-control or route authority.
+  // It is still accepted only from the exact currently authenticated Brain
+  // stream carrying the node's current control credential projection.
+  bool nativeRepairControlCurrent(NeuronBrainControlStream *stream, uint64_t generation,
+                                  uint128_t peerUUID) const
+  {
+    return controlTransportCredentials.enabled && controlPeerCurrentlyAuthorized(peerUUID) &&
+        transportPeerProjectionControlCurrent(stream, generation, peerUUID);
+  }
+
+  bool cousinSessionControlCurrent(const ProdigyCousinSessionRecord& session,
+                                   NeuronBrainControlStream *stream, uint64_t generation,
+                                   uint128_t peerUUID) const
+  {
+    return prodigyCousinNativeRepairSession(session) ?
+        nativeRepairControlCurrent(stream, generation, peerUUID) :
+        cousinSessionCarrierCurrent(stream, generation, peerUUID);
+  }
+
   void flushCousinSessionControlReceipts()
   {
     const int64_t now = Time::msSinceBoot();
@@ -4817,8 +4836,12 @@ public:
     NeuronBrainControlStream *stream = brain;
     const uint64_t generation = stream ? stream->ioGeneration : 0;
     const uint128_t peerUUID = stream ? stream->tlsPeerUUID : 0;
+    const int64_t wallNowMs = Time::now<TimeResolution::ms>();
+    const bool nativeRepair = prodigyCousinNativeRepairSession(command.session);
     if (containerUUID == 0 || !prodigyCousinSessionLocalCommandValid(command) ||
-        !cousinSessionCarrierCurrent(stream, generation, peerUUID)) return;
+        !cousinSessionControlCurrent(command.session, stream, generation, peerUUID)) return;
+    const uint32_t remainingMs = nativeRepair ? prodigyNativeRepairLeaseRemainingMs(command, wallNowMs) : command.validForMs;
+    if (nativeRepair && command.kind != ProdigyCousinSessionLocalKind::revoke && !remainingMs) return;
     auto containerIt = containers.find(containerUUID);
     if (containerIt == containers.end() || containerIt->second == nullptr || !streamIsActive(containerIt->second)) return;
     Container *container = containerIt->second;
@@ -4848,11 +4871,11 @@ public:
     String serialized = {}; auto copy = command;
     if (!BitseryEngine::serialize(serialized, copy) || serialized.size() > ProdigyCousinSessionMaximumBytes) return;
     if (command.kind != ProdigyCousinSessionLocalKind::reject &&
-        command.localHalf == CousinRouteHalf::source &&
-        prodigyCousinSessionUsesPrivateContainerEndpoints(command.session)) {
+        (nativeRepair || (command.localHalf == CousinRouteHalf::source &&
+                          prodigyCousinSessionUsesPrivateContainerEndpoints(command.session)))) {
       const bool revoke = command.kind == ProdigyCousinSessionLocalKind::revoke;
       const uint64_t nowNs = monotonicNowNs();
-      const uint64_t lifetime = uint64_t(command.validForMs) * 1000000ULL;
+      const uint64_t lifetime = uint64_t(remainingMs) * 1000000ULL;
       if (!nowNs || (!revoke && (!lifetime || command.validForMs > ProdigyCousinSessionLeaseMs ||
                                 UINT64_MAX - nowNs < lifetime)) ||
           !container->applyPrivateSessionTCPFlow(command.session, command.localHalf,
@@ -4863,7 +4886,7 @@ public:
     if (command.kind != ProdigyCousinSessionLocalKind::reject) {
       // Revocation has no lease by design, but its local acknowledgement must
       // remain admissible long enough to reach the same authenticated Brain.
-      const uint32_t acknowledgementWindow = command.validForMs ? command.validForMs : ProdigyCousinSessionPendingMs;
+      const uint32_t acknowledgementWindow = remainingMs ? remainingMs : ProdigyCousinSessionPendingMs;
       CousinSessionLocalPending pending = {command.session.sessionUUID, command.leaseGeneration, containerUUID,
           command.carrierConnectionID, command.carrierGeneration, command.localHalf, command.session, generation, peerUUID, command.kind, false,
           Time::msSinceBoot() + int64_t(acknowledgementWindow)};
@@ -4890,6 +4913,9 @@ public:
                                              const Container& container) const
   {
     if (!prodigyCousinSessionLocalCommandValid(command) || !controlTransportCredentials.enabled) return false;
+    if (prodigyCousinNativeRepairSession(command.session))
+      return nativeRepairEndpointMatchesContainer(command.session, command.localHalf, container,
+          command.kind != ProdigyCousinSessionLocalKind::revoke);
     const uint32_t containerID = generateLocalContainerID(container.plan.fragment);
     const bool source = command.localHalf == CousinRouteHalf::source;
     const auto& permission = source ? command.session.sourcePermission : command.session.destination.permission;
@@ -4922,6 +4948,64 @@ public:
           wormhole.layer4 == IPPROTO_TCP && !wormhole.isQuic) ++matches;
     }
     return matches == 1;
+  }
+
+  bool nativeRepairEndpointMatchesContainer(const ProdigyCousinSessionRecord& session,
+                                            CousinRouteHalf half, const Container& container,
+                                            bool requireCurrentPlan = true) const
+  {
+    if (!prodigyCousinNativeRepairSession(session) || !prodigyCousinSessionRecordValid(session) ||
+        !cousinRouteHalfValid(half)) return false;
+    const ProdigyCohortRepairEndpoint *endpoint = prodigyCousinNativeRepairEndpointForLocalHalf(session, half);
+    if (!endpoint || endpoint->containerUUID != container.plan.uuid ||
+        endpoint->nodeUUID != controlTransportCredentials.self.nodeUUID ||
+        session.repairAuthority.targetClusterUUID != controlTransportCredentials.self.clusterUUID) return false;
+    if (!requireCurrentPlan) return true;
+    if (!prodigyValidateContainerPlanMeshIdentity(container.plan, lcsubnet6) ||
+        !container.plan.isStateful || container.plan.config.type != ApplicationType::stateful ||
+        (container.plan.config.applicationID != 3 && container.plan.config.applicationID != 4) ||
+        container.plan.config.applicationID != session.repairAuthority.applicationID ||
+        container.plan.shardGroup != session.repairAuthority.shardGroup ||
+        container.plan.nShardGroups != session.repairAuthority.nShardGroups ||
+        !container.plan.statefulMeshRoles.hasDistinctServices()) return false;
+    uint32_t addresses = 0;
+    for (const auto& candidate : container.plan.addresses)
+      if (candidate.cidr == 128 && candidate.network.equals(endpoint->address)) ++addresses;
+    if (addresses != 1) return false;
+    const uint64_t repairService = prodigyCousinSessionServiceForLocalHalf(session, half);
+    const uint64_t expectedService = session.repairPurpose == ProdigyCohortRepairPurpose::seed ?
+        container.plan.statefulMeshRoles.seeding : container.plan.statefulMeshRoles.sibling;
+    if (repairService == 0 || repairService != expectedService) return false;
+    if (half == CousinRouteHalf::destination) {
+      const auto advertised = container.plan.advertisements.find(repairService);
+      return container.plan.config.deploymentID() == session.repairAuthority.sourceDeploymentID &&
+          (session.repairPurpose == ProdigyCohortRepairPurpose::catchup ||
+           container.plan.uuid == session.repairAuthority.sourceContainerUUID) &&
+          advertised != container.plan.advertisements.end() &&
+          advertised->second.port == endpoint->tcpPort &&
+          serviceBlueprintActiveAtContainerState(advertised->second, container.plan.state);
+    }
+    if (endpoint->tcpPort < 49152 ||
+        std::any_of(container.plan.advertisements.begin(), container.plan.advertisements.end(),
+            [&](const auto& entry) { return entry.second.port == endpoint->tcpPort; })) return false;
+    const auto subscription = container.plan.subscriptions.find(repairService);
+    if (subscription == container.plan.subscriptions.end() ||
+        !serviceBlueprintActiveAtContainerState(subscription->second, container.plan.state)) return false;
+    for (const auto& pending : cousinSessionLocalPendings) {
+      const uint16_t pendingSourcePort = prodigyCousinNativeRepairSession(pending.session) ?
+          pending.session.repairTarget.tcpPort : pending.session.sourceTCPPort;
+      if (pending.expiresAtMs > Time::msSinceBoot() && pending.sessionUUID != session.sessionUUID &&
+          pending.containerUUID == container.plan.uuid && pending.localHalf == CousinRouteHalf::source &&
+          pendingSourcePort == endpoint->tcpPort) return false;
+    }
+    const auto& selection = container.statefulStoreGenerationSelection;
+    if (container.plan.config.deploymentID() != session.repairAuthority.targetDeploymentID ||
+        selection.protocolVersion != ProdigyStatefulStoreGenerationSelection::version ||
+        selection.generationUUID != session.repairGenerationUUID ||
+        !container.statefulStoreGenerationLaunchReady()) return false;
+    auto expectedSelection = selection;
+    expectedSelection.authority = session.repairAuthority;
+    return prodigyStatefulStoreGenerationSameHome(selection, expectedSelection);
   }
 
   bool privateCousinEndpointMatchesContainer(const ProdigyCousinSessionRecord& session,
@@ -4959,8 +5043,9 @@ public:
 
   bool clearPrivateCousinFlow(const CousinSessionLocalPending& pending)
   {
-    if (pending.localHalf != CousinRouteHalf::source ||
-        !prodigyCousinSessionUsesPrivateContainerEndpoints(pending.session)) return true;
+    const bool nativeRepair = prodigyCousinNativeRepairSession(pending.session);
+    if ((!nativeRepair && (pending.localHalf != CousinRouteHalf::source ||
+                           !prodigyCousinSessionUsesPrivateContainerEndpoints(pending.session)))) return true;
     auto found = containers.find(pending.containerUUID);
     return found == containers.end() || !found->second ||
         found->second->applyPrivateSessionTCPFlow(pending.session, pending.localHalf, 0, true);
@@ -5083,14 +5168,15 @@ public:
     }
     if (pending == cousinSessionLocalPendings.end() ||
         (pending->acknowledged && ack.kind != ProdigyCousinSessionLocalKind::revoke) ||
-        !cousinSessionCarrierCurrent(stream, generation, peerUUID)) return;
+        !cousinSessionControlCurrent(pending->session, stream, generation, peerUUID)) return;
     String serialized = {}; auto copy = ack;
     if (!BitseryEngine::serialize(serialized, copy) || serialized.size() > ProdigyCousinSessionMaximumBytes) return;
     Message::construct(stream->wBuffer, NeuronTopic::cousinSessionAck, container->plan.uuid, serialized);
     Ring::queueSend(stream);
     if (ack.kind == ProdigyCousinSessionLocalKind::revoke || !ack.success) {
       (void)clearPrivateCousinFlow(*pending);
-      if (pending->localHalf == CousinRouteHalf::destination &&
+      if (!prodigyCousinNativeRepairSession(pending->session) &&
+          pending->localHalf == CousinRouteHalf::destination &&
           prodigyCousinSessionUsesPrivateContainerEndpoints(pending->session)) {
         for (auto it = cousinAdmissionInstalled.begin(); it != cousinAdmissionInstalled.end();) {
           if (it->privateContainerUUID != pending->containerUUID || it->sessionUUID != pending->sessionUUID ||
@@ -6293,17 +6379,11 @@ public:
       // and clears this transient authorization immediately before warm start.
       ProdigyStatefulStoreBootFailure typedBootFailure = {};
       String typedBootFailureHuman = {};
-      if (prodigyStatefulStoreBootFailureDecodeReport(crashReport, typedBootFailure, typedBootFailureHuman))
-      {
-        (void)ContainerManager::armStatefulStoreEnvironmentStorageRepair(
-            container, infop, restart, typedBootFailure);
-      }
-      else
-      {
-        container->pendingEnvironmentRepairGeneration.reset();
-      }
-
-      crashReport = ContainerManager::boundedFailureReport(infop, terminalSignal, crashReport, stderrTail);
+      const bool decoded = prodigyStatefulStoreBootFailureDecodeReport(crashReport, typedBootFailure, typedBootFailureHuman);
+      const bool current = decoded && ContainerManager::nativeStoreBootFailureCurrent(container, infop, restart, typedBootFailure);
+      (void)ContainerManager::armStatefulStoreEnvironmentStorageRepair(container, infop, restart, typedBootFailure);
+      crashReport = ContainerManager::boundedFailureReport(infop, terminalSignal,
+          decoded ? typedBootFailureHuman : crashReport, stderrTail, current ? &typedBootFailure : nullptr);
 
       uint64_t previewBytes = (crashReport.size() < 1024) ? crashReport.size() : 1024;
       String preview;

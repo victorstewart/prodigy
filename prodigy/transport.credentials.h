@@ -6,6 +6,7 @@
 #include <openssl/kdf.h>
 #include <types/types.containers.h>
 #include <prodigy/persistent.codec.h>
+#include <prodigy/sha256.digest.h>
 
 // Durable control-plane contract for the internal AEGIS credential authority.
 // These records are enrollment evidence only: transport activation and live
@@ -811,6 +812,33 @@ static inline bool prodigyDeriveTransportCredentialPSK(
   context.append(purpose);
   canonicalContext = std::move(context);
   return prodigyDeriveTransportCredentialHKDF(self.secret, canonicalContext, output);
+}
+
+// Same-cohort native source-cut repair uses the existing cluster transport
+// root, but cannot share an ordinary Brain/Neuron or pair-control PSK domain.
+// The caller supplies the already-validated immutable repair-record digest;
+// it is included in the HKDF purpose while the AEGIS prologue remains that
+// exact digest at the local command boundary.
+static inline bool prodigyDeriveNativeStatefulRepairPSK(
+    const ProdigyTransportNodeCredential& self, uint128_t peerOperationUUID,
+    uint128_t peerNodeUUID, ProdigyTransportCredentialNodeRole peerRole,
+    const String& repairRecordSHA256,
+    uint8_t output[ProdigyTransportCredentialAuthorityRootBytes])
+{
+  if (!prodigyIsSHA256HexDigest(repairRecordSHA256)) {
+    if (output != nullptr) OPENSSL_cleanse(output, ProdigyTransportCredentialAuthorityRootBytes);
+    return false;
+  }
+  String purpose = {};
+  constexpr char label[] = "prodigy/native-stateful-repair/aegis/v1";
+  if (!purpose.reserve(sizeof(label) - 1 + repairRecordSHA256.size())) return false;
+  purpose.append(label, sizeof(label) - 1); purpose.append(repairRecordSHA256);
+  String ignoredContext = {};
+  const bool ok = prodigyDeriveTransportCredentialPSK(self, peerOperationUUID, peerNodeUUID, peerRole,
+      purpose, ignoredContext, output);
+  OPENSSL_cleanse(purpose.data(), size_t(purpose.reservedBytes()));
+  OPENSSL_cleanse(ignoredContext.data(), size_t(ignoredContext.reservedBytes()));
+  return ok;
 }
 
 template <typename S>

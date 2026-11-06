@@ -142,13 +142,9 @@ static inline bool prodigyProjectStatefulStoreGeneration(
 // when every immutable launch field remains identical.  Keep this
 // normalization beside the sealed-runtime projection so Neuron cannot grow a
 // second, subtly weaker identity rule for same-UUID recovery.
-static inline bool prodigyStatefulStoreGenerationImmutablePlanIdentityMatches(
-    const ProdigyStatefulStoreGenerationSelection& selection,
-    const BrainReplicatedContainerRuntimeState& sealed,
-    const ContainerPlan& proposedPlan)
+static inline bool prodigyStatefulServingImmutablePlanMatches(
+    const BrainReplicatedContainerRuntimeState& sealed, const ContainerPlan& proposedPlan)
 {
-  if (!prodigyStatefulStoreGenerationSelectionMatchesPlan(selection, sealed.plan) ||
-      !prodigyStatefulStoreGenerationSelectionMatchesPlan(selection, proposedPlan)) return false;
   BrainReplicatedContainerRuntimeState normalized = sealed;
   normalized.plan = proposedPlan;
   normalized.plan.state = sealed.plan.state;
@@ -160,6 +156,16 @@ static inline bool prodigyStatefulStoreGenerationImmutablePlanIdentityMatches(
   String sealedDigest = {}, proposedDigest = {};
   return prodigyStatefulServingRuntimeDigest(sealed, sealedDigest) &&
       prodigyStatefulServingRuntimeDigest(normalized, proposedDigest) && sealedDigest == proposedDigest;
+}
+
+static inline bool prodigyStatefulStoreGenerationImmutablePlanIdentityMatches(
+    const ProdigyStatefulStoreGenerationSelection& selection,
+    const BrainReplicatedContainerRuntimeState& sealed,
+    const ContainerPlan& proposedPlan)
+{
+  return prodigyStatefulStoreGenerationSelectionMatchesPlan(selection, sealed.plan) &&
+      prodigyStatefulStoreGenerationSelectionMatchesPlan(selection, proposedPlan) &&
+      prodigyStatefulServingImmutablePlanMatches(sealed, proposedPlan);
 }
 
 static inline bool prodigyStatefulStoreGenerationImmutablePlanIdentityMatches(
@@ -188,6 +194,38 @@ static inline bool prodigyStatefulStoreGenerationSelectionStrictlyAdvances(
       previous.admittedPlanSHA256.equals(next.admittedPlanSHA256) &&
       next.authority.authorityGeneration > previous.authority.authorityGeneration &&
       next.authority.seedGeneration > previous.authority.seedGeneration;
+}
+
+// Re-read both halves of the sealed serving package before acting on a
+// reported failure. Replacing the plan or moving the UUID invalidates an old
+// request even if the new live view happens to use the same application ID.
+static inline const BrainReplicatedContainerRuntimeState *prodigyStatefulServingRepairMember(
+    const ProdigyMasterAuthorityRuntimeState& runtime,
+    const Vector<BrainReplicatedContainerRuntimeState>& sealedStates,
+    uint64_t deploymentID, uint32_t shard, uint128_t uuid, uint128_t machineUUID,
+    const ProdigyStatefulServingAuthority *&scope, String& memberDigest)
+{
+  scope = nullptr;
+  memberDigest.clear();
+  const auto state = std::find_if(sealedStates.begin(), sealedStates.end(),
+      [=](const auto& entry) { return entry.plan.uuid == uuid; });
+  if (state == sealedStates.end() || state->machineUUID != machineUUID ||
+      !state->plan.isStateful || state->plan.isSystemContainer() || state->plan.useHostNetworkNamespace ||
+      state->plan.shardGroup != shard || shard >= state->plan.nShardGroups ||
+      state->plan.config.deploymentID() != deploymentID ||
+      !prodigyStatefulServingRuntimeDigest(*state, memberDigest)) return nullptr;
+  for (const auto& authority : runtime.statefulServingAuthorities)
+  {
+    if (!prodigyStatefulServingAuthorityMatchesShard(authority, deploymentID, shard)) continue;
+    const auto member = std::find_if(authority.members.begin(), authority.members.end(),
+        [=](const auto& entry) { return entry.containerUUID == uuid; });
+    if (member == authority.members.end()) continue;
+    if (scope || member->machineUUID != machineUUID || member->shardGroup != shard ||
+        authority.revision == 0 || authority.revision > runtime.generation ||
+        !member->planSHA256.equals(memberDigest)) return nullptr;
+    scope = &authority;
+  }
+  return scope ? &*state : nullptr;
 }
 
 // Desired writer permission is not an application activation acknowledgement.

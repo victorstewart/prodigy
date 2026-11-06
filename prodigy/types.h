@@ -5610,6 +5610,7 @@ public:
   int32_t systemErrno = 0;
   uint64_t rawError = 0;
   uint128_t generationUUID = 0;
+  bool operator==(const ProdigyStatefulStoreBootFailure&) const = default;
 };
 
 template <typename S>
@@ -6121,6 +6122,7 @@ public:
   String contentSHA256, headsSHA256;
   bool ready = false, released = false;
   String failure;
+  bool operator==(const ProdigyStatefulStoreSourceCut&) const = default;
 };
 template <typename S> static void serialize(S&& s, ProdigyStatefulStoreSourceCut& v) {
   s.value4b(v.protocolVersion); s.value1b(v.action); s.value1b(v.response);
@@ -6314,6 +6316,64 @@ static inline bool prodigyStatefulStoreGenerationSameHome(
   String aBytes = {}, bBytes = {};
   auto aAuthority = a.authority, bAuthority = b.authority;
   return BitseryEngine::serialize(aBytes, aAuthority) && BitseryEngine::serialize(bBytes, bAuthority) && aBytes == bBytes;
+}
+
+// Intent to repair one existing serving member. The serving package owns the
+// target identity. A source cut has its own challenge and the native store
+// owns progress. Waiting for an input does not change the authority revision.
+struct ProdigyStatefulServingMemberRepair {
+  uint128_t operationUUID = 0;
+  uint64_t deploymentID = 0;
+  uint32_t shardGroup = 0;
+  uint128_t targetContainerUUID = 0;
+  uint128_t targetMachineUUID = 0;
+  uint64_t servingRevision = 0;
+  String targetPlanSHA256;
+  ProdigyStatefulStoreBootFailure failure;
+  ProdigyStatefulStoreSourceCut challenge = {.protocolVersion = 0};
+  uint128_t donorMachineUUID = 0;
+  String donorPlanSHA256;
+  uint128_t sourceBaselineOperationUUID = 0;
+  String fixtureSHA256;
+
+  bool operator==(const ProdigyStatefulServingMemberRepair&) const = default;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyStatefulServingMemberRepair& request)
+{
+  serializer.value16b(request.operationUUID);
+  serializer.value8b(request.deploymentID);
+  serializer.value4b(request.shardGroup);
+  serializer.value16b(request.targetContainerUUID);
+  serializer.value16b(request.targetMachineUUID);
+  serializer.value8b(request.servingRevision);
+  serializer.text1b(request.targetPlanSHA256, 64);
+  serializer.object(request.failure);
+  serializer.object(request.challenge);
+  serializer.value16b(request.donorMachineUUID);
+  serializer.text1b(request.donorPlanSHA256, 64);
+  serializer.value16b(request.sourceBaselineOperationUUID);
+  serializer.text1b(request.fixtureSHA256, 64);
+}
+
+static inline bool prodigyStatefulServingMemberRepairValid(const ProdigyStatefulServingMemberRepair& request)
+{
+  const auto app = uint16_t(request.deploymentID >> 48);
+  if (!request.operationUUID || (app != 3 && app != 4) || !request.targetContainerUUID ||
+      !request.targetMachineUUID || !request.servingRevision || !prodigyIsSHA256HexDigest(request.targetPlanSHA256) ||
+      !prodigyStatefulStoreBootFailureValid(request.failure)) return false;
+  const auto& cut = request.challenge;
+  if (cut.protocolVersion == 0)
+    return cut == ProdigyStatefulStoreSourceCut{.protocolVersion = 0} && request.donorMachineUUID == 0 &&
+        request.donorPlanSHA256.empty() && !request.sourceBaselineOperationUUID && request.fixtureSHA256.empty();
+  return prodigyStatefulStoreSourceCutValid(cut) && !cut.response && cut.action == ProdigyStatefulStoreSourceCutAction::prepare &&
+      cut.operationUUID == request.operationUUID && cut.memberRequestUUID != 0 && cut.sourceDeploymentID == request.deploymentID &&
+      cut.sourceContainerUUID != request.targetContainerUUID && cut.shardGroup == request.shardGroup &&
+      cut.applicationID == app && cut.storeKind == DeploymentIdentityStoreKind::kv &&
+      request.donorMachineUUID != 0 && request.donorMachineUUID != request.targetMachineUUID &&
+      prodigyIsSHA256HexDigest(request.donorPlanSHA256) && request.sourceBaselineOperationUUID != 0 &&
+      prodigyIsSHA256HexDigest(request.fixtureSHA256);
 }
 
 // Native store observation relayed through the existing container -> Neuron
@@ -12021,6 +12081,7 @@ public:
   // identity only; native checkpoint progress and serving promotion remain in
   // their existing owners.
   Vector<ProdigyStatefulStoreGenerationSelection> statefulStoreGenerationSelections;
+  Vector<ProdigyStatefulServingMemberRepair> statefulServingMemberRepairs;
   Vector<ApiCredentialExpiryNotice> apiCredentialExpiryNotices;
   Vector<ProdigyManagedMachineSchema> machineSchemas;
   Vector<RoutableResourceLease> routableResourceLeases;
@@ -12063,6 +12124,7 @@ public:
 
   bool operator==(const ProdigyMasterAuthorityRuntimeState& other) const
   {
+    if (statefulServingMemberRepairs != other.statefulServingMemberRepairs) return false;
     if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || nextPendingElasticAddressOperationID != other.nextPendingElasticAddressOperationID || nextDNSIntentRevision != other.nextDNSIntentRevision || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || pendingAddMachinesProvisioningIntents.size() != other.pendingAddMachinesProvisioningIntents.size() || pendingAutonomousProvisioningOperations.size() != other.pendingAutonomousProvisioningOperations.size() || pendingElasticAddressAssignments.size() != other.pendingElasticAddressAssignments.size() || pendingElasticAddressReleases.size() != other.pendingElasticAddressReleases.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || statefulServingAuthorities.size() != other.statefulServingAuthorities.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || materializedStatefulRecoveryOperations.size() != other.materializedStatefulRecoveryOperations.size() || materializedStatefulRecoveryRetries.size() != other.materializedStatefulRecoveryRetries.size() || retainedStatefulRearmProofs.size() != other.retainedStatefulRearmProofs.size() || statefulStoreGenerationSelections.size() != other.statefulStoreGenerationSelections.size() || apiCredentialExpiryNotices.size() != other.apiCredentialExpiryNotices.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || taskExecutions.size() != other.taskExecutions.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf || updateSelfFollowerConcurrency != other.updateSelfFollowerConcurrency || updateSelfFollowerTransitionIssuedPeerKeys != other.updateSelfFollowerTransitionIssuedPeerKeys || updateSelfFollowerReadyPeerKeys != other.updateSelfFollowerReadyPeerKeys ||
         prodigyDeploymentPlacementPoliciesEqual(deploymentPlacementPolicies, other.deploymentPlacementPolicies) == false ||
         prodigyStatelessDeploymentAdmissionsEqual(statelessDeploymentAdmissions, other.statelessDeploymentAdmissions) == false ||
@@ -13306,7 +13368,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   // re-arm proofs beside the existing recovery-operation ledger; version 23
   // appends exact stateful native-generation launch selections.
   // Older readers reject before consuming either newer operation layout.
-  constexpr uint64_t explicitVersion = 23;
+  constexpr uint64_t explicitVersion = 24;
   using Serializer = std::remove_cv_t<std::remove_reference_t<S>>;
   if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
     state.transportCredentialAuthorityRoot = {};
@@ -13333,6 +13395,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   bool hasStatelessDeploymentRetirements = false;
   bool hasRetainedStatefulRearmProofs = false;
   bool hasStatefulStoreGenerationSelections = false;
+  bool hasStatefulServingMemberRepairs = false;
 
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
@@ -13371,7 +13434,8 @@ static void prodigySerializeMasterAuthorityRuntimeState(
     hasPendingAddMachinesProvisioningIntents = state.pendingAddMachinesProvisioningIntents.empty() == false;
     hasStatelessDeploymentRetirements = !state.statelessDeploymentRetirements.empty();
     hasRetainedStatefulRearmProofs = !state.retainedStatefulRearmProofs.empty();
-    hasStatefulStoreGenerationSelections = !state.statefulStoreGenerationSelections.empty();
+    hasStatefulServingMemberRepairs = !state.statefulServingMemberRepairs.empty();
+    hasStatefulStoreGenerationSelections = hasStatefulServingMemberRepairs || !state.statefulStoreGenerationSelections.empty();
     hasCrossClusterMasqueGatewayAuthorities = !state.crossClusterMasqueGatewayAuthorities.empty() || hasStatelessDeploymentRetirements;
     // Version 22 is cumulative through the v21 retirement container. Emit
     // every earlier tail, even when empty, before the re-arm proof sidecar.
@@ -13457,6 +13521,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
       if (hasStatelessDeploymentRetirements) version = 21;
       if (hasRetainedStatefulRearmProofs) version = 22;
       if (hasStatefulStoreGenerationSelections) version = 23;
+      if (hasStatefulServingMemberRepairs) version = 24;
       serializer.value8b(version);
     }
     serializer.value8b(state.generation);
@@ -13508,6 +13573,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
       hasStatelessDeploymentRetirements = version >= 21;
       hasRetainedStatefulRearmProofs = version >= 22;
       hasStatefulStoreGenerationSelections = version >= 23;
+      hasStatefulServingMemberRepairs = version >= 24;
     }
   }
 
@@ -13796,6 +13862,26 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   {
     state.statefulStoreGenerationSelections.clear();
   }
+  if (hasStatefulServingMemberRepairs)
+  {
+    serializer.container(state.statefulServingMemberRepairs, 4096);
+    if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
+    {
+      uint128_t previous = 0;
+      for (const auto& request : state.statefulServingMemberRepairs)
+      {
+        if (!prodigyStatefulServingMemberRepairValid(request) || request.targetContainerUUID <= previous ||
+            request.servingRevision > state.generation)
+        {
+          serializer.adapter().error(bitsery::ReaderError::InvalidData);
+          return;
+        }
+        previous = request.targetContainerUUID;
+      }
+    }
+  }
+  else if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
+    state.statefulServingMemberRepairs.clear();
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
   {
     if (!prodigyPendingAddMachinesProvisioningIntentsValid(

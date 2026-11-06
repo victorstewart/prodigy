@@ -5,6 +5,7 @@
 #include <prodigy/transport.tls.h>
 #include <networking/ring.h>
 #include <memory>
+#include <ctime>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
@@ -15,6 +16,9 @@ static inline bool prodigyCousinSessionObservedSourceMatches(const sockaddr_stor
   if (length < sizeof(sockaddr_in6) || observed.ss_family != AF_INET6) return false;
   const auto& peer = reinterpret_cast<const sockaddr_in6&>(observed);
   if (peer.sin6_scope_id != 0 || peer.sin6_port == 0) return false;
+  if (prodigyCousinNativeRepairSession(session))
+    return ntohs(peer.sin6_port) == session.repairTarget.tcpPort &&
+        std::memcmp(&peer.sin6_addr, session.repairTarget.address.v6, 16) == 0;
   if (session.sourcePermission.transportSourcePolicy == ProdigyCousinTransportSourcePolicy::exact)
     return ntohs(peer.sin6_port) == session.sourceTCPPort && std::memcmp(&peer.sin6_addr, session.sourceAddress.v6, 16) == 0;
   IPAddress address = {}; address.is6 = true; std::memcpy(address.v6, &peer.sin6_addr, 16);
@@ -27,6 +31,13 @@ static inline bool prodigyCousinSessionObservedSourceMatches(const sockaddr_stor
 
 // Native application credential owner. The NeuronHub callback applies commands
 // here before acknowledging them. No enrollment root is exposed to this owner.
+static inline bool prodigyCousinSessionRealtimeMilliseconds(int64_t& output)
+{
+  output = 0; timespec now = {};
+  if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec < 0 || now.tv_sec > INT64_MAX / 1000) return false;
+  output = int64_t(now.tv_sec) * 1000 + int64_t(now.tv_nsec / 1000000); return true;
+}
+
 struct ProdigyCousinSessionLease {
   ProdigyCousinSessionLocalCommand command = {};
   int64_t deadline = 0;
@@ -36,7 +47,12 @@ struct ProdigyCousinSessionLease {
   // command must provide a fresh UUID or generation before another stream can
   // claim it, so a stale peer cannot replay an old open after interruption.
   bool carrierRetired = false;
-  bool current() const { return live && Time::msSinceBoot() < deadline; }
+  bool current() const {
+    if (!live || Time::msSinceBoot() >= deadline) return false;
+    if (!prodigyCousinNativeRepairSession(command.session)) return true;
+    int64_t now = 0;
+    return prodigyCousinSessionRealtimeMilliseconds(now) && prodigyNativeRepairLeaseRemainingMs(command, now) != 0;
+  }
   void revoke() { live = false; OPENSSL_cleanse(command.psk.data(), command.psk.size()); }
 };
 
@@ -181,8 +197,14 @@ public:
     if (!prodigyCousinSessionLocalCommandValid(command) || state->containerUUID == 0) return false;
     if (command.kind == ProdigyCousinSessionLocalKind::reject) return true;
     const auto& session = command.session;
-    if ((command.localHalf == CousinRouteHalf::source ? session.sourceContainerUUID :
-         session.destination.containerUUID) != state->containerUUID) return false;
+    if (prodigyCousinSessionContainerForLocalHalf(session, command.localHalf) != state->containerUUID) return false;
+    uint32_t remainingMs = command.validForMs;
+    if (prodigyCousinNativeRepairSession(session) && command.kind != ProdigyCousinSessionLocalKind::revoke) {
+      int64_t now = 0;
+      if (!prodigyCousinSessionRealtimeMilliseconds(now)) return false;
+      remainingMs = prodigyNativeRepairLeaseRemainingMs(command, now);
+      if (!remainingMs) return false;
+    }
     expire();
     auto found = std::find_if(state->leases.begin(), state->leases.end(), [&](const auto& lease) {
       return lease->command.session.sessionUUID == session.sessionUUID;
@@ -206,19 +228,20 @@ public:
           !command.authenticatedSourceAddress.equals(lease.command.authenticatedSourceAddress) ||
           CRYPTO_memcmp(command.psk.data(), lease.command.psk.data(), command.psk.size()) != 0) return false;
       lease.command.leaseGeneration = command.leaseGeneration;
-      lease.deadline = Time::msSinceBoot() + command.validForMs;
+      lease.command.nativeLeaseExpiresAtMilliseconds = command.nativeLeaseExpiresAtMilliseconds;
+      lease.deadline = Time::msSinceBoot() + remainingMs;
       return true;
     }
     if (command.kind == ProdigyCousinSessionLocalKind::renew || command.leaseGeneration != 1 ||
         state->leases.size() >= ProdigyCousinSessionMaximumRecords || state->retiredCapacityExhausted || state->retired(session.sessionUUID)) return false;
-    if (command.localHalf == CousinRouteHalf::source) {
+    if (!prodigyCousinNativeRepairSession(session) && command.localHalf == CousinRouteHalf::source) {
       for (const auto& lease : state->leases)
         if (lease->command.localHalf == CousinRouteHalf::source &&
             lease->command.session.sourceBindingNonce == session.sourceBindingNonce &&
             prodigyCousinSourcePermissionsConflict(session.sourcePermission, lease->command.session.sourcePermission)) return false;
     }
     auto lease = std::make_shared<ProdigyCousinSessionLease>();
-    lease->command = command; lease->deadline = Time::msSinceBoot() + command.validForMs;
+    lease->command = command; lease->deadline = Time::msSinceBoot() + remainingMs;
     state->leases.push_back(std::move(lease));
     return true;
   }
@@ -237,8 +260,13 @@ public:
     auto lease = *found;
     const auto& session = lease->command.session;
     stream.setIPVersion(AF_INET6); stream.setNonBlocking();
-    stream.setSaddr(session.sourceAddress, session.sourceTCPPort);
-    stream.setDaddr(session.destination.publicAddress, session.destination.publicTCPPort);
+    if (prodigyCousinNativeRepairSession(session)) {
+      stream.setSaddr(session.repairTarget.address, session.repairTarget.tcpPort);
+      stream.setDaddr(session.repairDonor.address, session.repairDonor.tcpPort);
+    } else {
+      stream.setSaddr(session.sourceAddress, session.sourceTCPPort);
+      stream.setDaddr(session.destination.publicAddress, session.destination.publicTCPPort);
+    }
     if (stream.fd < 0 || !Ring::bindSourceAddressBeforeFixedFileInstall(&stream)) return false;
     lease->claimed = true; stream.lease = lease; stream.resolving = false;
     std::weak_ptr<ProdigyCousinSessionLease> weak = lease;
@@ -249,7 +277,7 @@ public:
           if (!lease || !lease->current() ||
               peer != prelude(lease->command.session.sessionUUID, CousinRouteHalf::destination)) return false;
           key = lease->command.psk; context = lease->command.canonicalContext;
-          peerUUID = lease->command.session.destination.containerUUID; return true;
+          peerUUID = prodigyCousinSessionPeerContainerForLocalHalf(lease->command.session, CousinRouteHalf::source); return true;
         });
     if (prepared) stream.resolvedSessionUUID = sessionUUID;
     return prepared;
@@ -350,7 +378,7 @@ public:
             lease->claimed = true; stream.lease = lease;
             stream.resolvedSessionUUID = sessionUUID; stream.resolving = false;
             key = lease->command.psk; context = lease->command.canonicalContext;
-            peerUUID = lease->command.session.sourceContainerUUID;
+            peerUUID = prodigyCousinSessionPeerContainerForLocalHalf(lease->command.session, CousinRouteHalf::destination);
             local = prelude(sessionUUID, CousinRouteHalf::destination); return true;
           }
           return false;

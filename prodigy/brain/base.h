@@ -106,6 +106,7 @@ public:
   bool containerRetirementCapabilityAcknowledged = false;
   bool statefulServingAuthorityCapabilityAcknowledged = false;
   bool statefulStoreGenerationCapabilityAcknowledged = false;
+  bool nativeMemberRepairCapabilityAcknowledged = false;
   bool statefulDataAuthorityCapabilityAcknowledged = false;
   bool statelessDeploymentAdmissionCapabilityAcknowledged = false;
   bool statelessDeploymentRetirementCapabilityAcknowledged = false;
@@ -216,6 +217,7 @@ public:
     containerRetirementCapabilityAcknowledged = false;
     statefulServingAuthorityCapabilityAcknowledged = false;
     statefulStoreGenerationCapabilityAcknowledged = false;
+    nativeMemberRepairCapabilityAcknowledged = false;
     statefulDataAuthorityCapabilityAcknowledged = false;
     statelessDeploymentAdmissionCapabilityAcknowledged = false;
     statelessDeploymentRetirementCapabilityAcknowledged = false;

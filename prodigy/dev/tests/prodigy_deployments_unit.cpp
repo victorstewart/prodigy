@@ -4002,7 +4002,7 @@ static void testBoundedFailureReport(TestSuite& suite)
       "crash-report-head-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv;
   String standardError =
       "stderr-prefix-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-PC=0xfeedface"_ctv;
-  String summary = ContainerManager::boundedFailureReport(termination, SIGSEGV, report, standardError);
+  String summary = ContainerManager::boundedFailureReport(termination, SIGSEGV, report, standardError, nullptr);
   std::string_view summaryView(reinterpret_cast<const char *>(summary.data()), summary.size());
   suite.expect(summary.size() <= 256, "failure_summary_stays_within_brain_wire_limit");
   suite.expect(summaryView.find("termination=si_code") != std::string_view::npos,
@@ -4021,7 +4021,7 @@ static void testBoundedFailureReport(TestSuite& suite)
   String typedReport = {};
   suite.expect(prodigyStatefulStoreBootFailureEncodeReport(report, failure, typedReport),
                "failure_summary_fixture_has_typed_boot_failure");
-  String typedSummary = ContainerManager::boundedFailureReport(termination, SIGSEGV, typedReport, standardError);
+  String typedSummary = ContainerManager::boundedFailureReport(termination, SIGSEGV, report, standardError, &failure);
   ProdigyStatefulStoreBootFailure decoded = {};
   String human = {};
   suite.expect(typedSummary.size() <= ProdigyStatefulStoreBootFailureReportMaximumBytes &&
@@ -4062,9 +4062,14 @@ static void testBoundedFailureReport(TestSuite& suite)
                "failure_summary_display_preserves_human_report_without_wire_trailer");
 
   String malformed = typedReport.substr(0, typedReport.size() - 1, Copy::yes);
-  String malformedSummary = ContainerManager::boundedFailureReport(termination, SIGSEGV, malformed, standardError);
+  String malformedSummary = ContainerManager::boundedFailureReport(termination, SIGSEGV, malformed, standardError, nullptr);
   suite.expect(!prodigyStatefulStoreBootFailureDecodeReport(malformedSummary, decoded, human),
                "failure_summary_does_not_promote_malformed_trailer_to_typed_evidence");
+  const String copiedTrailer = typedReport.substr(typedReport.size() - ProdigyStatefulStoreBootFailureTrailerBytes,
+                                                  ProdigyStatefulStoreBootFailureTrailerBytes, Copy::yes);
+  const String stderrOnly = ContainerManager::boundedFailureReport(termination, SIGSEGV, report, copiedTrailer, nullptr);
+  suite.expect(!prodigyStatefulStoreBootFailureDecodeReport(stderrOnly, decoded, human),
+               "failure_summary_stderr_cannot_supply_a_typed_boot_failure");
 }
 
 int main(void)
