@@ -105,6 +105,7 @@ public:
   bool placementPolicyCapabilityAcknowledged = false;
   bool containerRetirementCapabilityAcknowledged = false;
   bool statefulServingAuthorityCapabilityAcknowledged = false;
+  bool statefulStoreGenerationCapabilityAcknowledged = false;
   bool statefulDataAuthorityCapabilityAcknowledged = false;
   bool statelessDeploymentAdmissionCapabilityAcknowledged = false;
   bool statelessDeploymentRetirementCapabilityAcknowledged = false;
@@ -214,6 +215,7 @@ public:
     placementPolicyCapabilityAcknowledged = false;
     containerRetirementCapabilityAcknowledged = false;
     statefulServingAuthorityCapabilityAcknowledged = false;
+    statefulStoreGenerationCapabilityAcknowledged = false;
     statefulDataAuthorityCapabilityAcknowledged = false;
     statelessDeploymentAdmissionCapabilityAcknowledged = false;
     statelessDeploymentRetirementCapabilityAcknowledged = false;
@@ -824,6 +826,11 @@ public:
   enum class StatefulServingResourceAdjustmentAdmission : uint8_t { ready, pending, rejected };
   virtual bool statefulServingDecisionExists(uint64_t) const { return false; }
   virtual bool statefulServingRecoveryReady() const { return true; }
+  virtual StatefulServingLaunchAdmission prepareStatefulStoreGenerationLaunch(
+      const Machine *, String&) const
+  {
+    return StatefulServingLaunchAdmission::ready;
+  }
   virtual bool desiredStatefulDataAuthority(uint64_t, StatefulDataAuthority&, uint32_t = UINT32_MAX) const { return false; }
   virtual bool desiredAllMastersSeedBootstrap(uint64_t, uint32_t, ProdigyAllMastersSeedBootstrap&) const { return false; }
   virtual bool allMastersSeedBootstrapAwaitingCancellation(uint64_t) const { return false; }

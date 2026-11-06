@@ -74,6 +74,7 @@ public:
   // A spin coroutine can await its artifact before pushContainer publishes a
   // live Container. Preserve the canonical UUID and plan across that gap.
   bytell_hash_map<uint128_t, ContainerPlan> pendingContainerLaunchPlans;
+  bytell_hash_map<uint128_t, ProdigyStatefulStoreGenerationSelection> pendingContainerStoreGenerationSelections;
   bytell_hash_map<uint128_t, uint64_t> pendingContainerLaunchGenerations;
   // A terminal lifecycle decision can overtake an already queued spin frame.
   // Keep that UUID retired for the current Brain-control generation so the
@@ -137,14 +138,18 @@ public:
     return address;
   }
 
-  uint64_t beginPendingContainerLaunch(const ContainerPlan& plan)
+  uint64_t beginPendingContainerLaunch(const ContainerPlan& plan,
+      const ProdigyStatefulStoreGenerationSelection& selection = {.protocolVersion = 0})
   {
-    if (plan.uuid == 0 || terminalContainerLaunchUUIDs.contains(plan.uuid) ||
+    if (!prodigyStatefulStoreGenerationSelectionMatchesPlan(selection, plan) ||
+        plan.uuid == 0 || terminalContainerLaunchUUIDs.contains(plan.uuid) ||
         containers.contains(plan.uuid) || pendingContainerLaunchPlans.contains(plan.uuid))
     {
       return 0;
     }
     pendingContainerLaunchPlans.insert_or_assign(plan.uuid, plan);
+    if (selection.protocolVersion != 0)
+      pendingContainerStoreGenerationSelections.insert_or_assign(plan.uuid, selection);
     pendingContainerLaunchGenerations.insert_or_assign(plan.uuid, containerLaunchControlGeneration);
     return containerLaunchControlGeneration;
   }
@@ -167,8 +172,17 @@ public:
       return true;
     }
     pendingContainerLaunchPlans.erase(uuid);
+    pendingContainerStoreGenerationSelections.erase(uuid);
     pendingContainerLaunchGenerations.erase(found);
     return true;
+  }
+
+  bool pendingContainerStoreGenerationMatches(uint128_t uuid,
+      const ProdigyStatefulStoreGenerationSelection& selection) const
+  {
+    const auto found = pendingContainerStoreGenerationSelections.find(uuid);
+    if (found == pendingContainerStoreGenerationSelections.end()) return selection.protocolVersion == 0;
+    return prodigyStatefulStoreGenerationSameHome(found->second, selection);
   }
 
   bool isPendingContainerLaunch(uint128_t uuid) const
@@ -239,6 +253,7 @@ public:
     if (preservePendingLaunches == false)
     {
       pendingContainerLaunchPlans.clear();
+      pendingContainerStoreGenerationSelections.clear();
       pendingContainerLaunchGenerations.clear();
       terminalContainerLaunchUUIDs.clear();
     }
@@ -256,6 +271,7 @@ public:
       return false;
     }
     pendingContainerLaunchPlans.erase(uuid);
+    pendingContainerStoreGenerationSelections.erase(uuid);
     pendingContainerLaunchGenerations.erase(found);
     return true;
   }

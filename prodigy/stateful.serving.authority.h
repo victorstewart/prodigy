@@ -74,6 +74,78 @@ static inline bool prodigyStatefulServingRuntimeDigest(
   return valid;
 }
 
+// Returns true with a zero protocolVersion only when this target has no desired
+// generation record.  A record for the target which is stale, malformed, or
+// no longer matches the sealed serving runtime is an error, never legacy
+// fallback.  `servingRevision` is an admission lower bound: later unrelated
+// authority revisions remain valid while the exact sealed member digest does.
+static inline bool prodigyProjectStatefulStoreGeneration(
+    const ProdigyMasterAuthorityRuntimeState& runtime,
+    const Vector<BrainReplicatedContainerRuntimeState>& sealedRuntimeStates,
+    const ContainerPlan& launch,
+    ProdigyStatefulStoreGenerationSelection& outSelection)
+{
+  outSelection = {.protocolVersion = 0};
+  const ProdigyStatefulStoreGenerationSelection *selected = nullptr;
+  for (const auto& candidate : runtime.statefulStoreGenerationSelections)
+  {
+    if (candidate.authority.targetContainerUUID != launch.uuid) continue;
+    if (selected != nullptr || !prodigyStatefulStoreGenerationSelectionValid(candidate)) return false;
+    selected = &candidate;
+  }
+  if (selected == nullptr) return true;
+  const auto& authority = selected->authority;
+  if (!prodigyStatefulStoreGenerationSelectionMatchesPlan(*selected, launch)) return false;
+
+  const BrainReplicatedContainerRuntimeState *sealed = nullptr;
+  for (const auto& candidate : sealedRuntimeStates)
+  {
+    if (candidate.plan.uuid != launch.uuid) continue;
+    if (sealed != nullptr) return false;
+    sealed = &candidate;
+  }
+  if (sealed == nullptr || sealed->plan.config.deploymentID() != authority.targetDeploymentID ||
+      sealed->plan.shardGroup != authority.shardGroup || sealed->plan.nShardGroups != authority.nShardGroups) return false;
+
+  String currentDigest = {};
+  if (!prodigyStatefulServingRuntimeDigest(*sealed, currentDigest) ||
+      !currentDigest.equals(selected->admittedPlanSHA256)) return false;
+  BrainReplicatedContainerRuntimeState proposed = *sealed;
+  proposed.plan = launch;
+  // These fields are live Neuron observations, refreshed outside the sealed
+  // serving-member snapshot.  They cannot rebind the selected home: restore
+  // their sealed values solely for immutable launch-identity comparison.
+  proposed.plan.state = sealed->plan.state;
+  proposed.plan.runtimeReady = sealed->plan.runtimeReady;
+  proposed.plan.subscriptionPairings = sealed->plan.subscriptionPairings;
+  proposed.plan.advertisementPairings = sealed->plan.advertisementPairings;
+  proposed.plan.hasCredentialBundle = sealed->plan.hasCredentialBundle;
+  proposed.plan.credentialBundle = sealed->plan.credentialBundle;
+  String proposedDigest = {};
+  if (!prodigyStatefulServingRuntimeDigest(proposed, proposedDigest) ||
+      !proposedDigest.equals(selected->admittedPlanSHA256)) return false;
+
+  const ProdigyStatefulServingAuthority *currentAuthority = nullptr;
+  const ProdigyStatefulServingAuthorityMember *currentMember = nullptr;
+  for (const auto& serving : runtime.statefulServingAuthorities)
+  {
+    if (!prodigyStatefulServingAuthorityMatchesShard(serving, authority.targetDeploymentID, authority.shardGroup)) continue;
+    auto member = std::find_if(serving.members.begin(), serving.members.end(), [&](const auto& value) {
+      return value.containerUUID == authority.targetContainerUUID;
+    });
+    if (member == serving.members.end()) continue;
+    if (currentAuthority != nullptr || serving.revision < selected->servingRevision ||
+        serving.revision > runtime.generation || member->machineUUID != sealed->machineUUID ||
+        member->shardGroup != launch.shardGroup ||
+        !member->planSHA256.equals(selected->admittedPlanSHA256)) return false;
+    currentAuthority = &serving;
+    currentMember = &*member;
+  }
+  if (currentAuthority == nullptr || currentMember == nullptr) return false;
+  outSelection = *selected;
+  return true;
+}
+
 // Desired writer permission is not an application activation acknowledgement.
 // The existing serving package seals that observation before discovery may
 // expose its desired client advertisement. Legacy/source serving is unchanged.

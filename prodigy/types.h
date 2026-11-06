@@ -6134,6 +6134,68 @@ static inline bool prodigyStatefulStoreSeedAuthorityValid(const ProdigyStatefulS
         value.qualificationDeadlineAtMilliseconds == 0));
 }
 
+// This is an immutable launch selection, not a materialization-progress state.
+// The HSE checkpoint owns progress; this record only binds a particular target
+// to the unpublished/selected native generation it is authorized to open.
+class ProdigyStatefulStoreGenerationSelection {
+public:
+  static constexpr uint32_t version = 1;
+  uint32_t protocolVersion = version;
+  uint128_t generationUUID = 0;
+  uint64_t servingRevision = 0;
+  String admittedPlanSHA256;
+  ProdigyStatefulStoreSeedAuthority authority = {.protocolVersion = 0};
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyStatefulStoreGenerationSelection& selection)
+{
+  serializer.value4b(selection.protocolVersion);
+  serializer.value16b(selection.generationUUID);
+  serializer.value8b(selection.servingRevision);
+  serializer.text1b(selection.admittedPlanSHA256, 64);
+  serializer.object(selection.authority);
+}
+
+static inline bool prodigyStatefulStoreGenerationSelectionValid(
+    const ProdigyStatefulStoreGenerationSelection& selection)
+{
+  return selection.protocolVersion == ProdigyStatefulStoreGenerationSelection::version &&
+      selection.generationUUID != 0 && selection.servingRevision != 0 &&
+      prodigyIsSHA256HexDigest(selection.admittedPlanSHA256) &&
+      prodigyStatefulStoreSeedAuthorityHasSourceCut(selection.authority.protocolVersion) &&
+      prodigyStatefulStoreSeedAuthorityValid(selection.authority);
+}
+
+// A zero protocol is the canonical absence of a selection.  Retained launch
+// state uses SameHome to decide whether an in-flight selected store may be
+// replayed; the full equality helper additionally binds the admitted plan.
+static inline bool prodigyStatefulStoreGenerationSelectionsEqual(
+    const ProdigyStatefulStoreGenerationSelection& a,
+    const ProdigyStatefulStoreGenerationSelection& b)
+{
+  if (a.protocolVersion == 0 || b.protocolVersion == 0)
+    return a.protocolVersion == 0 && b.protocolVersion == 0;
+  if (!prodigyStatefulStoreGenerationSelectionValid(a) ||
+      !prodigyStatefulStoreGenerationSelectionValid(b)) return false;
+  String aBytes = {}, bBytes = {};
+  auto aCopy = a, bCopy = b;
+  return BitseryEngine::serialize(aBytes, aCopy) && BitseryEngine::serialize(bBytes, bCopy) && aBytes == bBytes;
+}
+
+static inline bool prodigyStatefulStoreGenerationSameHome(
+    const ProdigyStatefulStoreGenerationSelection& a,
+    const ProdigyStatefulStoreGenerationSelection& b)
+{
+  if (a.protocolVersion == 0 || b.protocolVersion == 0)
+    return a.protocolVersion == 0 && b.protocolVersion == 0;
+  if (!prodigyStatefulStoreGenerationSelectionValid(a) ||
+      !prodigyStatefulStoreGenerationSelectionValid(b) || a.generationUUID != b.generationUUID) return false;
+  String aBytes = {}, bBytes = {};
+  auto aAuthority = a.authority, bAuthority = b.authority;
+  return BitseryEngine::serialize(aBytes, aAuthority) && BitseryEngine::serialize(bBytes, bAuthority) && aBytes == bBytes;
+}
+
 // Native store observation relayed through the existing container -> Neuron
 // -> Brain receipt channel.  It is deliberately an observation, not launch
 // authority: every field is emitted by the store after its own apply/session
@@ -11835,6 +11897,10 @@ public:
   // materializedStatefulRecoveryOperations; this vector is not another state
   // machine.
   Vector<ProdigyRetainedStatefulRearmProof> retainedStatefulRearmProofs;
+  // Version-twenty-three desired generation projections.  These bind launch
+  // identity only; native checkpoint progress and serving promotion remain in
+  // their existing owners.
+  Vector<ProdigyStatefulStoreGenerationSelection> statefulStoreGenerationSelections;
   Vector<ApiCredentialExpiryNotice> apiCredentialExpiryNotices;
   Vector<ProdigyManagedMachineSchema> machineSchemas;
   Vector<RoutableResourceLease> routableResourceLeases;
@@ -11877,7 +11943,7 @@ public:
 
   bool operator==(const ProdigyMasterAuthorityRuntimeState& other) const
   {
-    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || nextPendingElasticAddressOperationID != other.nextPendingElasticAddressOperationID || nextDNSIntentRevision != other.nextDNSIntentRevision || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || pendingAddMachinesProvisioningIntents.size() != other.pendingAddMachinesProvisioningIntents.size() || pendingAutonomousProvisioningOperations.size() != other.pendingAutonomousProvisioningOperations.size() || pendingElasticAddressAssignments.size() != other.pendingElasticAddressAssignments.size() || pendingElasticAddressReleases.size() != other.pendingElasticAddressReleases.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || statefulServingAuthorities.size() != other.statefulServingAuthorities.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || materializedStatefulRecoveryOperations.size() != other.materializedStatefulRecoveryOperations.size() || materializedStatefulRecoveryRetries.size() != other.materializedStatefulRecoveryRetries.size() || retainedStatefulRearmProofs.size() != other.retainedStatefulRearmProofs.size() || apiCredentialExpiryNotices.size() != other.apiCredentialExpiryNotices.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || taskExecutions.size() != other.taskExecutions.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf || updateSelfFollowerConcurrency != other.updateSelfFollowerConcurrency || updateSelfFollowerTransitionIssuedPeerKeys != other.updateSelfFollowerTransitionIssuedPeerKeys || updateSelfFollowerReadyPeerKeys != other.updateSelfFollowerReadyPeerKeys ||
+    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || nextPendingElasticAddressOperationID != other.nextPendingElasticAddressOperationID || nextDNSIntentRevision != other.nextDNSIntentRevision || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || pendingAddMachinesProvisioningIntents.size() != other.pendingAddMachinesProvisioningIntents.size() || pendingAutonomousProvisioningOperations.size() != other.pendingAutonomousProvisioningOperations.size() || pendingElasticAddressAssignments.size() != other.pendingElasticAddressAssignments.size() || pendingElasticAddressReleases.size() != other.pendingElasticAddressReleases.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || statefulServingAuthorities.size() != other.statefulServingAuthorities.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || materializedStatefulRecoveryOperations.size() != other.materializedStatefulRecoveryOperations.size() || materializedStatefulRecoveryRetries.size() != other.materializedStatefulRecoveryRetries.size() || retainedStatefulRearmProofs.size() != other.retainedStatefulRearmProofs.size() || statefulStoreGenerationSelections.size() != other.statefulStoreGenerationSelections.size() || apiCredentialExpiryNotices.size() != other.apiCredentialExpiryNotices.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || taskExecutions.size() != other.taskExecutions.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf || updateSelfFollowerConcurrency != other.updateSelfFollowerConcurrency || updateSelfFollowerTransitionIssuedPeerKeys != other.updateSelfFollowerTransitionIssuedPeerKeys || updateSelfFollowerReadyPeerKeys != other.updateSelfFollowerReadyPeerKeys ||
         prodigyDeploymentPlacementPoliciesEqual(deploymentPlacementPolicies, other.deploymentPlacementPolicies) == false ||
         prodigyStatelessDeploymentAdmissionsEqual(statelessDeploymentAdmissions, other.statelessDeploymentAdmissions) == false ||
         prodigyStatelessDeploymentRetirementsEqual(statelessDeploymentRetirements, other.statelessDeploymentRetirements) == false ||
@@ -11971,6 +12037,11 @@ public:
     for (uint32_t index = 0; index < statefulServingAuthorities.size(); ++index)
     {
       if (statefulServingAuthorities[index] != other.statefulServingAuthorities[index]) return false;
+    }
+    for (uint32_t index = 0; index < statefulStoreGenerationSelections.size(); ++index)
+    {
+      if (!prodigyStatefulStoreGenerationSelectionsEqual(
+              statefulStoreGenerationSelections[index], other.statefulStoreGenerationSelections[index])) return false;
     }
 
     for (uint32_t index = 0; index < deferredStatefulScaleIntents.size(); ++index)
@@ -13001,11 +13072,30 @@ static void serialize(S&& serializer, NeuronContainerMetricPolicy& policy)
   serializer.value4b(policy.metricsCadenceMs);
 }
 
+// This deliberately validates only the immutable plan scope.  Local cluster
+// and sealed-runtime admission are checked by the serving-authority owner.
+static inline bool prodigyStatefulStoreGenerationSelectionMatchesPlan(
+    const ProdigyStatefulStoreGenerationSelection& selection, const ContainerPlan& plan)
+{
+  if (selection.protocolVersion == 0) return true;
+  const auto& authority = selection.authority;
+  return prodigyStatefulStoreGenerationSelectionValid(selection) &&
+      !plan.isSystemContainer() && plan.isStateful && plan.config.type == ApplicationType::stateful &&
+      authority.applicationID == plan.config.applicationID &&
+      authority.targetContainerUUID == plan.uuid &&
+      authority.targetDeploymentID == plan.config.deploymentID() &&
+      authority.shardGroup == plan.shardGroup && authority.nShardGroups == plan.nShardGroups;
+}
+
 class NeuronContainerBootstrap {
 public:
 
   ContainerPlan plan;
   NeuronContainerMetricPolicy metricPolicy;
+  // Each bootstrap is serialized as its own bounded String on every current
+  // transport/persistence path. This terminal field is therefore safe to
+  // append; ContainerPlan itself remains byte-for-byte legacy.
+  ProdigyStatefulStoreGenerationSelection statefulStoreGenerationSelection = {.protocolVersion = 0};
 };
 
 template <typename S>
@@ -13013,6 +13103,23 @@ static void serialize(S&& serializer, NeuronContainerBootstrap& bootstrap)
 {
   serializer.object(bootstrap.plan);
   serializer.object(bootstrap.metricPolicy);
+  if constexpr (requires { serializer.adapter().isCompletedSuccessfully(); })
+  {
+    if (!serializer.adapter().isCompletedSuccessfully())
+    {
+      serializer.object(bootstrap.statefulStoreGenerationSelection);
+      if (!serializer.adapter().isCompletedSuccessfully() ||
+          !prodigyStatefulStoreGenerationSelectionValid(bootstrap.statefulStoreGenerationSelection) ||
+          !prodigyStatefulStoreGenerationSelectionMatchesPlan(
+              bootstrap.statefulStoreGenerationSelection, bootstrap.plan))
+        serializer.adapter().error(bitsery::ReaderError::InvalidData);
+    }
+    else bootstrap.statefulStoreGenerationSelection = {.protocolVersion = 0};
+  }
+  else if (bootstrap.statefulStoreGenerationSelection.protocolVersion != 0)
+  {
+    serializer.object(bootstrap.statefulStoreGenerationSelection);
+  }
 }
 
 class BrainReplicatedContainerRuntimeState {
@@ -13076,9 +13183,10 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   // add-machines record. Version 20 appends the Mothership-created local
   // MASQUE gateway authority ledger. Version 21 appends durable stateless
   // retirement receipts; version 22 appends immutable retained-deployment
-  // re-arm proofs beside the existing recovery-operation ledger.
+  // re-arm proofs beside the existing recovery-operation ledger; version 23
+  // appends exact stateful native-generation launch selections.
   // Older readers reject before consuming either newer operation layout.
-  constexpr uint64_t explicitVersion = 22;
+  constexpr uint64_t explicitVersion = 23;
   using Serializer = std::remove_cv_t<std::remove_reference_t<S>>;
   if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
     state.transportCredentialAuthorityRoot = {};
@@ -13104,6 +13212,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   bool hasCrossClusterMasqueGatewayAuthorities = false;
   bool hasStatelessDeploymentRetirements = false;
   bool hasRetainedStatefulRearmProofs = false;
+  bool hasStatefulStoreGenerationSelections = false;
 
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
@@ -13142,11 +13251,18 @@ static void prodigySerializeMasterAuthorityRuntimeState(
     hasPendingAddMachinesProvisioningIntents = state.pendingAddMachinesProvisioningIntents.empty() == false;
     hasStatelessDeploymentRetirements = !state.statelessDeploymentRetirements.empty();
     hasRetainedStatefulRearmProofs = !state.retainedStatefulRearmProofs.empty();
+    hasStatefulStoreGenerationSelections = !state.statefulStoreGenerationSelections.empty();
     hasCrossClusterMasqueGatewayAuthorities = !state.crossClusterMasqueGatewayAuthorities.empty() || hasStatelessDeploymentRetirements;
     // Version 22 is cumulative through the v21 retirement container. Emit
     // every earlier tail, even when empty, before the re-arm proof sidecar.
     if (hasRetainedStatefulRearmProofs)
     {
+      hasStatelessDeploymentRetirements = true;
+      hasCrossClusterMasqueGatewayAuthorities = true;
+    }
+    if (hasStatefulStoreGenerationSelections)
+    {
+      hasRetainedStatefulRearmProofs = true;
       hasStatelessDeploymentRetirements = true;
       hasCrossClusterMasqueGatewayAuthorities = true;
     }
@@ -13190,7 +13306,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
       hasAllMachineRecoveryWitnesses = true;
       hasMaterializedStatefulRecoveryRetries = true;
     }
-    if (hasMaterializedStatefulRecoveryOperations || hasApiCredentialExpiryNotices || hasAllMachineRecoveryWitnesses || hasMaterializedStatefulRecoveryRetries || hasContainerRuntimeStates || hasDeploymentPlacementPolicies || hasStatefulServingAuthorities || hasStatelessDeploymentAdmissions || hasExplicitUpdateSelfFollowerConcurrency || hasPendingAddMachinesProvisioningIntents)
+    if (hasMaterializedStatefulRecoveryOperations || hasApiCredentialExpiryNotices || hasAllMachineRecoveryWitnesses || hasMaterializedStatefulRecoveryRetries || hasContainerRuntimeStates || hasDeploymentPlacementPolicies || hasStatefulServingAuthorities || hasStatelessDeploymentAdmissions || hasExplicitUpdateSelfFollowerConcurrency || hasPendingAddMachinesProvisioningIntents || hasStatefulStoreGenerationSelections)
     {
       uint64_t marker = versionMarker;
       serializer.value8b(marker);
@@ -13220,6 +13336,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
       if (hasCrossClusterMasqueGatewayAuthorities) version = 20;
       if (hasStatelessDeploymentRetirements) version = 21;
       if (hasRetainedStatefulRearmProofs) version = 22;
+      if (hasStatefulStoreGenerationSelections) version = 23;
       serializer.value8b(version);
     }
     serializer.value8b(state.generation);
@@ -13270,6 +13387,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
       hasCrossClusterMasqueGatewayAuthorities = version >= 20;
       hasStatelessDeploymentRetirements = version >= 21;
       hasRetainedStatefulRearmProofs = version >= 22;
+      hasStatefulStoreGenerationSelections = version >= 23;
     }
   }
 
@@ -13538,6 +13656,25 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   else if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
     state.retainedStatefulRearmProofs.clear();
+  }
+  if (hasStatefulStoreGenerationSelections)
+  {
+    serializer.container(state.statefulStoreGenerationSelections, 4096,
+        [](auto& nested, ProdigyStatefulStoreGenerationSelection& selection) { nested.object(selection); });
+    if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
+    {
+      uint128_t previousTarget = 0;
+      for (const auto& selection : state.statefulStoreGenerationSelections)
+        if (!prodigyStatefulStoreGenerationSelectionValid(selection) ||
+            (previousTarget != 0 && selection.authority.targetContainerUUID <= previousTarget)) {
+          serializer.adapter().error(bitsery::ReaderError::InvalidData); return;
+        }
+        else previousTarget = selection.authority.targetContainerUUID;
+    }
+  }
+  else if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
+  {
+    state.statefulStoreGenerationSelections.clear();
   }
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
   {
@@ -14311,6 +14448,9 @@ public:
   // startup authority was supplied, including initial all-master boot and
   // legacy producers without the appended tail.
   ProdigyStatefulStoreSeedAuthority statefulStoreSeedAuthority = {.protocolVersion = 0};
+  // Terminal native-startup extension.  A zero protocolVersion explicitly
+  // means legacy home selection; it is never inferred for a selected repair.
+  ProdigyStatefulStoreGenerationSelection statefulStoreGenerationSelection = {.protocolVersion = 0};
 };
 
 // A private listener declaration is carried to the process without publishing
@@ -14378,11 +14518,30 @@ static void serialize(S&& serializer, ContainerParameters& params)
   // append-only tail when it is present so retained launches remain readable.
   if constexpr (requires { serializer.adapter().isCompletedSuccessfully(); })
   {
-    if (!serializer.adapter().isCompletedSuccessfully()) serializer.object(params.statefulStoreSeedAuthority);
-    else params.statefulStoreSeedAuthority = {.protocolVersion = 0};
+    if (!serializer.adapter().isCompletedSuccessfully())
+    {
+      serializer.object(params.statefulStoreSeedAuthority);
+      if (!serializer.adapter().isCompletedSuccessfully())
+      {
+        serializer.object(params.statefulStoreGenerationSelection);
+        if (!serializer.adapter().isCompletedSuccessfully() ||
+            !prodigyStatefulStoreGenerationSelectionValid(params.statefulStoreGenerationSelection))
+          serializer.adapter().error(bitsery::ReaderError::InvalidData);
+      }
+      else params.statefulStoreGenerationSelection = {.protocolVersion = 0};
+    }
+    else
+    {
+      params.statefulStoreSeedAuthority = {.protocolVersion = 0};
+      params.statefulStoreGenerationSelection = {.protocolVersion = 0};
+    }
   }
   else
   {
     serializer.object(params.statefulStoreSeedAuthority);
+    // Do not alter legacy native startup bytes merely because the producer
+    // understands generation launch. A selected generation is explicit.
+    if (params.statefulStoreGenerationSelection.protocolVersion != 0)
+      serializer.object(params.statefulStoreGenerationSelection);
   }
 }

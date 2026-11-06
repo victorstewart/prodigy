@@ -1329,6 +1329,16 @@ public:
   };
 
   ContainerPlan plan;
+  // This is a validated projection of the authoritative v23 record.  It is
+  // intentionally not part of ContainerPlan's legacy nested codec.
+  ProdigyStatefulStoreGenerationSelection statefulStoreGenerationSelection = {.protocolVersion = 0};
+  uint32_t statefulStoreGenerationProtocol = 0;
+  bool statefulStoreGenerationLaunchReady() const
+  {
+    return statefulStoreGenerationSelection.protocolVersion == 0 ||
+        (statefulStoreGenerationProtocol == 1 &&
+         prodigyStatefulStoreGenerationSelectionMatchesPlan(statefulStoreGenerationSelection, plan));
+  }
   StatefulDataAuthorityPreparation statefulPreparationRequest;
   ProdigyNametagQualificationWriterIsolation qualificationIsolationArm = {};
   uint64_t qualificationIsolationDeadlineNs = 0;
@@ -4261,6 +4271,7 @@ private:
     container->executeEnv.clear();
     container->executeCwd.clear();
     container->executeArchitecture = MachineCpuArchitecture::unknown;
+    container->statefulStoreGenerationProtocol = 0;
 
     int artifactRootFD = -1;
     if (openVerifiedContainerArtifactRoot(container, artifactRootFD, failureReport) == false)
@@ -4336,6 +4347,7 @@ private:
     bool sawExecuteEnv = false;
     bool sawExecuteCwd = false;
     bool sawExecuteArch = false;
+    bool sawStoreGenerationProtocol = false;
 
     for (auto field : doc.get_object())
     {
@@ -4440,6 +4452,17 @@ private:
         }
 
         sawExecuteArch = true;
+      }
+      else if (key == "stateful_store_generation_protocol"_ctv)
+      {
+        uint64_t protocol = 0;
+        if (sawStoreGenerationProtocol || field.value.get_uint64().get(protocol) != simdjson::SUCCESS || protocol != 1)
+        {
+          if (failureReport) failureReport->assign("launch metadata stateful_store_generation_protocol must appear once with value 1"_ctv);
+          return false;
+        }
+        sawStoreGenerationProtocol = true;
+        container->statefulStoreGenerationProtocol = uint32_t(protocol);
       }
       else
       {
@@ -12220,12 +12243,18 @@ public:
                                                const String& compressedContainerPath,
                                                Container *& container,
                                                String *failure = nullptr,
-                                               uint64_t admissionGeneration = 0)
+                                               uint64_t admissionGeneration = 0,
+                                               ProdigyStatefulStoreGenerationSelection selection = {.protocolVersion = 0})
   {
     container = nullptr;
     if (failure)
     {
       failure->clear();
+    }
+    if (!prodigyStatefulStoreGenerationSelectionMatchesPlan(selection, plan))
+    {
+      if (failure) failure->assign("stateful store generation does not match the container launch"_ctv);
+      co_return false;
     }
     if (approveCapabilities(plan) == false)
     {
@@ -12265,6 +12294,7 @@ public:
 
     container = new Container();
     container->plan = plan;
+    container->statefulStoreGenerationSelection = selection;
     container->name.assignItoa(plan.uuid);
     container->userID = userID;
     container->executionHostID = executionHostID;
@@ -13400,6 +13430,12 @@ public:
       }
     }
 
+    if (!container->statefulStoreGenerationLaunchReady())
+    {
+      if (failureReport) failureReport->assign("stateful store generation is not supported by the sealed artifact"_ctv);
+      return false;
+    }
+
     int parentSupplementaryGroupCount = getgroups(0, nullptr);
     if (parentSupplementaryGroupCount < 0)
     {
@@ -13851,6 +13887,10 @@ public:
         parameters.whiteholes = container->plan.whiteholes;
         parameters.statefulMeshRoles = container->plan.statefulMeshRoles;
         parameters.statefulTopology = container->plan.statefulTopology;
+        if (container->statefulStoreGenerationSelection.protocolVersion != 0)
+        {
+          parameters.statefulStoreGenerationSelection = container->statefulStoreGenerationSelection;
+        }
         // This is a private startup port declaration, not a mesh advertisement.
         // Catchup starts with client role zero; only authenticated writeOwner
         // may install this already-bound IPv6 listener at the application.
@@ -13897,7 +13937,8 @@ public:
                                          parameters.statefulMeshRoles.seeding != 0 ||
                                          parameters.statefulMeshRoles.sharding != 0 ||
                                          parameters.statefulMeshRoles.topologyBridge != 0 ||
-                                         parameters.statefulTopology.configured());
+                                         parameters.statefulTopology.configured() ||
+                                         parameters.statefulStoreGenerationSelection.protocolVersion != 0);
 
         // ProdigyWire covers the compact stateless startup path. Wormhole and
         // whitehole startup data plus stateful mesh and topology metadata use
@@ -14390,7 +14431,8 @@ public:
   // Coroutine arguments must own every value used after suspension. Callers
   // commonly supply a handler-local or temporary metric policy.
   static void spinContainer(ContainerPlan plan, uint128_t replaceContainerUUID, NeuronContainerMetricPolicy metricPolicy,
-                            RetainedContainerStorageSource retainedSource = {})
+                            RetainedContainerStorageSource retainedSource = {},
+                            ProdigyStatefulStoreGenerationSelection selection = {.protocolVersion = 0})
   {
 #if PRODIGY_DEBUG
     PRODIGY_DEBUG_LOG("executeWork spinContainer deploymentID=%llu containerUUID=%llu replaceUUID=%llu lifecycle=construct-or-updateInPlace\n",
@@ -14399,7 +14441,7 @@ public:
                       (unsigned long long)replaceContainerUUID);
 #endif
     const uint64_t launchAdmissionGeneration =
-        thisNeuron != nullptr ? thisNeuron->beginPendingContainerLaunch(plan) : 0;
+        thisNeuron != nullptr ? thisNeuron->beginPendingContainerLaunch(plan, selection) : 0;
     if (thisNeuron != nullptr && launchAdmissionGeneration == 0)
     {
       // Duplicate transport/recovery frames converge on the original launch.
@@ -14741,7 +14783,7 @@ public:
 
     Container *container = nullptr;
     String createFailure = {};
-    co_await createContainer(plan, compressedContainerPath, container, &createFailure, launchAdmissionGeneration);
+    co_await createContainer(plan, compressedContainerPath, container, &createFailure, launchAdmissionGeneration, selection);
     if (container == nullptr)
     {
       if (thisNeuron != nullptr &&

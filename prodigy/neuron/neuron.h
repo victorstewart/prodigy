@@ -530,6 +530,7 @@ protected:
   struct PendingContainerLaunchReplay final {
     ContainerPlan plan;
     NeuronContainerMetricPolicy metricPolicy;
+    ProdigyStatefulStoreGenerationSelection statefulStoreGenerationSelection = {.protocolVersion = 0};
     String identity;
   };
   bytell_hash_map<uint128_t, PendingContainerLaunchReplay> pendingContainerLaunchReplays;
@@ -1452,7 +1453,7 @@ protected:
                   operation->container->plan.uuid, operation->launchAdmissionGeneration))
           {
             operation->launchAdmissionGeneration =
-                beginPendingContainerLaunch(operation->container->plan);
+                beginPendingContainerLaunch(operation->container->plan, operation->container->statefulStoreGenerationSelection);
           }
           else
           {
@@ -1464,10 +1465,12 @@ protected:
   }
 
   bool queuePendingContainerLaunchReplay(ContainerPlan plan,
-                                         NeuronContainerMetricPolicy metricPolicy)
+                                         NeuronContainerMetricPolicy metricPolicy,
+                                         ProdigyStatefulStoreGenerationSelection selection = {.protocolVersion = 0})
   {
     auto pending = pendingContainerLaunchPlans.find(plan.uuid);
-    if (pending == pendingContainerLaunchPlans.end())
+    if (pending == pendingContainerLaunchPlans.end() ||
+        !pendingContainerStoreGenerationMatches(plan.uuid, selection))
     {
       return false;
     }
@@ -1480,6 +1483,7 @@ protected:
     NeuronContainerBootstrap bootstrap = {};
     bootstrap.plan = plan;
     bootstrap.metricPolicy = metricPolicy;
+    bootstrap.statefulStoreGenerationSelection = selection;
     if (!BitseryEngine::serialize(replayIdentity, bootstrap) || replayIdentity.size() == 0)
     {
       return false;
@@ -1497,6 +1501,7 @@ protected:
     PendingContainerLaunchReplay replay = {};
     replay.plan = std::move(plan);
     replay.metricPolicy = metricPolicy;
+    replay.statefulStoreGenerationSelection = selection;
     replay.identity = std::move(replayIdentity);
     const uint128_t uuid = replay.plan.uuid;
     pendingContainerLaunchReplays.insert_or_assign(uuid, std::move(replay));
@@ -1517,7 +1522,8 @@ protected:
     {
       return;
     }
-    launchContainerFromBrain(std::move(replay.plan), 0, replay.metricPolicy);
+    launchContainerFromBrain(std::move(replay.plan), 0, replay.metricPolicy, {},
+                             replay.statefulStoreGenerationSelection);
   }
 
   void pendingContainerLaunchDrained(uint128_t uuid) override
@@ -7461,8 +7467,14 @@ public:
   virtual void launchContainerFromBrain(ContainerPlan plan,
                                         uint128_t replaceContainerUUID,
                                         NeuronContainerMetricPolicy metricPolicy,
-                                        RetainedContainerStorageSource retainedSource = {})
+                                        RetainedContainerStorageSource retainedSource = {},
+                                        ProdigyStatefulStoreGenerationSelection selection = {.protocolVersion = 0})
   {
+    if (!prodigyStatefulStoreGenerationSelectionMatchesPlan(selection, plan))
+    {
+      basics_log("neuron spinContainer rejected mismatched stateful store generation\n");
+      return;
+    }
     if (plan.system.kind == SystemContainerKind::crossClusterMasqueGateway)
     {
       if (!admitCrossClusterMasqueGatewaySystemPlan(plan))
@@ -7495,7 +7507,7 @@ public:
         recoveredToken.assign(runtime->recoveryLaunchToken);
       if (!prepareCrossClusterMasqueGatewayLaunch(plan, *runtime, recoveredToken, replaceLaunch)) return;
     }
-    ContainerManager::spinContainer(std::move(plan), replaceContainerUUID, metricPolicy, retainedSource);
+    ContainerManager::spinContainer(std::move(plan), replaceContainerUUID, metricPolicy, retainedSource, selection);
   }
 
   // Production keeps received application artifacts in the canonical store.
@@ -7997,7 +8009,7 @@ protected:
   bool beginColdStateUploadGatewayRestore(std::unique_ptr<Container> container, uint64_t epoch)
   {
     if (container == nullptr) return false;
-    const uint64_t admission = beginPendingContainerLaunch(container->plan);
+    const uint64_t admission = beginPendingContainerLaunch(container->plan, container->statefulStoreGenerationSelection);
     if (pendingStateUploadRestores.size() >= maximumPendingStateUploadRestores || admission == 0)
     {
       finishPendingContainerLaunch(container->plan.uuid, admission);
@@ -8241,7 +8253,7 @@ protected:
   bool beginStateUploadRestore(std::unique_ptr<Container> container, uint64_t epoch)
   {
     if (container == nullptr) return false;
-    const uint64_t launchAdmissionGeneration = beginPendingContainerLaunch(container->plan);
+    const uint64_t launchAdmissionGeneration = beginPendingContainerLaunch(container->plan, container->statefulStoreGenerationSelection);
     if (pendingStateUploadRestores.size() >= maximumPendingStateUploadRestores ||
         launchAdmissionGeneration == 0)
     {
@@ -9037,14 +9049,25 @@ public:
             NeuronContainerBootstrap bootstrap;
             NeuronContainerMetricPolicy metricPolicy;
             ContainerPlan restoredPlan;
+            ProdigyStatefulStoreGenerationSelection selection = {.protocolVersion = 0};
             if (BitseryEngine::deserializeSafe(buffer, bootstrap))
             {
               restoredPlan = std::move(bootstrap.plan);
               metricPolicy = bootstrap.metricPolicy;
+              selection = bootstrap.statefulStoreGenerationSelection;
             }
             else if (BitseryEngine::deserializeSafe(buffer, restoredPlan) == false)
             {
               stateUploadRejection = "plan-decode";
+              malformedStateUpload = true;
+              break;
+            }
+
+            if (!prodigyStatefulStoreGenerationSelectionMatchesPlan(selection, restoredPlan) ||
+                (isPendingContainerLaunch(restoredPlan.uuid) &&
+                 !pendingContainerStoreGenerationMatches(restoredPlan.uuid, selection)))
+            {
+              stateUploadRejection = "store-generation-identity";
               malformedStateUpload = true;
               break;
             }
@@ -9074,7 +9097,7 @@ public:
                 // pending-launch callback marks the UUID drained; no second
                 // worker may materialize the same UUID concurrently.
                 const uint128_t replayUUID = restoredPlan.uuid;
-                if (!queuePendingContainerLaunchReplay(std::move(restoredPlan), metricPolicy))
+                if (!queuePendingContainerLaunchReplay(std::move(restoredPlan), metricPolicy, selection))
                 {
                   stateUploadRejection = "pending-replay-identity";
                   malformedStateUpload = true;
@@ -9102,6 +9125,14 @@ public:
               Container *liveContainer = existing->second;
               if (liveContainer->pendingDestroy == false)
               {
+                if (!prodigyStatefulStoreGenerationSameHome(
+                        liveContainer->statefulStoreGenerationSelection, selection))
+                {
+                  stateUploadRejection = "live-store-generation-identity";
+                  malformedStateUpload = true;
+                  break;
+                }
+                liveContainer->statefulStoreGenerationSelection = selection;
                 liveContainer->neuronScalingDimensionsMask = metricPolicy.scalingDimensionsMask;
                 liveContainer->neuronMetricsCadenceMs = metricPolicy.metricsCadenceMs;
                 // A fresh host router has no static Whitehole bindings. Rehydrate
@@ -9147,6 +9178,7 @@ public:
 
             Container *container = new Container();
             container->plan = std::move(restoredPlan);
+            container->statefulStoreGenerationSelection = selection;
             container->neuronScalingDimensionsMask = metricPolicy.scalingDimensionsMask;
             container->neuronMetricsCadenceMs = metricPolicy.metricsCadenceMs;
 
@@ -9302,7 +9334,7 @@ public:
                   // restart.  spinContainer owns its UUID deduplication.
                   ContainerPlan freshPlan = std::move(container->plan);
                   delete container;
-                  launchContainerFromBrain(std::move(freshPlan), 0, metricPolicy);
+                  launchContainerFromBrain(std::move(freshPlan), 0, metricPolicy, {}, selection);
                   continue;
                 }
 
@@ -9578,10 +9610,12 @@ public:
           ContainerPlan plan;
           NeuronContainerMetricPolicy metricPolicy;
           NeuronContainerBootstrap bootstrap;
+          ProdigyStatefulStoreGenerationSelection selection = {.protocolVersion = 0};
           if (BitseryEngine::deserializeSafe(buffer, bootstrap))
           {
             plan = std::move(bootstrap.plan);
             metricPolicy = bootstrap.metricPolicy;
+            selection = bootstrap.statefulStoreGenerationSelection;
           }
           else if (BitseryEngine::deserializeSafe(buffer, plan) == false)
           {
@@ -9608,7 +9642,7 @@ public:
               break;
             }
           }
-          launchContainerFromBrain(std::move(plan), replaceContainerUUID, metricPolicy, retainedSource);
+          launchContainerFromBrain(std::move(plan), replaceContainerUUID, metricPolicy, retainedSource, selection);
           // Replacement is asynchronous and can reject before stopping the old
           // owner. Its destruction finalizer, not dispatch, acknowledges removal.
 

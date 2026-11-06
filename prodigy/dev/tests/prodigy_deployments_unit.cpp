@@ -3764,10 +3764,50 @@ static void testAllMastersBootstrapSeedingSubscription(TestSuite& suite)
   verifyApplication.template operator()<5>();
 }
 
+static void testStoreGenerationLaunchMetadata(TestSuite& suite)
+{
+  TemporaryDirectory artifactRoot;
+  suite.expect(artifactRoot.create(), "store_generation_metadata_fixture_created");
+  if (artifactRoot.path.empty()) return;
+  Container container {};
+  container.artifactRootPath = artifactRoot.path;
+  container.plan.config.architecture = nametagCurrentBuildMachineArchitecture();
+  String architecture;
+  architecture.assign(machineCpuArchitectureName(container.plan.config.architecture));
+  const auto verify = [&](const char *extension, bool expected, uint32_t protocol) {
+    String metadata;
+    metadata.assign("{\"execute_path\":\"/app/server\",\"execute_args\":[],\"execute_env\":[],\"execute_cwd\":\"/\",\"execute_arch\":\"");
+    metadata.append(architecture);
+    metadata.append("\"");
+    metadata.append(extension);
+    metadata.append("}");
+    suite.expect(writeLaunchMetadataFixture(artifactRoot.path, metadata.c_str()), "store_generation_metadata_written");
+    String failure;
+    const bool loaded = ContainerManager::debugLoadContainerLaunchMetadata(&container, &failure);
+    suite.expect(loaded == expected, "store_generation_metadata_accepts_only_known_single_integer");
+    if (loaded) suite.expect(container.statefulStoreGenerationProtocol == protocol, "store_generation_metadata_protocol_projected");
+  };
+  verify("", true, 0);
+  verify(",\"stateful_store_generation_protocol\":1", true, 1);
+  verify("", true, 0); // A prior artifact's capability cannot survive a reload.
+  verify(",\"stateful_store_generation_protocol\":0", false, 0);
+  verify(",\"stateful_store_generation_protocol\":2", false, 0);
+  verify(",\"stateful_store_generation_protocol\":\"1\"", false, 0);
+  verify(",\"stateful_store_generation_protocol\":1,\"stateful_store_generation_protocol\":1", false, 0);
+}
+
 int main(void)
 {
   TestSuite suite;
   const char *selector = std::getenv("PRODIGY_TEST_ONLY");
+  if (selector == nullptr || std::strcmp(selector, "store-generation-metadata") == 0)
+  {
+    testStoreGenerationLaunchMetadata(suite);
+    if (selector != nullptr) {
+      dprintf(STDOUT_FILENO, "store_generation_metadata passed=%d failed=%d\n", suite.passed, suite.failed);
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+  }
   if (selector == nullptr || std::strcmp(selector, "bootstrap-seeding-subscription") == 0)
   {
     testAllMastersBootstrapSeedingSubscription(suite);

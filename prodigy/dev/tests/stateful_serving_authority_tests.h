@@ -348,6 +348,226 @@ static void testStatefulServingAuthorityTransitionFences(TestSuite& suite)
                "serving_authority_transition_rejects_legacy_payload_version");
 }
 
+static ProdigyStatefulStoreGenerationSelection servingAuthorityTestGenerationSelection(
+    const BrainReplicatedContainerRuntimeState& state)
+{
+  ProdigyStatefulStoreGenerationSelection selection = {};
+  selection.generationUUID = 0x77310001;
+  selection.servingRevision = 10;
+  selection.authority.protocolVersion = ProdigyStatefulStoreSeedAuthority::sourceCutVersion;
+  selection.authority.authorityGeneration = 1;
+  selection.authority.operationUUID = 0x77310002;
+  selection.authority.applicationID = state.plan.config.applicationID;
+  selection.authority.storeKind = DeploymentIdentityStoreKind::kv;
+  selection.authority.shardGroup = state.plan.shardGroup;
+  selection.authority.nShardGroups = state.plan.nShardGroups;
+  selection.authority.targetClusterUUID = 0x77310003;
+  selection.authority.targetDeploymentID = state.plan.config.deploymentID();
+  selection.authority.targetContainerUUID = state.plan.uuid;
+  selection.authority.sourceClusterUUID = 0x77310004;
+  selection.authority.sourceDeploymentID = state.plan.config.deploymentID() - 1;
+  selection.authority.sourceContainerUUID = 0x77310005;
+  selection.authority.seedGeneration = 1;
+  selection.authority.fixtureSHA256.assign("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
+  selection.authority.sourceContentWatermarkSHA256.assign("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"_ctv);
+  selection.authority.sourceCatchupWatermarkSHA256.assign("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"_ctv);
+  selection.authority.sourceBaselineOperationUUID = 0x77310006;
+  selection.authority.sourceRequestUUID = 0x77310007;
+  selection.authority.sourceMemberRequestUUID = 0x77310008;
+  selection.authority.seedRouteUUID = 0x77310009;
+  selection.authority.cutUUID = 0x7731000a;
+  selection.authority.cutGeneration = 1;
+  selection.authority.retainUntilMilliseconds = 1;
+  (void)prodigyStatefulServingRuntimeDigest(state, selection.admittedPlanSHA256);
+  return selection;
+}
+
+static void testStatefulStoreGenerationProjection(TestSuite& suite)
+{
+  auto transition = servingAuthorityTestTransition();
+  for (auto& state : transition.servingRuntimeStates)
+  {
+    state.plan.nShardGroups = 1;
+    state.plan.statefulTopology.shardGroup = 0;
+  }
+  for (uint32_t index = 0; index < transition.servingRuntimeStates.size(); ++index)
+    suite.require(prodigyStatefulServingRuntimeDigest(
+        transition.servingRuntimeStates[index],
+        transition.runtimeState.statefulServingAuthorities[0].members[index].planSHA256),
+        "generation_projection_fixture_seals_member");
+
+  const auto launch = transition.servingRuntimeStates.front().plan;
+  const auto selection = servingAuthorityTestGenerationSelection(transition.servingRuntimeStates.front());
+  suite.require(prodigyStatefulStoreGenerationSelectionValid(selection) &&
+      prodigyStatefulStoreGenerationSelectionMatchesPlan(selection, launch),
+      "generation_projection_fixture_has_exact_valid_selection");
+
+  ProdigyStatefulStoreGenerationSelection projected = {.protocolVersion = 0};
+  suite.expect(prodigyProjectStatefulStoreGeneration(
+          transition.runtimeState, transition.servingRuntimeStates, launch, projected) &&
+          projected.protocolVersion == 0,
+      "generation_projection_no_selection_is_explicit_legacy_absence");
+
+  transition.runtimeState.statefulStoreGenerationSelections.push_back(selection);
+  suite.expect(prodigyProjectStatefulStoreGeneration(
+          transition.runtimeState, transition.servingRuntimeStates, launch, projected) &&
+          prodigyStatefulStoreGenerationSelectionsEqual(projected, selection),
+      "generation_projection_accepts_exact_sealed_member");
+
+  auto mismatchedLaunch = launch;
+  ++mismatchedLaunch.config.memoryMB;
+  suite.expect(!prodigyProjectStatefulStoreGeneration(
+          transition.runtimeState, transition.servingRuntimeStates, mismatchedLaunch, projected),
+      "generation_projection_rejects_supplied_plan_digest_mismatch");
+
+  auto refreshedRuntime = launch;
+  refreshedRuntime.state = ContainerState::healthy;
+  refreshedRuntime.runtimeReady = true;
+  refreshedRuntime.subscriptionPairings.emplace(0x77310010, uint128_t(1), uint128_t(2), uint64_t(3), uint16_t(4));
+  refreshedRuntime.advertisementPairings.emplace(0x77310011, uint128_t(5), uint128_t(6), uint64_t(7));
+  refreshedRuntime.hasCredentialBundle = true;
+  refreshedRuntime.credentialBundle.bundleGeneration = 1;
+  suite.expect(prodigyProjectStatefulStoreGeneration(
+          transition.runtimeState, transition.servingRuntimeStates, refreshedRuntime, projected) &&
+          prodigyStatefulStoreGenerationSelectionsEqual(projected, selection),
+      "generation_projection_accepts_live_state_pairing_and_credential_refresh");
+
+  auto changedArtifact = launch;
+  ++changedArtifact.config.containerBlobBytes;
+  auto changedShard = launch;
+  changedShard.shardGroup = 1;
+  auto changedTarget = launch;
+  ++changedTarget.uuid;
+  suite.expect(!prodigyProjectStatefulStoreGeneration(
+          transition.runtimeState, transition.servingRuntimeStates, changedArtifact, projected) &&
+          !prodigyProjectStatefulStoreGeneration(
+              transition.runtimeState, transition.servingRuntimeStates, changedShard, projected) &&
+          !prodigyStatefulStoreGenerationSelectionMatchesPlan(selection, changedTarget),
+      "generation_projection_rejects_changed_artifact_shard_or_target");
+
+  auto duplicate = transition.runtimeState;
+  duplicate.statefulStoreGenerationSelections.push_back(selection);
+  suite.expect(!prodigyProjectStatefulStoreGeneration(
+          duplicate, transition.servingRuntimeStates, launch, projected),
+      "generation_projection_rejects_duplicate_target_selection");
+
+  auto malformed = transition.runtimeState;
+  malformed.statefulStoreGenerationSelections.front().authority.nShardGroups = 0;
+  suite.expect(!prodigyProjectStatefulStoreGeneration(
+          malformed, transition.servingRuntimeStates, launch, projected),
+      "generation_projection_rejects_malformed_target_selection");
+
+  auto unrelatedRevision = transition.runtimeState;
+  unrelatedRevision.generation = 11;
+  unrelatedRevision.statefulServingAuthorities.front().revision = 11;
+  suite.expect(prodigyProjectStatefulStoreGeneration(
+          unrelatedRevision, transition.servingRuntimeStates, launch, projected) &&
+          prodigyStatefulStoreGenerationSelectionsEqual(projected, selection),
+      "generation_projection_accepts_later_unrelated_revision_with_same_sealed_plan");
+
+  auto changedDigest = transition.servingRuntimeStates;
+  ++changedDigest.front().plan.config.memoryMB;
+  suite.expect(!prodigyProjectStatefulStoreGeneration(
+          transition.runtimeState, changedDigest, launch, projected),
+      "generation_projection_rejects_changed_sealed_digest_without_refreshed_selection");
+
+  ProdigyPersistentMasterAuthorityPackage package = {};
+  package.runtimeState = transition.runtimeState;
+  package.runtimeState.statefulStoreGenerationSelections = {selection};
+  package.servingRuntimeStates = transition.servingRuntimeStates;
+  String packageBytes = {};
+  ProdigyPersistentMasterAuthorityPackage packageDecoded = {};
+  suite.expect(BitseryEngine::serialize(packageBytes, package) &&
+          BitseryEngine::deserializeSafe(packageBytes, packageDecoded) &&
+          packageDecoded.runtimeState.statefulStoreGenerationSelections.size() == 1 &&
+          prodigyStatefulStoreGenerationSelectionsEqual(
+              packageDecoded.runtimeState.statefulStoreGenerationSelections.front(), selection),
+      "generation_selection_v23_package_roundtrips_valid_selection");
+
+  auto duplicatePackage = package;
+  duplicatePackage.runtimeState.statefulStoreGenerationSelections.push_back(selection);
+  String duplicatePackageBytes = {};
+  ProdigyPersistentMasterAuthorityPackage duplicatePackageDecoded = {};
+  suite.expect(BitseryEngine::serialize(duplicatePackageBytes, duplicatePackage) &&
+          !BitseryEngine::deserializeSafe(duplicatePackageBytes, duplicatePackageDecoded),
+      "generation_selection_v23_package_rejects_duplicate_target");
+
+  auto secondSelection = servingAuthorityTestGenerationSelection(transition.servingRuntimeStates[1]);
+  auto outOfOrderPackage = package;
+  outOfOrderPackage.runtimeState.statefulStoreGenerationSelections.clear();
+  outOfOrderPackage.runtimeState.statefulStoreGenerationSelections.push_back(secondSelection);
+  outOfOrderPackage.runtimeState.statefulStoreGenerationSelections.push_back(selection);
+  String outOfOrderPackageBytes = {};
+  ProdigyPersistentMasterAuthorityPackage outOfOrderPackageDecoded = {};
+  suite.expect(BitseryEngine::serialize(outOfOrderPackageBytes, outOfOrderPackage) &&
+          !BitseryEngine::deserializeSafe(outOfOrderPackageBytes, outOfOrderPackageDecoded),
+      "generation_selection_v23_package_rejects_noncanonical_target_order");
+
+  auto refreshedAdmission = selection;
+  ++refreshedAdmission.servingRevision;
+  refreshedAdmission.admittedPlanSHA256.assign("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"_ctv);
+  suite.expect(prodigyStatefulStoreGenerationSameHome(selection, refreshedAdmission) &&
+          !prodigyStatefulStoreGenerationSelectionsEqual(selection, refreshedAdmission),
+      "generation_selection_same_home_ignores_legitimate_admission_refresh");
+  auto otherGeneration = selection;
+  ++otherGeneration.generationUUID;
+  auto otherAuthority = selection;
+  ++otherAuthority.authority.sourceContainerUUID;
+  suite.expect(!prodigyStatefulStoreGenerationSameHome(selection, otherGeneration) &&
+          !prodigyStatefulStoreGenerationSameHome(selection, otherAuthority),
+      "generation_selection_same_home_rejects_different_generation_or_authority");
+
+  auto wrongApplication = launch;
+  ++wrongApplication.config.applicationID;
+  suite.expect(!prodigyStatefulStoreGenerationSelectionMatchesPlan(selection, wrongApplication),
+      "generation_selection_plan_match_rejects_application_mismatch");
+
+  NeuronContainerBootstrap legacyBootstrap = {};
+  legacyBootstrap.plan = launch;
+  String legacyBootstrapBytes = {};
+  NeuronContainerBootstrap legacyBootstrapDecoded = {};
+  suite.expect(BitseryEngine::serialize(legacyBootstrapBytes, legacyBootstrap) &&
+          BitseryEngine::deserializeSafe(legacyBootstrapBytes, legacyBootstrapDecoded) &&
+          legacyBootstrapDecoded.statefulStoreGenerationSelection.protocolVersion == 0,
+      "generation_selection_bootstrap_legacy_absence_roundtrips");
+
+  NeuronContainerBootstrap selectedBootstrap = legacyBootstrap;
+  selectedBootstrap.statefulStoreGenerationSelection = selection;
+  String selectedBootstrapBytes = {};
+  NeuronContainerBootstrap selectedBootstrapDecoded = {};
+  suite.expect(BitseryEngine::serialize(selectedBootstrapBytes, selectedBootstrap) &&
+          BitseryEngine::deserializeSafe(selectedBootstrapBytes, selectedBootstrapDecoded) &&
+          prodigyStatefulStoreGenerationSelectionsEqual(
+              selectedBootstrapDecoded.statefulStoreGenerationSelection, selection),
+      "generation_selection_bootstrap_terminal_tail_roundtrips");
+
+  String explicitZeroTail = legacyBootstrapBytes;
+  ProdigyStatefulStoreGenerationSelection zeroSelection = {.protocolVersion = 0};
+  String zeroSelectionBytes = {};
+  BitseryEngine::serialize(zeroSelectionBytes, zeroSelection);
+  explicitZeroTail.append(zeroSelectionBytes);
+  NeuronContainerBootstrap invalidBootstrap = {};
+  suite.expect(!BitseryEngine::deserializeSafe(explicitZeroTail, invalidBootstrap),
+      "generation_selection_bootstrap_rejects_explicit_zero_tail");
+
+  ContainerParameters parameters = {};
+  parameters.statefulStoreGenerationSelection = selection;
+  String parameterBytes = {};
+  ContainerParameters decodedParameters = {};
+  suite.expect(BitseryEngine::serialize(parameterBytes, parameters) &&
+          BitseryEngine::deserializeSafe(parameterBytes, decodedParameters) &&
+          prodigyStatefulStoreGenerationSelectionsEqual(
+              decodedParameters.statefulStoreGenerationSelection, selection),
+      "generation_selection_parameters_terminal_tail_roundtrips");
+  ContainerParameters legacyParameters = {};
+  String legacyParameterBytes = {};
+  BitseryEngine::serialize(legacyParameterBytes, legacyParameters);
+  legacyParameterBytes.append(zeroSelectionBytes);
+  ContainerParameters invalidParameters = {};
+  suite.expect(!BitseryEngine::deserializeSafe(legacyParameterBytes, invalidParameters),
+      "generation_selection_parameters_reject_explicit_zero_tail");
+}
+
 static void testStatefulServingAuthorityAsyncReceipt(TestSuite& suite)
 {
   ScopedRing scopedRing = {};

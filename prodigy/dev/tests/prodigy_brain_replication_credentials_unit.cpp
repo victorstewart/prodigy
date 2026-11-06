@@ -1463,6 +1463,7 @@ public:
   ContainerPlan lastLaunchedContainerPlanForTest = {};
   NeuronContainerMetricPolicy lastLaunchedContainerMetricPolicyForTest = {};
   uint128_t lastLaunchedContainerReplaceUUIDForTest = 0;
+  ProdigyStatefulStoreGenerationSelection lastLaunchedGenerationSelectionForTest = {.protocolVersion = 0};
   bool interceptContainerLaunchForTest = false;
 
   TestNeuron()
@@ -1683,19 +1684,22 @@ public:
   void launchContainerFromBrain(ContainerPlan plan,
                                 uint128_t replaceContainerUUID,
                                 NeuronContainerMetricPolicy metricPolicy,
-                                RetainedContainerStorageSource retainedSource = {}) override
+                                RetainedContainerStorageSource retainedSource = {},
+                                ProdigyStatefulStoreGenerationSelection selection = {.protocolVersion = 0}) override
   {
     if (interceptContainerLaunchForTest == false)
     {
-      Neuron::launchContainerFromBrain(std::move(plan), replaceContainerUUID, metricPolicy, retainedSource);
+      Neuron::launchContainerFromBrain(
+          std::move(plan), replaceContainerUUID, metricPolicy, retainedSource, std::move(selection));
       return;
     }
     ++launchedContainerPlansForTest;
     lastLaunchedContainerPlanForTest = std::move(plan);
     lastLaunchedContainerMetricPolicyForTest = metricPolicy;
     lastLaunchedContainerReplaceUUIDForTest = replaceContainerUUID;
+    lastLaunchedGenerationSelectionForTest = std::move(selection);
     lastLaunchedContainerAdmissionGenerationForTest =
-        beginPendingContainerLaunch(lastLaunchedContainerPlanForTest);
+        beginPendingContainerLaunch(lastLaunchedContainerPlanForTest, lastLaunchedGenerationSelectionForTest);
   }
 
   void downloadContainer(CoroutineStack *coro, uint64_t deploymentID) override
@@ -26951,6 +26955,99 @@ static void testNeuronPendingLaunchStateUploadRetainsCanonicalUUID(TestSuite& su
                "neuron_pending_launch_failure_or_completion_releases_claim");
 }
 
+static void testNeuronSpinContainerRetainsStatefulStoreGenerationSelection(TestSuite& suite)
+{
+  ScopedFreshRing ring = {};
+  suite.require(Ring::getRingFD() > 0, "neuron_spin_generation_fixture_owns_ring");
+  TestNeuron neuron = {};
+  neuron.interceptContainerLaunchForTest = true;
+  neuron.seedBrainStreamForTest(false);
+  neuron.seedLocalContainerSubnetForTest(1, 0x123d);
+
+  ContainerPlan plan = {};
+  plan.uuid = uint128_t(0x51aa07);
+  plan.config.applicationID = 7;
+  plan.config.versionID = 9;
+  plan.config.type = ApplicationType::stateful;
+  plan.isStateful = true;
+  plan.state = ContainerState::scheduled;
+  plan.shardGroup = 0;
+  plan.nShardGroups = 1;
+
+  ProdigyStatefulStoreGenerationSelection selection = {};
+  selection.generationUUID = 0x51aa08;
+  selection.servingRevision = 1;
+  selection.admittedPlanSHA256 =
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv;
+  selection.authority.protocolVersion = ProdigyStatefulStoreSeedAuthority::sourceCutVersion;
+  selection.authority.authorityGeneration = 1;
+  selection.authority.operationUUID = 0x51aa09;
+  selection.authority.applicationID = plan.config.applicationID;
+  selection.authority.storeKind = DeploymentIdentityStoreKind::kv;
+  selection.authority.shardGroup = plan.shardGroup;
+  selection.authority.nShardGroups = plan.nShardGroups;
+  selection.authority.targetClusterUUID = 0x51aa0a;
+  selection.authority.targetDeploymentID = plan.config.deploymentID();
+  selection.authority.targetContainerUUID = plan.uuid;
+  selection.authority.sourceClusterUUID = 0x51aa0b;
+  selection.authority.sourceDeploymentID = plan.config.deploymentID() - 1;
+  selection.authority.sourceContainerUUID = 0x51aa0c;
+  selection.authority.seedGeneration = 1;
+  selection.authority.fixtureSHA256 = selection.admittedPlanSHA256;
+  selection.authority.sourceContentWatermarkSHA256 =
+      "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"_ctv;
+  selection.authority.sourceCatchupWatermarkSHA256 =
+      "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"_ctv;
+  selection.authority.sourceBaselineOperationUUID = 0x51aa0d;
+  selection.authority.sourceRequestUUID = 0x51aa0e;
+  selection.authority.sourceMemberRequestUUID = 0x51aa0f;
+  selection.authority.seedRouteUUID = 0x51aa10;
+  selection.authority.cutUUID = 0x51aa11;
+  selection.authority.cutGeneration = 1;
+  selection.authority.sourceCutScope = ProdigyStatefulStoreSourceCutScope::fullShardGroup;
+  selection.authority.retainUntilMilliseconds = 1;
+  suite.require(prodigyStatefulStoreGenerationSelectionMatchesPlan(selection, plan),
+                "neuron_spin_generation_fixture_binds_exact_plan");
+
+  NeuronContainerBootstrap bootstrap = {};
+  bootstrap.plan = plan;
+  bootstrap.statefulStoreGenerationSelection = selection;
+  String serialized = {}, frame = {};
+  suite.require(BitseryEngine::serialize(serialized, bootstrap),
+                "neuron_spin_generation_selected_bootstrap_serializes");
+  neuron.dispatchBrainMessageForTest(buildNeuronMessage(
+      frame, NeuronTopic::spinContainer, uint128_t(0), serialized));
+  suite.expect(neuron.launchedContainerPlansForTest == 1 &&
+                   neuron.lastLaunchedContainerPlanForTest.uuid == plan.uuid &&
+                   neuron.lastLaunchedGenerationSelectionForTest.generationUUID == selection.generationUUID &&
+                   neuron.pendingContainerStoreGenerationMatches(plan.uuid, selection),
+               "neuron_spin_generation_selected_bootstrap_reaches_launch_owner_unchanged");
+
+  NeuronContainerBootstrap absentSelectionReplay = {};
+  absentSelectionReplay.plan = plan;
+  String replaySerialized = {}, replayFrame = {};
+  suite.require(BitseryEngine::serialize(replaySerialized, absentSelectionReplay),
+                "neuron_spin_generation_absent_selection_replay_serializes");
+  uint32_t header = Message::appendHeader(replayFrame, NeuronTopic::stateUpload);
+  local_container_subnet6 fragment = {};
+  fragment.dpfx = 1;
+  fragment.mpfx[1] = 0x12;
+  fragment.mpfx[2] = 0x3d;
+  Message::appendAlignedBuffer<Alignment::one>(
+      replayFrame, reinterpret_cast<const uint8_t *>(&fragment), sizeof(fragment));
+  Message::appendValue(replayFrame, replaySerialized);
+  Message::finish(replayFrame, header);
+  neuron.dispatchBrainMessageForTest(reinterpret_cast<Message *>(replayFrame.data()));
+  suite.expect(neuron.launchedContainerPlansForTest == 1 &&
+                   neuron.isPendingContainerLaunch(plan.uuid) &&
+                   neuron.pendingContainerStoreGenerationMatches(plan.uuid, selection) &&
+                   !neuron.pendingContainerStoreGenerationMatches(
+                       plan.uuid, ProdigyStatefulStoreGenerationSelection{.protocolVersion = 0}),
+               "neuron_stateupload_replay_cannot_downgrade_pending_selected_generation");
+  neuron.finishPendingContainerLaunch(
+      plan.uuid, neuron.lastLaunchedContainerAdmissionGenerationForTest);
+}
+
 static void testNeuronPendingLaunchControlReplacementReissuesAuthenticatedReplay(TestSuite& suite)
 {
   TestNeuron neuron = {};
@@ -45177,6 +45274,8 @@ int main(void)
     testStatefulServingAuthorityFanoutCapability(suite);
     testRestoredRuntimeRequiresFreshInventory(suite);
     testStatefulServingLaunchAdmission(suite);
+    testStatefulStoreGenerationBootstrapProjection(suite);
+    testStatefulStoreGenerationProjection(suite);
     testStatefulServingResourceAdjustment(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
@@ -45606,6 +45705,7 @@ int main(void)
       only != nullptr && strcmp(only, "duplicate-inventory-recovery") == 0)
   {
     testNeuronPendingLaunchStateUploadRetainsCanonicalUUID(suite);
+    testNeuronSpinContainerRetainsStatefulStoreGenerationSelection(suite);
     testNeuronPendingLaunchControlReplacementReissuesAuthenticatedReplay(suite);
     testNeuronFreshScheduledStateUploadResumesOrdinarySpin(suite);
     testNeuronStateUploadSkipsExistingLiveContainer(suite);
@@ -46279,6 +46379,9 @@ int main(void)
   testNeuronDeliversOnlyBoundNametagQualificationApplicationCommand(suite);
   testNeuronSourceBaselineRelayRequiresApp11(suite);
   testBrainSourceBaselineQueryRecoversReceipt(suite);
+  testStatefulStoreGenerationBootstrapProjection(suite);
+  testStatefulStoreGenerationProjection(suite);
+  testNeuronSpinContainerRetainsStatefulStoreGenerationSelection(suite);
   testNeuronContainerHandlerMarksMasterLocalContainerHealthyWithoutBrainStream(suite);
   testNeuronContainerHandlerRelaysHealthyToMasterPeerWithoutBrainStream(suite);
   testNeuronContainerHandlerMarksMasterLocalContainerHealthyWithActiveBrainStream(suite);

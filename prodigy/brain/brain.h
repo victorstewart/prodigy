@@ -2525,6 +2525,7 @@ public:
     uint32_t requiredContainerRetirementJournalVersion = 0;
     uint32_t targetContainerRetirementJournalVersion = 0;
     bool statelessRetirementReaderRequired = false;
+    bool statefulStoreGenerationReaderRequired = false;
     uint64_t targetBinaryVersion = 0;
     String admittedTargetContractSHA256 = {};
     bool hasExplicitFollowerConcurrency = false;
@@ -9595,6 +9596,67 @@ public:
     return true;
   }
 
+  bool statefulStoreGenerationPeersCapable() const
+  {
+    if (!statefulServingPeersCapable()) return false;
+    ClusterTopology topology;
+    if (!loadAuthoritativeClusterTopology(topology)) return false;
+    for (const auto& member : topology.machines) {
+      if (!member.isBrain || clusterMachineMatchesThisBrain(member)) continue;
+      const auto *peer = brainPeerForTopologyMember(member);
+      if (!peer || peer->version < ProdigyStatefulStoreGenerationMinimumVersion ||
+          !peer->statefulStoreGenerationCapabilityAcknowledged) return false;
+    }
+    return true;
+  }
+
+  StatefulServingLaunchAdmission prepareStatefulStoreGenerationLaunch(
+      const Machine *machine, String& encodedBootstrap) const override
+  {
+    NeuronContainerBootstrap bootstrap = {};
+    if (!BitseryEngine::deserializeSafe(encodedBootstrap, bootstrap))
+    {
+      bootstrap = {};
+      if (!BitseryEngine::deserializeSafe(encodedBootstrap, bootstrap.plan))
+        return StatefulServingLaunchAdmission::rejected;
+    }
+
+    ProdigyStatefulStoreGenerationSelection selected = {.protocolVersion = 0};
+    if (!prodigyProjectStatefulStoreGeneration(masterAuthorityRuntimeState,
+          statefulServingRuntimeStates, bootstrap.plan, selected))
+      return StatefulServingLaunchAdmission::rejected;
+    if (selected.protocolVersion == 0)
+    {
+      // A captured selected home cannot become the legacy home because its
+      // authority record is missing during replay or recovery.
+      return bootstrap.statefulStoreGenerationSelection.protocolVersion == 0
+          ? StatefulServingLaunchAdmission::ready : StatefulServingLaunchAdmission::rejected;
+    }
+    if (!weAreMaster || machine == nullptr ||
+        selected.authority.targetClusterUUID != brainConfig.clusterUUID)
+      return StatefulServingLaunchAdmission::rejected;
+
+    const auto sealed = std::find_if(statefulServingRuntimeStates.begin(), statefulServingRuntimeStates.end(),
+        [&](const auto& state) { return state.plan.uuid == bootstrap.plan.uuid; });
+    if (sealed == statefulServingRuntimeStates.end() || sealed->machineUUID != machine->uuid)
+      return StatefulServingLaunchAdmission::rejected;
+    // Inventory recovery needs this exact durable projection to restore its
+    // processes. Waiting for that inventory here would prevent its own replay.
+    // New placement admission remains in prepareStatefulServingLaunch.
+    if (!masterAuthorityRuntimeStateDurable ||
+        durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation ||
+        !statefulStoreGenerationPeersCapable() ||
+        !containerRetirementAuthorityAcknowledged() || !statefulServingResourceObservationSupported(machine))
+      return StatefulServingLaunchAdmission::pending;
+
+    bootstrap.statefulStoreGenerationSelection = std::move(selected);
+    String projected = {};
+    if (!BitseryEngine::serialize(projected, bootstrap))
+      return StatefulServingLaunchAdmission::rejected;
+    encodedBootstrap = std::move(projected);
+    return StatefulServingLaunchAdmission::ready;
+  }
+
   bool allMastersSeedBootstrapPeersCapable() const
   {
     if (!statefulServingPeersCapable()) return false;
@@ -14550,6 +14612,10 @@ public:
                     [](const auto& operation) { return operation.protocolVersion >= ProdigyClusterPairEnrollmentOperation::privateDiscoveryVersion; })))) &&
            (masterAuthorityRuntimeState.statefulServingAuthorities.empty() ||
             (containerRetirementPeerCapabilityCurrent(peer) && peer->statefulServingAuthorityCapabilityAcknowledged)) &&
+           (masterAuthorityRuntimeState.statefulStoreGenerationSelections.empty() ||
+            (containerRetirementPeerCapabilityCurrent(peer) &&
+             peer->version >= ProdigyStatefulStoreGenerationMinimumVersion &&
+             peer->statefulStoreGenerationCapabilityAcknowledged)) &&
            (std::none_of(masterAuthorityRuntimeState.statefulServingAuthorities.begin(), masterAuthorityRuntimeState.statefulServingAuthorities.end(),
               [](const auto& authority) { return authority.phase == StatefulWorkerTopologyUpgradePhase::allMastersSeedBootstrap; }) ||
             (containerRetirementPeerCapabilityCurrent(peer) && peer->allMastersSeedBootstrapCapabilityAcknowledged)) &&
@@ -24592,6 +24658,26 @@ public:
         bootstraps = nullptr;
         bootstrapSource = "retirement-merge-rejected";
         bootstrapFailure.assign("container retirement bootstrap merge rejected"_ctv);
+      }
+    }
+
+    if (bootstraps != nullptr)
+    {
+      if (bootstraps != &liveBootstraps) liveBootstraps = *bootstraps;
+      bootstraps = &liveBootstraps;
+      for (String& encoded : liveBootstraps)
+      {
+        const auto admission = prepareStatefulStoreGenerationLaunch(machine, encoded);
+        if (admission != StatefulServingLaunchAdmission::ready)
+        {
+          bootstraps = nullptr;
+          bootstrapSource = "generation-projection-withheld";
+          if (admission == StatefulServingLaunchAdmission::pending)
+            bootstrapFailure.assign("stateful store generation is awaiting current authority or machine capability"_ctv);
+          else
+            bootstrapFailure.assign("stateful store generation does not match the authoritative launch"_ctv);
+          break;
+        }
       }
     }
 
@@ -44973,6 +45059,7 @@ public:
           bv->placementPolicyCapabilityAcknowledged = false;
           bv->containerRetirementCapabilityAcknowledged = false;
           bv->statefulServingAuthorityCapabilityAcknowledged = false;
+          bv->statefulStoreGenerationCapabilityAcknowledged = false;
           bv->statefulDataAuthorityCapabilityAcknowledged = false;
           bv->statelessDeploymentAdmissionCapabilityAcknowledged = false;
           bv->statelessDeploymentRetirementCapabilityAcknowledged = false;
@@ -45000,7 +45087,8 @@ public:
                                       (bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion ? 31 :
                                       (bv->version >= ProdigyStatelessDeploymentAdmissionCapabilityMinimumVersion ? 15 : 7)) |
                                       (bv->transportAEGISEnabled() ? uint64_t(32 | 64 | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 32768 | 65536 | 131072 | 262144 | ProdigyInitialAllMastersSeedBootstrapCapability |
-                                      ProdigyStatelessDeploymentRetirementCapability) : 0);
+                                      ProdigyStatelessDeploymentRetirementCapability |
+                                      (bv->version >= ProdigyStatefulStoreGenerationMinimumVersion ? ProdigyStatefulStoreGenerationCapability : 0)) : 0);
             Message::construct(bv->wBuffer, BrainTopic::advertiseCapabilities, advertised);
             Ring::queueSend(bv);
           }
@@ -45706,7 +45794,8 @@ public:
                                      (bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion ? 31 :
                                      (bv->version >= ProdigyStatelessDeploymentAdmissionCapabilityMinimumVersion ? 15 : 7)) |
                                      (bv->transportAEGISEnabled() ? uint64_t(32 | 64 | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 32768 | 65536 | 131072 | 262144 | ProdigyInitialAllMastersSeedBootstrapCapability |
-                                      ProdigyStatelessDeploymentRetirementCapability) : 0);
+                                      ProdigyStatelessDeploymentRetirementCapability |
+                                      (bv->version >= ProdigyStatefulStoreGenerationMinimumVersion ? ProdigyStatefulStoreGenerationCapability : 0)) : 0);
           Message::construct(bv->wBuffer, BrainTopic::acknowledgeCapabilities, capabilities & supported);
           Ring::queueSend(bv);
           break;
@@ -45718,6 +45807,7 @@ public:
           uint64_t capabilities = 0;
           Message::extractArg<ArgumentNature::fixed>(args, capabilities);
           bv->statelessDeploymentRetirementCapabilityAcknowledged = false;
+          bv->statefulStoreGenerationCapabilityAcknowledged = false;
           bv->qualificationCancellationCapabilityAcknowledged = false;
           bv->allMastersSeedBootstrapCapabilityAcknowledged = false;
           bv->initialAllMastersSeedBootstrapCapabilityAcknowledged = false;
@@ -45740,6 +45830,9 @@ public:
           {
             bv->containerRetirementCapabilityAcknowledged = true;
             bv->statefulServingAuthorityCapabilityAcknowledged = (capabilities & uint64_t(4)) != 0;
+            bv->statefulStoreGenerationCapabilityAcknowledged =
+                bv->transportAEGISEnabled() && bv->version >= ProdigyStatefulStoreGenerationMinimumVersion &&
+                (capabilities & ProdigyStatefulStoreGenerationCapability) != 0;
             bv->statefulDataAuthorityCapabilityAcknowledged =
                 bv->version >= ProdigyStatefulDataAuthorityMinimumVersion && (capabilities & uint64_t(16384)) != 0;
             bv->statelessDeploymentAdmissionCapabilityAcknowledged =
@@ -51484,6 +51577,8 @@ public:
             pending->requiredContainerRetirementJournalVersion = requiredContainerRetirementJournalReaderVersion();
             pending->statelessRetirementReaderRequired =
                 !masterAuthorityRuntimeState.statelessDeploymentRetirements.empty();
+            pending->statefulStoreGenerationReaderRequired =
+                !masterAuthorityRuntimeState.statefulStoreGenerationSelections.empty();
             pending->responseTopic = admittedUpdateDispatch ? MothershipTopic::updateProdigyAdmitted : MothershipTopic::updateProdigy;
             pending->admittedRequest = admittedUpdateRequestForDispatch;
             pending->admittedClusterUUID = brainConfig.clusterUUID;
@@ -51512,7 +51607,7 @@ public:
                         pending->failure.assign("bundle artifact preparation failed"_ctv);
                       }
                       if (pending->failure.empty() && (pending->admitted || pending->requiredContainerRetirementJournalVersion ||
-                                                       pending->statelessRetirementReaderRequired))
+                                                       pending->statelessRetirementReaderRequired || pending->statefulStoreGenerationReaderRequired))
                       {
                         ProdigyApprovedUpgradeBundle approved = {};
                         if (!prodigyApproveBundleUpgradeContract(pending->prepared.stageBundlePath, approved, &pending->failure) ||
@@ -51530,6 +51625,12 @@ public:
                             pending->targetBinaryVersion < ProdigyStatelessDeploymentRetirementCapabilityMinimumVersion)
                         {
                           pending->failure.assign("target binary cannot read durable stateless retirement authority"_ctv);
+                          return;
+                        }
+                        if (pending->statefulStoreGenerationReaderRequired &&
+                            pending->targetBinaryVersion < ProdigyStatefulStoreGenerationMinimumVersion)
+                        {
+                          pending->failure.assign("target binary cannot read durable stateful store generation authority"_ctv);
                           return;
                         }
                         pending->targetContainerRetirementJournalVersion = approved.contract.containerRetirementJournalVersion;
@@ -51702,6 +51803,12 @@ public:
               pending->targetBinaryVersion < ProdigyStatelessDeploymentRetirementCapabilityMinimumVersion)
           {
             rejectPendingMothershipUpdateArtifact(pending, "target binary lacks the stateless retirement authority reader"_ctv);
+            break;
+          }
+          if (!masterAuthorityRuntimeState.statefulStoreGenerationSelections.empty() &&
+              pending->targetBinaryVersion < ProdigyStatefulStoreGenerationMinimumVersion)
+          {
+            rejectPendingMothershipUpdateArtifact(pending, "target binary lacks the stateful store generation authority reader"_ctv);
             break;
           }
           if (pending->targetContainerRetirementJournalVersion < requiredContainerRetirementJournalReaderVersion())
