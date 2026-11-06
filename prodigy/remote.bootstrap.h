@@ -1838,6 +1838,36 @@ static inline void prodigyAppendRemoteContainerRootCommand(String& command, bool
   command.append(" /containers 2>/dev/null || true); if [ \"$fs\" != btrfs ]; then if mountpoint -q /containers; then echo '/containers must be btrfs' >&2; exit 1; fi; if [ ! -e /sys/module/loop ]; then command -v modprobe >/dev/null 2>&1 || { echo 'loop module loader is unavailable' >&2; exit 1; }; modprobe loop || { echo 'could not load the loop device driver' >&2; exit 1; }; fi; if [ ! -e /sys/module/loop ] || [ ! -c /dev/loop-control ]; then echo 'loop device support is unavailable' >&2; exit 1; fi; img=/var/lib/prodigy/containers.btrfs.loop; if [ ! -e \"$img\" ]; then truncate -s 16G \"$img\" && mkfs.btrfs -f \"$img\" >/dev/null; fi; mount -o loop,nosuid,nodev \"$img\" /containers; fi; mkdir -p /containers/store /containers/storage"_ctv);
 }
 
+// Builds the remote half of an explicit Mothership-managed pool expansion.
+// It only grows Prodigy's own loop-backed Btrfs filesystem; an existing host
+// mount or loop device that does not prove that ownership is rejected.
+constexpr uint64_t prodigyRemoteContainerPoolDefaultBytes = 16ULL * 1024ULL * 1024ULL * 1024ULL;
+constexpr uint64_t prodigyRemoteContainerPoolRootReserveBytes = 16ULL * 1024ULL * 1024ULL * 1024ULL;
+
+static inline bool prodigyBuildRemoteContainerPoolGrowthCommand(
+    uint64_t requestedBytes,
+    String& command,
+    String *failure = nullptr)
+{
+  command.clear();
+  if (failure != nullptr)
+  {
+    failure->clear();
+  }
+  if (requestedBytes < prodigyRemoteContainerPoolDefaultBytes ||
+      requestedBytes > uint64_t(INT64_MAX) - prodigyRemoteContainerPoolRootReserveBytes)
+  {
+    if (failure != nullptr)
+    {
+      failure->assign("requested /containers pool size is outside the supported grow-only range"_ctv);
+    }
+    return false;
+  }
+
+  command.snprintf<"set -eu; img=/var/lib/prodigy/containers.btrfs.loop; target={itoa}; reserve={itoa}; mountpoint -q /containers || { echo '/containers must already be mounted' >&2; exit 1; }; fs=$(findmnt -n -o FSTYPE --target /containers 2>/dev/null || true); [ \"$fs\" = btrfs ] || { echo '/containers must be btrfs' >&2; exit 1; }; loop=$(findmnt -n -o SOURCE --target /containers 2>/dev/null || true); case \"$loop\" in /dev/loop[0-9]*) ;; *) echo '/containers must be mounted from a loop device' >&2; exit 1;; esac; [ -f \"$img\" ] && [ ! -L \"$img\" ] || { echo 'expected Prodigy container pool backing file is not a regular file' >&2; exit 1; }; expected=$(readlink -f \"$img\"); actual=$(losetup -n -O BACK-FILE \"$loop\" 2>/dev/null || true); [ \"$actual\" = \"$expected\" ] || { echo '/containers loop backing file is not the Prodigy pool' >&2; exit 1; }; current=$(stat -c %s \"$img\"); case \"$current\" in ''|*[!0-9]*) echo 'invalid Prodigy container pool size' >&2; exit 1;; esac; [ \"$current\" -le \"$target\" ] || { echo 'requested pool size would shrink an existing Prodigy backing file' >&2; exit 1; }; allocated=$(du -B1 \"$img\" | awk 'NR==1 {print $1}'); case \"$allocated\" in ''|*[!0-9]*) echo 'unable to determine allocated Prodigy pool bytes' >&2; exit 1;; esac; [ \"$allocated\" -le \"$target\" ] || { echo 'allocated Prodigy pool bytes exceed requested size' >&2; exit 1; }; if [ \"$allocated\" -lt \"$target\" ]; then available=$(df -B1 --output=avail /var/lib/prodigy | awk 'NR==2 {print $1}'); case \"$available\" in ''|*[!0-9]*) echo 'unable to determine available root storage' >&2; exit 1;; esac; required=$((target-allocated)); [ \"$available\" -ge $((required+reserve)) ] || { echo 'insufficient root storage while preserving Prodigy reserve' >&2; exit 1; }; fallocate -l \"$target\" \"$img\"; sync -f \"$img\"; allocated=$(du -B1 \"$img\" | awk 'NR==1 {print $1}'); [ \"$allocated\" -ge \"$target\" ] || { echo 'backing file allocation did not reach requested pool size' >&2; exit 1; }; fi; loopBytes=$(blockdev --getsize64 \"$loop\"); case \"$loopBytes\" in ''|*[!0-9]*) echo 'unable to determine loop capacity' >&2; exit 1;; esac; if [ \"$loopBytes\" -lt \"$target\" ]; then losetup -c \"$loop\"; loopBytes=$(blockdev --getsize64 \"$loop\"); [ \"$loopBytes\" -ge \"$target\" ] || { echo 'loop capacity did not refresh to requested pool size' >&2; exit 1; }; fi; btrfs filesystem resize max /containers"_ctv>(requestedBytes, prodigyRemoteContainerPoolRootReserveBytes);
+  return true;
+}
+
 static inline void renderProdigySystemdUnit(const String& remoteBinaryPath, const String& remoteLibraryDirectory, const String& controlSocketDirectory, String& unit)
 {
   String containerRootCommand = {};
@@ -2315,7 +2345,15 @@ static inline bool prodigyBuildRemoteBootstrapPlan(const ClusterMachine& cluster
   prodigyAppendRemoteContainerRootCommand(plan.installCommand);
   plan.installCommand.append("; tar --no-same-owner --same-permissions -xf "_ctv);
   prodigyAppendShellSingleQuoted(plan.installCommand, plan.remoteStagePayloadPath);
-  plan.installCommand.append(" -C /; rm -f "_ctv);
+  plan.installCommand.append(" -C /; sync -f "_ctv);
+  prodigyAppendShellSingleQuoted(plan.installCommand, remoteRootParent);
+  plan.installCommand.append("; sync -f /var/lib/prodigy"_ctv);
+  if (plan.bootstrapSSHDirectory.size() > 0)
+  {
+    plan.installCommand.append("; sync -f "_ctv);
+    prodigyAppendShellSingleQuoted(plan.installCommand, plan.bootstrapSSHDirectory);
+  }
+  plan.installCommand.append("; rm -f "_ctv);
   prodigyAppendShellSingleQuoted(plan.installCommand, plan.remoteStagePayloadPath);
   plan.installCommand.append("; rm -rf "_ctv);
   prodigyAppendShellSingleQuoted(plan.installCommand, plan.installPaths.installRootTemp);
@@ -2335,6 +2373,10 @@ static inline bool prodigyBuildRemoteBootstrapPlan(const ClusterMachine& cluster
   prodigyAppendShellSingleQuoted(plan.installCommand, plan.installPaths.bundleSHA256TempPath);
   plan.installCommand.append(" "_ctv);
   prodigyAppendShellSingleQuoted(plan.installCommand, tempBundleSHA256Path);
+  // Tar extraction can leave zero-length files after a crash unless the staged
+  // filesystem is flushed before its directory is published.
+  plan.installCommand.append("; sync -f "_ctv);
+  prodigyAppendShellSingleQuoted(plan.installCommand, plan.installPaths.installRootTemp);
   plan.installCommand.append("; mv "_ctv);
   prodigyAppendShellSingleQuoted(plan.installCommand, plan.remoteUnitTempPath);
   plan.installCommand.append(" "_ctv);
@@ -2349,6 +2391,8 @@ static inline bool prodigyBuildRemoteBootstrapPlan(const ClusterMachine& cluster
   prodigyAppendShellSingleQuoted(plan.installCommand, plan.installPaths.installRootTemp);
   plan.installCommand.append(" "_ctv);
   prodigyAppendShellSingleQuoted(plan.installCommand, plan.installPaths.installRoot);
+  plan.installCommand.append("; sync -f "_ctv);
+  prodigyAppendShellSingleQuoted(plan.installCommand, remoteRootParent);
   if (plan.acme.configured())
   {
     String certbotWheelhousePath = {};
@@ -2381,7 +2425,20 @@ static inline bool prodigyBuildRemoteBootstrapPlan(const ClusterMachine& cluster
   prodigyAppendShellSingleQuoted(plan.installCommand, plan.remoteBootJSONPath);
   plan.installCommand.append(" "_ctv);
   prodigyAppendShellSingleQuoted(plan.installCommand, plan.remoteTransportTLSJSONPath);
-  plan.installCommand.append(" && if command -v ufw >/dev/null 2>&1 && ufw status | grep -F 'Status: active' >/dev/null 2>&1; then ufw allow 312/tcp >/dev/null 2>&1 || true; ufw allow 313/tcp >/dev/null 2>&1 || true; ufw allow 315/tcp >/dev/null 2>&1 || true; ufw default allow routed >/dev/null; fi && systemctl daemon-reload && systemctl enable prodigy && systemctl restart prodigy"_ctv);
+  plan.installCommand.append(" && if command -v ufw >/dev/null 2>&1 && ufw status | grep -F 'Status: active' >/dev/null 2>&1; then ufw allow 312/tcp >/dev/null 2>&1 || true; ufw allow 313/tcp >/dev/null 2>&1 || true; ufw allow 315/tcp >/dev/null 2>&1 || true; ufw default allow routed >/dev/null; fi && systemctl daemon-reload && systemctl enable prodigy"_ctv);
+  // Credentials, boot state, hook links, and the enabled unit can reside on
+  // different filesystems. A failed durability barrier must prevent launch.
+  plan.installCommand.append(" && sync -f /var/lib/prodigy && sync -f /etc/systemd/system && sync -f /usr/lib/prodigy"_ctv);
+  if (plan.bootstrapSSHDirectory.size() > 0)
+  {
+    plan.installCommand.append(" && sync -f "_ctv);
+    prodigyAppendShellSingleQuoted(plan.installCommand, plan.bootstrapSSHDirectory);
+  }
+  if (plan.acme.configured())
+  {
+    plan.installCommand.append(" && sync -f /opt/prodigy"_ctv);
+  }
+  plan.installCommand.append(" && systemctl restart prodigy"_ctv);
   if (prodigyRemoteBootstrapShouldAwaitControlSocket(clusterMachine, bootState))
   {
     plan.installCommand.append(" && "_ctv);

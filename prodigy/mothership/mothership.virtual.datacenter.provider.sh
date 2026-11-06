@@ -698,10 +698,10 @@ repair_transport()
    provider_pid="$(<"${workspace}/virtual-datacenter.pid")"
    provider_process "${provider_pid}" "${workspace}" || return 1
    runtime="$(runtime_identity_for_workspace "${workspace}" "${provider_pid}")" || return 1
-   command -v bpftool >/dev/null && command -v nsenter >/dev/null && command -v sha256sum >/dev/null || return 1
+   command -v bpftool >/dev/null && command -v nsenter >/dev/null && command -v sha256sum >/dev/null && command -v timeout >/dev/null || return 1
    # The retained provider is the namespace owner; a new provider invocation
    # must enter that exact mount namespace before resolving its netns handles.
-   { declare -f disable_owned_boundary_host_tx_checksum; cat <<'VDC_REPAIR'; } | nsenter -t "${provider_pid}" -m -- bash -s -- "${workspace}" "${pass_elf}" "${expected_sha}" "${runtime}" "${provider_pid}"
+   { declare -f disable_owned_boundary_host_tx_checksum; cat <<'VDC_REPAIR'; } | timeout --foreground 30s nsenter -t "${provider_pid}" -m -- bash -s -- "${workspace}" "${pass_elf}" "${expected_sha}" "${runtime}" "${provider_pid}"
 set -Eeuo pipefail
 workspace="$1"; pass_elf="$2"; expected_sha="$3"; runtime="$4"; provider_pid="$5"
 [[ "$(stat -Lc %i /proc/self/ns/mnt)" == "$(stat -Lc %i "/proc/${provider_pid}/ns/mnt")" ]]

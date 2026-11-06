@@ -809,6 +809,10 @@ add_executable(prodigy_mothership_host_runtime_unit ${CMAKE_CURRENT_SOURCE_DIR}/
 add_executable(prodigy_remote_bootstrap_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_remote_bootstrap_unit.cpp)
 add_executable(prodigy_remote_bootstrap_smoke ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_remote_bootstrap_smoke.cpp)
 add_executable(prodigy_mothership_cluster_registry_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_cluster_registry_unit.cpp)
+add_executable(prodigy_mothership_file_limits_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_file_limits_unit.cpp)
+target_include_directories(prodigy_mothership_file_limits_unit PRIVATE "${PRODIGY_ROOT}")
+depos_link(prodigy_mothership_file_limits_unit PRIVATE tidesdb::tidesdb)
+add_dependencies(prodigy_mothership_file_limits_unit mothership)
 add_executable(prodigy_mothership_cluster_report_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_cluster_report_unit.cpp)
 add_executable(prodigy_mothership_restart_persistence_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_restart_persistence_unit.cpp)
 add_executable(prodigy_retained_container_recovery_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_retained_container_recovery_unit.cpp)
@@ -1131,6 +1135,7 @@ target_compile_definitions(mothership PUBLIC PRODIGY_DEBUG=${PRODIGY_DEBUG_VALUE
 target_compile_definitions(prodigy_ready_container PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_bundle_artifact_unit PUBLIC PRODIGY_TEST_BINARY_DIR="${CMAKE_BINARY_DIR}")
 target_compile_definitions(prodigy_mothership_cluster_report_unit PUBLIC PRODIGY_TEST_BINARY_DIR="${CMAKE_BINARY_DIR}" PRODIGY_ROOT_DIR="${PRODIGY_ROOT}")
+target_compile_definitions(prodigy_mothership_file_limits_unit PUBLIC PRODIGY_TEST_BINARY_DIR="${CMAKE_BINARY_DIR}")
 target_compile_definitions(prodigy_mothership_restart_persistence_unit PUBLIC PRODIGY_TEST_BINARY_DIR="${CMAKE_BINARY_DIR}")
 target_compile_definitions(prodigy_mothership_unix_connect_unit PUBLIC PRODIGY_TEST_BINARY_DIR="${CMAKE_BINARY_DIR}")
 target_compile_definitions(prodigy_pingpong_container PUBLIC PRODIGY_DEBUG=1)
@@ -2807,6 +2812,12 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       NAME prodigy_mothership_cluster_registry_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_cluster_registry_unit
    )
+
+   add_test(
+      NAME prodigy_mothership_file_limits_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_file_limits_unit
+   )
+   set_tests_properties(prodigy_mothership_file_limits_unit PROPERTIES TIMEOUT 180)
 
    add_test(
       NAME prodigy_mothership_cluster_report_unit

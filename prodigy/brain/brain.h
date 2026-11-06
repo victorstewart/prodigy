@@ -57952,6 +57952,17 @@ public:
           }
           Vector<ContainerView *> staleMachineContainerPointers;
           bytell_hash_set<uint128_t> staleMachineContainerUUIDs = {};
+          const auto taskWithoutDurableExecution = [this](const ContainerView *container) {
+            if (container == nullptr ||
+                (container->state != ContainerState::planned && container->state != ContainerState::scheduled))
+            {
+              return false;
+            }
+            const auto deployment = deployments.find(container->deploymentID);
+            return deployment != deployments.end() && deployment->second != nullptr &&
+                   deployment->second->plan.config.type == ApplicationType::task &&
+                   masterAuthorityRuntimeState.taskExecutions.contains(container->deploymentID) == false;
+          };
           for (const auto& [deploymentID, machineContainers] : neuron->machine->containersByDeploymentID)
           {
             (void)deploymentID;
@@ -57974,8 +57985,8 @@ public:
               // is authoritative only for observed processes, so it must not
               // erase that pending owner or free its reserved fragment before
               // the normal failure/kill owner responds.
-              if (container->state == ContainerState::planned ||
-                  container->state == ContainerState::scheduled ||
+              if (((container->state == ContainerState::planned || container->state == ContainerState::scheduled) &&
+                   !taskWithoutDurableExecution(container)) ||
                   (container->state == ContainerState::crashedRestarting &&
                    awaitingPostCloseInventory))
               {
@@ -58007,14 +58018,19 @@ public:
             mesh->stopAllSubscriptions(stale);
             mesh->stopAllAdvertisments(stale);
 
-            if (recoveringPersistedNeuronInventory)
+            if (taskWithoutDurableExecution(stale))
+            {
+              // An unadmitted task has no durable execution to reschedule.
+              auto *deployment = deployments.find(stale->deploymentID)->second;
+              deployment->containers.erase(stale);
+            }
+            else if (recoveringPersistedNeuronInventory)
             {
               stale->runtimeReady = false;
               persistedInventoryConfirmedAbsentContainers.insert(stale->uuid);
               continue;
             }
-
-            if (auto deployment = deployments.find(stale->deploymentID); deployment != deployments.end() && deployment->second)
+            else if (auto deployment = deployments.find(stale->deploymentID); deployment != deployments.end() && deployment->second)
             {
               missingContainerDeployments.insert(stale->deploymentID);
               continue;

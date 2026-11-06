@@ -14920,6 +14920,70 @@ static void testRetainedStatelessHealthRestoresRunning(TestSuite& suite)
   brain.containers.erase(taskContainer.uuid);
   task.containers.erase(&taskContainer);
 
+  // A fully restored non-all-master stateful cohort reaches its final health
+  // callback after the ordinary inventory pass. Its NONE state must converge
+  // through the existing recovery owner without reviving partial cohorts or
+  // active materialized handoffs.
+  ApplicationDeployment stateful = {};
+  stateful.plan = makeDeploymentPlan(62'573, 265'325'899'677'729ULL);
+  stateful.plan.isStateful = true;
+  stateful.plan.config.type = ApplicationType::stateful;
+  stateful.plan.stateful.allMasters = false;
+  stateful.plan.stateful.clientPrefix = (uint64_t(62'573) << 48) | (uint64_t(1) << 40);
+  stateful.plan.stateful.siblingPrefix = (uint64_t(62'573) << 48) | (uint64_t(2) << 40);
+  stateful.plan.stateful.seedingPrefix = (uint64_t(62'573) << 48) | (uint64_t(3) << 40);
+  stateful.plan.stateful.allowUpdateInPlace = true;
+  stateful.state = DeploymentState::none;
+  stateful.nTargetBase = 3;
+  stateful.nDeployedBase = 3;
+  stateful.nHealthyBase = 1;
+  const StatefulMeshRoles statefulRoles = StatefulMeshRoles::forShardGroup(
+      stateful.plan.stateful, stateful.plan.config.applicationID, 0);
+  ContainerView statefulContainers[3] = {};
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    ContainerView& current = statefulContainers[index];
+    current.uuid = uint128_t(0xA574 + index);
+    current.deploymentID = stateful.plan.config.deploymentID();
+    current.applicationID = stateful.plan.config.applicationID;
+    current.machine = &machine;
+    current.fragment = 8 + index;
+    current.lifetime = ApplicationLifetime::base;
+    current.isStateful = true;
+    current.shardGroup = 0;
+    current.state = index == 0 ? ContainerState::healthy : ContainerState::crashedRestarting;
+    current.runtimeReady = true;
+    current.explicitStatefulMeshRoles = statefulRoles;
+    if (index > 0)
+    {
+      current.explicitStatefulMeshRoles.client = 0;
+    }
+    stateful.containers.insert(&current);
+    stateful.containersByShardGroup.insert(0, &current);
+    brain.containers.insert_or_assign(current.uuid, &current);
+  }
+  brain.deployments.insert_or_assign(stateful.plan.config.deploymentID(), &stateful);
+  brain.deploymentsByApp.insert_or_assign(stateful.plan.config.applicationID, &stateful);
+
+  brain.noteLocalContainerHealthy(statefulContainers[1].uuid);
+  suite.expect(stateful.state == DeploymentState::none && stateful.nHealthy() == 2,
+               "retained_health_partial_stateful_target_does_not_reenter_recovery");
+  brain.noteLocalContainerHealthy(statefulContainers[2].uuid);
+  suite.expect(stateful.state == DeploymentState::running && stateful.nHealthy() == 3,
+               "retained_health_complete_stateful_target_reenters_recovery_and_runs");
+  brain.noteLocalContainerHealthy(statefulContainers[2].uuid);
+  suite.expect(stateful.state == DeploymentState::running && stateful.nHealthy() == 3,
+               "retained_health_duplicate_stateful_receipt_does_not_replay_recovery");
+
+  brain.deploymentsByApp.erase(stateful.plan.config.applicationID);
+  brain.deployments.erase(stateful.plan.config.deploymentID());
+  for (ContainerView& current : statefulContainers)
+  {
+    brain.containers.erase(current.uuid);
+    stateful.containersByShardGroup.eraseEntry(current.shardGroup, &current);
+    stateful.containers.erase(&current);
+  }
+
   brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
   brain.deployments.erase(deployment.plan.config.deploymentID());
   brain.containers.erase(container.uuid);
@@ -31109,6 +31173,119 @@ static void testBrainNeuronStateUploadMissingInventoryWithdrawsMeshBeforeCapacit
   thisBrain = previousBrain;
 }
 
+static void testBrainNeuronStateUploadRetiresOnlyUnadmittedTaskOwners(TestSuite& suite)
+{
+  TestBrain brain = {};
+  NoopBrainIaaS iaas = {};
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+
+  BrainBase *previousBrain = thisBrain;
+  thisBrain = &brain;
+
+  Rack rack = {};
+  rack.uuid = 62'035;
+  Machine machine = {};
+  machine.uuid = uint128_t(0x5311);
+  machine.state = MachineState::healthy;
+  machine.rack = &rack;
+  machine.neuron.machine = &machine;
+  brain.machines.insert(&machine);
+  brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+  brain.neurons.insert(&machine.neuron);
+
+  ApplicationDeployment orphanedTask = {};
+  ApplicationDeployment admittedTask = {};
+  ApplicationDeployment reportedTask = {};
+  ApplicationDeployment pendingService = {};
+  ApplicationDeployment *deployments[] = {&orphanedTask, &admittedTask, &reportedTask, &pendingService};
+  for (uint32_t index = 0; index < 4; ++index)
+  {
+    ApplicationDeployment *deployment = deployments[index];
+    deployment->plan = makeDeploymentPlan(uint16_t(62'035 + index), 1);
+    deployment->plan.stateless.nBase = 1;
+    deployment->plan.config.type = index == 3 ? ApplicationType::stateless : ApplicationType::task;
+    deployment->state = DeploymentState::deploying;
+    brain.deployments.insert_or_assign(deployment->plan.config.deploymentID(), deployment);
+    brain.deploymentsByApp.insert_or_assign(deployment->plan.config.applicationID, deployment);
+  }
+
+  auto addPending = [&machine, &brain](ApplicationDeployment& deployment, uint128_t uuid, uint32_t fragment) {
+    ContainerView *container = new ContainerView();
+    container->uuid = uuid;
+    container->deploymentID = deployment.plan.config.deploymentID();
+    container->applicationID = deployment.plan.config.applicationID;
+    container->machine = &machine;
+    container->lifetime = ApplicationLifetime::base;
+    container->state = ContainerState::planned;
+    container->fragment = fragment;
+    container->createdAtMs = 123'460;
+    deployment.containers.insert(container);
+    brain.containers.insert_or_assign(container->uuid, container);
+    machine.upsertContainerIndexEntry(container->deploymentID, container);
+    return container;
+  };
+
+  ContainerView *orphaned = addPending(orphanedTask, uint128_t(0x5312), 12);
+  ContainerView *admitted = addPending(admittedTask, uint128_t(0x5313), 13);
+  ContainerView *reported = addPending(reportedTask, uint128_t(0x5314), 14);
+  ContainerView *service = addPending(pendingService, uint128_t(0x5315), 15);
+  const uint128_t orphanedUUID = orphaned->uuid;
+  const uint128_t admittedUUID = admitted->uuid;
+  const uint128_t reportedUUID = reported->uuid;
+  const uint128_t serviceUUID = service->uuid;
+
+  TaskExecutionRecord accepted = {};
+  accepted.executionID = admittedTask.plan.config.deploymentID();
+  accepted.applicationID = admittedTask.plan.config.applicationID;
+  accepted.versionID = admittedTask.plan.config.versionID;
+  accepted.state = TaskExecutionState::accepted;
+  brain.masterAuthorityRuntimeState.taskExecutions.insert_or_assign(accepted.executionID, accepted);
+
+  ContainerView reportedSeed = *reported;
+  reportedSeed.state = ContainerState::healthy;
+  ContainerPlan reportedPlan = reportedSeed.generatePlan(reportedTask.plan);
+  String uploadBuffer = {};
+  uint32_t headerOffset = Message::appendHeader(uploadBuffer, NeuronTopic::stateUpload);
+  local_container_subnet6 fragment = {};
+  fragment.dpfx = 1;
+  fragment.mpfx[0] = 0x00;
+  fragment.mpfx[1] = 0x12;
+  fragment.mpfx[2] = 0x35;
+  Message::appendAlignedBuffer<Alignment::one>(uploadBuffer, reinterpret_cast<const uint8_t *>(&fragment), sizeof(fragment));
+  String serializedReportedPlan = {};
+  BitseryEngine::serialize(serializedReportedPlan, reportedPlan);
+  Message::appendValue(uploadBuffer, serializedReportedPlan);
+  Message::finish(uploadBuffer, headerOffset);
+  brain.neuronHandler(&machine.neuron, reinterpret_cast<Message *>(uploadBuffer.data()));
+
+  suite.expect(brain.containers.contains(orphanedUUID) == false && orphanedTask.containers.empty(),
+               "brain_neuron_state_upload_retires_unreported_task_without_durable_admission");
+  suite.expect(brain.containers.contains(admittedUUID) && admittedTask.containers.contains(admitted),
+               "brain_neuron_state_upload_preserves_unreported_accepted_task");
+  suite.expect(brain.containers.contains(reportedUUID) && reportedTask.containers.contains(reported),
+               "brain_neuron_state_upload_preserves_reported_task_without_record");
+  suite.expect(brain.containers.contains(serviceUUID) && pendingService.containers.contains(service),
+               "brain_neuron_state_upload_preserves_unreported_planned_non_task");
+
+  for (ApplicationDeployment *deployment : deployments)
+  {
+    for (ContainerView *container : deployment->containers)
+    {
+      machine.removeContainerIndexEntry(container->deploymentID, container);
+      brain.containers.erase(container->uuid);
+      delete container;
+    }
+    deployment->containers.clear();
+    brain.deploymentsByApp.erase(deployment->plan.config.applicationID);
+    brain.deployments.erase(deployment->plan.config.deploymentID());
+  }
+  brain.neurons.erase(&machine.neuron);
+  brain.machinesByUUID.erase(machine.uuid);
+  brain.machines.erase(&machine);
+  thisBrain = previousBrain;
+}
+
 static void testBrainNeuronStateUploadHealthyContainerClearsWaiters(TestSuite& suite)
 {
   TestBrain brain = {};
@@ -46197,6 +46374,7 @@ int main(void)
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "retained-health") == 0)
   {
     testRetainedStatelessHealthRestoresRunning(suite);
+    testBrainNeuronStateUploadRetiresOnlyUnadmittedTaskOwners(suite);
     std::printf("RETAINED_HEALTH_RESULT failed_assertions=%d\n", suite.failed);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }

@@ -1312,7 +1312,7 @@ public:
   // SocketBase is virtual through UnixSocket, so Container as the most-derived
   // owner must initialize the control-stream socket family for reconnect.
   Container()
-      : SocketBase(AF_UNIX, SOCK_STREAM, 0, false)
+      : SocketBase(AF_UNIX, SOCK_STREAM, 0, false), WaitableProcess {}
   {}
 
   class StorageLoopDevice {
@@ -5020,6 +5020,21 @@ public:
   {
     return verifyCompressedContainerBlob(compressedContainerPath, expectedDigest, expectedBytes, failureReport);
   }
+
+  static bool debugMoveContainerArtifactSubvolumeIntoPlace(
+      const String& sourcePath,
+      const String& targetPath,
+      bool& usedSnapshotFallback,
+      String *failureReport,
+      bool requireAbsentTarget)
+  {
+    return moveContainerArtifactSubvolumeIntoPlace(
+        sourcePath,
+        targetPath,
+        usedSnapshotFallback,
+        failureReport,
+        requireAbsentTarget);
+  }
 #endif
 
 private:
@@ -5540,7 +5555,8 @@ private:
       const String& sourcePath,
       const String& targetPath,
       bool& usedSnapshotFallback,
-      String *failureReport = nullptr)
+      String *failureReport = nullptr,
+      bool requireAbsentTarget = false)
   {
     usedSnapshotFallback = false;
 
@@ -5548,6 +5564,22 @@ private:
     sourceText.assign(sourcePath);
     String targetText = {};
     targetText.assign(targetPath);
+    if (requireAbsentTarget)
+    {
+      if (renameat2(AT_FDCWD, sourceText.c_str(), AT_FDCWD, targetText.c_str(), RENAME_NOREPLACE) == 0)
+      {
+        return true;
+      }
+      if (failureReport)
+      {
+        failureReport->snprintf<"failed to publish recovered container artifact without replacement from {} to {} errno={}({})"_ctv>(
+            sourcePath,
+            targetPath,
+            errno,
+            String(strerror(errno)));
+      }
+      return false;
+    }
     if (rename(sourceText.c_str(), targetText.c_str()) == 0)
     {
       return true;
@@ -12037,9 +12069,22 @@ public:
   // this worker stage. Neuron maps, core leases, cgroups and cleanup stay on Ring.
   static bool materializeContainerArtifact(Container *container,
                                             const String& compressedContainerPath,
-                                            String *failure)
+                                            String *failure, bool requireAbsentTarget = false)
   {
     const ContainerPlan& plan = container->plan;
+    struct MaterializationPathCleanup {
+      Container *container = nullptr;
+      bool completed = false;
+
+      ~MaterializationPathCleanup()
+      {
+        if (completed == false && container != nullptr)
+        {
+          container->artifactRootPath.clear();
+          container->rootfsPath.clear();
+        }
+      }
+    } materializationPathCleanup {container};
     struct DeploymentExtractionLock {
       int fd = -1;
 
@@ -12452,7 +12497,8 @@ public:
             receivedSubvolumePath,
             finalArtifactRootPath,
             artifactMoveUsedSnapshotFallback,
-            &artifactMoveFailure) == false)
+            &artifactMoveFailure,
+            requireAbsentTarget) == false)
     {
       if (failure)
       {
@@ -12480,6 +12526,7 @@ public:
     container->artifactRootPath.assign(finalArtifactRootPath);
     container->rootfsPath.assign(finalArtifactRootPath);
     container->rootfsPath.append("/rootfs"_ctv);
+    materializationPathCleanup.completed = true;
 
     return true;
   }
@@ -15222,6 +15269,90 @@ public:
       }
       return false;
     }
+
+    String artifactRootPath = {};
+    artifactRootPath.snprintf<"/containers/{itoa}"_ctv>(container->plan.uuid);
+    struct stat artifactMetadata = {};
+    if (lstat(artifactRootPath.c_str(), &artifactMetadata) == 0)
+    {
+      if (S_ISLNK(artifactMetadata.st_mode) || !S_ISDIR(artifactMetadata.st_mode))
+      {
+        if (failureReport)
+        {
+          failureReport->assign("retained artifact root is not a directory"_ctv);
+        }
+        return false;
+      }
+      String artifactFailure = {};
+      if (validateContainerArtifactShape(artifactRootPath, &artifactFailure) == false)
+      {
+        if (failureReport)
+        {
+          failureReport->assign(artifactFailure);
+        }
+        return false;
+      }
+      container->artifactRootPath.assign(artifactRootPath);
+      container->rootfsPath.assign(artifactRootPath);
+      container->rootfsPath.append("/rootfs"_ctv);
+      return true;
+    }
+    if (errno != ENOENT)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"failed to inspect retained artifact root: {}"_ctv>(String(strerror(errno)));
+      }
+      return false;
+    }
+
+    if (container->plan.config.storageMB == 0 || container->storageRootPath.size() == 0 ||
+        container->storagePayloadPath.size() == 0)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("retained artifact materialization requires an existing storage backend"_ctv);
+      }
+      return false;
+    }
+
+    const uint64_t deploymentID = container->plan.config.deploymentID();
+    const String compressedContainerPath = ContainerStore::pathForContainerImage(deploymentID);
+    String blobFailure = {};
+    if (verifyCompressedContainerBlob(
+            compressedContainerPath,
+            container->plan.config.containerBlobSHA256,
+            container->plan.config.containerBlobBytes,
+            &blobFailure) == false)
+    {
+      if (failureReport)
+      {
+        failureReport->assign(blobFailure.size() > 0 ? blobFailure : "retained container image verification failed"_ctv);
+      }
+      return false;
+    }
+
+    int payloadFD = -1;
+    String contractFailure = {};
+    const bool contractOK = prodigyOpenContainerBlobPayloadAfterContractHeader(
+        compressedContainerPath, payloadFD, &contractFailure);
+    if (payloadFD >= 0)
+    {
+      close(payloadFD);
+    }
+    if (contractOK == false)
+    {
+      if (failureReport)
+      {
+        failureReport->assign(contractFailure.size() > 0 ? contractFailure : "retained container image contract verification failed"_ctv);
+      }
+      return false;
+    }
+
+    if (materializeContainerArtifact(container, compressedContainerPath, failureReport, true) == false)
+    {
+      return false;
+    }
     return true;
   }
 
@@ -15302,19 +15433,11 @@ public:
       {
         thisNeuron->closeWhiteholesForLocalContainer(container->plan.fragment);
       }
-      if (coldRestart)
-      {
-        std::fprintf(stderr,
-                     "restartContainer cold start failed uuid=%llu reason=%s\n",
-                     (unsigned long long)container->plan.uuid,
-                     failureReport.c_str());
-      }
-      else
-      {
-        basics_log("restartContainer start failed uuid=%llu reason=%s\n",
+      std::fprintf(stderr,
+                   "restartContainer %s start failed uuid=%llu reason=%s\n",
+                   coldRestart ? "cold" : "warm",
                    (unsigned long long)container->plan.uuid,
                    failureReport.c_str());
-      }
       if (coldRestart)
       {
         cleanupContainerAfterFailedCreate(container, true, coldRestartCoresAllocated);

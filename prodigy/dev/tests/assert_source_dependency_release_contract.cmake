@@ -19,9 +19,9 @@ foreach(_prodigy_release_depofile IN LISTS _prodigy_release_depofiles)
 endforeach()
 file(READ "${PRODIGY_ROOT}/depofiles/tidesdb.DepoFile" _prodigy_tidesdb_depofile)
 foreach(_prodigy_tidesdb_release_contract IN ITEMS
-   [[VERSION 10.2.1.20261102.2]]
-   [[SOURCE URL https://github.com/victorstewart/tidesdb/releases/download/v10.2.1.20261102.2/tidesdb-10.2.1.20261102.2.tar.gz]]
-   [[SHA256 3b559b5aa3bf662919e5e763db6ace49be2f23581583bcfdc77c45c63c6ebb52]]
+   [[VERSION 10.2.1.20261105.213722]]
+   [[SOURCE URL https://github.com/tidesdb/tidesdb/archive/3f2ca62fa943c444f206cb5b151f4e2090ba1c2f.tar.gz]]
+   [[SHA256 b53c39e852901a6724034a692bfd204b56437f310c24da43037d3074a63398ab]]
 )
    string(FIND "${_prodigy_tidesdb_depofile}" "${_prodigy_tidesdb_release_contract}"
       _prodigy_tidesdb_release_contract_index)
@@ -60,7 +60,7 @@ foreach(_prodigy_pinned_basics_cache_contract IN ITEMS
    endif()
 endforeach()
 if (NOT _prodigy_depos_project MATCHES
-   "PRODIGY_BASICS_TIDESDB_DEPENDENCY_VERSION[ \t\r\n]+\"10\\.2\\.1\\.20261102\\.2\"")
+   "PRODIGY_BASICS_TIDESDB_DEPENDENCY_VERSION[ \t\r\n]+\"10\\.2\\.1\\.20261105\\.213722\"")
    message(FATAL_ERROR "The derived Basics package must depend on the published TidesDB foundation.")
 endif()
 
