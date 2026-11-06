@@ -1,13 +1,13 @@
 # Published Nametag-qualified TidesDB 10.2.1 recovery foundation.
 NAME tidesdb
-VERSION 10.2.1.20261105.213722
+VERSION 10.2.1.20261106.051416
 SYSTEM_LIBS ALLOW
-# Upstream master at the merge of tidesdb/tidesdb#703.
+# Includes upstream PR 703 and the opt-in 65,536-segment registry API.
 DEPENDS zstd VERSION 1.5.7
 DEPENDS snappy VERSION 1.2.2
 DEPENDS lz4 VERSION 1.10.0
-SOURCE URL https://github.com/tidesdb/tidesdb/archive/3f2ca62fa943c444f206cb5b151f4e2090ba1c2f.tar.gz
-SHA256 b53c39e852901a6724034a692bfd204b56437f310c24da43037d3074a63398ab
+SOURCE URL https://github.com/victorstewart/tidesdb/archive/81691faa9032b1e192c0e15cb63170f485e89d30.tar.gz
+SHA256 a8288f4098ae21ddad86a67f22b6f07b5fe1043a5e3dcbf996765d4c48d36877
 BUILD_SYSTEM CMAKE
 CMAKE_ARG "-DCMAKE_PREFIX_PATH=${dep:zstd};${dep:snappy};${dep:lz4}"
 CMAKE_ARG "-DCMAKE_C_FLAGS=-I${dep:zstd}/include -I${dep:snappy}/include -I${dep:lz4}/include"

@@ -14,21 +14,21 @@ set(
 )
 set(
   PRODIGY_BASICS_RELEASE_VERSION
-  "0.4.14-rc.5"
+  "0.4.14-rc.6"
   CACHE STRING
   "Pinned Basics release version consumed through the published detached DepoFile asset"
   FORCE
 )
 set(
   PRODIGY_BASICS_RELEASE_DEPOFILE_URL
-  "https://github.com/victorstewart/basics/releases/download/v0.4.14-rc.5/basics.DepoFile"
+  "https://github.com/victorstewart/basics/releases/download/v0.4.14-rc.6/basics.DepoFile"
   CACHE STRING
   "Published Basics detached DepoFile asset URL"
   FORCE
 )
 set(
   PRODIGY_BASICS_RELEASE_DEPOFILE_SHA256
-  "0ee234242c236b5bddc8e0da7b5024b5f2b5c65aa2e7cd5ac0f1eba9b8db50a2"
+  "589570e477ee33566f824f310f63833762a3b62c92b2e30ccb5b057d702c7f3e"
   CACHE STRING
   "SHA256 for the published Basics detached DepoFile asset"
   FORCE
@@ -42,7 +42,7 @@ set(
 )
 set(
   PRODIGY_BASICS_TIDESDB_DEPENDENCY_VERSION
-  "10.2.1.20261105.213722"
+  "10.2.1.20261106.051416"
   CACHE STRING
   "Pinned TidesDB package version used when deriving the Basics-with-TidesDB release DepoFile variant"
   FORCE

@@ -19,9 +19,9 @@ foreach(_prodigy_release_depofile IN LISTS _prodigy_release_depofiles)
 endforeach()
 file(READ "${PRODIGY_ROOT}/depofiles/tidesdb.DepoFile" _prodigy_tidesdb_depofile)
 foreach(_prodigy_tidesdb_release_contract IN ITEMS
-   [[VERSION 10.2.1.20261105.213722]]
-   [[SOURCE URL https://github.com/tidesdb/tidesdb/archive/3f2ca62fa943c444f206cb5b151f4e2090ba1c2f.tar.gz]]
-   [[SHA256 b53c39e852901a6724034a692bfd204b56437f310c24da43037d3074a63398ab]]
+   [[VERSION 10.2.1.20261106.051416]]
+   [[SOURCE URL https://github.com/victorstewart/tidesdb/archive/81691faa9032b1e192c0e15cb63170f485e89d30.tar.gz]]
+   [[SHA256 a8288f4098ae21ddad86a67f22b6f07b5fe1043a5e3dcbf996765d4c48d36877]]
 )
    string(FIND "${_prodigy_tidesdb_depofile}" "${_prodigy_tidesdb_release_contract}"
       _prodigy_tidesdb_release_contract_index)
@@ -33,9 +33,9 @@ endforeach()
 file(READ "${PRODIGY_ROOT}/depos.project.cmake" _prodigy_depos_project)
 foreach(_prodigy_basics_release_contract IN ITEMS
    [[PRODIGY_BASICS_RELEASE_VERSION
-  "0.4.14-rc.5"]]
-   [[https://github.com/victorstewart/basics/releases/download/v0.4.14-rc.5/basics.DepoFile]]
-   [[0ee234242c236b5bddc8e0da7b5024b5f2b5c65aa2e7cd5ac0f1eba9b8db50a2]]
+  "0.4.14-rc.6"]]
+   [[https://github.com/victorstewart/basics/releases/download/v0.4.14-rc.6/basics.DepoFile]]
+   [[589570e477ee33566f824f310f63833762a3b62c92b2e30ccb5b057d702c7f3e]]
 )
    string(FIND "${_prodigy_depos_project}" "${_prodigy_basics_release_contract}"
       _prodigy_basics_release_contract_index)
@@ -60,7 +60,7 @@ foreach(_prodigy_pinned_basics_cache_contract IN ITEMS
    endif()
 endforeach()
 if (NOT _prodigy_depos_project MATCHES
-   "PRODIGY_BASICS_TIDESDB_DEPENDENCY_VERSION[ \t\r\n]+\"10\\.2\\.1\\.20261105\\.213722\"")
+   "PRODIGY_BASICS_TIDESDB_DEPENDENCY_VERSION[ \t\r\n]+\"10\\.2\\.1\\.20261106\\.051416\"")
    message(FATAL_ERROR "The derived Basics package must depend on the published TidesDB foundation.")
 endif()
 
@@ -92,8 +92,8 @@ if (NOT _prodigy_source_dependency_script MATCHES
    message(FATAL_ERROR "The source-dependency release producer must declare its Basics dependency.")
 endif()
 if (NOT _prodigy_source_dependency_script MATCHES
-   "basics_version=\"0\\.4\\.14-rc\\.5\"")
-   message(FATAL_ERROR "The source-dependency release producer must pin Basics 0.4.14-rc.5.")
+   "basics_version=\"0\\.4\\.14-rc\\.6\"")
+   message(FATAL_ERROR "The source-dependency release producer must pin Basics 0.4.14-rc.6.")
 endif()
 if (NOT _prodigy_source_dependency_script MATCHES
    "basics_package=\"basics\"")
