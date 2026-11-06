@@ -65,6 +65,22 @@ public:
   {
     return ContainerManager::prepareContainerStorage(container, failureReport, requireExistingBackend);
   }
+
+  static bool armEnvironmentRepair(Container *container, const siginfo_t& infop, bool restart,
+                                   const ProdigyStatefulStoreBootFailure& failure)
+  {
+    return ContainerManager::armStatefulStoreEnvironmentStorageRepair(container, infop, restart, failure);
+  }
+
+  static bool reconcileEnvironmentRepairAt(Container *container, int storageParentFD, String *failureReport = nullptr)
+  {
+    return ContainerManager::reconcilePendingStatefulStoreEnvironmentStorageAt(container, storageParentFD, failureReport);
+  }
+
+  static bool captureDirectStoragePayloadAt(Container *container, int storageParentFD, String *failureReport = nullptr)
+  {
+    return ContainerManager::captureRegisteredDirectStoragePayloadAt(container, storageParentFD, failureReport);
+  }
 };
 
 class TestBrain final : public BrainBase {
@@ -3796,6 +3812,187 @@ static void testStoreGenerationLaunchMetadata(TestSuite& suite)
   verify(",\"stateful_store_generation_protocol\":1,\"stateful_store_generation_protocol\":1", false, 0);
 }
 
+static void testRetainedStatefulFilesAfterFailure(TestSuite& suite)
+{
+  TemporaryDirectory fixture;
+  const bool created = fixture.create();
+  suite.expect(created, "failed_stateful_cleanup_fixture_created");
+  if (!created) return;
+  const auto root = filesystemPathFromString(fixture.path);
+  const auto artifact = root / "81";
+  const auto storage = root / "storage" / "81";
+  const auto database = storage / "kvdb" / "file-1";
+  const auto legacyDatabase = artifact / "rootfs" / "storage" / "kvdb" / "file-2";
+  const auto selectedDatabase = storage / "kvdb.0x82" / "file-3";
+  suite.expect(writeFileFixture(database, "original") && writeFileFixture(legacyDatabase, "legacy") &&
+                    writeFileFixture(selectedDatabase, "partially seeded"),
+                "failed_stateful_cleanup_fixture_has_previous_and_selected_homes");
+  struct stat before[3] = {};
+  const std::filesystem::path paths[] = {database, legacyDatabase, selectedDatabase};
+  for (size_t index = 0; index < 3; ++index)
+    suite.expect(lstat(paths[index].c_str(), &before[index]) == 0, "failed_stateful_cleanup_fixture_records_inode");
+
+  Container container = {};
+  container.plan.config.type = ApplicationType::stateful;
+  container.plan.config.storageMB = 64;
+  container.name = "81"_ctv;
+  container.artifactRootPath.assign(artifact.c_str());
+  container.rootfsPath.assign((artifact / "rootfs").c_str());
+  container.storageRootPath.assign(storage.c_str());
+  container.storagePayloadPath.assign(storage.c_str());
+  ContainerManager::releaseContainerFiles(&container, ContainerManager::DestroyCause::processFailure, fixture.path);
+  for (size_t index = 0; index < 3; ++index)
+  {
+    struct stat after = {};
+    suite.expect(lstat(paths[index].c_str(), &after) == 0 && after.st_dev == before[index].st_dev &&
+                     after.st_ino == before[index].st_ino && after.st_size == before[index].st_size,
+                 "failed_stateful_cleanup_retains_same_file_for_recovery");
+  }
+  suite.expect(!container.deleteStorageOnCleanUp, "failed_stateful_cleanup_preserves_backing_on_later_teardown");
+}
+
+static void testStatefulEnvironmentStorageRepair(TestSuite& suite)
+{
+  TemporaryDirectory fixture;
+  suite.expect(fixture.create(), "environment_storage_repair_fixture_created");
+  if (fixture.path.size() == 0) return;
+  const auto parent = filesystemPathFromString(fixture.path) / "storage";
+  const auto outside = filesystemPathFromString(fixture.path) / "outside";
+  const uint128_t uuid = 0xE110;
+  String name = {};
+  name.assignItoa(uuid);
+  const auto payload = parent / name.c_str();
+
+  auto makeContainer = [&](uint128_t value) {
+    Container container = {};
+    container.plan.uuid = value;
+    container.plan.isStateful = true;
+    container.plan.restartOnFailure = true;
+    container.plan.config.type = ApplicationType::stateful;
+    container.plan.config.applicationID = 3;
+    container.plan.config.storageMB = 64;
+    container.name.assignItoa(value);
+    prodigyContainerStorageRootPathForName(container.name, container.storageRootPath);
+    container.storagePayloadPath.assign(container.storageRootPath);
+    container.executionHostID = uint32_t(geteuid());
+    container.statefulStoreGenerationProtocol = 1;
+    return container;
+  };
+  siginfo_t normalHSEExit = {};
+  normalHSEExit.si_code = CLD_EXITED;
+  normalHSEExit.si_status = 1;
+  ProdigyStatefulStoreBootFailure environment = {};
+  environment.kind = ProdigyStatefulStoreBootFailureKind::environment;
+  environment.stage = ProdigyStatefulStoreBootFailureStage::environmentInspection;
+  environment.systemErrno = ENOENT;
+  ProdigyStatefulStoreBootFailure permission = environment;
+  permission.kind = ProdigyStatefulStoreBootFailureKind::permission;
+  permission.systemErrno = EACCES;
+
+  suite.expect(createDirectoryFixture(payload) && chmod(payload.c_str(), 0000) == 0,
+               "environment_storage_repair_private_payload_fixture_created");
+  int parentFD = open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  Container container = makeContainer(uuid);
+  String failure = {};
+  const bool captured = parentFD >= 0 &&
+      ContainerManagerStorageTestAccess::captureDirectStoragePayloadAt(&container, parentFD, &failure);
+  const bool armed = ContainerManagerStorageTestAccess::armEnvironmentRepair(
+      &container, normalHSEExit, true, permission);
+  const bool repaired = parentFD >= 0 &&
+      ContainerManagerStorageTestAccess::reconcileEnvironmentRepairAt(&container, parentFD, &failure);
+  if (parentFD >= 0) close(parentFD);
+  struct stat repairedMetadata = {};
+  suite.expect(captured && armed && repaired && !container.pendingEnvironmentRepairGeneration.has_value() &&
+                   lstat(payload.c_str(), &repairedMetadata) == 0 &&
+                   repairedMetadata.st_uid == geteuid() && repairedMetadata.st_gid == getegid() &&
+                   (repairedMetadata.st_mode & 0777) == 0700,
+               "environment_storage_repair_restores_exact_payload_owner_and_mode");
+
+  ProdigyStatefulStoreBootFailure metadata = environment;
+  metadata.kind = ProdigyStatefulStoreBootFailureKind::missingMetadata;
+  metadata.systemErrno = EACCES;
+  Container metadataContainer = makeContainer(uuid);
+  suite.expect(!ContainerManagerStorageTestAccess::armEnvironmentRepair(
+                   &metadataContainer, normalHSEExit, true, metadata) &&
+                   !metadataContainer.pendingEnvironmentRepairGeneration.has_value(),
+               "environment_storage_repair_rejects_metadata_eacces");
+  Container permissionContainer = makeContainer(uuid);
+  suite.expect(ContainerManagerStorageTestAccess::armEnvironmentRepair(
+                   &permissionContainer, normalHSEExit, true, permission) &&
+                   permissionContainer.pendingEnvironmentRepairGeneration.has_value(),
+               "environment_storage_repair_accepts_permission_eacces");
+  ProdigyStatefulStoreBootFailure permissionEPERM = permission;
+  permissionEPERM.systemErrno = EPERM;
+  Container permissionEPERMContainer = makeContainer(uuid);
+  suite.expect(ContainerManagerStorageTestAccess::armEnvironmentRepair(
+                   &permissionEPERMContainer, normalHSEExit, true, permissionEPERM) &&
+                   permissionEPERMContainer.pendingEnvironmentRepairGeneration.has_value(),
+               "environment_storage_repair_accepts_permission_eperm");
+  ProdigyStatefulStoreBootFailure readonlyFilesystem = permission;
+  readonlyFilesystem.systemErrno = EROFS;
+  Container readonlyFilesystemContainer = makeContainer(uuid);
+  suite.expect(!ContainerManagerStorageTestAccess::armEnvironmentRepair(
+                   &readonlyFilesystemContainer, normalHSEExit, true, readonlyFilesystem) &&
+                   !readonlyFilesystemContainer.pendingEnvironmentRepairGeneration.has_value(),
+               "environment_storage_repair_defers_readonly_filesystem");
+
+  Container staleContainer = makeContainer(uuid);
+  suite.expect(ContainerManagerStorageTestAccess::armEnvironmentRepair(
+                   &staleContainer, normalHSEExit, true, environment),
+               "environment_storage_repair_arms_current_legacy_generation");
+  parentFD = open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  suite.expect(parentFD >= 0 &&
+                   ContainerManagerStorageTestAccess::captureDirectStoragePayloadAt(&staleContainer, parentFD, &failure),
+               "environment_storage_repair_captures_legacy_payload_identity");
+  staleContainer.statefulStoreGenerationSelection.protocolVersion = 1;
+  staleContainer.statefulStoreGenerationSelection.generationUUID = 0xE111;
+  failure.clear();
+  const bool staleRepaired = parentFD >= 0 &&
+      ContainerManagerStorageTestAccess::reconcileEnvironmentRepairAt(&staleContainer, parentFD, &failure);
+  if (parentFD >= 0) close(parentFD);
+  suite.expect(!staleRepaired && !staleContainer.pendingEnvironmentRepairGeneration.has_value(),
+               "environment_storage_repair_rejects_stale_generation_before_action");
+
+  const uint128_t symlinkUUID = 0xE112;
+  String symlinkName = {};
+  symlinkName.assignItoa(symlinkUUID);
+  const auto symlinkPayload = parent / symlinkName.c_str();
+  Container symlinkContainer = makeContainer(symlinkUUID);
+  std::error_code symlinkError = {};
+  const bool symlinkFixtureParent = createDirectoryFixture(outside) && chmod(outside.c_str(), 0711) == 0 &&
+      createDirectoryFixture(symlinkPayload);
+  parentFD = open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  const bool symlinkCaptured = parentFD >= 0 &&
+      ContainerManagerStorageTestAccess::captureDirectStoragePayloadAt(&symlinkContainer, parentFD, &failure);
+  if (parentFD >= 0) close(parentFD);
+  if (symlinkFixtureParent && symlinkCaptured)
+  {
+    std::filesystem::remove(symlinkPayload, symlinkError);
+    if (!symlinkError)
+      symlinkError.clear();
+  }
+  if (symlinkFixtureParent && symlinkCaptured && !symlinkError)
+    std::filesystem::create_directory_symlink(outside, symlinkPayload, symlinkError);
+  suite.expect(symlinkFixtureParent && symlinkCaptured && !symlinkError,
+               "environment_storage_repair_symlink_fixture_created");
+  struct stat outsideBefore = {};
+  (void)lstat(outside.c_str(), &outsideBefore);
+  suite.expect(ContainerManagerStorageTestAccess::armEnvironmentRepair(
+                   &symlinkContainer, normalHSEExit, true, permission),
+               "environment_storage_repair_arms_symlink_case_for_refusal");
+  parentFD = open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  failure.clear();
+  const bool symlinkRepaired = parentFD >= 0 &&
+      ContainerManagerStorageTestAccess::reconcileEnvironmentRepairAt(&symlinkContainer, parentFD, &failure);
+  if (parentFD >= 0) close(parentFD);
+  struct stat outsideAfter = {};
+  suite.expect(!symlinkRepaired && !symlinkContainer.pendingEnvironmentRepairGeneration.has_value() &&
+                   lstat(outside.c_str(), &outsideAfter) == 0 && outsideAfter.st_uid == outsideBefore.st_uid &&
+                   outsideAfter.st_gid == outsideBefore.st_gid &&
+                   (outsideAfter.st_mode & 0777) == (outsideBefore.st_mode & 0777),
+               "environment_storage_repair_refuses_symlink_without_mutating_target");
+}
+
 static void testBoundedFailureReport(TestSuite& suite)
 {
   siginfo_t termination = {};
@@ -3874,6 +4071,22 @@ int main(void)
 {
   TestSuite suite;
   const char *selector = std::getenv("PRODIGY_TEST_ONLY");
+  if (selector == nullptr || std::strcmp(selector, "retained-store-failure") == 0)
+  {
+    testRetainedStatefulFilesAfterFailure(suite);
+    if (selector != nullptr) {
+      dprintf(STDOUT_FILENO, "retained_store_failure passed=%d failed=%d\n", suite.passed, suite.failed);
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+  }
+  if (selector == nullptr || std::strcmp(selector, "environment-storage-repair") == 0)
+  {
+    testStatefulEnvironmentStorageRepair(suite);
+    if (selector != nullptr) {
+      dprintf(STDOUT_FILENO, "environment_storage_repair passed=%d failed=%d\n", suite.passed, suite.failed);
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+  }
   if (selector == nullptr || std::strcmp(selector, "typed-boot-failure") == 0)
   {
     testBoundedFailureReport(suite);

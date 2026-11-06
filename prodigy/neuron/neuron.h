@@ -46,6 +46,7 @@
 #include <prodigy/neuron/private.tunnel.bgp.runtime.h>
 #include <prodigy/neuron/masque.gateway.launch.h>
 #include <prodigy/neuron/containers.h>
+#include <prodigy/stateful.serving.authority.h>
 #include <prodigy/bundle.artifact.h>
 #include <prodigy/artifact.io.h>
 #include <prodigy/persistent.state.h>
@@ -1014,6 +1015,11 @@ protected:
 
     container->reset();
     return false;
+  }
+
+  virtual bool resumeFailedContainerRestart(Container *container)
+  {
+    return retireContainerControlBeforeRestart(container) || ContainerManager::restartContainer(container);
   }
 
   void scheduleFailedContainerRestart(Container *container, int64_t failureTimeMs)
@@ -6282,6 +6288,21 @@ public:
         stderrTail.assign(outputLogs.entries.front().standardError);
       }
 
+      // Consume only the original, typed HSE report while this exact exited
+      // Container still owns its normal restart.  The Container revalidates
+      // and clears this transient authorization immediately before warm start.
+      ProdigyStatefulStoreBootFailure typedBootFailure = {};
+      String typedBootFailureHuman = {};
+      if (prodigyStatefulStoreBootFailureDecodeReport(crashReport, typedBootFailure, typedBootFailureHuman))
+      {
+        (void)ContainerManager::armStatefulStoreEnvironmentStorageRepair(
+            container, infop, restart, typedBootFailure);
+      }
+      else
+      {
+        container->pendingEnvironmentRepairGeneration.reset();
+      }
+
       crashReport = ContainerManager::boundedFailureReport(infop, terminalSignal, crashReport, stderrTail);
 
       uint64_t previewBytes = (crashReport.size() < 1024) ? crashReport.size() : 1024;
@@ -6312,9 +6333,7 @@ public:
       }
       else
       {
-        // this does not destroy any stateful storage
-        // this deletes it from the bookkeeping
-        ContainerManager::destroyContainer(container);
+        ContainerManager::destroyContainer(container, ContainerManager::DestroyCause::processFailure);
       }
     }
     else if (resumeAfterShutdown)
@@ -9032,9 +9051,18 @@ public:
           // Container re-adoption carries several large domain values. Keep
           // them in a separate non-inlined frame so the bounded control
           // dispatcher does not reserve that storage for every Neuron topic.
+          struct PendingGenerationRestart {
+            Container *container = nullptr;
+            ContainerPlan plan = {};
+            NeuronContainerMetricPolicy metricPolicy = {};
+            ProdigyStatefulStoreGenerationSelection selection = {.protocolVersion = 0};
+          };
+          Vector<PendingGenerationRestart> pendingGenerationRestarts;
           const char *stateUploadRejection = "unknown";
-          auto applyStateUploadPlans = [this, &args, terminal, restoreEpoch, &stateUploadRejection]() __attribute__((noinline)) -> bool {
+          auto applyStateUploadPlans = [this, &args, terminal, restoreEpoch, &stateUploadRejection,
+                                        &pendingGenerationRestarts]() __attribute__((noinline)) -> bool {
             bool malformedStateUpload = false;
+            bytell_hash_set<uint128_t> generationOwners;
             while (args < terminal) // it's possible that some of these containers died right?
             {
             String buffer;
@@ -9125,12 +9153,35 @@ public:
               Container *liveContainer = existing->second;
               if (liveContainer->pendingDestroy == false)
               {
+                if (liveContainer->statefulStoreGenerationProtocol == 1 &&
+                    !generationOwners.insert(restoredPlan.uuid).second)
+                {
+                  stateUploadRejection = "generation-restart-duplicate";
+                  malformedStateUpload = true;
+                  break;
+                }
                 if (!prodigyStatefulStoreGenerationSameHome(
                         liveContainer->statefulStoreGenerationSelection, selection))
                 {
-                  stateUploadRejection = "live-store-generation-identity";
-                  malformedStateUpload = true;
-                  break;
+                  if (liveContainer->statefulStoreGenerationProtocol != 1 ||
+                      !prodigyStatefulStoreGenerationSelectionStrictlyAdvances(
+                          liveContainer->statefulStoreGenerationSelection, selection) ||
+                      !prodigyStatefulStoreGenerationImmutablePlanIdentityMatches(
+                          selection, liveContainer->plan, restoredPlan, uuid) ||
+                      !ContainerManager::stateUploadGenerationRestartPredecessorReady(
+                          liveContainer, restoredPlan))
+                  {
+                    stateUploadRejection = "generation-restart-admission";
+                    malformedStateUpload = true;
+                    break;
+                  }
+                  PendingGenerationRestart pending = {};
+                  pending.container = liveContainer;
+                  pending.plan = std::move(restoredPlan);
+                  pending.metricPolicy = metricPolicy;
+                  pending.selection = selection;
+                  pendingGenerationRestarts.push_back(std::move(pending));
+                  continue;
                 }
                 liveContainer->statefulStoreGenerationSelection = selection;
                 liveContainer->neuronScalingDimensionsMask = metricPolicy.scalingDimensionsMask;
@@ -9360,7 +9411,7 @@ public:
                 }
                 else
                 {
-                  ContainerManager::destroyContainer(container);
+                  ContainerManager::destroyContainer(container, ContainerManager::DestroyCause::processFailure);
                 }
 
                 if (restarted == false)
@@ -9400,6 +9451,60 @@ public:
           }
           else
           {
+            // Every ordinary entry has now completed its existing semantic
+            // checks. Revalidate the retained crash evidence before changing
+            // any selected home; a later malformed entry above therefore
+            // cannot have canceled an earlier restart timer.
+            bool restartRevalidationFailed = false;
+            for (const auto& pending : pendingGenerationRestarts)
+            {
+              String failure = {};
+              auto live = containers.find(pending.plan.uuid);
+              if (live == containers.end() || !live->second || live->second != pending.container ||
+                  pending.container->pendingDestroy ||
+                  pending.container->statefulStoreGenerationProtocol != 1 ||
+                  !prodigyStatefulStoreGenerationSelectionStrictlyAdvances(
+                      pending.container->statefulStoreGenerationSelection, pending.selection) ||
+                  !prodigyStatefulStoreGenerationImmutablePlanIdentityMatches(
+                      pending.selection, pending.container->plan, pending.plan, uuid) ||
+                  !ContainerManager::stateUploadGenerationRestartPredecessorReady(
+                      pending.container, pending.plan, &failure) ||
+                  !ContainerManager::observedCrashBackoffPredecessorCgroupIsEmpty(pending.container, &failure))
+              {
+                stateUploadRejection = "generation-restart-revalidation";
+                restartRevalidationFailed = true;
+                break;
+              }
+            }
+            if (restartRevalidationFailed)
+            {
+              // The authenticated inventory itself was valid. A cgroup,
+              // timeout, or close owner can change between staging and this
+              // final observation, so retain the old failure owner and let a
+              // later inventory retry rather than calling it malformed input.
+              basics_log("neuron generation restart deferred reason=%s\n", stateUploadRejection);
+            }
+            else for (const auto& pending : pendingGenerationRestarts)
+            {
+              String failure = {};
+              if (!ContainerManager::claimStateUploadGenerationRestartPredecessor(
+                      pending.container, pending.plan, &failure))
+              {
+                // The control event loop cannot interleave this straight-line
+                // section, so this is an environmental lifecycle change, not
+                // malformed authenticated Brain input. Leave the old failed
+                // owner fenced and let its existing failure/report path retry.
+                basics_log("neuron generation restart claim lost uuid=%llu reason=%s\n",
+                           (unsigned long long)pending.plan.uuid, failure.c_str());
+                continue;
+              }
+              pending.container->statefulStoreGenerationSelection = pending.selection;
+              pending.container->neuronScalingDimensionsMask = pending.metricPolicy.scalingDimensionsMask;
+              pending.container->neuronMetricsCadenceMs = pending.metricPolicy.metricsCadenceMs;
+              if (!resumeFailedContainerRestart(pending.container))
+                basics_log("neuron generation restart failed uuid=%llu after accepted stateUpload\n",
+                           (unsigned long long)pending.plan.uuid);
+            }
             stateUploadRestoreReplyPending = true;
             // A complete batch may have supplied authority/credentials before
             // its missing-process gateway was admitted. Retry only now, after
@@ -11478,10 +11583,7 @@ public:
                 // The failed process can outlive its control-stream close CQE.
                 // Reuse the existing retirement owner so a delayed restart
                 // never overlaps the old fixed-file/control-socket lifetime.
-                if (retireContainerControlBeforeRestart(container) == false)
-                {
-                  ContainerManager::restartContainer(container);
-                }
+                (void)resumeFailedContainerRestart(container);
               }
             }
           }

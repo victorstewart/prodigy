@@ -57798,6 +57798,14 @@ public:
             ContainerView *container = it->second;
 
             Machine *machine = container->machine;
+            // The UUID survives process restart. Only the machine that owns
+            // this replica can report its exit or change its recovery state.
+            if (!machine || !neuron || neuron->machine != machine || neuron != &machine->neuron)
+            {
+              basics_log("brain rejected container failure from a different machine uuid=%llu\n",
+                         (unsigned long long)containerUUID);
+              break;
+            }
             const bool restoredInventoryProgress =
                 noteRestoredContainerInventoryReplayProgress(containerUUID, machine);
 

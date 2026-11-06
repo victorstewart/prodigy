@@ -1438,6 +1438,15 @@ public:
   using DeferredHardwareInventoryResult = Neuron::DeferredHardwareInventoryResult;
   using ContainerMetricSampleState = Neuron::ContainerMetricSampleState;
 
+  bool observeRestartDispatch = false;
+  unsigned restartDispatches = 0;
+  bool resumeFailedContainerRestart(Container *container) override
+  {
+    if (!observeRestartDispatch) return Neuron::resumeFailedContainerRestart(container);
+    ++restartDispatches;
+    return true;
+  }
+
   NoopNeuronIaaS localIaaS;
   bool failAcceptedBrainTransportTLSForTest = false;
   bool liveContainerInventoryCompleteForTest = true;
@@ -28018,6 +28027,136 @@ static void testNeuronStateUploadSkipsExistingLiveContainer(TestSuite& suite)
   delete container;
 }
 
+static void testNeuronStateUploadStagesGenerationRestartBeforeTimerCancellation(TestSuite& suite)
+{
+  ScopedFreshRing scopedRing;
+  suite.require(Ring::getRingFD() > 0, "generation_restart_has_owned_ring");
+  TestNeuron neuron = {};
+  neuron.uuid = 0x5104;
+  neuron.observeRestartDispatch = true;
+  neuron.seedBrainStreamForTest(false);
+  neuron.brainStreamForTest()->fslot = -1;
+  neuron.seedLocalContainerSubnetForTest(7, 0x123457);
+
+  Container *container = new Container();
+  container->plan = ContainerPlan{};
+  container->plan.uuid = uint128_t(0x5105);
+  container->plan.config.applicationID = 62'014;
+  container->plan.config.versionID = 1;
+  container->plan.config.type = ApplicationType::stateful;
+  container->plan.isStateful = true;
+  container->plan.state = ContainerState::scheduled;
+  container->plan.shardGroup = 0;
+  container->plan.nShardGroups = 1;
+  container->pid = 42'424;
+  container->infop.si_pid = container->pid;
+  container->statefulStoreGenerationProtocol = 1;
+
+  auto selection = [&](uint128_t generation, uint64_t authorityGeneration, uint64_t seedGeneration) {
+    ProdigyStatefulStoreGenerationSelection value = {};
+    value.generationUUID = generation;
+    value.servingRevision = 9;
+    value.admittedPlanSHA256 =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv;
+    value.authority.protocolVersion = ProdigyStatefulStoreSeedAuthority::sourceCutVersion;
+    value.authority.authorityGeneration = authorityGeneration;
+    value.authority.operationUUID = 0x5106;
+    value.authority.applicationID = container->plan.config.applicationID;
+    value.authority.storeKind = DeploymentIdentityStoreKind::kv;
+    value.authority.shardGroup = container->plan.shardGroup;
+    value.authority.nShardGroups = container->plan.nShardGroups;
+    value.authority.targetClusterUUID = 0x5107;
+    value.authority.targetDeploymentID = container->plan.config.deploymentID();
+    value.authority.targetContainerUUID = container->plan.uuid;
+    value.authority.sourceClusterUUID = 0x5108;
+    value.authority.sourceDeploymentID = container->plan.config.deploymentID() - 1;
+    value.authority.sourceContainerUUID = 0x5109;
+    value.authority.seedGeneration = seedGeneration;
+    value.authority.fixtureSHA256 = value.admittedPlanSHA256;
+    value.authority.sourceContentWatermarkSHA256 =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"_ctv;
+    value.authority.sourceCatchupWatermarkSHA256 =
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"_ctv;
+    value.authority.sourceBaselineOperationUUID = 0x510a;
+    value.authority.sourceRequestUUID = 0x510b;
+    value.authority.sourceMemberRequestUUID = 0x510c;
+    value.authority.seedRouteUUID = 0x510d;
+    value.authority.cutUUID = 0x510e;
+    value.authority.cutGeneration = authorityGeneration;
+    value.authority.sourceCutScope = ProdigyStatefulStoreSourceCutScope::fullShardGroup;
+    value.authority.retainUntilMilliseconds = 1;
+    return value;
+  };
+  const auto previous = selection(0x5110, 1, 1);
+  const auto next = selection(0x5111, 2, 2);
+  suite.require(prodigyStatefulStoreGenerationSelectionMatchesPlan(previous, container->plan) &&
+                    prodigyStatefulStoreGenerationSelectionStrictlyAdvances(previous, next) &&
+                    prodigyStatefulStoreGenerationSelectionStrictlyAdvances(
+                        ProdigyStatefulStoreGenerationSelection{.protocolVersion = 0}, next),
+                "neuron_generation_restart_staging_fixture_is_ordered");
+  container->statefulStoreGenerationSelection = previous;
+
+  ScopedTempDir cgroupRoot = {};
+  const auto cgroup = cgroupRoot.path / "cgroup";
+  suite.require(cgroupRoot.valid() && std::filesystem::create_directories(cgroup) &&
+                    writeTextFile(cgroup / "cgroup.events", "populated 0\n"),
+                "neuron_generation_restart_staging_cgroup_fixture_created");
+  container->cgroup = open(cgroup.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  TimeoutPacket *timer = new TimeoutPacket();
+  timer->identifier = container->plan.uuid;
+  timer->flags = uint64_t(NeuronTimeoutFlags::restartContainer);
+  timer->setTimeoutMs(30'000);
+  container->restartTimer = timer;
+  neuron.containers.insert_or_assign(container->plan.uuid, container);
+
+  NeuronContainerBootstrap first = {};
+  first.plan = container->plan;
+  first.statefulStoreGenerationSelection = next;
+  String firstSerialized = {};
+  suite.require(BitseryEngine::serialize(firstSerialized, first),
+                "neuron_generation_restart_staging_selected_bootstrap_serializes");
+  String frame = {};
+  uint32_t header = Message::appendHeader(frame, NeuronTopic::stateUpload);
+  local_container_subnet6 fragment = {};
+  fragment.dpfx = 7;
+  fragment.mpfx[0] = 0x12;
+  fragment.mpfx[1] = 0x34;
+  fragment.mpfx[2] = 0x57;
+  Message::appendAlignedBuffer<Alignment::one>(frame, reinterpret_cast<const uint8_t *>(&fragment), sizeof(fragment));
+  Message::appendValue(frame, firstSerialized);
+  Message::appendValue(frame, "malformed-second-inventory-entry"_ctv);
+  Message::finish(frame, header);
+  neuron.dispatchBrainMessageForTest(reinterpret_cast<Message *>(frame.data()));
+
+  suite.expect(container->restartTimer == timer &&
+                   prodigyStatefulStoreGenerationSelectionsEqual(
+                       container->statefulStoreGenerationSelection, previous) &&
+                   container->killedOnPurpose == false,
+               "neuron_generation_restart_staging_rejects_late_malformed_entry_before_timer_or_home_mutation");
+
+  // A complete valid replay reaches the restart owner once. The fixture
+  // intercepts process launch after the production timer/selection handoff.
+  container->statefulStoreGenerationSelection = {.protocolVersion = 0};
+  frame.clear();
+  header = Message::appendHeader(frame, NeuronTopic::stateUpload);
+  Message::appendAlignedBuffer<Alignment::one>(frame, reinterpret_cast<const uint8_t *>(&fragment), sizeof(fragment));
+  Message::appendValue(frame, firstSerialized);
+  Message::finish(frame, header);
+  neuron.dispatchBrainMessageForTest(reinterpret_cast<Message *>(frame.data()));
+  suite.expect(neuron.restartDispatches == 1 && container->restartTimer == nullptr &&
+                   prodigyStatefulStoreGenerationSelectionsEqual(container->statefulStoreGenerationSelection, next),
+               "generation_restart_claims_timer_and_dispatches_selected_home_once");
+  neuron.dispatchBrainMessageForTest(reinterpret_cast<Message *>(frame.data()));
+  suite.expect(neuron.restartDispatches == 1,
+               "duplicate_selected_inventory_does_not_restart_again");
+
+  neuron.containers.erase(container->plan.uuid);
+  container->restartTimer = nullptr;
+  delete timer;
+  if (container->cgroup >= 0) close(container->cgroup);
+  delete container;
+}
+
 static void testNeuronHandlerKillContainerStopsContainerAndEchoesBrain(TestSuite& suite)
 {
   ScopedAsyncMothershipRing scopedRing = {};
@@ -32774,6 +32913,13 @@ static void testBrainNeuronHandlerHandlesRestartingContainerFailure(TestSuite& s
       int(11),
       "container crash"_ctv,
       true);
+  Machine other = {};
+  other.uuid = 0x5207;
+  other.neuron.machine = &other;
+  brain.neuronHandler(&other.neuron, message);
+  suite.expect(container->state == ContainerState::healthy && container->nCrashes == 0 &&
+                   deployment.nHealthyBase == 1 && deployment.failureReports.empty(),
+               "brain_rejects_other_machine_failure_before_mutating_replica");
   brain.neuronHandler(&machine.neuron, message);
 
   suite.expect(container->state == ContainerState::crashedRestarting, "brain_neuron_container_failed_restart_marks_crashed_restarting");
@@ -45709,6 +45855,7 @@ int main(void)
     testNeuronPendingLaunchControlReplacementReissuesAuthenticatedReplay(suite);
     testNeuronFreshScheduledStateUploadResumesOrdinarySpin(suite);
     testNeuronStateUploadSkipsExistingLiveContainer(suite);
+    testNeuronStateUploadStagesGenerationRestartBeforeTimerCancellation(suite);
     testNeuronControlClosePreservesExactOwnersUntilFreshInventory(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
@@ -46078,6 +46225,13 @@ int main(void)
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "retained-store-failure") == 0)
+  {
+    testBrainNeuronHandlerHandlesRestartingContainerFailure(suite);
+    if (createdRing) Ring::shutdownForExec();
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "stateful-source-cut") == 0)
   {
     testBrainStatefulSourceCutHandler(suite);
@@ -46390,6 +46544,7 @@ int main(void)
   testContainerStoreEvictsExternallyRemovedCachedImage(suite);
   testNeuronSpinContainerRejectReportsFailure(suite);
   testNeuronStateUploadSkipsExistingLiveContainer(suite);
+  testNeuronStateUploadStagesGenerationRestartBeforeTimerCancellation(suite);
   testNeuronHandlerKillContainerStopsContainerAndEchoesBrain(suite);
   testNeuronHandlerKillContainerFencesAbsentQueuedLaunch(suite);
   testNeuronHandlerKillContainerCancelsPendingRestart(suite);

@@ -74,6 +74,11 @@ static inline bool prodigyStatefulServingRuntimeDigest(
   return valid;
 }
 
+static inline bool prodigyStatefulStoreGenerationImmutablePlanIdentityMatches(
+    const ProdigyStatefulStoreGenerationSelection& selection,
+    const BrainReplicatedContainerRuntimeState& sealed,
+    const ContainerPlan& proposedPlan);
+
 // Returns true with a zero protocolVersion only when this target has no desired
 // generation record.  A record for the target which is stale, malformed, or
 // no longer matches the sealed serving runtime is an error, never legacy
@@ -106,25 +111,11 @@ static inline bool prodigyProjectStatefulStoreGeneration(
   }
   if (sealed == nullptr || sealed->plan.config.deploymentID() != authority.targetDeploymentID ||
       sealed->plan.shardGroup != authority.shardGroup || sealed->plan.nShardGroups != authority.nShardGroups) return false;
+  if (!prodigyStatefulStoreGenerationImmutablePlanIdentityMatches(*selected, *sealed, launch)) return false;
 
   String currentDigest = {};
   if (!prodigyStatefulServingRuntimeDigest(*sealed, currentDigest) ||
       !currentDigest.equals(selected->admittedPlanSHA256)) return false;
-  BrainReplicatedContainerRuntimeState proposed = *sealed;
-  proposed.plan = launch;
-  // These fields are live Neuron observations, refreshed outside the sealed
-  // serving-member snapshot.  They cannot rebind the selected home: restore
-  // their sealed values solely for immutable launch-identity comparison.
-  proposed.plan.state = sealed->plan.state;
-  proposed.plan.runtimeReady = sealed->plan.runtimeReady;
-  proposed.plan.subscriptionPairings = sealed->plan.subscriptionPairings;
-  proposed.plan.advertisementPairings = sealed->plan.advertisementPairings;
-  proposed.plan.hasCredentialBundle = sealed->plan.hasCredentialBundle;
-  proposed.plan.credentialBundle = sealed->plan.credentialBundle;
-  String proposedDigest = {};
-  if (!prodigyStatefulServingRuntimeDigest(proposed, proposedDigest) ||
-      !proposedDigest.equals(selected->admittedPlanSHA256)) return false;
-
   const ProdigyStatefulServingAuthority *currentAuthority = nullptr;
   const ProdigyStatefulServingAuthorityMember *currentMember = nullptr;
   for (const auto& serving : runtime.statefulServingAuthorities)
@@ -144,6 +135,59 @@ static inline bool prodigyProjectStatefulStoreGeneration(
   if (currentAuthority == nullptr || currentMember == nullptr) return false;
   outSelection = *selected;
   return true;
+}
+
+// State upload refreshes liveness and mesh observations independently of the
+// sealed serving member.  A selected native home may follow that refresh only
+// when every immutable launch field remains identical.  Keep this
+// normalization beside the sealed-runtime projection so Neuron cannot grow a
+// second, subtly weaker identity rule for same-UUID recovery.
+static inline bool prodigyStatefulStoreGenerationImmutablePlanIdentityMatches(
+    const ProdigyStatefulStoreGenerationSelection& selection,
+    const BrainReplicatedContainerRuntimeState& sealed,
+    const ContainerPlan& proposedPlan)
+{
+  if (!prodigyStatefulStoreGenerationSelectionMatchesPlan(selection, sealed.plan) ||
+      !prodigyStatefulStoreGenerationSelectionMatchesPlan(selection, proposedPlan)) return false;
+  BrainReplicatedContainerRuntimeState normalized = sealed;
+  normalized.plan = proposedPlan;
+  normalized.plan.state = sealed.plan.state;
+  normalized.plan.runtimeReady = sealed.plan.runtimeReady;
+  normalized.plan.subscriptionPairings = sealed.plan.subscriptionPairings;
+  normalized.plan.advertisementPairings = sealed.plan.advertisementPairings;
+  normalized.plan.hasCredentialBundle = sealed.plan.hasCredentialBundle;
+  normalized.plan.credentialBundle = sealed.plan.credentialBundle;
+  String sealedDigest = {}, proposedDigest = {};
+  return prodigyStatefulServingRuntimeDigest(sealed, sealedDigest) &&
+      prodigyStatefulServingRuntimeDigest(normalized, proposedDigest) && sealedDigest == proposedDigest;
+}
+
+static inline bool prodigyStatefulStoreGenerationImmutablePlanIdentityMatches(
+    const ProdigyStatefulStoreGenerationSelection& selection,
+    const ContainerPlan& sealedPlan, const ContainerPlan& proposedPlan,
+    uint128_t machineUUID)
+{
+  if (machineUUID == 0) return false;
+  BrainReplicatedContainerRuntimeState sealed = {};
+  sealed.machineUUID = machineUUID;
+  sealed.plan = sealedPlan;
+  return prodigyStatefulStoreGenerationImmutablePlanIdentityMatches(selection, sealed, proposedPlan);
+}
+
+// A desired home can advance only with a fresh durable authority decision.
+// UUID novelty alone is not ordering: an old state upload could otherwise
+// rebind a crashed container to a historical or forked generation.
+static inline bool prodigyStatefulStoreGenerationSelectionStrictlyAdvances(
+    const ProdigyStatefulStoreGenerationSelection& previous,
+    const ProdigyStatefulStoreGenerationSelection& next)
+{
+  if (!prodigyStatefulStoreGenerationSelectionValid(next)) return false;
+  if (previous.protocolVersion == 0) return true;
+  return prodigyStatefulStoreGenerationSelectionValid(previous) &&
+      previous.generationUUID != next.generationUUID &&
+      previous.admittedPlanSHA256.equals(next.admittedPlanSHA256) &&
+      next.authority.authorityGeneration > previous.authority.authorityGeneration &&
+      next.authority.seedGeneration > previous.authority.seedGeneration;
 }
 
 // Desired writer permission is not an application activation acknowledgement.

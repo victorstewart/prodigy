@@ -32,7 +32,9 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <optional>
 #include <string>
+#include <utility>
 
 #include <ebpf/common/structs.h>
 #include <services/memfd.h>
@@ -1396,6 +1398,13 @@ public:
   MachineCpuArchitecture executeArchitecture = MachineCpuArchitecture::unknown;
   String storageRootPath;
   String storagePayloadPath;
+  uint64_t registeredStoragePayloadDevice = 0;
+  uint64_t registeredStoragePayloadInode = 0;
+  // A typed HSE environment failure can authorize exactly one local storage
+  // ownership reconciliation before its ordinary warm restart.  The value is
+  // the exact selected generation (zero is the canonical legacy selection),
+  // never a durable recovery decision.
+  std::optional<uint128_t> pendingEnvironmentRepairGeneration;
   String runtimePath;
   String neuronListenerPath;
   bool gatewayReadinessListenerReady = false;
@@ -9639,6 +9648,100 @@ public:
     return ready;
   }
 
+  static bool captureRegisteredDirectStoragePayloadAt(
+      Container *container, int storageParentFD, String *failureReport = nullptr)
+  {
+    auto fail = [&](const char *reason) {
+      if (failureReport) failureReport->assign(reason);
+      return false;
+    };
+    if (container == nullptr || storageParentFD < 0) return fail("registered direct storage payload is unavailable");
+    container->registeredStoragePayloadDevice = 0;
+    container->registeredStoragePayloadInode = 0;
+    if (container->storageUsesLoopFilesystem)
+      return fail("registered direct storage payload is unavailable");
+    String expectedName = {};
+    expectedName.assignItoa(container->plan.uuid);
+    String expectedRoot = {};
+    prodigyContainerStorageRootPathForName(expectedName, expectedRoot);
+    if (container->name.equals(expectedName) == false || container->storageRootPath.equals(expectedRoot) == false ||
+        container->storagePayloadPath.equals(expectedRoot) == false)
+      return fail("registered direct storage payload is not canonical");
+    struct stat parent = {};
+    if (fstat(storageParentFD, &parent) != 0 || !S_ISDIR(parent.st_mode) || parent.st_uid != geteuid() ||
+        (parent.st_mode & 0022) != 0)
+      return fail("registered storage parent ownership is unsafe");
+    int payloadFD = openat(storageParentFD, expectedName.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (payloadFD < 0) return fail("registered direct storage payload cannot be opened without symlinks");
+    struct stat payload = {};
+    const bool captured = fstat(payloadFD, &payload) == 0 && S_ISDIR(payload.st_mode) && payload.st_dev != 0 && payload.st_ino != 0;
+    close(payloadFD);
+    if (!captured) return fail("registered direct storage payload identity is unavailable");
+    container->registeredStoragePayloadDevice = uint64_t(payload.st_dev);
+    container->registeredStoragePayloadInode = uint64_t(payload.st_ino);
+    if (failureReport) failureReport->clear();
+    return true;
+  }
+
+  static bool statefulStoreEnvironmentStorageRepairCandidate(const Container *container)
+  {
+    return container != nullptr && container->plan.isStateful &&
+        container->plan.config.type == ApplicationType::stateful && container->plan.config.storageMB > 0 &&
+        (container->plan.config.applicationID == 3 || container->plan.config.applicationID == 4);
+  }
+
+  static int openVerifiedContainerStorageParent(String *failureReport = nullptr)
+  {
+    int containersFD = open("/containers", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (containersFD < 0)
+    {
+      if (failureReport) failureReport->assign("registered storage containers owner cannot be opened without symlinks");
+      return -1;
+    }
+    struct stat containers = {};
+    const bool containersSafe = fstat(containersFD, &containers) == 0 && S_ISDIR(containers.st_mode) &&
+        containers.st_uid == geteuid() && (containers.st_mode & 0022) == 0;
+    if (!containersSafe)
+    {
+      close(containersFD);
+      if (failureReport) failureReport->assign("registered storage containers owner is unsafe");
+      return -1;
+    }
+    int storageParentFD = openat(containersFD, "storage", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    close(containersFD);
+    if (storageParentFD < 0 && failureReport)
+      failureReport->assign("registered storage parent cannot be opened without symlinks");
+    return storageParentFD;
+  }
+
+  static bool captureRegisteredDirectStoragePayload(Container *container, String *failureReport = nullptr)
+  {
+    int storageParentFD = openVerifiedContainerStorageParent(failureReport);
+    if (storageParentFD < 0)
+    {
+      return false;
+    }
+    const bool captured = captureRegisteredDirectStoragePayloadAt(container, storageParentFD, failureReport);
+    close(storageParentFD);
+    return captured;
+  }
+
+  // Capturing this extra witness must never turn an otherwise successful
+  // prepare/hydrate into a failed create.  A missing witness simply leaves
+  // the privileged restart-only reconciliation unavailable until a later
+  // successful lifecycle pass records one.
+  static void recordStatefulStoreEnvironmentStorageWitness(Container *container)
+  {
+    if (!statefulStoreEnvironmentStorageRepairCandidate(container)) return;
+    String witnessFailure = {};
+    if (captureRegisteredDirectStoragePayload(container, &witnessFailure) == false)
+    {
+      std::fprintf(stderr, "container storage repair witness unavailable uuid=%llu reason=%s\n",
+                   (unsigned long long)container->plan.uuid,
+                   witnessFailure.c_str());
+    }
+  }
+
   // A process-present state upload re-adopts the existing container rather
   // than creating its storage again.  Record only an already canonical,
   // complete backend so a later crash-backoff handoff has the same ownership
@@ -9675,6 +9778,9 @@ public:
       container->storagePayloadPath = root;
       container->storageUsesLoopFilesystem = false;
       container->storageLoopDevices.clear();
+      container->registeredStoragePayloadDevice = 0;
+      container->registeredStoragePayloadInode = 0;
+      recordStatefulStoreEnvironmentStorageWitness(container);
       return true;
     }
 
@@ -9707,6 +9813,8 @@ public:
     container->storagePayloadPath = std::move(payload);
     container->storageUsesLoopFilesystem = true;
     container->storageLoopDevices = std::move(loopDevices);
+    container->registeredStoragePayloadDevice = 0;
+    container->registeredStoragePayloadInode = 0;
     return true;
   }
 
@@ -9722,6 +9830,8 @@ public:
     container->storagePayloadPath.assign(container->storageRootPath);
     container->storageUsesLoopFilesystem = false;
     container->storageLoopDevices.clear();
+    container->registeredStoragePayloadDevice = 0;
+    container->registeredStoragePayloadInode = 0;
 
     int containersFD = open("/containers", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (containersFD < 0)
@@ -9788,6 +9898,7 @@ public:
                          errno,
                          strerror(errno));
             }
+            recordStatefulStoreEnvironmentStorageWitness(container);
             return true;
           }
         }
@@ -9820,6 +9931,7 @@ public:
                    strerror(errno));
       }
 
+      recordStatefulStoreEnvironmentStorageWitness(container);
       return true;
     }
 
@@ -9874,6 +9986,108 @@ public:
                  strerror(errno));
     }
 
+    return true;
+  }
+
+  // This repair is deliberately narrower than storage preparation: the
+  // existing backend is already registered on this live Container, and only
+  // its exact payload directory may be made accessible to its mapped owner.
+  // It never creates, removes, traverses, or changes descendants/backing
+  // files.  `storageParentFD` lets the focused unit test prove the same
+  // descriptor-pinned operation without touching /containers.
+  static bool reconcilePendingStatefulStoreEnvironmentStorageAt(
+      Container *container, int storageParentFD, String *failureReport = nullptr)
+  {
+    if (container == nullptr || storageParentFD < 0)
+    {
+      if (failureReport) failureReport->assign("stateful environment storage repair owner is unavailable"_ctv);
+      return false;
+    }
+    const std::optional<uint128_t> pending = std::exchange(container->pendingEnvironmentRepairGeneration, std::nullopt);
+    if (!pending.has_value()) return false;
+
+    String expectedName = {};
+    expectedName.assignItoa(container->plan.uuid);
+    const auto reject = [&](const char *reason) {
+      if (failureReport) failureReport->assign(reason);
+      return false;
+    };
+    if (container->pendingDestroy || container->killedOnPurpose || !container->plan.restartOnFailure ||
+        !statefulStoreEnvironmentStorageRepairCandidate(container) ||
+        container->name.equals(expectedName) == false || container->statefulStoreGenerationProtocol != 1)
+      return reject("stateful environment storage repair is no longer authorized");
+
+    const auto& selection = container->statefulStoreGenerationSelection;
+    if ((selection.protocolVersion == 0 && *pending != 0) ||
+        (selection.protocolVersion != 0 && *pending != selection.generationUUID) ||
+        !container->statefulStoreGenerationLaunchReady())
+      return reject("stateful environment storage repair generation is stale");
+
+    // Loop-backed payloads also need a current mounted-device proof.  The
+    // existing loop owner does not retain that proof yet, so defer rather than
+    // infer it from a pathname or a nonempty device vector.
+    if (container->storageUsesLoopFilesystem) return reject("stateful environment storage repair loop backend is unverified");
+    String expectedRoot = {};
+    prodigyContainerStorageRootPathForName(expectedName, expectedRoot);
+    if (container->storageRootPath.equals(expectedRoot) == false ||
+        container->storagePayloadPath.equals(expectedRoot) == false ||
+        container->registeredStoragePayloadDevice == 0 || container->registeredStoragePayloadInode == 0)
+      return reject("stateful environment storage repair backend is not registered");
+
+    struct stat parent = {};
+    if (fstat(storageParentFD, &parent) != 0 || !S_ISDIR(parent.st_mode) || parent.st_uid != geteuid() ||
+        (parent.st_mode & 0022) != 0)
+      return reject("stateful environment storage repair parent is unsafe");
+    int payloadFD = openat(storageParentFD, expectedName.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (payloadFD < 0) return reject("stateful environment storage repair cannot open registered payload");
+    struct stat payload = {};
+    bool repaired = fstat(payloadFD, &payload) == 0 && S_ISDIR(payload.st_mode) &&
+        uint64_t(payload.st_dev) == container->registeredStoragePayloadDevice &&
+        uint64_t(payload.st_ino) == container->registeredStoragePayloadInode;
+    const uid_t expectedOwner = uid_t(container->executionHostID);
+    if (repaired && (payload.st_uid != expectedOwner || payload.st_gid != gid_t(expectedOwner)))
+      repaired = fchown(payloadFD, expectedOwner, gid_t(expectedOwner)) == 0;
+    if (repaired && (payload.st_mode & 0777) != 0700)
+      repaired = fchmod(payloadFD, 0700) == 0;
+    close(payloadFD);
+    if (!repaired) return reject("stateful environment storage repair could not restore registered payload access");
+    if (failureReport) failureReport->clear();
+    return true;
+  }
+
+  static bool reconcilePendingStatefulStoreEnvironmentStorage(Container *container, String *failureReport = nullptr)
+  {
+    int storageParentFD = openVerifiedContainerStorageParent(failureReport);
+    if (storageParentFD < 0)
+    {
+      if (container) container->pendingEnvironmentRepairGeneration.reset();
+      return false;
+    }
+    const bool repaired = reconcilePendingStatefulStoreEnvironmentStorageAt(container, storageParentFD, failureReport);
+    close(storageParentFD);
+    return repaired;
+  }
+
+  static bool armStatefulStoreEnvironmentStorageRepair(
+      Container *container, const siginfo_t& infop, bool restart,
+      const ProdigyStatefulStoreBootFailure& failure)
+  {
+    if (container == nullptr) return false;
+    container->pendingEnvironmentRepairGeneration.reset();
+    const bool selectedGeneration =
+        (container->statefulStoreGenerationSelection.protocolVersion == 0 && failure.generationUUID == 0) ||
+        (container->statefulStoreGenerationSelection.protocolVersion != 0 &&
+         failure.generationUUID == container->statefulStoreGenerationSelection.generationUUID);
+    if (infop.si_code != CLD_EXITED || infop.si_status != 1 || !restart || container->killedOnPurpose ||
+        container->pendingDestroy || !container->plan.restartOnFailure ||
+        !statefulStoreEnvironmentStorageRepairCandidate(container) ||
+        container->statefulStoreGenerationProtocol != 1 || !selectedGeneration ||
+        !container->statefulStoreGenerationLaunchReady() ||
+        failure.stage != ProdigyStatefulStoreBootFailureStage::environmentInspection ||
+        !((failure.kind == ProdigyStatefulStoreBootFailureKind::environment && failure.systemErrno == ENOENT) ||
+          (failure.kind == ProdigyStatefulStoreBootFailureKind::permission &&
+           (failure.systemErrno == EACCES || failure.systemErrno == EPERM)))) return false;
+    container->pendingEnvironmentRepairGeneration = failure.generationUUID;
     return true;
   }
 
@@ -11135,6 +11349,28 @@ public:
     return true;
   }
 
+  // A generation handoff keeps the canonical container UUID and its storage
+  // allocation.  It is therefore deliberately narrower than a replacement:
+  // only an already-observed crash whose ordinary restart timer still owns
+  // backoff may be rebound.  The Neuron validates immutable plan identity and
+  // the selected generation before calling this lifecycle-only guard.
+  static bool stateUploadGenerationRestartPredecessorReady(
+      const Container *predecessor, const ContainerPlan& uploaded,
+      String *failureReport = nullptr)
+  {
+    if (predecessor == nullptr || predecessor->plan.uuid != uploaded.uuid || predecessor->pid <= 0 ||
+        predecessor->waitidPending || predecessor->infop.si_pid != predecessor->pid ||
+        predecessor->infop.si_pid <= 0 || predecessor->cgroup < 0 || predecessor->restartTimer == nullptr ||
+        predecessor->killedOnPurpose || predecessor->pendingDestroy || predecessor->resumeAfterShutdown != nullptr ||
+        predecessor->plan.config.applicationID != uploaded.config.applicationID ||
+        predecessor->plan.config.type == ApplicationType::task)
+    {
+      if (failureReport) failureReport->assign("generation restart requires the same observed crash-backoff container"_ctv);
+      return false;
+    }
+    return true;
+  }
+
   // A replacement continuation finishes its wait while co_consume is still
   // inspecting this stack. Retire it after the outermost consumer returns,
   // using the same ownership rule as the deployment drain continuation.
@@ -11255,6 +11491,23 @@ public:
     }
     TimeoutPacket *restartTimer = predecessor->restartTimer;
     predecessor->killedOnPurpose = true;
+    predecessor->restartAfterClose = false;
+    predecessor->restartTimer = nullptr;
+    Ring::queueCancelTimeout(restartTimer);
+    return true;
+  }
+
+  static bool claimStateUploadGenerationRestartPredecessor(
+      Container *predecessor, const ContainerPlan& uploaded,
+      String *failureReport = nullptr)
+  {
+    if (!stateUploadGenerationRestartPredecessorReady(predecessor, uploaded, failureReport) ||
+        !observedCrashBackoffPredecessorCgroupIsEmpty(predecessor, failureReport)) return false;
+    TimeoutPacket *restartTimer = predecessor->restartTimer;
+    // Clearing the timer before queuing its cancellation fences any delayed
+    // timeout CQE. Unlike a replacement claim this retains the same owner,
+    // so it must not borrow `killedOnPurpose`: the normal close/restart owner
+    // remains responsible for resuming this exact container.
     predecessor->restartAfterClose = false;
     predecessor->restartTimer = nullptr;
     Ring::queueCancelTimeout(restartTimer);
@@ -14946,6 +15199,8 @@ public:
     return true;
   }
 
+  enum class DestroyCause : uint8_t { lifecycle, processFailure };
+
   static bool restartContainer(Container *container)
   {
     // Keep the active pairing snapshot in the restart payload. The old
@@ -14971,7 +15226,7 @@ public:
       }
       else
       {
-        destroyContainer(container);
+        destroyContainer(container, DestroyCause::processFailure);
       }
       return false;
     }
@@ -14995,6 +15250,20 @@ public:
     if (thisNeuron != nullptr && container->plan.whiteholes.empty() == false)
     {
       thisNeuron->openWhiteholesForLocalContainer(container->plan.fragment, container->plan.whiteholes);
+    }
+
+    if (!coldRestart && container->pendingEnvironmentRepairGeneration.has_value())
+    {
+      String repairFailure = {};
+      if (reconcilePendingStatefulStoreEnvironmentStorage(container, &repairFailure) == false)
+      {
+        // A malformed, moved, or unavailable retained backend remains owned
+        // by the ordinary failure path.  Do not delete it merely because this
+        // optional local reconciliation could not prove its target.
+        std::fprintf(stderr, "restartContainer environment storage repair skipped uuid=%llu reason=%s\n",
+                     (unsigned long long)container->plan.uuid,
+                     repairFailure.c_str());
+      }
     }
 
     if (startContainer(container, true, &failureReport) == false)
@@ -15026,7 +15295,7 @@ public:
       }
       else
       {
-        destroyContainer(container);
+        destroyContainer(container, DestroyCause::processFailure);
       }
       return false;
     }
@@ -15085,7 +15354,54 @@ public:
     finalizeContainerDestroy(container);
   }
 
-  static void destroyContainer(Container *container)
+  static void releaseContainerFiles(Container *container, DestroyCause cause,
+                                    const String& containersRoot = "/containers"_ctv)
+  {
+    // A failed process releases its runtime resources. The retained artifact
+    // identifies its storage during the next inventory, including rootfs-local
+    // databases from older deployments. Only lifecycle retirement owns removal.
+    if (cause == DestroyCause::processFailure && container->plan.config.type == ApplicationType::stateful &&
+        container->plan.config.storageMB > 0)
+    {
+      container->deleteStorageOnCleanUp = false;
+      teardownContainerStorage(container);
+      return;
+    }
+
+    String containerSubvolumePath = {};
+    containerSubvolumePath.assign(containersRoot);
+    containerSubvolumePath.append('/');
+    containerSubvolumePath.append(container->name);
+
+    std::vector<char *> argv;
+    argv.push_back((char *)"btrfs");
+    argv.push_back((char *)"subvolume");
+    argv.push_back((char *)"delete");
+    argv.push_back((char *)containerSubvolumePath.c_str());
+    argv.push_back(nullptr);
+
+    String destroyOutput = {};
+    String destroyFailure = {};
+    const bool retainStorageRootfs = retainsRootfsLocalStorageForHandoff(container, containersRoot);
+    if (retainStorageRootfs)
+    {
+      basics_log("destroyContainer retains legacy storage rootfs uuid=%llu path=%s for handoff recovery\n",
+                 (unsigned long long)container->plan.uuid, containerSubvolumePath.c_str());
+    }
+    if (retainStorageRootfs == false &&
+        runExternalCommand("btrfs_container_subvolume_delete", "btrfs", argv, &destroyOutput, &destroyFailure) == false)
+    {
+      basics_log("destroyContainer subvolume delete failed uuid=%llu path=%s reason=%s output=%s\n",
+                 (unsigned long long)container->plan.uuid,
+                 containerSubvolumePath.c_str(),
+                 destroyFailure.c_str(),
+                 destroyOutput.c_str());
+    }
+
+    teardownContainerStorage(container);
+  }
+
+  static void destroyContainer(Container *container, DestroyCause cause = DestroyCause::lifecycle)
   {
     if (container == nullptr || container->pendingDestroy)
     {
@@ -15278,37 +15594,7 @@ public:
 
     cleanupContainerNeuronListener(container);
 
-    // destroy subvolume
-    String containerSubvolumePath = {};
-    containerSubvolumePath.assign("/containers/"_ctv);
-    containerSubvolumePath.append(container->name);
-
-    std::vector<char *> argv;
-    argv.push_back((char *)"btrfs");
-    argv.push_back((char *)"subvolume");
-    argv.push_back((char *)"delete");
-    argv.push_back((char *)containerSubvolumePath.c_str());
-    argv.push_back(nullptr);
-
-    String destroyOutput = {};
-    String destroyFailure = {};
-    const bool retainStorageRootfs = retainsRootfsLocalStorageForHandoff(container);
-    if (retainStorageRootfs)
-    {
-      basics_log("destroyContainer retains legacy storage rootfs uuid=%llu path=%s for handoff recovery\n",
-                 (unsigned long long)container->plan.uuid, containerSubvolumePath.c_str());
-    }
-    if (retainStorageRootfs == false &&
-        runExternalCommand("btrfs_container_subvolume_delete", "btrfs", argv, &destroyOutput, &destroyFailure) == false)
-    {
-      basics_log("destroyContainer subvolume delete failed uuid=%llu path=%s reason=%s output=%s\n",
-                 (unsigned long long)container->plan.uuid,
-                 containerSubvolumePath.c_str(),
-                 destroyFailure.c_str(),
-                 destroyOutput.c_str());
-    }
-
-    teardownContainerStorage(container);
+    releaseContainerFiles(container, cause);
 
     // destroy cgroup tree
     (void)removeContainerCgroupTree(container);
