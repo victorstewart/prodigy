@@ -12,8 +12,25 @@
 #include <set>
 #include <thread>
 
+// Existing retained-fleet frames embed these records inline. The seed field is
+// part of their fixed layout. Only a separately bounded native startup frame
+// can use bytes remaining after it to detect a generation selection.
+template<typename S> void mothershipSerializeRetainedParameters(S& s, ContainerParameters& parameters) {
+  if constexpr (requires { s.adapter().isCompletedSuccessfully(); }) {
+    parameters.statefulStoreGenerationSelection = {.protocolVersion = 0};
+  } else {
+    MothershipTidesMigration::require(parameters.statefulStoreGenerationSelection.protocolVersion == 0,
+        "retained fleet request cannot encode a selected native store generation");
+  }
+  prodigySerializeContainerParameterFields(s, parameters);
+  s.object(parameters.statefulStoreSeedAuthority);
+}
 template<typename S> void serialize(S&& s, MothershipRetainedRecoveryMachineInput& m) {
-  s.value16b(m.machineUUID); s.value4b(m.machineFragment); s.object(m.parameters); s.object(m.observedCreatedAtMs);
+  s.value16b(m.machineUUID); s.value4b(m.machineFragment);
+  s.container(m.parameters, UINT16_MAX, [](S& entry, ContainerParameters& parameters) {
+    mothershipSerializeRetainedParameters(entry, parameters);
+  });
+  s.object(m.observedCreatedAtMs);
 }
 
 namespace MothershipRetainedRecovery {
@@ -165,7 +182,7 @@ struct Schema9OrphanedStatefulPredecessorRequest {
 };
 template<typename S> void serialize(S&& s, Schema9OrphanedStatefulPredecessorRequest& r) {
   s.text1b(r.canonicalRequest, UINT32_MAX); s.object(r.orphan.operation);
-  s.value16b(r.orphan.machineUUID); s.object(r.orphan.parameters);
+  s.value16b(r.orphan.machineUUID); mothershipSerializeRetainedParameters(s, r.orphan.parameters);
   s.text1b(r.orphan.priorRequestSHA256, 128); s.text1b(r.orphan.priorManifestSHA256, 128);
   s.text1b(r.orphan.rejectedCandidateSHA256, 128);
   s.container(r.orphan.successorBootstraps, 3, [](S& nested,

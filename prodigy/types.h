@@ -14674,7 +14674,7 @@ static inline bool prodigyProjectStatefulDataClientPort(const ContainerPlan& pla
 }
 
 template <typename S>
-static void serialize(S&& serializer, ContainerParameters& params)
+static void prodigySerializeContainerParameterFields(S&& serializer, ContainerParameters& params)
 {
   serializer.value16b(params.uuid);
   serializer.value8b(params.deploymentID);
@@ -14719,6 +14719,12 @@ static void serialize(S&& serializer, ContainerParameters& params)
   serializer.object(params.statefulMeshRoles);
   serializer.object(params.statefulTopology);
   serializer.container8b(params.flags, UINT32_MAX);
+}
+
+template <typename S>
+static void serialize(S&& serializer, ContainerParameters& params)
+{
+  prodigySerializeContainerParameterFields(serializer, params);
 
   // Bitsery startup payloads predate this authority.  Only consume the
   // append-only tail when it is present so retained launches remain readable.
