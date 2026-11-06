@@ -1066,6 +1066,13 @@ static inline bool mothershipTruthRetirementInventoryDigest(const MothershipProd
 class MothershipClusterRegistry {
 private:
 
+  // The preserved controller registry already has 4,096 sealed VLog files.
+  // TidesDB must reserve one additional active slot when reopening it, so the
+  // ordinary 4,096-slot default is insufficient. This opt-in belongs only to
+  // the durable Mothership cluster registry; unrelated embedded stores retain
+  // the library default.
+  constexpr static uint64_t clusterRegistryMaxVLogSegments = 65'536;
+
   TidesDB db;
   // The Vault owns clear pair BGP material.  Public TidesDB records remain
   // authority descriptors containing its SHA-256 reference only.
@@ -3559,7 +3566,8 @@ public:
           String resolved;
           resolveDefaultDBPath(resolved);
           return resolved;
-        }(), TidesDB::Durability::full)
+        }(), TidesDB::Durability::full, 0,
+        TidesDB::OpenOptions{clusterRegistryMaxVLogSegments})
   {
   }
 
