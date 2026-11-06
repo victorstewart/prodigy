@@ -2439,6 +2439,72 @@ static void runDirectMasterClaimReconciliationFixtures(TestSuite& suite)
   suite.expect(repeatedRegistrationReconciles == 1,
                "selected_master_repeat_fresh_registration_does_not_duplicate_reconcile");
 
+  // A former master's forced fallback connector must not survive an ordinary
+  // authenticated registration that establishes this peer as the current
+  // master. Keeping it would make the follower redial against canonical
+  // connector ownership and repeatedly invalidate exact authority ACK state.
+  TestBrain formerMasterFollower = {};
+  formerMasterFollower.iaas = new NoopBrainIaaS();
+  formerMasterFollower.nBrains = 2;
+  formerMasterFollower.noMasterYet = false;
+
+  BrainView *authoritativeMaster = makePeer(uint128_t(0x401), 41, IPAddress("10.0.0.15", false).v4);
+  authoritativeMaster->connected = true;
+  authoritativeMaster->isFixedFile = true;
+  authoritativeMaster->fslot = 83;
+  authoritativeMaster->isMasterBrain = true;
+  authoritativeMaster->weConnectToIt = false;
+  authoritativeMaster->forceConnectorOwnershipUntilMasterAck = true;
+  formerMasterFollower.brains.insert(authoritativeMaster);
+
+  String authoritativeRegistration = {};
+  formerMasterFollower.testBrainHandler(
+      authoritativeMaster,
+      buildBrainMessage(
+          authoritativeRegistration,
+          BrainTopic::registration,
+          authoritativeMaster->uuid,
+          int64_t(42),
+          uint64_t(18),
+          authoritativeMaster->uuid));
+
+  suite.expect(authoritativeMaster->registrationFresh &&
+                   formerMasterFollower.testGetExistingMasterUUID() == authoritativeMaster->uuid,
+               "follower_authenticated_master_registration_establishes_current_master");
+  suite.expect(!authoritativeMaster->forceConnectorOwnershipUntilMasterAck && !formerMasterFollower.peerReconnectOwned(authoritativeMaster),
+               "follower_authenticated_master_registration_clears_stale_forced_connector");
+
+  TestBrain unconfirmedMaster = {};
+  unconfirmedMaster.iaas = new NoopBrainIaaS();
+  unconfirmedMaster.nBrains = 2;
+  unconfirmedMaster.noMasterYet = false;
+  unconfirmedMaster.weAreMaster = true;
+  BrainView *unconfirmedPeer = makePeer(uint128_t(0x402), 43, IPAddress("10.0.0.16", false).v4);
+  unconfirmedPeer->connected = true;
+  unconfirmedPeer->isFixedFile = true;
+  unconfirmedPeer->fslot = 84;
+  unconfirmedPeer->isMasterBrain = true;
+  unconfirmedPeer->weConnectToIt = false;
+  unconfirmedPeer->forceConnectorOwnershipUntilMasterAck = true;
+  unconfirmedMaster.brains.insert(unconfirmedPeer);
+  String unconfirmedRegistration = {};
+  unconfirmedMaster.testBrainHandler(
+      unconfirmedPeer,
+      buildBrainMessage(
+          unconfirmedRegistration,
+          BrainTopic::registration,
+          unconfirmedPeer->uuid,
+          int64_t(44),
+          uint64_t(19),
+          uint128_t(0)));
+  suite.expect(unconfirmedPeer->forceConnectorOwnershipUntilMasterAck,
+               "master_unconfirmed_follower_registration_retains_forced_connector");
+
+  unconfirmedMaster.brains.erase(unconfirmedPeer);
+  delete unconfirmedPeer;
+  formerMasterFollower.brains.erase(authoritativeMaster);
+  delete authoritativeMaster;
+
   reconnectingFollower.brains.erase(selectedMaster);
   delete selectedMaster;
 

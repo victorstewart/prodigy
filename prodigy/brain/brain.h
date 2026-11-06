@@ -46152,6 +46152,12 @@ public:
 
           const uint128_t selectedMasterUUID = getExistingMasterUUID();
           const bool selectedPeerRegistered = selectedMasterUUID != 0 && selectedMasterUUID == bv->uuid;
+          if (!weAreMaster && !noMasterYet && selectedPeerRegistered && bv->existingMasterUUID == bv->uuid)
+          {
+            // The follower and its selected master now agree. Let the normal
+            // address order choose the next connector after this stream closes.
+            bv->forceConnectorOwnershipUntilMasterAck = false;
+          }
           if (weAreMaster == false && noMasterYet == false &&
               (selectedMasterUUID != previousMasterUUID ||
                (selectedPeerRegistered &&
