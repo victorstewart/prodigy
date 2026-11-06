@@ -41,6 +41,7 @@
 #include <prodigy/mothership/mothership.addmachines.progress.h>
 #include <prodigy/mothership/mothership.cluster.reconcile.h>
 #include <prodigy/mothership/mothership.cluster.registry.h>
+#include <prodigy/mothership/mothership.file.limits.h>
 #include <prodigy/mothership/mothership.virtual.datacenter.h>
 #include <prodigy/mothership/mothership.virtual.datacenter.recovery.h>
 #include <prodigy/mothership/mothership.neuron.checkpoint.h>
@@ -19552,6 +19553,12 @@ int main(int argc, char *argv[])
   }
   else
   {
+    // Configure the process before either lazily opened registry or any worker
+    // starts. Keep the registries short-lived so other commands can acquire them.
+    if (mothershipPrepareFileLimit() == false)
+    {
+      return EXIT_FAILURE;
+    }
     Mothership mothership;
     mothership.start(argc - 1, ++argv);
   }

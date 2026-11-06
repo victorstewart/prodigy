@@ -35,6 +35,21 @@ The C++ project uses committed Depos recipes and configuration under `depos.proj
 
 ## Runtime prerequisites
 
+Mothership raises its process soft open-file limit to at least 16,384 before
+starting an operation, using TidesDB's public limit helper. The launching shell
+must have a hard `nofile` limit of at least 16,384; a systemd launcher can set
+`LimitNOFILE=16384`. Mothership rejects an insufficient effective limit before
+opening a registry. This provides recovery headroom for the cluster and
+provider-credential registries while retaining their short exclusive-lock scopes.
+
+TidesDB is pinned to `04574538`, upstream 10.2.1 plus the recovery cleanup in
+[upstream PR #703](https://github.com/tidesdb/tidesdb/pull/703), while that change
+awaits upstream review. Recovery removes validated header-only segments before
+adopting files into its fixed table, so idle reopens do not accumulate them.
+The 4,096-segment limit still applies to retained data-bearing or damaged files.
+Mothership leaves segment cleanup to TidesDB and keeps its descriptor policy
+separate from that storage limit.
+
 Prodigy runtime and test-cluster paths require Linux kernel 7.0 or newer. Hosts that run Prodigy need TCP Fast Open enabled:
 
 ```bash
