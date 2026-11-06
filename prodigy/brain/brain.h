@@ -2286,6 +2286,50 @@ public:
   uint64_t nextContainerLogRequestID = 1;
   bytell_hash_map<uint64_t, PendingElasticAddressControlOperation> pendingElasticAddressControlOperations;
   bytell_hash_map<BrainView *, MasterAuthorityReplicationPeerState> masterAuthorityReplicationByPeer;
+#if PRODIGY_DEBUG
+  // Bounded, scalar-only provenance for a Brain transport close. This is
+  // intentionally local diagnostic state: it is neither replicated nor
+  // persisted, and records no credential or payload material.
+  class BrainCloseProvenance
+  {
+  public:
+    uint128_t peerUUID = 0;
+    int64_t peerBootNs = 0;
+    uint64_t ioGeneration = 0;
+    int64_t timestampMs = 0;
+    uint32_t transportEpoch = 0;
+    int32_t fileSlot = -1;
+    int32_t result = 0;
+    uint32_t reasonCode = 0;
+  };
+  static constexpr uint8_t BrainCloseProvenanceCapacity = 4;
+  BrainCloseProvenance brainCloseProvenance[BrainCloseProvenanceCapacity] = {};
+  uint8_t nextBrainCloseProvenance = 0;
+
+  static uint32_t brainCloseReasonCode(const char *reason)
+  {
+    uint32_t code = 2166136261u;
+    if (reason == nullptr) return 0;
+    for (const unsigned char *p = reinterpret_cast<const unsigned char *>(reason); *p; ++p)
+      code = (code ^ *p) * 16777619u;
+    return code;
+  }
+
+  void noteBrainCloseProvenance(const BrainView *brain, const char *reason, int result)
+  {
+    if (brain == nullptr) return;
+    BrainCloseProvenance& record = brainCloseProvenance[nextBrainCloseProvenance];
+    record.peerUUID = brain->uuid;
+    record.peerBootNs = brain->boottimens;
+    record.ioGeneration = brain->ioGeneration;
+    record.timestampMs = Time::msSinceBoot();
+    record.transportEpoch = brain->transportEpoch;
+    record.fileSlot = brain->fslot;
+    record.result = result;
+    record.reasonCode = brainCloseReasonCode(reason);
+    nextBrainCloseProvenance = uint8_t((nextBrainCloseProvenance + 1) % BrainCloseProvenanceCapacity);
+  }
+#endif
   CoroutineStack brainInventoryCoroutine;
   bytell_hash_map<BrainView *, TimeoutPacket *> brainWaiters;
   bytell_hash_map<BrainView *, TimeoutPacket *> brainReconnectWaiters;
@@ -21594,6 +21638,9 @@ public:
               brain->connected = false;
               if (Ring::socketIsClosing(brain) == false)
               {
+#if PRODIGY_DEBUG
+                noteBrainCloseProvenance(brain, "accepted-replacement", 0);
+#endif
                 brain->noteCloseQueuedForCurrentTransport();
                 Ring::queueClose(brain);
               }
@@ -34807,6 +34854,9 @@ public:
       return;
     }
 
+#if PRODIGY_DEBUG
+    noteBrainCloseProvenance(brain, reason, result);
+#endif
     brain->noteCloseQueuedForCurrentTransport();
     Ring::queueClose(brain);
   }
@@ -36049,6 +36099,12 @@ public:
                    stream->fslot);
         stream->noteSendCompleted();
         stream->clearQueuedSendBytes();
+#if PRODIGY_DEBUG
+        if constexpr (std::is_same_v<T, BrainView>)
+        {
+          noteBrainCloseProvenance(stream, "send-overflow", result);
+        }
+#endif
         queueCloseIfActive(stream);
         return;
       }
@@ -36080,6 +36136,12 @@ public:
           // We still have buffered bytes, but the socket dropped out of active
           // state between submissions/completions. Force close/reconnect so
           // connectHandler can re-register and flush pending bytes.
+#if PRODIGY_DEBUG
+          if constexpr (std::is_same_v<T, BrainView>)
+          {
+            noteBrainCloseProvenance(stream, "send-inactive-buffered", result);
+          }
+#endif
           queueCloseIfActive(stream);
         }
       }
@@ -36091,6 +36153,12 @@ public:
       // A failed send may leave the buffer starting mid-frame; replaying that
       // tail on a new socket can desynchronize framing and corrupt parsing.
       stream->clearQueuedSendBytes();
+#if PRODIGY_DEBUG
+      if constexpr (std::is_same_v<T, BrainView>)
+      {
+        noteBrainCloseProvenance(stream, "send-failure", result);
+      }
+#endif
       queueCloseIfActive(stream);
     }
   }
