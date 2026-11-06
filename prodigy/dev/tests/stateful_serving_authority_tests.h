@@ -382,8 +382,94 @@ static ProdigyStatefulStoreGenerationSelection servingAuthorityTestGenerationSel
   return selection;
 }
 
+static void testStatefulStoreBootFailureCarrier(TestSuite& suite)
+{
+  auto record = [](ProdigyStatefulStoreBootFailureKind kind,
+                   ProdigyStatefulStoreBootFailureStage stage,
+                   uint128_t generation) {
+    ProdigyStatefulStoreBootFailure result = {};
+    result.kind = kind;
+    result.stage = stage;
+    result.publicationStage = 9;
+    result.systemErrno = 28;
+    result.rawError = 0xfedcba9876543210ULL;
+    result.generationUUID = generation;
+    return result;
+  };
+  auto same = [](const ProdigyStatefulStoreBootFailure& a,
+                 const ProdigyStatefulStoreBootFailure& b) {
+    return a.protocolVersion == b.protocolVersion && a.kind == b.kind && a.stage == b.stage &&
+        a.publicationStage == b.publicationStage && a.reserved == b.reserved &&
+        a.systemErrno == b.systemErrno && a.rawError == b.rawError && a.generationUUID == b.generationUUID;
+  };
+  String longHuman = {};
+  for (uint32_t index = 0; index < 400; ++index) longHuman.append('h');
+  for (uint8_t rawKind = uint8_t(ProdigyStatefulStoreBootFailureKind::missingMetadata);
+       rawKind <= uint8_t(ProdigyStatefulStoreBootFailureKind::needsDiagnosis); ++rawKind)
+  {
+    auto input = record(ProdigyStatefulStoreBootFailureKind(rawKind),
+                        ProdigyStatefulStoreBootFailureStage(1 + (rawKind % 7)),
+                        rawKind == uint8_t(ProdigyStatefulStoreBootFailureKind::missingMetadata) ? 0 : uint128_t(rawKind));
+    String report = {}, human = {};
+    ProdigyStatefulStoreBootFailure decoded = {.protocolVersion = 0};
+    suite.expect(prodigyStatefulStoreBootFailureEncodeReport(longHuman, input, report) &&
+            report.size() == ProdigyStatefulStoreBootFailureReportMaximumBytes &&
+            prodigyStatefulStoreBootFailureDecodeReport(report, decoded, human) && same(input, decoded) &&
+            human.size() == ProdigyStatefulStoreBootFailureHumanMaximumBytes &&
+            prodigyStatefulStoreBootFailureHumanReport(report) == human,
+        "boot_failure_carrier_roundtrips_every_kind_with_bounded_human_prefix");
+  }
+
+  auto input = record(ProdigyStatefulStoreBootFailureKind::capacity,
+                      ProdigyStatefulStoreBootFailureStage::publication, 0x77310020);
+  String report = {};
+  suite.require(prodigyStatefulStoreBootFailureEncodeReport("native boot failure"_ctv, input, report),
+                "boot_failure_carrier_builds_valid_fixture");
+  auto malformed = [&](const ProdigyStatefulStoreBootFailure& value) {
+    String binary = {}, encoded = {}, candidate = {};
+    auto copy = value;
+    BitseryEngine::serialize(binary, copy);
+    Base64::encode(reinterpret_cast<const uint8_t *>(binary.data()), binary.size(), encoded);
+    candidate.assign("native boot failure"_ctv);
+    candidate.append(ProdigyStatefulStoreBootFailureTrailerMarker);
+    candidate.append(encoded);
+    candidate.append('\n');
+    ProdigyStatefulStoreBootFailure decoded = {.protocolVersion = 0};
+    String human = {};
+    return !prodigyStatefulStoreBootFailureDecodeReport(candidate, decoded, human) &&
+        decoded.protocolVersion == 0 && human == candidate;
+  };
+  auto badVersion = input; ++badVersion.protocolVersion;
+  auto badKind = input; badKind.kind = ProdigyStatefulStoreBootFailureKind::none;
+  auto badStage = input; badStage.stage = ProdigyStatefulStoreBootFailureStage::none;
+  auto badReserved = input; badReserved.reserved = 1;
+  suite.expect(malformed(badVersion) && malformed(badKind) && malformed(badStage) && malformed(badReserved),
+      "boot_failure_carrier_rejects_bad_version_enum_or_reserved_record");
+
+  String truncated = report;
+  truncated.resize(truncated.size() - 1);
+  String badBase64 = report;
+  badBase64[badBase64.size() - 2] = '!';
+  ProdigyStatefulStoreBootFailure decoded = {.protocolVersion = 0};
+  String human = {};
+  suite.expect(!prodigyStatefulStoreBootFailureDecodeReport(truncated, decoded, human) && human == truncated &&
+          !prodigyStatefulStoreBootFailureDecodeReport(badBase64, decoded, human) && human == badBase64,
+      "boot_failure_carrier_rejects_truncated_or_noncanonical_base64_trailer");
+
+  String oversized = {};
+  for (uint32_t index = 0; index <= ProdigyStatefulStoreBootFailureReportMaximumBytes; ++index) oversized.append('x');
+  suite.expect(!prodigyStatefulStoreBootFailureDecodeReport(oversized, decoded, human) && human == oversized,
+      "boot_failure_carrier_rejects_oversized_report");
+
+  String legacy = "HSEHub bootData failed kind=5 stage=6"_ctv;
+  suite.expect(!prodigyStatefulStoreBootFailureDecodeReport(legacy, decoded, human) && human == legacy &&
+          prodigyStatefulStoreBootFailureHumanReport(legacy) == legacy,
+      "boot_failure_carrier_preserves_legacy_human_report");
+}
+
 static void testStatefulStoreGenerationProjection(TestSuite& suite)
 {
+  testStatefulStoreBootFailureCarrier(suite);
   auto transition = servingAuthorityTestTransition();
   for (auto& state : transition.servingRuntimeStates)
   {

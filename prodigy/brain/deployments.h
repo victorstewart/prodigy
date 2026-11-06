@@ -10036,7 +10036,7 @@ public:
       }
     }
 
-    uint64_t reportBytes = (report.size() < 256) ? report.size() : 256;
+    uint64_t reportBytes = std::min<uint64_t>(report.size(), ProdigyStatefulStoreBootFailureReportMaximumBytes);
 
     bool failedBeforeDeployHealthy = false;
     if (container->deploymentID == plan.config.deploymentID())

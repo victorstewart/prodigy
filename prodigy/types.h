@@ -10,6 +10,7 @@
 #include <prodigy/enums/datacenter.h>
 #include <networking/private4.h>
 #include <services/prodigy.h>
+#include <services/base64.h>
 #include <services/vault.h>
 #include <prodigy/container.contract.h>
 #include <prodigy/cluster.pair.enrollment.h>
@@ -5586,6 +5587,124 @@ static void serialize(S&& serializer, StatelessDeploymentPlan& plan)
   serializer.value1b(plan.moveableDuringCompaction);
 }
 
+enum class ProdigyStatefulStoreBootFailureKind : uint8_t {
+  none = 0, missingMetadata = 1, malformedMetadata = 2, permission = 3,
+  io = 4, capacity = 5, incompatible = 6, unsafePath = 7,
+  unverifiedStore = 8, interruptedInitialization = 9, other = 10,
+  environment = 11, configuration = 12, needsDiagnosis = 13
+};
+
+enum class ProdigyStatefulStoreBootFailureStage : uint8_t {
+  none = 0, environmentInspection = 1, configurationInitialization = 2,
+  kvdbOpen = 3, kvsOperation = 4, checkpoint = 5, publication = 6, other = 7
+};
+
+class ProdigyStatefulStoreBootFailure {
+public:
+  static constexpr uint32_t version = 1;
+  uint32_t protocolVersion = version;
+  ProdigyStatefulStoreBootFailureKind kind = ProdigyStatefulStoreBootFailureKind::none;
+  ProdigyStatefulStoreBootFailureStage stage = ProdigyStatefulStoreBootFailureStage::none;
+  uint8_t publicationStage = 0;
+  uint8_t reserved = 0;
+  int32_t systemErrno = 0;
+  uint64_t rawError = 0;
+  uint128_t generationUUID = 0;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyStatefulStoreBootFailure& failure)
+{
+  serializer.value4b(failure.protocolVersion);
+  serializer.value1b(failure.kind);
+  serializer.value1b(failure.stage);
+  serializer.value1b(failure.publicationStage);
+  serializer.value1b(failure.reserved);
+  serializer.value4b(failure.systemErrno);
+  serializer.value8b(failure.rawError);
+  serializer.value16b(failure.generationUUID);
+}
+
+constexpr inline uint32_t ProdigyStatefulStoreBootFailureReportMaximumBytes = 256;
+constexpr inline uint32_t ProdigyStatefulStoreBootFailureBinaryBytes = 36;
+constexpr inline uint32_t ProdigyStatefulStoreBootFailureBase64Bytes = 48;
+constexpr inline auto ProdigyStatefulStoreBootFailureTrailerMarker = "\n@NTBF1:"_ctv;
+constexpr inline uint32_t ProdigyStatefulStoreBootFailureTrailerBytes =
+    ProdigyStatefulStoreBootFailureTrailerMarker.size() + ProdigyStatefulStoreBootFailureBase64Bytes + 1;
+constexpr inline uint32_t ProdigyStatefulStoreBootFailureHumanMaximumBytes =
+    ProdigyStatefulStoreBootFailureReportMaximumBytes - ProdigyStatefulStoreBootFailureTrailerBytes;
+static_assert(ProdigyStatefulStoreBootFailureTrailerBytes == 57);
+
+static inline bool prodigyStatefulStoreBootFailureValid(const ProdigyStatefulStoreBootFailure& failure)
+{
+  return failure.protocolVersion == ProdigyStatefulStoreBootFailure::version &&
+      uint8_t(failure.kind) >= uint8_t(ProdigyStatefulStoreBootFailureKind::missingMetadata) &&
+      uint8_t(failure.kind) <= uint8_t(ProdigyStatefulStoreBootFailureKind::needsDiagnosis) &&
+      uint8_t(failure.stage) >= uint8_t(ProdigyStatefulStoreBootFailureStage::environmentInspection) &&
+      uint8_t(failure.stage) <= uint8_t(ProdigyStatefulStoreBootFailureStage::other) &&
+      failure.reserved == 0 && failure.systemErrno >= 0;
+}
+
+static inline bool prodigyStatefulStoreBootFailureEncodeReport(
+    const String& human, const ProdigyStatefulStoreBootFailure& failure, String& report)
+{
+  report.clear();
+  if (!prodigyStatefulStoreBootFailureValid(failure)) return false;
+  auto copy = failure;
+  String binary = {};
+  if (!BitseryEngine::serialize(binary, copy) || binary.size() != ProdigyStatefulStoreBootFailureBinaryBytes) return false;
+  String encoded = {};
+  Base64::encode(reinterpret_cast<const uint8_t *>(binary.data()), binary.size(), encoded);
+  if (encoded.size() != ProdigyStatefulStoreBootFailureBase64Bytes) return false;
+  const uint64_t humanBytes = std::min<uint64_t>(human.size(), ProdigyStatefulStoreBootFailureHumanMaximumBytes);
+  report.append(human.substr(0, humanBytes, Copy::no));
+  report.append(ProdigyStatefulStoreBootFailureTrailerMarker);
+  report.append(encoded);
+  report.append('\n');
+  return report.size() <= ProdigyStatefulStoreBootFailureReportMaximumBytes;
+}
+
+static inline bool prodigyStatefulStoreBootFailureBase64Character(char character)
+{
+  return (character >= 'A' && character <= 'Z') || (character >= 'a' && character <= 'z') ||
+      (character >= '0' && character <= '9') || character == '+' || character == '/';
+}
+
+static inline bool prodigyStatefulStoreBootFailureDecodeReport(
+    const String& report, ProdigyStatefulStoreBootFailure& failure, String& human)
+{
+  failure = {.protocolVersion = 0};
+  human.assign(report);
+  if (report.size() > ProdigyStatefulStoreBootFailureReportMaximumBytes ||
+      report.size() < ProdigyStatefulStoreBootFailureTrailerBytes) return false;
+  const uint64_t trailerOffset = report.size() - ProdigyStatefulStoreBootFailureTrailerBytes;
+  if (std::memcmp(report.data() + trailerOffset, ProdigyStatefulStoreBootFailureTrailerMarker.data(),
+                  ProdigyStatefulStoreBootFailureTrailerMarker.size()) != 0 || report[report.size() - 1] != '\n') return false;
+  String encoded = report.substr(trailerOffset + ProdigyStatefulStoreBootFailureTrailerMarker.size(),
+                                 ProdigyStatefulStoreBootFailureBase64Bytes, Copy::yes);
+  for (char character : encoded)
+    if (!prodigyStatefulStoreBootFailureBase64Character(character)) return false;
+  String binary = {};
+  Base64::decode(encoded, binary);
+  if (binary.size() != ProdigyStatefulStoreBootFailureBinaryBytes) return false;
+  String canonical = {};
+  Base64::encode(reinterpret_cast<const uint8_t *>(binary.data()), binary.size(), canonical);
+  ProdigyStatefulStoreBootFailure decoded = {.protocolVersion = 0};
+  if (canonical != encoded || !BitseryEngine::deserializeSafe(binary, decoded) ||
+      !prodigyStatefulStoreBootFailureValid(decoded)) return false;
+  failure = decoded;
+  human.assign(report.substr(0, trailerOffset, Copy::no));
+  return true;
+}
+
+static inline String prodigyStatefulStoreBootFailureHumanReport(const String& report)
+{
+  ProdigyStatefulStoreBootFailure ignored = {.protocolVersion = 0};
+  String human = {};
+  (void)prodigyStatefulStoreBootFailureDecodeReport(report, ignored, human);
+  return human;
+}
+
 class FailureReport {
 public:
 
@@ -5602,7 +5721,8 @@ public:
     string.appendTabs(nTabs);
     string.append("Failure Report:\n"_ctv);
 
-    string.snprintf_tab_add<"\tnreport: {}\n"_ctv>(nTabs, report);
+    String humanReport = prodigyStatefulStoreBootFailureHumanReport(report);
+    string.snprintf_tab_add<"\tnreport: {}\n"_ctv>(nTabs, humanReport);
     string.snprintf_tab_add<"\tnapproxTime: {}\n"_ctv>(nTabs, String::epochMsToDateTime(approxTimeMs));
     string.snprintf_tab_add<"\tnnthCrash: {itoa}\n"_ctv>(nTabs, nthCrash);
     string.snprintf_tab_add<"\tnsignal: {itoa}\n"_ctv>(nTabs, signal);

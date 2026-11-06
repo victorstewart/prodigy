@@ -3796,10 +3796,92 @@ static void testStoreGenerationLaunchMetadata(TestSuite& suite)
   verify(",\"stateful_store_generation_protocol\":1,\"stateful_store_generation_protocol\":1", false, 0);
 }
 
+static void testBoundedFailureReport(TestSuite& suite)
+{
+  siginfo_t termination = {};
+  termination.si_code = CLD_DUMPED;
+  termination.si_status = SIGSEGV;
+  String report =
+      "crash-report-head-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv;
+  String standardError =
+      "stderr-prefix-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-PC=0xfeedface"_ctv;
+  String summary = ContainerManager::boundedFailureReport(termination, SIGSEGV, report, standardError);
+  std::string_view summaryView(reinterpret_cast<const char *>(summary.data()), summary.size());
+  suite.expect(summary.size() <= 256, "failure_summary_stays_within_brain_wire_limit");
+  suite.expect(summaryView.find("termination=si_code") != std::string_view::npos,
+               "failure_summary_retains_termination_identity");
+  suite.expect(summaryView.find("crash-report-head") != std::string_view::npos,
+               "failure_summary_retains_report_head");
+  suite.expect(summaryView.find("PC=0xfeedface") != std::string_view::npos,
+               "failure_summary_retains_stderr_tail");
+
+  ProdigyStatefulStoreBootFailure failure = {};
+  failure.kind = ProdigyStatefulStoreBootFailureKind::missingMetadata;
+  failure.stage = ProdigyStatefulStoreBootFailureStage::kvdbOpen;
+  failure.systemErrno = ENOENT;
+  failure.rawError = 18432952018894061570ULL;
+  failure.generationUUID = 0x71;
+  String typedReport = {};
+  suite.expect(prodigyStatefulStoreBootFailureEncodeReport(report, failure, typedReport),
+               "failure_summary_fixture_has_typed_boot_failure");
+  String typedSummary = ContainerManager::boundedFailureReport(termination, SIGSEGV, typedReport, standardError);
+  ProdigyStatefulStoreBootFailure decoded = {};
+  String human = {};
+  suite.expect(typedSummary.size() <= ProdigyStatefulStoreBootFailureReportMaximumBytes &&
+                   prodigyStatefulStoreBootFailureDecodeReport(typedSummary, decoded, human) &&
+                   decoded.kind == failure.kind && decoded.stage == failure.stage &&
+                   decoded.systemErrno == ENOENT && decoded.rawError == failure.rawError &&
+                   decoded.generationUUID == failure.generationUUID,
+               "failure_summary_preserves_typed_cause_and_generation_through_truncation");
+  std::string_view humanView(reinterpret_cast<const char *>(human.data()), human.size());
+  suite.expect(humanView.find("termination=si_code") != std::string_view::npos &&
+                   humanView.find("crash-report-head") != std::string_view::npos &&
+                   humanView.find("PC=0xfeedface") != std::string_view::npos,
+               "failure_summary_typed_path_retains_termination_report_head_and_stderr_tail");
+
+  FailureReport recorded = {};
+  recorded.containerUUID = 0x81;
+  recorded.report = typedSummary;
+  recorded.approxTimeMs = 1;
+  recorded.nthCrash = 1;
+  recorded.signal = SIGSEGV;
+  recorded.restarted = true;
+  recorded.wasCanary = false;
+  DeploymentStatusReport status = {};
+  status.failureReports.push_back(recorded);
+  String statusBytes = {};
+  DeploymentStatusReport restored = {};
+  suite.expect(BitseryEngine::serialize(statusBytes, status) &&
+                   BitseryEngine::deserializeSafe(statusBytes, restored) && restored.failureReports.size() == 1 &&
+                   restored.failureReports[0].report == typedSummary &&
+                   prodigyStatefulStoreBootFailureDecodeReport(restored.failureReports[0].report, decoded, human) &&
+                   decoded.generationUUID == failure.generationUUID,
+               "failure_summary_typed_record_survives_existing_status_codec");
+  String displayed = {};
+  recorded.stringify(displayed, 0);
+  const std::string_view displayedView(reinterpret_cast<const char *>(displayed.data()), displayed.size());
+  suite.expect(displayedView.find("crash-report-head") != std::string_view::npos &&
+                   displayedView.find("@NTBF1:") == std::string_view::npos,
+               "failure_summary_display_preserves_human_report_without_wire_trailer");
+
+  String malformed = typedReport.substr(0, typedReport.size() - 1, Copy::yes);
+  String malformedSummary = ContainerManager::boundedFailureReport(termination, SIGSEGV, malformed, standardError);
+  suite.expect(!prodigyStatefulStoreBootFailureDecodeReport(malformedSummary, decoded, human),
+               "failure_summary_does_not_promote_malformed_trailer_to_typed_evidence");
+}
+
 int main(void)
 {
   TestSuite suite;
   const char *selector = std::getenv("PRODIGY_TEST_ONLY");
+  if (selector == nullptr || std::strcmp(selector, "typed-boot-failure") == 0)
+  {
+    testBoundedFailureReport(suite);
+    if (selector != nullptr) {
+      dprintf(STDOUT_FILENO, "typed_boot_failure passed=%d failed=%d\n", suite.passed, suite.failed);
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+  }
   if (selector == nullptr || std::strcmp(selector, "store-generation-metadata") == 0)
   {
     testStoreGenerationLaunchMetadata(suite);
@@ -4610,25 +4692,6 @@ int main(void)
   {
     dprintf(STDOUT_FILENO, "storage_owner_focused failed=%d\n", suite.failed);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
-  }
-
-  {
-    siginfo_t termination = {};
-    termination.si_code = CLD_DUMPED;
-    termination.si_status = SIGSEGV;
-    String report =
-        "crash-report-head-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv;
-    String standardError =
-        "stderr-prefix-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-PC=0xfeedface"_ctv;
-    String summary = ContainerManager::boundedFailureReport(termination, SIGSEGV, report, standardError);
-    std::string_view summaryView(reinterpret_cast<const char *>(summary.data()), summary.size());
-    suite.expect(summary.size() <= 256, "failure_summary_stays_within_brain_wire_limit");
-    suite.expect(summaryView.find("termination=si_code") != std::string_view::npos,
-                 "failure_summary_retains_termination_identity");
-    suite.expect(summaryView.find("crash-report-head") != std::string_view::npos,
-                 "failure_summary_retains_report_head");
-    suite.expect(summaryView.find("PC=0xfeedface") != std::string_view::npos,
-                 "failure_summary_retains_stderr_tail");
   }
 
   {

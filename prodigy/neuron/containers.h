@@ -4607,11 +4607,16 @@ public:
   {
     // The Brain stores at most 256 report bytes. Keep the termination identity,
     // beginning of the report, and the end of stderr (where crash PCs land).
+    ProdigyStatefulStoreBootFailure bootFailure = {};
+    String humanReport = {};
+    const bool typed = prodigyStatefulStoreBootFailureDecodeReport(report, bootFailure, humanReport);
+    const String& reportHead = typed ? humanReport : report;
+    const uint64_t maximumWireReportBytes = typed ? ProdigyStatefulStoreBootFailureHumanMaximumBytes :
+        ProdigyStatefulStoreBootFailureReportMaximumBytes;
     String bounded = {};
     bounded.snprintf<"termination=si_code {itoa} si_status {itoa} signal {itoa}\nreport-head:\n"_ctv>(
         int(infop.si_code), int(infop.si_status), terminalSignal);
-    constexpr uint64_t maximumWireReportBytes = 256;
-    constexpr uint64_t stderrTailBytes = 112;
+    const uint64_t stderrTailBytes = typed ? 64 : 112;
     constexpr uint64_t stderrLabelBytes = 14;
     uint64_t remainingAfterHeader = maximumWireReportBytes > bounded.size()
                                         ? maximumWireReportBytes - bounded.size()
@@ -4619,8 +4624,8 @@ public:
     uint64_t headBudget = remainingAfterHeader > stderrLabelBytes + stderrTailBytes
                               ? remainingAfterHeader - stderrLabelBytes - stderrTailBytes
                               : 0;
-    uint64_t headBytes = std::min<uint64_t>(report.size(), headBudget);
-    bounded.append(report.substr(0, headBytes, Copy::no));
+    uint64_t headBytes = std::min<uint64_t>(reportHead.size(), headBudget);
+    bounded.append(reportHead.substr(0, headBytes, Copy::no));
     bounded.append("\nstderr-tail:\n"_ctv);
     uint64_t tailBudget = maximumWireReportBytes > bounded.size()
                               ? maximumWireReportBytes - bounded.size()
@@ -4634,6 +4639,12 @@ public:
     if (bounded.size() > maximumWireReportBytes)
     {
       bounded.assign(bounded.substr(0, maximumWireReportBytes, Copy::yes));
+    }
+    if (typed)
+    {
+      String encoded = {};
+      if (prodigyStatefulStoreBootFailureEncodeReport(bounded, bootFailure, encoded))
+        return encoded;
     }
     return bounded;
   }
