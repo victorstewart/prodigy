@@ -42,10 +42,10 @@ must have a hard `nofile` limit of at least 16,384; a systemd launcher can set
 opening a registry. This provides recovery headroom for the cluster and
 provider-credential registries while retaining their short exclusive-lock scopes.
 
-TidesDB is pinned to `04574538`, upstream 10.2.1 plus the recovery cleanup in
-[upstream PR #703](https://github.com/tidesdb/tidesdb/pull/703), while that change
-awaits upstream review. Recovery removes validated header-only segments before
-adopting files into its fixed table, so idle reopens do not accumulate them.
+TidesDB is pinned to upstream master commit `3f2ca62f` (10.2.1), which includes
+[PR #703](https://github.com/tidesdb/tidesdb/pull/703). Recovery removes validated
+header-only segments before adopting files into its fixed table, so idle reopens
+do not accumulate them.
 The 4,096-segment limit still applies to retained data-bearing or damaged files.
 Mothership leaves segment cleanup to TidesDB and keeps its descriptor policy
 separate from that storage limit.
