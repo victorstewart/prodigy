@@ -13,11 +13,30 @@
 
 static inline bool mothershipRetainedRecoveryPlansEqual(const DeploymentPlan&,const DeploymentPlan&);
 
+// Ordinary update admission may retain a rejected candidate and its failure
+// before the inventory checkpoint starts. It is dormant only when every
+// coordinator, handoff, worker and recovery field is still default. Preserve
+// these bytes as evidence; they do not authorize executing the candidate.
+static inline bool mothershipRetainedRecoveryRejectedUpdatePayloadValid(
+    const ProdigyPersistentUpdateSelfState& update)
+{
+  if (update.bundleBlob.empty() || update.workerFailure.empty() ||
+      !prodigyIsSHA256HexDigest(update.workerExpectedBundleSHA256)) return false;
+  ProdigyPersistentUpdateSelfState rejected = {};
+  rejected.bundleBlob = update.bundleBlob;
+  rejected.workerExpectedBundleSHA256 = update.workerExpectedBundleSHA256;
+  rejected.workerFailure = update.workerFailure;
+  String digest = {};
+  return update == rejected && prodigyComputeSHA256Hex(update.bundleBlob, digest) &&
+      digest == update.workerExpectedBundleSHA256;
+}
+
 // Read-only admission for a generic stopped-runtime replacement.  The caller
 // supplies objects decoded by Prodigy's persistent store from private copies;
-// this validator never opens, rewrites, or normalizes a store.  An old
-// update-self coordinator is meaningful authority, not stale clutter, so a
-// generic recovery must reject it rather than silently clearing it.
+// this validator never opens, rewrites, or normalizes a store. An actionable
+// update-self coordinator remains meaningful authority and blocks recovery.
+// An exact rejected-before-checkpoint payload and a concurrency preference
+// carry no transition intent; both remain unchanged in the retained store.
 static inline bool mothershipRuntimeRecoverySnapshotValid(
     const ProdigyPersistentLocalBrainState& local,
     const ProdigyPersistentBrainSnapshot& snapshot,
@@ -44,7 +63,9 @@ static inline bool mothershipRuntimeRecoverySnapshotValid(
   if (!authority.hasCompletedInitialMasterElection || authority.generation==0)
     return reject("private Brain snapshot lacks completed durable initial election");
   const ProdigyPersistentUpdateSelfState idle = {};
-  if (authority.updateSelf != idle || authority.updateSelfFollowerConcurrency != 0 ||
+  if ((authority.updateSelf != idle &&
+       !mothershipRetainedRecoveryRejectedUpdatePayloadValid(authority.updateSelf)) ||
+      authority.updateSelfFollowerConcurrency > ProdigyUpdateSelfMaximumConcurrency ||
       !authority.updateSelfFollowerTransitionIssuedPeerKeys.empty() ||
       !authority.updateSelfFollowerReadyPeerKeys.empty())
     return reject("private Brain snapshot contains an in-flight update-self coordinator");
@@ -638,20 +659,11 @@ static inline bool mothershipRetainedRecoveryCanReplaceUpdate(
   // Admission may reject after retaining the candidate payload, before the
   // coordinator issues any work. Fenced recovery may consume that exact
   // candidate only when every progress, handoff and recovery field is empty.
-  ProdigyPersistentUpdateSelfState unstarted;
-  unstarted.bundleBlob = update.bundleBlob;
-  unstarted.workerExpectedBundleSHA256 = update.workerExpectedBundleSHA256;
-  unstarted.workerFailure = update.workerFailure;
-  if (update == unstarted && !update.bundleBlob.empty() && !update.workerFailure.empty() &&
-      (update.workerExpectedBundleSHA256 == expectedBundleSHA256 ||
+  if ((update.workerExpectedBundleSHA256 == expectedBundleSHA256 ||
        (prodigyIsSHA256HexDigest(rejectedCandidateSHA256) &&
         rejectedCandidateSHA256 != expectedBundleSHA256 &&
-        update.workerExpectedBundleSHA256 == rejectedCandidateSHA256)))
-  {
-    String digest;
-    return prodigyComputeSHA256Hex(update.bundleBlob, digest) &&
-        digest == update.workerExpectedBundleSHA256;
-  }
+        update.workerExpectedBundleSHA256 == rejectedCandidateSHA256)) &&
+      mothershipRetainedRecoveryRejectedUpdatePayloadValid(update)) return true;
   // Followers can still hold the previous recovery envelope when the master's
   // next update is contained. Only the sealed installed predecessor is allowed.
   const bool previousEnvelope = mothershipRetainedRecoveryEnvelopeMatches(update, previousBundleSHA256);

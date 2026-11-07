@@ -1839,6 +1839,73 @@ int main()
     snapshot.masterAuthority.runtimeState.updateSelf={};
     snapshot.masterAuthority.runtimeState.updateSelfFollowerReadyPeerKeys.push_back(1);
     assert(!mothershipRuntimeRecoverySnapshotValid(local,snapshot,cluster,member,topology,&failure));
+    snapshot.masterAuthority.runtimeState.updateSelfFollowerReadyPeerKeys.clear();
+
+    // A rejected inventory checkpoint leaves only the candidate payload,
+    // digest, failure and requested concurrency. Restart restores idle state;
+    // admission preserves this evidence and never executes that candidate.
+    auto& authority = snapshot.masterAuthority.runtimeState;
+    for (uint8_t concurrency = 0; concurrency <= ProdigyUpdateSelfMaximumConcurrency; ++concurrency) {
+      authority.updateSelfFollowerConcurrency = concurrency;
+      assert(mothershipRuntimeRecoverySnapshotValid(local,snapshot,cluster,member,topology,&failure));
+    }
+    authority.updateSelf.bundleBlob.assign("candidate rejected before inventory checkpoint"_ctv);
+    assert(prodigyComputeSHA256Hex(authority.updateSelf.bundleBlob,
+                                  authority.updateSelf.workerExpectedBundleSHA256));
+    authority.updateSelf.workerFailure.assign("machine container ownership needs a fresh authenticated stateUpload for bundle exec"_ctv);
+    const auto rejected = authority.updateSelf;
+    for (uint8_t concurrency = 0; concurrency <= ProdigyUpdateSelfMaximumConcurrency; ++concurrency) {
+      authority.updateSelfFollowerConcurrency = concurrency;
+      assert(mothershipRuntimeRecoverySnapshotValid(local,snapshot,cluster,member,topology,&failure));
+      assert(authority.updateSelf == rejected && authority.updateSelfFollowerConcurrency == concurrency);
+    }
+    assert(mothershipRetainedRecoveryCanReplaceUpdate(snapshot,rejected.workerExpectedBundleSHA256));
+    String otherDigest; otherDigest.assign(std::string(64,'e').c_str());
+    assert(!mothershipRetainedRecoveryCanReplaceUpdate(snapshot,otherDigest));
+    assert(mothershipRetainedRecoveryCanReplaceUpdate(snapshot,otherDigest,{}, {},rejected.workerExpectedBundleSHA256));
+    struct UnsafeRejectedMutation { void (*apply)(ProdigyPersistentUpdateSelfState&); };
+    const UnsafeRejectedMutation mutations[] = {
+      {[](auto& v) { v.state = uint8_t(ProdigyPersistentUpdateSelfState::Phase::waitingForBundleEchos); }},
+      {[](auto& v) { v.state = uint8_t(ProdigyPersistentUpdateSelfState::Phase::waitingForFollowerReboots); }},
+      {[](auto& v) { v.state = uint8_t(ProdigyPersistentUpdateSelfState::Phase::waitingForRelinquishEchos); }},
+      {[](auto& v) { v.expectedEchos = 1; }},
+      {[](auto& v) { v.bundleEchos = 1; }},
+      {[](auto& v) { v.relinquishEchos = 1; }},
+      {[](auto& v) { v.plannedMasterPeerKey = 1; }},
+      {[](auto& v) { v.pendingDesignatedMasterPeerKey = 1; }},
+      {[](auto& v) { v.useStagedBundleOnly = true; }},
+      {[](auto& v) { v.bundleBlob.clear(); }},
+      {[](auto& v) { v.bundleBlob.append('!'); }},
+      {[](auto& v) { v.workerExpectedBundleSHA256.clear(); }},
+      {[](auto& v) { v.workerFailure.clear(); }},
+      {[](auto& v) { v.bundleEchoPeerKeys.push_back(1); }},
+      {[](auto& v) { v.relinquishEchoPeerKeys.push_back(1); }},
+      {[](auto& v) { v.followerBootNsByPeerKey.push_back({.peerKey=1,.bootNs=1}); }},
+      {[](auto& v) { v.followerRebootedPeerKeys.push_back(1); }},
+      {[](auto& v) { v.workerMachineUUIDs.push_back(1); }},
+      {[](auto& v) { v.workerStagedMachineUUIDs.push_back(1); }},
+      {[](auto& v) { v.workerTransitionIssuedMachineUUIDs.push_back(1); }},
+      {[](auto& v) { v.workerRebootedMachineUUIDs.push_back(1); }},
+      {[](auto& v) { v.workerStateUploadedMachineUUIDs.push_back(1); }},
+      {[](auto& v) { v.localMachineUUID = 1; }},
+      {[](auto& v) { v.localBundleRegistered = true; }},
+      {[](auto& v) { v.localContainerBootstraps.push_back("retained"_ctv); }},
+      {[](auto& v) { v.machineRecoveryWitnesses.push_back({}); }}
+    };
+    for (const auto& mutation : mutations) {
+      authority.updateSelf = rejected;
+      mutation.apply(authority.updateSelf);
+      assert(!mothershipRuntimeRecoverySnapshotValid(local,snapshot,cluster,member,topology,&failure));
+    }
+    authority.updateSelf = rejected;
+    authority.updateSelfFollowerConcurrency = ProdigyUpdateSelfMaximumConcurrency + 1;
+    assert(!mothershipRuntimeRecoverySnapshotValid(local,snapshot,cluster,member,topology,&failure));
+    authority.updateSelfFollowerConcurrency = 1;
+    authority.updateSelfFollowerTransitionIssuedPeerKeys.push_back(1);
+    assert(!mothershipRuntimeRecoverySnapshotValid(local,snapshot,cluster,member,topology,&failure));
+    authority.updateSelfFollowerTransitionIssuedPeerKeys.clear();
+    authority.updateSelfFollowerReadyPeerKeys.push_back(1);
+    assert(!mothershipRuntimeRecoverySnapshotValid(local,snapshot,cluster,member,topology,&failure));
   }
   if (const char *only=std::getenv("PRODIGY_TEST_ONLY");only &&
       (std::strcmp(only,"initial-seed-runtime-repair")==0 || std::strcmp(only,"populated-seed-runtime-repair")==0)) {
