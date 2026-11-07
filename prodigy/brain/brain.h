@@ -27616,6 +27616,112 @@ public:
     return 1;
   }
 
+  // ClusterTopology is the authority for an adopted machine's logical rack.
+  // `Machine::rack` and the deployment placement maps intentionally use Rack*
+  // identity for their hot scheduling path, so changing only rackUUID makes a
+  // truthful cluster report while leaving scheduling on the old rack.
+  void rebindMachineRack(Machine *machine, uint32_t rackUUID)
+  {
+    if (machine == nullptr || rackUUID == 0)
+    {
+      return;
+    }
+
+    Rack *previousRack = machine->rack;
+    if (previousRack != nullptr && previousRack->uuid == rackUUID)
+    {
+      machine->rackUUID = rackUUID;
+      return;
+    }
+
+    Rack *rack = nullptr;
+    if (auto rackIt = racks.find(rackUUID); rackIt != racks.end())
+    {
+      rack = rackIt->second;
+    }
+    else
+    {
+      rack = new Rack();
+      rack->uuid = rackUUID;
+      racks.insert_or_assign(rackUUID, rack);
+    }
+
+    if (previousRack != nullptr)
+    {
+      previousRack->machines.erase(machine);
+    }
+    machine->rackUUID = rackUUID;
+    machine->rack = rack;
+    rack->machines.insert(machine);
+
+    // Existing deployment counters and shard fences are keyed by Rack*, not
+    // by the durable rack UUID. Re-key only the moved machine's contribution;
+    // the existing deployment predicate remains the single authority for
+    // whether an old or new rack is represented by a stateful shard.
+    if (previousRack != nullptr)
+    {
+      Vector<ApplicationDeployment *> graph;
+      collectDeploymentGraph(graph);
+      for (ApplicationDeployment *deployment : graph)
+      {
+        if (deployment == nullptr)
+        {
+          continue;
+        }
+
+        uint32_t movedCount = 0;
+        if (auto machineCount = deployment->countPerMachine.find(machine);
+            machineCount != deployment->countPerMachine.end())
+        {
+          movedCount = machineCount->second;
+        }
+        if (movedCount > 0)
+        {
+          if (auto previousCount = deployment->countPerRack.find(previousRack);
+              previousCount != deployment->countPerRack.end())
+          {
+            if (previousCount->second <= movedCount)
+            {
+              deployment->countPerRack.erase(previousCount);
+            }
+            else
+            {
+              previousCount->second -= movedCount;
+            }
+          }
+          deployment->countPerRack[rack] += movedCount;
+        }
+
+        for (auto& [shardGroup, placedRacks] : deployment->racksByShardGroup)
+        {
+          if (deploymentUsesRackForShardGroup(deployment, previousRack, shardGroup) == false)
+          {
+            placedRacks.erase(previousRack);
+          }
+          if (deploymentUsesRackForShardGroup(deployment, rack, shardGroup))
+          {
+            placedRacks.insert(rack);
+          }
+        }
+      }
+      bool referencedByRetiringMachine = false;
+      for (const auto& [neuron, retirement] : retiringMachinesByNeuron)
+      {
+        (void)neuron;
+        if (retirement.machine != nullptr && retirement.machine->rack == previousRack)
+        {
+          referencedByRetiringMachine = true;
+          break;
+        }
+      }
+      if (previousRack->machines.empty() && referencedByRetiringMachine == false)
+      {
+        eraseRetiredRackPlacement(previousRack, graph);
+      }
+      deleteRackIfUnused(previousRack);
+    }
+  }
+
   void applyClusterMachineRecord(Machine *machine, const ClusterMachine& clusterMachine, uint32_t resolvedPrivate4, const IPAddress& resolvedPeerAddress, const String& resolvedPeerAddressText)
   {
     if (machine == nullptr)
@@ -27698,7 +27804,7 @@ public:
     }
     machine->uuid = resolvedMachineUUID;
     uint32_t rackUUID = synthesizeTestClusterRackUUID(clusterMachine, resolvedPrivate4, resolvedPeerAddressText);
-    machine->rackUUID = rackUUID != 0 ? rackUUID : 1;
+    rebindMachineRack(machine, rackUUID != 0 ? rackUUID : 1);
     machine->private4 = resolvedPrivate4;
     machine->gatewayPrivate4 = 0;
     if (clusterMachine.resolvePrivate4Gateway(machine->gatewayPrivate4) == false && thisNeuron != nullptr)
@@ -28833,42 +28939,6 @@ public:
         return;
       }
 
-      auto assignRack = [&](Machine *machine, uint32_t rackUUID) -> void {
-        if (machine == nullptr || rackUUID == 0)
-        {
-          return;
-        }
-
-        if (machine->rack != nullptr && machine->rack->uuid == rackUUID)
-        {
-          machine->rackUUID = rackUUID;
-          return;
-        }
-
-        if (machine->rack != nullptr)
-        {
-          Rack *previousRack = machine->rack;
-          previousRack->machines.erase(machine);
-          deleteRackIfUnused(previousRack);
-        }
-
-        Rack *rack = nullptr;
-        if (auto rackIt = racks.find(rackUUID); rackIt != racks.end())
-        {
-          rack = rackIt->second;
-        }
-        else
-        {
-          rack = new Rack();
-          rack->uuid = rackUUID;
-          racks.insert_or_assign(rackUUID, rack);
-        }
-
-        machine->rackUUID = rackUUID;
-        machine->rack = rack;
-        rack->machines.insert(machine);
-      };
-
       // The authoritative topology owns cluster roles. Provider inventory
       // snapshots describe backing-machine state and may omit both flags, so a
       // sparse refresh must not erase an already established Brain or local
@@ -28929,7 +28999,7 @@ public:
 
       if (candidate->rackUUID != 0)
       {
-        assignRack(canonical, candidate->rackUUID);
+        rebindMachineRack(canonical, candidate->rackUUID);
       }
     };
 

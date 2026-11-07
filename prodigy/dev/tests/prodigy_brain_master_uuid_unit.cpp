@@ -3918,11 +3918,159 @@ int main(void)
     delete peer;
   };
 
+  auto runAdoptedRackTopologyRebindFixture = [&] {
+    BrainBase *savedBrain = thisBrain;
+    TestBrain brain = {};
+    NoopBrainIaaS provider = {};
+    brain.iaas = &provider;
+    thisBrain = &brain;
+
+    Rack *originalRack = new Rack();
+    originalRack->uuid = 1;
+    brain.racks.insert_or_assign(originalRack->uuid, originalRack);
+
+    Vector<Machine *> machines = {};
+    for (uint32_t index = 0; index < 3; ++index)
+    {
+      Machine *machine = new Machine();
+      machine->uuid = uint128_t(0x7a000 + index);
+      machine->rackUUID = originalRack->uuid;
+      machine->rack = originalRack;
+      machine->topologySource = uint8_t(ClusterMachineSource::adopted);
+      machine->lifetime = MachineLifetime::owned;
+      machine->state = MachineState::healthy;
+      machine->neuron.machine = machine;
+      originalRack->machines.insert(machine);
+      brain.machines.insert(machine);
+      brain.machinesByUUID.insert_or_assign(machine->uuid, machine);
+      machines.push_back(machine);
+    }
+
+    ApplicationDeployment *current = new ApplicationDeployment();
+    current->plan = makeDeploymentPlan(0x7a01, 1);
+    current->plan.config.type = ApplicationType::stateful;
+    current->plan.isStateful = true;
+    current->nShardGroups = 1;
+    brain.deployments.insert_or_assign(current->plan.config.deploymentID(), current);
+
+    MachineTicket placedTicket = {};
+    placedTicket.deployment = current;
+    Machine::Claim placedClaim = {};
+    placedClaim.ticket = &placedTicket;
+    placedClaim.nFit = 1;
+    placedClaim.shardGroups.push_back(0);
+    machines[2]->claims.push_back(std::move(placedClaim));
+    current->countPerMachine[machines[1]] = 2;
+    current->countPerMachine[machines[2]] = 1;
+    current->countPerRack[originalRack] = 3;
+    current->racksByShardGroup[0].insert(originalRack);
+
+    ClusterTopology corrected = {};
+    corrected.version = 9;
+    for (uint32_t index = 0; index < machines.size(); ++index)
+    {
+      ClusterMachine record = {};
+      record.source = ClusterMachineSource::adopted;
+      record.backing = ClusterMachineBacking::owned;
+      record.kind = MachineConfig::MachineKind::vm;
+      record.lifetime = MachineLifetime::owned;
+      record.uuid = machines[index]->uuid;
+      record.rackUUID = index + 1;
+      record.ssh.address.snprintf<"10.0.{}.{}"_ctv>(7, 10 + index);
+      record.ssh.user = "root"_ctv;
+      prodigyAppendUniqueClusterMachineAddress(record.addresses.privateAddresses, record.ssh.address, 24);
+      corrected.machines.push_back(std::move(record));
+    }
+
+    suite.expect(brain.testRestoreMachinesFromClusterTopology(corrected),
+                 "adopted_rack_topology_restore_accepts_in_place_labels");
+    Rack *rackOne = machines[0]->rack;
+    Rack *rackTwo = machines[1]->rack;
+    Rack *rackThree = machines[2]->rack;
+    suite.expect(rackOne != nullptr && rackTwo != nullptr && rackThree != nullptr &&
+                     rackOne->uuid == 1 && rackTwo->uuid == 2 && rackThree->uuid == 3 &&
+                     rackOne != rackTwo && rackTwo != rackThree &&
+                     rackOne->machines.contains(machines[0]) && rackTwo->machines.contains(machines[1]) &&
+                     rackThree->machines.contains(machines[2]),
+                 "adopted_rack_topology_restore_rebinds_runtime_rack_identity");
+    suite.expect(current->countPerRack.contains(originalRack) == false &&
+                     current->countPerRack.getIf(rackTwo) == 2 && current->countPerRack.getIf(rackThree) == 1 &&
+                     current->racksByShardGroup[0].contains(originalRack) == false &&
+                     current->racksByShardGroup[0].contains(rackThree),
+                 "adopted_rack_topology_restore_rekeys_current_placements");
+
+    ApplicationDeployment singleShard = {};
+    singleShard.nShardGroups = 1;
+    uint32_t singleShardFit = 0;
+    for (Machine *machine : machines)
+    {
+      if (singleShard.canPlaceReplicaForShardGroupOnRack(0, machine->rack))
+      {
+        singleShard.racksByShardGroup[0].insert(machine->rack);
+        ++singleShardFit;
+      }
+    }
+    suite.expect(singleShardFit == 3, "adopted_rack_topology_restore_single_shard_fits_three_racks");
+
+    ApplicationDeployment threeShards = {};
+    threeShards.nShardGroups = 3;
+    uint32_t threeShardFit = 0;
+    for (uint32_t shardGroup = 0; shardGroup < 3; ++shardGroup)
+    {
+      for (Machine *machine : machines)
+      {
+        if (threeShards.canPlaceReplicaForShardGroupOnRack(shardGroup, machine->rack))
+        {
+          threeShards.racksByShardGroup[shardGroup].insert(machine->rack);
+          ++threeShardFit;
+        }
+      }
+    }
+    suite.expect(threeShardFit == 9, "adopted_rack_topology_restore_three_shards_fit_nine_replicas");
+
+    suite.expect(brain.testRestoreMachinesFromClusterTopology(corrected) &&
+                     machines[0]->rack == rackOne && machines[1]->rack == rackTwo && machines[2]->rack == rackThree &&
+                     current->countPerRack.getIf(rackTwo) == 2 && current->countPerRack.getIf(rackThree) == 1,
+                 "adopted_rack_topology_restore_is_idempotent");
+
+    const uint32_t originalRackUUID = originalRack->uuid;
+    current->countPerRack[originalRack] = 0;
+    current->racksByShardGroup[0].insert(originalRack);
+    corrected.machines[0].rackUUID = 4;
+    suite.expect(brain.testRestoreMachinesFromClusterTopology(corrected) &&
+                     brain.racks.contains(originalRackUUID) == false && machines[0]->rack != nullptr &&
+                     machines[0]->rack->uuid == 4 && current->countPerRack.contains(originalRack) == false &&
+                     current->racksByShardGroup[0].contains(originalRack) == false,
+                 "adopted_rack_topology_restore_reaps_last_old_rack_and_zero_indexes");
+    Rack *rackFour = machines[0]->rack;
+
+    brain.deployments.clear();
+    delete current;
+    for (Machine *machine : machines)
+    {
+      brain.machines.erase(machine);
+      brain.machinesByUUID.erase(machine->uuid);
+      machine->rack->machines.erase(machine);
+      delete machine;
+    }
+    for (Rack *rack : {rackTwo, rackThree, rackFour})
+    {
+      brain.racks.erase(rack->uuid);
+      delete rack;
+    }
+    thisBrain = savedBrain;
+  };
+
   if (const char *testOnly = ::getenv("PRODIGY_TEST_ONLY"); testOnly != nullptr)
   {
     if (std::strcmp(testOnly, "forced-non-connector-fallback") == 0)
     {
       runForcedNonConnectorFallbackFixture();
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (std::strcmp(testOnly, "adopted-rack-topology-rebind") == 0)
+    {
+      runAdoptedRackTopologyRebindFixture();
       return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     if (std::strcmp(testOnly, "machine-claim-resume-mutation") == 0)
@@ -4016,6 +4164,7 @@ int main(void)
   }
 
   runStrandedFollowerReconnectFixture(suite);
+  runAdoptedRackTopologyRebindFixture();
   runInitialConnectFailureRetryFixture(suite);
   runPromotedCanonicalConnectorRecoveryFixture(suite, neuron);
   runGhostMasterRegistrationFixtures(suite);
