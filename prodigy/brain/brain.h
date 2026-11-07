@@ -24229,18 +24229,50 @@ public:
   // stateUpload records, and only while their complete UUID set still equals
   // the canonical machine index. A membership change makes this return false;
   // the caller requests the established fresh stateUpload before retrying.
-  bool collectAuthenticatedNeuronStateUploadBootstraps(Machine *machine, Vector<String>& serializedBootstraps)
+  bool collectAuthenticatedNeuronStateUploadBootstraps(
+      Machine *machine, Vector<String>& serializedBootstraps, String *diagnostic = nullptr)
   {
     serializedBootstraps.clear();
-    if (machine == nullptr || machine->uuid == 0 || machine->runtimeReady == false ||
-        persistedMachineInventoryUploaded.contains(machine->uuid) == false)
+    if (diagnostic != nullptr)
     {
+      diagnostic->clear();
+    }
+    if (machine == nullptr)
+    {
+      if (diagnostic != nullptr) diagnostic->assign("stateUpload inventory machine=0 category=machine-null"_ctv);
       return false;
+    }
+
+    const auto reject = [&](const String& category, uint64_t deploymentID = 0, uint128_t containerUUID = 0,
+                            uint64_t canonicalCount = 0, uint64_t uploadedCount = 0) {
+      serializedBootstraps.clear();
+      if (diagnostic != nullptr)
+      {
+        String machineID = {}, deployment = {}, container = {};
+        machineID.assignItoh(machine->uuid);
+        deployment.assignItoh(deploymentID);
+        container.assignItoh(containerUUID);
+        diagnostic->snprintf_add<"stateUpload inventory machine={} category={} deployment={} container={} canonical={itoa} uploaded={itoa}"_ctv>(
+            machineID, category, deployment, container, canonicalCount, uploadedCount);
+      }
+      return false;
+    };
+    if (machine->uuid == 0)
+    {
+      return reject("machine-uuid-zero"_ctv);
+    }
+    if (machine->runtimeReady == false)
+    {
+      return reject("machine-runtime-not-ready"_ctv);
+    }
+    if (persistedMachineInventoryUploaded.contains(machine->uuid) == false)
+    {
+      return reject("machine-upload-marker-missing"_ctv);
     }
     const auto uploaded = persistedMachineStateUploadPlansByMachine.find(machine->uuid);
     if (uploaded == persistedMachineStateUploadPlansByMachine.end())
     {
-      return false;
+      return reject("authenticated-upload-missing"_ctv);
     }
 
     bytell_hash_set<uint128_t> canonical = {};
@@ -24248,10 +24280,29 @@ public:
     {
       for (const ContainerView *container : machineContainers)
       {
-        if (container == nullptr || container->uuid == 0 || container->machine != machine ||
-            container->deploymentID != deploymentID || canonical.insert(container->uuid).second == false)
+        if (container == nullptr)
         {
-          return false;
+          return reject("canonical-container-null"_ctv, deploymentID, 0, canonical.size(), uploaded->second.size());
+        }
+        if (container->uuid == 0)
+        {
+          return reject("canonical-container-uuid-zero"_ctv, deploymentID, 0,
+                        canonical.size(), uploaded->second.size());
+        }
+        if (container->machine != machine)
+        {
+          return reject("canonical-container-wrong-machine"_ctv, deploymentID, container->uuid,
+                        canonical.size(), uploaded->second.size());
+        }
+        if (container->deploymentID != deploymentID)
+        {
+          return reject("canonical-container-wrong-deployment"_ctv, deploymentID, container->uuid,
+                        canonical.size(), uploaded->second.size());
+        }
+        if (canonical.insert(container->uuid).second == false)
+        {
+          return reject("canonical-container-duplicate"_ctv, deploymentID, container->uuid,
+                        canonical.size(), uploaded->second.size());
         }
       }
     }
@@ -24260,22 +24311,39 @@ public:
     for (const String& serializedPlan : uploaded->second)
     {
       ContainerPlan plan = {};
-      if (BitseryEngine::deserializeSafe(serializedPlan, plan) == false || plan.uuid == 0 ||
-          canonical.contains(plan.uuid) == false || seen.insert(plan.uuid).second == false)
+      if (BitseryEngine::deserializeSafe(serializedPlan, plan) == false)
       {
-        return false;
+        return reject("authenticated-upload-deserialize-failed"_ctv, 0, 0,
+                      canonical.size(), uploaded->second.size());
+      }
+      if (plan.uuid == 0)
+      {
+        return reject("authenticated-upload-uuid-zero"_ctv, plan.config.deploymentID(), 0,
+                      canonical.size(), uploaded->second.size());
+      }
+      if (canonical.contains(plan.uuid) == false)
+      {
+        return reject("authenticated-upload-not-canonical"_ctv, plan.config.deploymentID(), plan.uuid,
+                      canonical.size(), uploaded->second.size());
+      }
+      if (seen.insert(plan.uuid).second == false)
+      {
+        return reject("authenticated-upload-duplicate"_ctv, plan.config.deploymentID(), plan.uuid,
+                      canonical.size(), uploaded->second.size());
       }
       auto deploymentIt = deployments.find(plan.config.deploymentID());
       if (deploymentIt == deployments.end() || deploymentIt->second == nullptr)
       {
-        return false;
+        return reject("deployment-index-missing"_ctv, plan.config.deploymentID(), plan.uuid,
+                      canonical.size(), uploaded->second.size());
       }
       ApplicationDeployment *deployment = deploymentIt->second;
       auto indexed = containers.find(plan.uuid);
       if (indexed == containers.end() || indexed->second == nullptr || indexed->second->machine != machine ||
           indexed->second->deploymentID != plan.config.deploymentID())
       {
-        return false;
+        return reject("global-container-index-mismatch"_ctv, plan.config.deploymentID(), plan.uuid,
+                      canonical.size(), uploaded->second.size());
       }
       String credentialFailure = {};
       if (deploymentApiCredentialsAvailableForLaunch(deployment->plan, &credentialFailure) == false)
@@ -24287,7 +24355,8 @@ public:
             deployment->plan.config.deploymentID(),
             credentialFailure.size() ? credentialFailure : String("credential policy unavailable for container replay"_ctv),
             deployment->generateReport());
-        return false;
+        return reject("deployment-credentials-unavailable"_ctv, plan.config.deploymentID(), plan.uuid,
+                      canonical.size(), uploaded->second.size());
       }
       NeuronContainerBootstrap bootstrap = {};
       bootstrap.plan = plan;
@@ -24298,7 +24367,20 @@ public:
     }
     if (seen.size() != canonical.size())
     {
-      return false;
+      uint128_t missingUUID = 0;
+      for (uint128_t uuid : canonical)
+        if (!seen.contains(uuid)) { missingUUID = uuid; break; }
+      auto missing = containers.find(missingUUID);
+      const bool unlaunchedReservation = missing != containers.end() && missing->second != nullptr &&
+          missing->second->state == ContainerState::planned && missing->second->fragment == 0 &&
+          !missing->second->runtimeReady;
+      // A normal inventory refresh cannot report an unsent planner reservation.
+      // Keep admission closed: excluding it would require a lifecycle fence
+      // that prevents scheduling and in-flight launch callbacks during exec.
+      return reject(unlaunchedReservation ? String("canonical-planner-reservation-unlaunched"_ctv) :
+                    String("authenticated-upload-set-mismatch"_ctv),
+                    missing == containers.end() || missing->second == nullptr ? 0 : missing->second->deploymentID,
+                    missingUUID, canonical.size(), seen.size());
     }
 
     // System gateways are deliberately outside the application deployment
@@ -24312,10 +24394,15 @@ public:
       {
         continue;
       }
-      if (!crossClusterMasqueGatewayAuthenticatedInventoryCurrent(runtime, machine) ||
-          seen.insert(runtime.authenticatedInventoryPlan.uuid).second == false)
+      if (!crossClusterMasqueGatewayAuthenticatedInventoryCurrent(runtime, machine))
       {
-        return false;
+        return reject("gateway-authenticated-inventory-missing-or-stale"_ctv, 0,
+                      runtime.authenticatedInventoryPlan.uuid, canonical.size(), seen.size());
+      }
+      if (seen.insert(runtime.authenticatedInventoryPlan.uuid).second == false)
+      {
+        return reject("gateway-authenticated-inventory-duplicate"_ctv, 0,
+                      runtime.authenticatedInventoryPlan.uuid, canonical.size(), seen.size());
       }
       NeuronContainerBootstrap bootstrap = {};
       bootstrap.plan = runtime.authenticatedInventoryPlan;
@@ -43590,7 +43677,8 @@ public:
       }
       ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
       witness.machineUUID = machine->uuid;
-      if (collectAuthenticatedNeuronStateUploadBootstraps(machine, witness.containerBootstraps) == false)
+      String inventoryDiagnostic = {};
+      if (collectAuthenticatedNeuronStateUploadBootstraps(machine, witness.containerBootstraps, &inventoryDiagnostic) == false)
       {
         // A normal stateUpload remains the single owner of inventory refresh.
         // Do not checkpoint a stale or scheduler-derived view; ask Neuron for
@@ -43598,6 +43686,10 @@ public:
         // attempt this operation again after the reply.
         queueNeuronStateUploadForMachine(machine);
         updateSelfWorkerFailure.assign("machine container ownership needs a fresh authenticated stateUpload for bundle exec"_ctv);
+        if (inventoryDiagnostic.empty() == false)
+        {
+          updateSelfWorkerFailure.snprintf_add<": {}"_ctv>(inventoryDiagnostic);
+        }
         completion(false); return;
       }
       witnesses.push_back(std::move(witness));

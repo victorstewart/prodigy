@@ -1654,6 +1654,120 @@ static void testLocalBundleRecoveryDefersCheckpointUntilArtifactLeaseReleases(Te
   havePersistedBrainSnapshot = false;
 }
 
+static void testAuthenticatedStateUploadInventoryDiagnostics(TestSuite& suite)
+{
+  ProdigyHostControlNetwork network;
+  ProdigyBrain brain(network, {});
+  brain.weAreMaster = true;
+  brain.masterAuthorityRuntimeStateDurable = true;
+  brain.durableMasterAuthorityRuntimeStateGeneration = brain.masterAuthorityRuntimeState.generation;
+  Machine machine = {};
+  machine.uuid = 0xa5513001ULL;
+  machine.state = MachineState::healthy;
+  machine.runtimeReady = true;
+  brain.machines.insert(&machine);
+  brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+  brain.persistedMachineInventoryUploaded.insert(machine.uuid);
+  brain.persistedMachineStateUploadPlansByMachine.insert_or_assign(machine.uuid, Vector<String> {});
+
+  Vector<String> bootstraps = {};
+  String diagnostic = {};
+  const bool matchingEmptyInventory =
+      brain.collectAuthenticatedNeuronStateUploadBootstraps(&machine, bootstraps, &diagnostic);
+  suite.expect(matchingEmptyInventory && bootstraps.empty() && diagnostic.empty(),
+               "runtime_stateupload_inventory_matching_empty_inventory_is_accepted");
+
+  ApplicationDeployment deployment = {};
+  deployment.plan.config.applicationID = 0xa551;
+  deployment.plan.config.versionID = 0x3003;
+  deployment.plan.hasApiCredentialPolicy = true;
+  deployment.plan.apiCredentialPolicy.applicationID = deployment.plan.config.applicationID;
+  const uint64_t deploymentID = deployment.plan.config.deploymentID();
+  brain.deployments.insert_or_assign(deploymentID, &deployment);
+  ContainerView unmatched = {};
+  unmatched.uuid = 0xa5513002ULL;
+  unmatched.machine = &machine;
+  unmatched.deploymentID = deploymentID;
+  unmatched.state = ContainerState::scheduled;
+  unmatched.fragment = 1;
+  machine.upsertContainerIndexEntry(unmatched.deploymentID, &unmatched);
+  brain.containers.insert_or_assign(unmatched.uuid, &unmatched);
+
+  const bool canonicalMismatchAccepted =
+      brain.collectAuthenticatedNeuronStateUploadBootstraps(&machine, bootstraps, &diagnostic);
+  suite.expect(!canonicalMismatchAccepted && bootstraps.empty() &&
+                   std::strstr(diagnostic.c_str(), "machine=0xa5513001") != nullptr &&
+                   std::strstr(diagnostic.c_str(), "container=0xa5513002") != nullptr &&
+                   std::strstr(diagnostic.c_str(), "category=authenticated-upload-set-mismatch") != nullptr &&
+                   std::strstr(diagnostic.c_str(), "canonical=1") != nullptr &&
+                   std::strstr(diagnostic.c_str(), "uploaded=0") != nullptr,
+               "runtime_stateupload_inventory_canonical_authenticated_mismatch_is_diagnostic");
+
+  bool completionCalled = false, completionDurable = true;
+  brain.prepareLocalBundleExecRecoveryAsync([&](bool durable) {
+    completionCalled = true;
+    completionDurable = durable;
+  });
+  suite.expect(completionCalled && !completionDurable && brain.updateSelfMachineRecoveryWitnesses.empty() &&
+                   std::strstr(brain.updateSelfWorkerFailure.c_str(), "machine container ownership needs a fresh authenticated stateUpload for bundle exec") != nullptr &&
+                   std::strstr(brain.updateSelfWorkerFailure.c_str(), "machine=0xa5513001") != nullptr &&
+                   std::strstr(brain.updateSelfWorkerFailure.c_str(), "category=authenticated-upload-set-mismatch") != nullptr,
+               "runtime_stateupload_inventory_bundle_recovery_forwards_reason_without_checkpoint");
+
+  // Reproduce the EWR reservation: it has never acquired a runtime fragment.
+  // Diagnostics must explain the blocker without exempting it from admission.
+  unmatched.state = ContainerState::planned;
+  unmatched.fragment = 0;
+  const bool plannedAccepted =
+      brain.collectAuthenticatedNeuronStateUploadBootstraps(&machine, bootstraps, &diagnostic);
+  suite.expect(!plannedAccepted && bootstraps.empty() &&
+                   std::strstr(diagnostic.c_str(), "machine=0xa5513001") != nullptr &&
+                   std::strstr(diagnostic.c_str(), "container=0xa5513002") != nullptr &&
+                   std::strstr(diagnostic.c_str(), "category=canonical-planner-reservation-unlaunched") != nullptr,
+               "runtime_stateupload_inventory_planner_reservation_is_diagnostic_and_fail_closed");
+  unmatched.state = ContainerState::scheduled;
+  unmatched.fragment = 1;
+
+  ContainerPlan uploadedPlan = {};
+  uploadedPlan.uuid = unmatched.uuid;
+  uploadedPlan.config = deployment.plan.config;
+  uploadedPlan.state = ContainerState::scheduled;
+  uploadedPlan.fragment = 1;
+  String uploadedPlanBytes = {};
+  BitseryEngine::serialize(uploadedPlanBytes, uploadedPlan);
+  brain.persistedMachineStateUploadPlansByMachine[machine.uuid] = {uploadedPlanBytes};
+  const bool matchingRuntimeAccepted =
+      brain.collectAuthenticatedNeuronStateUploadBootstraps(&machine, bootstraps, &diagnostic);
+  suite.expect(matchingRuntimeAccepted && bootstraps.size() == 1 && diagnostic.empty(),
+               "runtime_stateupload_inventory_exact_authenticated_runtime_still_accepted");
+
+  brain.persistedMachineStateUploadPlansByMachine[machine.uuid] = {uploadedPlanBytes, uploadedPlanBytes};
+  const bool duplicateAccepted =
+      brain.collectAuthenticatedNeuronStateUploadBootstraps(&machine, bootstraps, &diagnostic);
+  suite.expect(!duplicateAccepted && bootstraps.empty() &&
+                   std::strstr(diagnostic.c_str(), "category=authenticated-upload-duplicate") != nullptr,
+               "runtime_stateupload_inventory_duplicate_rejection_discards_partial_witness");
+
+  uploadedPlan.uuid = 0xa5513006ULL;
+  uploadedPlanBytes.clear();
+  BitseryEngine::serialize(uploadedPlanBytes, uploadedPlan);
+  brain.persistedMachineStateUploadPlansByMachine[machine.uuid] = {uploadedPlanBytes};
+  const bool unknownAccepted =
+      brain.collectAuthenticatedNeuronStateUploadBootstraps(&machine, bootstraps, &diagnostic);
+  suite.expect(!unknownAccepted && bootstraps.empty() &&
+                   std::strstr(diagnostic.c_str(), "category=authenticated-upload-not-canonical") != nullptr,
+               "runtime_stateupload_inventory_unknown_uuid_remains_rejected");
+
+  brain.containers.erase(unmatched.uuid);
+  machine.removeContainerIndexEntry(unmatched.deploymentID, &unmatched);
+  brain.deployments.erase(deploymentID);
+  brain.persistedMachineStateUploadPlansByMachine.erase(machine.uuid);
+  brain.persistedMachineInventoryUploaded.erase(machine.uuid);
+  brain.machinesByUUID.erase(machine.uuid);
+  brain.machines.erase(&machine);
+  (void)network.shutdown();
+}
+
 static void testFollowerMetricIngestionTrimsBeforePersistence(TestSuite& suite)
 {
   PersistenceRing ring;
@@ -2647,6 +2761,13 @@ int main(void)
     testPersistentLocalCousinServicePermissions(suite);
     return suite.failed == 0 ? 0 : 1;
   }
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only != nullptr &&
+      std::strcmp(only, "stateupload-inventory-diagnostics") == 0)
+  {
+    testAuthenticatedStateUploadInventoryDiagnostics(suite);
+    std::printf("STATEUPLOAD_INVENTORY_DIAGNOSTICS_RESULT failed_assertions=%d\n", suite.failed);
+    return suite.failed == 0 ? 0 : 1;
+  }
   testProductionPairProjectionWriterUsesColocatedNeuronAuthority(suite);
   testNeuronClusterPairControlProjectionDurabilityAndStreamFence(suite);
   testClusterPairRuntimeRequiresFreshDurableProjectionAfterRestart(suite);
@@ -2692,6 +2813,7 @@ int main(void)
   }
   testProductionUpdateProgressDefersReentrantPersistenceUntilArtifactLeaseReleases(suite);
   testLocalBundleRecoveryDefersCheckpointUntilArtifactLeaseReleases(suite);
+  testAuthenticatedStateUploadInventoryDiagnostics(suite);
   testFollowerMetricIngestionTrimsBeforePersistence(suite);
   testLargeMetricHistoryUsesImmutableAsyncCapture(suite);
   testProductionPersistenceAPI(suite);
