@@ -511,6 +511,8 @@ int main(void)
   }
   assert(registry.advanceRemoteRuntimeRecoveryCohort(handoffParent, handoffParent.phase, recoveryStored, resumed, &failure));
   handoffParent = recoveryStored;
+  const ClusterTopology parentTopology = remote.topology;
+  ++remote.topology.version;
   auto handoffAdmission = expectedEligibleAdmission;
   handoffAdmission.operationID = uint128_t(0xD31);
   handoffAdmission.targetBundleSHA256 = digest('e');
@@ -539,7 +541,6 @@ int main(void)
     handoffChild.members[index].phaseReceipts.clear();
   }
   ClusterTopology observedTopology = remote.topology;
-  observedTopology.version = remote.topology.version + 1;
   observedTopology.machines[0].rackUUID = 17;
   auto addressDriftTopology = observedTopology;
   addressDriftTopology.machines[0].ssh.address = "198.51.100.17"_ctv;
@@ -564,12 +565,33 @@ int main(void)
   handoff.parentCohortSHA256 = parentSHA256;
   handoff.childAdmissionSHA256 = handoffAdmissionSHA256;
   handoff.childCohortSHA256 = childSHA256;
+  handoff.parentTopology = parentTopology;
   handoff.declaredTopology = remote.topology;
   handoff.observedTopology = observedTopology;
   handoff.restorationReceiptSHA256.push_back(digest('1'));
   handoff.restorationReceiptSHA256.push_back(digest('2'));
   handoff.restorationReceiptSHA256.push_back(digest('3'));
   MothershipRemoteRuntimeRecoveryHandoffRecord handoffStored = {}, handoffLoaded = {};
+  auto oldSchemaHandoff = handoff;
+  oldSchemaHandoff.version = 1;
+  oldSchemaHandoff.parentTopology = {};
+  assert(MothershipClusterRegistry::remoteRuntimeRecoveryHandoffValid(oldSchemaHandoff));
+  String oldSchemaBytes = {};
+  MothershipRemoteRuntimeRecoveryHandoffRecord oldSchemaDecoded = {};
+  assert(BitseryEngine::serialize(oldSchemaBytes, oldSchemaHandoff));
+  assert(BitseryEngine::deserializeSafe(oldSchemaBytes, oldSchemaDecoded));
+  assert(oldSchemaDecoded.version == 1 && oldSchemaDecoded.parentTopology.machines.empty() &&
+         MothershipClusterRegistry::remoteRuntimeRecoveryParentTopology(oldSchemaDecoded) == oldSchemaDecoded.declaredTopology &&
+         MothershipClusterRegistry::remoteRuntimeRecoveryHandoffValid(oldSchemaDecoded));
+  auto changedParentRack = handoff;
+  ++changedParentRack.parentTopology.machines[0].rackUUID;
+  assert(!MothershipClusterRegistry::remoteRuntimeRecoveryHandoffValid(changedParentRack));
+  auto changedParentMachine = handoff;
+  changedParentMachine.parentTopology.machines[0].isBrain = false;
+  assert(!MothershipClusterRegistry::remoteRuntimeRecoveryHandoffValid(changedParentMachine));
+  auto decreasedDeclaredTopology = handoff;
+  decreasedDeclaredTopology.declaredTopology.version = parentTopology.version - 1;
+  assert(!MothershipClusterRegistry::remoteRuntimeRecoveryHandoffValid(decreasedDeclaredTopology));
   auto missingReceipt = handoff;
   missingReceipt.restorationReceiptSHA256.pop_back();
   assert(!registry.admitRemoteRuntimeRecoveryHandoff(missingReceipt, remote, handoffChild, handoffStored, recoveryStored, resumed, &failure));
@@ -579,6 +601,15 @@ int main(void)
   auto installedChild = handoffChild;
   installedChild.members[0].targetRuntimeInstalled = true;
   assert(!registry.admitRemoteRuntimeRecoveryHandoff(handoff, remote, installedChild, handoffStored, recoveryStored, resumed, &failure));
+  assert(registry.validateRemoteRuntimeRecoveryHandoff(handoff, remote, handoffChild, &failure));
+  assert(!registry.loadRemoteRuntimeRecoveryHandoffForChild(remote.clusterUUID, handoffChild.operationID, handoffLoaded, &failure));
+  assert(failure == "record not found"_ctv);
+  assert(!registry.loadRemoteRuntimeRecoveryCohort(remote.clusterUUID, handoffChild.operationID, recoveryStored, &failure));
+  assert(failure == "record not found"_ctv);
+  auto mismatchedParentDigest = handoff;
+  mismatchedParentDigest.parentCohortSHA256 = digest('9');
+  assert(!registry.validateRemoteRuntimeRecoveryHandoff(mismatchedParentDigest, remote, handoffChild, &failure));
+  assert(failure == "remote runtime recovery handoff parent cohort digest differs"_ctv);
   assert(registry.admitRemoteRuntimeRecoveryHandoff(handoff, remote, handoffChild, handoffStored, recoveryStored, resumed, &failure));
   assert(!resumed && handoffStored.childOperationID == handoffChild.operationID && recoveryStored.operationID == handoffChild.operationID);
   assert(registry.loadRemoteRuntimeRecoveryHandoffForChild(remote.clusterUUID, handoffChild.operationID, handoffLoaded, &failure));
@@ -649,6 +680,11 @@ int main(void)
   addPhaseReceipts(completedChild);
   assert(registry.advanceRemoteRuntimeRecoveryCohort(completedChild, completedChild.phase, recoveryStored, resumed, &failure));
   auto postHandoffRecovery = makeWithdrawableRecovery(uint128_t(0xD33));
+  String postHandoffTopologyBytes = {}, postHandoffTopologySHA256 = {};
+  auto postHandoffTopology = remote.topology;
+  assert(BitseryEngine::serialize(postHandoffTopologyBytes, postHandoffTopology));
+  assert(prodigyComputeSHA256Hex(postHandoffTopologyBytes, postHandoffTopologySHA256));
+  postHandoffRecovery.topologySHA256 = postHandoffTopologySHA256;
   assert(registry.admitRemoteRuntimeRecoveryCohort(postHandoffRecovery, remote, recoveryStored, resumed, &failure));
   assert(!resumed && recoveryStored.operationID == postHandoffRecovery.operationID);
   MothershipTestPairBoundaryRecord pair = {}, pairStored = {}, pairLoaded = {};

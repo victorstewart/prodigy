@@ -13600,7 +13600,7 @@ REMOTE_RUNTIME
       const MothershipProdigyCluster& cluster, const MothershipRemoteRuntimeRecoveryCohortRecord& parent,
       const MothershipUpgradeAdmissionRecord& childAdmission, const String& registryPath,
       Vector<MothershipRemoteRuntimeRecoveryMember>& currentMembers,
-      Vector<String>& restorationReceipts, String& failure)
+      Vector<String>& restorationReceipts, ClusterTopology& parentTopology, String& failure)
   {
     using namespace MothershipTidesMigration;
     try {
@@ -13624,6 +13624,12 @@ REMOTE_RUNTIME
               abort.requestSHA256==binding && abort.frozenCohortSHA256==parentSHA &&
               abort.sources.size()==3 && abort.restartInhibited.size()==3 && abort.proofFileSHA256.size()==3,
               "recovery handoff restored-parent binding differs");
+      String originalTopologyBytes={},originalTopologySHA={};
+      require(BitseryEngine::serialize(originalTopologyBytes,original.topology) &&
+              prodigyComputeSHA256Hex(originalTopologyBytes,originalTopologySHA,&failure) &&
+              originalTopologySHA==parent.topologySHA256,
+              "recovery handoff original parent topology digest differs");
+      parentTopology=original.topology;
       currentMembers.clear();restorationReceipts.clear();
       const auto root="/var/lib/prodigy/runtime-recovery/"+str(operation);
       for(uint32_t index=0;index<3;++index) {
@@ -13782,16 +13788,31 @@ REMOTE_RUNTIME
               record.runtimeRoot==cluster.remoteProdigyPath && record.targetBundleSHA256==approved.bundleSHA256 &&
               record.targetProdigySHA256==approved.contract.prodigySHA256 && record.targetMothershipSHA256==approved.contract.mothershipSHA256,
               "recovery immutable record differs from registered topology, admission or target artifacts");
+      const auto prepareHandoff=[&](MothershipClusterRegistry& registry) {
+        MothershipRemoteRuntimeRecoveryCohortRecord parent={};
+        Vector<MothershipRemoteRuntimeRecoveryMember> restored={};Vector<String> receipts={};
+        require(registry.loadRemoteRuntimeRecoveryCohort(cluster.clusterUUID,parentOperation,parent,&failure),"recovery parent unavailable");
+        require(verifyRestoredRemoteRuntimeRecoveryParent(cluster,parent,admission,registryPath,restored,receipts,handoff.parentTopology,failure),
+                "recovery parent restoration verification failed");
+        for(uint32_t index=0;index<3;++index) {String left={},right={};BitseryEngine::serialize(left,restored[index]);BitseryEngine::serialize(right,record.members[index]);
+          require(left==right,"recovery current identities changed during handoff");}
+        String parentBytes={};BitseryEngine::serialize(parentBytes,parent);
+        handoff.clusterUUID=cluster.clusterUUID;handoff.parentOperationID=parentOperation;handoff.childOperationID=operation;
+        handoff.declaredTopology=cluster.topology;handoff.observedTopology=currentTopology;handoff.childAdmissionSHA256=admissionSHA;
+        handoff.restorationReceiptSHA256=std::move(receipts);
+        require(prodigyComputeSHA256Hex(parentBytes,handoff.parentCohortSHA256,&failure) &&
+                MothershipClusterRegistry::remoteRuntimeRecoveryInitialCohortDigest(record,handoff.childCohortSHA256,&failure),"recovery handoff identity digest failed");
+        basics_log("recoverRemoteClusterRuntime handoffParentTopologyVersion=%llu declaredTopologyVersion=%llu observedTopologyVersion=%llu\n",
+                   static_cast<unsigned long long>(handoff.parentTopology.version),
+                   static_cast<unsigned long long>(handoff.declaredTopology.version),
+                   static_cast<unsigned long long>(handoff.observedTopology.version));
+      };
       if(check) {
         require(record.phase<Phase::fenced,"live recovery is already fenced; resume its exact operation");
         preflight();
         if(parentOperation && !recorded) {
-          MothershipRemoteRuntimeRecoveryCohortRecord parent={};
-          {auto registry=openClusterRegistry();require(registry.loadRemoteRuntimeRecoveryCohort(cluster.clusterUUID,parentOperation,parent,&failure),"recovery check parent unavailable");}
-          Vector<MothershipRemoteRuntimeRecoveryMember> restored={};Vector<String> receipts={};
-          require(verifyRestoredRemoteRuntimeRecoveryParent(cluster,parent,admission,registryPath,restored,receipts,failure),"recovery check parent restoration failed");
-          for(uint32_t index=0;index<3;++index) {String left={},right={};BitseryEngine::serialize(left,restored[index]);BitseryEngine::serialize(right,record.members[index]);
-            require(left==right,"recovery check source identities changed");}
+          auto registry=openClusterRegistry();prepareHandoff(registry);
+          require(registry.validateRemoteRuntimeRecoveryHandoff(handoff,cluster,record,&failure),"recovery check handoff validation failed");
         }
         if(record.phase==Phase::staged) {
           auto initial=record; initial.phase=Phase::admitted;
@@ -13818,19 +13839,7 @@ REMOTE_RUNTIME
       if(!recorded) {
         auto registry=openClusterRegistry(); MothershipRemoteRuntimeRecoveryCohortRecord saved={}; bool resumed=false;
         if(parentOperation) {
-          Vector<MothershipRemoteRuntimeRecoveryMember> restored={};Vector<String> receipts={};
-          MothershipRemoteRuntimeRecoveryCohortRecord parent={};
-          require(registry.loadRemoteRuntimeRecoveryCohort(cluster.clusterUUID,parentOperation,parent,&failure),"recovery parent disappeared");
-          require(verifyRestoredRemoteRuntimeRecoveryParent(cluster,parent,admission,registryPath,restored,receipts,failure),
-                  "recovery parent restoration verification failed");
-          for(uint32_t index=0;index<3;++index) {String left={},right={};BitseryEngine::serialize(left,restored[index]);BitseryEngine::serialize(right,record.members[index]);
-            require(left==right,"recovery current identities changed during handoff");}
-          String parentBytes={};BitseryEngine::serialize(parentBytes,parent);
-          handoff.clusterUUID=cluster.clusterUUID;handoff.parentOperationID=parentOperation;handoff.childOperationID=operation;
-          handoff.declaredTopology=cluster.topology;handoff.observedTopology=currentTopology;handoff.childAdmissionSHA256=admissionSHA;
-          handoff.restorationReceiptSHA256=std::move(receipts);
-          require(prodigyComputeSHA256Hex(parentBytes,handoff.parentCohortSHA256,&failure) &&
-                  MothershipClusterRegistry::remoteRuntimeRecoveryInitialCohortDigest(record,handoff.childCohortSHA256,&failure),"recovery handoff identity digest failed");
+          prepareHandoff(registry);
           MothershipRemoteRuntimeRecoveryHandoffRecord linked={};
           require(registry.admitRemoteRuntimeRecoveryHandoff(handoff,cluster,record,linked,saved,resumed,&failure),"recovery handoff admission failed");
           handoff=std::move(linked);handedOff=true;
