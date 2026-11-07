@@ -9599,12 +9599,61 @@ public:
     return true;
   }
 
+  static bool prepareContainerArtifactParentAt(int containersFD, String *failureReport = nullptr)
+  {
+    // The child enters its user namespace before opening and mounting its
+    // artifact root. The mapped UID needs traversal through the shared
+    // /containers parent, but must not be able to list other container homes.
+    // The production Neuron runs as root, so this also rejects a non-root
+    // owner there; tests deliberately use their effective owner.
+    struct stat metadata = {};
+    const bool ready = fstat(containersFD, &metadata) == 0 && S_ISDIR(metadata.st_mode) &&
+                       metadata.st_uid == geteuid() && fchmod(containersFD, 0711) == 0;
+    if (ready == false && failureReport)
+    {
+      failureReport->assign("container artifact parent is not owned or cannot be made traversable"_ctv);
+    }
+    else if (ready && failureReport)
+    {
+      failureReport->clear();
+    }
+    return ready;
+  }
+
+  static bool prepareContainerArtifactParent(String *failureReport = nullptr)
+  {
+    if (geteuid() != 0)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("container artifact parent repair requires root owner"_ctv);
+      }
+      return false;
+    }
+    int containersFD = open("/containers", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (containersFD < 0)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("failed to open container artifact parent without symlinks"_ctv);
+      }
+      return false;
+    }
+    const bool ready = prepareContainerArtifactParentAt(containersFD, failureReport);
+    close(containersFD);
+    return ready;
+  }
+
   static bool prepareContainerStorageParentAt(int containersFD, String *failureReport = nullptr)
   {
     // The child enters its user namespace before mounting /storage. Its mapped
     // UID needs traversal through this shared parent, but must not list another
     // container's storage. Each container directory remains private and owned
     // by its own execution UID.
+    if (prepareContainerArtifactParentAt(containersFD, failureReport) == false)
+    {
+      return false;
+    }
     if (mkdirat(containersFD, "storage", 0711) != 0 && errno != EEXIST)
     {
       if (failureReport)
@@ -13418,6 +13467,11 @@ public:
       return false;
     }
     ensureSigchldIsWaitable();
+
+    if (prepareContainerArtifactParent(failureReport) == false)
+    {
+      return false;
+    }
 
     if (container->artifactRootPath.size() == 0)
     {

@@ -1010,8 +1010,39 @@ static void testStorageParentTraversal(TestSuite& suite)
   int root = open(fixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   suite.expect(root >= 0, "storage_parent_fixture_opened");
   if (root < 0) return;
-  suite.expect(fchmod(root, 0711) == 0, "storage_parent_fixture_models_traversable_containers_root");
+  suite.expect(fchmod(root, 0700) == 0, "storage_parent_fixture_models_private_containers_root");
+  String artifactPath = {};
+  artifactPath.assign(fixture.path);
+  artifactPath.append("/artifact"_ctv);
+  suite.expect(mkdirat(root, "artifact", 0700) == 0, "artifact_parent_private_child_created");
+  if (geteuid() == 0)
+  {
+    constexpr uid_t mappedUID = 15728400;
+    suite.expect(fchownat(root, "artifact", mappedUID, mappedUID, AT_SYMLINK_NOFOLLOW) == 0,
+                 "artifact_parent_private_child_owned_by_mapped_uid");
+    pid_t child = fork();
+    suite.expect(child >= 0, "artifact_parent_private_mode_child_forked");
+    if (child == 0)
+    {
+      if (setgroups(0, nullptr) != 0 || setresgid(mappedUID, mappedUID, mappedUID) != 0 ||
+          setresuid(mappedUID, mappedUID, mappedUID) != 0) _exit(2);
+      int artifact = open(artifactPath.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+      if (artifact >= 0) { close(artifact); _exit(3); }
+      _exit(errno == EACCES ? 0 : 4);
+    }
+    if (child > 0)
+    {
+      int status = 0;
+      suite.expect(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                   "artifact_parent_private_mode_reproduces_mapped_uid_eacces");
+    }
+  }
   String failure;
+  suite.expect(ContainerManager::prepareContainerArtifactParentAt(root, &failure), "artifact_parent_prepared");
+  struct stat artifactParent = {};
+  suite.expect(fstat(root, &artifactParent) == 0 && (artifactParent.st_mode & 0777) == 0711 &&
+               artifactParent.st_uid == geteuid(),
+               "artifact_parent_owner_only_listing_mapped_uid_traversal");
   suite.expect(ContainerManager::prepareContainerStorageParentAt(root, &failure), "storage_parent_prepared");
   struct stat parent = {};
   suite.expect(fstatat(root, "storage", &parent, AT_SYMLINK_NOFOLLOW) == 0 &&
@@ -1032,6 +1063,12 @@ static void testStorageParentTraversal(TestSuite& suite)
       int own = openat(root, "storage/123", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
       if (own < 0) _exit(3);
       close(own);
+      int artifact = open(artifactPath.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+      if (artifact < 0) _exit(6);
+      close(artifact);
+      int artifactListing = open(fixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+      if (artifactListing >= 0) { close(artifactListing); _exit(7); }
+      if (errno != EACCES) _exit(8);
       int listing = openat(root, "storage", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
       if (listing >= 0) { close(listing); _exit(4); }
       _exit(errno == EACCES ? 0 : 5);
@@ -1040,13 +1077,17 @@ static void testStorageParentTraversal(TestSuite& suite)
     {
       int status = 0;
       suite.expect(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
-                   "storage_parent_real_mapped_uid_can_traverse_but_not_list");
+                   "artifact_and_storage_parents_real_mapped_uid_can_traverse_but_not_list");
     }
   }
   suite.expect(fchmodat(root, "storage", 0700, 0) == 0 &&
                ContainerManager::prepareContainerStorageParentAt(root, &failure) &&
                fstatat(root, "storage", &parent, AT_SYMLINK_NOFOLLOW) == 0 && (parent.st_mode & 0777) == 0711,
                "storage_parent_existing_private_parent_is_repaired");
+  suite.expect(fchmod(root, 0700) == 0 &&
+               ContainerManager::prepareContainerArtifactParentAt(root, &failure) &&
+               fstat(root, &artifactParent) == 0 && (artifactParent.st_mode & 0777) == 0711,
+               "artifact_parent_existing_private_parent_is_repaired");
   struct stat childMetadata = {};
   suite.expect(fstatat(root, "storage/123", &childMetadata, AT_SYMLINK_NOFOLLOW) == 0 &&
                (childMetadata.st_mode & 0777) == 0700,
@@ -3850,6 +3891,12 @@ int main(void)
 {
   TestSuite suite;
   const char *selector = std::getenv("PRODIGY_TEST_ONLY");
+  if (selector != nullptr && std::strcmp(selector, "storage-parent-traversal") == 0)
+  {
+    testStorageParentTraversal(suite);
+    dprintf(STDOUT_FILENO, "storage_parent_traversal passed=%d failed=%d\n", suite.passed, suite.failed);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (selector == nullptr || std::strcmp(selector, "retained-store-failure") == 0)
   {
     testRetainedStatefulFilesAfterFailure(suite);
