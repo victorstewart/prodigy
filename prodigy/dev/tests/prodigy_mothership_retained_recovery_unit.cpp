@@ -1,4 +1,5 @@
 #include <cassert>
+#include <array>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -1810,8 +1811,309 @@ static void assertInitialSeedRuntimeRepair()
   fs::remove_all(root);
 }
 
+static void assertRuntimeRecoveryStartupAuthorityPreparation()
+{
+  using namespace MothershipRetainedRecovery;
+  const uint128_t cluster = 0x7a01, member = 1;
+  const String targetBundle = MothershipTidesMigration::text(std::string(64, 'd'));
+  ProdigyPersistentLocalBrainState local = {};
+  local.uuid = member;
+  local.ownerClusterUUID = cluster;
+  ProdigyPersistentBrainSnapshot source = {};
+  source.brainConfig.clusterUUID = cluster;
+  source.brainConfig.datacenterFragment = 7;
+  source.masterAuthority.runtimeState.generation = 17;
+  source.masterAuthority.runtimeState.hasCompletedInitialMasterElection = true;
+
+  DeploymentPlan deployment = {};
+  deployment.config.type = ApplicationType::stateless;
+  deployment.config.applicationID = 77;
+  deployment.config.versionID = 9;
+  deployment.config.memoryMB = 256;
+  deployment.config.storageMB = 128;
+  deployment.config.nLogicalCores = 1;
+  const uint64_t deploymentID = deployment.config.deploymentID();
+  source.masterAuthority.deploymentPlans[deploymentID] = deployment;
+  bytell_hash_map<uint64_t, DeploymentPlan> approved = source.masterAuthority.deploymentPlans;
+
+  Vector<MothershipRetainedRecoveryMachineInput> machines = {};
+  for (uint32_t index = 1; index <= 3; ++index)
+  {
+    ClusterMachine topologyMachine = {};
+    topologyMachine.uuid = index;
+    topologyMachine.isBrain = true;
+    source.topology.machines.push_back(topologyMachine);
+    MothershipRetainedRecoveryMachineInput machine = {};
+    machine.machineUUID = index;
+    machine.machineFragment = index;
+    ContainerParameters parameters = {};
+    parameters.uuid = 0x8100 + index;
+    parameters.deploymentID = deploymentID;
+    parameters.memoryMB = deployment.config.memoryMB;
+    parameters.storageMB = deployment.config.storageMB;
+    parameters.nLogicalCores = applicationSharedCPUCoreHint(deployment.config);
+    parameters.cpuMode = deployment.config.cpuMode;
+    parameters.requestedCPUMillis = applicationRequestedCPUMillis(deployment.config);
+    parameters.private6.network.is6 = true;
+    parameters.private6.cidr = 128;
+    std::memcpy(parameters.private6.network.v6, container_network_subnet6.value, 11);
+    parameters.private6.network.v6[11] = source.brainConfig.datacenterFragment;
+    parameters.private6.network.v6[14] = index;
+    parameters.private6.network.v6[15] = 1;
+    machine.parameters.push_back(parameters);
+    machine.observedCreatedAtMs.push_back(1793647800000LL + index);
+    machines.push_back(std::move(machine));
+  }
+  for (const MothershipRetainedRecoveryMachineInput& machine : machines)
+  {
+    NeuronContainerBootstrap bootstrap = {};
+    String bootstrapFailure = {};
+    assert(prodigyBuildRetainedContainerBootstrap(
+        deployment, machine.parameters[0], machine.machineFragment,
+        source.brainConfig.datacenterFragment, machine.observedCreatedAtMs[0], bootstrap, &bootstrapFailure));
+    BrainReplicatedContainerRuntimeState runtime = {};
+    runtime.machineUUID = machine.machineUUID;
+    runtime.plan = bootstrap.plan;
+    runtime.plan.state = ContainerState::healthy;
+    runtime.plan.runtimeReady = true;
+    source.masterAuthority.containerRuntimeStates.push_back(std::move(runtime));
+  }
+
+  // A durable planned reservation is not a live census member and therefore
+  // cannot be turned into a recovery witness.
+  BrainReplicatedContainerRuntimeState planned = {};
+  planned.machineUUID = member;
+  planned.plan.uuid = 0xfeed;
+  planned.plan.config = deployment.config;
+  planned.plan.state = ContainerState::planned;
+  planned.plan.runtimeReady = false;
+  source.masterAuthority.containerRuntimeStates.push_back(planned);
+
+  auto& update = source.masterAuthority.runtimeState.updateSelf;
+  update.bundleBlob.assign("rejected before inventory checkpoint"_ctv);
+  assert(prodigyComputeSHA256Hex(update.bundleBlob, update.workerExpectedBundleSHA256));
+  update.workerFailure.assign("machine container ownership needs a fresh authenticated stateUpload for bundle exec"_ctv);
+  const String rejectedCandidateSHA256 = update.workerExpectedBundleSHA256;
+  String originalBytes = {};
+  auto original = source;
+  assert(BitseryEngine::serialize(originalBytes, original));
+
+  String failure = {};
+  ProdigyPersistentBrainSnapshot prepared = {};
+  assert(mothershipPrepareRuntimeRecoveryStartupAuthority(
+      local, source, cluster, member, source.topology, approved, machines, targetBundle,
+      rejectedCandidateSHA256, prepared, &failure));
+  String sourceAfterBytes = {};
+  assert(BitseryEngine::serialize(sourceAfterBytes, source) && sourceAfterBytes == originalBytes);
+  const auto& witnesses = prepared.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;
+  assert(witnesses.size() == 3 && prepared.masterAuthority.runtimeState.updateSelf.workerExpectedBundleSHA256 == targetBundle);
+  bytell_hash_set<uint128_t> witnessed = {};
+  for (const auto& witness : witnesses)
+    for (const String& serialized : witness.containerBootstraps)
+    {
+      NeuronContainerBootstrap bootstrap = {};
+      assert(BitseryEngine::deserializeSafe(serialized, bootstrap));
+      assert(bootstrap.plan.state == ContainerState::scheduled && bootstrap.plan.runtimeReady == false);
+      witnessed.insert(bootstrap.plan.uuid);
+    }
+  assert(witnessed.size() == 3 && !witnessed.contains(planned.plan.uuid));
+  NeuronContainerBootstrap expected = {}, observed = {};
+  assert(prodigyBuildRetainedContainerBootstrap(
+      deployment, machines[0].parameters[0], machines[0].machineFragment,
+      source.brainConfig.datacenterFragment, machines[0].observedCreatedAtMs[0], expected, &failure));
+  assert(BitseryEngine::deserializeSafe(witnesses[0].containerBootstraps[0], observed) &&
+      mothershipRetainedRecoveryBootstrapMatchesObservedLifecycle(observed, expected));
+
+  auto rejectsWithoutChangingSource = [&](Vector<MothershipRetainedRecoveryMachineInput> badMachines) {
+    ProdigyPersistentBrainSnapshot untouched = prepared;
+    String before = {};
+    assert(BitseryEngine::serialize(before, untouched));
+    assert(!mothershipPrepareRuntimeRecoveryStartupAuthority(
+        local, source, cluster, member, source.topology, approved, badMachines, targetBundle,
+        rejectedCandidateSHA256, untouched, &failure));
+    String after = {};
+    assert(BitseryEngine::serialize(after, source) && after == originalBytes);
+    assert(BitseryEngine::serialize(after, untouched) && after == before);
+  };
+  auto alteredUUID = machines;
+  ++alteredUUID[0].parameters[0].uuid;
+  rejectsWithoutChangingSource(std::move(alteredUUID));
+  auto alteredParameters = machines;
+  ++alteredParameters[0].parameters[0].memoryMB;
+  rejectsWithoutChangingSource(std::move(alteredParameters));
+  auto fakeExtra = machines;
+  fakeExtra[0].parameters.push_back(fakeExtra[0].parameters[0]);
+  fakeExtra[0].observedCreatedAtMs.push_back(1793647800999LL);
+  rejectsWithoutChangingSource(std::move(fakeExtra));
+  auto missingMaterialized = machines;
+  missingMaterialized[1].parameters.clear();
+  missingMaterialized[1].observedCreatedAtMs.clear();
+  rejectsWithoutChangingSource(std::move(missingMaterialized));
+  auto wrongDeployment = machines;
+  ++wrongDeployment[2].parameters[0].deploymentID;
+  rejectsWithoutChangingSource(std::move(wrongDeployment));
+  auto malformedCensus = machines;
+  malformedCensus[1].observedCreatedAtMs.clear();
+  rejectsWithoutChangingSource(std::move(malformedCensus));
+
+  // The operation request binds raw captured bytes supplied by the caller;
+  // its structural gate cannot silently substitute another member's source.
+  RuntimeStartupRequest request = {};
+  request.bindingSHA256.assign(std::string(64, 'a').c_str());
+  request.clusterUUID = cluster;
+  request.targetBundleSHA256 = targetBundle;
+  request.rejectedCandidateSHA256 = rejectedCandidateSHA256;
+  request.topology = source.topology;
+  request.machines = machines;
+  for (uint32_t index = 1; index <= 3; ++index) {
+    RuntimeStartupSource captured = {};
+    captured.memberUUID = index;
+    captured.stoppedProofSHA256.assign(std::string(64, char('0' + index)).c_str());
+    captured.stateSHA256.assign(std::string(64, char('3' + index)).c_str());
+    captured.secretsSHA256.assign(std::string(64, char('6' + index)).c_str());
+    captured.snapshotSHA256.assign(std::string(64, char('a' + index)).c_str());
+    request.sources.push_back(std::move(captured));
+  }
+  assert(runtimeStartupRequestValid(request, &failure));
+  assert(runtimeStartupSourceMatches(request, member, request.sources[0].snapshotSHA256));
+  auto swappedSource = request;
+  std::swap(swappedSource.sources[0].snapshotSHA256, swappedSource.sources[1].snapshotSHA256);
+  assert(runtimeStartupRequestValid(swappedSource, &failure));
+  assert(!runtimeStartupSourceMatches(swappedSource, member, request.sources[0].snapshotSHA256));
+  auto malformedRequest = request;
+  malformedRequest.sources[1].memberUUID = malformedRequest.sources[0].memberUUID;
+  assert(!runtimeStartupRequestValid(malformedRequest, &failure));
+  WitnessSet sealed = {};
+  sealed.requestSHA.assign(std::string(64, 'f').c_str());
+  sealed.witnesses = witnesses;
+  assert(witnessesExact(sealed.witnesses, witnesses));
+  sealed.witnesses[0].containerBootstraps[0].append("x", 1);
+  assert(!witnessesExact(sealed.witnesses, witnesses));
+
+  // Exercise the command-owner's real private paired store path.  This is a
+  // unit-owned TidesDB copy only: it never opens a runtime service, socket,
+  // namespace, or BPF resource.
+  std::filesystem::create_directories(".run");
+  char temporaryRoot[] = ".run/mothership-runtime-startup-private-XXXXXX";
+  assert(::mkdtemp(temporaryRoot) != nullptr && ::chmod(temporaryRoot, 0700) == 0);
+  const std::string operationRoot(temporaryRoot);
+  const std::string privateState = operationRoot + "/state.new10";
+  std::filesystem::create_directories(privateState + ".secrets");
+  {
+    ProdigyPersistentStateStore store(MothershipTidesMigration::text(privateState));
+    assert(store.saveLocalBrainState(local, &failure));
+    assert(store.saveBrainSnapshot(source, &failure));
+  }
+  String sourceBytes = {};
+  auto sourceCopy = source;
+  assert(BitseryEngine::serialize(sourceBytes, sourceCopy));
+  String sourceSnapshotSHA = {};
+  assert(prodigyComputeSHA256Hex(sourceBytes, sourceSnapshotSHA));
+  request.sources[0].snapshotSHA256 = sourceSnapshotSHA;
+  const String exactRequestSHA = MothershipTidesMigration::text(std::string(64, 'e'));
+  RuntimeStartupPrepared privatePrepared = {};
+  assert(prepareRuntimeStartupPrivate(request, local, source, member, exactRequestSHA, sourceSnapshotSHA,
+                                      operationRoot, privateState, privatePrepared, &failure));
+  ProdigyPersistentBrainSnapshot privateReadback = {};
+  loadSnapshot(privateState, privateReadback);
+  assert(prodigyPersistentBrainSnapshotsEqual(privateReadback, prepared));
+  String beforeFinalize = {};
+  assert(runtimeStartupSnapshotDigest(privateReadback, beforeFinalize, &failure));
+  WitnessSet shared = privatePrepared.candidateWitnesses;
+  assert(finalizeRuntimeStartupPrivate(request, local, source, member, exactRequestSHA, sourceSnapshotSHA,
+                                       operationRoot, privateState, shared, privatePrepared, &failure));
+  ProdigyPersistentBrainSnapshot finalized = {};
+  loadSnapshot(privateState, finalized);
+  String finalizedDigest = {};
+  assert(runtimeStartupSnapshotDigest(finalized, finalizedDigest, &failure));
+  assert(finalizeRuntimeStartupPrivate(request, local, source, member, exactRequestSHA, sourceSnapshotSHA,
+                                       operationRoot, privateState, shared, privatePrepared, &failure));
+  ProdigyPersistentBrainSnapshot replayed = {};
+  loadSnapshot(privateState, replayed);
+  String replayedDigest = {};
+  assert(runtimeStartupSnapshotDigest(replayed, replayedDigest, &failure) && replayedDigest == finalizedDigest);
+  auto wrongShared = shared;
+  wrongShared.requestSHA.assign(std::string(64, 'c').c_str());
+  assert(!finalizeRuntimeStartupPrivate(request, local, source, member, exactRequestSHA, sourceSnapshotSHA,
+                                        operationRoot, privateState, wrongShared, privatePrepared, &failure));
+  ProdigyPersistentBrainSnapshot rejectedReadback = {};
+  loadSnapshot(privateState, rejectedReadback);
+  String rejectedDigest = {};
+  assert(runtimeStartupSnapshotDigest(rejectedReadback, rejectedDigest, &failure) && rejectedDigest == replayedDigest);
+  assert(beforeFinalize == finalizedDigest);
+
+  // The publication primitive must resume a crash between moving one original
+  // aside and promoting its prepared replacement, without touching the other
+  // paired database until that member can be reconciled.
+  const auto publicationRoot = std::filesystem::path(operationRoot) / "paired-publication";
+  auto makeDirectory = [](const std::filesystem::path& path,const char *marker) {
+    std::filesystem::create_directories(path);
+    std::ofstream file(path / "marker", std::ios::binary);
+    assert(file); file << marker;
+  };
+  auto database = [&](const char *live,const char *retained,const char *preparedPath) {
+    MothershipTidesDBMigrationDatabase value = {};
+    value.livePath = MothershipTidesMigration::text((publicationRoot / live).string());
+    value.retainedV9Path = MothershipTidesMigration::text((publicationRoot / retained).string());
+    value.preparedV10Path = MothershipTidesMigration::text((publicationRoot / preparedPath).string());
+    return value;
+  };
+  auto stateDatabase = database("state", "source.state", "state.new10");
+  auto secretsDatabase = database("state.secrets", "source.secrets", "state.new10.secrets");
+  for (const auto& entry : std::array<MothershipTidesDBMigrationDatabase, 2>{stateDatabase, secretsDatabase}) {
+    makeDirectory(MothershipTidesMigration::str(entry.livePath), "original");
+    makeDirectory(MothershipTidesMigration::str(entry.preparedV10Path), "prepared");
+  }
+  Vector<MothershipTidesDBMigrationDatabase> interrupted = {stateDatabase, secretsDatabase};
+  bool interruptedAtPromotion = false;
+  try {
+    publishPreparedPairedRecoveryDatabases(interrupted,
+        [](const auto&,const String& path) { return std::filesystem::exists(MothershipTidesMigration::str(path)); },
+        [&](const auto&,const String& from,const String& to,String *why) {
+          if (MothershipTidesMigration::str(from).ends_with("state.new10")) {
+            interruptedAtPromotion = true; if (why) why->assign("injected promotion interruption"_ctv); return false;
+          }
+          std::filesystem::rename(MothershipTidesMigration::str(from), MothershipTidesMigration::str(to)); return true;
+        }, [] {});
+    assert(false);
+  } catch (const std::exception&) {}
+  assert(interruptedAtPromotion && !std::filesystem::exists(MothershipTidesMigration::str(stateDatabase.livePath)) &&
+      std::filesystem::exists(MothershipTidesMigration::str(stateDatabase.retainedV9Path)) &&
+      std::filesystem::exists(MothershipTidesMigration::str(stateDatabase.preparedV10Path)) &&
+      std::filesystem::exists(MothershipTidesMigration::str(secretsDatabase.livePath)) &&
+      !std::filesystem::exists(MothershipTidesMigration::str(secretsDatabase.retainedV9Path)));
+  Vector<MothershipTidesDBMigrationDatabase> resumed = {stateDatabase, secretsDatabase};
+  publishPreparedPairedRecoveryDatabases(resumed,
+      [](const auto&,const String& path) { return std::filesystem::exists(MothershipTidesMigration::str(path)); },
+      [](const auto&,const String& from,const String& to,String *) { std::filesystem::rename(MothershipTidesMigration::str(from), MothershipTidesMigration::str(to)); return true; },
+      [] {});
+  for (const auto& entry : resumed) {
+    assert(entry.swapped && std::filesystem::exists(MothershipTidesMigration::str(entry.livePath)) &&
+        std::filesystem::exists(MothershipTidesMigration::str(entry.retainedV9Path)) &&
+        !std::filesystem::exists(MothershipTidesMigration::str(entry.preparedV10Path)));
+    std::ifstream current(std::filesystem::path(MothershipTidesMigration::str(entry.livePath)) / "marker", std::ios::binary);
+    std::ifstream original(std::filesystem::path(MothershipTidesMigration::str(entry.retainedV9Path)) / "marker", std::ios::binary);
+    std::string currentValue, originalValue; current >> currentValue; original >> originalValue;
+    assert(currentValue == "prepared" && originalValue == "original");
+  }
+  auto ambiguous = database("ambiguous-live", "ambiguous-retained", "ambiguous-prepared");
+  makeDirectory(MothershipTidesMigration::str(ambiguous.livePath), "live");
+  makeDirectory(MothershipTidesMigration::str(ambiguous.retainedV9Path), "retained");
+  makeDirectory(MothershipTidesMigration::str(ambiguous.preparedV10Path), "prepared");
+  bool ambiguousRejected = false;
+  try {
+    Vector<MothershipTidesDBMigrationDatabase> values = {ambiguous};
+    publishPreparedPairedRecoveryDatabases(values,
+        [](const auto&,const String& path) { return std::filesystem::exists(MothershipTidesMigration::str(path)); },
+        [](const auto&,const String&,const String&,String *) { return false; }, [] {});
+  } catch (const std::exception&) { ambiguousRejected = true; }
+  assert(ambiguousRejected);
+  std::filesystem::remove_all(operationRoot);
+}
+
 int main()
 {
+  assertRuntimeRecoveryStartupAuthorityPreparation();
   // Generic runtime recovery may inspect only decoded private copies.  Its
   // neutral admission must refuse any unfinished update coordinator rather
   // than treating an interrupted rollout as disposable state.

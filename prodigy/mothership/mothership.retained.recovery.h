@@ -1371,6 +1371,105 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
   return true;
 }
 
+// Prepare the one startup-authority projection used by a replacement runtime
+// after Mothership has independently captured a complete live cohort.  This
+// does not admit a second recovery policy: it first applies the ordinary
+// private-snapshot gate, then delegates all bootstrap construction and
+// canonical inventory checks to the retained-recovery owner above.  Leave both
+// the source snapshot and the caller's output untouched on every rejection.
+static inline bool mothershipPrepareRuntimeRecoveryStartupAuthority(
+    const ProdigyPersistentLocalBrainState& local,
+    const ProdigyPersistentBrainSnapshot& source,
+    uint128_t expectedClusterUUID, uint128_t expectedMemberUUID,
+    const ClusterTopology& expectedTopology,
+    const bytell_hash_map<uint64_t, DeploymentPlan>& approvedPlans,
+    const Vector<MothershipRetainedRecoveryMachineInput>& machines,
+    const String& targetBundleSHA256,
+    const String& rejectedCandidateSHA256,
+    ProdigyPersistentBrainSnapshot& prepared,
+    String *failure = nullptr)
+{
+  const auto reject = [&](const char *reason) {
+    if (failure) failure->assign(reason);
+    return false;
+  };
+  if (failure) failure->clear();
+  if (expectedTopology.machines.size() != 3 || machines.size() != 3)
+    return reject("runtime recovery requires a complete three-Brain live cohort");
+  bytell_hash_set<uint128_t> topologyMachines = {};
+  for (const ClusterMachine& machine : expectedTopology.machines)
+    if (machine.uuid == 0 || machine.isBrain == false || !topologyMachines.insert(machine.uuid).second)
+      return reject("runtime recovery topology is not an exact three-Brain cohort");
+  bytell_hash_set<uint128_t> cohortMachines = {};
+  bytell_hash_set<uint32_t> cohortFragments = {};
+  for (const MothershipRetainedRecoveryMachineInput& machine : machines)
+    if (machine.machineUUID == 0 || machine.machineFragment == 0 || machine.machineFragment > 0xffffff ||
+        machine.parameters.empty() || machine.parameters.size() != machine.observedCreatedAtMs.size() ||
+        !cohortMachines.insert(machine.machineUUID).second || !cohortFragments.insert(machine.machineFragment).second ||
+        !topologyMachines.contains(machine.machineUUID))
+      return reject("runtime recovery live cohort shape differs from frozen topology");
+  if (!mothershipRuntimeRecoverySnapshotValid(
+          local, source, expectedClusterUUID, expectedMemberUUID, expectedTopology, failure))
+    return false;
+
+  // The census is evidence, not new scheduler authority. Every observed live
+  // process must bind once to a pre-existing canonical runtime record, with
+  // its credentials and immutable deployment projection preserved by the
+  // persistent bootstrap comparator. Planned reservations are intentionally
+  // outside that bijection: they have no live process and must never acquire a
+  // witness merely because they remain in durable scheduler state.
+  bytell_hash_set<uint128_t> observedRuntimeUUIDs = {};
+  for (const MothershipRetainedRecoveryMachineInput& machine : machines)
+  {
+    for (uint32_t index = 0; index < machine.parameters.size(); ++index)
+    {
+      const ContainerParameters& parameters = machine.parameters[index];
+      const BrainReplicatedContainerRuntimeState *runtime = nullptr;
+      for (const BrainReplicatedContainerRuntimeState& candidate : source.masterAuthority.containerRuntimeStates)
+      {
+        if (candidate.plan.uuid != parameters.uuid) continue;
+        if (runtime != nullptr || candidate.machineUUID != machine.machineUUID)
+          return reject("live retained container does not map to one canonical runtime owner");
+        runtime = &candidate;
+      }
+      auto plan = approvedPlans.find(parameters.deploymentID);
+      NeuronContainerBootstrap reconstructed = {}, observed = {};
+      String bootstrapFailure = {};
+      if (runtime == nullptr || plan == approvedPlans.end() ||
+          !observedRuntimeUUIDs.insert(parameters.uuid).second ||
+          !prodigyBuildRetainedContainerBootstrap(
+              plan->second, parameters, machine.machineFragment,
+              source.brainConfig.datacenterFragment, machine.observedCreatedAtMs[index],
+              reconstructed, &bootstrapFailure) ||
+          runtime->plan.config.deploymentID() != parameters.deploymentID)
+        return reject("live retained container differs from canonical deployment authority");
+      observed = reconstructed;
+      observed.plan = runtime->plan;
+      if (!mothershipRetainedRecoveryBootstrapMatchesObservedLifecycle(observed, reconstructed))
+        return reject("live retained container lifecycle or credentials differ from canonical authority");
+    }
+  }
+  for (const BrainReplicatedContainerRuntimeState& runtime : source.masterAuthority.containerRuntimeStates)
+  {
+    if (runtime.plan.state == ContainerState::planned) continue;
+    if ((runtime.plan.state != ContainerState::scheduled && runtime.plan.state != ContainerState::healthy) ||
+        !observedRuntimeUUIDs.contains(runtime.plan.uuid))
+      return reject("canonical live runtime is absent from the retained census");
+  }
+
+  ProdigyPersistentBrainSnapshot candidate = source;
+  String preparationFailure = {};
+  if (!mothershipPrepareRetainedRecoverySnapshot(
+          candidate, approvedPlans, machines, targetBundleSHA256, &preparationFailure,
+          {}, {}, 0, nullptr, false, true, 0, {}, nullptr, rejectedCandidateSHA256))
+  {
+    if (failure) failure->assign(preparationFailure);
+    return false;
+  }
+  prepared = std::move(candidate);
+  return true;
+}
+
 
 // A superseded coordinator may have failed locally before it issued any
 // work. This narrow schema-four proof accepts only its sealed older witness;

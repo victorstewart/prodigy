@@ -742,6 +742,40 @@ static void serialize(S&& serializer, MothershipRemoteRuntimeRecoveryCohortRecor
   serializer.container(record.members, 3);
 }
 
+// Links one already-frozen, never-installed cohort to exactly one fresh
+// recovery admission.  The parent remains byte-for-byte intact: this record
+// records a source restoration and permits the child to use the current
+// observed topology only when it differs from the registered declaration by
+// logical rack labels alone.
+class MothershipRemoteRuntimeRecoveryHandoffRecord {
+public:
+  uint32_t version = 1;
+  uint128_t clusterUUID = 0;
+  uint128_t parentOperationID = 0;
+  uint128_t childOperationID = 0;
+  String parentCohortSHA256;
+  String childAdmissionSHA256;
+  String childCohortSHA256;
+  ClusterTopology declaredTopology;
+  ClusterTopology observedTopology;
+  Vector<String> restorationReceiptSHA256;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipRemoteRuntimeRecoveryHandoffRecord& record)
+{
+  serializer.value4b(record.version);
+  serializer.value16b(record.clusterUUID);
+  serializer.value16b(record.parentOperationID);
+  serializer.value16b(record.childOperationID);
+  serializer.text1b(record.parentCohortSHA256, 64);
+  serializer.text1b(record.childAdmissionSHA256, 64);
+  serializer.text1b(record.childCohortSHA256, 64);
+  serializer.object(record.declaredTopology);
+  serializer.object(record.observedTopology);
+  serializer.container(record.restorationReceiptSHA256, 3);
+}
+
 // Private Mothership intent.  It is deliberately separate from a Brain's
 // replicated enrollment: this record makes the one-time root and pair identity
 // retry-safe while each Brain remains the sole runtime authority owner.
@@ -1196,6 +1230,7 @@ private:
   constexpr static auto clustersByUUIDColumnFamily = "clusters_by_uuid"_ctv;
   constexpr static auto upgradeAdmissionsColumnFamily = "upgrade_admissions"_ctv;
   constexpr static auto remoteRuntimeRecoveryCohortsColumnFamily = "remote_runtime_recovery_cohorts"_ctv;
+  constexpr static auto remoteRuntimeRecoveryHandoffsColumnFamily = "remote_runtime_recovery_handoffs"_ctv;
   constexpr static auto testPairBoundariesColumnFamily = "test_pair_boundaries"_ctv;
   constexpr static auto cousinRoutesColumnFamily = "cousin_routes"_ctv;
   constexpr static auto cousinRouteReceiptsColumnFamily = "cousin_route_receipts"_ctv;
@@ -4659,6 +4694,60 @@ public:
     key.clear(); key.append(cluster); key.append('/'); key.append(operation);
   }
 
+  static void remoteRuntimeRecoveryHandoffKey(uint128_t clusterUUID, uint128_t parentOperationID, String& key)
+  {
+    String cluster = {}, parent = {}; cluster.assignItoh(clusterUUID); parent.assignItoh(parentOperationID);
+    key.clear(); key.append(cluster); key.append('/'); key.append(parent);
+  }
+
+  static bool remoteRuntimeRecoveryRackOnlyTopologyDriftValid(
+      const ClusterTopology& declared, const ClusterTopology& observed)
+  {
+    if (declared.version == 0 || observed.version < declared.version || declared.machines.size() != 3 ||
+        observed.machines.size() != declared.machines.size()) return false;
+    ClusterTopology normalized = observed;
+    normalized.version = declared.version;
+    for (uint32_t index = 0; index < declared.machines.size(); ++index)
+    {
+      const ClusterMachine& expected = declared.machines[index];
+      const ClusterMachine& actual = normalized.machines[index];
+      if (expected.uuid == 0 || expected.uuid != actual.uuid || !expected.isBrain || !actual.isBrain) return false;
+      normalized.machines[index].rackUUID = expected.rackUUID;
+    }
+    return normalized == declared;
+  }
+
+  static bool remoteRuntimeRecoveryHandoffValid(const MothershipRemoteRuntimeRecoveryHandoffRecord& handoff)
+  {
+    if (handoff.version != 1 || handoff.clusterUUID == 0 || handoff.parentOperationID == 0 ||
+        handoff.childOperationID == 0 || handoff.parentOperationID == handoff.childOperationID ||
+        !prodigyIsSHA256HexDigest(handoff.parentCohortSHA256) ||
+        !prodigyIsSHA256HexDigest(handoff.childAdmissionSHA256) ||
+        !prodigyIsSHA256HexDigest(handoff.childCohortSHA256) ||
+        handoff.restorationReceiptSHA256.size() != 3 ||
+        !remoteRuntimeRecoveryRackOnlyTopologyDriftValid(handoff.declaredTopology, handoff.observedTopology)) return false;
+    for (uint32_t index = 0; index < handoff.restorationReceiptSHA256.size(); ++index)
+    {
+      if (!prodigyIsSHA256HexDigest(handoff.restorationReceiptSHA256[index])) return false;
+    }
+    return true;
+  }
+
+  static bool remoteRuntimeRecoveryInitialCohortDigest(
+      const MothershipRemoteRuntimeRecoveryCohortRecord& cohort, String& digest, String *failure = nullptr)
+  {
+    auto initial = cohort;
+    initial.phase = MothershipRemoteRuntimeRecoveryPhase::admitted;
+    for (auto& member : initial.members)
+    {
+      member.stateSHA256.clear(); member.secretsSHA256.clear(); member.containerInventorySHA256.clear();
+      member.privateLoaderSHA256.clear(); member.retainedNetworkSHA256.clear();
+      member.targetRuntimeInstalled = false; member.phaseReceipts.clear();
+    }
+    String bytes = {};
+    return BitseryEngine::serialize(bytes, initial) && prodigyComputeSHA256Hex(bytes, digest, failure);
+  }
+
   bool admitRemoteRuntimeRecoveryCohort(const MothershipRemoteRuntimeRecoveryCohortRecord& requested,
                                         const MothershipProdigyCluster& cluster,
                                         MothershipRemoteRuntimeRecoveryCohortRecord& recorded,
@@ -4729,7 +4818,13 @@ public:
       { if (failure) failure->assign("remote runtime recovery encountered an invalid prior cohort"_ctv); return false; }
       if (other.clusterUUID == requested.clusterUUID && other.operationID != requested.operationID &&
           !remoteRuntimeRecoveryTerminal(other.phase))
-      { if (failure) failure->assign("remote runtime recovery has an unresolved overlapping cohort"_ctv); return false; }
+      {
+        bool superseded = false;
+        if (other.phase == MothershipRemoteRuntimeRecoveryPhase::frozen &&
+            !remoteRuntimeRecoveryParentSuperseded(other, superseded, failure)) return false;
+        if (!superseded)
+        { if (failure) failure->assign("remote runtime recovery has an unresolved overlapping cohort"_ctv); return false; }
+      }
     }
     BitseryEngine::serialize(encoded, requested);
     if (!db.write(remoteRuntimeRecoveryCohortsColumnFamily, key, encoded, failure)) return false;
@@ -4749,6 +4844,220 @@ public:
       record = {}; if (failure) failure->assign("remote runtime recovery record is invalid"_ctv); return false;
     }
     if (failure) failure->clear(); return true;
+  }
+
+  bool loadRemoteRuntimeRecoveryHandoffForChild(
+      uint128_t clusterUUID, uint128_t childOperationID,
+      MothershipRemoteRuntimeRecoveryHandoffRecord& handoff, String *failure = nullptr)
+  {
+    handoff = {};
+    if (clusterUUID == 0 || childOperationID == 0)
+    { if (failure) failure->assign("remote runtime recovery handoff identity is required"_ctv); return false; }
+    RemoteRuntimeRecoveryLock lock = {};
+    if (!lockRemoteRuntimeRecovery(lock, failure)) return false;
+    Vector<String> values = {};
+    if (!db.listValues(remoteRuntimeRecoveryHandoffsColumnFamily, values, failure)) return false;
+    uint32_t matches = 0;
+    for (const String& bytes : values)
+    {
+      MothershipRemoteRuntimeRecoveryHandoffRecord candidate = {};
+      if (!BitseryEngine::deserializeSafe(bytes, candidate) || !remoteRuntimeRecoveryHandoffValid(candidate))
+      { if (failure) failure->assign("remote runtime recovery handoff is corrupt or unsupported"_ctv); return false; }
+      if (candidate.clusterUUID == clusterUUID && candidate.childOperationID == childOperationID)
+      { handoff = std::move(candidate); ++matches; }
+    }
+    if (matches != 1)
+    {
+      handoff = {};
+      if (failure)
+      {
+        if (matches) failure->assign("remote runtime recovery child handoff is ambiguous"_ctv);
+        else failure->assign("record not found"_ctv);
+      }
+      return false;
+    }
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool remoteRuntimeRecoveryParentSuperseded(
+      const MothershipRemoteRuntimeRecoveryCohortRecord& parent, bool& superseded, String *failure = nullptr)
+  {
+    superseded = false;
+    if (!remoteRuntimeRecoveryCohortValid(parent) || parent.phase != MothershipRemoteRuntimeRecoveryPhase::frozen)
+    { if (failure) failure->assign("remote runtime recovery parent is not frozen"_ctv); return false; }
+    String parentBytes = {}, parentSHA256 = {};
+    auto parentCopy = parent;
+    if (!BitseryEngine::serialize(parentBytes, parentCopy) || !prodigyComputeSHA256Hex(parentBytes, parentSHA256, failure)) return false;
+    String handoffKey = {}; remoteRuntimeRecoveryHandoffKey(parent.clusterUUID, parent.operationID, handoffKey);
+    String handoffBytes = {}, readFailure = {};
+    if (!db.read(remoteRuntimeRecoveryHandoffsColumnFamily, handoffKey, handoffBytes, &readFailure))
+    {
+      if (readFailure.equal("record not found"_ctv)) { if (failure) failure->clear(); return true; }
+      if (failure) *failure = readFailure;
+      return false;
+    }
+    MothershipRemoteRuntimeRecoveryHandoffRecord handoff = {};
+    if (!BitseryEngine::deserializeSafe(handoffBytes, handoff) || !remoteRuntimeRecoveryHandoffValid(handoff) ||
+        handoff.clusterUUID != parent.clusterUUID || handoff.parentOperationID != parent.operationID ||
+        handoff.parentCohortSHA256 != parentSHA256)
+    { if (failure) failure->assign("remote runtime recovery parent handoff is invalid"_ctv); return false; }
+    MothershipRemoteRuntimeRecoveryCohortRecord child = {};
+    if (!loadRemoteRuntimeRecoveryCohort(parent.clusterUUID, handoff.childOperationID, child, failure)) return false;
+    String childSHA256 = {};
+    String observedBytes = {}, observedSHA256 = {};
+    auto observedTopology = handoff.observedTopology;
+    MothershipUpgradeAdmissionRecord childAdmission = {};
+    String childAdmissionBytes = {}, childAdmissionSHA256 = {};
+    if (!BitseryEngine::serialize(observedBytes, observedTopology) || !prodigyComputeSHA256Hex(observedBytes, observedSHA256, failure) ||
+        !loadUpgradeAdmission(parent.clusterUUID, handoff.childOperationID, childAdmission, failure) ||
+        !childAdmission.eligible || childAdmission.approvedPath != uint8_t(MothershipUpgradePath::sameLogicalRollout) ||
+        !BitseryEngine::serialize(childAdmissionBytes, childAdmission) ||
+        !prodigyComputeSHA256Hex(childAdmissionBytes, childAdmissionSHA256, failure) ||
+        childAdmissionSHA256 != handoff.childAdmissionSHA256 || child.admissionRecordSHA256 != childAdmissionSHA256 ||
+        child.sourceBundleSHA256 != parent.sourceBundleSHA256 || child.sourceContractSHA256 != parent.sourceContractSHA256 ||
+        child.sourceProdigySHA256 != parent.sourceProdigySHA256 || child.sourceMothershipSHA256 != parent.sourceMothershipSHA256 ||
+        childAdmission.sourceBundleSHA256 != child.sourceBundleSHA256 || childAdmission.sourceContractSHA256 != child.sourceContractSHA256 ||
+        childAdmission.sourceProdigySHA256 != child.sourceProdigySHA256 || childAdmission.sourceMothershipSHA256 != child.sourceMothershipSHA256 ||
+        child.topologySHA256 != observedSHA256 ||
+        !remoteRuntimeRecoveryInitialCohortDigest(child, childSHA256, failure) || childSHA256 != handoff.childCohortSHA256 ||
+        child.phase == MothershipRemoteRuntimeRecoveryPhase::withdrawnBeforeFence ||
+        child.phase == MothershipRemoteRuntimeRecoveryPhase::abortedBeforeInstallation)
+    { if (failure && failure->empty()) failure->assign("remote runtime recovery child handoff differs"_ctv); return false; }
+    for (uint32_t index = 0; index < parent.members.size(); ++index)
+      if (parent.members[index].machineUUID != child.members[index].machineUUID ||
+          parent.members[index].linuxMachineID != child.members[index].linuxMachineID ||
+          parent.members[index].bootID != child.members[index].bootID)
+      { if (failure) failure->assign("remote runtime recovery child handoff source identity differs"_ctv); return false; }
+    superseded = true;
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool admitRemoteRuntimeRecoveryHandoff(
+      const MothershipRemoteRuntimeRecoveryHandoffRecord& requested,
+      const MothershipProdigyCluster& cluster,
+      const MothershipRemoteRuntimeRecoveryCohortRecord& childRequested,
+      MothershipRemoteRuntimeRecoveryHandoffRecord& handoffRecorded,
+      MothershipRemoteRuntimeRecoveryCohortRecord& childRecorded,
+      bool& resumed, String *failure = nullptr)
+  {
+    handoffRecorded = {}; childRecorded = {}; resumed = false;
+    RemoteRuntimeRecoveryLock lock = {};
+    if (!lockRemoteRuntimeRecovery(lock, failure)) return false;
+    if (!remoteRuntimeRecoveryHandoffValid(requested) || !remoteRuntimeRecoveryCohortValid(childRequested) ||
+        childRequested.phase != MothershipRemoteRuntimeRecoveryPhase::admitted ||
+        cluster.clusterUUID != requested.clusterUUID || cluster.clusterUUID != childRequested.clusterUUID ||
+        cluster.deploymentMode != MothershipClusterDeploymentMode::remote || cluster.provider != MothershipClusterProvider::vultr ||
+        cluster.nBrains != 3 || cluster.topology != requested.declaredTopology || cluster.remoteProdigyPath != childRequested.runtimeRoot ||
+        childRequested.operationID != requested.childOperationID)
+    { if (failure) failure->assign("remote runtime recovery handoff request is invalid"_ctv); return false; }
+    String observedBytes = {}, observedSHA256 = {}, declaredBytes = {}, declaredSHA256 = {};
+    auto observed = requested.observedTopology, declared = requested.declaredTopology;
+    if (!BitseryEngine::serialize(observedBytes, observed) || !prodigyComputeSHA256Hex(observedBytes, observedSHA256, failure) ||
+        !BitseryEngine::serialize(declaredBytes, declared) || !prodigyComputeSHA256Hex(declaredBytes, declaredSHA256, failure) ||
+        childRequested.topologySHA256 != observedSHA256)
+    { if (failure && failure->empty()) failure->assign("remote runtime recovery handoff topology binding differs"_ctv); return false; }
+    for (uint32_t index = 0; index < childRequested.members.size(); ++index)
+      if (childRequested.members[index].machineUUID != requested.observedTopology.machines[index].uuid)
+      { if (failure) failure->assign("remote runtime recovery handoff child member order differs"_ctv); return false; }
+    MothershipRemoteRuntimeRecoveryCohortRecord parent = {};
+    if (!loadRemoteRuntimeRecoveryCohort(requested.clusterUUID, requested.parentOperationID, parent, failure) ||
+        parent.phase != MothershipRemoteRuntimeRecoveryPhase::frozen || !remoteRuntimeRecoveryAllProofsSealed(parent) ||
+        remoteRuntimeRecoveryAllMembersInstalled(parent))
+    { if (failure && failure->empty()) failure->assign("remote runtime recovery handoff parent is not frozen uninstalled evidence"_ctv); return false; }
+    String parentBytes = {}, parentSHA256 = {};
+    auto parentCopy = parent;
+    if (!BitseryEngine::serialize(parentBytes, parentCopy) || !prodigyComputeSHA256Hex(parentBytes, parentSHA256, failure) ||
+        requested.parentCohortSHA256 != parentSHA256 || parent.topologySHA256 != declaredSHA256 ||
+        parent.sourceBundleSHA256 != childRequested.sourceBundleSHA256 ||
+        parent.sourceContractSHA256 != childRequested.sourceContractSHA256 ||
+        parent.sourceProdigySHA256 != childRequested.sourceProdigySHA256 ||
+        parent.sourceMothershipSHA256 != childRequested.sourceMothershipSHA256)
+    { if (failure && failure->empty()) failure->assign("remote runtime recovery handoff parent binding differs"_ctv); return false; }
+    for (uint32_t index = 0; index < parent.members.size(); ++index)
+      if (parent.members[index].machineUUID != childRequested.members[index].machineUUID ||
+          parent.members[index].linuxMachineID != childRequested.members[index].linuxMachineID ||
+          parent.members[index].bootID != childRequested.members[index].bootID)
+      { if (failure) failure->assign("remote runtime recovery handoff source machine or boot changed"_ctv); return false; }
+    MothershipUpgradeAdmissionRecord admission = {};
+    String admissionBytes = {}, admissionSHA256 = {};
+    if (!loadUpgradeAdmission(requested.clusterUUID, requested.childOperationID, admission, failure) || !admission.eligible ||
+        admission.approvedPath != uint8_t(MothershipUpgradePath::sameLogicalRollout) ||
+        admission.authorityGeneration != childRequested.authorityGeneration ||
+        admission.sourceBundleSHA256 != childRequested.sourceBundleSHA256 ||
+        admission.sourceContractSHA256 != childRequested.sourceContractSHA256 ||
+        admission.sourceProdigySHA256 != childRequested.sourceProdigySHA256 || admission.sourceMothershipSHA256 != childRequested.sourceMothershipSHA256 ||
+        admission.targetBundleSHA256 != childRequested.targetBundleSHA256 || admission.targetContractSHA256 != childRequested.targetContractSHA256 ||
+        !BitseryEngine::serialize(admissionBytes, admission) || !prodigyComputeSHA256Hex(admissionBytes, admissionSHA256, failure) ||
+        admissionSHA256 != requested.childAdmissionSHA256 || childRequested.admissionRecordSHA256 != admissionSHA256)
+    { if (failure && failure->empty()) failure->assign("remote runtime recovery handoff child admission differs"_ctv); return false; }
+    String childSHA256 = {};
+    if (!remoteRuntimeRecoveryInitialCohortDigest(childRequested, childSHA256, failure) || childSHA256 != requested.childCohortSHA256)
+    { if (failure && failure->empty()) failure->assign("remote runtime recovery handoff child cohort differs"_ctv); return false; }
+    Vector<String> existingCohorts = {};
+    if (!db.listValues(remoteRuntimeRecoveryCohortsColumnFamily, existingCohorts, failure)) return false;
+    for (const String& bytes : existingCohorts)
+    {
+      MothershipRemoteRuntimeRecoveryCohortRecord other = {};
+      if (!BitseryEngine::deserializeSafe(bytes, other) || !remoteRuntimeRecoveryCohortValid(other))
+      { if (failure) failure->assign("remote runtime recovery handoff encountered an invalid prior cohort"_ctv); return false; }
+      if (other.clusterUUID != requested.clusterUUID || remoteRuntimeRecoveryTerminal(other.phase)) continue;
+      if (other.operationID != requested.parentOperationID && other.operationID != requested.childOperationID)
+      { if (failure) failure->assign("remote runtime recovery handoff has an unresolved overlapping cohort"_ctv); return false; }
+    }
+    Vector<String> existingHandoffs = {};
+    if (!db.listValues(remoteRuntimeRecoveryHandoffsColumnFamily, existingHandoffs, failure)) return false;
+    for (const String& bytes : existingHandoffs)
+    {
+      MothershipRemoteRuntimeRecoveryHandoffRecord other = {};
+      if (!BitseryEngine::deserializeSafe(bytes, other) || !remoteRuntimeRecoveryHandoffValid(other))
+      { if (failure) failure->assign("remote runtime recovery handoff is corrupt or unsupported"_ctv); return false; }
+      if (other.clusterUUID != requested.clusterUUID) continue;
+      if (other.parentOperationID == requested.parentOperationID && other.childOperationID != requested.childOperationID)
+      { if (failure) failure->assign("remote runtime recovery handoff parent already has a different child"_ctv); return false; }
+      if (other.childOperationID == requested.childOperationID && other.parentOperationID != requested.parentOperationID)
+      { if (failure) failure->assign("remote runtime recovery handoff child already has a different parent"_ctv); return false; }
+      if (other.parentOperationID == requested.childOperationID || other.childOperationID == requested.parentOperationID)
+      { if (failure) failure->assign("remote runtime recovery handoff cycle is invalid"_ctv); return false; }
+    }
+    String parentKey = {}, encoded = {}, readFailure = {};
+    remoteRuntimeRecoveryHandoffKey(requested.clusterUUID, requested.parentOperationID, parentKey);
+    if (db.read(remoteRuntimeRecoveryHandoffsColumnFamily, parentKey, encoded, &readFailure))
+    {
+      MothershipRemoteRuntimeRecoveryHandoffRecord existing = {};
+      String existingBytes = {}, requestedBytes = {}; auto requestedCopy = requested;
+      if (!BitseryEngine::deserializeSafe(encoded, existing) || !remoteRuntimeRecoveryHandoffValid(existing) ||
+          !BitseryEngine::serialize(existingBytes, existing) || !BitseryEngine::serialize(requestedBytes, requestedCopy) || existingBytes != requestedBytes)
+      { if (failure) failure->assign("remote runtime recovery handoff parent already has a different child"_ctv); return false; }
+      handoffRecorded = existing;
+    }
+    else if (!readFailure.equal("record not found"_ctv)) { if (failure) *failure = readFailure; return false; }
+    else
+    {
+      BitseryEngine::serialize(encoded, requested);
+      if (!db.write(remoteRuntimeRecoveryHandoffsColumnFamily, parentKey, encoded, failure)) return false;
+      handoffRecorded = requested;
+    }
+    String childKey = {}, childBytes = {}, childReadFailure = {};
+    remoteRuntimeRecoveryKey(requested.clusterUUID, requested.childOperationID, childKey);
+    if (db.read(remoteRuntimeRecoveryCohortsColumnFamily, childKey, childBytes, &childReadFailure))
+    {
+      MothershipRemoteRuntimeRecoveryCohortRecord existing = {};
+      if (!BitseryEngine::deserializeSafe(childBytes, existing) || !remoteRuntimeRecoveryCohortValid(existing) ||
+          !remoteRuntimeRecoveryIdentityMatches(existing, childRequested))
+      { if (failure) failure->assign("remote runtime recovery handoff child cohort conflicts"_ctv); return false; }
+      childRecorded = existing; resumed = true;
+    }
+    else if (!childReadFailure.equal("record not found"_ctv)) { if (failure) *failure = childReadFailure; return false; }
+    else
+    {
+      BitseryEngine::serialize(childBytes, childRequested);
+      if (!db.write(remoteRuntimeRecoveryCohortsColumnFamily, childKey, childBytes, failure)) return false;
+      childRecorded = childRequested;
+    }
+    if (failure) failure->clear();
+    return true;
   }
 
   // Ordinary upgrade admission uses this read-only interlock before it starts
@@ -4776,7 +5085,12 @@ public:
         return false;
       }
       if (record.clusterUUID == clusterUUID && !remoteRuntimeRecoveryTerminal(record.phase))
-        pending = true;
+      {
+        bool superseded = false;
+        if (record.phase == MothershipRemoteRuntimeRecoveryPhase::frozen &&
+            !remoteRuntimeRecoveryParentSuperseded(record, superseded, failure)) return false;
+        if (!superseded) pending = true;
+      }
     }
     if (failure) failure->clear();
     return true;
@@ -4886,6 +5200,13 @@ public:
       if (failure) failure->assign("remote runtime recovery can be aborted only from frozen uninstalled evidence"_ctv);
       return false;
     }
+    bool superseded = false;
+    if (!remoteRuntimeRecoveryParentSuperseded(current, superseded, failure)) return false;
+    if (superseded)
+    {
+      if (failure) failure->assign("remote runtime recovery parent is superseded by a typed child handoff"_ctv);
+      return false;
+    }
     auto preserved = candidate;
     preserved.phase = MothershipRemoteRuntimeRecoveryPhase::frozen;
     for (auto& member : preserved.members) member.phaseReceipts.pop_back();
@@ -4923,6 +5244,13 @@ public:
     if (!loadRemoteRuntimeRecoveryCohort(candidate.clusterUUID, candidate.operationID, current, failure) ||
         !remoteRuntimeRecoveryIdentityMatches(current, candidate))
     { if (failure && failure->empty()) failure->assign("remote runtime recovery transition identity differs"_ctv); return false; }
+    if (current.phase == MothershipRemoteRuntimeRecoveryPhase::frozen)
+    {
+      bool superseded = false;
+      if (!remoteRuntimeRecoveryParentSuperseded(current, superseded, failure)) return false;
+      if (superseded)
+      { if (failure) failure->assign("remote runtime recovery parent is superseded by a typed child handoff"_ctv); return false; }
+    }
     const uint8_t currentPhase = uint8_t(current.phase), requestedPhase = uint8_t(nextPhase);
     if (requestedPhase < currentPhase || requestedPhase > currentPhase + 1)
     { if (failure) failure->assign("remote runtime recovery phase regresses or skips"_ctv); return false; }
