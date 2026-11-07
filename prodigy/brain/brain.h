@@ -12842,6 +12842,91 @@ public:
     return ownerPresent;
   }
 
+  static bool isVolatileStatelessPlannerReservation(
+      bool isStateful, ContainerState state, uint8_t fragment, bool runtimeReady)
+  {
+    return !isStateful && state == ContainerState::planned && fragment == 0 && !runtimeReady;
+  }
+
+  static bool isStatelessPlannerReservationShape(const BrainReplicatedContainerRuntimeState& state)
+  {
+    return isVolatileStatelessPlannerReservation(
+        state.plan.isStateful, state.plan.state, state.plan.fragment, state.plan.runtimeReady);
+  }
+
+  bool isVolatileStatelessPlannerReservation(const BrainReplicatedContainerRuntimeState& state) const
+  {
+    const uint64_t deploymentID = state.plan.config.deploymentID();
+    const auto authoritative = deploymentPlans.find(deploymentID);
+    return state.plan.uuid != 0 && state.machineUUID != 0 &&
+           isStatelessPlannerReservationShape(state) &&
+           state.plan.system.kind == SystemContainerKind::none &&
+           !state.plan.useHostNetworkNamespace &&
+           authoritative != deploymentPlans.end() && !authoritative->second.isStateful &&
+           authoritative->second.config.applicationID == state.plan.config.applicationID &&
+           authoritative->second.config.versionID == state.plan.config.versionID &&
+           authoritative->second.config.containerBlobSHA256.equals(state.plan.config.containerBlobSHA256) &&
+           authoritative->second.config.containerBlobBytes == state.plan.config.containerBlobBytes;
+  }
+
+  bool volatileStatelessPlannerReservationInventoryCurrent(
+      const BrainReplicatedContainerRuntimeState& state) const
+  {
+    if (!weAreMaster || !recoveringPersistedNeuronInventory || !persistedMachineInventoryEnumerated ||
+        !masterAuthorityRuntimeStateDurable ||
+        durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation ||
+        !isVolatileStatelessPlannerReservation(state)) return false;
+    bool sourceMachinePresent = false;
+    uint32_t observedOwners = 0;
+    for (const Machine *machine : machines)
+    {
+      if (machine == nullptr || machine->uuid == 0 || !machine->runtimeReady || !neuronControlStreamActive(machine) ||
+          !persistedMachineInventoryUploaded.contains(machine->uuid)) return false;
+      const auto inventory = containerRetirementInventoryByMachine.find(machine->uuid);
+      if (inventory == containerRetirementInventoryByMachine.end() ||
+          inventory->second.authorityEpoch != masterAuthorityEpoch ||
+          inventory->second.ioGeneration != machine->neuron.ioGeneration) return false;
+      sourceMachinePresent |= machine->uuid == state.machineUUID;
+      if (inventory->second.present.contains(state.plan.uuid))
+      {
+        // UUID equality alone is not an adoption proof: a stale or duplicate
+        // report from another Machine must retain the legacy record closed.
+        if (machine->uuid != state.machineUUID || ++observedOwners != 1) return false;
+      }
+    }
+    if (!sourceMachinePresent) return false;
+    if (observedOwners == 0) return !containers.contains(state.plan.uuid);
+    const auto actual = containers.find(state.plan.uuid);
+    const auto owner = deployments.find(state.plan.config.deploymentID());
+    const auto authoritative = deploymentPlans.find(state.plan.config.deploymentID());
+    return observedOwners == 1 && actual != containers.end() && actual->second != nullptr && actual->second->machine != nullptr &&
+           actual->second->uuid == state.plan.uuid && !actual->second->isStateful &&
+           actual->second->state != ContainerState::planned &&
+           actual->second->machine->uuid == state.machineUUID &&
+           actual->second->deploymentID == state.plan.config.deploymentID() && actual->second->fragment != 0 &&
+           owner != deployments.end() && owner->second != nullptr && !owner->second->plan.isStateful &&
+           authoritative != deploymentPlans.end() && !authoritative->second.isStateful &&
+           owner->second->plan.config.applicationID == authoritative->second.config.applicationID &&
+           owner->second->plan.config.versionID == authoritative->second.config.versionID &&
+           owner->second->plan.config.containerBlobSHA256.equals(authoritative->second.config.containerBlobSHA256) &&
+           owner->second->plan.config.containerBlobBytes == authoritative->second.config.containerBlobBytes &&
+           owner->second->containers.contains(actual->second) &&
+           actual->second->machine->containersByDeploymentID.contains(actual->second->deploymentID) &&
+           actual->second->machine->containersByDeploymentID.find(actual->second->deploymentID)->second.contains(actual->second);
+  }
+
+  bool pendingReplicatedContainerRuntimeStatesContainOnlyVolatileStatelessPlannerReservations() const
+  {
+    if (pendingReplicatedContainerRuntimeStates.empty()) return false;
+    for (const auto& [deploymentID, states] : pendingReplicatedContainerRuntimeStates)
+    {
+      (void)deploymentID;
+      for (const BrainReplicatedContainerRuntimeState& state : states)
+        if (!isVolatileStatelessPlannerReservation(state)) return false;
+    }
+    return true;
+  }
+
   bool preparePresentInitialSeedReservationRecovery(
       ApplicationDeployment *deployment,
       const BrainReplicatedContainerRuntimeState& state,
@@ -15100,6 +15185,21 @@ public:
     }
 
     ApplicationDeployment *deployment = deploymentIt->second;
+    // A legacy zero-fragment stateless planned row has no process or
+    // restorable DeploymentWork. Keep it in the existing pending-runtime
+    // owner until current fleet inventory either proves it absent or has
+    // already adopted an exact real runtime with the same UUID.
+    if (isStatelessPlannerReservationShape(state))
+    {
+      // A malformed row with this legacy shape is not a runnable plan.  It
+      // must remain in the existing pending owner rather than taking the
+      // ordinary replication path and materializing a ghost ContainerView.
+      if (!isVolatileStatelessPlannerReservation(state))
+        return ReplicatedContainerRuntimeStateApplyResult::deferred;
+      return volatileStatelessPlannerReservationInventoryCurrent(state)
+          ? ReplicatedContainerRuntimeStateApplyResult::rejected
+          : ReplicatedContainerRuntimeStateApplyResult::deferred;
+    }
     ContainerView *container = nullptr;
     bool created = false;
     if (auto existing = containers.find(state.plan.uuid); existing != containers.end())
@@ -24416,9 +24516,11 @@ public:
   bool replayRestoredContainerInventory()
   {
     if (!weAreMaster || !recoveringPersistedNeuronInventory) return pendingRestoredContainerInventory.empty();
-    // Never emit a partial bootstrap while another deployment or machine is
-    // still awaiting materialization. Retain exact UUIDs across split batches.
-    if (!pendingReplicatedContainerRuntimeStates.empty()) return false;
+    // Retain exact runtime UUIDs across split batches. Volatile planner rows
+    // cannot bootstrap a process; replay the real runtimes so authenticated
+    // inventory can settle those rows before the final recovery barrier opens.
+    if (!pendingReplicatedContainerRuntimeStates.empty() &&
+        !pendingReplicatedContainerRuntimeStatesContainOnlyVolatileStatelessPlannerReservations()) return false;
     Vector<uint128_t> observed;
     bytell_hash_set<Machine *> progressed;
     bytell_hash_set<Machine *> missing;
