@@ -35042,13 +35042,23 @@ static void testLocalBundleRecoveryWaitsForCapturedInventory(TestSuite& suite)
 static void testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(TestSuite& suite)
 {
   ScopedRing scopedRing = {};
-  TestBrain brain = {};
+  TransportCredentialCohortTestBrain brain = {};
   NoopBrainIaaS iaas = {};
   brain.iaas = &iaas;
   brain.weAreMaster = true;
   brain.ignited = true;
   brain.persistedMachineInventoryEnumerated = true;
   brain.brainConfig.datacenterFragment = 1;
+  brain.nBrains = 1;
+
+  TestNeuron self = {};
+  self.uuid = uint128_t(0x5219f000);
+  NeuronBase *previousNeuron = thisNeuron;
+  thisNeuron = &self;
+  ClusterMachine selfMember = {};
+  selfMember.uuid = self.uuid;
+  selfMember.isBrain = true;
+  brain.authoritativeTopology.machines.push_back(selfMember);
 
   BrainBase *previousBrain = thisBrain;
   thisBrain = &brain;
@@ -35073,6 +35083,7 @@ static void testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(Tes
   deployment.state = DeploymentState::running;
   brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
   brain.deploymentsByApp.insert_or_assign(deployment.plan.config.applicationID, &deployment);
+  brain.deploymentPlans.insert_or_assign(deployment.plan.config.deploymentID(), deployment.plan);
 
   ContainerView retained = {};
   retained.uuid = uint128_t(0x5219f002);
@@ -35099,6 +35110,8 @@ static void testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(Tes
   machine.runtimeReady = true;
   brain.masterAuthorityRuntimeStateDurable = true;
   brain.durableMasterAuthorityRuntimeStateGeneration = brain.masterAuthorityRuntimeState.generation;
+  suite.require(brain.containerRetirementAuthorityAcknowledged(),
+                "persisted_inventory_runtime_fixture_has_current_retirement_authority");
   brain.updateSelfWorkerExpectedBundleSHA256 =
       "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"_ctv;
   suite.require(brain.prepareLocalBundleExecRecovery(),
@@ -35126,6 +35139,20 @@ static void testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(Tes
                    deployment.containers.contains(restored->second) &&
                    brain.recoveringPersistedNeuronInventory,
                "persisted_inventory_runtime_does_not_discard_unready_retained_stateless_container_before_exact_uploads");
+
+  // Old snapshots could persist a scheduler reservation that never launched.
+  // It must wait on the same authenticated recovery inventory without becoming
+  // a ghost runtime or blocking bootstrap of the retained real container.
+  BrainReplicatedContainerRuntimeState unlaunched = {};
+  unlaunched.machineUUID = machine.uuid;
+  unlaunched.plan.uuid = uint128_t(0x5219f003);
+  unlaunched.plan.config = deployment.plan.config;
+  unlaunched.plan.state = ContainerState::planned;
+  brain.applyReplicatedContainerRuntimeState(unlaunched);
+  suite.expect(!brain.containers.contains(unlaunched.plan.uuid) &&
+                   brain.pendingReplicatedContainerRuntimeStates.contains(deployment.plan.config.deploymentID()) &&
+                   brain.recoveringPersistedNeuronInventory,
+               "persisted_inventory_runtime_legacy_reservation_waits_without_materializing_ghost");
 
   // A digest-matching registration and the exact fresh inventory upload let
   // the existing central recovery owner release the coordinator barrier.
@@ -35170,11 +35197,24 @@ static void testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(Tes
                                                                                                         machine.fragment)));
   }
   restored = brain.containers.find(retained.uuid);
-  suite.expect(brain.recoveringPersistedNeuronInventory == false &&
-                   restored != brain.containers.end() && restored->second != nullptr &&
-                   deployment.containers.contains(restored->second),
+  const bool recoveryCompleted = !brain.recoveringPersistedNeuronInventory &&
+      restored != brain.containers.end() && restored->second != nullptr &&
+      deployment.containers.contains(restored->second) &&
+      !brain.containers.contains(unlaunched.plan.uuid) &&
+      brain.pendingReplicatedContainerRuntimeStates.empty();
+  suite.expect(recoveryCompleted,
                "persisted_inventory_runtime_central_recovery_releases_after_fresh_switchboard_ack");
 
+  if (auto ghost = brain.containers.find(unlaunched.plan.uuid); ghost != brain.containers.end())
+  {
+    ContainerView *view = ghost->second;
+    deployment.containers.erase(view);
+    machine.removeContainerIndexEntry(view->deploymentID, view);
+    brain.containers.erase(ghost);
+    delete view;
+  }
+
+  restored = brain.containers.find(retained.uuid);
   if (restored != brain.containers.end() && restored->second != nullptr)
   {
     ContainerView *view = restored->second;
@@ -35188,10 +35228,12 @@ static void testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(Tes
   }
   brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
   brain.deployments.erase(deployment.plan.config.deploymentID());
+  brain.deploymentPlans.erase(deployment.plan.config.deploymentID());
   brain.neurons.erase(&machine.neuron);
   brain.machinesByUUID.erase(machine.uuid);
   brain.machines.erase(&machine);
   thisBrain = previousBrain;
+  thisNeuron = previousNeuron;
 }
 
 static void testMachineConstructionInitializesLifecycleState(TestSuite& suite)
@@ -45302,6 +45344,14 @@ static void testAuthorityElectionFrontierRefreshesDurablePeerRevision(TestSuite&
 
 int main(void)
 {
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "persisted-inventory-runtime") == 0)
+  {
+    TestSuite suite;
+    testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(suite);
+    std::printf("PERSISTED_INVENTORY_RUNTIME_RESULT passed=%d failed=%d\n", suite.passed, suite.failed);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "authority-frontier-refresh") == 0)
   {
     TestSuite suite;
@@ -45870,12 +45920,6 @@ int main(void)
       only != nullptr && strcmp(only, "brain-recovery-inventory-healthy-gate") == 0)
   {
     testMachineHealthyDefersStatelessRecoveryUntilInventoryComplete(suite);
-    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
-  }
-  if (const char *only = getenv("PRODIGY_TEST_ONLY");
-      only != nullptr && strcmp(only, "persisted-inventory-runtime") == 0)
-  {
-    testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
