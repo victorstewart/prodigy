@@ -9110,6 +9110,59 @@ public:
     return upsertClusterWithBGPOriginPolicyMode(cluster, false, nullptr, storedCluster, failure);
   }
 
+  // DNS and ACME are normally immutable cluster identity.  A cluster created
+  // without either may make one initial, complete enablement through the
+  // explicit administration command below; it cannot rotate, disable, or
+  // partially alter that identity through this exception.
+  bool enableInitialDNSACME(const String& identity,
+                            MothershipClusterProvider dnsProvider,
+                            const String& dnsProviderCredentialName,
+                            const ProdigyACMEConfig& acme,
+                            MothershipProdigyCluster *storedCluster = nullptr,
+                            String *failure = nullptr,
+                            const BGPOriginPolicyLock *heldPolicyLock = nullptr)
+  {
+    BGPOriginPolicyLock ownedPolicyLock = {};
+    if (heldPolicyLock == nullptr)
+    {
+      if (lockBGPOriginPolicy(ownedPolicyLock, failure) == false)
+      {
+        return false;
+      }
+      heldPolicyLock = &ownedPolicyLock;
+    }
+    else if (heldPolicyLock->fd < 0)
+    {
+      if (failure) failure->assign("BGP origin policy lock required"_ctv);
+      return false;
+    }
+
+    MothershipProdigyCluster existing = {};
+    if (getClusterByIdentity(identity, existing, failure) == false)
+    {
+      return false;
+    }
+
+    if (existing.dnsProvider != MothershipClusterProvider::unknown ||
+        existing.dnsProviderCredentialName.size() != 0 || existing.acme.configured())
+    {
+      if (failure) failure->assign("cluster DNS/ACME is already configured"_ctv);
+      return false;
+    }
+    if (dnsProvider == MothershipClusterProvider::unknown ||
+        dnsProviderCredentialName.size() == 0 || acme.configured() == false)
+    {
+      if (failure) failure->assign("initial DNS/ACME enablement requires complete DNS and ACME configuration"_ctv);
+      return false;
+    }
+
+    MothershipProdigyCluster candidate = existing;
+    candidate.dnsProvider = dnsProvider;
+    candidate.dnsProviderCredentialName = dnsProviderCredentialName;
+    candidate.acme = acme;
+    return upsertClusterWithBGPOriginPolicyMode(candidate, false, heldPolicyLock, storedCluster, failure, true);
+  }
+
   // Ordinary cluster writers do not own BGP origin policy. Serialize every
   // full-record update with the policy lock and retain the durable policy from
   // the latest record so a stale unrelated update cannot silently erase it.
@@ -9117,7 +9170,8 @@ public:
                                              bool replaceBGPOriginPolicy,
                                              const BGPOriginPolicyLock *heldPolicyLock,
                                              MothershipProdigyCluster *storedCluster = nullptr,
-                                             String *failure = nullptr)
+                                             String *failure = nullptr,
+                                             bool allowInitialDNSACMEEnablement = false)
   {
     BGPOriginPolicyLock ownedPolicyLock = {};
     if (heldPolicyLock == nullptr)
@@ -9211,7 +9265,13 @@ public:
       return false;
     }
 
-    if (hadExistingCluster && stored.dnsProvider != existingCluster.dnsProvider)
+    const bool initialDNSACMEEnablement = hadExistingCluster && allowInitialDNSACMEEnablement &&
+        existingCluster.dnsProvider == MothershipClusterProvider::unknown &&
+        existingCluster.dnsProviderCredentialName.size() == 0 && existingCluster.acme.configured() == false &&
+        stored.dnsProvider != MothershipClusterProvider::unknown && stored.dnsProviderCredentialName.size() > 0 &&
+        stored.acme.configured();
+
+    if (hadExistingCluster && stored.dnsProvider != existingCluster.dnsProvider && initialDNSACMEEnablement == false)
     {
       if (failure)
       {
@@ -9220,8 +9280,7 @@ public:
       return false;
     }
 
-    if (hadExistingCluster &&
-        (stored.acme == existingCluster.acme) == false)
+    if (hadExistingCluster && (stored.acme == existingCluster.acme) == false && initialDNSACMEEnablement == false)
     {
       if (failure)
       {

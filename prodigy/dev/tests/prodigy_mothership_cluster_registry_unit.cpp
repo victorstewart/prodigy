@@ -1372,6 +1372,47 @@ int main(void)
     suite.expect(refreshedRemoteAdopted.lastRefreshMs == 424'242, "upsert_existing_remote_adopted_refresh_ms");
     storedRemoteAdopted = refreshedRemoteAdopted;
 
+    MothershipProdigyCluster initialDNSACMEEnabled = {};
+    bool enableInitialDNSACME = registry.enableInitialDNSACME(
+        storedRemoteAdopted.name,
+        storedRemoteCreated.dnsProvider,
+        storedRemoteCreated.dnsProviderCredentialName,
+        storedRemoteCreated.acme,
+        &initialDNSACMEEnabled,
+        &failure);
+    suite.expect(enableInitialDNSACME, "enable_initial_dns_acme_for_existing_unconfigured_cluster");
+    suite.expect(initialDNSACMEEnabled.dnsProvider == storedRemoteCreated.dnsProvider &&
+                     initialDNSACMEEnabled.dnsProviderCredentialName.equals(storedRemoteCreated.dnsProviderCredentialName) &&
+                     initialDNSACMEEnabled.acme == storedRemoteCreated.acme,
+                 "enable_initial_dns_acme_persists_complete_identity");
+    storedRemoteAdopted = initialDNSACMEEnabled;
+    MothershipProdigyCluster repeatedDNSACMEEnablement = {};
+    suite.expect(!registry.enableInitialDNSACME(storedRemoteAdopted.name,
+                                                 storedRemoteCreated.dnsProvider,
+                                                 storedRemoteCreated.dnsProviderCredentialName,
+                                                 storedRemoteCreated.acme,
+                                                 &repeatedDNSACMEEnablement,
+                                                 &failure) &&
+                     failure.equals("cluster DNS/ACME is already configured"_ctv),
+                 "enable_initial_dns_acme_rejects_second_change");
+    MothershipProdigyCluster ordinaryInitialDNSACME = storedSecondTestLocal;
+    ordinaryInitialDNSACME.dnsProvider = storedRemoteCreated.dnsProvider;
+    ordinaryInitialDNSACME.dnsProviderCredentialName = storedRemoteCreated.dnsProviderCredentialName;
+    ordinaryInitialDNSACME.acme = storedRemoteCreated.acme;
+    suite.expect(!registry.upsertCluster(ordinaryInitialDNSACME, nullptr, &failure) &&
+                     failure.equals("dnsProvider is immutable for an existing cluster"_ctv),
+                 "ordinary_upsert_cannot_enable_initial_dns_acme");
+    MothershipProdigyCluster incompleteDNSACMEEnablement = {};
+    ProdigyACMEConfig noACME = {};
+    suite.expect(!registry.enableInitialDNSACME(storedSecondTestLocal.name,
+                                                 MothershipClusterProvider::cloudflare,
+                                                 "cloudflare-prod"_ctv,
+                                                 noACME,
+                                                 &incompleteDNSACMEEnablement,
+                                                 &failure) &&
+                     failure.equals("initial DNS/ACME enablement requires complete DNS and ACME configuration"_ctv),
+                 "enable_initial_dns_acme_rejects_partial_identity");
+
     MothershipProdigyCluster changedDNSProvider = storedRemoteCreated;
     changedDNSProvider.dnsProvider = MothershipClusterProvider::route53;
     changedDNSProvider.dnsProviderCredentialName = "route53-prod"_ctv;

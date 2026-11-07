@@ -12525,6 +12525,100 @@ private:
     printManagedCluster(desiredCluster);
   }
 
+  // Correct logical placement labels on already-adopted remote members. The
+  // reconciliation owner reads current Brain topology and admits only exact
+  // unchanged adopted identities before emitting a rack-only AddMachines update.
+  void runUpdateAdoptedMachineRacks(int argc, char *argv[])
+  {
+    if (argc != 2)
+    {
+      basics_log("usage: updateAdoptedMachineRacks [remote cluster name|UUID] [json|-|@path]\n");
+      exit(EXIT_FAILURE);
+    }
+    String failure = {};
+    MothershipProdigyCluster controlCluster = {};
+    if (loadRemoteClusterMutationTarget("updateAdoptedMachineRacks", argv[0], controlCluster, failure) == false)
+    {
+      basics_log("updateAdoptedMachineRacks success=0 identity=%s failure=%s\n", argv[0], failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    String json = {};
+    if (resolveJSONArgument("updateAdoptedMachineRacks", argv[1], json) == false) exit(EXIT_FAILURE);
+    json.need(simdjson::SIMDJSON_PADDING);
+    simdjson::dom::parser parser;
+    simdjson::dom::element doc;
+    if (parser.parse(json.data(), json.size()).get(doc) || doc.type() != simdjson::dom::element_type::ARRAY)
+    {
+      basics_log("updateAdoptedMachineRacks requires a JSON array\n");
+      exit(EXIT_FAILURE);
+    }
+    struct RackUpdate { uint128_t machineUUID = 0; uint32_t rackUUID = 0; };
+    Vector<RackUpdate> updates = {};
+    for (auto item : doc.get_array())
+    {
+      if (item.type() != simdjson::dom::element_type::OBJECT)
+      { basics_log("updateAdoptedMachineRacks[] requires object\n"); exit(EXIT_FAILURE); }
+      RackUpdate update = {};
+      bool sawMachineUUID = false, sawRackUUID = false;
+      for (auto field : item.get_object())
+      {
+        String key = {}; key.setInvariant(field.key.data(), field.key.size());
+        if (key.equal("machineUUID"_ctv))
+        {
+          String identity = {};
+          if (sawMachineUUID || field.value.type() != simdjson::dom::element_type::STRING)
+          { basics_log("updateAdoptedMachineRacks[].machineUUID requires one canonical UUID string\n"); exit(EXIT_FAILURE); }
+          identity.setInvariant(field.value.get_c_str());
+          if (prodigyParseCanonicalHex128(identity, update.machineUUID) == false || update.machineUUID == 0)
+          { basics_log("updateAdoptedMachineRacks[].machineUUID invalid\n"); exit(EXIT_FAILURE); }
+          sawMachineUUID = true;
+        }
+        else if (key.equal("rackUUID"_ctv))
+        {
+          uint64_t rackUUID = 0;
+          if (sawRackUUID || (field.value.type() != simdjson::dom::element_type::INT64 && field.value.type() != simdjson::dom::element_type::UINT64) ||
+              field.value.get(rackUUID) != simdjson::SUCCESS || rackUUID == 0 || rackUUID > UINT32_MAX)
+          { basics_log("updateAdoptedMachineRacks[].rackUUID requires uint32 in 1..%u\n", UINT32_MAX); exit(EXIT_FAILURE); }
+          update.rackUUID = uint32_t(rackUUID); sawRackUUID = true;
+        }
+        else { basics_log("updateAdoptedMachineRacks[] invalid field\n"); exit(EXIT_FAILURE); }
+      }
+      if (sawMachineUUID == false || sawRackUUID == false)
+      { basics_log("updateAdoptedMachineRacks[] requires machineUUID and rackUUID\n"); exit(EXIT_FAILURE); }
+      for (const RackUpdate& prior : updates)
+        if (prior.machineUUID == update.machineUUID)
+        { basics_log("updateAdoptedMachineRacks duplicate machineUUID\n"); exit(EXIT_FAILURE); }
+      updates.push_back(update);
+    }
+    if (updates.empty()) { basics_log("updateAdoptedMachineRacks requires at least one update\n"); exit(EXIT_FAILURE); }
+
+    MothershipProdigyCluster desiredCluster = controlCluster;
+    for (const RackUpdate& update : updates)
+    {
+      MothershipProdigyClusterMachine *machine = nullptr;
+      for (MothershipProdigyClusterMachine& candidate : desiredCluster.machines)
+      {
+        if (candidate.uuid != update.machineUUID) continue;
+        if (machine != nullptr)
+        { basics_log("updateAdoptedMachineRacks success=0 name=%s failure=machine UUID is ambiguous\n", controlCluster.name.c_str()); exit(EXIT_FAILURE); }
+        machine = &candidate;
+      }
+      if (machine == nullptr || machine->source != MothershipClusterMachineSource::adopted)
+      { basics_log("updateAdoptedMachineRacks success=0 name=%s failure=machine UUID is not an adopted member\n", controlCluster.name.c_str()); exit(EXIT_FAILURE); }
+      machine->rackUUID = update.rackUUID;
+    }
+    AddMachines request = {};
+    bool changed = false;
+    if (applyAndPersistScopedClusterMutation(controlCluster, desiredCluster, request, changed, failure) == false)
+    {
+      basics_log("updateAdoptedMachineRacks success=0 name=%s failure=%s\n", controlCluster.name.c_str(), failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    basics_log("updateAdoptedMachineRacks success=1 name=%s changed=%d requested=%u topologyVersion=%llu topologyMachines=%u\n",
+               desiredCluster.name.c_str(), int(changed), unsigned(request.adoptedMachines.size()),
+               (unsigned long long)desiredCluster.topology.version, unsigned(desiredCluster.topology.machines.size()));
+  }
+
   void runSetTestClusterMachineCount(int argc, char *argv[])
   {
     if (argc < 2)
@@ -29861,6 +29955,160 @@ LOCAL_RUNTIME
     runCreateClusterRequest(argc, argv, false);
   }
 
+  // DNS and ACME are cluster identity once configured.  This command is the
+  // sole exception for a durable record that was created completely
+  // unconfigured: configure the already-running Brain first, wait for its
+  // acknowledgement, and only then durably record the one-way enablement.
+  // It deliberately does not stand up, restart, or otherwise alter a machine.
+  void runEnableClusterDNSACME(int argc, char *argv[])
+  {
+    if (argc != 2)
+    {
+      basics_log("usage: enableClusterDNSACME [cluster name|UUID] [json|-|@path]\n");
+      exit(EXIT_FAILURE);
+    }
+
+    String json = {};
+    if (resolveJSONArgument("enableClusterDNSACME", argv[1], json) == false)
+    {
+      exit(EXIT_FAILURE);
+    }
+    json.need(simdjson::SIMDJSON_PADDING);
+
+    simdjson::dom::parser parser;
+    simdjson::dom::element doc;
+    if (parser.parse(json.data(), json.size()).get(doc) || doc.type() != simdjson::dom::element_type::OBJECT)
+    {
+      basics_log("enableClusterDNSACME requires object json\n");
+      exit(EXIT_FAILURE);
+    }
+
+    MothershipClusterProvider dnsProvider = MothershipClusterProvider::unknown;
+    String dnsProviderCredentialName = {};
+    ProdigyACMEConfig acme = {};
+    bool sawDNSProvider = false, sawDNSCredential = false, sawACME = false;
+    for (auto field : doc.get_object())
+    {
+      String key = {};
+      key.setInvariant(field.key.data(), field.key.size());
+      if (key.equal("dnsProvider"_ctv))
+      {
+        String provider = {};
+        if (sawDNSProvider || field.value.type() != simdjson::dom::element_type::STRING)
+        {
+          basics_log("enableClusterDNSACME.dnsProvider requires one string\n");
+          exit(EXIT_FAILURE);
+        }
+        provider.setInvariant(field.value.get_c_str());
+        if (parseMothershipClusterProvider(provider, dnsProvider) == false || dnsProvider == MothershipClusterProvider::unknown)
+        {
+          basics_log("enableClusterDNSACME.dnsProvider invalid\n");
+          exit(EXIT_FAILURE);
+        }
+        sawDNSProvider = true;
+      }
+      else if (key.equal("dnsProviderCredentialName"_ctv))
+      {
+        if (sawDNSCredential || field.value.type() != simdjson::dom::element_type::STRING)
+        {
+          basics_log("enableClusterDNSACME.dnsProviderCredentialName requires one string\n");
+          exit(EXIT_FAILURE);
+        }
+        dnsProviderCredentialName.assign(field.value.get_c_str());
+        sawDNSCredential = true;
+      }
+      else if (key.equal("acme"_ctv))
+      {
+        if (sawACME || parseClusterACMEConfigJSON(field.value, acme, "enableClusterDNSACME.acme") == false)
+        {
+          exit(EXIT_FAILURE);
+        }
+        sawACME = true;
+      }
+      else
+      {
+        basics_log("enableClusterDNSACME invalid field\n");
+        exit(EXIT_FAILURE);
+      }
+    }
+
+    if (sawDNSProvider == false || sawDNSCredential == false || sawACME == false || acme.configured() == false)
+    {
+      basics_log("enableClusterDNSACME requires complete DNS and ACME configuration\n");
+      exit(EXIT_FAILURE);
+    }
+
+    String identity = {};
+    identity.assign(argv[0]);
+    String failure = {};
+    MothershipProdigyCluster existing = {};
+    // A configure message carries the current complete BrainConfig.  Hold the
+    // registry's existing full-record writer lock across the read, ACK, and
+    // durable transition so another accepted record update cannot make that
+    // snapshot stale or be overwritten by this narrow enablement.
+    MothershipClusterRegistry registry = openClusterRegistry();
+    MothershipClusterRegistry::BGPOriginPolicyLock registryLock = {};
+    if (registry.lockBGPOriginPolicy(registryLock, &failure) == false ||
+        registry.getClusterByIdentity(identity, existing, &failure) == false)
+    {
+      basics_log("enableClusterDNSACME success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    if (existing.dnsProvider != MothershipClusterProvider::unknown ||
+        existing.dnsProviderCredentialName.size() != 0 || existing.acme.configured())
+    {
+      basics_log("enableClusterDNSACME success=0 failure=cluster DNS/ACME is already configured\n");
+      exit(EXIT_FAILURE);
+    }
+
+    MothershipProdigyCluster candidate = existing;
+    candidate.dnsProvider = dnsProvider;
+    candidate.dnsProviderCredentialName = dnsProviderCredentialName;
+    candidate.acme = acme;
+
+    MothershipProviderCredential providerCredential = {}, dnsCredential = {};
+    if (validateClusterProviderCredentialReference(candidate, failure, &providerCredential) == false ||
+        validateClusterDNSProviderCredentialReference(candidate, failure, &dnsCredential) == false)
+    {
+      basics_log("enableClusterDNSACME success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    BrainConfig config = {};
+    const MothershipProviderCredential *providerCredentialPtr =
+        candidate.providerCredentialName.size() == 0 ? nullptr : &providerCredential;
+    if (mothershipBuildClusterBrainConfig(candidate, providerCredentialPtr, config, &failure, &dnsCredential) == false)
+    {
+      basics_log("enableClusterDNSACME success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    // ClusterCreateHooks owns the existing configure request/acknowledgement
+    // protocol and its bounded control-socket retry behavior.  Reusing it here
+    // keeps credential propagation and runtime persistence in the one owner.
+    ClusterCreateHooks hooks(this);
+    if (hooks.configureSeedCluster(candidate, config, &failure) == false)
+    {
+      basics_log("enableClusterDNSACME success=0 configured=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    MothershipProdigyCluster stored = {};
+    if (registry.enableInitialDNSACME(identity, dnsProvider, dnsProviderCredentialName, acme,
+                                      &stored, &failure, &registryLock) == false)
+    {
+      // The acknowledged runtime configuration is intentionally not hidden:
+      // a later normal configure derives only from the durable registry, so
+      // this conflict cannot manufacture a durable enablement.
+      basics_log("enableClusterDNSACME success=0 configured=1 persisted=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    basics_log("enableClusterDNSACME success=1 cluster=%s clusterUUID=%016llx%016llx\n",
+               stored.name.c_str(), (unsigned long long)(stored.clusterUUID >> 64),
+               (unsigned long long)stored.clusterUUID);
+  }
+
   void runCheckClusterProviderPlan(int argc, char *argv[])
   {
     runCreateClusterRequest(argc, argv, true);
@@ -36265,6 +36513,7 @@ public:
         {"deploymentIdentity",              &Mothership::runDeploymentIdentity             },
         {"destroyProviderClusterMachines",  &Mothership::runDestroyProviderClusterMachines },
         {"destroyProviderMachines",         &Mothership::runDestroyProviderMachines        },
+        {"enableClusterDNSACME",            &Mothership::runEnableClusterDNSACME           },
         {"enrollClusterPair",               &Mothership::runEnrollClusterPair              },
         {"estimateClusterHourlyCost",       &Mothership::runEstimateClusterHourlyCost      },
         {"faultClusterNetwork",            &Mothership::runFaultClusterNetwork           },
@@ -36338,6 +36587,7 @@ public:
         {"testClusterPairControl",          &Mothership::runTestClusterPairControl         },
         {"transportCredentialLifecycle",    &Mothership::runTransportCredentialLifecycle   },
         {"unregisterRoutableSubnet",        &Mothership::runUnregisterRoutableSubnet       },
+        {"updateAdoptedMachineRacks",       &Mothership::runUpdateAdoptedMachineRacks      },
         {"updateProdigy",                   &Mothership::runUpdateProdigy                  },
         {"upsertApiCredentialSet",          &Mothership::runUpsertApiCredentialSet         },
         {"upsertDNSBinding",                &Mothership::runUpsertDNSBinding               },
@@ -36443,11 +36693,15 @@ int main(int argc, char *argv[])
     message.append("\toptionally enables one cluster DNS provider and ACME with dnsProvider plus acme.accountEmail/acme.termsAgreed; see prodigy/docs/dns-providers.md\n");
     message.append("\tdeploymentMode=test creates a Mothership-managed virtual datacenter\n");
     message.append("\tan optional test initial bundle is a transient, approved explicit .zst archive used only to seed a test virtual datacenter\n");
+    message.append("enableClusterDNSACME [name|clusterUUID] [json|-|@path]\n");
+    message.append("\tenables complete DNS credential and ACME configuration exactly once on an existing unconfigured cluster through the durable configure acknowledgement; it does not restart or recreate machines\n");
     message.append("resumeClusterCreation [exact 0x cluster UUID] [expected seed cloud UUID]\n");
     message.append("printClusters\n");
     message.append("\tlists all managed Prodigy cluster records with their clusterUUIDs\n");
     message.append("setLocalClusterMembership [name|clusterUUID] [json]\n");
     message.append("\trequires deploymentMode=local and atomically replaces the stored local membership spec with includeLocalMachine, machines, optional nBrains, and bootstrapSshUser/bootstrapSshPrivateKeyPath/bootstrapSshKeyPackage for adopted-machine bootstrap before reconciling and persisting on live success\n");
+    message.append("updateAdoptedMachineRacks [remote name|clusterUUID] [json|-|@path]\n");
+    message.append("\tupdates only nonzero logical rackUUID labels for exact existing adopted remote machineUUIDs through ordinary live topology reconciliation; it does not create, remove, restart, or relocate a machine\n");
     message.append("setTestClusterMachineCount [name|clusterUUID] [json]\n");
     message.append("\trequires deploymentMode=test and updates only test.machineCount through exact json field machineCount before restarting/reconciling and persisting on live success\n");
     message.append("adoptTestClusterSpare [name|clusterUUID]\n\tsubmits the configured SSH spare to ordinary Brain AddMachines and exits; observe native durable acceptance and cluster readiness separately\n");
