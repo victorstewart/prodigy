@@ -4306,21 +4306,6 @@ static bool mothershipReadLocalBootID(String& bootID)
   return true;
 }
 
-static bool mothershipFrozenServiceCgroup(const MothershipVDCProcessIdentity& process)
-{
-  String cgroup = {};
-  if (!mothershipVDCReadProcessFile(process.pid, "cgroup", cgroup)) return false;
-  const String prefix = "0::"_ctv;
-  if (cgroup.size() <= prefix.size() || std::memcmp(cgroup.data(), prefix.data(), prefix.size()) != 0) return false;
-  uint64_t end = prefix.size(); while (end < cgroup.size() && cgroup[end] != '\n') ++end;
-  if (end == prefix.size() || cgroup[prefix.size()] != '/') return false;
-  String events = "/sys/fs/cgroup"_ctv;
-  events.append(cgroup.data() + prefix.size(), end - prefix.size()); events.append("/cgroup.events"_ctv);
-  String contents = {};
-  if (!mothershipVDCRead(events, contents, 4096)) return false;
-  return std::strstr(contents.c_str(), "frozen 1\n") != nullptr;
-}
-
 static void mothershipTCXImport(const MothershipVDCRetainedTCX& source, SwitchboardHostTCXRetentionIdentity& target)
 {
   target.interfaceIndex = source.ifindex;
@@ -5750,7 +5735,8 @@ static bool mothershipRecoveryInspectLocal(const std::string& command, String& o
   if (child==0) {
     if (::dup2(fds[1],STDOUT_FILENO)<0 || ::dup2(fds[1],STDERR_FILENO)<0) _exit(127);
     ::close(fds[0]); ::close(fds[1]);
-    ::execl("/bin/bash","bash","-euo","pipefail","-c",command.c_str(),nullptr); _exit(127);
+    ::unsetenv("BASH_ENV");
+    ::execl("/bin/bash","bash","--noprofile","--norc","-euo","pipefail","-c",command.c_str(),nullptr); _exit(127);
   }
   ::close(fds[1]);
   if (child<0) { ::close(fds[0]); return false; }
@@ -5771,7 +5757,7 @@ static bool mothershipRecoveryTreeDigest(const String& path, String& digest, Str
 // never stops, installs or starts a service.  It may retain existing kernel
 // references only after the controller's exact source cgroup is frozen.
 static bool mothershipRemoteRuntimeRecoveryLocal(const String& root, const String& binding,
-    uint128_t memberUUID, const String& mode, String& output, String *failure)
+    uint128_t memberUUID, const String& mode, const String& driverBundle, String& output, String *failure)
 {
   using namespace MothershipTidesMigration;
   try {
@@ -5805,8 +5791,27 @@ static bool mothershipRemoteRuntimeRecoveryLocal(const String& root, const Strin
             "runtime recovery boot identity differs");
     if (!machineID.empty() && machineID[machineID.size()-1]=='\n') machineID.resize(machineID.size()-1);
     require(machineID==member->linuxMachineID,"runtime recovery machine identity differs");
-    require(prodigyComputeFileSHA256Hex("/proc/self/exe"_ctv,sha,failure) && sha==request.cohort.targetMothershipSHA256,
-            "runtime recovery helper is not the approved Mothership");
+    require(prodigyComputeFileSHA256Hex("/proc/self/exe"_ctv,sha,failure),"runtime recovery helper identity unavailable");
+    if(driverBundle.empty()) require(sha==request.cohort.targetMothershipSHA256,
+                                    "runtime recovery helper is not the approved Mothership");
+    else {
+      ProdigyApprovedUpgradeBundle target={},driver={};
+      const auto targetBundle=text(str(root)+"/target-runtime/prodigy.bundle.tar.zst");
+      require(prodigyApproveBundleUpgradeContract(targetBundle,target,failure) && target.verifyRetainedSnapshot(failure) &&
+              target.bundleSHA256==request.cohort.targetBundleSHA256 &&
+              target.contract.contractSHA256==request.cohort.targetContractSHA256 &&
+              target.contract.prodigySHA256==request.cohort.targetProdigySHA256 &&
+              target.contract.mothershipSHA256==request.cohort.targetMothershipSHA256,
+              "runtime recovery helper target differs from immutable request");
+      MothershipUpgradeIdentity identity={}; identity.releaseID=target.contract.releaseID;
+      identity.contractSHA256=target.contract.contractSHA256; identity.prodigySHA256=target.contract.prodigySHA256;
+      identity.mothershipSHA256=target.contract.mothershipSHA256;
+      require(prodigyApproveBundleUpgradeContract(driverBundle,driver,failure) && driver.verifyRetainedSnapshot(failure) &&
+              prodigyValidateRuntimeRecoveryDriver(driver,sha,identity,target.contract.architecture,request.cohort.clusterUUID,failure),
+              "runtime recovery helper is not a separately approved compatible controller");
+      require(str(driverBundle)==str(root)+"/driver-"+str(driver.bundleSHA256).substr(0,16)+"/prodigy.bundle.tar.zst",
+              "runtime recovery helper bundle is outside its operation-bound driver root");
+    }
     MothershipVDCProcessIdentity inspector={};
     require(mothershipVDCReadProcess(::getpid(),inspector),"runtime recovery inspector identity is unavailable");
     const bool capture=mode=="capture"_ctv, active=mode=="active"_ctv;
@@ -5822,10 +5827,12 @@ static bool mothershipRemoteRuntimeRecoveryLocal(const String& root, const Strin
       require(errno==ENOENT && capture,"runtime recovery stopped proof is absent");
       proof.bindingSHA256=binding; proof.memberUUID=memberUUID;
       MothershipVDCProcessIdentity source={};
-      require(mothershipVDCReadProcess(member->sourceProcessPID,source) && source.startTime==member->sourceProcessStartTicks &&
-              source.mountNamespace==inspector.mountNamespace && source.networkNamespace==inspector.networkNamespace &&
-              source.cgroupNamespace==inspector.cgroupNamespace && mothershipFrozenServiceCgroup(source),
-              "runtime recovery source is not the exact frozen host service");
+      require(mothershipVDCReadProcess(member->sourceProcessPID,source),"runtime recovery source process identity unavailable");
+      require(source.startTime==member->sourceProcessStartTicks,"runtime recovery source process start time changed");
+      require(source.mountNamespace==inspector.mountNamespace,"runtime recovery source mount namespace differs");
+      require(source.networkNamespace==inspector.networkNamespace,"runtime recovery source network namespace differs");
+      require(source.cgroupNamespace==inspector.cgroupNamespace,"runtime recovery source cgroup namespace differs");
+      require(mothershipFrozenServiceCgroup(source),"runtime recovery source service cgroup is not frozen");
       String cgroup={};
       require(mothershipVDCReadProcessFile(source.pid,"cgroup",cgroup) && cgroup=="0::/system.slice/prodigy.service\n"_ctv,
               "runtime recovery source is outside its admitted service cgroup");
@@ -13264,9 +13271,11 @@ REMOTE_RUNTIME
   {
     String root=argc>0?String(argv[0]):String(), binding=argc>1?String(argv[1]):String();
     String member=argc>2?String(argv[2]):String(), mode=argc>3?String(argv[3]):String();
+    const bool separateDriver=argc==6 && std::strcmp(argv[4],"--driver-bundle")==0;
+    String driverBundle=separateDriver?String(argv[5]):String();
     String failure={},output={}; uint128_t uuid=0;
-    if (argc!=4 || !prodigyParseCanonicalHex128(member,uuid) ||
-        !mothershipRemoteRuntimeRecoveryLocal(root,binding,uuid,mode,output,&failure)) {
+    if ((argc!=4 && !separateDriver) || !prodigyParseCanonicalHex128(member,uuid) ||
+        !mothershipRemoteRuntimeRecoveryLocal(root,binding,uuid,mode,driverBundle,output,&failure)) {
       basics_log("remoteRuntimeRecoveryLocal success=0 failure=%s\n",failure.c_str()); exit(EXIT_FAILURE);
     }
     std::printf("%s\n",output.c_str());
@@ -13302,7 +13311,7 @@ REMOTE_RUNTIME
       MothershipRemoteRuntimeRecoveryExecutionLock lock;
       require(lock.acquire(registryPath),"another runtime recovery executor is active or lock ownership is invalid");
       MachineCpuArchitecture architecture=MachineCpuArchitecture::unknown;
-      String bundlePath={}; ProdigyApprovedUpgradeBundle approved={};
+      String bundlePath={}; ProdigyApprovedUpgradeBundle approved={},approvedDriver={};
       require(resolveProdigyBundleTargetArchitecture(identity.c_str(),architecture,&failure) &&
               prodigyResolveBundleArtifactInput(bundleInput,architecture,bundlePath,&failure) &&
               prodigyApproveBundleUpgradeContract(bundlePath,approved,&failure) && approved.verifyRetainedSnapshot(&failure),
@@ -13312,17 +13321,17 @@ REMOTE_RUNTIME
       if(driverInput.empty()) require(driverSHA==approved.contract.mothershipSHA256,
               "recovery must execute the target Mothership or name a separately approved compatible driver bundle");
       else {
-        String driverPath={}; ProdigyApprovedUpgradeBundle driver={};
+        String driverPath={};
         MothershipUpgradeIdentity targetIdentity={};
         targetIdentity.releaseID=approved.contract.releaseID; targetIdentity.contractSHA256=approved.contract.contractSHA256;
         targetIdentity.prodigySHA256=approved.contract.prodigySHA256; targetIdentity.mothershipSHA256=approved.contract.mothershipSHA256;
         String architectureName={}; architectureName.assign(machineCpuArchitectureName(architecture));
         require(prodigyResolveBundleArtifactInput(driverInput,architecture,driverPath,&failure) &&
-                prodigyApproveBundleUpgradeContract(driverPath,driver,&failure) && driver.verifyRetainedSnapshot(&failure) &&
-                prodigyValidateRuntimeRecoveryDriver(driver,driverSHA,targetIdentity,architectureName,cluster.clusterUUID,&failure),
+                prodigyApproveBundleUpgradeContract(driverPath,approvedDriver,&failure) && approvedDriver.verifyRetainedSnapshot(&failure) &&
+                prodigyValidateRuntimeRecoveryDriver(approvedDriver,driverSHA,targetIdentity,architectureName,cluster.clusterUUID,&failure),
                 "recovery controller artifact or exact target compatibility is unqualified");
         basics_log("recoverRemoteClusterRuntime controllerBundleSHA256=%s controllerSHA256=%s targetBundleSHA256=%s\n",
-                   driver.bundleSHA256.c_str(),driverSHA.c_str(),approved.bundleSHA256.c_str());
+                   approvedDriver.bundleSHA256.c_str(),driverSHA.c_str(),approved.bundleSHA256.c_str());
       }
       MothershipUpgradeAdmissionRecord admission={};
       bool recorded=false;
@@ -13417,6 +13426,7 @@ REMOTE_RUNTIME
       String canonicalOperation={}; canonicalOperation.assignItoh(operation);
       const std::string root="/var/lib/prodigy/runtime-recovery/"+str(canonicalOperation), target=root+"/target-runtime";
       const std::string runtime=str(cluster.remoteProdigyPath), retained=root+"/source-runtime", cg="/sys/fs/cgroup/system.slice/prodigy.service";
+      const std::string inspectionRoot=driverInput.empty()?target:root+"/driver-"+str(approvedDriver.bundleSHA256).substr(0,16);
       const auto localRoot=fs::path(str(registryPath)).parent_path()/"runtime-recovery"/str(canonicalOperation);
       fs::create_directories(localRoot); ::chmod(localRoot.c_str(),0700);
       String requestFile=text((localRoot/"request.bin").string());
@@ -13438,8 +13448,9 @@ REMOTE_RUNTIME
       };
       const auto inspect=[&](const auto& member,const char *mode) {
         String id={}; id.assignItoh(member.machineUUID);
-        return "env -u PRODIGY_STATE_DB -u PRODIGY_STATE_SECRETS_DB LD_LIBRARY_PATH="+quote(target+"/lib")+" "+quote(target+"/tools/mothership")+
-            " remoteRuntimeRecoveryLocal "+quote(root)+" "+quote(str(binding))+" "+quote(str(id))+" "+mode;
+        return "env -u PRODIGY_STATE_DB -u PRODIGY_STATE_SECRETS_DB LD_LIBRARY_PATH="+quote(inspectionRoot+"/lib")+" "+quote(inspectionRoot+"/tools/mothership")+
+            " remoteRuntimeRecoveryLocal "+quote(root)+" "+quote(str(binding))+" "+quote(str(id))+" "+mode+
+            (driverInput.empty()?std::string():" --driver-bundle "+quote(inspectionRoot+"/prodigy.bundle.tar.zst"));
       };
       const auto runStrict=[&](const auto& member,const std::string& command,String *output=nullptr) {
         // Attested actions already own a strict shell. Wrapping their quoted
@@ -13452,6 +13463,25 @@ REMOTE_RUNTIME
       const auto run=[&](const auto& member,const std::string& command,String *output=nullptr) {
         runStrict(member,remoteRecoveryStrictShell(command),output);
       };
+      if(!driverInput.empty()) {
+        // A corrected inspector is part of the explicitly approved controller
+        // artifact. Stage it separately; never edit the immutable runtime
+        // target, request, stopped stores, or existing phase receipts.
+        const auto upload=inspectionRoot+".bundle";
+        const auto driverInstalled="test \"$(sha256sum "+quote(inspectionRoot+"/tools/mothership")+" | cut -d' ' -f1)\" = "+quote(str(driverSHA))+
+            "; test \"$(sha256sum "+quote(inspectionRoot+"/prodigy.bundle.tar.zst")+" | cut -d' ' -f1)\" = "+quote(str(approvedDriver.bundleSHA256))+"; ";
+        String install; prodigyBuildBundleInstallCommand(text(upload),text(inspectionRoot),install);
+        const auto action="test \"$(sha256sum "+quote(upload)+" | cut -d' ' -f1)\" = "+quote(str(approvedDriver.bundleSHA256))+
+            "; printf '%s\\n' "+quote(str(approvedDriver.bundleSHA256))+" > "+quote(upload+".sha256")+"; "+str(install);
+        for(const auto& member:record.members) {
+          run(member,identityGuard(member));
+          String destination=text(upload);
+          require(remoteRuntimeRecoveryCommand(cluster,member.machineUUID,text("true"),nullptr,failure,
+                    &approvedDriver.retainedSnapshotPath,&destination),"recovery controller helper upload failed");
+          runStrict(member,remoteRecoveryAttestedCommand(root,str(binding),"driver-"+str(approvedDriver.bundleSHA256).substr(0,16),
+                    identityGuard(member),identityGuard(member)+driverInstalled,action));
+        }
+      }
       const auto sealPhase=[&](Phase phase) {
         auto next=record; next.phase=phase;
         for(auto& member:next.members) {

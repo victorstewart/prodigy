@@ -9,6 +9,7 @@
 #include <signal.h>
 #include <sched.h>
 #include <climits>
+#include <cstring>
 
 // Workers retain the live Brain as their plan owner. A sole Brain requires
 // the authenticated checkpoint path plus an exact incomplete-update receipt.
@@ -685,6 +686,30 @@ static inline bool mothershipVDCReadProcessFile(uint64_t pid, const char *name, 
   String path = {};
   path.snprintf<"/proc/{itoa}/{}"_ctv>(pid, String(name));
   return mothershipVDCRead(path, result);
+}
+
+// A same-boot recovery may capture only after the source service's own cgroup
+// reports a completed freeze.  Keep this path construction in the VDC owner:
+// a compile-time String view is read-only and must first be copied before the
+// cgroup suffix is appended.
+static inline bool mothershipFrozenServiceCgroup(const MothershipVDCProcessIdentity& process,
+                                                 const String& cgroupRoot = "/sys/fs/cgroup"_ctv)
+{
+  String cgroup = {};
+  if (!mothershipVDCReadProcessFile(process.pid, "cgroup", cgroup)) return false;
+  const String prefix = "0::"_ctv;
+  if (cgroup.size() <= prefix.size() || std::memcmp(cgroup.data(), prefix.data(), prefix.size()) != 0) return false;
+  uint64_t end = prefix.size(); while (end < cgroup.size() && cgroup[end] != '\n') ++end;
+  if (end == prefix.size() || cgroup[prefix.size()] != '/') return false;
+  String events = {};
+  events.assign(cgroupRoot);
+  events.append(cgroup.data() + prefix.size(), end - prefix.size()); events.append("/cgroup.events"_ctv);
+  String contents = {};
+  if (!mothershipVDCRead(events, contents, 4096)) return false;
+  constexpr char frozen[] = "frozen 1\n";
+  for (uint64_t index = 0; index + sizeof(frozen) - 1 <= contents.size(); ++index)
+    if (std::memcmp(contents.data() + index, frozen, sizeof(frozen) - 1) == 0) return true;
+  return false;
 }
 
 static inline bool mothershipVDCReadArguments(uint64_t pid, Vector<String>& arguments)

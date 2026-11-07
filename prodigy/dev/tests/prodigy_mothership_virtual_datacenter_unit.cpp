@@ -665,6 +665,36 @@ static void testStopCleanupContractFailsClosed(TestSuite& suite)
                "stop_verifies_exact_provider_before_cleaning_stalled_partial_bootstrap");
 }
 
+static void testFrozenServiceCgroupUsesOwnedFixtureRoot(TestSuite& suite)
+{
+  MothershipVDCProcessIdentity self = {};
+  String cgroup = {};
+  suite.expect(mothershipVDCReadProcess(uint64_t(::getpid()), self) &&
+                   mothershipVDCReadProcessFile(self.pid, "cgroup", cgroup),
+               "frozen_service_cgroup_reads_self_membership");
+  const String prefix = "0::"_ctv;
+  uint64_t end = prefix.size();
+  while (end < cgroup.size() && cgroup[end] != '\n') ++end;
+  if (cgroup.size() <= prefix.size() || std::memcmp(cgroup.data(), prefix.data(), prefix.size()) != 0 ||
+      end == prefix.size() || cgroup[prefix.size()] != '/')
+  { suite.expect(false, "frozen_service_cgroup_self_membership_shape"); return; }
+  std::filesystem::create_directories(".run");
+  char temporary[] = ".run/prodigy-frozen-cgroup-XXXXXX";
+  if (::mkdtemp(temporary) == nullptr) { suite.expect(false, "frozen_service_cgroup_fixture"); return; }
+  const std::filesystem::path root(temporary);
+  std::string suffix(reinterpret_cast<const char *>(cgroup.data() + prefix.size()), end - prefix.size());
+  std::filesystem::path events = root;
+  if (suffix != "/") events /= std::filesystem::path(suffix).relative_path();
+  std::filesystem::create_directories(events);
+  events /= "cgroup.events";
+  String fixtureRoot = {}; fixtureRoot.assign(temporary);
+  { std::ofstream output(events); output << "populated 1\nfrozen 0\n"; }
+  suite.expect(!mothershipFrozenServiceCgroup(self, fixtureRoot), "frozen_service_cgroup_rejects_unfrozen_fixture");
+  { std::ofstream output(events); output << "populated 1\nfrozen 1\n"; }
+  suite.expect(mothershipFrozenServiceCgroup(self, fixtureRoot), "frozen_service_cgroup_reads_nested_frozen_fixture");
+  std::filesystem::remove_all(root);
+}
+
 int main(void)
 {
   TestSuite suite;
@@ -678,6 +708,7 @@ int main(void)
   testCleanupReceiptBindsExactOwnedRuntime(suite);
   testCleanupResourceVerifierRejectsOwnedResidue(suite);
   testStopCleanupContractFailsClosed(suite);
+  testFrozenServiceCgroupUsesOwnedFixtureRoot(suite);
 
   suite.expect(mothershipTestClusterWorkspaceRootValid("/tmp/vdc"_ctv), "workspace_accepts_nested_absolute_path");
   suite.expect(mothershipTestClusterWorkspaceRootValid("/tmp/space dir/vdc"_ctv), "workspace_accepts_spaces");
