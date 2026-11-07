@@ -240,6 +240,19 @@ int main(void)
       }
     }
   };
+  const auto addAbortReceipts = [](MothershipRemoteRuntimeRecoveryCohortRecord& candidate) {
+    assert(candidate.phase == MothershipRemoteRuntimeRecoveryPhase::abortedBeforeInstallation);
+    for (uint32_t index = 0; index < candidate.members.size(); ++index)
+    {
+      assert(candidate.members[index].phaseReceipts.size() == 3);
+      MothershipRemoteRuntimeRecoveryMember::PhaseReceipt receipt = {};
+      MothershipClusterRegistry::remoteRuntimeRecoveryOperationMarker(
+          candidate.operationID, candidate.members[index].machineUUID,
+          MothershipRemoteRuntimeRecoveryPhase::abortedBeforeInstallation, receipt.operationMarker);
+      receipt.receiptSHA256 = digest(char('a' + index));
+      candidate.members[index].phaseReceipts.push_back(std::move(receipt));
+    }
+  };
   const auto makeWithdrawableRecovery = [&](uint128_t operationID) {
     auto admission = expectedEligibleAdmission;
     admission.operationID = operationID;
@@ -327,6 +340,20 @@ int main(void)
   overlappingRecovery.operationID = overlappingAdmission.operationID;
   overlappingRecovery.admissionRecordSHA256 = overlappingAdmissionSHA256;
   assert(!registry.admitRemoteRuntimeRecoveryCohort(overlappingRecovery, remote, recoveryStored, resumed, &failure));
+  auto abortTooEarly = recovery;
+  abortTooEarly.phase = MothershipRemoteRuntimeRecoveryPhase::frozen;
+  addPhaseReceipts(abortTooEarly);
+  for (uint32_t index = 0; index < abortTooEarly.members.size(); ++index)
+  {
+    abortTooEarly.members[index].stateSHA256 = digest(char('a' + index));
+    abortTooEarly.members[index].secretsSHA256 = digest(char('d' + index));
+    abortTooEarly.members[index].containerInventorySHA256 = digest(char('1' + index));
+    abortTooEarly.members[index].privateLoaderSHA256 = digest(char('4' + index));
+    abortTooEarly.members[index].retainedNetworkSHA256 = digest(char('7' + index));
+  }
+  abortTooEarly.phase = MothershipRemoteRuntimeRecoveryPhase::abortedBeforeInstallation;
+  addAbortReceipts(abortTooEarly);
+  assert(!registry.abortRemoteRuntimeRecoveryCohort(abortTooEarly, recoveryStored, &failure));
   auto phase = recovery;
   phase.phase = MothershipRemoteRuntimeRecoveryPhase::staged;
   addPhaseReceipts(phase);
@@ -363,9 +390,68 @@ int main(void)
     phase.members[index].retainedNetworkSHA256 = digest(char('7' + index));
   }
   assert(registry.advanceRemoteRuntimeRecoveryCohort(phase, phase.phase, recoveryStored, resumed, &failure));
+  auto abortMissingReceipt = phase;
+  abortMissingReceipt.phase = MothershipRemoteRuntimeRecoveryPhase::abortedBeforeInstallation;
+  assert(!registry.abortRemoteRuntimeRecoveryCohort(abortMissingReceipt, recoveryStored, &failure));
+  auto abortChangedProof = phase;
+  abortChangedProof.phase = MothershipRemoteRuntimeRecoveryPhase::abortedBeforeInstallation;
+  addAbortReceipts(abortChangedProof);
+  abortChangedProof.members[0].stateSHA256 = digest('f');
+  assert(!registry.abortRemoteRuntimeRecoveryCohort(abortChangedProof, recoveryStored, &failure));
+  auto abortWithInstalledTarget = phase;
+  abortWithInstalledTarget.phase = MothershipRemoteRuntimeRecoveryPhase::abortedBeforeInstallation;
+  addAbortReceipts(abortWithInstalledTarget);
+  abortWithInstalledTarget.members[0].targetRuntimeInstalled = true;
+  assert(!registry.abortRemoteRuntimeRecoveryCohort(abortWithInstalledTarget, recoveryStored, &failure));
+  auto aborted = phase;
+  aborted.phase = MothershipRemoteRuntimeRecoveryPhase::abortedBeforeInstallation;
+  addAbortReceipts(aborted);
+  assert(!registry.advanceRemoteRuntimeRecoveryCohort(aborted, aborted.phase, recoveryStored, resumed, &failure));
+  assert(registry.abortRemoteRuntimeRecoveryCohort(aborted, recoveryStored, &failure));
+  assert(recoveryStored.phase == MothershipRemoteRuntimeRecoveryPhase::abortedBeforeInstallation);
+  for (uint32_t index = 0; index < phase.members.size(); ++index)
+  {
+    assert(recoveryStored.members[index].phaseReceipts.size() == 4);
+    for (uint32_t receiptIndex = 0; receiptIndex < 3; ++receiptIndex)
+    {
+      assert(recoveryStored.members[index].phaseReceipts[receiptIndex].operationMarker ==
+             phase.members[index].phaseReceipts[receiptIndex].operationMarker);
+      assert(recoveryStored.members[index].phaseReceipts[receiptIndex].receiptSHA256 ==
+             phase.members[index].phaseReceipts[receiptIndex].receiptSHA256);
+    }
+    assert(!recoveryStored.members[index].targetRuntimeInstalled);
+  }
+  assert(registry.abortRemoteRuntimeRecoveryCohort(aborted, recoveryStored, &failure));
+  assert(registry.remoteRuntimeRecoveryPending(remote.clusterUUID, recoveryPending, &failure));
+  assert(!recoveryPending);
+  auto recoveryAfterAbort = makeWithdrawableRecovery(uint128_t(0xD23));
+  assert(registry.admitRemoteRuntimeRecoveryCohort(recoveryAfterAbort, remote, recoveryStored, resumed, &failure));
+  phase = recoveryAfterAbort;
+  phase.phase = MothershipRemoteRuntimeRecoveryPhase::staged;
+  addPhaseReceipts(phase);
+  assert(registry.advanceRemoteRuntimeRecoveryCohort(phase, phase.phase, recoveryStored, resumed, &failure));
+  phase.phase = MothershipRemoteRuntimeRecoveryPhase::fenced;
+  addPhaseReceipts(phase);
+  assert(registry.advanceRemoteRuntimeRecoveryCohort(phase, phase.phase, recoveryStored, resumed, &failure));
+  phase.phase = MothershipRemoteRuntimeRecoveryPhase::frozen;
+  addPhaseReceipts(phase);
+  for (uint32_t index = 0; index < phase.members.size(); ++index)
+  {
+    phase.members[index].stateSHA256 = digest(char('a' + index));
+    phase.members[index].secretsSHA256 = digest(char('d' + index));
+    phase.members[index].containerInventorySHA256 = digest(char('1' + index));
+    phase.members[index].privateLoaderSHA256 = digest(char('4' + index));
+    phase.members[index].retainedNetworkSHA256 = digest(char('7' + index));
+  }
+  assert(registry.advanceRemoteRuntimeRecoveryCohort(phase, phase.phase, recoveryStored, resumed, &failure));
   phase.phase = MothershipRemoteRuntimeRecoveryPhase::quiesced;
   addPhaseReceipts(phase);
   assert(registry.advanceRemoteRuntimeRecoveryCohort(phase, phase.phase, recoveryStored, resumed, &failure));
+  auto abortTooLate = phase;
+  abortTooLate.phase = MothershipRemoteRuntimeRecoveryPhase::abortedBeforeInstallation;
+  for (auto& member : abortTooLate.members) member.phaseReceipts.pop_back();
+  addAbortReceipts(abortTooLate);
+  assert(!registry.abortRemoteRuntimeRecoveryCohort(abortTooLate, recoveryStored, &failure));
   auto alteredProof = phase;
   alteredProof.members[0].stateSHA256 = digest('f');
   assert(!registry.advanceRemoteRuntimeRecoveryCohort(alteredProof, alteredProof.phase, recoveryStored, resumed, &failure));

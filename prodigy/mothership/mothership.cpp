@@ -5704,6 +5704,18 @@ struct MothershipRemoteRuntimeRecoveryRequest {
 template <typename S> static void serialize(S&& s, MothershipRemoteRuntimeRecoveryRequest& r) {
   s.value4b(r.version); s.object(r.cohort); s.object(r.topology);
 }
+struct MothershipRemoteRuntimeRecoveryAbortRequest {
+  uint32_t version=1;
+  String requestSHA256, frozenCohortSHA256;
+  Vector<MothershipRemoteRuntimeRecoveryMember> sources;
+  Vector<uint8_t> restartInhibited;
+  Vector<String> proofFileSHA256;
+};
+template <typename S> static void serialize(S&& s, MothershipRemoteRuntimeRecoveryAbortRequest& r) {
+  s.value4b(r.version); s.text1b(r.requestSHA256,64); s.text1b(r.frozenCohortSHA256,64);
+  s.container(r.sources,3); s.container1b(r.restartInhibited,3);
+  s.container(r.proofFileSHA256,3,[](auto& nested,auto& digest){nested.text1b(digest,64);});
+}
 template <typename S> static void serialize(S&& s, MothershipFrozenServiceTCXWitness& w) {
   s.object(w.process); s.text1b(w.bootID,36); s.text1b(w.primaryInterface,IF_NAMESIZE);
   s.value8b(w.bpffsDevice); s.value8b(w.bpffsInode); s.object(w.links[0]); s.object(w.links[1]);
@@ -13208,6 +13220,40 @@ private:
     return okay;
   }
 
+  // Large attested commands retain the same exact script and predicates;
+  // publish their bytes privately through the existing SSH upload owner rather
+  // than exceeding libssh2's exec-packet bound with repeated shell quoting.
+  bool remoteRuntimeRecoveryScript(const MothershipProdigyCluster& cluster,
+      const MothershipRemoteRuntimeRecoveryMember& member,const String& command,
+      const std::string& localRoot,const std::string& remoteRoot,
+      String *output,String& failure)
+  {
+    using namespace MothershipTidesMigration;
+    if(command.size()<LIBSSH2_PACKET_MAXCOMP-1024)
+      return remoteRuntimeRecoveryCommand(cluster,member.machineUUID,command,output,failure);
+    if(command.size()>256*1024) {failure.assign("recovery script exceeds bounded publication size"_ctv);return false;}
+    String digest={};
+    if(!prodigyComputeSHA256Hex(command,digest,&failure)) return false;
+    const auto name="command-"+str(digest)+".sh";
+    const auto local=fs::path(localRoot)/name; const auto remote=remoteRoot+"/"+name;
+    String localPath=text(local.string()),remotePath=text(remote);
+    if(fs::exists(local)) {
+      String prior={};if(!mothershipVDCRead(localPath,prior,256*1024) || prior!=command) {
+        failure.assign("recovery script publication conflicts"_ctv);return false;
+      }
+    } else if(!mothershipVDCDurableWrite(text(localRoot),name.c_str(),command,&failure)) return false;
+    const auto guard="test \"$(cat /etc/machine-id)\" = "+quote(str(member.linuxMachineID))+
+        "; test \"$(cat /proc/sys/kernel/random/boot_id)\" = "+quote(str(member.bootID))+
+        "; test -d "+quote(remoteRoot)+"; test ! -L "+quote(remoteRoot)+
+        "; test \"$(stat -c '%u:%a' "+quote(remoteRoot)+")\" = 0:700; test ! -L "+quote(remote)+
+        "; if test -e "+quote(remote)+"; then test -f "+quote(remote)+"; test \"$(stat -c '%u:%a:%h' "+quote(remote)+")\" = 0:600:1; fi; ";
+    if(!remoteRuntimeRecoveryCommand(cluster,member.machineUUID,text(remoteRecoveryStrictShell(guard)),nullptr,failure)) return false;
+    if(!remoteRuntimeRecoveryCommand(cluster,member.machineUUID,"true"_ctv,nullptr,failure,&localPath,&remotePath)) return false;
+    const auto execute=guard+"test -f "+quote(remote)+"; test \"$(stat -c '%u:%a:%h' "+quote(remote)+")\" = 0:600:1; test \"$(sha256sum "+quote(remote)+
+        " | cut -d' ' -f1)\" = "+quote(str(digest))+"; exec env -u BASH_ENV bash --noprofile --norc -euo pipefail "+quote(remote);
+    return remoteRuntimeRecoveryCommand(cluster,member.machineUUID,text(remoteRecoveryStrictShell(execute)),output,failure);
+  }
+
   // This is intentionally an observation, not a service operation.  Its
   // double systemd PID read prevents an admitted source identity from being
   // assembled across a restart, and its exact cgroup check binds the main
@@ -13406,11 +13452,11 @@ REMOTE_RUNTIME
           const auto root="/var/lib/prodigy/runtime-recovery/"+str(canonical),fence=root+"/writers-fenced";
           for(const auto& member:record.members) {
             auto probe="test ! -L "+quote(fence)+"; if test -e "+quote(fence)+"; then "+
-                runtimeStartupFencePredicate(root,str(binding))+"fi; ";
+                runtimeStartupFencePredicate(root,str(binding),"/etc/systemd/system/prodigy.service.d",true)+"fi; ";
             for(const auto suffix:{"/remote-recovery-fenced","/remote-recovery-fenced.new"}) {
               const auto marker=root+suffix;
               probe+="test ! -L "+quote(marker)+"; if test -e "+quote(marker)+"; then "+
-                  remoteRecoveryMarkerPredicate(marker,str(binding))+runtimeStartupFencePredicate(root,str(binding))+"fi; ";
+                  remoteRecoveryMarkerPredicate(marker,str(binding))+runtimeStartupFencePredicate(root,str(binding),"/etc/systemd/system/prodigy.service.d",true)+"fi; ";
             }
             require(remoteRuntimeRecoveryCommand(cluster,member.machineUUID,text(remoteRecoveryStrictShell(probe)),nullptr,failure),
                     "recovery check found an invalid partial startup fence");
@@ -13463,10 +13509,9 @@ REMOTE_RUNTIME
       const auto runStrict=[&](const auto& member,const std::string& command,String *output=nullptr) {
         // Attested actions already own a strict shell. Wrapping their quoted
         // script again can exceed the SSH exec packet before the server runs
-        // it. Keep the existing shell boundary and reject an oversized request.
-        require(command.size()<LIBSSH2_PACKET_MAXCOMP-1024,"runtime recovery command exceeds the SSH exec bound");
+        // it. Keep its shell boundary; publish larger exact scripts privately.
         String captured={}; String *reply=output?output:&captured;
-        const bool okay=remoteRuntimeRecoveryCommand(cluster,member.machineUUID,text(command),reply,failure);
+        const bool okay=remoteRuntimeRecoveryScript(cluster,member,text(command),localRoot.string(),root,reply,failure);
         if(!okay && !reply->empty()) {
           // The SSH owner may prefer stderr when both streams are populated.
           // Preserve the verifier's structured rejection even when a bundle
@@ -13529,8 +13574,8 @@ REMOTE_RUNTIME
       if(record.phase==Phase::staged) {
         preflight();
         for(const auto& member:record.members) {
-          const auto fenceCheck=sourceGuard(member)+runtimeStartupFencePredicate(root,str(binding));
-          runStrict(member,remoteRecoveryAttestedCommand(root,str(binding),"fenced",sourceGuard(member),fenceCheck,runtimeStartupFenceCommand(root,str(binding))));
+          const auto fenceCheck=sourceGuard(member)+runtimeStartupFencePredicate(root,str(binding),"/etc/systemd/system/prodigy.service.d",true);
+          runStrict(member,remoteRecoveryAttestedCommand(root,str(binding),"fenced",sourceGuard(member),fenceCheck,runtimeStartupFenceCommand(root,str(binding),"/etc/systemd/system/prodigy.service.d",true)));
         }
         sealPhase(Phase::fenced);
       }
@@ -13577,7 +13622,8 @@ REMOTE_RUNTIME
       if(record.phase==Phase::activationStarted) {
         for(const auto& member:record.members) {
           const auto before=stopped(member)+installed(runtime)+"test \"$(cat "+quote(root+"/remote-recovery-activation-ready")+")\" = "+quote(str(binding))+"; ";
-          const auto action="test ! -L "+quote(root+"/writers-fenced")+"; if test -e "+quote(root+"/writers-fenced")+"; then test \"$(cat "+quote(root+"/writers-fenced")+")\" = "+quote(str(binding))+"; rm -- "+quote(root+"/writers-fenced")+"; fi; sync -f "+quote(root)+"; systemctl reset-failed prodigy; systemctl start prodigy; ";
+          const auto action=runtimeStartupUnfenceCommand(root,str(binding),"/etc/systemd/system/prodigy.service.d",true)+
+              "systemctl reset-failed prodigy; systemctl start prodigy; ";
           runStrict(member,remoteRecoveryAttestedCommand(root,str(binding),"started",before,active(member),action));
         }
       }
@@ -13608,6 +13654,191 @@ REMOTE_RUNTIME
     } catch(const std::exception& error) {
       basics_log("recoverRemoteClusterRuntime success=0 phase=%u preserved=1 failure=%s detail=%s\n",unsigned(record.phase),error.what(),failure.c_str());
       exit(EXIT_FAILURE);
+    }
+  }
+
+  // Undo only the lifecycle fence of a frozen cohort whose source runtime is
+  // still installed and running. A same-boot automatic source restart may
+  // change its PID; record that observation separately, never rewrite the
+  // original cohort identity or reuse its old store proof for installation.
+  void runAbortRemoteRuntimeRecoveryBeforeInstall(int argc,char *argv[])
+  {
+    using namespace MothershipTidesMigration;
+    using Phase=MothershipRemoteRuntimeRecoveryPhase;
+    String failure={};
+    try {
+      require(argc==5 && std::strcmp(argv[3],"--driver-bundle")==0,
+              "usage: abortRemoteRuntimeRecoveryBeforeInstall CLUSTER ORIGINAL_TARGET OPERATION_ID --driver-bundle APPROVED_CONTROLLER_BUNDLE");
+      String identity(argv[0]),targetInput(argv[1]),operationText(argv[2]),driverInput(argv[4]);
+      uint128_t operation=0;
+      require(prodigyParseCanonicalHex128(operationText,operation) && operation,"abort recovery operation ID invalid");
+      MothershipProdigyCluster cluster={};
+      require(loadClusterForScopedMutation("abortRemoteRuntimeRecoveryBeforeInstall",identity,cluster,failure) &&
+              cluster.deploymentMode==MothershipClusterDeploymentMode::remote && cluster.provider==MothershipClusterProvider::vultr &&
+              cluster.nBrains==3 && cluster.topology.machines.size()==3,"abort requires the registered three-Brain remote cohort");
+      String registryPath={}; {auto registry=openClusterRegistry();registryPath=registry.path();}
+      MothershipRemoteRuntimeRecoveryExecutionLock lock;
+      require(lock.acquire(registryPath),"another runtime recovery executor is active");
+      MothershipRemoteRuntimeRecoveryCohortRecord record={}; MothershipUpgradeAdmissionRecord admission={};
+      {auto registry=openClusterRegistry();require(registry.loadRemoteRuntimeRecoveryCohort(cluster.clusterUUID,operation,record,&failure) &&
+          registry.loadUpgradeAdmission(cluster.clusterUUID,operation,admission,&failure),"abort recovery authority unavailable");}
+      require(record.phase==Phase::frozen || record.phase==Phase::abortedBeforeInstallation,
+              "abort is restricted to a frozen, never-installed cohort");
+      auto frozen=record; frozen.phase=Phase::frozen;
+      for(auto& member:frozen.members) if(member.phaseReceipts.size()==4) member.phaseReceipts.resize(3);
+      require(MothershipClusterRegistry::remoteRuntimeRecoveryCohortValid(frozen) &&
+              MothershipClusterRegistry::remoteRuntimeRecoveryAllProofsSealed(frozen),"abort frozen proofs invalid");
+      MachineCpuArchitecture architecture=MachineCpuArchitecture::unknown;
+      ProdigyApprovedUpgradeBundle target={},driver={}; String targetPath={},driverPath={},selfSHA={};
+      require(resolveProdigyBundleTargetArchitecture(identity.c_str(),architecture,&failure) &&
+              prodigyResolveBundleArtifactInput(targetInput,architecture,targetPath,&failure) &&
+              prodigyApproveBundleUpgradeContract(targetPath,target,&failure) && target.verifyRetainedSnapshot(&failure) &&
+              target.bundleSHA256==record.targetBundleSHA256 && target.contract.contractSHA256==record.targetContractSHA256,
+              "abort original approved target differs");
+      MothershipUpgradeIdentity targetIdentity={};targetIdentity.releaseID=target.contract.releaseID;
+      targetIdentity.contractSHA256=target.contract.contractSHA256;targetIdentity.prodigySHA256=target.contract.prodigySHA256;
+      targetIdentity.mothershipSHA256=target.contract.mothershipSHA256;
+      String architectureName={};architectureName.assign(machineCpuArchitectureName(architecture));
+      require(prodigyResolveBundleArtifactInput(driverInput,architecture,driverPath,&failure) &&
+              prodigyApproveBundleUpgradeContract(driverPath,driver,&failure) && driver.verifyRetainedSnapshot(&failure) &&
+              prodigyComputeFileSHA256Hex("/proc/self/exe"_ctv,selfSHA,&failure) &&
+              prodigyValidateRuntimeRecoveryDriver(driver,selfSHA,targetIdentity,architectureName,cluster.clusterUUID,&failure),
+              "abort controller is not separately approved for the immutable target");
+      String bytes={},digest={};auto topology=cluster.topology;BitseryEngine::serialize(bytes,topology);
+      require(prodigyComputeSHA256Hex(bytes,digest,&failure) && digest==record.topologySHA256 &&
+              record.runtimeRoot==cluster.remoteProdigyPath,"abort registered topology or runtime root differs");
+      BitseryEngine::serialize(bytes,admission);
+      require(admission.eligible && admission.targetBundleSHA256==record.targetBundleSHA256 &&
+              prodigyComputeSHA256Hex(bytes,digest,&failure) && digest==record.admissionRecordSHA256,
+              "abort immutable upgrade admission differs");
+      String canonical={};canonical.assignItoh(operation);
+      const auto root="/var/lib/prodigy/runtime-recovery/"+str(canonical);
+      const auto localRoot=fs::path(str(registryPath)).parent_path()/"runtime-recovery"/str(canonical);
+      const auto runtime=str(record.runtimeRoot); const std::string cg="/sys/fs/cgroup/system.slice/prodigy.service";
+      MothershipRemoteRuntimeRecoveryRequest original={};String originalBytes={},binding={};
+      require(mothershipVDCRead(text((localRoot/"request.bin").string()),originalBytes,16*1024*1024) &&
+              BitseryEngine::deserializeSafe(originalBytes,original) && original.version==1 &&
+              original.cohort.phase==Phase::admitted && MothershipClusterRegistry::remoteRuntimeRecoveryCohortValid(original.cohort) &&
+              MothershipClusterRegistry::remoteRuntimeRecoveryIdentityMatches(original.cohort,record) &&
+              prodigyComputeSHA256Hex(originalBytes,binding,&failure),"abort original request binding invalid");
+      String frozenBytes={},frozenSHA={};BitseryEngine::serialize(frozenBytes,frozen);
+      require(prodigyComputeSHA256Hex(frozenBytes,frozenSHA,&failure),"abort frozen cohort digest unavailable");
+      const auto sourceGuard=[&](const auto& member) {
+        const auto pid=std::to_string(member.sourceProcessPID);
+        const auto process="import pathlib; p=pathlib.Path('/proc/"+pid+"'); assert int((p/'stat').read_text().rsplit(')',1)[1].split()[19])=="+
+            std::to_string(member.sourceProcessStartTicks)+"; assert (p/'cgroup').read_text()=='0::/system.slice/prodigy.service\\n'";
+        return "test \"$(cat /etc/machine-id)\" = "+quote(str(member.linuxMachineID))+"; test \"$(cat /proc/sys/kernel/random/boot_id)\" = "+quote(str(member.bootID))+
+            "; test \"$(systemctl show -p MainPID --value prodigy)\" = "+pid+"; python3 -c "+quote(process)+
+            "; test \"$(sha256sum /proc/"+pid+"/exe | cut -d' ' -f1)\" = "+quote(str(record.sourceProdigySHA256))+
+            "; test \"$(sha256sum "+quote(runtime+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(str(record.sourceProdigySHA256))+
+            "; test \"$(sha256sum "+quote(runtime+"/tools/mothership")+" | cut -d' ' -f1)\" = "+quote(str(record.sourceMothershipSHA256))+
+            "; test \"$(sha256sum "+quote(runtime+"/prodigy.bundle.tar.zst")+" | cut -d' ' -f1)\" = "+quote(str(record.sourceBundleSHA256))+"; ";
+      };
+      std::string untouched="test -d "+quote(root)+"; test ! -L "+quote(root)+"; test \"$(stat -c '%u:%a' "+quote(root)+")\" = 0:700; ";
+      for(const auto name:{"source-runtime","remote-recovery-quiesced","remote-recovery-installed","remote-recovery-activation-ready","remote-recovery-started"})
+        for(const auto suffix:{"",".new"}) {
+          const auto path=root+"/"+name+suffix;untouched+="test ! -e "+quote(path)+"; test ! -L "+quote(path)+"; ";
+        }
+      untouched+="test \"$(sha256sum "+quote(root+"/request.bin")+" | cut -d' ' -f1)\" = "+quote(str(binding))+"; test -f "+quote(root+"/stopped-proof.bin")+
+          "; test ! -L "+quote(root+"/stopped-proof.bin")+"; test \"$(stat -c '%u:%a:%h' "+quote(root+"/stopped-proof.bin")+")\" = 0:600:1; ";
+      const auto run=[&](const auto& member,const std::string& command,String *output=nullptr) {
+        String captured={};String *reply=output?output:&captured;
+        const bool okay=remoteRuntimeRecoveryCommand(cluster,member.machineUUID,text(remoteRecoveryStrictShell(command)),reply,failure);
+        if(!okay && !reply->empty()) {failure.append(" abort verifier: "_ctv);failure.append(*reply);}
+        require(okay,"abort member verification or lifecycle reconciliation failed");
+      };
+      MothershipRemoteRuntimeRecoveryAbortRequest abort={};String abortBytes={},abortSHA={};
+      const auto abortPath=localRoot/"abort-before-installation.bin";
+      struct stat localMetadata={};
+      require(::lstat(localRoot.c_str(),&localMetadata)==0 && S_ISDIR(localMetadata.st_mode) &&
+              localMetadata.st_uid==0 && (localMetadata.st_mode&0777)==0700,"abort evidence root ownership invalid");
+      if(fs::exists(abortPath) || fs::is_symlink(abortPath)) {
+        require(::lstat(abortPath.c_str(),&localMetadata)==0 && S_ISREG(localMetadata.st_mode) &&
+                localMetadata.st_uid==0 && localMetadata.st_nlink==1 && (localMetadata.st_mode&0777)==0600,
+                "abort request ownership invalid");
+        require(mothershipVDCRead(text(abortPath.string()),abortBytes,16*1024*1024) &&
+                BitseryEngine::deserializeSafe(abortBytes,abort),"abort request is unreadable");
+      } else {
+        require(record.phase==Phase::frozen,"terminal abort is missing its immutable request");
+        abort.requestSHA256=binding;abort.frozenCohortSHA256=frozenSHA;
+        // Observe every exact source before unfreezing any member. The
+        // original record and its sealed proofs are never edited.
+        for(const auto& saved:record.members) {
+          MothershipRemoteRuntimeRecoveryMember current={};
+          require(observeRemoteRuntimeRecoverySource(cluster,saved.machineUUID,record.runtimeRoot,admission,current,failure) &&
+                  current.linuxMachineID==saved.linuxMachineID && current.bootID==saved.bootID,
+                  "abort source runtime or unchanged VM identity unavailable");
+          String fenceMode={},proofSHA={};
+          const auto legacy=runtimeStartupFencePredicate(root,str(binding));
+          const auto inhibited=runtimeStartupFencePredicate(root,str(binding),"/etc/systemd/system/prodigy.service.d",true);
+          run(current,sourceGuard(current)+untouched+"if "+remoteRecoveryStrictShell(legacy)+"; then printf 0; elif "+
+              remoteRecoveryStrictShell(inhibited)+"; then printf 1; else exit 1; fi",&fenceMode);
+          require(fenceMode=="0"_ctv || fenceMode=="1"_ctv,"abort startup fence variant invalid");
+          run(current,sourceGuard(current)+untouched+"sha256sum "+quote(root+"/stopped-proof.bin")+" | cut -d' ' -f1",&proofSHA);
+          if(!proofSHA.empty() && proofSHA[proofSHA.size()-1]=='\n') proofSHA.resize(proofSHA.size()-1);
+          require(prodigyIsSHA256HexDigest(proofSHA),"abort frozen proof file digest invalid");
+          abort.sources.push_back(current);abort.restartInhibited.push_back(fenceMode=="1"_ctv?1:0);abort.proofFileSHA256.push_back(proofSHA);
+        }
+        BitseryEngine::serialize(abortBytes,abort);
+        require(mothershipVDCDurableWrite(text(localRoot.string()),"abort-before-installation.bin",abortBytes,&failure),"abort request publication failed");
+      }
+      require(abort.version==1 && abort.requestSHA256==binding && abort.frozenCohortSHA256==frozenSHA &&
+              abort.sources.size()==3 && abort.restartInhibited.size()==3 && abort.proofFileSHA256.size()==3 &&
+              prodigyComputeSHA256Hex(abortBytes,abortSHA,&failure),"abort request differs from the immutable frozen operation");
+      for(uint32_t index=0;index<3;++index) {
+        const auto& current=abort.sources[index];const auto& originalMember=record.members[index];
+        require(MothershipClusterRegistry::remoteRuntimeRecoveryMemberIdentityValid(current) &&
+                current.machineUUID==originalMember.machineUUID && current.linuxMachineID==originalMember.linuxMachineID &&
+                current.bootID==originalMember.bootID && abort.restartInhibited[index]<=1 &&
+                prodigyIsSHA256HexDigest(abort.proofFileSHA256[index]),"abort source observation is outside the admitted VM cohort");
+        run(current,sourceGuard(current)+untouched+"test \"$(sha256sum "+quote(root+"/stopped-proof.bin")+" | cut -d' ' -f1)\" = "+
+            quote(str(abort.proofFileSHA256[index]))+"; ");
+      }
+      for(uint32_t index=0;index<3;++index) {
+        const auto& current=abort.sources[index];const bool inhibit=abort.restartInhibited[index]!=0;
+        const auto unchangedProof="test \"$(sha256sum "+quote(root+"/stopped-proof.bin")+" | cut -d' ' -f1)\" = "+
+            quote(str(abort.proofFileSHA256[index]))+"; ";
+        const auto restored=sourceGuard(current)+untouched+unchangedProof+runtimeStartupUnfencePredicate(root,str(binding),"/etc/systemd/system/prodigy.service.d",inhibit)+
+            "systemctl is-active --quiet prodigy; test \"$(awk '$1 == \"frozen\" { print $2 }' "+quote(std::string(cg)+"/cgroup.events")+")\" = 0; ";
+        // The unfence owner also validates an exact partial release after an
+        // interrupted rename. Requiring the full active fence here would make
+        // that safe continuation unreachable.
+        const auto before=sourceGuard(current)+untouched+unchangedProof;
+        const auto action=runtimeStartupUnfenceCommand(root,str(binding),"/etc/systemd/system/prodigy.service.d",inhibit)+
+            "test -w "+quote(std::string(cg)+"/cgroup.freeze")+"; printf 0 > "+quote(std::string(cg)+"/cgroup.freeze")+
+            "; for i in $(seq 1 100); do test \"$(awk '$1 == \"frozen\" { print $2 }' "+quote(std::string(cg)+"/cgroup.events")+")\" = 0 && break; sleep 0.05; done; ";
+        const auto command=remoteRecoveryAttestedCommand(root,str(abortSHA),"aborted-before-installation",before,restored,action);
+        String reply={};require(remoteRuntimeRecoveryScript(cluster,current,text(command),localRoot.string(),root,&reply,failure),
+                                "abort source thaw or receipt failed");
+      }
+      ClusterStatusReport status={};bool healthy=false;
+      for(unsigned attempt=0;attempt<120;++attempt) {
+        if(productionClusterHealthy(cluster,status,failure) && status.topology==cluster.topology) {healthy=true;break;}
+        ::usleep(500'000);
+      }
+      require(healthy && configureControlTarget(identity.c_str(),&failure),"abort awaits restored source quorum");
+      ProdigyUpgradeAdmissionReportRequest observation={};observation.operationID=operationText;
+      observation.targetBundleSHA256=target.bundleSHA256;observation.targetContractSHA256=target.contract.contractSHA256;
+      observation.requiredStagingBytes=target.contract.requiredFreeBytes;
+      MothershipUpgradeAdmissionReport report={};MothershipUpgradePlannerInput input={};
+      require(validateFreshRuntimeUpgradeAdmission(target,admission,architecture,&cluster,observation,true,report,input,failure,
+                  RuntimeAdmissionValidation::restoreSourceBeforeInstallation) &&
+              report.masterApprovedBundleSHA256==record.sourceBundleSHA256,"abort awaits fresh source authority and inventory admission");
+      if(record.phase!=Phase::abortedBeforeInstallation) {
+        auto terminal=record;terminal.phase=Phase::abortedBeforeInstallation;
+        for(auto& member:terminal.members) {
+          MothershipRemoteRuntimeRecoveryMember::PhaseReceipt receipt;
+          MothershipClusterRegistry::remoteRuntimeRecoveryOperationMarker(operation,member.machineUUID,terminal.phase,receipt.operationMarker);
+          String material=receipt.operationMarker;material.append('\0');material.append(abortSHA);
+          require(prodigyComputeSHA256Hex(material,receipt.receiptSHA256,&failure),"abort receipt digest failed");
+          member.phaseReceipts.push_back(std::move(receipt));
+        }
+        auto registry=openClusterRegistry();MothershipRemoteRuntimeRecoveryCohortRecord saved={};
+        require(registry.abortRemoteRuntimeRecoveryCohort(terminal,saved,&failure),"abort registry terminal transition failed");
+      }
+      basics_log("abortRemoteRuntimeRecoveryBeforeInstall success=1 operationID=%s sourceCohortHealthy=1 bootIdentitiesPreserved=1 originalProofsPreserved=1\n",operationText.c_str());
+    } catch(const std::exception& error) {
+      basics_log("abortRemoteRuntimeRecoveryBeforeInstall success=0 preserved=1 failure=%s detail=%s\n",error.what(),failure.c_str());exit(EXIT_FAILURE);
     }
   }
 
@@ -31231,6 +31462,14 @@ LOCAL_RUNTIME
   // Normal rollout and recovery share the same fresh typed admission owner.
   // Recovery adds stopped-state evidence after this check; it never relaxes
   // the fleet identity, authority, capacity or compatibility requirements.
+  enum class RuntimeAdmissionValidation {
+    executeAdmittedUpdate,
+    // Closing an abandoned, never-installed operation does not authorize an
+    // update. Its source may have restarted, so validate fresh planner gates
+    // without claiming the old process observation still holds.
+    restoreSourceBeforeInstallation,
+  };
+
   bool validateFreshRuntimeUpgradeAdmission(
       const ProdigyApprovedUpgradeBundle& approved,
       const MothershipUpgradeAdmissionRecord& admission,
@@ -31239,7 +31478,8 @@ LOCAL_RUNTIME
       const ProdigyUpgradeAdmissionReportRequest& observationRequest,
       bool acceptActiveWorkloadInterruption,
       MothershipUpgradeAdmissionReport& report,
-      MothershipUpgradePlannerInput& input, String& failure)
+      MothershipUpgradePlannerInput& input, String& failure,
+      RuntimeAdmissionValidation validation = RuntimeAdmissionValidation::executeAdmittedUpdate)
   {
     report = {}; input = {}; failure.clear();
     constexpr uint32_t maximumObservationAttempts = 3;
@@ -31284,10 +31524,12 @@ LOCAL_RUNTIME
     MothershipUpgradePlan freshPlan = mothershipPlanUpgrade(approved.contract, input);
     if (failure.empty() && !freshPlan.eligible)
       failure = freshPlan.firstStopGate;
-    if (failure.empty() && (freshPlan.path != MothershipUpgradePath::sameLogicalRollout ||
-                            freshPlan.inputSHA256 != admission.plannerInputSHA256 ||
-                            report.authorityGeneration != admission.authorityGeneration || report.masterUUID != admission.masterUUID ||
-                            report.masterBootNs != admission.masterBootNs || semanticSHA256 != admission.semanticObservationSHA256))
+    if (failure.empty() && freshPlan.path != MothershipUpgradePath::sameLogicalRollout)
+      failure.assign("fresh plan does not permit same-logical runtime recovery"_ctv);
+    if (failure.empty() && validation == RuntimeAdmissionValidation::executeAdmittedUpdate &&
+        (freshPlan.inputSHA256 != admission.plannerInputSHA256 ||
+         report.authorityGeneration != admission.authorityGeneration || report.masterUUID != admission.masterUUID ||
+         report.masterBootNs != admission.masterBootNs || semanticSHA256 != admission.semanticObservationSHA256))
       failure.assign("fresh report or plan no longer matches the durable admission; re-plan required"_ctv);
     if (!failure.empty())
     {
@@ -37383,6 +37625,7 @@ public:
     };
 
     constexpr static Command commands[] = {
+        {"abortRemoteRuntimeRecoveryBeforeInstall", &Mothership::runAbortRemoteRuntimeRecoveryBeforeInstall},
         {"acme-cleanup-dns-01",             &Mothership::runACMECleanupDNS01ChallengeHook  },
         {"acme-import-lineage",             &Mothership::runACMELineageImportHook          },
         {"acme-present-dns-01",             &Mothership::runACMEPresentDNS01ChallengeHook  },

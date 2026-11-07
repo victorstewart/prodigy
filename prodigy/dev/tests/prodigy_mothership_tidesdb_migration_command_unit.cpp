@@ -92,27 +92,77 @@ int main(int argc, char **argv)
       std::ofstream output(path); output << script; output.close(); ::chmod(path.c_str(),0700);
     };
     writeExecutable(fenceBin/"systemctl", "#!/bin/sh\nif test \"$1\" = daemon-reload; then : > "+quote(reloaded)+"; exit 0; fi\n"
-        "if test \"$1\" = show; then case \"$*\" in *DropInPaths*) printf '%s\\n' "+quote(dropin)+";; *NeedDaemonReload*) test -e "+quote(reloaded)+" && printf 'no\\n' || printf 'yes\\n';; *) exit 1;; esac; exit 0; fi\nexit 1\n");
+        "if test \"$1\" = show; then dropin=\"${FAKE_DROPIN:-"+dropin+"}\"; case \"$*\" in *DropInPaths*) test -f \"$dropin\" && printf '%s\\n' \"$dropin\";; *NeedDaemonReload*) test -e "+quote(reloaded)+" && printf 'no\\n' || printf 'yes\\n';; *Restart*) if test \"${FAKE_RESTART+x}\" = x; then printf '%s\\n' \"$FAKE_RESTART\"; elif test -f \"$dropin\"; then printf 'no\\n'; else printf 'always\\n'; fi;; *) exit 1;; esac; exit 0; fi\nexit 1\n");
     const auto busctlJSON = [&](const std::string& trigger,const std::string& negate,const std::string& path) {
       return "{\"type\":\"a(sbbsi)\",\"data\":[[\"ConditionPathExists\","+trigger+","+negate+",\""+path+"\",0]]}";
     };
     writeExecutable(fenceBin/"busctl", "#!/bin/sh\ncase \"${FAKE_CONDITION_MODE:-positive}\" in positive) printf '%s\\n' "+quote(busctlJSON("false","true",fencePath))+";; negatedwrong) printf '%s\\n' "+quote(busctlJSON("false","false",fencePath))+";; triggered) printf '%s\\n' "+quote(busctlJSON("true","true",fencePath))+";; resetmissing) printf '%s\\n' '{\"type\":\"a(sbbsi)\",\"data\":[]}' ;; *) exit 1;; esac\n");
     { std::ofstream output(hostile); output << ": \"$PS1\"\n"; }
-    const auto fencePredicate=runtimeStartupFencePredicate(fenceRoot,binding,fenceDropins);
+    const auto fencePredicate=runtimeStartupFencePredicate(fenceRoot,binding,fenceDropins,true);
+    assert(runtimeStartupFenceCommand(fenceRoot,binding,fenceDropins).find("Restart=no")==std::string::npos);
+    assert(runtimeStartupFenceCommand(fenceRoot,binding,fenceDropins,true).find("Restart=no")!=std::string::npos);
     const auto fenceCommand=remoteRecoveryAttestedCommand(fenceRoot,binding,"fence",
-        "test ! -e "+quote(fenceAction),fencePredicate,"printf x > "+quote(fenceAction)+"; "+runtimeStartupFenceCommand(fenceRoot,binding,fenceDropins));
+        "test ! -e "+quote(fenceAction),fencePredicate,"printf x > "+quote(fenceAction)+"; "+runtimeStartupFenceCommand(fenceRoot,binding,fenceDropins,true));
     assert(fenceCommand.size() < 30976);
-    execution.run(0,"BASH_ENV="+quote(hostile)+" PATH="+quote(fenceBin.string())+":$PATH "+fenceCommand);
+    execution.run(0,"BASH_ENV="+quote(hostile)+" FAKE_RESTART=no PATH="+quote(fenceBin.string())+":$PATH "+fenceCommand);
     assert(read(fenceAction)=="x" && read(fenceRoot+"/remote-recovery-fence")==binding);
-    execution.run(0,"BASH_ENV="+quote(hostile)+" PATH="+quote(fenceBin.string())+":$PATH "+fenceCommand);
+    execution.run(0,"BASH_ENV="+quote(hostile)+" FAKE_RESTART=no PATH="+quote(fenceBin.string())+":$PATH "+fenceCommand);
     assert(read(fenceAction)=="x");
+    assert(!execution.command(0,"FAKE_RESTART=always PATH="+quote(fenceBin.string())+":$PATH "+remoteRecoveryStrictShell(fencePredicate),&failure));
     for (const auto mode:{"negatedwrong","triggered","resetmissing"})
-      assert(!execution.command(0,"FAKE_CONDITION_MODE="+quote(mode)+" PATH="+quote(fenceBin.string())+":$PATH "+remoteRecoveryStrictShell(fencePredicate),&failure));
+      assert(!execution.command(0,"FAKE_CONDITION_MODE="+quote(mode)+" FAKE_RESTART=no PATH="+quote(fenceBin.string())+":$PATH "+remoteRecoveryStrictShell(fencePredicate),&failure));
+    assert(execution.command(0,"FAKE_RESTART=no PATH="+quote(fenceBin.string())+":$PATH "+remoteRecoveryStrictShell(fencePredicate),&failure));
     { std::ofstream output(dropin); output << "altered"; }
     ::chmod(dropin.c_str(),0600);
-    assert(!execution.command(0,"PATH="+quote(fenceBin.string())+":$PATH "+remoteRecoveryStrictShell(fencePredicate),&failure));
-    { std::ofstream output(dropin); output << "[Unit]\nConditionPathExists=!" << fencePath << "\n"; }
+    assert(!execution.command(0,"FAKE_RESTART=no PATH="+quote(fenceBin.string())+":$PATH "+remoteRecoveryStrictShell(fencePredicate),&failure));
+    { std::ofstream output(dropin); output << "[Unit]\nConditionPathExists=!" << fencePath << "\n[Service]\nRestart=no\n"; }
     ::chmod(dropin.c_str(),0600);
+    assert(execution.command(0,"FAKE_RESTART=no PATH="+quote(fenceBin.string())+":$PATH "+remoteRecoveryStrictShell(fencePredicate),&failure));
+    const auto unfence=runtimeStartupUnfenceCommand(fenceRoot,binding,fenceDropins,true);
+    const auto unfencePredicate=runtimeStartupUnfencePredicate(fenceRoot,binding,fenceDropins,true);
+    execution.run(0,"PATH="+quote(fenceBin.string())+":$PATH "+remoteRecoveryStrictShell(unfence));
+    assert(!fs::exists(fencePath) && !fs::exists(dropin));
+    assert(fs::exists(fenceRoot+"/writers-fenced.released") &&
+           fs::exists(fenceRoot+"/startup-fence-"+binding.substr(0,16)+".conf.released"));
+    assert(execution.command(0,"PATH="+quote(fenceBin.string())+":$PATH "+remoteRecoveryStrictShell("test \"$(systemctl show -p Restart --value prodigy)\" = always"),&failure));
+    assert(execution.command(0,"PATH="+quote(fenceBin.string())+":$PATH "+remoteRecoveryStrictShell(unfencePredicate),&failure));
+    execution.run(0,"PATH="+quote(fenceBin.string())+":$PATH "+remoteRecoveryStrictShell(unfence));
+    assert(!execution.command(0,"PATH="+quote(fenceBin.string())+":$PATH "+
+        remoteRecoveryStrictShell(runtimeStartupUnfenceCommand(fenceRoot,std::string(64,'c'),fenceDropins,true)),&failure));
+    { std::ofstream output(fenceRoot+"/startup-fence-"+binding.substr(0,16)+".conf.released"); output << "altered"; }
+    ::chmod((fenceRoot+"/startup-fence-"+binding.substr(0,16)+".conf.released").c_str(),0600);
+    assert(!execution.command(0,"PATH="+quote(fenceBin.string())+":$PATH "+remoteRecoveryStrictShell(unfencePredicate),&failure));
+    // An SSH disconnect can happen after either rename but before reload.
+    // Each partial, exact pair must converge rather than becoming unreleasable.
+    const auto partialFence = [&](const std::string& name, bool moveFence) {
+      const auto partialRoot=(root/name).string(), partialDropins=(root/(name+"-dropins")).string();
+      const auto partialDropin=runtimeStartupFenceDropinPath(binding,partialDropins);
+      fs::create_directories(partialRoot); fs::create_directories(partialDropins); ::chmod(partialRoot.c_str(),0700);
+      execution.run(0,"PATH="+quote(fenceBin.string())+":$PATH "+remoteRecoveryStrictShell(runtimeStartupFenceCommand(partialRoot,binding,partialDropins,true)));
+      const auto releasedFence=partialRoot+"/writers-fenced.released";
+      const auto releasedDropin=partialRoot+"/startup-fence-"+binding.substr(0,16)+".conf.released";
+      if (moveFence) execution.run(0,"mv -T "+quote(partialRoot+"/writers-fenced")+" "+quote(releasedFence));
+      else execution.run(0,"mv -T "+quote(partialDropin)+" "+quote(releasedDropin));
+      fs::remove(reloaded);
+      execution.run(0,"FAKE_DROPIN="+quote(partialDropin)+" PATH="+quote(fenceBin.string())+":$PATH "+
+          remoteRecoveryStrictShell(runtimeStartupUnfenceCommand(partialRoot,binding,partialDropins,true)));
+      assert(execution.command(0,"FAKE_DROPIN="+quote(partialDropin)+" PATH="+quote(fenceBin.string())+":$PATH "+
+          remoteRecoveryStrictShell(runtimeStartupUnfencePredicate(partialRoot,binding,partialDropins,true)),&failure));
+    };
+    partialFence("unfence-after-first-move",false);
+    // Both paths moved but daemon-reload not reached: final reconciliation
+    // must reload and validate the retained pair, not treat it as terminal.
+    const auto bothRoot=(root/"unfence-before-reload").string(), bothDropins=(root/"unfence-before-reload-dropins").string();
+    const auto bothDropin=runtimeStartupFenceDropinPath(binding,bothDropins);
+    fs::create_directories(bothRoot); fs::create_directories(bothDropins); ::chmod(bothRoot.c_str(),0700);
+    execution.run(0,"PATH="+quote(fenceBin.string())+":$PATH "+remoteRecoveryStrictShell(runtimeStartupFenceCommand(bothRoot,binding,bothDropins,true)));
+    execution.run(0,"mv -T "+quote(bothDropin)+" "+quote(bothRoot+"/startup-fence-"+binding.substr(0,16)+".conf.released")+
+        "; mv -T "+quote(bothRoot+"/writers-fenced")+" "+quote(bothRoot+"/writers-fenced.released"));
+    fs::remove(reloaded);
+    execution.run(0,"FAKE_DROPIN="+quote(bothDropin)+" PATH="+quote(fenceBin.string())+":$PATH "+
+        remoteRecoveryStrictShell(runtimeStartupUnfenceCommand(bothRoot,binding,bothDropins,true)));
+    assert(execution.command(0,"FAKE_DROPIN="+quote(bothDropin)+" PATH="+quote(fenceBin.string())+":$PATH "+
+        remoteRecoveryStrictShell(runtimeStartupUnfencePredicate(bothRoot,binding,bothDropins,true)),&failure));
     const auto sourceRejected=remoteRecoveryAttestedCommand(fenceRoot,binding,"source-rejected","false",
         "false","touch "+quote(fenceAction+".unexpected"));
     assert(!execution.command(0,"PATH="+quote(fenceBin.string())+":$PATH "+sourceRejected,&failure));

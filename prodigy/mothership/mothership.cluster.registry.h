@@ -642,6 +642,11 @@ enum class MothershipRemoteRuntimeRecoveryPhase : uint8_t {
   // admission and any staged receipt so the abandoned operation remains
   // auditable, but no longer interlocks a fresh operation.
   withdrawnBeforeFence = 8,
+  // A frozen cohort may terminate only after the original source runtime has
+  // been restored and independently revalidated.  Its stopped-store proofs
+  // and the first three phase receipts remain immutable; this receipt records
+  // that the recovery stopped before any target runtime was installed.
+  abortedBeforeInstallation = 9,
 };
 
 class MothershipRemoteRuntimeRecoveryMember {
@@ -4532,7 +4537,15 @@ public:
 
   static uint32_t remoteRuntimeRecoveryPhaseReceiptCount(MothershipRemoteRuntimeRecoveryPhase phase)
   {
+    if (phase == MothershipRemoteRuntimeRecoveryPhase::abortedBeforeInstallation) return 4;
     return uint32_t(phase);
+  }
+
+  static bool remoteRuntimeRecoveryTerminal(MothershipRemoteRuntimeRecoveryPhase phase)
+  {
+    return phase == MothershipRemoteRuntimeRecoveryPhase::completed ||
+           phase == MothershipRemoteRuntimeRecoveryPhase::withdrawnBeforeFence ||
+           phase == MothershipRemoteRuntimeRecoveryPhase::abortedBeforeInstallation;
   }
 
   static void remoteRuntimeRecoveryOperationMarker(uint128_t operationID, uint128_t machineUUID,
@@ -4555,8 +4568,10 @@ public:
     {
       const auto& receipt = member.phaseReceipts[index];
       String expected = {};
+      const auto receiptPhase = record.phase == MothershipRemoteRuntimeRecoveryPhase::abortedBeforeInstallation && index == 3 ?
+          MothershipRemoteRuntimeRecoveryPhase::abortedBeforeInstallation : MothershipRemoteRuntimeRecoveryPhase(index + 1);
       remoteRuntimeRecoveryOperationMarker(record.operationID, member.machineUUID,
-                                            MothershipRemoteRuntimeRecoveryPhase(index + 1), expected);
+                                            receiptPhase, expected);
       if (receipt.operationMarker != expected || !prodigyIsSHA256HexDigest(receipt.receiptSHA256)) return false;
     }
     return true;
@@ -4589,7 +4604,8 @@ public:
   {
     if (record.version != 3 || record.runtimeRoot.empty() || record.runtimeRoot[0] != '/' ||
         record.authorityGeneration == 0 || !record.cohortInterruptionAccepted || record.clusterUUID == 0 || record.operationID == 0 || record.members.size() != 3 ||
-        uint8_t(record.phase) > uint8_t(MothershipRemoteRuntimeRecoveryPhase::withdrawnBeforeFence) ||
+        (uint8_t(record.phase) > uint8_t(MothershipRemoteRuntimeRecoveryPhase::withdrawnBeforeFence) &&
+         record.phase != MothershipRemoteRuntimeRecoveryPhase::abortedBeforeInstallation) ||
         !prodigyIsSHA256HexDigest(record.topologySHA256) || !prodigyIsSHA256HexDigest(record.admissionRecordSHA256) ||
         !prodigyIsSHA256HexDigest(record.sourceBundleSHA256) ||
         !prodigyIsSHA256HexDigest(record.sourceContractSHA256) || !prodigyIsSHA256HexDigest(record.sourceProdigySHA256) ||
@@ -4610,14 +4626,17 @@ public:
       if (anyProof && !remoteRuntimeRecoveryMemberProofSealed(member)) return false;
       allProofs = allProofs && remoteRuntimeRecoveryMemberProofSealed(member);
       const bool withdrawn = record.phase == MothershipRemoteRuntimeRecoveryPhase::withdrawnBeforeFence;
+      const bool aborted = record.phase == MothershipRemoteRuntimeRecoveryPhase::abortedBeforeInstallation;
       if (!remoteRuntimeRecoveryMemberReceiptsValid(record, member) ||
           (withdrawn && (anyProof || member.targetRuntimeInstalled)) ||
-          (!withdrawn && uint8_t(record.phase) < uint8_t(MothershipRemoteRuntimeRecoveryPhase::frozen) && anyProof) ||
-          (!withdrawn && uint8_t(record.phase) < uint8_t(MothershipRemoteRuntimeRecoveryPhase::installed) && member.targetRuntimeInstalled) ||
-          (!withdrawn && uint8_t(record.phase) >= uint8_t(MothershipRemoteRuntimeRecoveryPhase::installed) && !member.targetRuntimeInstalled)) return false;
+          (!withdrawn && !aborted && uint8_t(record.phase) < uint8_t(MothershipRemoteRuntimeRecoveryPhase::frozen) && anyProof) ||
+          (aborted && member.targetRuntimeInstalled) ||
+          (!withdrawn && !aborted && uint8_t(record.phase) < uint8_t(MothershipRemoteRuntimeRecoveryPhase::installed) && member.targetRuntimeInstalled) ||
+          (!withdrawn && !aborted && uint8_t(record.phase) >= uint8_t(MothershipRemoteRuntimeRecoveryPhase::installed) && !member.targetRuntimeInstalled)) return false;
     }
     if (record.phase != MothershipRemoteRuntimeRecoveryPhase::withdrawnBeforeFence &&
-        uint8_t(record.phase) >= uint8_t(MothershipRemoteRuntimeRecoveryPhase::frozen) &&
+        (record.phase == MothershipRemoteRuntimeRecoveryPhase::abortedBeforeInstallation ||
+         uint8_t(record.phase) >= uint8_t(MothershipRemoteRuntimeRecoveryPhase::frozen)) &&
         !allProofs) return false;
     return true;
   }
@@ -4709,8 +4728,7 @@ public:
       if (!BitseryEngine::deserializeSafe(bytes, other) || !remoteRuntimeRecoveryCohortValid(other))
       { if (failure) failure->assign("remote runtime recovery encountered an invalid prior cohort"_ctv); return false; }
       if (other.clusterUUID == requested.clusterUUID && other.operationID != requested.operationID &&
-          other.phase != MothershipRemoteRuntimeRecoveryPhase::completed &&
-          other.phase != MothershipRemoteRuntimeRecoveryPhase::withdrawnBeforeFence)
+          !remoteRuntimeRecoveryTerminal(other.phase))
       { if (failure) failure->assign("remote runtime recovery has an unresolved overlapping cohort"_ctv); return false; }
     }
     BitseryEngine::serialize(encoded, requested);
@@ -4757,8 +4775,7 @@ public:
         if (failure) failure->assign("remote runtime recovery encountered an invalid prior cohort"_ctv);
         return false;
       }
-      if (record.clusterUUID == clusterUUID && record.phase != MothershipRemoteRuntimeRecoveryPhase::completed &&
-          record.phase != MothershipRemoteRuntimeRecoveryPhase::withdrawnBeforeFence)
+      if (record.clusterUUID == clusterUUID && !remoteRuntimeRecoveryTerminal(record.phase))
         pending = true;
     }
     if (failure) failure->clear();
@@ -4822,6 +4839,74 @@ public:
     return true;
   }
 
+  // This terminal transition is intentionally separate from normal phase
+  // advancement.  It is available only from frozen evidence, after the caller
+  // has restored the original source runtimes and checked their fresh health.
+  // The registry records that fact without replacing any sealed proof or the
+  // original source-process identity.
+  bool abortRemoteRuntimeRecoveryCohort(const MothershipRemoteRuntimeRecoveryCohortRecord& candidate,
+                                        MothershipRemoteRuntimeRecoveryCohortRecord& recorded,
+                                        String *failure = nullptr)
+  {
+    recorded = {};
+    RemoteRuntimeRecoveryLock lock = {};
+    if (!lockRemoteRuntimeRecovery(lock, failure)) return false;
+    if (candidate.phase != MothershipRemoteRuntimeRecoveryPhase::abortedBeforeInstallation ||
+        !remoteRuntimeRecoveryCohortValid(candidate))
+    {
+      if (failure) failure->assign("remote runtime recovery abort candidate is invalid"_ctv);
+      return false;
+    }
+    MothershipRemoteRuntimeRecoveryCohortRecord current = {};
+    if (!loadRemoteRuntimeRecoveryCohort(candidate.clusterUUID, candidate.operationID, current, failure) ||
+        !remoteRuntimeRecoveryIdentityMatches(current, candidate))
+    {
+      if (failure && failure->empty()) failure->assign("remote runtime recovery abort identity differs"_ctv);
+      return false;
+    }
+    if (current.phase == MothershipRemoteRuntimeRecoveryPhase::abortedBeforeInstallation)
+    {
+      String currentBytes = {}, candidateBytes = {};
+      auto currentCopy = current, candidateCopy = candidate;
+      if (!BitseryEngine::serialize(currentBytes, currentCopy) || !BitseryEngine::serialize(candidateBytes, candidateCopy) ||
+          currentBytes != candidateBytes)
+      {
+        if (failure) failure->assign("remote runtime recovery abort replay differs"_ctv);
+        return false;
+      }
+      recorded = current;
+      if (failure) failure->clear();
+      return true;
+    }
+    const bool anyTargetRuntimeInstalled = std::any_of(current.members.begin(), current.members.end(),
+        [](const auto& member) { return member.targetRuntimeInstalled; });
+    if (current.phase != MothershipRemoteRuntimeRecoveryPhase::frozen ||
+        !remoteRuntimeRecoveryAllProofsSealed(current) || anyTargetRuntimeInstalled)
+    {
+      if (failure) failure->assign("remote runtime recovery can be aborted only from frozen uninstalled evidence"_ctv);
+      return false;
+    }
+    auto preserved = candidate;
+    preserved.phase = MothershipRemoteRuntimeRecoveryPhase::frozen;
+    for (auto& member : preserved.members) member.phaseReceipts.pop_back();
+    String currentBytes = {}, preservedBytes = {};
+    auto currentCopy = current;
+    if (!BitseryEngine::serialize(currentBytes, currentCopy) || !BitseryEngine::serialize(preservedBytes, preserved) ||
+        currentBytes != preservedBytes)
+    {
+      if (failure) failure->assign("remote runtime recovery abort mutates frozen evidence"_ctv);
+      return false;
+    }
+    String key = {}, encoded = {};
+    remoteRuntimeRecoveryKey(candidate.clusterUUID, candidate.operationID, key);
+    auto replacement = candidate;
+    BitseryEngine::serialize(encoded, replacement);
+    if (!db.write(remoteRuntimeRecoveryCohortsColumnFamily, key, encoded, failure)) return false;
+    recorded = std::move(replacement);
+    if (failure) failure->clear();
+    return true;
+  }
+
   bool advanceRemoteRuntimeRecoveryCohort(const MothershipRemoteRuntimeRecoveryCohortRecord& candidate,
                                           MothershipRemoteRuntimeRecoveryPhase nextPhase,
                                           MothershipRemoteRuntimeRecoveryCohortRecord& recorded,
@@ -4831,6 +4916,7 @@ public:
     RemoteRuntimeRecoveryLock lock = {};
     if (!lockRemoteRuntimeRecovery(lock, failure)) return false;
     if (nextPhase == MothershipRemoteRuntimeRecoveryPhase::withdrawnBeforeFence ||
+        nextPhase == MothershipRemoteRuntimeRecoveryPhase::abortedBeforeInstallation ||
         !remoteRuntimeRecoveryCohortValid(candidate) || candidate.phase != nextPhase)
     { if (failure) failure->assign("remote runtime recovery transition candidate is invalid"_ctv); return false; }
     MothershipRemoteRuntimeRecoveryCohortRecord current = {};

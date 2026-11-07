@@ -228,24 +228,89 @@ inline std::string runtimeStartupFenceDropinPath(const std::string& bindingSHA,
 }
 
 inline std::string runtimeStartupFenceCommand(const std::string& operationRoot,const std::string& bindingSHA,
-                                              const std::string& dropinDirectory = "/etc/systemd/system/prodigy.service.d") {
+                                              const std::string& dropinDirectory = "/etc/systemd/system/prodigy.service.d",
+                                              bool inhibitAutomaticRestart = false) {
   pathCheck(operationRoot); require(prodigyIsSHA256HexDigest(text(bindingSHA)), "runtime fence binding digest invalid");
   const auto fence=operationRoot+"/writers-fenced";
   const auto dropin=runtimeStartupFenceDropinPath(bindingSHA,dropinDirectory);
-  const auto content="[Unit]\nConditionPathExists=!"+fence+"\n";
+  const auto content="[Unit]\nConditionPathExists=!"+fence+"\n"+
+      (inhibitAutomaticRestart ? "[Service]\nRestart=no\n" : "");
   return "umask 077; printf %s "+quote(bindingSHA)+" > "+quote(fence+".new")+"; sync -f "+quote(fence+".new")+"; mv -T "+quote(fence+".new")+" "+quote(fence)+"; sync -f "+quote(operationRoot)+"; mkdir -p "+quote(dropinDirectory)+"; printf %s "+quote(content)+" > "+quote(dropin+".new")+"; sync -f "+quote(dropin+".new")+"; mv -T "+quote(dropin+".new")+" "+quote(dropin)+"; sync -f "+quote(dropinDirectory)+"; systemctl daemon-reload";
 }
 
 inline std::string runtimeStartupFencePredicate(const std::string& operationRoot,const std::string& bindingSHA,
-                                                const std::string& dropinDirectory = "/etc/systemd/system/prodigy.service.d") {
+                                                const std::string& dropinDirectory = "/etc/systemd/system/prodigy.service.d",
+                                                bool inhibitAutomaticRestart = false) {
   pathCheck(operationRoot); require(prodigyIsSHA256HexDigest(text(bindingSHA)), "runtime fence binding digest invalid");
   const auto fence=operationRoot+"/writers-fenced";
   const auto dropin=runtimeStartupFenceDropinPath(bindingSHA,dropinDirectory);
-  const auto content="[Unit]\nConditionPathExists=!"+fence+"\n";
+  const auto content="[Unit]\nConditionPathExists=!"+fence+"\n"+
+      (inhibitAutomaticRestart ? "[Service]\nRestart=no\n" : "");
   const auto conditions="import json,sys;d=json.load(sys.stdin);x=[r for r in d['data'] if r[0]=='ConditionPathExists' and r[3]==sys.argv[1]];assert d['type']=='a(sbbsi)' and len(x)==1 and x[0][1:3]==[False,True] and isinstance(x[0][4],int)";
   return "test -f "+quote(fence)+"; test ! -L "+quote(fence)+"; test \"$(stat -c '%u:%a:%h' "+quote(fence)+")\" = '0:600:1'; test \"$(cat "+quote(fence)+")\" = "+quote(bindingSHA)+
       "; test -f "+quote(dropin)+"; test ! -L "+quote(dropin)+"; test \"$(stat -c '%u:%a:%h' "+quote(dropin)+")\" = '0:600:1'; printf %s "+quote(content)+" | cmp -s - "+quote(dropin)+
-      "; systemctl show -p DropInPaths --value prodigy | tr ' ' '\\n' | grep -Fx -- "+quote(dropin)+" > /dev/null; test \"$(systemctl show -p NeedDaemonReload --value prodigy)\" = no; busctl --json=short get-property org.freedesktop.systemd1 /org/freedesktop/systemd1/unit/prodigy_2eservice org.freedesktop.systemd1.Unit Conditions | python3 -c "+quote(conditions)+" "+quote(fence)+"; ";
+      "; systemctl show -p DropInPaths --value prodigy | tr ' ' '\\n' | grep -Fx -- "+quote(dropin)+" > /dev/null; test \"$(systemctl show -p NeedDaemonReload --value prodigy)\" = no; "+
+      (inhibitAutomaticRestart ? "test \"$(systemctl show -p Restart --value prodigy)\" = no; " : "")+
+      "busctl --json=short get-property org.freedesktop.systemd1 /org/freedesktop/systemd1/unit/prodigy_2eservice org.freedesktop.systemd1.Unit Conditions | python3 -c "+quote(conditions)+" "+quote(fence)+"; ";
+}
+
+// Releases only this operation's exact fence.  The released files remain as
+// immutable operation evidence; a retry accepts that retained pair, never an
+// ambient unit policy or a same-named file with different contents.
+inline std::string runtimeStartupUnfencePredicate(const std::string& operationRoot,const std::string& bindingSHA,
+                                                  const std::string& dropinDirectory = "/etc/systemd/system/prodigy.service.d",
+                                                  bool inhibitAutomaticRestart = false) {
+  pathCheck(operationRoot); require(prodigyIsSHA256HexDigest(text(bindingSHA)), "runtime unfence binding digest invalid");
+  const auto fence=operationRoot+"/writers-fenced";
+  const auto dropin=runtimeStartupFenceDropinPath(bindingSHA,dropinDirectory);
+  const auto releasedFence=operationRoot+"/writers-fenced.released";
+  const auto releasedDropin=operationRoot+"/startup-fence-"+bindingSHA.substr(0,16)+".conf.released";
+  const auto content="[Unit]\nConditionPathExists=!"+fence+"\n"+
+      (inhibitAutomaticRestart ? "[Service]\nRestart=no\n" : "");
+  const auto exactFence = [&](const std::string& path) {
+    return "test -f "+quote(path)+"; test ! -L "+quote(path)+"; test \"$(stat -c '%u:%a:%h' "+quote(path)+")\" = '0:600:1'; test \"$(cat "+quote(path)+")\" = "+quote(bindingSHA)+"; ";
+  };
+  const auto exactDropin = [&](const std::string& path) {
+    return "test -f "+quote(path)+"; test ! -L "+quote(path)+"; test \"$(stat -c '%u:%a:%h' "+quote(path)+")\" = '0:600:1'; printf %s "+quote(content)+" | cmp -s - "+quote(path)+"; ";
+  };
+  // Check the show command independently: `! pipeline` alone would turn a
+  // systemctl failure into a superficially successful absence result.
+  const auto absentLoadedDropin = "loaded=$(systemctl show -p DropInPaths --value prodigy); ! printf '%s\\n' \"$loaded\" | tr ' ' '\\n' | grep -Fx -- "+quote(dropin)+" > /dev/null; test \"$(systemctl show -p NeedDaemonReload --value prodigy)\" = no; ";
+  return exactFence(releasedFence)+exactDropin(releasedDropin)+
+      "test ! -e "+quote(fence)+"; test ! -L "+quote(fence)+"; test ! -e "+quote(dropin)+"; test ! -L "+quote(dropin)+"; "+absentLoadedDropin;
+}
+
+inline std::string runtimeStartupUnfenceCommand(const std::string& operationRoot,const std::string& bindingSHA,
+                                                const std::string& dropinDirectory = "/etc/systemd/system/prodigy.service.d",
+                                                bool inhibitAutomaticRestart = false) {
+  pathCheck(operationRoot); require(prodigyIsSHA256HexDigest(text(bindingSHA)), "runtime unfence binding digest invalid");
+  const auto fence=operationRoot+"/writers-fenced";
+  const auto dropin=runtimeStartupFenceDropinPath(bindingSHA,dropinDirectory);
+  const auto releasedFence=operationRoot+"/writers-fenced.released";
+  const auto releasedDropin=operationRoot+"/startup-fence-"+bindingSHA.substr(0,16)+".conf.released";
+  const auto released=runtimeStartupUnfencePredicate(operationRoot,bindingSHA,dropinDirectory,inhibitAutomaticRestart);
+  const auto exactFence = [&](const std::string& path) {
+    return "test -f "+quote(path)+"; test ! -L "+quote(path)+"; test \"$(stat -c '%u:%a:%h' "+quote(path)+")\" = '0:600:1'; test \"$(cat "+quote(path)+")\" = "+quote(bindingSHA)+"; ";
+  };
+  const auto content="[Unit]\nConditionPathExists=!"+fence+"\n"+
+      (inhibitAutomaticRestart ? "[Service]\nRestart=no\n" : "");
+  const auto exactDropin = [&](const std::string& path) {
+    return "test -f "+quote(path)+"; test ! -L "+quote(path)+"; test \"$(stat -c '%u:%a:%h' "+quote(path)+")\" = '0:600:1'; printf %s "+quote(content)+" | cmp -s - "+quote(path)+"; ";
+  };
+  // Each item has exactly one authenticated location.  A fully active pair
+  // also proves its live systemd state; a partial pair is an interrupted own
+  // release and is completed only after both retained/active forms validate.
+  const auto itemForms = "test ! -L "+quote(fence)+"; test ! -L "+quote(releasedFence)+"; test ! -L "+quote(dropin)+"; test ! -L "+quote(releasedDropin)+"; "+
+      "if test -e "+quote(fence)+"; then test ! -e "+quote(releasedFence)+"; "+exactFence(fence)+"else "+exactFence(releasedFence)+"fi; "+
+      "if test -e "+quote(dropin)+"; then test ! -e "+quote(releasedDropin)+"; "+exactDropin(dropin)+"else "+exactDropin(releasedDropin)+"fi; ";
+  const auto fullyActive = "test -e "+quote(fence)+" && test -e "+quote(dropin)+"; "+
+      runtimeStartupFencePredicate(operationRoot,bindingSHA,dropinDirectory,inhibitAutomaticRestart)+
+      "test ! -e "+quote(releasedFence)+"; test ! -e "+quote(releasedDropin)+"; ";
+  const auto moveRemaining = "if test -e "+quote(dropin)+"; then mv -T "+quote(dropin)+" "+quote(releasedDropin)+"; sync -f "+quote(operationRoot)+"; fi; "+
+      "if test -e "+quote(fence)+"; then mv -T "+quote(fence)+" "+quote(releasedFence)+"; sync -f "+quote(operationRoot)+"; fi; "+
+      "systemctl daemon-reload; "+released;
+  return "test \"$(stat -c '%d' "+quote(operationRoot)+")\" = \"$(stat -c '%d' "+quote(dropinDirectory)+")\"; "+
+      itemForms+"if test -e "+quote(fence)+" && test -e "+quote(dropin)+"; then "+fullyActive+"fi; "+moveRemaining;
 }
 
 inline std::string remoteRecoveryMarkerPredicate(const std::string& path,const std::string& bindingSHA) {
