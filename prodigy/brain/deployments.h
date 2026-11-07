@@ -5657,20 +5657,6 @@ private:
       return;
     }
 
-    const auto generationAdmission = brain->prepareStatefulStoreGenerationLaunch(machine, deferred.bootstrap);
-    if (generationAdmission == BrainBase::StatefulServingLaunchAdmission::pending)
-    {
-      deferred.waitingForServingAuthority = true;
-      deferDurableContainerSpinForPersistence(std::move(deferred));
-      return;
-    }
-    if (generationAdmission == BrainBase::StatefulServingLaunchAdmission::rejected)
-    {
-      failDurableContainerSpinPersistence(brain, deferred, launchContainer,
-          "stateful store generation launch is not admitted by serving authority"_ctv);
-      return;
-    }
-
     // A capacity miss has no side effects.  Preserve the scheduled owner and
     // retry it from the deployment's existing Ring dispatcher after the
     // current ArtifactIO completion has released its lease.  A rejected
@@ -5715,22 +5701,6 @@ private:
             // is a failed durable receipt, even when another request happens
             // to fill the shared writer by the time it returns.
             failDurableContainerSpinPersistence(brain, deferred, container);
-            return;
-          }
-          // Persistence yields to the Ring. Re-project the current generation
-          // before retiring a predecessor or dispatching this delayed launch.
-          const auto generationAdmission = brain->prepareStatefulStoreGenerationLaunch(
-              deferred.machine, deferred.bootstrap);
-          if (generationAdmission == BrainBase::StatefulServingLaunchAdmission::pending)
-          {
-            deferred.waitingForServingAuthority = true;
-            deferDurableContainerSpinForPersistence(std::move(deferred));
-            return;
-          }
-          if (generationAdmission == BrainBase::StatefulServingLaunchAdmission::rejected)
-          {
-            failDurableContainerSpinPersistence(brain, deferred, container,
-                "stateful store generation changed before durable launch"_ctv);
             return;
           }
           if (deferred.replaceContainerUUID != 0)
@@ -10036,7 +10006,7 @@ public:
       }
     }
 
-    uint64_t reportBytes = std::min<uint64_t>(report.size(), ProdigyStatefulStoreBootFailureReportMaximumBytes);
+    uint64_t reportBytes = std::min<uint64_t>(report.size(), 256);
 
     bool failedBeforeDeployHealthy = false;
     if (container->deploymentID == plan.config.deploymentID())

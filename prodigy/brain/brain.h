@@ -1441,17 +1441,6 @@ public:
     ProdigyCousinSessionRecord record = {};
     uint128_t sourceMachineUUID = 0;
     uint128_t destinationMachineUUID = 0;
-    uint64_t destinationIOGeneration = 0;
-    uint32_t destinationCrashCount = 0;
-    // A native receipt is usable only after the target has acknowledged this
-    // exact two-half lease.  Keep the previous acknowledgement while a
-    // renewal is in flight so a transient renewal cannot manufacture a proof
-    // gap or extend an expired lease.
-    int64_t pendingNativeLeaseExpiresAtMilliseconds = 0;
-    uint64_t acknowledgedNativeLeaseGeneration = 0;
-    int64_t acknowledgedNativeLeaseExpiresAtMs = 0;
-    CousinRouteHalf pendingLocalHalf = CousinRouteHalf::source;
-    bool nativeRepairRenewing = false;
     uint64_t carrierIOGeneration = 0;
     uint64_t applicationIOGeneration = 0;
     uint32_t applicationCrashCount = 0;
@@ -1496,7 +1485,6 @@ public:
     uint128_t neuronMachineUUID = 0;
     uint64_t neuronIOGeneration = 0;
     uint64_t authorityEpoch = 0;
-    uint32_t crashCount = 0;
   };
   Vector<StatefulStoreReceiptCache> statefulStoreReceiptCaches = {};
   class StatefulStoreSeedAuthorityCache {
@@ -2512,7 +2500,6 @@ public:
     uint64_t authorityEpoch = 0;
     uint32_t crashCount = 0;
     bool releasing = false;
-    int64_t lastRepairSendMs = 0;
   };
   bytell_hash_map<uint128_t, StatefulSourceCutCache> statefulSourceCuts;
 
@@ -2538,7 +2525,6 @@ public:
     uint32_t requiredContainerRetirementJournalVersion = 0;
     uint32_t targetContainerRetirementJournalVersion = 0;
     bool statelessRetirementReaderRequired = false;
-    uint64_t requiredStoreRecoveryReaderVersion = 0;
     uint64_t targetBinaryVersion = 0;
     String admittedTargetContractSHA256 = {};
     bool hasExplicitFollowerConcurrency = false;
@@ -9609,153 +9595,6 @@ public:
     return true;
   }
 
-  bool statefulStoreGenerationPeersCapable(bool requireMemberRepair = false) const
-  {
-    if (!statefulServingPeersCapable()) return false;
-    ClusterTopology topology;
-    if (!loadAuthoritativeClusterTopology(topology)) return false;
-    for (const auto& member : topology.machines) {
-      if (!member.isBrain || clusterMachineMatchesThisBrain(member)) continue;
-      const auto *peer = brainPeerForTopologyMember(member);
-      if (!peer || peer->version < ProdigyStatefulStoreGenerationMinimumVersion ||
-          !peer->statefulStoreGenerationCapabilityAcknowledged ||
-          (requireMemberRepair && (peer->version < ProdigyNativeMemberRepairMinimumVersion ||
-                                   !peer->nativeMemberRepairCapabilityAcknowledged))) return false;
-    }
-    return true;
-  }
-
-  uint64_t requiredStoreRecoveryReaderVersion() const
-  {
-    if (!masterAuthorityRuntimeState.statefulServingMemberRepairs.empty() ||
-        std::any_of(masterAuthorityRuntimeState.statefulStoreGenerationSelections.begin(),
-                    masterAuthorityRuntimeState.statefulStoreGenerationSelections.end(), [](const auto& selected) {
-          return selected.authority.sourceClusterUUID == selected.authority.targetClusterUUID;
-        })) return ProdigyNativeMemberRepairMinimumVersion;
-    return masterAuthorityRuntimeState.statefulStoreGenerationSelections.empty() ? 0 :
-        ProdigyStatefulStoreGenerationMinimumVersion;
-  }
-
-  StatefulServingLaunchAdmission prepareStatefulStoreGenerationLaunch(
-      const Machine *machine, String& encodedBootstrap) const override
-  {
-    NeuronContainerBootstrap bootstrap = {};
-    if (!BitseryEngine::deserializeSafe(encodedBootstrap, bootstrap))
-    {
-      bootstrap = {};
-      if (!BitseryEngine::deserializeSafe(encodedBootstrap, bootstrap.plan))
-        return StatefulServingLaunchAdmission::rejected;
-    }
-
-    ProdigyStatefulStoreGenerationSelection selected = {.protocolVersion = 0};
-    if (!prodigyProjectStatefulStoreGeneration(masterAuthorityRuntimeState,
-          statefulServingRuntimeStates, bootstrap.plan, selected))
-      return StatefulServingLaunchAdmission::rejected;
-    if (selected.protocolVersion == 0)
-    {
-      // A captured selected home cannot become the legacy home because its
-      // authority record is missing during replay or recovery.
-      return bootstrap.statefulStoreGenerationSelection.protocolVersion == 0
-          ? StatefulServingLaunchAdmission::ready : StatefulServingLaunchAdmission::rejected;
-    }
-    if (!weAreMaster || machine == nullptr ||
-        selected.authority.targetClusterUUID != brainConfig.clusterUUID)
-      return StatefulServingLaunchAdmission::rejected;
-
-    const auto sealed = std::find_if(statefulServingRuntimeStates.begin(), statefulServingRuntimeStates.end(),
-        [&](const auto& state) { return state.plan.uuid == bootstrap.plan.uuid; });
-    if (sealed == statefulServingRuntimeStates.end() || sealed->machineUUID != machine->uuid)
-      return StatefulServingLaunchAdmission::rejected;
-    // Inventory recovery needs this exact durable projection to restore its
-    // processes. Waiting for that inventory here would prevent its own replay.
-    // New placement admission remains in prepareStatefulServingLaunch.
-    if (!masterAuthorityRuntimeStateDurable ||
-        durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation ||
-        !statefulStoreGenerationPeersCapable(selected.authority.sourceClusterUUID == selected.authority.targetClusterUUID) ||
-        !containerRetirementAuthorityAcknowledged() || !statefulServingResourceObservationSupported(machine))
-      return StatefulServingLaunchAdmission::pending;
-
-    bootstrap.statefulStoreGenerationSelection = std::move(selected);
-    String projected = {};
-    if (!BitseryEngine::serialize(projected, bootstrap))
-      return StatefulServingLaunchAdmission::rejected;
-    encodedBootstrap = std::move(projected);
-    return StatefulServingLaunchAdmission::ready;
-  }
-
-  bool nativeRepairLivePlanMatches(ContainerView *member, const BrainReplicatedContainerRuntimeState& sealed) const
-  {
-    BrainReplicatedContainerRuntimeState live = {};
-    return member && captureReplicatedContainerRuntimeState(member, live) && live.machineUUID == sealed.machineUUID &&
-        prodigyStatefulServingImmutablePlanMatches(sealed, live.plan);
-  }
-
-  // Accept a diagnostic only from the current owner of the failed home.
-  // Retries of that home share one durable request, even across master
-  // election. The selected generation acquires authority only after the
-  // native donor returns a verifiable cut.
-  void acceptNativeMemberRepair(NeuronView *neuron, ApplicationDeployment *deployment,
-                                ContainerView *target, const String& report)
-  {
-    if (!weAreMaster || !deployment || !target || !target->machine || !target->isStateful ||
-        target->lifetime != ApplicationLifetime::base || target->plannedWork ||
-        target->state != ContainerState::crashedRestarting || target->runtimeReady ||
-        !deployment->plan.isStateful || deployment->plan.config.deploymentID() != target->deploymentID ||
-        (deployment->plan.config.applicationID != 3 && deployment->plan.config.applicationID != 4) ||
-        !containerRetirementNeuronAuthorized(neuron, target->machine->uuid) ||
-        !statefulServingResourceObservationSupported(target->machine)) return;
-    ProdigyStatefulStoreBootFailure failure;
-    String human;
-    target->nativeBootFailure = {.protocolVersion = 0};
-    if (!prodigyStatefulStoreBootFailureDecodeReport(report, failure, human)) return;
-    target->nativeBootFailure = failure;
-    target->nativeFailureStreamGeneration = neuron->ioGeneration;
-    target->nativeFailureAuthorityEpoch = masterAuthorityEpoch;
-    target->nativeFailureCrashCount = target->nCrashes;
-    using Kind = ProdigyStatefulStoreBootFailureKind;
-    // An I/O or permission error cannot establish that a store needs seeding.
-    // Local restart and storage reconciliation own those errors.
-    if (failure.kind != Kind::missingMetadata && failure.kind != Kind::malformedMetadata &&
-        failure.kind != Kind::unverifiedStore && failure.kind != Kind::interruptedInitialization) return;
-    if (!masterAuthorityRuntimeStateDurable || masterAuthorityPersistencePending != 0 ||
-        durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation ||
-        !statefulServingRecoveryReady() || !statefulStoreGenerationPeersCapable(true) ||
-        !containerRetirementAuthorityAcknowledged() ||
-        containerRuntimeStateRetired(masterAuthorityRuntimeState, target->uuid)) return;
-    const auto selected = std::find_if(masterAuthorityRuntimeState.statefulStoreGenerationSelections.begin(),
-        masterAuthorityRuntimeState.statefulStoreGenerationSelections.end(),
-        [&](const auto& current) { return current.authority.targetContainerUUID == target->uuid; });
-    if (failure.generationUUID != (selected == masterAuthorityRuntimeState.statefulStoreGenerationSelections.end()
-            ? uint128_t(0) : selected->generationUUID)) return;
-    auto& requests = masterAuthorityRuntimeState.statefulServingMemberRepairs;
-    auto position = std::lower_bound(requests.begin(), requests.end(), target->uuid,
-        [](const auto& current, uint128_t uuid) { return current.targetContainerUUID < uuid; });
-    const bool replacingExpiredPartial = position != requests.end() && position->targetContainerUUID == target->uuid;
-    if (replacingExpiredPartial &&
-        (selected == masterAuthorityRuntimeState.statefulStoreGenerationSelections.end() ||
-         selected->authority.operationUUID != position->operationUUID || position->failure.generationUUID == failure.generationUUID ||
-         failure.kind != Kind::interruptedInitialization || failure.stage != ProdigyStatefulStoreBootFailureStage::checkpoint ||
-         failure.systemErrno != ESTALE || selected->authority.retainUntilMilliseconds > uint64_t(Time::now<TimeResolution::ms>()))) return;
-    if ((!replacingExpiredPartial && requests.size() >= 4096) || masterAuthorityRuntimeState.generation >= UINT64_MAX - 1) return;
-    const ProdigyStatefulServingAuthority *scope = nullptr;
-    ProdigyStatefulServingMemberRepair request = {};
-    const auto *sealed = prodigyStatefulServingRepairMember(masterAuthorityRuntimeState, statefulServingRuntimeStates,
-        target->deploymentID, target->shardGroup, target->uuid, target->machine->uuid, scope, request.targetPlanSHA256);
-    if (!sealed || !nativeRepairLivePlanMatches(target, *sealed)) return;
-    if (RAND_priv_bytes(reinterpret_cast<unsigned char *>(&request.operationUUID), sizeof(request.operationUUID)) != 1 ||
-        request.operationUUID == 0) return;
-    request.deploymentID = target->deploymentID;
-    request.shardGroup = target->shardGroup;
-    request.targetContainerUUID = target->uuid;
-    request.targetMachineUUID = target->machine->uuid;
-    request.servingRevision = scope->revision;
-    request.failure = failure;
-    if (!prodigyStatefulServingMemberRepairValid(request)) return;
-    if (replacingExpiredPartial) *position = std::move(request);
-    else requests.insert(position, std::move(request));
-    commitMasterAuthorityStateChangeAsync({});
-  }
-
   bool allMastersSeedBootstrapPeersCapable() const
   {
     if (!statefulServingPeersCapable()) return false;
@@ -10147,305 +9986,6 @@ public:
     Message::construct(container->machine->neuron.wBuffer, NeuronTopic::statefulStoreSourceCut, container->uuid, encoded);
     Ring::queueSend(&container->machine->neuron);
     return response;
-  }
-
-  bool nativeRepairFailureStillCurrent(const ProdigyStatefulServingMemberRepair& request,
-                                     const ContainerView *target) const
-  {
-    return target && target->machine && target->machine->uuid == request.targetMachineUUID &&
-        !target->plannedWork && target->state == ContainerState::crashedRestarting && !target->runtimeReady &&
-        target->deploymentID == request.deploymentID && target->shardGroup == request.shardGroup &&
-        target->nativeFailureStreamGeneration == target->machine->neuron.ioGeneration &&
-        target->nativeFailureAuthorityEpoch == masterAuthorityEpoch && target->nativeFailureCrashCount == target->nCrashes &&
-        target->nativeBootFailure == request.failure && statefulServingResourceObservationSupported(target->machine) &&
-        !containerRuntimeStateRetired(masterAuthorityRuntimeState, target->uuid);
-  }
-
-  // Choose one healthy authoritative donor. Its verified native receipt
-  // supplies the fixture and baseline lineage. A plan digest is never a
-  // substitute for either. Waiting for a donor does not pin a snapshot.
-  bool prepareNativeRepairChallenge(ProdigyStatefulServingMemberRepair& request,
-                                    const ProdigyStatefulServingAuthority& scope,
-                                    const BrainReplicatedContainerRuntimeState& target, uint128_t excludeDonor = 0)
-  {
-    for (const auto& member : scope.members)
-    {
-      if (member.containerUUID == excludeDonor || member.containerUUID == request.targetContainerUUID || member.machineUUID == request.targetMachineUUID ||
-          member.shardGroup != request.shardGroup) continue;
-      auto live = containers.find(member.containerUUID);
-      if (live == containers.end() || !live->second || !live->second->machine ||
-          live->second->machine->uuid != member.machineUUID) continue;
-      auto& peer = live->second->machine->neuron;
-      if (!containerRetirementNeuronAuthorized(&peer, member.machineUUID)) continue;
-      auto proof = std::find_if(statefulStoreReceiptCaches.begin(), statefulStoreReceiptCaches.end(), [&](const auto& cached) {
-        const auto& value = cached.receipt;
-        return cached.authorityEpoch == masterAuthorityEpoch && cached.neuronIOGeneration == peer.ioGeneration &&
-            cached.neuronMachineUUID == member.machineUUID && cached.crashCount == live->second->nCrashes && value.localContainerUUID == member.containerUUID &&
-            value.localClusterUUID == brainConfig.clusterUUID && value.deploymentID == request.deploymentID &&
-            value.shardGroup == request.shardGroup && value.nShardGroups == target.plan.nShardGroups &&
-            value.protocolVersion == ProdigyStatefulStoreReceipt::sourceCutVersion &&
-            value.state == ProdigyStatefulStoreReceiptState::active && value.cutMaterialized &&
-            value.committedHeadsDominateCut && prodigyStatefulStoreReceiptValid(value);
-      });
-      if (proof == statefulStoreReceiptCaches.end()) continue;
-      const auto now = Time::now<TimeResolution::ms>();
-      const auto& repairs = masterAuthorityRuntimeState.statefulServingMemberRepairs;
-      if (std::any_of(repairs.begin(), repairs.end(), [&](const auto& other) {
-            return other.operationUUID != request.operationUUID && other.challenge.protocolVersion &&
-                other.challenge.sourceContainerUUID == member.containerUUID && other.challenge.retainUntilMilliseconds > now;
-          })) continue;
-      auto busy = statefulSourceCuts.find(member.containerUUID);
-      if (busy != statefulSourceCuts.end() && !busy->second.releaseReceipt.released &&
-          busy->second.challenge.retainUntilMilliseconds > now) continue;
-      ProdigyStatefulStoreSourceCut cut = {};
-      cut.applicationID = uint16_t(request.deploymentID >> 48);
-      cut.sourceClusterUUID = brainConfig.clusterUUID;
-      cut.sourceDeploymentID = request.deploymentID;
-      cut.sourceContainerUUID = member.containerUUID;
-      cut.storeKind = DeploymentIdentityStoreKind::kv;
-      cut.nShardGroups = target.plan.nShardGroups;
-      cut.shardGroup = request.shardGroup;
-      cut.operationUUID = request.operationUUID;
-      cut.retainUntilMilliseconds = now + 60 * 60 * 1000;
-      ContainerView *donor = nullptr;
-      String observedPlan;
-      if (!statefulSourceCutIncarnation(cut, donor, observedPlan) || donor != live->second) continue;
-      const ProdigyStatefulServingAuthority *donorScope = nullptr;
-      String donorDigest;
-      const auto *sealed = prodigyStatefulServingRepairMember(masterAuthorityRuntimeState, statefulServingRuntimeStates,
-          request.deploymentID, request.shardGroup, member.containerUUID, member.machineUUID, donorScope, donorDigest);
-      if (!sealed || donorScope != &scope || !nativeRepairLivePlanMatches(donor, *sealed)) continue;
-      if (RAND_priv_bytes(reinterpret_cast<unsigned char *>(&cut.requestUUID), sizeof(cut.requestUUID)) != 1 ||
-          RAND_priv_bytes(reinterpret_cast<unsigned char *>(&cut.memberRequestUUID), sizeof(cut.memberRequestUUID)) != 1 ||
-          !cut.requestUUID || !cut.memberRequestUUID) return false;
-      request.challenge = std::move(cut);
-      request.donorMachineUUID = member.machineUUID;
-      request.donorPlanSHA256 = std::move(donorDigest);
-      request.fixtureSHA256 = proof->receipt.seedFixtureSHA256;
-      request.sourceBaselineOperationUUID = proof->receipt.sourceBaselineOperationUUID;
-      commitMasterAuthorityStateChangeAsync({});
-      return true;
-    }
-    return false;
-  }
-
-  // The desired generation survives master failover. Ask the donor whether it
-  // still holds that exact snapshot; a query cannot create or repin a cut.
-  void recoverSelectedNativeRepairCut(const ProdigyStatefulServingMemberRepair& request,
-                                      const ProdigyStatefulStoreSeedAuthority& authority)
-  {
-    const auto& challenge = request.challenge;
-    const auto now = Time::now<TimeResolution::ms>();
-    if (!challenge.protocolVersion || challenge.retainUntilMilliseconds <= now ||
-        challenge.requestUUID != authority.sourceRequestUUID || challenge.memberRequestUUID != authority.sourceMemberRequestUUID ||
-        challenge.operationUUID != authority.operationUUID || challenge.sourceContainerUUID != authority.sourceContainerUUID) return;
-    ContainerView *donor = nullptr;
-    String incarnation;
-    if (!statefulSourceCutIncarnation(challenge, donor, incarnation) ||
-        !containerRetirementNeuronAuthorized(&donor->machine->neuron, request.donorMachineUUID)) return;
-    const ProdigyStatefulServingAuthority *scope = nullptr;
-    String digest;
-    const auto *sealed = prodigyStatefulServingRepairMember(masterAuthorityRuntimeState, statefulServingRuntimeStates,
-        request.deploymentID, request.shardGroup, challenge.sourceContainerUUID, request.donorMachineUUID, scope, digest);
-    if (!sealed || digest != request.donorPlanSHA256 || !nativeRepairLivePlanMatches(donor, *sealed)) return;
-
-    auto found = statefulSourceCuts.find(challenge.sourceContainerUUID);
-    if (found != statefulSourceCuts.end())
-    {
-      auto& prior = found->second;
-      if (prior.challenge != challenge && prior.challenge.retainUntilMilliseconds > now && !prior.releaseReceipt.released) return;
-      if (prior.challenge == challenge && prior.ioGeneration == donor->machine->neuron.ioGeneration &&
-          prior.authorityEpoch == masterAuthorityEpoch && prior.crashCount == donor->nCrashes && prior.planSHA256 == incarnation)
-      {
-        if (prior.receipt.ready || prior.releasing || prior.releaseReceipt.released ||
-            (prior.lastRepairSendMs && now - prior.lastRepairSendMs < 1000)) return;
-      }
-    }
-    StatefulSourceCutCache restored = {};
-    restored.challenge = restored.outstanding = challenge;
-    restored.outstanding.action = ProdigyStatefulStoreSourceCutAction::query;
-    restored.outstanding.cutUUID = authority.cutUUID;
-    restored.outstanding.cutGeneration = authority.cutGeneration;
-    restored.planSHA256 = std::move(incarnation);
-    restored.ioGeneration = donor->machine->neuron.ioGeneration;
-    restored.authorityEpoch = masterAuthorityEpoch;
-    restored.crashCount = donor->nCrashes;
-    restored.lastRepairSendMs = now;
-    String encoded;
-    if (!BitseryEngine::serialize(encoded, restored.outstanding)) return;
-    statefulSourceCuts.insert_or_assign(challenge.sourceContainerUUID, std::move(restored));
-    auto& peer = donor->machine->neuron;
-    Message::construct(peer.wBuffer, NeuronTopic::statefulStoreSourceCut, donor->uuid, encoded);
-    Ring::queueSend(&peer);
-  }
-
-  void driveNativeMemberRepairs()
-  {
-    auto& requests = masterAuthorityRuntimeState.statefulServingMemberRepairs;
-    // Losing a lease must withdraw health even when this master cannot
-    // currently issue replacement authority.
-    if (weAreMaster)
-      for (const auto& home : masterAuthorityRuntimeState.statefulStoreGenerationSelections)
-      {
-        if (home.authority.sourceClusterUUID != brainConfig.clusterUUID || home.authority.targetClusterUUID != brainConfig.clusterUUID) continue;
-        auto member = containers.find(home.authority.targetContainerUUID);
-        if (member != containers.end() && member->second && member->second->state == ContainerState::healthy &&
-            !nativeMemberProofCurrent(*member->second, home)) withdrawNativeMemberHealth(*member->second);
-      }
-    if ((requests.empty() && masterAuthorityRuntimeState.statefulStoreGenerationSelections.empty()) ||
-        !weAreMaster || !masterAuthorityRuntimeStateDurable || masterAuthorityPersistencePending ||
-        durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation ||
-        masterAuthorityRuntimeState.generation >= UINT64_MAX - 1 || !statefulServingRecoveryReady() ||
-        !statefulStoreGenerationPeersCapable(true) || !containerRetirementAuthorityAcknowledged()) return;
-    auto& selections = masterAuthorityRuntimeState.statefulStoreGenerationSelections;
-    for (const auto& home : selections)
-    {
-      if (home.authority.sourceClusterUUID == brainConfig.clusterUUID && home.authority.targetClusterUUID == brainConfig.clusterUUID &&
-          std::none_of(requests.begin(), requests.end(), [&](const auto& request) { return request.targetContainerUUID == home.authority.targetContainerUUID; }))
-        (void)ensureNativeMemberRepairSession(home, ProdigyCohortRepairPurpose::catchup);
-    }
-    for (auto& request : requests)
-    {
-      auto live = containers.find(request.targetContainerUUID);
-      if (live == containers.end() || !live->second) continue;
-      const ProdigyStatefulServingAuthority *scope = nullptr;
-      String digest;
-      const auto *target = prodigyStatefulServingRepairMember(masterAuthorityRuntimeState, statefulServingRuntimeStates,
-          request.deploymentID, request.shardGroup, request.targetContainerUUID, request.targetMachineUUID, scope, digest);
-      if (!target || digest != request.targetPlanSHA256 || scope->revision < request.servingRevision ||
-          !nativeRepairLivePlanMatches(live->second, *target)) continue;
-      auto chosen = std::lower_bound(selections.begin(), selections.end(), request.targetContainerUUID,
-          [](const auto& selection, uint128_t uuid) { return selection.authority.targetContainerUUID < uuid; });
-      const bool hasHome = chosen != selections.end() && chosen->authority.targetContainerUUID == request.targetContainerUUID;
-      if (hasHome && chosen->authority.operationUUID == request.operationUUID)
-      {
-        auto *member = live->second;
-        recoverSelectedNativeRepairCut(request, chosen->authority);
-        if (nativeMemberProofCurrent(*member, *chosen))
-        {
-          // Release the donor through its native owner. A cut that expired on
-          // the donor's own deadline no longer holds a snapshot to release.
-          if (chosen->authority.retainUntilMilliseconds > Time::now<TimeResolution::ms>())
-          {
-            ProdigyStatefulStoreSourceCut release = request.challenge;
-            release.action = ProdigyStatefulStoreSourceCutAction::release;
-            release.cutUUID = chosen->authority.cutUUID; release.cutGeneration = chosen->authority.cutGeneration;
-            const auto result = statefulSourceCutOperation(release);
-            if (!result.released) continue;
-          }
-          std::erase_if(requests, [uuid = request.targetContainerUUID](const auto& entry) { return entry.targetContainerUUID == uuid; });
-          commitMasterAuthorityStateChangeAsync({});
-          return;
-        }
-        if (nativeRepairFailureStillCurrent(request, member))
-        {
-          auto *machine = member->machine;
-          if (!machine->stateUploadRequestPending &&
-              (member->requestedRepairHome != chosen->generationUUID || member->requestedRepairCrash != member->nCrashes ||
-               member->requestedRepairStream != machine->neuron.ioGeneration))
-          {
-            queueNeuronStateUploadForMachine(machine);
-            if (machine->stateUploadRequestPending)
-            {
-              member->requestedRepairHome = chosen->generationUUID;
-              member->requestedRepairCrash = member->nCrashes;
-              member->requestedRepairStream = machine->neuron.ioGeneration;
-            }
-          }
-        }
-        else if (member->state != ContainerState::crashedRestarting)
-        {
-          // A healthy process may already have materialized the retained cut
-          // before this Brain restarted. Offer ordinary catch-up independently
-          // of the old copy lease. Only the native proof can complete repair.
-          (void)ensureNativeMemberRepairSession(*chosen, ProdigyCohortRepairPurpose::catchup);
-          if (chosen->authority.retainUntilMilliseconds > Time::now<TimeResolution::ms>())
-            (void)ensureNativeMemberRepairSession(*chosen, ProdigyCohortRepairPurpose::seed);
-        }
-        continue;
-      }
-      if ((hasHome ? chosen->generationUUID : uint128_t(0)) != request.failure.generationUUID ||
-          !nativeRepairFailureStillCurrent(request, live->second)) continue;
-      if (!request.challenge.protocolVersion)
-      {
-        if (prepareNativeRepairChallenge(request, *scope, *target)) return;
-        continue;
-      }
-      const auto& cut = request.challenge;
-      const auto now = Time::now<TimeResolution::ms>();
-      if (cut.retainUntilMilliseconds <= now)
-      {
-        request.challenge = {.protocolVersion = 0}; request.donorMachineUUID = 0;
-        request.donorPlanSHA256.clear(); request.fixtureSHA256.clear(); request.sourceBaselineOperationUUID = 0;
-        commitMasterAuthorityStateChangeAsync({});
-        return;
-      }
-      const ProdigyStatefulServingAuthority *donorScope = nullptr;
-      String donorDigest;
-      const auto *sealedDonor = prodigyStatefulServingRepairMember(masterAuthorityRuntimeState, statefulServingRuntimeStates,
-          request.deploymentID, request.shardGroup, cut.sourceContainerUUID, request.donorMachineUUID, donorScope, donorDigest);
-      if (!sealedDonor || donorScope != scope || donorDigest != request.donorPlanSHA256) continue;
-      ContainerView *donor = nullptr;
-      String incarnation;
-      if (!statefulSourceCutIncarnation(cut, donor, incarnation) ||
-          !containerRetirementNeuronAuthorized(&donor->machine->neuron, request.donorMachineUUID) ||
-          !nativeRepairLivePlanMatches(donor, *sealedDonor))
-      {
-        // No target bytes have been authorized yet. A different healthy
-        // donor can satisfy this request while the failed donor is offline.
-        if (prepareNativeRepairChallenge(request, *scope, *target, cut.sourceContainerUUID)) return;
-        continue;
-      }
-      auto cached = statefulSourceCuts.find(cut.sourceContainerUUID);
-      if (cached == statefulSourceCuts.end() || cached->second.challenge.retainUntilMilliseconds <= now || cached->second.releaseReceipt.released)
-      {
-        StatefulSourceCutCache prepare;
-        prepare.challenge = cut;
-        prepare.planSHA256 = incarnation; prepare.ioGeneration = donor->machine->neuron.ioGeneration;
-        prepare.authorityEpoch = masterAuthorityEpoch; prepare.crashCount = donor->nCrashes;
-        statefulSourceCuts.insert_or_assign(cut.sourceContainerUUID, std::move(prepare));
-        cached = statefulSourceCuts.find(cut.sourceContainerUUID);
-      }
-      if (cached->second.challenge != cut || cached->second.releasing || cached->second.planSHA256 != incarnation ||
-          cached->second.ioGeneration != donor->machine->neuron.ioGeneration || cached->second.authorityEpoch != masterAuthorityEpoch ||
-          cached->second.crashCount != donor->nCrashes) continue;
-      if (cached->second.lastRepairSendMs && now - cached->second.lastRepairSendMs < 1000 && !cached->second.receipt.ready) continue;
-      cached->second.lastRepairSendMs = now;
-      const auto receipt = statefulSourceCutOperation(cut);
-      if (!receipt.failure.empty())
-      {
-        if (prepareNativeRepairChallenge(request, *scope, *target, cut.sourceContainerUUID)) return;
-        continue;
-      }
-      if (!receipt.ready || !prodigyStatefulStoreSourceCutResponseMatches(cut, receipt)) continue;
-      ProdigyStatefulStoreGenerationSelection next = {};
-      if (RAND_priv_bytes(reinterpret_cast<unsigned char *>(&next.generationUUID), sizeof(next.generationUUID)) != 1 ||
-          next.generationUUID == 0 || next.generationUUID == request.failure.generationUUID) continue;
-      next.admittedPlanSHA256 = digest;
-      next.servingRevision = scope->revision;
-      auto& authority = next.authority;
-      authority.protocolVersion = ProdigyStatefulStoreSeedAuthority::sourceCutVersion;
-      const uint64_t prior = hasHome ? std::max(chosen->authority.authorityGeneration, chosen->authority.seedGeneration) : 0;
-      if (prior == UINT64_MAX) continue;
-      authority.seedGeneration = authority.authorityGeneration = std::max(prior, masterAuthorityRuntimeState.generation) + 1;
-      authority.operationUUID = cut.operationUUID; authority.applicationID = cut.applicationID; authority.storeKind = cut.storeKind;
-      authority.shardGroup = cut.shardGroup; authority.nShardGroups = cut.nShardGroups;
-      authority.targetClusterUUID = authority.sourceClusterUUID = brainConfig.clusterUUID;
-      authority.targetDeploymentID = authority.sourceDeploymentID = request.deploymentID;
-      authority.sourceContainerUUID = cut.sourceContainerUUID; authority.targetContainerUUID = request.targetContainerUUID;
-      authority.fixtureSHA256 = request.fixtureSHA256; authority.sourceBaselineOperationUUID = request.sourceBaselineOperationUUID;
-      authority.sourceRequestUUID = receipt.requestUUID; authority.sourceMemberRequestUUID = receipt.memberRequestUUID;
-      authority.sourceContentWatermarkSHA256 = receipt.contentSHA256; authority.sourceCatchupWatermarkSHA256 = receipt.headsSHA256;
-      authority.cutUUID = receipt.cutUUID; authority.cutGeneration = receipt.cutGeneration;
-      authority.sourceCutScope = receipt.scope; authority.retainUntilMilliseconds = receipt.retainUntilMilliseconds;
-      if (RAND_priv_bytes(reinterpret_cast<unsigned char *>(&authority.seedRouteUUID), sizeof(authority.seedRouteUUID)) != 1 ||
-          !prodigyStatefulStoreGenerationSelectionMatchesPlan(next, target->plan)) continue;
-      if (hasHome) *chosen = std::move(next);
-      else if (selections.size() < 4096) selections.insert(chosen, std::move(next));
-      else continue;
-      commitMasterAuthorityStateChangeAsync({});
-      return;
-    }
   }
 
   StatefulDataAuthorityOperation statefulDataAuthorityPreparationOperation(const StatefulDataAuthorityOperation& request)
@@ -15010,13 +14550,6 @@ public:
                     [](const auto& operation) { return operation.protocolVersion >= ProdigyClusterPairEnrollmentOperation::privateDiscoveryVersion; })))) &&
            (masterAuthorityRuntimeState.statefulServingAuthorities.empty() ||
             (containerRetirementPeerCapabilityCurrent(peer) && peer->statefulServingAuthorityCapabilityAcknowledged)) &&
-           (requiredStoreRecoveryReaderVersion() < ProdigyNativeMemberRepairMinimumVersion ||
-            (containerRetirementPeerCapabilityCurrent(peer) && peer->version >= ProdigyNativeMemberRepairMinimumVersion &&
-             peer->nativeMemberRepairCapabilityAcknowledged)) &&
-           (masterAuthorityRuntimeState.statefulStoreGenerationSelections.empty() ||
-            (containerRetirementPeerCapabilityCurrent(peer) &&
-             peer->version >= ProdigyStatefulStoreGenerationMinimumVersion &&
-             peer->statefulStoreGenerationCapabilityAcknowledged)) &&
            (std::none_of(masterAuthorityRuntimeState.statefulServingAuthorities.begin(), masterAuthorityRuntimeState.statefulServingAuthorities.end(),
               [](const auto& authority) { return authority.phase == StatefulWorkerTopologyUpgradePhase::allMastersSeedBootstrap; }) ||
             (containerRetirementPeerCapabilityCurrent(peer) && peer->allMastersSeedBootstrapCapabilityAcknowledged)) &&
@@ -15376,7 +14909,6 @@ public:
 
   void applyContainerRuntimePlanToView(ContainerView *container, Machine *machine, ApplicationDeployment *deployment, ContainerPlan& plan)
   {
-    const bool holdClient = nativeMemberInventoryHoldsClient(*container, plan, machine);
     container->subscriptions.clear();
     container->advertisements.clear();
     container->advertisingOnPorts.clear();
@@ -15385,7 +14917,7 @@ public:
     container->deploymentID = plan.config.deploymentID();
     container->applicationID = plan.config.applicationID;
     container->lifetime = plan.lifetime;
-    container->state = holdClient && plan.state == ContainerState::healthy ? ContainerState::scheduled : plan.state;
+    container->state = plan.state;
     container->runtimeReady = plan.runtimeReady;
     container->declaredStatefulClientService = plan.declaredStatefulClientService;
     container->declaredStatefulClientPort = plan.declaredStatefulClientPort;
@@ -15431,7 +14963,6 @@ public:
 
       for (const auto& [service, advertisement] : container->advertisements)
       {
-        if (holdClient && service == plan.statefulMeshRoles.client) continue;
         mesh->logAdvertisement(container,
                                advertisement.service,
                                recoveringPersistedNeuronInventory);
@@ -15442,7 +14973,6 @@ public:
       {
         for (const AdvertisementPairing& pairing : pairings)
         {
-          if (holdClient && pairing.service == plan.statefulMeshRoles.client) continue;
           mesh->logAdvertisementPairing(pairing.secret, container, pairing);
           container->remainingSubscriberCapacity -= 1;
         }
@@ -23549,7 +23079,6 @@ public:
     driveTransportCredentialEnrollmentOperations();
     driveClusterPairEnrollmentOperations();
     driveCousinDiscoverySnapshots();
-    driveNativeMemberRepairs();
     driveCousinSessions();
     resumeStatefulTopologyRetirements();
     for (BrainView *peer : brains)
@@ -25070,20 +24599,6 @@ public:
     {
       if (bootstraps != &liveBootstraps) liveBootstraps = *bootstraps;
       bootstraps = &liveBootstraps;
-      for (String& encoded : liveBootstraps)
-      {
-        const auto admission = prepareStatefulStoreGenerationLaunch(machine, encoded);
-        if (admission != StatefulServingLaunchAdmission::ready)
-        {
-          bootstraps = nullptr;
-          bootstrapSource = "generation-projection-withheld";
-          if (admission == StatefulServingLaunchAdmission::pending)
-            bootstrapFailure.assign("stateful store generation is awaiting current authority or machine capability"_ctv);
-          else
-            bootstrapFailure.assign("stateful store generation does not match the authoritative launch"_ctv);
-          break;
-        }
-      }
     }
 
     // Read the last accepted inventory before invalidating it for this new
@@ -29095,11 +28610,6 @@ public:
     if (auto it = containers.find(containerUUID); it != containers.end())
     {
       ContainerView *container = it->second;
-      if (const auto *home = nativeRepairSelection(containerUUID))
-      {
-        container->nativeRepairHealthyObserved = true;
-        if (!nativeMemberProofCurrent(*container, *home)) return;
-      }
       const bool restoredInventoryProgress =
           noteRestoredContainerInventoryReplayProgress(containerUUID, container->machine);
       ApplicationDeployment *deployment = nullptr;
@@ -29129,13 +28639,6 @@ public:
         const bool recoveringDeployment = deployment->plan.config.type != ApplicationType::task &&
                                           deployment->state == DeploymentState::none;
         deployment->containerIsHealthy(container);
-        if (mesh && container->verifiedRepairHome && container->state == ContainerState::healthy)
-        {
-          const auto client = container->explicitStatefulMeshRoles.client;
-          auto entry = container->advertisements.find(client);
-          if (client && entry != container->advertisements.end() && serviceBlueprintActiveAtContainerState(entry->second, container->state))
-            mesh->advertise(client, container, entry->second.port, true);
-        }
         (void)advanceTlsResumptionLifecycleForDeployment(deployment->plan, Time::now<TimeResolution::ms>(), false);
         replicateContainerRuntimeStateToFollowers(container);
         PRODIGY_DEBUG_LOG(
@@ -40373,24 +39876,6 @@ public:
                               String& context) const
   {
     OPENSSL_cleanse(key.data(), key.size()); context.clear();
-    if (prodigyCousinNativeRepairSession(record)) {
-      const auto& root = masterAuthorityRuntimeState.transportCredentialAuthorityRoot;
-      const auto target = std::find_if(masterAuthorityRuntimeState.transportCredentialEnrollments.begin(), masterAuthorityRuntimeState.transportCredentialEnrollments.end(), [&](const auto& value) {
-        return value.nodeUUID == record.repairTarget.nodeUUID && value.clusterUUID == record.repairAuthority.targetClusterUUID &&
-            value.role == ProdigyTransportCredentialNodeRole::neuron && value.state == ProdigyTransportCredentialEnrollmentState::active;
-      });
-      const auto donor = std::find_if(masterAuthorityRuntimeState.transportCredentialEnrollments.begin(), masterAuthorityRuntimeState.transportCredentialEnrollments.end(), [&](const auto& value) {
-        return value.nodeUUID == record.repairDonor.nodeUUID && value.clusterUUID == record.repairAuthority.sourceClusterUUID &&
-            value.role == ProdigyTransportCredentialNodeRole::neuron && value.state == ProdigyTransportCredentialEnrollmentState::active;
-      });
-      if (!root.valid() || target == masterAuthorityRuntimeState.transportCredentialEnrollments.end() ||
-          donor == masterAuthorityRuntimeState.transportCredentialEnrollments.end()) return false;
-      ProdigyTransportNodeCredential credential = {};
-      const bool ok = prodigyDeriveTransportNodeCredential(root, *target, credential) &&
-          prodigyCousinSessionDigest(record, context) && prodigyDeriveNativeStatefulRepairPSK(credential,
-              donor->operationUUID, donor->nodeUUID, donor->role, context, key.data());
-      OPENSSL_cleanse(credential.secret, sizeof(credential.secret)); return ok;
-    }
     const auto enrollment = std::find_if(masterAuthorityRuntimeState.clusterPairEnrollments.begin(),
         masterAuthorityRuntimeState.clusterPairEnrollments.end(), [&](const auto& value) {
           return value.pairUUID == record.sourcePermission.pairUUID && value.state == ProdigyClusterPairEnrollmentState::active &&
@@ -40410,196 +39895,8 @@ public:
     return ok;
   }
 
-  // Same-cohort repair remains one bounded cousinSessions lease.  Unlike an
-  // ordinary route, both local halves are commanded by this Brain: donor
-  // install first, then target activation after its exact ACK.
-  bool nativeSeedCutCurrent(const ProdigyStatefulStoreSeedAuthority& authority, ContainerView *expectedDonor)
-  {
-    const auto found = statefulSourceCuts.find(authority.sourceContainerUUID);
-    if (found == statefulSourceCuts.end()) return false;
-    const auto& cache = found->second;
-    const auto& challenge = cache.challenge;
-    const auto& receipt = cache.receipt;
-    auto expected = challenge;
-    if (receipt.action == ProdigyStatefulStoreSourceCutAction::query) {
-      expected.action = ProdigyStatefulStoreSourceCutAction::query;
-      expected.cutUUID = authority.cutUUID;
-      expected.cutGeneration = authority.cutGeneration;
-    }
-    ContainerView *incarnated = nullptr;
-    String incarnation = {};
-    return expectedDonor != nullptr && statefulSourceCutIncarnation(challenge, incarnated, incarnation) &&
-        incarnated == expectedDonor && cache.planSHA256 == incarnation &&
-        cache.ioGeneration == expectedDonor->machine->neuron.ioGeneration && cache.crashCount == expectedDonor->nCrashes &&
-        cache.authorityEpoch == masterAuthorityEpoch && !cache.releasing && !cache.releaseReceipt.released &&
-        authority.retainUntilMilliseconds > uint64_t(Time::now<TimeResolution::ms>()) &&
-        challenge.operationUUID == authority.operationUUID && challenge.sourceClusterUUID == authority.sourceClusterUUID &&
-        challenge.sourceDeploymentID == authority.sourceDeploymentID && challenge.sourceContainerUUID == authority.sourceContainerUUID &&
-        challenge.applicationID == authority.applicationID && challenge.storeKind == authority.storeKind &&
-        challenge.shardGroup == authority.shardGroup && challenge.nShardGroups == authority.nShardGroups &&
-        challenge.scope == authority.sourceCutScope && challenge.retainUntilMilliseconds == authority.retainUntilMilliseconds &&
-        receipt.response && receipt.ready && !receipt.released && prodigyStatefulStoreSourceCutResponseMatches(expected, receipt) &&
-        receipt.requestUUID == authority.sourceRequestUUID && receipt.memberRequestUUID == authority.sourceMemberRequestUUID &&
-        receipt.cutUUID == authority.cutUUID && receipt.cutGeneration == authority.cutGeneration &&
-        receipt.contentSHA256 == authority.sourceContentWatermarkSHA256 && receipt.headsSHA256 == authority.sourceCatchupWatermarkSHA256;
-  }
-
-  bool ensureNativeMemberRepairSession(const ProdigyStatefulStoreGenerationSelection& selection,
-                                       ProdigyCohortRepairPurpose purpose)
-  {
-    if (!weAreMaster || !masterAuthorityRuntimeStateDurable || masterAuthorityPersistencePending ||
-        durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation ||
-        !statefulServingRecoveryReady() || !statefulStoreGenerationPeersCapable(true) ||
-        !containerRetirementAuthorityAcknowledged() || !prodigyStatefulStoreGenerationSelectionValid(selection) ||
-        selection.authority.targetClusterUUID != brainConfig.clusterUUID) return false;
-    const auto& authority = selection.authority;
-    const auto *current = nativeRepairSelection(authority.targetContainerUUID);
-    if (!current || !prodigyStatefulStoreGenerationSelectionsEqual(*current, selection)) return false;
-    for (const auto& session : cousinSessions) {
-      if (prodigyCousinNativeRepairSession(session.record) && session.record.repairTarget.containerUUID == authority.targetContainerUUID &&
-          session.record.repairGenerationUUID == selection.generationUUID && session.record.repairPurpose == purpose &&
-          cousinSessionLocalCurrent(session)) return true;
-    }
-    if (cousinSessions.size() >= ProdigyCousinSessionMaximumRecords) return false;
-    auto target = containers.find(authority.targetContainerUUID);
-    if (target == containers.end() || !target->second || !target->second->machine) return false;
-    const ProdigyStatefulServingAuthority *scope = nullptr;
-    String targetDigest = {};
-    const auto *targetSealed = prodigyStatefulServingRepairMember(masterAuthorityRuntimeState, statefulServingRuntimeStates,
-            authority.targetDeploymentID, authority.shardGroup, target->second->uuid, target->second->machine->uuid,
-            scope, targetDigest);
-    if (!targetSealed || !scope || targetDigest != selection.admittedPlanSHA256 ||
-        !nativeRepairLivePlanMatches(target->second, *targetSealed)) return false;
-    auto targetDeployment = deployments.find(target->second->deploymentID);
-    if (targetDeployment == deployments.end() || !targetDeployment->second ||
-        target->second->shardGroup != authority.shardGroup || targetDeployment->second->nShardGroups != authority.nShardGroups) return false;
-    const uint64_t targetService = purpose == ProdigyCohortRepairPurpose::seed ?
-        target->second->effectiveStatefulMeshRoles(targetDeployment->second->plan).seeding :
-        target->second->effectiveStatefulMeshRoles(targetDeployment->second->plan).sibling;
-    if (targetService == 0 || !target->second->subscriptions.contains(targetService)) return false;
-    ContainerView *donorView = nullptr;
-    uint16_t donorPort = 0;
-    for (const auto& member : scope->members) {
-      if (member.containerUUID == target->second->uuid || member.shardGroup != authority.shardGroup ||
-          (purpose == ProdigyCohortRepairPurpose::seed && member.containerUUID != authority.sourceContainerUUID)) continue;
-      auto donor = containers.find(member.containerUUID);
-      if (donor == containers.end() || !donor->second || !donor->second->machine ||
-          donor->second->machine == target->second->machine || donor->second->machine->uuid != member.machineUUID ||
-          donor->second->state != ContainerState::healthy || !donor->second->runtimeReady) continue;
-      const ProdigyStatefulServingAuthority *donorScope = nullptr;
-      String donorDigest = {};
-      const auto *donorSealed = prodigyStatefulServingRepairMember(masterAuthorityRuntimeState, statefulServingRuntimeStates,
-              authority.targetDeploymentID, authority.shardGroup, donor->second->uuid, donor->second->machine->uuid,
-              donorScope, donorDigest);
-      if (!donorSealed || donorScope != scope || donorDigest != member.planSHA256 ||
-          !nativeRepairLivePlanMatches(donor->second, *donorSealed)) continue;
-      auto donorDeployment = deployments.find(donor->second->deploymentID);
-      if (donorDeployment == deployments.end() || !donorDeployment->second || donor->second->shardGroup != authority.shardGroup ||
-          donorDeployment->second->nShardGroups != authority.nShardGroups) continue;
-      const uint64_t donorService = purpose == ProdigyCohortRepairPurpose::seed ?
-          donor->second->effectiveStatefulMeshRoles(donorDeployment->second->plan).seeding :
-          donor->second->effectiveStatefulMeshRoles(donorDeployment->second->plan).sibling;
-      auto advertisement = donor->second->advertisements.find(donorService);
-      if (donorService != targetService || advertisement == donor->second->advertisements.end() || advertisement->second.port == 0 ||
-          !serviceBlueprintActiveAtContainerState(advertisement->second, donor->second->state)) continue;
-      donorView = donor->second; donorPort = advertisement->second.port; break;
-    }
-    if (!donorView) return false;
-    if (purpose == ProdigyCohortRepairPurpose::seed && !nativeSeedCutCurrent(authority, donorView)) return false;
-    CousinSessionState state = {}; auto& record = state.record;
-    record.protocolVersion = ProdigyCousinSessionNativeRepairProtocolVersion;
-    if (RAND_priv_bytes(reinterpret_cast<unsigned char *>(&record.sessionUUID), sizeof(record.sessionUUID)) != 1 ||
-        RAND_priv_bytes(reinterpret_cast<unsigned char *>(&record.requestUUID), sizeof(record.requestUUID)) != 1 ||
-        record.sessionUUID == 0 || record.requestUUID == 0) return false;
-    record.repairGenerationUUID = selection.generationUUID; record.repairAuthority = authority;
-    record.repairPurpose = purpose; record.repairService = targetService;
-    if (purpose == ProdigyCohortRepairPurpose::seed && authority.retainUntilMilliseconds > uint64_t(INT64_MAX)) return false;
-    // Catch-up can keep one authenticated change stream across renewals.
-    // Each endpoint still gets an absolute, short-lived command grant.
-    record.repairExpiresAtMilliseconds = purpose == ProdigyCohortRepairPurpose::seed ?
-        int64_t(authority.retainUntilMilliseconds) : INT64_MAX;
-    record.repairTarget = {.containerUUID = target->second->uuid, .nodeUUID = target->second->machine->uuid, .tcpPort = 0};
-    record.repairDonor = {.containerUUID = donorView->uuid, .nodeUUID = donorView->machine->uuid, .tcpPort = donorPort};
-    record.repairTarget.address.is6 = record.repairDonor.address.is6 = true;
-    std::memcpy(record.repairTarget.address.v6, &target->second->meshAddress, 16);
-    std::memcpy(record.repairDonor.address.v6, &donorView->meshAddress, 16);
-    for (uint32_t attempt = 0; attempt < 32 && record.repairTarget.tcpPort == 0; ++attempt) {
-      uint16_t random = 0; if (RAND_priv_bytes(reinterpret_cast<unsigned char *>(&random), sizeof(random)) != 1) return false;
-      const uint16_t port = uint16_t(49152u + random % 16384u);
-      if (std::none_of(cousinSessions.begin(), cousinSessions.end(), [&](const auto& existing) {
-            return existing.expiresAtMs > Time::msSinceBoot() && prodigyCousinNativeRepairSession(existing.record) &&
-                existing.record.repairTarget.containerUUID == record.repairTarget.containerUUID && existing.record.repairTarget.tcpPort == port;
-          })) record.repairTarget.tcpPort = port;
-    }
-    if (!prodigyCousinSessionRecordValid(record)) return false;
-    state.sourceMachineUUID = target->second->machine->uuid; state.destinationMachineUUID = donorView->machine->uuid;
-    state.applicationIOGeneration = target->second->machine->neuron.ioGeneration; state.destinationIOGeneration = donorView->machine->neuron.ioGeneration;
-    state.applicationCrashCount = target->second->nCrashes; state.destinationCrashCount = donorView->nCrashes;
-    state.authorityEpoch = masterAuthorityEpoch; state.createdAtMs = Time::msSinceBoot(); state.expiresAtMs = state.createdAtMs + ProdigyCousinSessionPendingMs;
-    state.pendingLocalHalf = CousinRouteHalf::destination;
-    if (!cousinSessionLocalCurrent(state) || !sendCousinSessionLocalCommand(state, ProdigyCousinSessionLocalKind::install)) return false;
-    cousinSessions.push_back(std::move(state)); return true;
-  }
-
   bool cousinSessionLocalCurrent(const CousinSessionState& state)
   {
-    if (prodigyCousinNativeRepairSession(state.record)) {
-      if (!weAreMaster || state.authorityEpoch != masterAuthorityEpoch || state.expiresAtMs <= Time::msSinceBoot() ||
-          !prodigyCousinNativeRepairSessionCurrent(state.record, Time::now<TimeResolution::ms>())) return false;
-      auto target = containers.find(state.record.repairTarget.containerUUID);
-      auto donor = containers.find(state.record.repairDonor.containerUUID);
-      if (target == containers.end() || donor == containers.end() || !target->second || !donor->second ||
-          !target->second->machine || !donor->second->machine || target->second->machine->uuid != state.sourceMachineUUID ||
-          donor->second->machine->uuid != state.destinationMachineUUID ||
-          target->second->machine->neuron.ioGeneration != state.applicationIOGeneration ||
-          donor->second->machine->neuron.ioGeneration != state.destinationIOGeneration ||
-          !containerRetirementNeuronAuthorized(&target->second->machine->neuron, target->second->machine->uuid) ||
-          !containerRetirementNeuronAuthorized(&donor->second->machine->neuron, donor->second->machine->uuid) ||
-          donor->second->nCrashes != state.destinationCrashCount || target->second->nCrashes != state.applicationCrashCount ||
-          donor->second->state != ContainerState::healthy || !donor->second->runtimeReady) return false;
-      const auto *selection = nativeRepairSelection(target->second->uuid);
-      if (!selection || selection->generationUUID != state.record.repairGenerationUUID) return false;
-      auto recordSelection = *selection;
-      recordSelection.authority = state.record.repairAuthority;
-      if (!prodigyStatefulStoreGenerationSelectionsEqual(*selection, recordSelection)) return false;
-      const ProdigyStatefulServingAuthority *scope = nullptr;
-      String targetDigest = {}, donorDigest = {};
-      const auto *targetSealed = prodigyStatefulServingRepairMember(masterAuthorityRuntimeState, statefulServingRuntimeStates,
-              state.record.repairAuthority.targetDeploymentID, state.record.repairAuthority.shardGroup,
-              target->second->uuid, target->second->machine->uuid, scope, targetDigest);
-      if (!targetSealed || !scope || targetDigest != selection->admittedPlanSHA256 ||
-          !nativeRepairLivePlanMatches(target->second, *targetSealed)) return false;
-      const ProdigyStatefulServingAuthority *donorScope = nullptr;
-      const auto *donorSealed = prodigyStatefulServingRepairMember(masterAuthorityRuntimeState, statefulServingRuntimeStates,
-              state.record.repairAuthority.targetDeploymentID, state.record.repairAuthority.shardGroup,
-              donor->second->uuid, donor->second->machine->uuid, donorScope, donorDigest);
-      if (!donorSealed || donorScope != scope || !nativeRepairLivePlanMatches(donor->second, *donorSealed)) return false;
-      auto targetDeployment = deployments.find(target->second->deploymentID);
-      auto donorDeployment = deployments.find(donor->second->deploymentID);
-      if (targetDeployment == deployments.end() || donorDeployment == deployments.end() || !targetDeployment->second || !donorDeployment->second ||
-          target->second->shardGroup != state.record.repairAuthority.shardGroup || donor->second->shardGroup != state.record.repairAuthority.shardGroup ||
-          targetDeployment->second->nShardGroups != state.record.repairAuthority.nShardGroups ||
-          donorDeployment->second->nShardGroups != state.record.repairAuthority.nShardGroups) return false;
-      const uint64_t service = state.record.repairPurpose == ProdigyCohortRepairPurpose::seed ?
-          target->second->effectiveStatefulMeshRoles(targetDeployment->second->plan).seeding :
-          target->second->effectiveStatefulMeshRoles(targetDeployment->second->plan).sibling;
-      const uint64_t donorService = state.record.repairPurpose == ProdigyCohortRepairPurpose::seed ?
-          donor->second->effectiveStatefulMeshRoles(donorDeployment->second->plan).seeding :
-          donor->second->effectiveStatefulMeshRoles(donorDeployment->second->plan).sibling;
-      const auto advertisement = donor->second->advertisements.find(donorService);
-      if (service == 0 || !target->second->subscriptions.contains(service) || donorService != service || service != state.record.repairService ||
-          advertisement == donor->second->advertisements.end() || advertisement->second.port != state.record.repairDonor.tcpPort) return false;
-      IPAddress targetAddress = {}, donorAddress = {};
-      targetAddress.is6 = donorAddress.is6 = true;
-      std::memcpy(targetAddress.v6, &target->second->meshAddress, 16);
-      std::memcpy(donorAddress.v6, &donor->second->meshAddress, 16);
-      if (!targetAddress.equals(state.record.repairTarget.address) || !donorAddress.equals(state.record.repairDonor.address)) return false;
-      if (state.record.repairPurpose == ProdigyCohortRepairPurpose::seed) {
-        if (state.record.repairDonor.containerUUID != state.record.repairAuthority.sourceContainerUUID ||
-            !nativeSeedCutCurrent(state.record.repairAuthority, donor->second)) return false;
-      }
-      return true;
-    }
     if (!weAreMaster || state.authorityEpoch != masterAuthorityEpoch || state.expiresAtMs <= Time::msSinceBoot() ||
         !clusterPairAuthorityQualified() || !localCousinServicePermissionAuthorityAcknowledged() ||
         !cousinRouteAuthorityAcknowledged()) return false;
@@ -40715,36 +40012,23 @@ public:
 
   bool sendCousinSessionLocalCommand(CousinSessionState& state, ProdigyCousinSessionLocalKind kind)
   {
-    const bool nativeRepair = prodigyCousinNativeRepairSession(state.record);
-    const CousinRouteHalf half = nativeRepair ? state.pendingLocalHalf :
-        (state.record.sourcePermission.localClusterUUID == brainConfig.clusterUUID ? CousinRouteHalf::source : CousinRouteHalf::destination);
-    const bool source = half == CousinRouteHalf::source;
-    const uint128_t localUUID = nativeRepair ? prodigyCousinSessionContainerForLocalHalf(state.record, half) :
-        (source ? state.record.sourceContainerUUID : state.record.destination.containerUUID);
-    Machine *machine = findMachineByUUID(nativeRepair ? (source ? state.sourceMachineUUID : state.destinationMachineUUID) :
-        (source ? state.record.sourceNodeUUID : state.record.destination.nodeUUID));
+    const bool source = state.record.sourcePermission.localClusterUUID == brainConfig.clusterUUID;
+    const uint128_t localUUID = source ? state.record.sourceContainerUUID : state.record.destination.containerUUID;
+    Machine *machine = findMachineByUUID(source ? state.record.sourceNodeUUID : state.record.destination.nodeUUID);
     if (!machine || !containerRetirementNeuronAuthorized(&machine->neuron, machine->uuid) ||
-        machine->neuron.ioGeneration != (nativeRepair && !source ? state.destinationIOGeneration : state.applicationIOGeneration)) return false;
+        machine->neuron.ioGeneration != state.applicationIOGeneration) return false;
     ProdigyCousinSessionLocalCommand command = {};
     command.kind = kind; command.localHalf = source ? CousinRouteHalf::source : CousinRouteHalf::destination;
     command.requestUUID = state.record.requestUUID; command.session = state.record; command.leaseGeneration = state.leaseGeneration;
-    if (nativeRepair) command.protocolVersion = 4;
     if (state.record.transport == ProdigyCousinSessionTransport::reverseCarrier) {
       command.protocolVersion = 3; command.carrierConnectionID = state.connectionID;
       command.carrierGeneration = state.carrierGeneration;
     }
-    if (!nativeRepair && !source && state.record.sourcePermission.transportSourcePolicy == ProdigyCousinTransportSourcePolicy::authenticatedNAT) {
+    if (!source && state.record.sourcePermission.transportSourcePolicy == ProdigyCousinTransportSourcePolicy::authenticatedNAT) {
       command.protocolVersion = 2; command.authenticatedSourceAddress = state.authenticatedSourceAddress;
     }
     if (kind != ProdigyCousinSessionLocalKind::revoke) {
       command.validForMs = ProdigyCousinSessionLeaseMs;
-      if (nativeRepair) {
-        const auto now = Time::now<TimeResolution::ms>();
-        if (!source) state.pendingNativeLeaseExpiresAtMilliseconds = std::min<int64_t>(
-            state.record.repairExpiresAtMilliseconds, now + ProdigyCousinSessionLeaseMs);
-        command.nativeLeaseExpiresAtMilliseconds = state.pendingNativeLeaseExpiresAtMilliseconds;
-        if (!prodigyNativeRepairLeaseRemainingMs(command, now)) return false;
-      }
       if (!cousinSessionDeriveKey(state.record, command.psk, command.canonicalContext)) return false;
     }
     String encoded = {};
@@ -40761,21 +40045,9 @@ public:
     // removes this terminal record. They must not start another revoke exchange.
     if (state.expiresAtMs == 0) return;
     state.expiresAtMs = 0;
-    state.acknowledgedNativeLeaseGeneration = 0;
-    state.acknowledgedNativeLeaseExpiresAtMs = 0;
     // A deposed leader cannot keep issuing commands. Independent kernel/app
     // deadlines close anything whose current owner can no longer be reached.
     if (weAreMaster && state.authorityEpoch == masterAuthorityEpoch) {
-      if (prodigyCousinNativeRepairSession(state.record)) {
-        state.pendingLocalHalf = CousinRouteHalf::destination;
-        (void)sendCousinSessionLocalCommand(state, ProdigyCousinSessionLocalKind::revoke);
-        state.pendingLocalHalf = CousinRouteHalf::source;
-        (void)sendCousinSessionLocalCommand(state, ProdigyCousinSessionLocalKind::revoke);
-        auto target = containers.find(state.record.repairTarget.containerUUID);
-        if (target != containers.end() && target->second && target->second->verifiedRepairSession == state.record.sessionUUID)
-          withdrawNativeMemberHealth(*target->second);
-        return;
-      }
       (void)sendCousinSessionLocalCommand(state, ProdigyCousinSessionLocalKind::revoke);
       ProdigyCousinAdmissionCommand command = {}; command.session = state.record;
       command.revoke = true; command.leaseGeneration = state.leaseGeneration;
@@ -40966,104 +40238,6 @@ public:
     });
   }
 
-  const ProdigyStatefulStoreGenerationSelection *nativeRepairSelection(uint128_t uuid) const
-  {
-    const auto& homes = masterAuthorityRuntimeState.statefulStoreGenerationSelections;
-    auto home = std::lower_bound(homes.begin(), homes.end(), uuid,
-        [](const auto& value, uint128_t target) { return value.authority.targetContainerUUID < target; });
-    return home != homes.end() && home->authority.targetContainerUUID == uuid &&
-        home->authority.targetClusterUUID == brainConfig.clusterUUID && home->authority.sourceClusterUUID == brainConfig.clusterUUID
-        ? &*home : nullptr;
-  }
-
-  bool nativeMemberProofCurrent(const ContainerView& member, const ProdigyStatefulStoreGenerationSelection& home)
-  {
-    if (!member.machine || member.verifiedRepairHome != home.generationUUID ||
-        member.verifiedRepairEpoch != masterAuthorityEpoch || member.verifiedRepairCrash != member.nCrashes ||
-        member.verifiedRepairStream != member.machine->neuron.ioGeneration ||
-        member.verifiedRepairLeaseExpiresAtMs <= Time::msSinceBoot()) return false;
-    return std::any_of(cousinSessions.begin(), cousinSessions.end(), [&](const auto& session) {
-      return session.record.sessionUUID == member.verifiedRepairSession &&
-          prodigyCousinNativeRepairSession(session.record) && session.record.repairPurpose == ProdigyCohortRepairPurpose::catchup &&
-          session.record.repairGenerationUUID == home.generationUUID && session.record.repairTarget.containerUUID == member.uuid &&
-          session.destinationInstalled && session.sourceActivated && cousinSessionLocalCurrent(session);
-    });
-  }
-
-  void withdrawNativeMemberHealth(ContainerView& member)
-  {
-    member.verifiedRepairHome = 0;
-    member.verifiedRepairSession = 0;
-    if (member.state != ContainerState::healthy) return;
-    auto owner = deployments.find(member.deploymentID);
-    if (owner == deployments.end() || !owner->second) return;
-    const auto client = member.explicitStatefulMeshRoles.client;
-    if (mesh && client) mesh->stopAdvertisement(client, &member, true);
-    member.state = ContainerState::scheduled;
-    owner->second->rebuildRecoveredContainerCounts();
-    replicateContainerRuntimeStateToFollowers(&member);
-  }
-
-  // Inventory establishes the running process. Only its authenticated native
-  // receipt establishes whether the selected database can serve.
-  bool nativeMemberInventoryHoldsClient(ContainerView& member, const ContainerPlan& plan, Machine *machine)
-  {
-    if (!weAreMaster) return false;
-    const auto *home = nativeRepairSelection(plan.uuid);
-    if (!home) return false;
-    if (plan.state == ContainerState::healthy) member.nativeRepairHealthyObserved = true;
-    return member.machine != machine || !nativeMemberProofCurrent(member, *home);
-  }
-
-  // The native worker checked its committed frontier on an authenticated
-  // ordinary change stream. A seed-session receipt can never promote the
-  // member or clear its outstanding recovery request.
-  void receiveNativeMemberRepairReceipt(NeuronView *neuron, ContainerView *target,
-      const ProdigyStatefulStoreGenerationSelection& home, const ProdigyStatefulStoreReceipt& receipt)
-  {
-    if (!target || !target->machine || !containerRetirementNeuronAuthorized(neuron, target->machine->uuid) ||
-        !masterAuthorityRuntimeStateDurable || masterAuthorityPersistencePending ||
-        durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation ||
-        !containerRetirementAuthorityAcknowledged() ||
-        !prodigyStatefulStoreReceiptMatchesSourceCutAuthority(receipt, home.authority)) return;
-    auto cached = std::find_if(statefulStoreReceiptCaches.begin(), statefulStoreReceiptCaches.end(), [&](const auto& value) {
-      return value.receipt.localContainerUUID == target->uuid;
-    });
-    if (receipt.state == ProdigyStatefulStoreReceiptState::withdrawn)
-    {
-      if (cached != statefulStoreReceiptCaches.end() && cached->authorityEpoch == masterAuthorityEpoch &&
-          cached->neuronIOGeneration == neuron->ioGeneration && cached->receipt.siblingSessionUUID == receipt.siblingSessionUUID &&
-          cached->receipt.siblingSessionGeneration == receipt.siblingSessionGeneration)
-      {
-        cached->receipt = receipt;
-        withdrawNativeMemberHealth(*target);
-      }
-      return;
-    }
-    auto active = std::find_if(cousinSessions.begin(), cousinSessions.end(), [&](const auto& state) {
-      const auto& record = state.record;
-      return prodigyCousinNativeRepairSession(record) && record.repairPurpose == ProdigyCohortRepairPurpose::catchup &&
-          record.repairGenerationUUID == home.generationUUID && record.repairTarget.containerUUID == target->uuid &&
-          record.repairTarget.nodeUUID == target->machine->uuid && record.sessionUUID == receipt.siblingSessionUUID &&
-          state.acknowledgedNativeLeaseGeneration == receipt.siblingSessionGeneration &&
-          state.acknowledgedNativeLeaseExpiresAtMs > Time::msSinceBoot() && state.destinationInstalled &&
-          state.sourceActivated && cousinSessionLocalCurrent(state);
-    });
-    if (active == cousinSessions.end()) return;
-    StatefulStoreReceiptCache latest = {};
-    latest.crashCount = target->nCrashes;
-    latest.receipt = receipt; latest.neuronMachineUUID = target->machine->uuid;
-    latest.neuronIOGeneration = neuron->ioGeneration; latest.authorityEpoch = masterAuthorityEpoch;
-    if (cached == statefulStoreReceiptCaches.end()) statefulStoreReceiptCaches.push_back(std::move(latest));
-    else *cached = std::move(latest);
-    target->verifiedRepairHome = home.generationUUID; target->verifiedRepairStream = neuron->ioGeneration;
-    target->verifiedRepairEpoch = masterAuthorityEpoch; target->verifiedRepairCrash = target->nCrashes;
-    target->verifiedRepairSession = receipt.siblingSessionUUID;
-    target->verifiedRepairLeaseExpiresAtMs = active->acknowledgedNativeLeaseExpiresAtMs;
-    if (target->nativeRepairHealthyObserved && target->state != ContainerState::healthy) noteLocalContainerHealthy(target->uuid);
-    driveNativeMemberRepairs();
-  }
-
   void receiveStatefulStoreReceipt(NeuronView *neuron, const ProdigyStatefulStoreReceipt& receipt)
   {
     if (!weAreMaster || !neuron || !neuron->machine || !prodigyStatefulStoreReceiptValid(receipt) ||
@@ -41082,11 +40256,6 @@ public:
         receipt.shardGroup != container->second->shardGroup || receipt.nShardGroups == 0 ||
         deployment == deployments.end() || deployment->second == nullptr ||
         receipt.nShardGroups != deployment->second->nShardGroups) return;
-    if (const auto *home = nativeRepairSelection(receipt.localContainerUUID))
-    {
-      receiveNativeMemberRepairReceipt(neuron, container->second, *home, receipt);
-      return;
-    }
     auto found = std::find_if(statefulStoreReceiptCaches.begin(), statefulStoreReceiptCaches.end(), [&](const auto& value) {
       return value.receipt.localContainerUUID == receipt.localContainerUUID;
     });
@@ -41150,7 +40319,6 @@ public:
           receipt.siblingSessionUUID == found->receipt.siblingSessionUUID &&
           receipt.siblingSessionGeneration < found->receipt.siblingSessionGeneration))) return;
     StatefulStoreReceiptCache next = {};
-    next.crashCount = container->second->nCrashes;
     next.receipt = receipt; next.neuronMachineUUID = neuron->machine->uuid;
     next.neuronIOGeneration = neuron->ioGeneration; next.authorityEpoch = masterAuthorityEpoch;
     if (found == statefulStoreReceiptCaches.end()) statefulStoreReceiptCaches.push_back(std::move(next));
@@ -41988,31 +41156,6 @@ public:
     auto found = std::find_if(cousinSessions.begin(), cousinSessions.end(), [&](const auto& state) { return state.record.sessionUUID == ack.sessionUUID; });
     if (found == cousinSessions.end()) return;
     auto& state = *found;
-    if (prodigyCousinNativeRepairSession(state.record)) {
-      const CousinRouteHalf half = state.pendingLocalHalf;
-      if (state.authorityEpoch != masterAuthorityEpoch || !state.awaitingLocalAck || ack.leaseGeneration != state.leaseGeneration ||
-          ack.kind != state.expectedLocalKind || containerUUID != prodigyCousinSessionContainerForLocalHalf(state.record, half) ||
-          neuron->machine->uuid != (half == CousinRouteHalf::source ? state.sourceMachineUUID : state.destinationMachineUUID) ||
-          neuron->ioGeneration != (half == CousinRouteHalf::source ? state.applicationIOGeneration : state.destinationIOGeneration)) return;
-      state.awaitingLocalAck = false;
-      if (!ack.success || !cousinSessionLocalCurrent(state)) { revokeCousinSession(state); return; }
-      if (half == CousinRouteHalf::destination) {
-        state.destinationInstalled = true; state.pendingLocalHalf = CousinRouteHalf::source;
-        if (!sendCousinSessionLocalCommand(state, state.nativeRepairRenewing ? ProdigyCousinSessionLocalKind::renew : ProdigyCousinSessionLocalKind::activate)) revokeCousinSession(state);
-      } else {
-        const auto remaining = state.pendingNativeLeaseExpiresAtMilliseconds - Time::now<TimeResolution::ms>();
-        if (remaining <= 0 || remaining > ProdigyCousinSessionLeaseMs) { revokeCousinSession(state); return; }
-        state.sourceActivated = true; state.nativeRepairRenewing = false;
-        state.expiresAtMs = Time::msSinceBoot() + remaining;
-        state.nextRenewalMs = Time::msSinceBoot() + ProdigyCousinSessionRenewMs;
-        // Only a successful target acknowledgement makes this generation
-        // eligible for a native receipt.  The application sends that receipt
-        // through its existing retrying owner after this activation command.
-        state.acknowledgedNativeLeaseGeneration = state.leaseGeneration;
-        state.acknowledgedNativeLeaseExpiresAtMs = state.expiresAtMs;
-      }
-      return;
-    }
     const bool source = state.record.sourcePermission.localClusterUUID == brainConfig.clusterUUID;
     if (state.authorityEpoch != masterAuthorityEpoch || state.applicationIOGeneration != neuron->ioGeneration ||
         (source ? state.record.sourceNodeUUID : state.record.destination.nodeUUID) != neuron->machine->uuid ||
@@ -42057,15 +41200,6 @@ public:
     for (auto it = cousinSessions.begin(); it != cousinSessions.end();) {
       auto& state = *it;
       if (!cousinSessionLocalCurrent(state)) { revokeCousinSession(state); it = cousinSessions.erase(it); continue; }
-      if (prodigyCousinNativeRepairSession(state.record)) {
-        if (state.sourceActivated && state.destinationInstalled && !state.awaitingLocalAck && now >= state.nextRenewalMs) {
-          if (state.leaseGeneration == UINT64_MAX) { revokeCousinSession(state); it = cousinSessions.erase(it); continue; }
-          ++state.leaseGeneration; state.nativeRepairRenewing = true; state.pendingLocalHalf = CousinRouteHalf::destination;
-          state.expiresAtMs = now + ProdigyCousinSessionPendingMs;
-          if (!sendCousinSessionLocalCommand(state, ProdigyCousinSessionLocalKind::renew)) { revokeCousinSession(state); it = cousinSessions.erase(it); continue; }
-        }
-        ++it; continue;
-      }
       if (state.sourceActivated && !state.awaitingPeerReady && !state.awaitingLocalAck && now >= state.nextRenewalMs) {
         Machine *carrier = findMachineByUUID(state.localEndpoint.nodeUUID);
         if (state.leaseGeneration == UINT64_MAX) { revokeCousinSession(state); it = cousinSessions.erase(it); continue; }
@@ -45845,8 +44979,6 @@ public:
           bv->placementPolicyCapabilityAcknowledged = false;
           bv->containerRetirementCapabilityAcknowledged = false;
           bv->statefulServingAuthorityCapabilityAcknowledged = false;
-          bv->statefulStoreGenerationCapabilityAcknowledged = false;
-          bv->nativeMemberRepairCapabilityAcknowledged = false;
           bv->statefulDataAuthorityCapabilityAcknowledged = false;
           bv->statelessDeploymentAdmissionCapabilityAcknowledged = false;
           bv->statelessDeploymentRetirementCapabilityAcknowledged = false;
@@ -45874,9 +45006,7 @@ public:
                                       (bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion ? 31 :
                                       (bv->version >= ProdigyStatelessDeploymentAdmissionCapabilityMinimumVersion ? 15 : 7)) |
                                       (bv->transportAEGISEnabled() ? uint64_t(32 | 64 | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 32768 | 65536 | 131072 | 262144 | ProdigyInitialAllMastersSeedBootstrapCapability |
-                                      ProdigyStatelessDeploymentRetirementCapability |
-                                      (bv->version >= ProdigyStatefulStoreGenerationMinimumVersion ? ProdigyStatefulStoreGenerationCapability : 0) |
-                                      (bv->version >= ProdigyNativeMemberRepairMinimumVersion ? ProdigyNativeMemberRepairCapability : 0)) : 0);
+                                      ProdigyStatelessDeploymentRetirementCapability) : 0);
             Message::construct(bv->wBuffer, BrainTopic::advertiseCapabilities, advertised);
             Ring::queueSend(bv);
           }
@@ -46588,9 +45718,7 @@ public:
                                      (bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion ? 31 :
                                      (bv->version >= ProdigyStatelessDeploymentAdmissionCapabilityMinimumVersion ? 15 : 7)) |
                                      (bv->transportAEGISEnabled() ? uint64_t(32 | 64 | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 32768 | 65536 | 131072 | 262144 | ProdigyInitialAllMastersSeedBootstrapCapability |
-                                      ProdigyStatelessDeploymentRetirementCapability |
-                                      (bv->version >= ProdigyStatefulStoreGenerationMinimumVersion ? ProdigyStatefulStoreGenerationCapability : 0) |
-                                      (bv->version >= ProdigyNativeMemberRepairMinimumVersion ? ProdigyNativeMemberRepairCapability : 0)) : 0);
+                                     ProdigyStatelessDeploymentRetirementCapability) : 0);
           Message::construct(bv->wBuffer, BrainTopic::acknowledgeCapabilities, capabilities & supported);
           Ring::queueSend(bv);
           break;
@@ -46602,8 +45730,6 @@ public:
           uint64_t capabilities = 0;
           Message::extractArg<ArgumentNature::fixed>(args, capabilities);
           bv->statelessDeploymentRetirementCapabilityAcknowledged = false;
-          bv->statefulStoreGenerationCapabilityAcknowledged = false;
-          bv->nativeMemberRepairCapabilityAcknowledged = false;
           bv->qualificationCancellationCapabilityAcknowledged = false;
           bv->allMastersSeedBootstrapCapabilityAcknowledged = false;
           bv->initialAllMastersSeedBootstrapCapabilityAcknowledged = false;
@@ -46626,12 +45752,6 @@ public:
           {
             bv->containerRetirementCapabilityAcknowledged = true;
             bv->statefulServingAuthorityCapabilityAcknowledged = (capabilities & uint64_t(4)) != 0;
-            bv->statefulStoreGenerationCapabilityAcknowledged =
-                bv->transportAEGISEnabled() && bv->version >= ProdigyStatefulStoreGenerationMinimumVersion &&
-                (capabilities & ProdigyStatefulStoreGenerationCapability) != 0;
-            bv->nativeMemberRepairCapabilityAcknowledged = bv->transportAEGISEnabled() &&
-                bv->version >= ProdigyNativeMemberRepairMinimumVersion &&
-                (capabilities & ProdigyNativeMemberRepairCapability) != 0;
             bv->statefulDataAuthorityCapabilityAcknowledged =
                 bv->version >= ProdigyStatefulDataAuthorityMinimumVersion && (capabilities & uint64_t(16384)) != 0;
             bv->statelessDeploymentAdmissionCapabilityAcknowledged =
@@ -52376,7 +51496,6 @@ public:
             pending->requiredContainerRetirementJournalVersion = requiredContainerRetirementJournalReaderVersion();
             pending->statelessRetirementReaderRequired =
                 !masterAuthorityRuntimeState.statelessDeploymentRetirements.empty();
-            pending->requiredStoreRecoveryReaderVersion = requiredStoreRecoveryReaderVersion();
             pending->responseTopic = admittedUpdateDispatch ? MothershipTopic::updateProdigyAdmitted : MothershipTopic::updateProdigy;
             pending->admittedRequest = admittedUpdateRequestForDispatch;
             pending->admittedClusterUUID = brainConfig.clusterUUID;
@@ -52405,7 +51524,7 @@ public:
                         pending->failure.assign("bundle artifact preparation failed"_ctv);
                       }
                       if (pending->failure.empty() && (pending->admitted || pending->requiredContainerRetirementJournalVersion ||
-                                                       pending->statelessRetirementReaderRequired || pending->requiredStoreRecoveryReaderVersion != 0))
+                                                       pending->statelessRetirementReaderRequired))
                       {
                         ProdigyApprovedUpgradeBundle approved = {};
                         if (!prodigyApproveBundleUpgradeContract(pending->prepared.stageBundlePath, approved, &pending->failure) ||
@@ -52423,11 +51542,6 @@ public:
                             pending->targetBinaryVersion < ProdigyStatelessDeploymentRetirementCapabilityMinimumVersion)
                         {
                           pending->failure.assign("target binary cannot read durable stateless retirement authority"_ctv);
-                          return;
-                        }
-                        if (pending->targetBinaryVersion < pending->requiredStoreRecoveryReaderVersion)
-                        {
-                          pending->failure.assign("target binary cannot read durable stateful store generation authority"_ctv);
                           return;
                         }
                         pending->targetContainerRetirementJournalVersion = approved.contract.containerRetirementJournalVersion;
@@ -52600,11 +51714,6 @@ public:
               pending->targetBinaryVersion < ProdigyStatelessDeploymentRetirementCapabilityMinimumVersion)
           {
             rejectPendingMothershipUpdateArtifact(pending, "target binary lacks the stateless retirement authority reader"_ctv);
-            break;
-          }
-          if (pending->targetBinaryVersion < requiredStoreRecoveryReaderVersion())
-          {
-            rejectPendingMothershipUpdateArtifact(pending, "target binary lacks the stateful store generation authority reader"_ctv);
             break;
           }
           if (pending->targetContainerRetirementJournalVersion < requiredContainerRetirementJournalReaderVersion())
@@ -57745,10 +56854,7 @@ public:
             Machine *previousMachine = container->machine;
             ContainerState previousState = container->state;
             bool previousRuntimeReady = container->runtimeReady;
-            const bool holdClient = nativeMemberInventoryHoldsClient(*container, plan, neuron->machine);
-            ContainerState uploadedState = holdClient && plan.state == ContainerState::healthy ? ContainerState::scheduled : plan.state;
-            if (holdClient && previousState == ContainerState::healthy && mesh && container->explicitStatefulMeshRoles.client)
-              mesh->stopAdvertisement(container->explicitStatefulMeshRoles.client, container, true);
+            ContainerState uploadedState = plan.state;
             uint128_t previousPairingAddress = container->pairingAddress();
             bool replayActivePeerPairings = false;
 
@@ -57865,7 +56971,7 @@ public:
 
             for (const auto& [service, advertisement] : container->advertisements)
             {
-              if ((!holdClient || service != plan.statefulMeshRoles.client) && serviceBlueprintActiveAtContainerState(advertisement, uploadedState))
+              if (serviceBlueprintActiveAtContainerState(advertisement, uploadedState))
               {
                 mesh->logAdvertisement(container,
                                        advertisement.service,
@@ -57878,7 +56984,6 @@ public:
             {
               for (const AdvertisementPairing& pairing : pairings)
               {
-                if (holdClient && pairing.service == plan.statefulMeshRoles.client) continue;
                 mesh->logAdvertisementPairing(pairing.secret, container, pairing);
 
                 // we could also just pull the stress right now.... and then calculate capacity exactly...
@@ -58413,22 +57518,9 @@ public:
             // ready cut whose identity has already been returned upstream.
             if (cache.receipt.ready) break;
             cache.receipt = std::move(reply);
-            if (cache.receipt.ready && !masterAuthorityRuntimeState.statefulServingMemberRepairs.empty())
-              driveNativeMemberRepairs();
-          }
-          else if (reply.action == ProdigyStatefulStoreSourceCutAction::query && reply.ready)
-          {
-            // Only this query path reaches the donor. Keep its actual reply
-            // and require the selected content and head digests at grant time.
-            cache.receipt = std::move(reply);
-            driveNativeMemberRepairs();
           }
           else if (reply.action == ProdigyStatefulStoreSourceCutAction::release &&
-                   (reply.released || !reply.failure.empty()))
-          {
-            cache.releaseReceipt = std::move(reply);
-            if (cache.releaseReceipt.released) driveNativeMemberRepairs();
-          }
+                   (reply.released || !reply.failure.empty())) cache.releaseReceipt = std::move(reply);
           break;
         }
       case NeuronTopic::statefulDataAuthority:
@@ -58660,10 +57752,7 @@ public:
               break;
             }
 
-            container->nativeRepairHealthyObserved = false;
-            container->verifiedRepairHome = 0;
             deployment->containerFailed(container, approxTimeMs, signal, report, restarted);
-            if (restarted && signal == 0) acceptNativeMemberRepair(neuron, deployment, container, report);
 
             if (restoredInventoryProgress)
             {

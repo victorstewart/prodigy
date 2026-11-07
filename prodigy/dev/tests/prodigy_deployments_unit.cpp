@@ -66,21 +66,6 @@ public:
     return ContainerManager::prepareContainerStorage(container, failureReport, requireExistingBackend);
   }
 
-  static bool armEnvironmentRepair(Container *container, const siginfo_t& infop, bool restart,
-                                   const ProdigyStatefulStoreBootFailure& failure)
-  {
-    return ContainerManager::armStatefulStoreEnvironmentStorageRepair(container, infop, restart, failure);
-  }
-
-  static bool reconcileEnvironmentRepairAt(Container *container, int storageParentFD, String *failureReport = nullptr)
-  {
-    return ContainerManager::reconcilePendingStatefulStoreEnvironmentStorageAt(container, storageParentFD, failureReport);
-  }
-
-  static bool captureDirectStoragePayloadAt(Container *container, int storageParentFD, String *failureReport = nullptr)
-  {
-    return ContainerManager::captureRegisteredDirectStoragePayloadAt(container, storageParentFD, failureReport);
-  }
 };
 
 class TestBrain final : public BrainBase {
@@ -3780,38 +3765,6 @@ static void testAllMastersBootstrapSeedingSubscription(TestSuite& suite)
   verifyApplication.template operator()<5>();
 }
 
-static void testStoreGenerationLaunchMetadata(TestSuite& suite)
-{
-  TemporaryDirectory artifactRoot;
-  suite.expect(artifactRoot.create(), "store_generation_metadata_fixture_created");
-  if (artifactRoot.path.empty()) return;
-  Container container {};
-  container.artifactRootPath = artifactRoot.path;
-  container.plan.config.architecture = nametagCurrentBuildMachineArchitecture();
-  String architecture;
-  architecture.assign(machineCpuArchitectureName(container.plan.config.architecture));
-  const auto verify = [&](const char *extension, bool expected, uint32_t protocol) {
-    String metadata;
-    metadata.assign("{\"execute_path\":\"/app/server\",\"execute_args\":[],\"execute_env\":[],\"execute_cwd\":\"/\",\"execute_arch\":\"");
-    metadata.append(architecture);
-    metadata.append("\"");
-    metadata.append(extension);
-    metadata.append("}");
-    suite.expect(writeLaunchMetadataFixture(artifactRoot.path, metadata.c_str()), "store_generation_metadata_written");
-    String failure;
-    const bool loaded = ContainerManager::debugLoadContainerLaunchMetadata(&container, &failure);
-    suite.expect(loaded == expected, "store_generation_metadata_accepts_only_known_single_integer");
-    if (loaded) suite.expect(container.statefulStoreGenerationProtocol == protocol, "store_generation_metadata_protocol_projected");
-  };
-  verify("", true, 0);
-  verify(",\"stateful_store_generation_protocol\":1", true, 1);
-  verify("", true, 0); // A prior artifact's capability cannot survive a reload.
-  verify(",\"stateful_store_generation_protocol\":0", false, 0);
-  verify(",\"stateful_store_generation_protocol\":2", false, 0);
-  verify(",\"stateful_store_generation_protocol\":\"1\"", false, 0);
-  verify(",\"stateful_store_generation_protocol\":1,\"stateful_store_generation_protocol\":1", false, 0);
-}
-
 static void testRetainedStatefulFilesAfterFailure(TestSuite& suite)
 {
   TemporaryDirectory fixture;
@@ -3823,12 +3776,12 @@ static void testRetainedStatefulFilesAfterFailure(TestSuite& suite)
   const auto storage = root / "storage" / "81";
   const auto database = storage / "kvdb" / "file-1";
   const auto legacyDatabase = artifact / "rootfs" / "storage" / "kvdb" / "file-2";
-  const auto selectedDatabase = storage / "kvdb.0x82" / "file-3";
+  const auto applicationBackup = storage / "app-backup" / "file-3";
   suite.expect(writeFileFixture(database, "original") && writeFileFixture(legacyDatabase, "legacy") &&
-                    writeFileFixture(selectedDatabase, "partially seeded"),
-                "failed_stateful_cleanup_fixture_has_previous_and_selected_homes");
+                    writeFileFixture(applicationBackup, "application-owned backup"),
+                "failed_stateful_cleanup_fixture_has_application_storage");
   struct stat before[3] = {};
-  const std::filesystem::path paths[] = {database, legacyDatabase, selectedDatabase};
+  const std::filesystem::path paths[] = {database, legacyDatabase, applicationBackup};
   for (size_t index = 0; index < 3; ++index)
     suite.expect(lstat(paths[index].c_str(), &before[index]) == 0, "failed_stateful_cleanup_fixture_records_inode");
 
@@ -3851,148 +3804,6 @@ static void testRetainedStatefulFilesAfterFailure(TestSuite& suite)
   suite.expect(!container.deleteStorageOnCleanUp, "failed_stateful_cleanup_preserves_backing_on_later_teardown");
 }
 
-static void testStatefulEnvironmentStorageRepair(TestSuite& suite)
-{
-  TemporaryDirectory fixture;
-  suite.expect(fixture.create(), "environment_storage_repair_fixture_created");
-  if (fixture.path.size() == 0) return;
-  const auto parent = filesystemPathFromString(fixture.path) / "storage";
-  const auto outside = filesystemPathFromString(fixture.path) / "outside";
-  const uint128_t uuid = 0xE110;
-  String name = {};
-  name.assignItoa(uuid);
-  const auto payload = parent / name.c_str();
-
-  auto makeContainer = [&](uint128_t value) {
-    Container container = {};
-    container.plan.uuid = value;
-    container.plan.isStateful = true;
-    container.plan.restartOnFailure = true;
-    container.plan.config.type = ApplicationType::stateful;
-    container.plan.config.applicationID = 3;
-    container.plan.config.storageMB = 64;
-    container.name.assignItoa(value);
-    prodigyContainerStorageRootPathForName(container.name, container.storageRootPath);
-    container.storagePayloadPath.assign(container.storageRootPath);
-    container.executionHostID = uint32_t(geteuid());
-    container.statefulStoreGenerationProtocol = 1;
-    return container;
-  };
-  siginfo_t normalHSEExit = {};
-  normalHSEExit.si_code = CLD_EXITED;
-  normalHSEExit.si_status = 1;
-  ProdigyStatefulStoreBootFailure environment = {};
-  environment.kind = ProdigyStatefulStoreBootFailureKind::environment;
-  environment.stage = ProdigyStatefulStoreBootFailureStage::environmentInspection;
-  environment.systemErrno = ENOENT;
-  ProdigyStatefulStoreBootFailure permission = environment;
-  permission.kind = ProdigyStatefulStoreBootFailureKind::permission;
-  permission.systemErrno = EACCES;
-
-  suite.expect(createDirectoryFixture(payload) && chmod(payload.c_str(), 0000) == 0,
-               "environment_storage_repair_private_payload_fixture_created");
-  int parentFD = open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-  Container container = makeContainer(uuid);
-  String failure = {};
-  const bool captured = parentFD >= 0 &&
-      ContainerManagerStorageTestAccess::captureDirectStoragePayloadAt(&container, parentFD, &failure);
-  const bool armed = ContainerManagerStorageTestAccess::armEnvironmentRepair(
-      &container, normalHSEExit, true, permission);
-  const bool repaired = parentFD >= 0 &&
-      ContainerManagerStorageTestAccess::reconcileEnvironmentRepairAt(&container, parentFD, &failure);
-  if (parentFD >= 0) close(parentFD);
-  struct stat repairedMetadata = {};
-  suite.expect(captured && armed && repaired && !container.pendingEnvironmentRepairGeneration.has_value() &&
-                   lstat(payload.c_str(), &repairedMetadata) == 0 &&
-                   repairedMetadata.st_uid == geteuid() && repairedMetadata.st_gid == getegid() &&
-                   (repairedMetadata.st_mode & 0777) == 0700,
-               "environment_storage_repair_restores_exact_payload_owner_and_mode");
-
-  ProdigyStatefulStoreBootFailure metadata = environment;
-  metadata.kind = ProdigyStatefulStoreBootFailureKind::missingMetadata;
-  metadata.systemErrno = EACCES;
-  Container metadataContainer = makeContainer(uuid);
-  suite.expect(!ContainerManagerStorageTestAccess::armEnvironmentRepair(
-                   &metadataContainer, normalHSEExit, true, metadata) &&
-                   !metadataContainer.pendingEnvironmentRepairGeneration.has_value(),
-               "environment_storage_repair_rejects_metadata_eacces");
-  Container permissionContainer = makeContainer(uuid);
-  suite.expect(ContainerManagerStorageTestAccess::armEnvironmentRepair(
-                   &permissionContainer, normalHSEExit, true, permission) &&
-                   permissionContainer.pendingEnvironmentRepairGeneration.has_value(),
-               "environment_storage_repair_accepts_permission_eacces");
-  ProdigyStatefulStoreBootFailure permissionEPERM = permission;
-  permissionEPERM.systemErrno = EPERM;
-  Container permissionEPERMContainer = makeContainer(uuid);
-  suite.expect(ContainerManagerStorageTestAccess::armEnvironmentRepair(
-                   &permissionEPERMContainer, normalHSEExit, true, permissionEPERM) &&
-                   permissionEPERMContainer.pendingEnvironmentRepairGeneration.has_value(),
-               "environment_storage_repair_accepts_permission_eperm");
-  ProdigyStatefulStoreBootFailure readonlyFilesystem = permission;
-  readonlyFilesystem.systemErrno = EROFS;
-  Container readonlyFilesystemContainer = makeContainer(uuid);
-  suite.expect(!ContainerManagerStorageTestAccess::armEnvironmentRepair(
-                   &readonlyFilesystemContainer, normalHSEExit, true, readonlyFilesystem) &&
-                   !readonlyFilesystemContainer.pendingEnvironmentRepairGeneration.has_value(),
-               "environment_storage_repair_defers_readonly_filesystem");
-
-  Container staleContainer = makeContainer(uuid);
-  suite.expect(ContainerManagerStorageTestAccess::armEnvironmentRepair(
-                   &staleContainer, normalHSEExit, true, environment),
-               "environment_storage_repair_arms_current_legacy_generation");
-  parentFD = open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-  suite.expect(parentFD >= 0 &&
-                   ContainerManagerStorageTestAccess::captureDirectStoragePayloadAt(&staleContainer, parentFD, &failure),
-               "environment_storage_repair_captures_legacy_payload_identity");
-  staleContainer.statefulStoreGenerationSelection.protocolVersion = 1;
-  staleContainer.statefulStoreGenerationSelection.generationUUID = 0xE111;
-  failure.clear();
-  const bool staleRepaired = parentFD >= 0 &&
-      ContainerManagerStorageTestAccess::reconcileEnvironmentRepairAt(&staleContainer, parentFD, &failure);
-  if (parentFD >= 0) close(parentFD);
-  suite.expect(!staleRepaired && !staleContainer.pendingEnvironmentRepairGeneration.has_value(),
-               "environment_storage_repair_rejects_stale_generation_before_action");
-
-  const uint128_t symlinkUUID = 0xE112;
-  String symlinkName = {};
-  symlinkName.assignItoa(symlinkUUID);
-  const auto symlinkPayload = parent / symlinkName.c_str();
-  Container symlinkContainer = makeContainer(symlinkUUID);
-  std::error_code symlinkError = {};
-  const bool symlinkFixtureParent = createDirectoryFixture(outside) && chmod(outside.c_str(), 0711) == 0 &&
-      createDirectoryFixture(symlinkPayload);
-  parentFD = open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-  const bool symlinkCaptured = parentFD >= 0 &&
-      ContainerManagerStorageTestAccess::captureDirectStoragePayloadAt(&symlinkContainer, parentFD, &failure);
-  if (parentFD >= 0) close(parentFD);
-  if (symlinkFixtureParent && symlinkCaptured)
-  {
-    std::filesystem::remove(symlinkPayload, symlinkError);
-    if (!symlinkError)
-      symlinkError.clear();
-  }
-  if (symlinkFixtureParent && symlinkCaptured && !symlinkError)
-    std::filesystem::create_directory_symlink(outside, symlinkPayload, symlinkError);
-  suite.expect(symlinkFixtureParent && symlinkCaptured && !symlinkError,
-               "environment_storage_repair_symlink_fixture_created");
-  struct stat outsideBefore = {};
-  (void)lstat(outside.c_str(), &outsideBefore);
-  suite.expect(ContainerManagerStorageTestAccess::armEnvironmentRepair(
-                   &symlinkContainer, normalHSEExit, true, permission),
-               "environment_storage_repair_arms_symlink_case_for_refusal");
-  parentFD = open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-  failure.clear();
-  const bool symlinkRepaired = parentFD >= 0 &&
-      ContainerManagerStorageTestAccess::reconcileEnvironmentRepairAt(&symlinkContainer, parentFD, &failure);
-  if (parentFD >= 0) close(parentFD);
-  struct stat outsideAfter = {};
-  suite.expect(!symlinkRepaired && !symlinkContainer.pendingEnvironmentRepairGeneration.has_value() &&
-                   lstat(outside.c_str(), &outsideAfter) == 0 && outsideAfter.st_uid == outsideBefore.st_uid &&
-                   outsideAfter.st_gid == outsideBefore.st_gid &&
-                   (outsideAfter.st_mode & 0777) == (outsideBefore.st_mode & 0777),
-               "environment_storage_repair_refuses_symlink_without_mutating_target");
-}
-
 static void testBoundedFailureReport(TestSuite& suite)
 {
   siginfo_t termination = {};
@@ -4002,7 +3813,7 @@ static void testBoundedFailureReport(TestSuite& suite)
       "crash-report-head-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv;
   String standardError =
       "stderr-prefix-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-PC=0xfeedface"_ctv;
-  String summary = ContainerManager::boundedFailureReport(termination, SIGSEGV, report, standardError, nullptr);
+  String summary = ContainerManager::boundedFailureReport(termination, SIGSEGV, report, standardError);
   std::string_view summaryView(reinterpret_cast<const char *>(summary.data()), summary.size());
   suite.expect(summary.size() <= 256, "failure_summary_stays_within_brain_wire_limit");
   suite.expect(summaryView.find("termination=si_code") != std::string_view::npos,
@@ -4012,33 +3823,9 @@ static void testBoundedFailureReport(TestSuite& suite)
   suite.expect(summaryView.find("PC=0xfeedface") != std::string_view::npos,
                "failure_summary_retains_stderr_tail");
 
-  ProdigyStatefulStoreBootFailure failure = {};
-  failure.kind = ProdigyStatefulStoreBootFailureKind::missingMetadata;
-  failure.stage = ProdigyStatefulStoreBootFailureStage::kvdbOpen;
-  failure.systemErrno = ENOENT;
-  failure.rawError = 18432952018894061570ULL;
-  failure.generationUUID = 0x71;
-  String typedReport = {};
-  suite.expect(prodigyStatefulStoreBootFailureEncodeReport(report, failure, typedReport),
-               "failure_summary_fixture_has_typed_boot_failure");
-  String typedSummary = ContainerManager::boundedFailureReport(termination, SIGSEGV, report, standardError, &failure);
-  ProdigyStatefulStoreBootFailure decoded = {};
-  String human = {};
-  suite.expect(typedSummary.size() <= ProdigyStatefulStoreBootFailureReportMaximumBytes &&
-                   prodigyStatefulStoreBootFailureDecodeReport(typedSummary, decoded, human) &&
-                   decoded.kind == failure.kind && decoded.stage == failure.stage &&
-                   decoded.systemErrno == ENOENT && decoded.rawError == failure.rawError &&
-                   decoded.generationUUID == failure.generationUUID,
-               "failure_summary_preserves_typed_cause_and_generation_through_truncation");
-  std::string_view humanView(reinterpret_cast<const char *>(human.data()), human.size());
-  suite.expect(humanView.find("termination=si_code") != std::string_view::npos &&
-                   humanView.find("crash-report-head") != std::string_view::npos &&
-                   humanView.find("PC=0xfeedface") != std::string_view::npos,
-               "failure_summary_typed_path_retains_termination_report_head_and_stderr_tail");
-
   FailureReport recorded = {};
   recorded.containerUUID = 0x81;
-  recorded.report = typedSummary;
+  recorded.report = summary;
   recorded.approxTimeMs = 1;
   recorded.nthCrash = 1;
   recorded.signal = SIGSEGV;
@@ -4050,26 +3837,13 @@ static void testBoundedFailureReport(TestSuite& suite)
   DeploymentStatusReport restored = {};
   suite.expect(BitseryEngine::serialize(statusBytes, status) &&
                    BitseryEngine::deserializeSafe(statusBytes, restored) && restored.failureReports.size() == 1 &&
-                   restored.failureReports[0].report == typedSummary &&
-                   prodigyStatefulStoreBootFailureDecodeReport(restored.failureReports[0].report, decoded, human) &&
-                   decoded.generationUUID == failure.generationUUID,
-               "failure_summary_typed_record_survives_existing_status_codec");
+                   restored.failureReports[0].report == summary,
+               "failure_summary_record_survives_existing_status_codec");
   String displayed = {};
   recorded.stringify(displayed, 0);
   const std::string_view displayedView(reinterpret_cast<const char *>(displayed.data()), displayed.size());
-  suite.expect(displayedView.find("crash-report-head") != std::string_view::npos &&
-                   displayedView.find("@NTBF1:") == std::string_view::npos,
-               "failure_summary_display_preserves_human_report_without_wire_trailer");
-
-  String malformed = typedReport.substr(0, typedReport.size() - 1, Copy::yes);
-  String malformedSummary = ContainerManager::boundedFailureReport(termination, SIGSEGV, malformed, standardError, nullptr);
-  suite.expect(!prodigyStatefulStoreBootFailureDecodeReport(malformedSummary, decoded, human),
-               "failure_summary_does_not_promote_malformed_trailer_to_typed_evidence");
-  const String copiedTrailer = typedReport.substr(typedReport.size() - ProdigyStatefulStoreBootFailureTrailerBytes,
-                                                  ProdigyStatefulStoreBootFailureTrailerBytes, Copy::yes);
-  const String stderrOnly = ContainerManager::boundedFailureReport(termination, SIGSEGV, report, copiedTrailer, nullptr);
-  suite.expect(!prodigyStatefulStoreBootFailureDecodeReport(stderrOnly, decoded, human),
-               "failure_summary_stderr_cannot_supply_a_typed_boot_failure");
+  suite.expect(displayedView.find("crash-report-head") != std::string_view::npos,
+               "failure_summary_display_preserves_human_report");
 }
 
 int main(void)
@@ -4084,27 +3858,11 @@ int main(void)
       return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
   }
-  if (selector == nullptr || std::strcmp(selector, "environment-storage-repair") == 0)
-  {
-    testStatefulEnvironmentStorageRepair(suite);
-    if (selector != nullptr) {
-      dprintf(STDOUT_FILENO, "environment_storage_repair passed=%d failed=%d\n", suite.passed, suite.failed);
-      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
-    }
-  }
-  if (selector == nullptr || std::strcmp(selector, "typed-boot-failure") == 0)
+  if (selector == nullptr || std::strcmp(selector, "bounded-failure-report") == 0)
   {
     testBoundedFailureReport(suite);
     if (selector != nullptr) {
-      dprintf(STDOUT_FILENO, "typed_boot_failure passed=%d failed=%d\n", suite.passed, suite.failed);
-      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
-    }
-  }
-  if (selector == nullptr || std::strcmp(selector, "store-generation-metadata") == 0)
-  {
-    testStoreGenerationLaunchMetadata(suite);
-    if (selector != nullptr) {
-      dprintf(STDOUT_FILENO, "store_generation_metadata passed=%d failed=%d\n", suite.passed, suite.failed);
+      dprintf(STDOUT_FILENO, "bounded_failure_report passed=%d failed=%d\n", suite.passed, suite.failed);
       return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
   }

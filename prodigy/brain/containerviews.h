@@ -24,23 +24,6 @@ public:
   uint8_t fragment;
 
   uint32_t nCrashes;
-  // An observed failed process is current only on its reporting control
-  // connection. The durable serving request retains the failure separately.
-  ProdigyStatefulStoreBootFailure nativeBootFailure = {.protocolVersion = 0};
-  uint64_t nativeFailureStreamGeneration = 0;
-  uint64_t nativeFailureAuthorityEpoch = 0;
-  uint32_t nativeFailureCrashCount = 0;
-  uint128_t requestedRepairHome = 0;
-  uint64_t requestedRepairStream = 0;
-  uint32_t requestedRepairCrash = 0;
-  bool nativeRepairHealthyObserved = false;
-  uint128_t verifiedRepairHome = 0;
-  uint128_t verifiedRepairSession = 0;
-  int64_t verifiedRepairLeaseExpiresAtMs = 0;
-  uint64_t verifiedRepairStream = 0;
-  uint64_t verifiedRepairEpoch = 0;
-  uint32_t verifiedRepairCrash = 0;
-
 
   DeploymentWork *plannedWork = nullptr;
   uint64_t destructionWaiterDeploymentID = 0;

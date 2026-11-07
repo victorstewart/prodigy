@@ -16,11 +16,3 @@ static_assert(ProdigyBinaryVersion >= ProdigyPairedSourceRetirementCapabilityMin
 
 constexpr inline uint64_t ProdigyStatelessDeploymentRetirementCapabilityMinimumVersion = 44;
 constexpr inline uint64_t ProdigyStatelessDeploymentRetirementCapability = 1048576;
-
-// Generation selection changes durable authority and native launch framing.
-// Activation also requires a fresh capability acknowledgement on this stream.
-constexpr inline uint64_t ProdigyStatefulStoreGenerationMinimumVersion = 60;
-constexpr inline uint64_t ProdigyStatefulStoreGenerationCapability = 2097152;
-
-constexpr inline uint64_t ProdigyNativeMemberRepairMinimumVersion = 61;
-constexpr inline uint64_t ProdigyNativeMemberRepairCapability = 4194304;

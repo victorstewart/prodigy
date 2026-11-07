@@ -2672,7 +2672,6 @@ fn write_launch_metadata(path: &Path, resolved: &ResolvedBuildSpec) -> Result<()
             .collect(),
         execute_cwd: resolved.workdir.clone(),
         execute_arch: resolved.from.arch.as_str().to_string(),
-        stateful_store_generation_protocol: resolved.stateful_store_generation_protocol,
     };
     fs::write(path, serde_json::to_vec_pretty(&payload)?)?;
     Ok(())
@@ -3802,49 +3801,6 @@ struct LaunchMetadata {
     execute_env: Vec<String>,
     execute_cwd: String,
     execute_arch: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stateful_store_generation_protocol: Option<u8>,
-}
-
-#[cfg(test)]
-mod launch_metadata_tests {
-    use super::*;
-
-    fn resolved(protocol: Option<u8>) -> ResolvedBuildSpec {
-        let source = "FROM scratch for x86_64\nEXECUTE [\"/app/server\"]\n";
-        let spec = parse_build_spec(source).unwrap();
-        let mut resolved = resolve_build_spec(&spec, OutputKind::App, &BTreeMap::new()).unwrap();
-        resolved.stateful_store_generation_protocol = protocol;
-        resolved
-    }
-
-    #[test]
-    fn launch_metadata_omits_legacy_generation_protocol_bytes() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("launch.metadata");
-        write_launch_metadata(&path, &resolved(None)).unwrap();
-        let bytes = fs::read(&path).unwrap();
-        assert_eq!(
-            bytes,
-            br#"{
-  "execute_path": "/app/server",
-  "execute_args": [],
-  "execute_env": [],
-  "execute_cwd": "/",
-  "execute_arch": "x86_64"
-}"#
-        );
-    }
-
-    #[test]
-    fn launch_metadata_writes_generation_protocol_one() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("launch.metadata");
-        write_launch_metadata(&path, &resolved(Some(1))).unwrap();
-        assert!(String::from_utf8(fs::read(&path).unwrap())
-            .unwrap()
-            .contains("\"stateful_store_generation_protocol\": 1"));
-    }
 }
 
 struct LoopbackBtrfs {

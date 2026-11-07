@@ -15,28 +15,7 @@ static void expect(bool value, const char *name)
   if (!value) ++failures;
 }
 
-static String repairDigest(char value) { String result = {}; for (unsigned i = 0; i < 64; ++i) result.append(value); return result; }
-
-static ProdigyCousinSessionRecord nativeRepairFixture()
-{
-  ProdigyCousinSessionRecord session = {};
-  session.protocolVersion = ProdigyCousinSessionNativeRepairProtocolVersion;
-  session.sessionUUID = 0x9501; session.requestUUID = 0x9502; session.repairGenerationUUID = 0x9503;
-  auto& a = session.repairAuthority;
-  a.protocolVersion = ProdigyStatefulStoreSeedAuthority::sourceCutVersion; a.authorityGeneration = 9; a.operationUUID = 0x9504;
-  a.applicationID = 3; a.storeKind = DeploymentIdentityStoreKind::kv; a.shardGroup = 1; a.nShardGroups = 3;
-  a.targetClusterUUID = a.sourceClusterUUID = 0x9505; a.targetDeploymentID = 0x3000000000001; a.sourceDeploymentID = a.targetDeploymentID;
-  a.targetContainerUUID = 0x9506; a.sourceContainerUUID = 0x9507; a.seedGeneration = 11; a.fixtureSHA256 = repairDigest('a');
-  a.sourceContentWatermarkSHA256 = repairDigest('b'); a.sourceCatchupWatermarkSHA256 = repairDigest('c');
-  a.sourceBaselineOperationUUID = 0x9508; a.sourceRequestUUID = 0x9509; a.sourceMemberRequestUUID = 0x950a;
-  a.seedRouteUUID = 0x950b; a.cutUUID = 0x950c; a.cutGeneration = 13; a.retainUntilMilliseconds = UINT64_MAX;
-  session.repairTarget = {.containerUUID = a.targetContainerUUID, .nodeUUID = 0x950d, .address = IPAddress("fd00:9500::6", true), .tcpPort = 49506};
-  session.repairDonor = {.containerUUID = a.sourceContainerUUID, .nodeUUID = 0x950e, .address = IPAddress("fd00:9500::7", true), .tcpPort = 49507};
-  session.repairPurpose = ProdigyCohortRepairPurpose::seed;
-  session.repairService = MeshServices::generateStatefulService(3, 1);
-  session.repairExpiresAtMilliseconds = INT64_MAX; return session;
-}
-
+#include "cousin_session_fixture.h"
 #include "cousin_session_fixture.h"
 
 static bool pump(ProdigyCousinSessionStream& from, ProdigyCousinSessionStream& to)
@@ -56,85 +35,10 @@ static bool pump(ProdigyCousinSessionStream& from, ProdigyCousinSessionStream& t
 int main()
 {
   const char *only = std::getenv("PRODIGY_TEST_ONLY");
-  const bool nativeRepairOnly = only != nullptr && std::strcmp(only, "native-member-repair") == 0;
-  if (!nativeRepairOnly && !prodigyTestOwnedULA(localTestAddress)) {
+  if (!prodigyTestOwnedULA(localTestAddress)) {
     std::fprintf(stderr, "SKIP: session socket fixture requires an already assigned non-loopback IPv6 ULA\n");
     return 77;
   }
-  {
-    auto repair = nativeRepairFixture(); String encoded = {}, digest = {}; ProdigyCousinSessionRecord decoded = {};
-    expect(prodigyCousinSessionRecordValid(repair) && prodigyCousinNativeRepairSessionCurrent(repair, 14000) &&
-        prodigyCousinSessionDigest(repair, digest) && BitseryEngine::serialize(encoded, repair) &&
-        BitseryEngine::deserializeSafe(encoded, decoded) && prodigyCousinSessionExact(repair, decoded),
-        "native_repair_v5_roundtrips_exact_same_cohort_full_cut_identity");
-    auto invalid = repair; invalid.repairAuthority.targetClusterUUID++;
-    expect(!prodigyCousinSessionRecordValid(invalid), "native_repair_rejects_cross_cluster_authority");
-    invalid = repair; invalid.repairAuthority.protocolVersion = ProdigyStatefulStoreSeedAuthority::qualificationSeedFaultVersion;
-    expect(!prodigyCousinSessionRecordValid(invalid), "native_repair_rejects_qualification_authority");
-    invalid = repair; invalid.repairDonor.nodeUUID = invalid.repairTarget.nodeUUID;
-    expect(!prodigyCousinSessionRecordValid(invalid), "native_repair_requires_distinct_donor_target_nodes");
-    invalid = repair; invalid.rootGeneration = 1; invalid.sourcePermission.permissionUUID = 1;
-    expect(!prodigyCousinSessionRecordValid(invalid), "native_repair_rejects_legacy_pair_authority_fields");
-    invalid = repair; invalid.repairTarget.address = IPAddress("2001:db8::6", true);
-    expect(!prodigyCousinSessionRecordValid(invalid), "native_repair_requires_private_ipv6_only");
-    auto expiredProvenance = repair; expiredProvenance.repairAuthority.retainUntilMilliseconds = 100;
-    expiredProvenance.repairExpiresAtMilliseconds = 200;
-    expect(!prodigyCousinSessionRecordValid(expiredProvenance), "native_seed_rejects_expired_held_cut");
-    expiredProvenance.repairPurpose = ProdigyCohortRepairPurpose::catchup;
-    expect(prodigyCousinSessionRecordValid(expiredProvenance) &&
-        prodigyCousinNativeRepairSessionCurrent(expiredProvenance, 150),
-        "native_catchup_accepts_fresh_lease_after_historical_cut_expiry");
-    auto anotherDeployment = repair; ++anotherDeployment.repairAuthority.sourceDeploymentID;
-    expect(!prodigyCousinSessionRecordValid(anotherDeployment), "native_repair_rejects_another_deployment_on_same_cluster");
-    auto alternateCatchup = expiredProvenance;
-    alternateCatchup.repairDonor.containerUUID = 0x9512;
-    alternateCatchup.repairDonor.nodeUUID = 0x9513;
-    expect(prodigyCousinSessionRecordValid(alternateCatchup) &&
-        prodigyCousinNativeRepairSessionCurrent(alternateCatchup, 150),
-        "native_catchup_allows_current_admitted_sibling_distinct_from_historical_seed_donor");
-    alternateCatchup.repairPurpose = ProdigyCohortRepairPurpose::seed;
-    expect(!prodigyCousinSessionRecordValid(alternateCatchup),
-        "native_seed_remains_bound_to_held_historical_cut_donor");
-    ProdigyCousinSessionLocalCommand target = {};
-    target.protocolVersion = 4; target.session = repair; target.requestUUID = repair.requestUUID; target.localHalf = CousinRouteHalf::source;
-    target.kind = ProdigyCousinSessionLocalKind::activate; target.validForMs = ProdigyCousinSessionLeaseMs; target.psk.fill(0x5a);
-    int64_t issued = 0;
-    expect(prodigyCousinSessionRealtimeMilliseconds(issued), "native_repair_has_grant_clock");
-    target.nativeLeaseExpiresAtMilliseconds = issued + target.validForMs;
-    expect(prodigyNativeRepairLeaseRemainingMs(target, issued + 17) == target.validForMs - 17 &&
-        prodigyNativeRepairLeaseRemainingMs(target, target.nativeLeaseExpiresAtMilliseconds) == 0,
-        "native_repair_delivery_delay_consumes_only_issued_lease");
-    (void)prodigyCousinSessionDigest(repair, target.canonicalContext);
-    auto donor = target; donor.localHalf = CousinRouteHalf::destination; donor.kind = ProdigyCousinSessionLocalKind::install;
-    ProdigyCousinSessionClient targetOwner(repair.repairTarget.containerUUID), donorOwner(repair.repairDonor.containerUUID);
-    expect(prodigyCousinSessionLocalCommandValid(target) && prodigyCousinSessionLocalCommandValid(donor) &&
-        targetOwner.applyCommand(target) && donorOwner.applyCommand(donor), "native_repair_maps_target_pull_and_donor_listener");
-    auto legacy = target; legacy.protocolVersion = 3;
-    expect(!prodigyCousinSessionLocalCommandValid(legacy), "native_repair_rejected_by_legacy_local_command");
-    ProdigyCousinSessionControl control = {}; control.session = repair;
-    expect(!prodigyCousinSessionControlValid(control), "native_repair_rejected_by_pair_control");
-    auto revoke = target; revoke.kind = ProdigyCousinSessionLocalKind::revoke; revoke.validForMs = 0; revoke.nativeLeaseExpiresAtMilliseconds = 0;
-    revoke.psk.fill(0); revoke.canonicalContext.clear();
-    expect(prodigyCousinSessionLocalCommandValid(revoke) && targetOwner.applyCommand(revoke),
-        "native_repair_revoke_remains_valid_without_psk_after_expiry");
-    invalid = repair; invalid.repairExpiresAtMilliseconds = 1;
-    auto expired = target; expired.session = invalid; expired.nativeLeaseExpiresAtMilliseconds = 1; (void)prodigyCousinSessionDigest(invalid, expired.canonicalContext);
-    ProdigyCousinSessionClient expiredOwner(invalid.repairTarget.containerUUID);
-    expect(prodigyCousinSessionLocalCommandValid(expired) && !expiredOwner.applyCommand(expired),
-        "native_repair_rejects_absolute_expiry_at_apply");
-    ProdigyTransportNodeCredential credential = {};
-    credential.operationUUID = 0x9510; credential.nodeUUID = repair.repairTarget.nodeUUID;
-    credential.clusterUUID = repair.repairAuthority.targetClusterUUID; credential.authorityEpoch = 1; credential.keyEpoch = 2;
-    credential.authorityGeneration = credential.rootAuthorityGeneration = 3; credential.role = ProdigyTransportCredentialNodeRole::neuron;
-    credential.secret[0] = 1; std::array<uint8_t, 32> first = {}, second = {}; String changed = {};
-    auto altered = repair; ++altered.repairGenerationUUID;
-    expect(prodigyDeriveNativeStatefulRepairPSK(credential, 0x9511, repair.repairDonor.nodeUUID,
-               ProdigyTransportCredentialNodeRole::neuron, digest, first.data()) &&
-        prodigyCousinSessionDigest(altered, changed) && prodigyDeriveNativeStatefulRepairPSK(credential, 0x9511,
-               repair.repairDonor.nodeUUID, ProdigyTransportCredentialNodeRole::neuron, changed, second.data()) && first != second,
-        "native_repair_kdf_is_bound_to_immutable_generation_digest");
-  }
-  if (nativeRepairOnly) return failures == 0 ? 0 : 1;
   {
     // Capacity required by the fixed three-site cohort: ordinary sessions,
     // retained source pulls, and two remote App6 instances at each peer.

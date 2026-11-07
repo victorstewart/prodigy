@@ -12,16 +12,9 @@
 #include <set>
 #include <thread>
 
-// Existing retained-fleet frames embed these records inline. The seed field is
-// part of their fixed layout. Only a separately bounded native startup frame
-// can use bytes remaining after it to detect a generation selection.
+// Existing retained-fleet frames embed these records inline. Their seed field
+// is fixed-layout: the next embedded record is not an optional startup tail.
 template<typename S> void mothershipSerializeRetainedParameters(S& s, ContainerParameters& parameters) {
-  if constexpr (requires { s.adapter().isCompletedSuccessfully(); }) {
-    parameters.statefulStoreGenerationSelection = {.protocolVersion = 0};
-  } else {
-    MothershipTidesMigration::require(parameters.statefulStoreGenerationSelection.protocolVersion == 0,
-        "retained fleet request cannot encode a selected native store generation");
-  }
   prodigySerializeContainerParameterFields(s, parameters);
   s.object(parameters.statefulStoreSeedAuthority);
 }

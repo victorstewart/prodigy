@@ -497,16 +497,6 @@ static void assertEmptyMachineColdCanonicalRuntimeRecovery(void)
           decodedCold.states[0].plan.subscriptions.end() &&
       decodedCold.states[0].plan.subscriptions.find(0x5100)->second.nature ==
           SubscriptionNature::any);
-  // The sealed recovery format cannot silently drop a selected startup home.
-  auto selectedRequest = request;
-  selectedRequest.machines[1].parameters[0].statefulStoreGenerationSelection.protocolVersion = 1;
-  bool rejectedSelection = false;
-  try {
-    (void)encodeColdCanonicalSourceRequest(selectedRequest, MothershipTidesMigration::Plan{}, 1, coldSource);
-  } catch (const std::runtime_error&) {
-    rejectedSelection = true;
-  }
-  assert(rejectedSelection);
   auto tamperedCold = coldSource;
   tamperedCold.serializedStates[tamperedCold.serializedStates.size() - 1] ^= 1;
   const String tampered = encodeColdCanonicalSourceRequest(request, MothershipTidesMigration::Plan{}, 1, tamperedCold);

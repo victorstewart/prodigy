@@ -6,7 +6,6 @@
 #include <prodigy/cousin.discovery.h>
 #include <prodigy/cousin.route.h>
 #include <prodigy/cluster.pair.keys.h>
-#include <prodigy/types.h>
 
 // A three-site, three-replica cohort needs 96 ordinary local-half records per
 // site (eight groups, two peers, both directions). The seed source additionally
@@ -21,10 +20,6 @@ constexpr inline uint32_t ProdigyCousinSessionLegacyProtocolVersion = 1;
 constexpr inline uint32_t ProdigyCousinSessionDirectProtocolVersion = 2;
 constexpr inline uint32_t ProdigyCousinSessionProtocolVersion = 3;
 constexpr inline uint32_t ProdigyCousinSessionPrivateContainerProtocolVersion = 4;
-// v5 is deliberately not another ordinary COUSIN route encoding.  It is the
-// same-cohort, native Hot/Cold source-cut repair data plane; its wire branch
-// contains no cluster-pair authority, route, discovery, or carrier fields.
-constexpr inline uint32_t ProdigyCousinSessionNativeRepairProtocolVersion = 5;
 constexpr inline uint32_t ProdigyCousinCarrierMaximumPayloadBytes = 1200;
 constexpr inline uint32_t ProdigyCousinCarrierMaximumCredits = 64;
 
@@ -33,7 +28,6 @@ constexpr inline uint32_t ProdigyCousinCarrierMaximumCredits = 64;
 // stream on the already-established pair-control connection; it is not a
 // listener, tunnel, proxy, or a replacement for the direct data plane.
 enum class ProdigyCousinSessionTransport : uint8_t { direct = 1, reverseCarrier = 2 };
-enum class ProdigyCohortRepairPurpose : uint8_t { seed = 1, catchup = 2 };
 
 enum class ProdigyCousinCarrierKind : uint8_t {
   open = 1, openAck = 2, data = 3, fin = 4, reset = 5, window = 6
@@ -106,22 +100,6 @@ struct ProdigyCousinSessionRouteBinding {
   String authorizationSHA256 = {};
 };
 
-// The target is the active TCP opener and the donor is the passive listener.
-// These are separate from CousinRoute endpoints because native repair has one
-// cluster and must never acquire an ordinary cross-cluster route identity.
-struct ProdigyCohortRepairEndpoint {
-  uint128_t containerUUID = 0;
-  uint128_t nodeUUID = 0;
-  IPAddress address = {};
-  uint16_t tcpPort = 0;
-};
-
-template <typename S>
-static void serialize(S&& s, ProdigyCohortRepairEndpoint& v)
-{
-  s.value16b(v.containerUUID); s.value16b(v.nodeUUID); s.object(v.address); s.value2b(v.tcpPort);
-}
-
 struct ProdigyCousinSessionRecord {
   // Version 1 did not carry route authority. It remains decodable only so
   // persisted/queued legacy messages can be rejected or retired by their
@@ -154,15 +132,6 @@ struct ProdigyCousinSessionRecord {
   // Compatibility storage only: a pair-control counter is local evidence and
   // never part of the v3 record, digest, or KDF context.
   uint64_t carrierConnectionID = 0;
-
-  // v5 only.  `repairAuthority` is the existing, fully retained source-cut
-  // authority; it is not duplicated into a new recovery or key authority.
-  uint128_t repairGenerationUUID = 0;
-  ProdigyStatefulStoreSeedAuthority repairAuthority = {.protocolVersion = 0};
-  ProdigyCohortRepairEndpoint repairTarget = {}, repairDonor = {};
-  ProdigyCohortRepairPurpose repairPurpose = ProdigyCohortRepairPurpose::seed;
-  uint64_t repairService = 0;
-  int64_t repairExpiresAtMilliseconds = 0;
 };
 
 static inline bool prodigyCousinSessionUsesPrivateContainerEndpoints(const ProdigyCousinSessionRecord& session)
@@ -171,22 +140,6 @@ static inline bool prodigyCousinSessionUsesPrivateContainerEndpoints(const Prodi
       session.transport == ProdigyCousinSessionTransport::direct &&
       session.route.authorizedRoute.version == 3 &&
       session.route.authorizedRoute.endpointKind == CousinRouteEndpointKind::privateContainer;
-}
-
-static inline bool prodigyCohortRepairPrivateIPv6AddressValid(const IPAddress& address)
-{
-  return prodigyCousinDirectIPv6AddressValid(address) && (address.v6[0] & 0xfeu) == 0xfcu;
-}
-
-static inline bool prodigyCohortRepairEndpointValid(const ProdigyCohortRepairEndpoint& endpoint)
-{
-  return endpoint.containerUUID != 0 && endpoint.nodeUUID != 0 && endpoint.tcpPort != 0 &&
-      prodigyCohortRepairPrivateIPv6AddressValid(endpoint.address);
-}
-
-static inline bool prodigyCousinNativeRepairSession(const ProdigyCousinSessionRecord& session)
-{
-  return session.protocolVersion == ProdigyCousinSessionNativeRepairProtocolVersion;
 }
 
 enum class ProdigyCousinSessionControlKind : uint8_t {
@@ -260,10 +213,6 @@ struct ProdigyCousinSessionLocalCommand {
   uint64_t carrierGeneration = 0;
   ProdigyCousinSessionRecord session = {};
   uint32_t validForMs = 0;
-  // Both endpoint commands in one native renewal carry the same deadline.
-  // It is authenticated by the Brain control channel, outside the stable
-  // session digest that the existing data stream continues to use.
-  int64_t nativeLeaseExpiresAtMilliseconds = 0;
   std::array<uint8_t, 32> psk = {};
   String canonicalContext = {};
   String failure = {};
@@ -313,11 +262,6 @@ template <typename S>
 static void serialize(S&& s, ProdigyCousinSessionRecord& v)
 {
   s.value4b(v.protocolVersion); s.value16b(v.sessionUUID); s.value16b(v.requestUUID);
-  if (v.protocolVersion == ProdigyCousinSessionNativeRepairProtocolVersion) {
-    s.value16b(v.repairGenerationUUID); s.object(v.repairAuthority);
-    s.object(v.repairTarget); s.object(v.repairDonor); s.value1b(v.repairPurpose); s.value8b(v.repairService); s.value8b(v.repairExpiresAtMilliseconds);
-    return;
-  }
   s.value8b(v.rootGeneration); s.value8b(v.keyEpoch); s.value2b(v.slot);
   s.object(v.sourcePermission); s.value16b(v.sourceContainerUUID); s.value16b(v.sourceNodeUUID);
   s.value4b(v.sourceContainerID); s.value2b(v.sourceShardGroup); s.value2b(v.sourceShardGroups);
@@ -331,7 +275,6 @@ static void serialize(S&& s, ProdigyCousinSessionRecord& v)
     s.value1b(v.transport); s.object(v.sourceCarrier); s.object(v.destinationCarrier);
   }
 }
-
 
 template <typename S>
 static void serialize(S&& s, ProdigyCousinSessionControl& v)
@@ -403,7 +346,6 @@ static void serialize(S&& s, ProdigyCousinSessionLocalCommand& v)
   s.text1b(v.canonicalContext, 64); s.text1b(v.failure, 1024);
   if (v.protocolVersion >= 2) s.object(v.authenticatedSourceAddress);
   if (v.protocolVersion >= 3) { s.value8b(v.carrierConnectionID); s.value8b(v.carrierGeneration); }
-  if (v.protocolVersion == 4) s.value8b(v.nativeLeaseExpiresAtMilliseconds);
 }
 
 template <typename S>
@@ -535,40 +477,6 @@ static inline bool prodigyCousinAutomaticSessionDesired(
 
 static inline bool prodigyCousinSessionRecordValid(const ProdigyCousinSessionRecord& v)
 {
-  if (prodigyCousinNativeRepairSession(v)) {
-    const auto& authority = v.repairAuthority;
-    return v.sessionUUID != 0 && v.requestUUID != 0 && v.repairGenerationUUID != 0 &&
-        prodigyStatefulStoreSeedAuthorityHasSourceCut(authority.protocolVersion) &&
-        authority.protocolVersion == ProdigyStatefulStoreSeedAuthority::sourceCutVersion &&
-        prodigyStatefulStoreSeedAuthorityValid(authority) &&
-        authority.targetClusterUUID == authority.sourceClusterUUID && authority.targetDeploymentID == authority.sourceDeploymentID &&
-        (authority.applicationID == 3 || authority.applicationID == 4) &&
-        authority.storeKind == DeploymentIdentityStoreKind::kv &&
-        prodigyCohortRepairEndpointValid(v.repairTarget) && prodigyCohortRepairEndpointValid(v.repairDonor) &&
-        v.repairTarget.containerUUID == authority.targetContainerUUID &&
-        // A copy still has one retained, held source cut.  A completed home,
-        // however, may catch up from another currently admitted sibling after
-        // that historical cut has expired.  The Brain and the receiving
-        // Neuron fence that sibling to the same sealed cohort and role; the
-        // immutable authority remains in the record as provenance only.
-        (v.repairPurpose != ProdigyCohortRepairPurpose::seed ||
-         v.repairDonor.containerUUID == authority.sourceContainerUUID) &&
-        v.repairTarget.containerUUID != v.repairDonor.containerUUID &&
-        v.repairTarget.nodeUUID != v.repairDonor.nodeUUID &&
-        (v.repairPurpose == ProdigyCohortRepairPurpose::seed || v.repairPurpose == ProdigyCohortRepairPurpose::catchup) &&
-        v.repairService != 0 &&
-        v.repairExpiresAtMilliseconds > 0 &&
-        (v.repairPurpose != ProdigyCohortRepairPurpose::seed ||
-         uint64_t(v.repairExpiresAtMilliseconds) <= authority.retainUntilMilliseconds) &&
-        // These ordinary-session identities are not serialized by v5 and can
-        // never contribute authority to native repair.
-        v.rootGeneration == 0 && v.keyEpoch == 0 && v.slot == 0 &&
-        v.sourcePermission.permissionUUID == 0 && v.sourceContainerUUID == 0 && v.sourceNodeUUID == 0 &&
-        v.sourceContainerID == 0 && v.sourceShardGroup == 0 && v.sourceShardGroups == 0 && v.sourceService == 0 &&
-        v.sourceBindingNonce == 0 && v.sourceAddress.isNull() && v.sourceTCPPort == 0 &&
-        v.destination.containerUUID == 0 && v.sourceCarrier.clusterUUID == 0 && v.sourceCarrier.nodeUUID == 0 &&
-        v.destinationCarrier.clusterUUID == 0 && v.destinationCarrier.nodeUUID == 0 && v.carrierConnectionID == 0;
-  }
   return (v.protocolVersion == ProdigyCousinSessionLegacyProtocolVersion ||
           v.protocolVersion == ProdigyCousinSessionDirectProtocolVersion ||
           v.protocolVersion == ProdigyCousinSessionProtocolVersion ||
@@ -655,63 +563,11 @@ static inline bool prodigyCousinSessionExact(const ProdigyCousinSessionRecord& a
   return prodigyCousinSessionDigest(a, first) && prodigyCousinSessionDigest(b, second) && first == second;
 }
 
-// v5 names the TCP direction independently of cluster membership: target
-// pulls (`source`) and donor listens (`destination`).  Ordinary COUSIN keeps
-// its existing source/destination fields and its distinct-cluster validators.
-static inline uint128_t prodigyCousinSessionContainerForLocalHalf(
-    const ProdigyCousinSessionRecord& session, CousinRouteHalf localHalf)
-{
-  if (prodigyCousinNativeRepairSession(session))
-    return localHalf == CousinRouteHalf::source ? session.repairTarget.containerUUID : session.repairDonor.containerUUID;
-  return localHalf == CousinRouteHalf::source ? session.sourceContainerUUID : session.destination.containerUUID;
-}
-
-static inline uint128_t prodigyCousinSessionPeerContainerForLocalHalf(
-    const ProdigyCousinSessionRecord& session, CousinRouteHalf localHalf)
-{
-  if (prodigyCousinNativeRepairSession(session))
-    return localHalf == CousinRouteHalf::source ? session.repairDonor.containerUUID : session.repairTarget.containerUUID;
-  return localHalf == CousinRouteHalf::source ? session.destination.containerUUID : session.sourceContainerUUID;
-}
-
-static inline uint64_t prodigyCousinSessionServiceForLocalHalf(
-    const ProdigyCousinSessionRecord& session, CousinRouteHalf localHalf)
-{
-  if (prodigyCousinNativeRepairSession(session)) return session.repairService;
-  return localHalf == CousinRouteHalf::source ? session.sourceService : session.destination.service;
-}
-
-static inline const ProdigyCohortRepairEndpoint *prodigyCousinNativeRepairEndpointForLocalHalf(
-    const ProdigyCousinSessionRecord& session, CousinRouteHalf localHalf)
-{
-  if (!prodigyCousinNativeRepairSession(session)) return nullptr;
-  return localHalf == CousinRouteHalf::source ? &session.repairTarget : &session.repairDonor;
-}
-
-static inline bool prodigyCousinNativeRepairSessionCurrent(const ProdigyCousinSessionRecord& session, int64_t nowMilliseconds)
-{
-  return prodigyCousinNativeRepairSession(session) && prodigyCousinSessionRecordValid(session) && nowMilliseconds > 0 &&
-      nowMilliseconds < session.repairExpiresAtMilliseconds &&
-      (session.repairPurpose != ProdigyCohortRepairPurpose::seed ||
-       uint64_t(nowMilliseconds) < session.repairAuthority.retainUntilMilliseconds);
-}
-
-// A delayed command gets only the remainder of the lease issued to the
-// donor and target. This same interval bounds the kernel flow and app key.
-static inline uint32_t prodigyNativeRepairLeaseRemainingMs(const ProdigyCousinSessionLocalCommand& command, int64_t nowMs)
-{
-  if (!prodigyCousinNativeRepairSessionCurrent(command.session, nowMs) ||
-      command.nativeLeaseExpiresAtMilliseconds <= nowMs || command.nativeLeaseExpiresAtMilliseconds > command.session.repairExpiresAtMilliseconds ||
-      command.validForMs == 0 || command.validForMs > ProdigyCousinSessionLeaseMs) return 0;
-  const auto remaining = uint64_t(command.nativeLeaseExpiresAtMilliseconds - nowMs);
-  return remaining > command.validForMs ? 0 : uint32_t(remaining);
-}
-
 static inline bool prodigyCousinSessionControlValid(const ProdigyCousinSessionControl& v)
 {
   const uint8_t kind = uint8_t(v.kind);
   return v.protocolVersion == 1 && v.leaseGeneration != 0 && kind >= 1 && kind <= 5 && v.failure.size() <= 1024 &&
-      !prodigyCousinNativeRepairSession(v.session) && prodigyCousinSessionRecordValid(v.session);
+      prodigyCousinSessionRecordValid(v.session);
 }
 
 static inline bool prodigyCousinSessionControlFromCluster(const ProdigyCousinSessionControl& v, uint128_t cluster)
@@ -731,7 +587,6 @@ static inline bool prodigyCousinSessionControlFromCluster(const ProdigyCousinSes
 
 static inline bool prodigyCousinSessionPublicationValid(const ProdigyCousinSessionPublication& v)
 {
-  if (prodigyCousinNativeRepairSession(v.control.session)) return false;
   const bool endpointBound = v.control.session.protocolVersion < ProdigyCousinSessionProtocolVersion ||
       ((v.localEndpoint == v.control.session.sourceCarrier && v.remoteEndpoint == v.control.session.destinationCarrier) ||
        (v.localEndpoint == v.control.session.destinationCarrier && v.remoteEndpoint == v.control.session.sourceCarrier));
@@ -749,7 +604,6 @@ static inline bool prodigyCousinSessionPublicationValid(const ProdigyCousinSessi
 
 static inline bool prodigyCousinSessionReceiptValid(const ProdigyCousinSessionReceipt& v)
 {
-  if (prodigyCousinNativeRepairSession(v.control.session)) return false;
   if ((v.protocolVersion != 1 && v.protocolVersion != 2) || v.projectionGeneration == 0 || v.connectionID == 0 ||
       !clusterPairControlEndpointValid(v.localEndpoint) || !clusterPairControlEndpointValid(v.remoteEndpoint) ||
       v.localEndpoint.clusterUUID == v.remoteEndpoint.clusterUUID ||
@@ -783,26 +637,10 @@ static inline bool prodigyCousinDestinationSourceProjectionValid(uint32_t versio
 static inline bool prodigyCousinSessionLocalCommandValid(const ProdigyCousinSessionLocalCommand& v)
 {
   const uint8_t kind = uint8_t(v.kind);
-  if ((v.protocolVersion != 1 && v.protocolVersion != 2 && v.protocolVersion != 3 && v.protocolVersion != 4) || v.leaseGeneration == 0 || kind < 1 || kind > 5 || v.requestUUID == 0 ||
+  if ((v.protocolVersion != 1 && v.protocolVersion != 2 && v.protocolVersion != 3) || v.leaseGeneration == 0 || kind < 1 || kind > 5 || v.requestUUID == 0 ||
       !cousinRouteHalfValid(v.localHalf) || v.failure.size() > 1024) return false;
   uint8_t key = 0;
   for (uint8_t byte : v.psk) key |= byte;
-  if (v.protocolVersion == 4) {
-    String digest = {};
-    if (v.kind == ProdigyCousinSessionLocalKind::revoke)
-      return v.authenticatedSourceAddress.isNull() && v.carrierConnectionID == 0 && v.carrierGeneration == 0 &&
-          prodigyCousinNativeRepairSession(v.session) && v.requestUUID == v.session.requestUUID &&
-          v.validForMs == 0 && v.nativeLeaseExpiresAtMilliseconds == 0 && key == 0 && v.canonicalContext.empty();
-    return v.kind != ProdigyCousinSessionLocalKind::reject && v.authenticatedSourceAddress.isNull() &&
-        v.carrierConnectionID == 0 && v.carrierGeneration == 0 &&
-        prodigyCousinNativeRepairSession(v.session) && v.requestUUID == v.session.requestUUID &&
-        v.nativeLeaseExpiresAtMilliseconds > 0 && v.nativeLeaseExpiresAtMilliseconds <= v.session.repairExpiresAtMilliseconds &&
-        v.validForMs != 0 && v.validForMs <= ProdigyCousinSessionLeaseMs && key != 0 &&
-        prodigyCousinSessionDigest(v.session, digest) && digest == v.canonicalContext &&
-        (v.kind != ProdigyCousinSessionLocalKind::install || v.localHalf == CousinRouteHalf::destination) &&
-        (v.kind != ProdigyCousinSessionLocalKind::activate || v.localHalf == CousinRouteHalf::source);
-  }
-  if (prodigyCousinNativeRepairSession(v.session)) return false;
   if (v.kind == ProdigyCousinSessionLocalKind::reject)
     return v.protocolVersion == 1 && v.authenticatedSourceAddress.isNull() && !v.failure.empty() && key == 0 && v.canonicalContext.empty();
   if (!prodigyCousinSessionRecordValid(v.session) || v.requestUUID != v.session.requestUUID) return false;
@@ -828,7 +666,7 @@ static inline bool prodigyCousinSessionLocalAckValid(const ProdigyCousinSessionL
 
 static inline bool prodigyCousinAdmissionCommandValid(const ProdigyCousinAdmissionCommand& v)
 {
-  return !prodigyCousinNativeRepairSession(v.session) && prodigyCousinDestinationSourceProjectionValid(v.protocolVersion, v.session, v.authenticatedSourceAddress) &&
+  return prodigyCousinDestinationSourceProjectionValid(v.protocolVersion, v.session, v.authenticatedSourceAddress) &&
       v.leaseGeneration != 0 && prodigyCousinSessionRecordValid(v.session) &&
       (v.revoke || (v.validForMs != 0 && v.validForMs <= ProdigyCousinSessionLeaseMs));
 }
@@ -845,7 +683,6 @@ static inline bool prodigyCousinSessionKeyContext(const ProdigyCousinSessionReco
                                                  ClusterPairKeyContext& context)
 {
   context = {};
-  if (prodigyCousinNativeRepairSession(session)) return false;
   if (!prodigyCousinSessionDigest(session, context.channelIdentity)) return false;
   context.scope = ClusterPairKeyScope::serviceRoute;
   context.purpose = ClusterPairKeyPurpose::serviceSessionAuthentication;
