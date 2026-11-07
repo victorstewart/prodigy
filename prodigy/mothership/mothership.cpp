@@ -13457,8 +13457,16 @@ REMOTE_RUNTIME
         // script again can exceed the SSH exec packet before the server runs
         // it. Keep the existing shell boundary and reject an oversized request.
         require(command.size()<LIBSSH2_PACKET_MAXCOMP-1024,"runtime recovery command exceeds the SSH exec bound");
-        require(remoteRuntimeRecoveryCommand(cluster,member.machineUUID,text(command),output,failure),
-                "remote runtime recovery command failed; resume exact operation after reconciling recorded phase");
+        String captured={}; String *reply=output?output:&captured;
+        const bool okay=remoteRuntimeRecoveryCommand(cluster,member.machineUUID,text(command),reply,failure);
+        if(!okay && !reply->empty()) {
+          // The SSH owner may prefer stderr when both streams are populated.
+          // Preserve the verifier's structured rejection even when a bundle
+          // prefix fallback also emitted tar diagnostics on stderr.
+          failure.append("\nrecovery member="_ctv); String id={}; id.assignItoh(member.machineUUID); failure.append(id);
+          failure.append(" stdout: "_ctv); failure.append(*reply);
+        }
+        require(okay,"remote runtime recovery command failed; resume exact operation after reconciling recorded phase");
       };
       const auto run=[&](const auto& member,const std::string& command,String *output=nullptr) {
         runStrict(member,remoteRecoveryStrictShell(command),output);
