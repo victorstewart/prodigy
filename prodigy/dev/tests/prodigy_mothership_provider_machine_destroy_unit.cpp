@@ -153,6 +153,12 @@ int main(void)
 
   ClusterTopology observedTopology = topology;
   failure.clear();
+  suite.expect(mothershipValidateObservedMachineAuthorizationProjection(topology,observedTopology,&failure) && failure.empty(),
+               "process_recovery_authorization_preserves_registered_adopted_members");
+  observedTopology.machines[1].source=ClusterMachineSource::created;
+  suite.expect(!mothershipValidateObservedMachineAuthorizationProjection(topology,observedTopology,&failure),
+               "process_recovery_authorization_rejects_adopted_origin_substitution");
+  observedTopology=topology;
   suite.expect(mothershipResolveVerifiedCreatedCloudMachineID(
                    topology, observedTopology, created.uuid, resolvedCloudID, &failure) &&
                    resolvedCloudID == created.cloud.cloudID && failure.empty(),

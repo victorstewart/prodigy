@@ -13317,14 +13317,13 @@ REMOTE_RUNTIME
       require(prodigyComputeSHA256Hex(topologyBytes,topologySHA,&failure) && prodigyComputeSHA256Hex(admissionBytes,admissionSHA,&failure),
               "recovery authority binding digest failed");
       const auto preflight=[&]() {
-        ClusterTopology provider={}; ClusterCreateHooks hooks(this);
-        require(hooks.fetchSeedTopology(cluster,provider,&failure) && provider==cluster.topology,
-                "recovery provider-confirmed topology differs");
-        for(const auto& member:cluster.topology.machines) {
-          String cloudID={};
-          require(mothershipResolveVerifiedCreatedCloudMachineID(cluster.topology,provider,member.uuid,cloudID,&failure),
-                  "recovery provider member identity differs");
-        }
+        ClusterTopology observed={}; ClusterCreateHooks hooks(this);
+        // Process recovery applies to registered adopted machines as well as
+        // created machines. Validate the durable authorization projection;
+        // provider hard-reboot authority is neither needed nor exercised.
+        require(hooks.fetchSeedTopology(cluster,observed,&failure) && observed==cluster.topology &&
+                mothershipValidateObservedMachineAuthorizationProjection(cluster.topology,observed,&failure),
+                "recovery authenticated topology or machine authorization differs");
         require(configureControlTarget(identity.c_str(),&failure),"recovery control target unavailable");
         ProdigyUpgradeAdmissionReportRequest request={}; request.operationID=operationText;
         request.targetBundleSHA256=approved.bundleSHA256; request.targetContractSHA256=approved.contract.contractSHA256;
