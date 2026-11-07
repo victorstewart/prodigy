@@ -1812,6 +1812,34 @@ static void assertInitialSeedRuntimeRepair()
 
 int main()
 {
+  // Generic runtime recovery may inspect only decoded private copies.  Its
+  // neutral admission must refuse any unfinished update coordinator rather
+  // than treating an interrupted rollout as disposable state.
+  {
+    const uint128_t cluster=0x9a01, member=0x9a02;
+    ClusterTopology topology = {};
+    ClusterMachine brain = {}; brain.uuid=member; brain.isBrain=true;
+    topology.machines.push_back(brain);
+    ProdigyPersistentLocalBrainState local = {}; local.uuid=member; local.ownerClusterUUID=cluster;
+    ProdigyPersistentBrainSnapshot snapshot = {};
+    snapshot.brainConfig.clusterUUID=cluster; snapshot.topology=topology;
+    snapshot.masterAuthority.runtimeState.generation=1;
+    snapshot.masterAuthority.runtimeState.hasCompletedInitialMasterElection=true;
+    String failure = {};
+    assert(mothershipRuntimeRecoverySnapshotValid(local,snapshot,cluster,member,topology,&failure));
+    auto wrongOwner=local; wrongOwner.ownerClusterUUID=cluster+1;
+    assert(!mothershipRuntimeRecoverySnapshotValid(wrongOwner,snapshot,cluster,member,topology,&failure));
+    assert(failure=="private local Brain owner differs from recovery member"_ctv);
+    auto wrongTopology=topology; wrongTopology.machines[0].uuid=member+1;
+    assert(!mothershipRuntimeRecoverySnapshotValid(local,snapshot,cluster,member,wrongTopology,&failure));
+    snapshot.masterAuthority.runtimeState.updateSelf.state=
+        uint8_t(ProdigyPersistentUpdateSelfState::Phase::waitingForBundleEchos);
+    assert(!mothershipRuntimeRecoverySnapshotValid(local,snapshot,cluster,member,topology,&failure));
+    assert(failure=="private Brain snapshot contains an in-flight update-self coordinator"_ctv);
+    snapshot.masterAuthority.runtimeState.updateSelf={};
+    snapshot.masterAuthority.runtimeState.updateSelfFollowerReadyPeerKeys.push_back(1);
+    assert(!mothershipRuntimeRecoverySnapshotValid(local,snapshot,cluster,member,topology,&failure));
+  }
   if (const char *only=std::getenv("PRODIGY_TEST_ONLY");only &&
       (std::strcmp(only,"initial-seed-runtime-repair")==0 || std::strcmp(only,"populated-seed-runtime-repair")==0)) {
     assertInitialSeedRuntimeRepair();std::puts("INITIAL_SEED_RUNTIME_REPAIR_RESULT failed_assertions=0");return 0;

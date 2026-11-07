@@ -424,6 +424,14 @@ protected:
   std::unique_ptr<Switchboard> switchboard;
   std::unique_ptr<EthDevice> additionalIngressEth;
   std::unique_ptr<EthDevice> privateOverlayEth;
+  // These are local ownership receipts for the exact links this Neuron made
+  // restart-recoverable. They are not a second lifecycle authority: the pins
+  // survive an unexpected same-boot process death, while the Guardian's
+  // ordinary shutdown path releases them before it tears the service down.
+  SwitchboardHostTCXRetentionPair retainedPrimaryHostTCX = {};
+  SwitchboardHostTCXRetentionPair retainedPrivateOverlayHostTCX = {};
+  bool retainedPrimaryHostTCXPresent = false;
+  bool retainedPrivateOverlayHostTCXPresent = false;
   SwitchboardOverlayRoutingConfig overlayRoutingConfig;
   ProdigyOverlayPresenceMirror<switchboard_overlay_prefix4_key> installedIngressOverlayPrefixes4;
   ProdigyOverlayPresenceMirror<switchboard_overlay_prefix6_key> installedIngressOverlayPrefixes6;
@@ -4030,6 +4038,85 @@ protected:
     }
   }
 
+  bool retainExactHostTCXForUnexpectedRestart(EthDevice& device,
+                                               SwitchboardHostTCXRetentionPair& retained,
+                                               bool& retainedPresent,
+                                               String *failureReport,
+                                               bool *created = nullptr)
+  {
+    if (created) *created = false;
+    SwitchboardHostTCXRetentionPair candidate = {};
+    bool present = false;
+    if (switchboardHostTCXReadRetainedPair(device, "/sys/fs/bpf"_ctv, candidate, present) == false ||
+        (present && switchboardHostTCXVerifyRetainedPair(device, "/sys/fs/bpf"_ctv, candidate) == false))
+    {
+      if (failureReport) failureReport->assign("invalid retained host TCX pins"_ctv);
+      return false;
+    }
+    if (present == false && switchboardHostTCXRetainCurrentPair(device, "/sys/fs/bpf"_ctv, candidate) == false)
+    {
+      if (failureReport) failureReport->assign("cannot retain exact host TCX pair"_ctv);
+      return false;
+    }
+    if (switchboardHostTCXVerifyRetainedPair(device, "/sys/fs/bpf"_ctv, candidate) == false)
+    {
+      // This Neuron created the candidate only after observing no pair. Exact
+      // release cannot remove a replacement's pin, and avoids leaving a
+      // failed startup's pair to be mistaken for a recovery witness.
+      if (present == false)
+      {
+        (void)switchboardHostTCXReleaseExact("/sys/fs/bpf"_ctv, candidate.ingress);
+        (void)switchboardHostTCXReleaseExact("/sys/fs/bpf"_ctv, candidate.egress);
+      }
+      if (failureReport) failureReport->assign("retained host TCX identity changed"_ctv);
+      return false;
+    }
+    retained = candidate;
+    retainedPresent = true;
+    if (created) *created = present == false;
+    return true;
+  }
+
+  void releaseExactHostTCXForGracefulShutdown(SwitchboardHostTCXRetentionPair& retained,
+                                               bool& retainedPresent,
+                                               const char *scope)
+  {
+    if (retainedPresent == false) return;
+    if (switchboardHostTCXVerifyRetainedPair(retained.ingress.interfaceIndex, "/sys/fs/bpf"_ctv, retained) == false)
+    {
+      basics_log("neuron graceful shutdown retained %s TCX release rejected ifidx=%u\n", scope,
+                 retained.ingress.interfaceIndex);
+      return;
+    }
+    const bool ingressReleased = switchboardHostTCXReleaseExact("/sys/fs/bpf"_ctv, retained.ingress);
+    const bool egressReleased = switchboardHostTCXReleaseExact("/sys/fs/bpf"_ctv, retained.egress);
+    if (ingressReleased == false || egressReleased == false)
+    {
+      basics_log("neuron graceful shutdown retained %s TCX release failed ifidx=%u ingress=%d egress=%d\n", scope,
+                 retained.ingress.interfaceIndex, int(ingressReleased), int(egressReleased));
+      return;
+    }
+    retained = {};
+    retainedPresent = false;
+  }
+
+  bool retainHostTCXForUnexpectedRestart(String *failureReport)
+  {
+    bool primaryCreated = false;
+    if (retainExactHostTCXForUnexpectedRestart(eth, retainedPrimaryHostTCX,
+                                                retainedPrimaryHostTCXPresent, failureReport, &primaryCreated) == false)
+      return false;
+    if (privateOverlayEth &&
+        retainExactHostTCXForUnexpectedRestart(*privateOverlayEth, retainedPrivateOverlayHostTCX,
+                                                retainedPrivateOverlayHostTCXPresent, failureReport) == false)
+    {
+      if (primaryCreated)
+        releaseExactHostTCXForGracefulShutdown(retainedPrimaryHostTCX, retainedPrimaryHostTCXPresent, "primary");
+      return false;
+    }
+    return true;
+  }
+
   // we don't run this until after the brain sends us our fragment and any container plans, because we use
   // haveFragments as a test of whether it was a spurious connection break or a neuron crash/update or machine crash/update
   void setupNetworking(String *failureReport = nullptr)
@@ -4329,7 +4416,8 @@ protected:
     // container network. Consume the optional, root-owned ingress selection
     // here too, rather than relying on a later container setup to attach it.
     String additionalIngressFailure = {};
-    if (ensureAdditionalIngressReady(&additionalIngressFailure) == false)
+    const bool additionalIngressReady = ensureAdditionalIngressReady(&additionalIngressFailure);
+    if (additionalIngressReady == false)
     {
       if (failureReport && failureReport->empty())
       {
@@ -4338,6 +4426,14 @@ protected:
       std::fprintf(stderr, "neuron additional ingress setup failed reason=%s\n",
                    additionalIngressFailure.c_str());
       std::fflush(stderr);
+    }
+
+    if (hostRouterBPFEnabled && additionalIngressReady &&
+        retainHostTCXForUnexpectedRestart(failureReport) == false)
+    {
+      std::fprintf(stderr, "neuron host TCX retention setup failed reason=%s ifidx=%d\n",
+                   failureReport ? failureReport->c_str() : "retention rejected", eth.ifidx);
+      return;
     }
   }
 
@@ -4561,15 +4657,22 @@ protected:
       return false;
     }
 
-    return ensurePrivateOverlayHostRoutingReady(failureReport) && ensureAdditionalIngressReady(failureReport);
+    return ensurePrivateOverlayHostRoutingReady(failureReport) && ensureAdditionalIngressReady(failureReport) &&
+           retainHostTCXForUnexpectedRestart(failureReport);
   }
 
 public:
 
-  // Guardian shutdown does not rely on C++ destruction. Release the optional
-  // ingress while this Neuron still has the exact attachment identity.
+  // Guardian shutdown does not rely on C++ destruction. Release the exact
+  // runtime-owned restart pins, then the optional ingress, while this Neuron
+  // still owns the corresponding attachment identities. Unexpected death and
+  // bundle exec deliberately do not call this path.
   void detachAdditionalIngressForShutdown(void)
   {
+    releaseExactHostTCXForGracefulShutdown(retainedPrivateOverlayHostTCX,
+                                           retainedPrivateOverlayHostTCXPresent, "private-overlay");
+    releaseExactHostTCXForGracefulShutdown(retainedPrimaryHostTCX,
+                                           retainedPrimaryHostTCXPresent, "primary");
     if (switchboard) switchboard->detachAdditionalIngress();
     additionalIngressEth.reset();
   }

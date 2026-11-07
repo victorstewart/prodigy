@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <networking/includes.h>
@@ -16,6 +17,7 @@
 #include <prodigy/mothership/mothership.cluster.reconcile.h>
 #include <prodigy/mothership/mothership.cluster.test.h>
 #include <prodigy/mothership/mothership.cluster.types.h>
+#include <prodigy/mothership/mothership.upgrade.contract.h>
 #include <prodigy/mothership/mothership.tunnel.auth.h>
 #include <prodigy/mothership/mothership.tunnel.policy.h>
 #include <prodigy/mothership/mothership.virtual.datacenter.h>
@@ -621,6 +623,115 @@ static void serialize(S&& serializer, MothershipUpgradeAdmissionRecord& record)
   serializer.object(record.rejectedObservations);
 }
 
+// This is Mothership-only recovery authority for a same-format live runtime
+// replacement.  It intentionally records neither a VM lifecycle action nor a
+// database transformation.  Each member's frozen-runtime evidence is sealed
+// once so a resumed controller cannot silently substitute a different process,
+// store, or container inventory.
+enum class MothershipRemoteRuntimeRecoveryPhase : uint8_t {
+  admitted = 0,
+  staged = 1,
+  fenced = 2,
+  frozen = 3,
+  quiesced = 4,
+  installed = 5,
+  activationStarted = 6,
+  completed = 7,
+};
+
+class MothershipRemoteRuntimeRecoveryMember {
+public:
+  uint128_t machineUUID = 0;
+  String linuxMachineID;
+  String bootID;
+  uint64_t sourceProcessPID = 0;
+  uint64_t sourceProcessStartTicks = 0;
+  String stateSHA256;
+  String secretsSHA256;
+  String containerInventorySHA256;
+  String privateLoaderSHA256;
+  String retainedNetworkSHA256;
+  bool targetRuntimeInstalled = false;
+  // Index zero is the staged receipt; each later entry corresponds to the
+  // next monotonic cohort phase. The marker is derived from the operation,
+  // member, and phase so a stale SSH response cannot be credited elsewhere.
+  class PhaseReceipt {
+  public:
+    String operationMarker;
+    String receiptSHA256;
+  };
+  Vector<PhaseReceipt> phaseReceipts;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipRemoteRuntimeRecoveryMember::PhaseReceipt& receipt)
+{
+  serializer.text1b(receipt.operationMarker, 192);
+  serializer.text1b(receipt.receiptSHA256, 64);
+}
+
+template <typename S>
+static void serialize(S&& serializer, MothershipRemoteRuntimeRecoveryMember& member)
+{
+  serializer.value16b(member.machineUUID);
+  serializer.text1b(member.linuxMachineID, 64);
+  serializer.text1b(member.bootID, 64);
+  serializer.value8b(member.sourceProcessPID);
+  serializer.value8b(member.sourceProcessStartTicks);
+  serializer.text1b(member.stateSHA256, 64);
+  serializer.text1b(member.secretsSHA256, 64);
+  serializer.text1b(member.containerInventorySHA256, 64);
+  serializer.text1b(member.privateLoaderSHA256, 64);
+  serializer.text1b(member.retainedNetworkSHA256, 64);
+  serializer.value1b(member.targetRuntimeInstalled);
+  serializer.container(member.phaseReceipts, 7);
+}
+
+class MothershipRemoteRuntimeRecoveryCohortRecord {
+public:
+  uint32_t version = 3;
+  uint128_t clusterUUID = 0;
+  uint128_t operationID = 0;
+  String runtimeRoot;
+  uint64_t authorityGeneration = 0;
+  bool cohortInterruptionAccepted = false;
+  String topologySHA256;
+  String admissionRecordSHA256;
+  String sourceBundleSHA256;
+  String sourceContractSHA256;
+  String sourceProdigySHA256;
+  String sourceMothershipSHA256;
+  String targetBundleSHA256;
+  String targetContractSHA256;
+  String targetProdigySHA256;
+  String targetMothershipSHA256;
+  MothershipRemoteRuntimeRecoveryPhase phase = MothershipRemoteRuntimeRecoveryPhase::admitted;
+  Vector<MothershipRemoteRuntimeRecoveryMember> members;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipRemoteRuntimeRecoveryCohortRecord& record)
+{
+  serializer.value4b(record.version);
+  serializer.value16b(record.clusterUUID);
+  serializer.value16b(record.operationID);
+  serializer.text1b(record.runtimeRoot, 4096);
+  serializer.value8b(record.authorityGeneration);
+  serializer.value1b(record.cohortInterruptionAccepted);
+  serializer.text1b(record.topologySHA256, 64);
+  serializer.text1b(record.admissionRecordSHA256, 64);
+  serializer.text1b(record.sourceBundleSHA256, 64);
+  serializer.text1b(record.sourceContractSHA256, 64);
+  serializer.text1b(record.sourceProdigySHA256, 64);
+  serializer.text1b(record.sourceMothershipSHA256, 64);
+  serializer.text1b(record.targetBundleSHA256, 64);
+  serializer.text1b(record.targetContractSHA256, 64);
+  serializer.text1b(record.targetProdigySHA256, 64);
+  serializer.text1b(record.targetMothershipSHA256, 64);
+  serializer.value1b(record.phase);
+  serializer.container(record.members, 3);
+}
+
 // Private Mothership intent.  It is deliberately separate from a Brain's
 // replicated enrollment: this record makes the one-time root and pair identity
 // retry-safe while each Brain remains the sole runtime authority owner.
@@ -1074,6 +1185,7 @@ private:
   constexpr static auto clustersColumnFamily = "clusters"_ctv;
   constexpr static auto clustersByUUIDColumnFamily = "clusters_by_uuid"_ctv;
   constexpr static auto upgradeAdmissionsColumnFamily = "upgrade_admissions"_ctv;
+  constexpr static auto remoteRuntimeRecoveryCohortsColumnFamily = "remote_runtime_recovery_cohorts"_ctv;
   constexpr static auto testPairBoundariesColumnFamily = "test_pair_boundaries"_ctv;
   constexpr static auto cousinRoutesColumnFamily = "cousin_routes"_ctv;
   constexpr static auto cousinRouteReceiptsColumnFamily = "cousin_route_receipts"_ctv;
@@ -3542,6 +3654,35 @@ public:
     return true;
   }
 
+  // Recovery command processes are independently restartable. Serialize their
+  // check/read/write sequence so an overlapping operation cannot pass the
+  // unresolved-cohort check between another process's read and write.
+  struct RemoteRuntimeRecoveryLock {
+    int fd = -1;
+    RemoteRuntimeRecoveryLock() = default;
+    RemoteRuntimeRecoveryLock(const RemoteRuntimeRecoveryLock&) = delete;
+    RemoteRuntimeRecoveryLock& operator=(const RemoteRuntimeRecoveryLock&) = delete;
+    ~RemoteRuntimeRecoveryLock() { if (fd >= 0) ::close(fd); }
+  };
+
+  bool lockRemoteRuntimeRecovery(RemoteRuntimeRecoveryLock& lock, String *failure = nullptr) const
+  {
+    String path = db.path();
+    path.append(".remote-runtime-recovery.lock"_ctv);
+    lock.fd = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+    struct stat st = {};
+    if (lock.fd < 0 || ::fstat(lock.fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_uid != ::geteuid() || st.st_nlink != 1 || (st.st_mode & 0077) != 0 ||
+        ::flock(lock.fd, LOCK_EX | LOCK_NB) != 0)
+    {
+      if (lock.fd >= 0) { ::close(lock.fd); lock.fd = -1; }
+      if (failure) failure->assign("remote runtime recovery registry lock unavailable"_ctv);
+      return false;
+    }
+    if (failure) failure->clear();
+    return true;
+  }
+
   static bool validateClusterForStorage(const MothershipProdigyCluster& cluster, MothershipProdigyCluster& normalizedCluster, String *failure = nullptr)
   {
     MothershipProdigyCluster candidate = cluster;
@@ -4350,6 +4491,324 @@ public:
     }
     if (failure) failure->clear();
     return true;
+  }
+
+  static bool remoteRuntimeRecoveryMemberIdentityValid(const MothershipRemoteRuntimeRecoveryMember& member)
+  {
+    if (member.machineUUID == 0 || member.linuxMachineID.size() != 32 || !remoteRuntimeRecoveryBootIDValid(member.bootID) ||
+        member.sourceProcessPID <= 1 || member.sourceProcessStartTicks == 0) return false;
+    for (uint64_t index = 0; index < member.linuxMachineID.size(); ++index)
+      if (!((member.linuxMachineID[index] >= '0' && member.linuxMachineID[index] <= '9') ||
+            (member.linuxMachineID[index] >= 'a' && member.linuxMachineID[index] <= 'f'))) return false;
+    return true;
+  }
+
+  static bool remoteRuntimeRecoveryBootIDValid(const String& bootID)
+  {
+    if (bootID.size() != 36) return false;
+    for (uint64_t index = 0; index < bootID.size(); ++index)
+    {
+      if (index == 8 || index == 13 || index == 18 || index == 23)
+      { if (bootID[index] != '-') return false; continue; }
+      if (!((bootID[index] >= '0' && bootID[index] <= '9') ||
+            (bootID[index] >= 'a' && bootID[index] <= 'f'))) return false;
+    }
+    return true;
+  }
+
+  static bool remoteRuntimeRecoveryMemberProofSealed(const MothershipRemoteRuntimeRecoveryMember& member)
+  {
+    return prodigyIsSHA256HexDigest(member.stateSHA256) &&
+           prodigyIsSHA256HexDigest(member.secretsSHA256) &&
+           prodigyIsSHA256HexDigest(member.containerInventorySHA256) &&
+           prodigyIsSHA256HexDigest(member.privateLoaderSHA256) &&
+           prodigyIsSHA256HexDigest(member.retainedNetworkSHA256);
+  }
+
+  static uint32_t remoteRuntimeRecoveryPhaseReceiptCount(MothershipRemoteRuntimeRecoveryPhase phase)
+  {
+    return uint32_t(phase);
+  }
+
+  static void remoteRuntimeRecoveryOperationMarker(uint128_t operationID, uint128_t machineUUID,
+                                                    MothershipRemoteRuntimeRecoveryPhase phase, String& marker)
+  {
+    String operation = {}, machine = {}, phaseNumber = {};
+    operation.assignItoh(operationID); machine.assignItoh(machineUUID); phaseNumber.assignItoh(uint64_t(phase));
+    marker.assign("remote-runtime-recovery/"_ctv); marker.append(operation); marker.append('/');
+    marker.append(machine); marker.append('/'); marker.append(phaseNumber);
+  }
+
+  static bool remoteRuntimeRecoveryMemberReceiptsValid(const MothershipRemoteRuntimeRecoveryCohortRecord& record,
+                                                        const MothershipRemoteRuntimeRecoveryMember& member)
+  {
+    if (member.phaseReceipts.size() != remoteRuntimeRecoveryPhaseReceiptCount(record.phase)) return false;
+    for (uint32_t index = 0; index < member.phaseReceipts.size(); ++index)
+    {
+      const auto& receipt = member.phaseReceipts[index];
+      String expected = {};
+      remoteRuntimeRecoveryOperationMarker(record.operationID, member.machineUUID,
+                                            MothershipRemoteRuntimeRecoveryPhase(index + 1), expected);
+      if (receipt.operationMarker != expected || !prodigyIsSHA256HexDigest(receipt.receiptSHA256)) return false;
+    }
+    return true;
+  }
+
+  static bool remoteRuntimeRecoveryIdentityMatches(const MothershipRemoteRuntimeRecoveryCohortRecord& lhs,
+                                                   const MothershipRemoteRuntimeRecoveryCohortRecord& rhs)
+  {
+    if (lhs.version != 3 || rhs.version != 3 || lhs.clusterUUID != rhs.clusterUUID ||
+        lhs.operationID != rhs.operationID || lhs.runtimeRoot != rhs.runtimeRoot ||
+        lhs.authorityGeneration != rhs.authorityGeneration ||
+        lhs.cohortInterruptionAccepted != rhs.cohortInterruptionAccepted || lhs.topologySHA256 != rhs.topologySHA256 ||
+        lhs.admissionRecordSHA256 != rhs.admissionRecordSHA256 ||
+        lhs.sourceBundleSHA256 != rhs.sourceBundleSHA256 || lhs.sourceContractSHA256 != rhs.sourceContractSHA256 ||
+        lhs.sourceProdigySHA256 != rhs.sourceProdigySHA256 || lhs.sourceMothershipSHA256 != rhs.sourceMothershipSHA256 ||
+        lhs.targetBundleSHA256 != rhs.targetBundleSHA256 || lhs.targetContractSHA256 != rhs.targetContractSHA256 ||
+        lhs.targetProdigySHA256 != rhs.targetProdigySHA256 || lhs.targetMothershipSHA256 != rhs.targetMothershipSHA256 ||
+        lhs.members.size() != rhs.members.size()) return false;
+    for (uint32_t index = 0; index < lhs.members.size(); ++index)
+    {
+      const auto& left = lhs.members[index]; const auto& right = rhs.members[index];
+      if (left.machineUUID != right.machineUUID || left.linuxMachineID != right.linuxMachineID ||
+          left.bootID != right.bootID || left.sourceProcessPID != right.sourceProcessPID ||
+          left.sourceProcessStartTicks != right.sourceProcessStartTicks) return false;
+    }
+    return true;
+  }
+
+  static bool remoteRuntimeRecoveryCohortValid(const MothershipRemoteRuntimeRecoveryCohortRecord& record)
+  {
+    if (record.version != 3 || record.runtimeRoot.empty() || record.runtimeRoot[0] != '/' ||
+        record.authorityGeneration == 0 || !record.cohortInterruptionAccepted || record.clusterUUID == 0 || record.operationID == 0 || record.members.size() != 3 ||
+        uint8_t(record.phase) > uint8_t(MothershipRemoteRuntimeRecoveryPhase::completed) ||
+        !prodigyIsSHA256HexDigest(record.topologySHA256) || !prodigyIsSHA256HexDigest(record.admissionRecordSHA256) ||
+        !prodigyIsSHA256HexDigest(record.sourceBundleSHA256) ||
+        !prodigyIsSHA256HexDigest(record.sourceContractSHA256) || !prodigyIsSHA256HexDigest(record.sourceProdigySHA256) ||
+        !prodigyIsSHA256HexDigest(record.sourceMothershipSHA256) || !prodigyIsSHA256HexDigest(record.targetBundleSHA256) ||
+        !prodigyIsSHA256HexDigest(record.targetContractSHA256) || !prodigyIsSHA256HexDigest(record.targetProdigySHA256) ||
+        !prodigyIsSHA256HexDigest(record.targetMothershipSHA256)) return false;
+    bool allProofs = true;
+    for (uint32_t index = 0; index < record.members.size(); ++index)
+    {
+      if (!remoteRuntimeRecoveryMemberIdentityValid(record.members[index])) return false;
+      for (uint32_t prior = 0; prior < index; ++prior)
+        if (record.members[prior].machineUUID == record.members[index].machineUUID ||
+            record.members[prior].linuxMachineID == record.members[index].linuxMachineID) return false;
+      const auto& member = record.members[index];
+      const bool anyProof = !member.stateSHA256.empty() || !member.secretsSHA256.empty() ||
+                            !member.containerInventorySHA256.empty() || !member.privateLoaderSHA256.empty() ||
+                            !member.retainedNetworkSHA256.empty();
+      if (anyProof && !remoteRuntimeRecoveryMemberProofSealed(member)) return false;
+      allProofs = allProofs && remoteRuntimeRecoveryMemberProofSealed(member);
+      if (!remoteRuntimeRecoveryMemberReceiptsValid(record, member) ||
+          (uint8_t(record.phase) < uint8_t(MothershipRemoteRuntimeRecoveryPhase::frozen) && anyProof) ||
+          (uint8_t(record.phase) < uint8_t(MothershipRemoteRuntimeRecoveryPhase::installed) && member.targetRuntimeInstalled) ||
+          (uint8_t(record.phase) >= uint8_t(MothershipRemoteRuntimeRecoveryPhase::installed) && !member.targetRuntimeInstalled)) return false;
+    }
+    if (uint8_t(record.phase) >= uint8_t(MothershipRemoteRuntimeRecoveryPhase::frozen) &&
+        !allProofs) return false;
+    return true;
+  }
+
+  static bool remoteRuntimeRecoveryAllProofsSealed(const MothershipRemoteRuntimeRecoveryCohortRecord& record)
+  {
+    return record.members.size() == 3 && std::all_of(record.members.begin(), record.members.end(),
+        [](const auto& member) { return remoteRuntimeRecoveryMemberProofSealed(member); });
+  }
+
+  static bool remoteRuntimeRecoveryAllMembersInstalled(const MothershipRemoteRuntimeRecoveryCohortRecord& record)
+  {
+    return record.members.size() == 3 && std::all_of(record.members.begin(), record.members.end(),
+        [](const auto& member) { return member.targetRuntimeInstalled; });
+  }
+
+  static void remoteRuntimeRecoveryKey(uint128_t clusterUUID, uint128_t operationID, String& key)
+  {
+    String cluster = {}, operation = {}; cluster.assignItoh(clusterUUID); operation.assignItoh(operationID);
+    key.clear(); key.append(cluster); key.append('/'); key.append(operation);
+  }
+
+  bool admitRemoteRuntimeRecoveryCohort(const MothershipRemoteRuntimeRecoveryCohortRecord& requested,
+                                        const MothershipProdigyCluster& cluster,
+                                        MothershipRemoteRuntimeRecoveryCohortRecord& recorded,
+                                        bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    RemoteRuntimeRecoveryLock lock = {};
+    if (!lockRemoteRuntimeRecovery(lock, failure)) return false;
+    if (!remoteRuntimeRecoveryCohortValid(requested) ||
+        requested.phase != MothershipRemoteRuntimeRecoveryPhase::admitted ||
+        cluster.clusterUUID != requested.clusterUUID || cluster.deploymentMode != MothershipClusterDeploymentMode::remote ||
+        cluster.provider != MothershipClusterProvider::vultr || cluster.nBrains != 3 || cluster.topology.machines.size() != 3 ||
+        cluster.remoteProdigyPath != requested.runtimeRoot)
+    {
+      if (failure) failure->assign("remote runtime recovery cohort is invalid"_ctv);
+      return false;
+    }
+    ClusterTopology topology = cluster.topology;
+    String topologyBytes = {}, topologySHA256 = {};
+    if (!BitseryEngine::serialize(topologyBytes, topology) ||
+        !prodigyComputeSHA256Hex(topologyBytes, topologySHA256, failure) || topologySHA256 != requested.topologySHA256)
+    {
+      if (failure && failure->empty()) failure->assign("remote runtime recovery topology binding differs"_ctv);
+      return false;
+    }
+    for (uint32_t index = 0; index < requested.members.size(); ++index)
+    {
+      const ClusterMachine& machine = cluster.topology.machines[index];
+      if (machine.uuid != requested.members[index].machineUUID || !machine.isBrain)
+      {
+        if (failure) failure->assign("remote runtime recovery member order is not the registered Brain topology"_ctv);
+        return false;
+      }
+    }
+    MothershipUpgradeAdmissionRecord admission = {};
+    String admissionBytes = {}, admissionSHA256 = {};
+    if (!loadUpgradeAdmission(requested.clusterUUID, requested.operationID, admission, failure) || !admission.eligible ||
+        admission.approvedPath != uint8_t(MothershipUpgradePath::sameLogicalRollout) ||
+        admission.authorityGeneration != requested.authorityGeneration ||
+        admission.sourceBundleSHA256 != requested.sourceBundleSHA256 ||
+        admission.sourceContractSHA256 != requested.sourceContractSHA256 || admission.sourceProdigySHA256 != requested.sourceProdigySHA256 ||
+        admission.sourceMothershipSHA256 != requested.sourceMothershipSHA256 ||
+        admission.targetBundleSHA256 != requested.targetBundleSHA256 || admission.targetContractSHA256 != requested.targetContractSHA256 ||
+        !BitseryEngine::serialize(admissionBytes, admission) ||
+        !prodigyComputeSHA256Hex(admissionBytes, admissionSHA256, failure) || admissionSHA256 != requested.admissionRecordSHA256)
+    {
+      if (failure && failure->empty()) failure->assign("remote runtime recovery admission does not bind the requested artifacts"_ctv);
+      return false;
+    }
+    String key = {}, encoded = {}, readFailure = {}; remoteRuntimeRecoveryKey(requested.clusterUUID, requested.operationID, key);
+    if (db.read(remoteRuntimeRecoveryCohortsColumnFamily, key, encoded, &readFailure))
+    {
+      if (!BitseryEngine::deserializeSafe(encoded, recorded) || !remoteRuntimeRecoveryCohortValid(recorded) ||
+          !remoteRuntimeRecoveryIdentityMatches(recorded, requested))
+      {
+        if (failure) failure->assign("remote runtime recovery operation identity conflicts with existing record"_ctv);
+        return false;
+      }
+      resumed = true; if (failure) failure->clear(); return true;
+    }
+    if (!readFailure.equal("record not found"_ctv)) { if (failure) *failure = readFailure; return false; }
+    Vector<String> existingCohorts = {};
+    if (!db.listValues(remoteRuntimeRecoveryCohortsColumnFamily, existingCohorts, failure)) return false;
+    for (const auto& bytes : existingCohorts)
+    {
+      MothershipRemoteRuntimeRecoveryCohortRecord other = {};
+      if (!BitseryEngine::deserializeSafe(bytes, other) || !remoteRuntimeRecoveryCohortValid(other))
+      { if (failure) failure->assign("remote runtime recovery encountered an invalid prior cohort"_ctv); return false; }
+      if (other.clusterUUID == requested.clusterUUID && other.operationID != requested.operationID &&
+          other.phase != MothershipRemoteRuntimeRecoveryPhase::completed)
+      { if (failure) failure->assign("remote runtime recovery has an unresolved overlapping cohort"_ctv); return false; }
+    }
+    BitseryEngine::serialize(encoded, requested);
+    if (!db.write(remoteRuntimeRecoveryCohortsColumnFamily, key, encoded, failure)) return false;
+    recorded = requested; if (failure) failure->clear(); return true;
+  }
+
+  bool loadRemoteRuntimeRecoveryCohort(uint128_t clusterUUID, uint128_t operationID,
+                                       MothershipRemoteRuntimeRecoveryCohortRecord& record,
+                                       String *failure = nullptr)
+  {
+    record = {}; if (clusterUUID == 0 || operationID == 0) { if (failure) failure->assign("remote runtime recovery cluster and operation IDs are required"_ctv); return false; }
+    String key = {}, encoded = {}; remoteRuntimeRecoveryKey(clusterUUID, operationID, key);
+    if (!db.read(remoteRuntimeRecoveryCohortsColumnFamily, key, encoded, failure)) return false;
+    if (!BitseryEngine::deserializeSafe(encoded, record) || !remoteRuntimeRecoveryCohortValid(record) ||
+        record.clusterUUID != clusterUUID || record.operationID != operationID)
+    {
+      record = {}; if (failure) failure->assign("remote runtime recovery record is invalid"_ctv); return false;
+    }
+    if (failure) failure->clear(); return true;
+  }
+
+  // Ordinary upgrade admission uses this read-only interlock before it starts
+  // another process cohort.  Scan under the same lock and validate every
+  // record exactly as cohort admission does, so corrupt unrelated durable
+  // state cannot be mistaken for an empty recovery set.
+  bool remoteRuntimeRecoveryPending(uint128_t clusterUUID, bool& pending, String *failure = nullptr)
+  {
+    pending = false;
+    if (clusterUUID == 0)
+    {
+      if (failure) failure->assign("remote runtime recovery cluster ID is required"_ctv);
+      return false;
+    }
+    RemoteRuntimeRecoveryLock lock = {};
+    if (!lockRemoteRuntimeRecovery(lock, failure)) return false;
+    Vector<String> cohorts = {};
+    if (!db.listValues(remoteRuntimeRecoveryCohortsColumnFamily, cohorts, failure)) return false;
+    for (const String& bytes : cohorts)
+    {
+      MothershipRemoteRuntimeRecoveryCohortRecord record = {};
+      if (!BitseryEngine::deserializeSafe(bytes, record) || !remoteRuntimeRecoveryCohortValid(record))
+      {
+        if (failure) failure->assign("remote runtime recovery encountered an invalid prior cohort"_ctv);
+        return false;
+      }
+      if (record.clusterUUID == clusterUUID && record.phase != MothershipRemoteRuntimeRecoveryPhase::completed)
+        pending = true;
+    }
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool advanceRemoteRuntimeRecoveryCohort(const MothershipRemoteRuntimeRecoveryCohortRecord& candidate,
+                                          MothershipRemoteRuntimeRecoveryPhase nextPhase,
+                                          MothershipRemoteRuntimeRecoveryCohortRecord& recorded,
+                                          bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    RemoteRuntimeRecoveryLock lock = {};
+    if (!lockRemoteRuntimeRecovery(lock, failure)) return false;
+    if (!remoteRuntimeRecoveryCohortValid(candidate) || candidate.phase != nextPhase)
+    { if (failure) failure->assign("remote runtime recovery transition candidate is invalid"_ctv); return false; }
+    MothershipRemoteRuntimeRecoveryCohortRecord current = {};
+    if (!loadRemoteRuntimeRecoveryCohort(candidate.clusterUUID, candidate.operationID, current, failure) ||
+        !remoteRuntimeRecoveryIdentityMatches(current, candidate))
+    { if (failure && failure->empty()) failure->assign("remote runtime recovery transition identity differs"_ctv); return false; }
+    const uint8_t currentPhase = uint8_t(current.phase), requestedPhase = uint8_t(nextPhase);
+    if (requestedPhase < currentPhase || requestedPhase > currentPhase + 1)
+    { if (failure) failure->assign("remote runtime recovery phase regresses or skips"_ctv); return false; }
+    for (uint32_t index = 0; index < current.members.size(); ++index)
+    {
+      const auto& before = current.members[index]; const auto& after = candidate.members[index];
+      if (before.stateSHA256 != after.stateSHA256 || before.secretsSHA256 != after.secretsSHA256 ||
+          before.containerInventorySHA256 != after.containerInventorySHA256 ||
+          before.privateLoaderSHA256 != after.privateLoaderSHA256 ||
+          before.retainedNetworkSHA256 != after.retainedNetworkSHA256)
+      {
+        if (remoteRuntimeRecoveryMemberProofSealed(before) || requestedPhase < uint8_t(MothershipRemoteRuntimeRecoveryPhase::frozen) ||
+            !remoteRuntimeRecoveryMemberProofSealed(after))
+        { if (failure) failure->assign("remote runtime recovery stopped proof mutates or is premature"_ctv); return false; }
+      }
+      if (before.targetRuntimeInstalled != after.targetRuntimeInstalled &&
+          (before.targetRuntimeInstalled || requestedPhase != uint8_t(MothershipRemoteRuntimeRecoveryPhase::installed) ||
+           !after.targetRuntimeInstalled))
+      { if (failure) failure->assign("remote runtime recovery installed member marker mutates or is premature"_ctv); return false; }
+      if (before.phaseReceipts.size() > after.phaseReceipts.size() ||
+          after.phaseReceipts.size() != remoteRuntimeRecoveryPhaseReceiptCount(nextPhase))
+      { if (failure) failure->assign("remote runtime recovery phase receipt regresses or skips"_ctv); return false; }
+      for (uint32_t receiptIndex = 0; receiptIndex < before.phaseReceipts.size(); ++receiptIndex)
+        if (before.phaseReceipts[receiptIndex].operationMarker != after.phaseReceipts[receiptIndex].operationMarker ||
+            before.phaseReceipts[receiptIndex].receiptSHA256 != after.phaseReceipts[receiptIndex].receiptSHA256)
+        { if (failure) failure->assign("remote runtime recovery phase receipt mutates"_ctv); return false; }
+    }
+    if (requestedPhase >= uint8_t(MothershipRemoteRuntimeRecoveryPhase::activationStarted) &&
+        (!remoteRuntimeRecoveryAllProofsSealed(candidate) || !remoteRuntimeRecoveryAllMembersInstalled(candidate)))
+    { if (failure) failure->assign("remote runtime recovery activation requires every sealed stopped store proof"_ctv); return false; }
+    if (requestedPhase == currentPhase)
+    {
+      String currentBytes = {}, candidateBytes = {};
+      auto currentCopy = current, candidateCopy = candidate;
+      if (!BitseryEngine::serialize(currentBytes, currentCopy) || !BitseryEngine::serialize(candidateBytes, candidateCopy) || currentBytes != candidateBytes)
+      { if (failure) failure->assign("remote runtime recovery same-phase replay differs"_ctv); return false; }
+      recorded = current; resumed = true; if (failure) failure->clear(); return true;
+    }
+    String key = {}, encoded = {}; remoteRuntimeRecoveryKey(candidate.clusterUUID, candidate.operationID, key);
+    auto replacement = candidate;
+    BitseryEngine::serialize(encoded, replacement);
+    if (!db.write(remoteRuntimeRecoveryCohortsColumnFamily, key, encoded, failure)) return false;
+    recorded = std::move(replacement); if (failure) failure->clear(); return true;
   }
 
   // The flock spans lookup and write, unlike TidesDB's per-call transactions.

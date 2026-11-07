@@ -13,6 +13,51 @@
 
 static inline bool mothershipRetainedRecoveryPlansEqual(const DeploymentPlan&,const DeploymentPlan&);
 
+// Read-only admission for a generic stopped-runtime replacement.  The caller
+// supplies objects decoded by Prodigy's persistent store from private copies;
+// this validator never opens, rewrites, or normalizes a store.  An old
+// update-self coordinator is meaningful authority, not stale clutter, so a
+// generic recovery must reject it rather than silently clearing it.
+static inline bool mothershipRuntimeRecoverySnapshotValid(
+    const ProdigyPersistentLocalBrainState& local,
+    const ProdigyPersistentBrainSnapshot& snapshot,
+    uint128_t expectedClusterUUID, uint128_t expectedMemberUUID,
+    const ClusterTopology& expectedTopology, String *failure = nullptr)
+{
+  const auto reject = [&](const char *reason) { if (failure) failure->assign(reason); return false; };
+  if (failure) failure->clear();
+  if (!expectedClusterUUID || !expectedMemberUUID) return reject("runtime recovery identity is empty");
+  if (local.uuid != expectedMemberUUID || local.ownerClusterUUID != expectedClusterUUID)
+    return reject("private local Brain owner differs from recovery member");
+  if (snapshot.brainConfig.clusterUUID != expectedClusterUUID)
+    return reject("private Brain snapshot cluster differs from recovery cohort");
+  String observedBytes = {}, expectedBytes = {};
+  auto observedTopology=snapshot.topology, expectedTopologyCopy=expectedTopology;
+  if (!BitseryEngine::serialize(observedBytes,observedTopology) ||
+      !BitseryEngine::serialize(expectedBytes,expectedTopologyCopy) || observedBytes != expectedBytes)
+    return reject("private Brain snapshot topology differs from recovery cohort");
+  uint32_t memberMatches=0;
+  for (const ClusterMachine& machine : snapshot.topology.machines)
+    if (machine.uuid==expectedMemberUUID && machine.isBrain) ++memberMatches;
+  if (memberMatches!=1) return reject("recovery member is not one exact Brain in private topology");
+  const auto& authority=snapshot.masterAuthority.runtimeState;
+  if (!authority.hasCompletedInitialMasterElection || authority.generation==0)
+    return reject("private Brain snapshot lacks completed durable initial election");
+  const ProdigyPersistentUpdateSelfState idle = {};
+  if (authority.updateSelf != idle || authority.updateSelfFollowerConcurrency != 0 ||
+      !authority.updateSelfFollowerTransitionIssuedPeerKeys.empty() ||
+      !authority.updateSelfFollowerReadyPeerKeys.empty())
+    return reject("private Brain snapshot contains an in-flight update-self coordinator");
+  if (!authority.pendingAddMachinesOperations.empty() || !authority.pendingAddMachinesProvisioningIntents.empty() ||
+      !authority.pendingAutonomousProvisioningOperations.empty() || !authority.pendingElasticAddressAssignments.empty() ||
+      !authority.pendingElasticAddressReleases.empty() || !authority.statefulWorkerTopologyUpgradeOperations.empty() ||
+      !authority.deferredStatefulScaleIntents.empty() || !authority.materializedStatefulRecoveryOperations.empty() ||
+      !authority.materializedStatefulRecoveryRetries.empty() || !authority.retainedStatefulRearmProofs.empty() ||
+      !authority.taskExecutions.empty())
+    return reject("private Brain snapshot contains an unsupported in-flight authority operation");
+  return true;
+}
+
 // The original same-format repair admits only the unmaterialized first seed. It never
 // edits this snapshot: the command owner checks private copies and retains the
 // original state and paired secrets directories byte-for-byte.
