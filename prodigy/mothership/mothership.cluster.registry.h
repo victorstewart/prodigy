@@ -14,6 +14,7 @@
 #include <prodigy/iaas/bootstrap.ssh.h>
 #include <prodigy/cousin.route.h>
 #include <prodigy/cluster.pair.authority.h>
+#include <prodigy/cluster.machine.helpers.h>
 #include <prodigy/mothership/mothership.cluster.reconcile.h>
 #include <prodigy/mothership/mothership.cluster.test.h>
 #include <prodigy/mothership/mothership.cluster.types.h>
@@ -4733,9 +4734,25 @@ public:
   {
     if (parent.version == 0 || declared.version < parent.version || parent.machines.size() != 3 ||
         declared.machines.size() != parent.machines.size()) return false;
-    ClusterTopology normalized = declared;
-    normalized.version = parent.version;
-    return normalized == parent;
+    // Brain persists hardware observations in the authoritative topology after
+    // startup. They can advance without changing the admitted machine's
+    // configuration or resource totals; both topology hashes remain sealed.
+    bool refreshedHardware = false;
+    for (uint32_t index = 0; index < parent.machines.size(); ++index)
+    {
+      const ClusterMachine& before = parent.machines[index];
+      const ClusterMachine& after = declared.machines[index];
+      ClusterMachine normalized = after;
+      normalized.hardware = before.hardware;
+      if (normalized != before) return false;
+      if (after.hardware != before.hardware)
+      {
+        if (after.hardware.collectedAtMs <= 0 || after.hardware.collectedAtMs <= before.hardware.collectedAtMs ||
+            !prodigyMachineHardwareInventoryReady(after.hardware)) return false;
+        refreshedHardware = true;
+      }
+    }
+    return !refreshedHardware || declared.version > parent.version;
   }
 
   static bool remoteRuntimeRecoveryHandoffValid(const MothershipRemoteRuntimeRecoveryHandoffRecord& handoff)
@@ -4969,6 +4986,8 @@ public:
       const MothershipRemoteRuntimeRecoveryCohortRecord& childRequested,
       String *failure = nullptr)
   {
+    if (!remoteRuntimeRecoveryParentToDeclaredTopologyValid(remoteRuntimeRecoveryParentTopology(requested), requested.declaredTopology))
+    { if (failure) failure->assign("remote runtime recovery handoff parent topology semantic change is invalid"_ctv); return false; }
     if (!remoteRuntimeRecoveryHandoffValid(requested) || !remoteRuntimeRecoveryCohortValid(childRequested) ||
         childRequested.phase != MothershipRemoteRuntimeRecoveryPhase::admitted ||
         cluster.clusterUUID != requested.clusterUUID || cluster.clusterUUID != childRequested.clusterUUID ||

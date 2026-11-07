@@ -183,6 +183,12 @@ int main(void)
     machine.isBrain = true;
     remote.topology.machines.push_back(std::move(machine));
   }
+  remote.topology.machines[0].hardware.inventoryComplete = true;
+  remote.topology.machines[0].hardware.collectedAtMs = 10;
+  remote.topology.machines[0].hardware.cpu.logicalCores = 4;
+  remote.topology.machines[0].hardware.memory.totalMB = 8192;
+  remote.topology.machines[0].totalLogicalCores = 4;
+  remote.topology.machines[0].totalMemoryMB = 8192;
   String topologyBytes = {}, topologySHA256 = {};
   auto topologyCopy = remote.topology;
   assert(BitseryEngine::serialize(topologyBytes, topologyCopy));
@@ -513,6 +519,8 @@ int main(void)
   handoffParent = recoveryStored;
   const ClusterTopology parentTopology = remote.topology;
   ++remote.topology.version;
+  remote.topology.machines[0].hardware.collectedAtMs = 11;
+  remote.topology.machines[0].hardware.network.internet.attempted = true;
   auto handoffAdmission = expectedEligibleAdmission;
   handoffAdmission.operationID = uint128_t(0xD31);
   handoffAdmission.targetBundleSHA256 = digest('e');
@@ -592,6 +600,25 @@ int main(void)
   auto decreasedDeclaredTopology = handoff;
   decreasedDeclaredTopology.declaredTopology.version = parentTopology.version - 1;
   assert(!MothershipClusterRegistry::remoteRuntimeRecoveryHandoffValid(decreasedDeclaredTopology));
+  auto staleHardware = handoff.declaredTopology;
+  staleHardware.machines[0].hardware.collectedAtMs = parentTopology.machines[0].hardware.collectedAtMs;
+  assert(!MothershipClusterRegistry::remoteRuntimeRecoveryParentToDeclaredTopologyValid(parentTopology, staleHardware));
+  auto versionOnlyAdvance = parentTopology;
+  ++versionOnlyAdvance.version;
+  assert(MothershipClusterRegistry::remoteRuntimeRecoveryParentToDeclaredTopologyValid(parentTopology, versionOnlyAdvance));
+  auto sameVersionHardware = parentTopology;
+  sameVersionHardware.machines[0].hardware.collectedAtMs = parentTopology.machines[0].hardware.collectedAtMs + 1;
+  sameVersionHardware.machines[0].hardware.network.internet.attempted = true;
+  assert(!MothershipClusterRegistry::remoteRuntimeRecoveryParentToDeclaredTopologyValid(parentTopology, sameVersionHardware));
+  auto notReadyHardware = handoff.declaredTopology;
+  notReadyHardware.machines[0].hardware.inventoryComplete = false;
+  assert(!MothershipClusterRegistry::remoteRuntimeRecoveryParentToDeclaredTopologyValid(parentTopology, notReadyHardware));
+  auto changedCapacity = handoff.declaredTopology;
+  ++changedCapacity.machines[0].totalMemoryMB;
+  assert(!MothershipClusterRegistry::remoteRuntimeRecoveryParentToDeclaredTopologyValid(parentTopology, changedCapacity));
+  auto changedIdentity = handoff.declaredTopology;
+  ++changedIdentity.machines[0].uuid;
+  assert(!MothershipClusterRegistry::remoteRuntimeRecoveryParentToDeclaredTopologyValid(parentTopology, changedIdentity));
   auto missingReceipt = handoff;
   missingReceipt.restorationReceiptSHA256.pop_back();
   assert(!registry.admitRemoteRuntimeRecoveryHandoff(missingReceipt, remote, handoffChild, handoffStored, recoveryStored, resumed, &failure));

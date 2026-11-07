@@ -13740,10 +13740,30 @@ REMOTE_RUNTIME
         }
         if(recorded && record.phase==Phase::frozen) {bool superseded=false;require(registry.remoteRuntimeRecoveryParentSuperseded(record,superseded,&failure) && !superseded,"recovery operation was handed off; resume its recorded child");}
       }
-      require(!handedOff || (parentOperation==handoff.parentOperationID && cluster.topology==handoff.declaredTopology),"recovery child requires its exact declared handoff");
+      require(!handedOff || (parentOperation==handoff.parentOperationID &&
+              MothershipClusterRegistry::remoteRuntimeRecoveryParentToDeclaredTopologyValid(handoff.declaredTopology,cluster.topology)),
+              "recovery child registered configuration differs from its declared handoff");
       require(!parentOperation || parentOperation!=operation,"recovery cannot hand off to itself");
       require(driverInput.empty() || recorded,"a separate recovery controller may only resume an existing immutable operation");
       auto currentTopology=handedOff?handoff.observedTopology:cluster.topology;
+      // Startup can persist a newer hardware observation. Replay the original
+      // request and its proofs while validating the current declaration's
+      // unchanged configuration through the shared observation comparison.
+      if(recorded && !handedOff) {
+        String canonical={};canonical.assignItoh(operation);
+        const auto immutableRequest=fs::path(str(registryPath)).parent_path()/"runtime-recovery"/str(canonical)/"request.bin";
+        if(fs::exists(immutableRequest)) {
+          MothershipRetainedRecovery::privateFile(immutableRequest);
+          MothershipRemoteRuntimeRecoveryRequest original={};
+          require(BitseryEngine::deserializeSafe(text(read(immutableRequest)),original) &&
+                  (original.version==1 || original.version==2) &&
+                  original.cohort.phase==Phase::admitted && MothershipClusterRegistry::remoteRuntimeRecoveryCohortValid(original.cohort) &&
+                  MothershipClusterRegistry::remoteRuntimeRecoveryIdentityMatches(original.cohort,record) &&
+                  MothershipClusterRegistry::remoteRuntimeRecoveryParentToDeclaredTopologyValid(original.topology,cluster.topology),
+                  "recovery immutable topology or current registered configuration differs");
+          currentTopology=original.topology;
+        } else require(record.phase==Phase::admitted,"recovery immutable request is missing after staging");
+      }
       if(parentOperation && !handedOff) {ClusterCreateHooks hooks(this);
         require(hooks.fetchSeedTopology(cluster,currentTopology,&failure) &&
             MothershipClusterRegistry::remoteRuntimeRecoveryRackOnlyTopologyDriftValid(cluster.topology,currentTopology),
@@ -14106,7 +14126,8 @@ REMOTE_RUNTIME
       require(record.phase==Phase::activationStarted || record.phase==Phase::completed,"recovery phase is unsupported");
       ClusterStatusReport status={}; bool healthy=false;
       for(unsigned attempt=0;attempt<120;++attempt) {
-        if(productionClusterHealthy(cluster,status,failure) && status.topology==currentTopology) { healthy=true; break; }
+        if(productionClusterHealthy(cluster,status,failure) &&
+           MothershipClusterRegistry::remoteRuntimeRecoveryParentToDeclaredTopologyValid(currentTopology,status.topology)) { healthy=true; break; }
         ::usleep(500'000);
       }
       require(healthy,"recovery awaits fresh healthy three-Brain quorum");
@@ -14115,14 +14136,22 @@ REMOTE_RUNTIME
       observation.targetBundleSHA256=approved.bundleSHA256; observation.targetContractSHA256=approved.contract.contractSHA256;
       observation.requiredStagingBytes=approved.contract.requiredFreeBytes;
       MothershipUpgradeAdmissionReport report={};
-      require(requestUpgradeAdmissionReport(observation,report,failure) && report.observationComplete && report.master &&
-              report.clusterUUID==cluster.clusterUUID && report.masterApprovedBundleSHA256==record.targetBundleSHA256 &&
-              report.authorityGeneration>=record.authorityGeneration && report.healthyCommissionedBrainCount==3 && report.peers.size()==3 &&
-              report.authorityQuorumHealthy && report.authorityAcknowledged && report.recoveryWitnessAcknowledged &&
-              report.commissionedPeerTransportVerified && report.fleetBundleDigestsFresh && report.fleetInventoriesFresh,
-              "recovery awaits fresh authenticated target inventory and authority acknowledgements");
-      for(const auto& peer:report.peers) require(peer.installedBundleSHA256==record.targetBundleSHA256 && peer.stateUploadFresh &&
-          peer.localInstalledBundleVerified && peer.authorityAcknowledged && peer.recoveryWitnessAcknowledged,"recovery target peer attestation is incomplete");
+      bool attested=false;
+      for(unsigned attempt=0;attempt<30;++attempt) {
+        // The first report starts the existing asynchronous peer probes.
+        // Completion still requires one fresh complete report for this exact
+        // operation and target; a partial report never seals the cohort.
+        attested=requestUpgradeAdmissionReport(observation,report,failure) && report.observationComplete && report.master &&
+            report.clusterUUID==cluster.clusterUUID && report.masterApprovedBundleSHA256==record.targetBundleSHA256 &&
+            report.authorityGeneration>=record.authorityGeneration && report.healthyCommissionedBrainCount==3 && report.peers.size()==3 &&
+            report.authorityQuorumHealthy && report.authorityAcknowledged && report.recoveryWitnessAcknowledged &&
+            report.commissionedPeerTransportVerified && report.fleetBundleDigestsFresh && report.fleetInventoriesFresh;
+        if(attested) for(const auto& peer:report.peers) attested=attested && peer.installedBundleSHA256==record.targetBundleSHA256 &&
+            peer.stateUploadFresh && peer.localInstalledBundleVerified && peer.authorityAcknowledged && peer.recoveryWitnessAcknowledged;
+        if(attested) break;
+        ::usleep(500'000);
+      }
+      require(attested,"recovery awaits fresh authenticated target inventory and authority acknowledgements");
       for(const auto& member:record.members) run(member,active(member));
       if(record.phase!=Phase::completed) sealPhase(Phase::completed);
       basics_log("recoverRemoteClusterRuntime success=1 completed=1 operationID=%s members=3 bootIdentitiesPreserved=1 prodigySHA256=%s mothershipSHA256=%s\n",
@@ -14167,7 +14196,8 @@ REMOTE_RUNTIME
         require(linked || failure=="record not found"_ctv,"abort recovery handoff is unreadable");failure.clear();
         if(linked) {
           MothershipRemoteRuntimeRecoveryCohortRecord parent={};bool superseded=false;
-          require(handoff.declaredTopology==cluster.topology && registry.loadRemoteRuntimeRecoveryCohort(cluster.clusterUUID,handoff.parentOperationID,parent,&failure) &&
+          require(MothershipClusterRegistry::remoteRuntimeRecoveryParentToDeclaredTopologyValid(handoff.declaredTopology,cluster.topology) &&
+                  registry.loadRemoteRuntimeRecoveryCohort(cluster.clusterUUID,handoff.parentOperationID,parent,&failure) &&
                   registry.remoteRuntimeRecoveryParentSuperseded(parent,superseded,&failure) && superseded,"abort child handoff binding changed");
           recoveryTopology=handoff.observedTopology;
         }}
@@ -14193,23 +14223,27 @@ REMOTE_RUNTIME
               prodigyComputeFileSHA256Hex("/proc/self/exe"_ctv,selfSHA,&failure) &&
               prodigyValidateRuntimeRecoveryDriver(driver,selfSHA,targetIdentity,architectureName,cluster.clusterUUID,&failure),
               "abort controller is not separately approved for the immutable target");
-      String bytes={},digest={};auto topology=recoveryTopology;BitseryEngine::serialize(bytes,topology);
-      require(prodigyComputeSHA256Hex(bytes,digest,&failure) && digest==record.topologySHA256 &&
-              record.runtimeRoot==cluster.remoteProdigyPath,"abort registered topology or runtime root differs");
-      BitseryEngine::serialize(bytes,admission);
-      require(admission.eligible && admission.targetBundleSHA256==record.targetBundleSHA256 &&
-              prodigyComputeSHA256Hex(bytes,digest,&failure) && digest==record.admissionRecordSHA256,
-              "abort immutable upgrade admission differs");
       String canonical={};canonical.assignItoh(operation);
       const auto root="/var/lib/prodigy/runtime-recovery/"+str(canonical);
       const auto localRoot=fs::path(str(registryPath)).parent_path()/"runtime-recovery"/str(canonical);
       const auto runtime=str(record.runtimeRoot); const std::string cg="/sys/fs/cgroup/system.slice/prodigy.service";
       MothershipRemoteRuntimeRecoveryRequest original={};String originalBytes={},binding={};
+      MothershipRetainedRecovery::privateFile(localRoot/"request.bin");
       require(mothershipVDCRead(text((localRoot/"request.bin").string()),originalBytes,16*1024*1024) &&
               BitseryEngine::deserializeSafe(originalBytes,original) && (original.version==1 || original.version==2) &&
               original.cohort.phase==Phase::admitted && MothershipClusterRegistry::remoteRuntimeRecoveryCohortValid(original.cohort) &&
               MothershipClusterRegistry::remoteRuntimeRecoveryIdentityMatches(original.cohort,record) &&
               prodigyComputeSHA256Hex(originalBytes,binding,&failure),"abort original request binding invalid");
+      require(MothershipClusterRegistry::remoteRuntimeRecoveryParentToDeclaredTopologyValid(original.topology,recoveryTopology),
+              "abort current registered configuration differs from its immutable topology");
+      recoveryTopology=original.topology;
+      String bytes={},digest={};auto topology=recoveryTopology;BitseryEngine::serialize(bytes,topology);
+      require(prodigyComputeSHA256Hex(bytes,digest,&failure) && digest==record.topologySHA256 &&
+              record.runtimeRoot==cluster.remoteProdigyPath,"abort original topology or runtime root differs");
+      BitseryEngine::serialize(bytes,admission);
+      require(admission.eligible && admission.targetBundleSHA256==record.targetBundleSHA256 &&
+              prodigyComputeSHA256Hex(bytes,digest,&failure) && digest==record.admissionRecordSHA256,
+              "abort immutable upgrade admission differs");
       String frozenBytes={},frozenSHA={};BitseryEngine::serialize(frozenBytes,frozen);
       require(prodigyComputeSHA256Hex(frozenBytes,frozenSHA,&failure),"abort frozen cohort digest unavailable");
       const auto sourceGuard=[&](const auto& member) {
@@ -14302,7 +14336,8 @@ REMOTE_RUNTIME
       }
       ClusterStatusReport status={};bool healthy=false;
       for(unsigned attempt=0;attempt<120;++attempt) {
-        if(productionClusterHealthy(cluster,status,failure) && status.topology==recoveryTopology) {healthy=true;break;}
+        if(productionClusterHealthy(cluster,status,failure) &&
+           MothershipClusterRegistry::remoteRuntimeRecoveryParentToDeclaredTopologyValid(recoveryTopology,status.topology)) {healthy=true;break;}
         ::usleep(500'000);
       }
       require(healthy && configureControlTarget(identity.c_str(),&failure),"abort awaits restored source quorum");
