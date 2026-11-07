@@ -5701,6 +5701,17 @@ static bool bootstrapLocalProdigy(
 
 // The same immutable request is staged on every member.  The local command is
 // part of the approved Mothership bundle; only the controller owns sequencing.
+struct MothershipRemoteRuntimeRecoveryExecutionLock {
+  int fd=-1;
+  ~MothershipRemoteRuntimeRecoveryExecutionLock(){if(fd>=0)::close(fd);}
+  bool acquire(const String& registryPath) {
+    String path=registryPath; path.append(".remote-runtime-recovery-execution.lock"_ctv);
+    fd=::open(path.c_str(),O_CREAT|O_RDWR|O_CLOEXEC|O_NOFOLLOW,0600);
+    struct stat st={};
+    return fd>=0 && ::fstat(fd,&st)==0 && S_ISREG(st.st_mode) && st.st_uid==::geteuid() &&
+        st.st_nlink==1 && (st.st_mode&0077)==0 && ::flock(fd,LOCK_EX|LOCK_NB)==0;
+  }
+};
 struct MothershipRemoteRuntimeRecoveryRequest {
   uint32_t version = 1;
   MothershipRemoteRuntimeRecoveryCohortRecord cohort;
@@ -13284,13 +13295,8 @@ REMOTE_RUNTIME
               cluster.nBrains==3 && cluster.topology.machines.size()==3,"recovery requires one registered three-Brain remote cluster");
       pathCheck(str(cluster.remoteProdigyPath));
       String registryPath={}; { auto registry=openClusterRegistry(); registryPath=registry.path(); }
-      String lockPath=registryPath; lockPath.append(".remote-runtime-recovery-execution.lock"_ctv);
-      struct Lock { int fd=-1; ~Lock(){if(fd>=0)::close(fd);} } lock;
-      lock.fd=::open(lockPath.c_str(),O_CREAT|O_RDWR|O_CLOEXEC|O_NOFOLLOW,0600);
-      struct stat st={};
-      require(lock.fd>=0 && ::fstat(lock.fd,&st)==0 && S_ISREG(st.st_mode) && st.st_uid==::geteuid() &&
-              st.st_nlink==1 && (st.st_mode&0077)==0 && ::flock(lock.fd,LOCK_EX|LOCK_NB)==0,
-              "another runtime recovery executor is active or lock ownership is invalid");
+      MothershipRemoteRuntimeRecoveryExecutionLock lock;
+      require(lock.acquire(registryPath),"another runtime recovery executor is active or lock ownership is invalid");
       MachineCpuArchitecture architecture=MachineCpuArchitecture::unknown;
       String bundlePath={}; ProdigyApprovedUpgradeBundle approved={};
       require(resolveProdigyBundleTargetArchitecture(identity.c_str(),architecture,&failure) &&
@@ -13397,9 +13403,16 @@ REMOTE_RUNTIME
         return "env -u PRODIGY_STATE_DB -u PRODIGY_STATE_SECRETS_DB LD_LIBRARY_PATH="+quote(target+"/lib")+" "+quote(target+"/tools/mothership")+
             " remoteRuntimeRecoveryLocal "+quote(root)+" "+quote(str(binding))+" "+quote(str(id))+" "+mode;
       };
-      const auto run=[&](const auto& member,const std::string& command,String *output=nullptr) {
-        require(remoteRuntimeRecoveryCommand(cluster,member.machineUUID,text("bash -euo pipefail -c "+quote(command)),output,failure),
+      const auto runStrict=[&](const auto& member,const std::string& command,String *output=nullptr) {
+        // Attested actions already own a strict shell. Wrapping their quoted
+        // script again can exceed the SSH exec packet before the server runs
+        // it. Keep the existing shell boundary and reject an oversized request.
+        require(command.size()<LIBSSH2_PACKET_MAXCOMP-1024,"runtime recovery command exceeds the SSH exec bound");
+        require(remoteRuntimeRecoveryCommand(cluster,member.machineUUID,text(command),output,failure),
                 "remote runtime recovery command failed; resume exact operation after reconciling recorded phase");
+      };
+      const auto run=[&](const auto& member,const std::string& command,String *output=nullptr) {
+        runStrict(member,"bash -euo pipefail -c "+quote(command),output);
       };
       const auto sealPhase=[&](Phase phase) {
         auto next=record; next.phase=phase;
@@ -13425,7 +13438,7 @@ REMOTE_RUNTIME
               " | cut -d' ' -f1)\" = "+quote(str(approved.bundleSHA256))+"; printf '%s\\n' "+quote(str(approved.bundleSHA256))+" > "+quote(root+"/target.bundle.upload.sha256")+"; "+str(install);
           const auto kernelCheck="python3 -c "+quote("import hashlib,pathlib,sys; a=pathlib.Path(sys.argv[1]); b=pathlib.Path(sys.argv[2]); x={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in a.glob('*.ebpf.o')}; y={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in b.glob('*.ebpf.o')}; assert x and x==y")+" "+quote(runtime)+" "+quote(target)+"; ";
           const auto predicate=sourceGuard(member)+installed(target)+"test \"$(sha256sum "+quote(root+"/request.bin")+" | cut -d' ' -f1)\" = "+quote(str(binding))+"; "+kernelCheck;
-          run(member,remoteRecoveryAttestedCommand(root,str(binding),"staged",sourceGuard(member),predicate,action));
+          runStrict(member,remoteRecoveryAttestedCommand(root,str(binding),"staged",sourceGuard(member),predicate,action));
         }
         sealPhase(Phase::staged);
       }
@@ -13433,14 +13446,14 @@ REMOTE_RUNTIME
         preflight();
         for(const auto& member:record.members) {
           const auto fenceCheck=sourceGuard(member)+"test \"$(cat "+quote(root+"/writers-fenced")+")\" = "+quote(str(binding))+"; systemctl show -p Conditions --value prodigy | grep -F -- "+quote(root+"/writers-fenced")+" > /dev/null; ";
-          run(member,remoteRecoveryAttestedCommand(root,str(binding),"fenced",sourceGuard(member),fenceCheck,runtimeStartupFenceCommand(root,str(binding))));
+          runStrict(member,remoteRecoveryAttestedCommand(root,str(binding),"fenced",sourceGuard(member),fenceCheck,runtimeStartupFenceCommand(root,str(binding))));
         }
         sealPhase(Phase::fenced);
       }
       if(record.phase==Phase::fenced) {
         // No service stop/kill occurs until all three sources are frozen.
         for(const auto& member:record.members)
-          run(member,remoteRecoveryAttestedCommand(root,str(binding),"frozen",sourceGuard(member),sourceGuard(member)+remoteRecoveryCgroupFrozenPredicate(cg),remoteRecoveryFreezeCgroupCommand(cg)));
+          runStrict(member,remoteRecoveryAttestedCommand(root,str(binding),"frozen",sourceGuard(member),sourceGuard(member)+remoteRecoveryCgroupFrozenPredicate(cg),remoteRecoveryFreezeCgroupCommand(cg)));
         for(auto& member:record.members) {
           String output; run(member,sourceGuard(member)+inspect(member,"capture"),&output);
           std::istringstream fields(str(output)); std::string values[5],extra;
@@ -13457,13 +13470,13 @@ REMOTE_RUNTIME
       if(record.phase==Phase::frozen) {
         for(const auto& member:record.members) {
           const auto before=sourceGuard(member)+inspect(member,"capture")+" > /dev/null; test \"$(cat "+quote(root+"/writers-fenced")+")\" = "+quote(str(binding))+"; ";
-          run(member,remoteRecoveryAttestedCommand(root,str(binding),"quiesced",before,stopped(member),remoteRecoveryKillFrozenCgroupCommand(cg)));
+          runStrict(member,remoteRecoveryAttestedCommand(root,str(binding),"quiesced",before,stopped(member),remoteRecoveryKillFrozenCgroupCommand(cg)));
         }
         sealPhase(Phase::quiesced);
       }
       if(record.phase==Phase::quiesced) {
         for(auto& member:record.members) {
-          run(member,remoteRecoveryAttestedCommand(root,str(binding),"installed",stopped(member)+installed(target),stopped(member)+installed(runtime),
+          runStrict(member,remoteRecoveryAttestedCommand(root,str(binding),"installed",stopped(member)+installed(target),stopped(member)+installed(runtime),
               retainedRuntimePublicationCommand(runtime,target,retained,str(record.sourceProdigySHA256),str(record.sourceBundleSHA256),str(record.targetProdigySHA256))));
           member.targetRuntimeInstalled=true;
         }
@@ -13471,7 +13484,7 @@ REMOTE_RUNTIME
       }
       if(record.phase==Phase::installed) {
         for(const auto& member:record.members)
-          run(member,remoteRecoveryAttestedCommand(root,str(binding),"activation-ready",stopped(member)+installed(runtime),stopped(member)+installed(runtime),"true"));
+          runStrict(member,remoteRecoveryAttestedCommand(root,str(binding),"activation-ready",stopped(member)+installed(runtime),stopped(member)+installed(runtime),"true"));
         sealPhase(Phase::activationStarted);
       }
       const auto active=[&](const auto& member) {
@@ -13481,7 +13494,7 @@ REMOTE_RUNTIME
         for(const auto& member:record.members) {
           const auto before=stopped(member)+installed(runtime)+"test \"$(cat "+quote(root+"/remote-recovery-activation-ready")+")\" = "+quote(str(binding))+"; ";
           const auto action="test ! -L "+quote(root+"/writers-fenced")+"; if test -e "+quote(root+"/writers-fenced")+"; then test \"$(cat "+quote(root+"/writers-fenced")+")\" = "+quote(str(binding))+"; rm -- "+quote(root+"/writers-fenced")+"; fi; sync -f "+quote(root)+"; systemctl reset-failed prodigy; systemctl start prodigy; ";
-          run(member,remoteRecoveryAttestedCommand(root,str(binding),"started",before,active(member),action));
+          runStrict(member,remoteRecoveryAttestedCommand(root,str(binding),"started",before,active(member),action));
         }
       }
       require(record.phase==Phase::activationStarted || record.phase==Phase::completed,"recovery phase is unsupported");
@@ -13511,6 +13524,85 @@ REMOTE_RUNTIME
     } catch(const std::exception& error) {
       basics_log("recoverRemoteClusterRuntime success=0 phase=%u preserved=1 failure=%s detail=%s\n",unsigned(record.phase),error.what(),failure.c_str());
       exit(EXIT_FAILURE);
+    }
+  }
+
+  // Retire only an operation that never crossed the fencing boundary. This
+  // preserves its evidence while allowing a corrected, separately admitted
+  // release. A source restart, partial fence, or later phase fails closed.
+  void runWithdrawRemoteRuntimeRecovery(int argc,char *argv[])
+  {
+    using namespace MothershipTidesMigration;
+    using Phase=MothershipRemoteRuntimeRecoveryPhase;
+    String failure={};
+    try {
+      const bool check=argc==4 && std::strcmp(argv[3],"--check")==0;
+      require(argc==3 || check,"usage: withdrawRemoteRuntimeRecovery CLUSTER ORIGINAL_APPROVED_TARGET_BUNDLE OPERATION_ID [--check]");
+      String identity(argv[0]),bundleInput(argv[1]),operationText(argv[2]); uint128_t operation=0;
+      require(prodigyParseCanonicalHex128(operationText,operation) && operation,"withdraw recovery operation identity is invalid");
+      MothershipProdigyCluster cluster={};
+      require(loadClusterForScopedMutation("withdrawRemoteRuntimeRecovery",identity,cluster,failure) &&
+              cluster.deploymentMode==MothershipClusterDeploymentMode::remote && cluster.nBrains==3 &&
+              cluster.topology.machines.size()==3,"withdraw recovery cluster identity is invalid");
+      String registryPath={}; {auto registry=openClusterRegistry();registryPath=registry.path();}
+      MothershipRemoteRuntimeRecoveryExecutionLock lock;
+      require(lock.acquire(registryPath),"another runtime recovery executor is active or lock ownership is invalid");
+      MothershipRemoteRuntimeRecoveryCohortRecord record={}; MothershipUpgradeAdmissionRecord admission={};
+      {auto registry=openClusterRegistry();
+        require(registry.loadRemoteRuntimeRecoveryCohort(cluster.clusterUUID,operation,record,&failure) &&
+                registry.loadUpgradeAdmission(cluster.clusterUUID,operation,admission,&failure),"withdraw recovery authority is unavailable");}
+      if(record.phase==Phase::withdrawnBeforeFence) {
+        basics_log("withdrawRemoteRuntimeRecovery success=1 resumed=1 operationID=%s\n",operationText.c_str());return;
+      }
+      require(record.phase<=Phase::staged,"runtime recovery already crossed its fencing boundary");
+      MachineCpuArchitecture architecture=MachineCpuArchitecture::unknown;
+      String bundlePath={}; ProdigyApprovedUpgradeBundle approved={};
+      require(resolveProdigyBundleTargetArchitecture(identity.c_str(),architecture,&failure) &&
+              prodigyResolveBundleArtifactInput(bundleInput,architecture,bundlePath,&failure) &&
+              prodigyApproveBundleUpgradeContract(bundlePath,approved,&failure) && approved.verifyRetainedSnapshot(&failure) &&
+              approved.bundleSHA256==record.targetBundleSHA256 && approved.contract.contractSHA256==record.targetContractSHA256,
+              "withdraw recovery original target artifact differs");
+      String bytes={},digest={}; auto topology=cluster.topology; BitseryEngine::serialize(bytes,topology);
+      require(prodigyComputeSHA256Hex(bytes,digest,&failure) && digest==record.topologySHA256 &&
+              record.runtimeRoot==cluster.remoteProdigyPath,"withdraw recovery registered topology differs");
+      BitseryEngine::serialize(bytes,admission);
+      require(prodigyComputeSHA256Hex(bytes,digest,&failure) && digest==record.admissionRecordSHA256,
+              "withdraw recovery original admission differs");
+      ClusterCreateHooks hooks(this); ClusterTopology observed={};
+      require(hooks.fetchSeedTopology(cluster,observed,&failure) && observed==cluster.topology &&
+              mothershipValidateObservedMachineAuthorizationProjection(cluster.topology,observed,&failure),
+              "withdraw recovery authenticated topology differs");
+      String canonical={}; canonical.assignItoh(operation);
+      const auto root="/var/lib/prodigy/runtime-recovery/"+str(canonical);
+      for(const auto& saved:record.members) {
+        MothershipRemoteRuntimeRecoveryMember current={};
+        require(observeRemoteRuntimeRecoverySource(cluster,saved.machineUUID,record.runtimeRoot,admission,current,failure) &&
+                current.linuxMachineID==saved.linuxMachineID && current.bootID==saved.bootID &&
+                current.sourceProcessPID==saved.sourceProcessPID && current.sourceProcessStartTicks==saved.sourceProcessStartTicks,
+                "withdraw recovery source machine or process changed");
+        std::string guard="test \"$(awk '$1 == \"frozen\" { print $2 }' /sys/fs/cgroup/system.slice/prodigy.service/cgroup.events)\" = 0; ";
+        for(const auto name:{"writers-fenced","remote-recovery-fenced","remote-recovery-frozen","remote-recovery-quiesced",
+                              "remote-recovery-installed","remote-recovery-activation-ready","remote-recovery-started","stopped-proof.bin"}) {
+          const auto path=root+"/"+name;
+          guard+="test ! -e "+quote(path)+"; test ! -L "+quote(path)+"; test ! -e "+quote(path+".new")+"; test ! -L "+quote(path+".new")+"; ";
+        }
+        require(remoteRuntimeRecoveryCommand(cluster,saved.machineUUID,text("bash -euo pipefail -c "+quote(guard)),nullptr,failure),
+                "withdraw recovery found a partial fence or retained-state effect");
+      }
+      require(configureControlTarget(identity.c_str(),&failure),"withdraw recovery control target unavailable");
+      ProdigyUpgradeAdmissionReportRequest request={};request.operationID=operationText;
+      request.targetBundleSHA256=approved.bundleSHA256;request.targetContractSHA256=approved.contract.contractSHA256;
+      request.requiredStagingBytes=approved.contract.requiredFreeBytes;
+      MothershipUpgradeAdmissionReport report={};MothershipUpgradePlannerInput input={};
+      require(validateFreshRuntimeUpgradeAdmission(approved,admission,architecture,&cluster,request,true,report,input,failure),
+              "withdraw recovery fresh source admission failed");
+      if(!check) {auto registry=openClusterRegistry();
+        require(registry.withdrawRemoteRuntimeRecoveryCohort(cluster.clusterUUID,operation,record,&failure),
+                "withdraw recovery registry transition failed");}
+      basics_log("withdrawRemoteRuntimeRecovery success=1 checked=%u operationID=%s sourceProcessesUnchanged=1 evidencePreserved=1\n",
+                 unsigned(check),operationText.c_str());
+    } catch(const std::exception& error) {
+      basics_log("withdrawRemoteRuntimeRecovery success=0 preserved=1 failure=%s detail=%s\n",error.what(),failure.c_str());exit(EXIT_FAILURE);
     }
   }
 
@@ -37318,6 +37410,7 @@ public:
         {"upsertMachineSchemas",            &Mothership::runUpsertMachineSchemas           },
         {"upsertTlsVaultFactory",           &Mothership::runUpsertTlsVaultFactory          },
         {"verifyRetiredConflictingClientLocal", &Mothership::runVerifyRetiredConflictingClientLocal},
+        {"withdrawRemoteRuntimeRecovery", &Mothership::runWithdrawRemoteRuntimeRecovery},
     };
 
     static_assert([] {
@@ -37455,6 +37548,7 @@ int main(int argc, char *argv[])
     message.append("\trefreshes authoritative topology, resolves one exact Mothership-created Vultr machine, and submits one bounded provider hard reboot\n");
     message.append("repairRemoteCloudMachineRuntime [clusterName|clusterUUID] [machineUUID canonical hex] [upgrade operationUUID] [approved bundle] [expected Linux machine ID] [--check]\n");
     message.append("recoverRemoteClusterRuntime [clusterName|clusterUUID] [approved bundle] [upgrade operationUUID] --accept-cohort-interruption [--check]\n");
+    message.append("withdrawRemoteRuntimeRecovery [cluster] [original approved target bundle] [operationUUID] [--check]\n");
     message.append("\trepairs one failed, empty remote runtime only when its immutable upgrade admission, provider topology, target machine identity, and live two-Brain quorum still match; --check performs no upload or install\n");
     message.append("faultTestCluster [name|clusterUUID] [link|crash|flap] [machine indices csv] [durationMs] [cycles] [downMs] [upMs]\n");
     message.append("\trequests a bounded virtual-datacenter machine fault through the Mothership-owned test provider\n");

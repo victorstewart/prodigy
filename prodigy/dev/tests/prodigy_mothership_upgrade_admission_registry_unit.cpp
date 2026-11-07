@@ -225,6 +225,80 @@ int main(void)
   bool recoveryPending = true;
   assert(registry.remoteRuntimeRecoveryPending(remote.clusterUUID, recoveryPending, &failure));
   assert(!recoveryPending);
+  const auto addPhaseReceipts = [](MothershipRemoteRuntimeRecoveryCohortRecord& candidate) {
+    for (uint32_t index = 0; index < candidate.members.size(); ++index)
+    {
+      while (candidate.members[index].phaseReceipts.size() < uint8_t(candidate.phase))
+      {
+        MothershipRemoteRuntimeRecoveryMember::PhaseReceipt receipt = {};
+        const auto receiptPhase = MothershipRemoteRuntimeRecoveryPhase(
+            candidate.members[index].phaseReceipts.size() + 1);
+        MothershipClusterRegistry::remoteRuntimeRecoveryOperationMarker(
+            candidate.operationID, candidate.members[index].machineUUID, receiptPhase, receipt.operationMarker);
+        receipt.receiptSHA256 = digest(char('0' + uint8_t(receiptPhase) + index));
+        candidate.members[index].phaseReceipts.push_back(std::move(receipt));
+      }
+    }
+  };
+  const auto makeWithdrawableRecovery = [&](uint128_t operationID) {
+    auto admission = expectedEligibleAdmission;
+    admission.operationID = operationID;
+    assert(registry.recordUpgradeAdmission(admission, recorded, resumed, &failure));
+    String bytes = {}, sha256 = {};
+    auto copy = admission;
+    assert(BitseryEngine::serialize(bytes, copy));
+    assert(prodigyComputeSHA256Hex(bytes, sha256));
+    auto cohort = recovery;
+    cohort.operationID = operationID;
+    cohort.admissionRecordSHA256 = sha256;
+    return cohort;
+  };
+  auto withdrawnAtAdmission = makeWithdrawableRecovery(uint128_t(0xD20));
+  assert(registry.admitRemoteRuntimeRecoveryCohort(withdrawnAtAdmission, remote, recoveryStored, resumed, &failure));
+  assert(!resumed);
+  const auto admittedBeforeWithdrawal = recoveryStored;
+  auto directWithdrawal = recoveryStored;
+  directWithdrawal.phase = MothershipRemoteRuntimeRecoveryPhase::withdrawnBeforeFence;
+  assert(!registry.advanceRemoteRuntimeRecoveryCohort(directWithdrawal, directWithdrawal.phase, recoveryStored, resumed, &failure));
+  assert(registry.withdrawRemoteRuntimeRecoveryCohort(remote.clusterUUID, withdrawnAtAdmission.operationID, recoveryStored, &failure));
+  assert(recoveryStored.phase == MothershipRemoteRuntimeRecoveryPhase::withdrawnBeforeFence);
+  assert(MothershipClusterRegistry::remoteRuntimeRecoveryIdentityMatches(admittedBeforeWithdrawal, recoveryStored));
+  for (const auto& member : recoveryStored.members)
+  {
+    assert(member.phaseReceipts.empty());
+    assert(member.stateSHA256.empty() && member.secretsSHA256.empty() && member.containerInventorySHA256.empty());
+    assert(member.privateLoaderSHA256.empty() && member.retainedNetworkSHA256.empty());
+    assert(!member.targetRuntimeInstalled);
+  }
+  auto withdrawnReplay = recoveryStored;
+  assert(registry.withdrawRemoteRuntimeRecoveryCohort(remote.clusterUUID, withdrawnAtAdmission.operationID, recoveryStored, &failure));
+  String withdrawnBytes = {}, withdrawnReplayBytes = {};
+  assert(BitseryEngine::serialize(withdrawnBytes, recoveryStored));
+  assert(BitseryEngine::serialize(withdrawnReplayBytes, withdrawnReplay));
+  assert(withdrawnBytes == withdrawnReplayBytes);
+  assert(registry.remoteRuntimeRecoveryPending(remote.clusterUUID, recoveryPending, &failure));
+  assert(!recoveryPending);
+  auto withdrawnAtStage = makeWithdrawableRecovery(uint128_t(0xD21));
+  assert(registry.admitRemoteRuntimeRecoveryCohort(withdrawnAtStage, remote, recoveryStored, resumed, &failure));
+  withdrawnAtStage.phase = MothershipRemoteRuntimeRecoveryPhase::staged;
+  addPhaseReceipts(withdrawnAtStage);
+  assert(registry.advanceRemoteRuntimeRecoveryCohort(withdrawnAtStage, withdrawnAtStage.phase, recoveryStored, resumed, &failure));
+  const auto stagedBeforeWithdrawal = recoveryStored;
+  assert(registry.withdrawRemoteRuntimeRecoveryCohort(remote.clusterUUID, withdrawnAtStage.operationID, recoveryStored, &failure));
+  assert(recoveryStored.phase == MothershipRemoteRuntimeRecoveryPhase::withdrawnBeforeFence);
+  assert(MothershipClusterRegistry::remoteRuntimeRecoveryIdentityMatches(stagedBeforeWithdrawal, recoveryStored));
+  for (uint32_t index = 0; index < recoveryStored.members.size(); ++index)
+  {
+    assert(recoveryStored.members[index].phaseReceipts.size() == 1);
+    assert(recoveryStored.members[index].phaseReceipts[0].operationMarker == stagedBeforeWithdrawal.members[index].phaseReceipts[0].operationMarker);
+    assert(recoveryStored.members[index].phaseReceipts[0].receiptSHA256 == stagedBeforeWithdrawal.members[index].phaseReceipts[0].receiptSHA256);
+    assert(recoveryStored.members[index].stateSHA256.empty() && recoveryStored.members[index].secretsSHA256.empty());
+    assert(recoveryStored.members[index].containerInventorySHA256.empty() && recoveryStored.members[index].privateLoaderSHA256.empty());
+    assert(recoveryStored.members[index].retainedNetworkSHA256.empty() && !recoveryStored.members[index].targetRuntimeInstalled);
+  }
+  assert(registry.withdrawRemoteRuntimeRecoveryCohort(remote.clusterUUID, withdrawnAtStage.operationID, recoveryStored, &failure));
+  assert(registry.remoteRuntimeRecoveryPending(remote.clusterUUID, recoveryPending, &failure));
+  assert(!recoveryPending);
   auto wrongBoot = recovery;
   wrongBoot.members[0].bootID.assign("not-a-kernel-boot-id"_ctv);
   assert(!registry.admitRemoteRuntimeRecoveryCohort(wrongBoot, remote, recoveryStored, resumed, &failure));
@@ -253,21 +327,6 @@ int main(void)
   overlappingRecovery.operationID = overlappingAdmission.operationID;
   overlappingRecovery.admissionRecordSHA256 = overlappingAdmissionSHA256;
   assert(!registry.admitRemoteRuntimeRecoveryCohort(overlappingRecovery, remote, recoveryStored, resumed, &failure));
-  const auto addPhaseReceipts = [](MothershipRemoteRuntimeRecoveryCohortRecord& candidate) {
-    for (uint32_t index = 0; index < candidate.members.size(); ++index)
-    {
-      while (candidate.members[index].phaseReceipts.size() < uint8_t(candidate.phase))
-      {
-        MothershipRemoteRuntimeRecoveryMember::PhaseReceipt receipt = {};
-        const auto receiptPhase = MothershipRemoteRuntimeRecoveryPhase(
-            candidate.members[index].phaseReceipts.size() + 1);
-        MothershipClusterRegistry::remoteRuntimeRecoveryOperationMarker(
-            candidate.operationID, candidate.members[index].machineUUID, receiptPhase, receipt.operationMarker);
-        receipt.receiptSHA256 = digest(char('0' + uint8_t(receiptPhase) + index));
-        candidate.members[index].phaseReceipts.push_back(std::move(receipt));
-      }
-    }
-  };
   auto phase = recovery;
   phase.phase = MothershipRemoteRuntimeRecoveryPhase::staged;
   addPhaseReceipts(phase);
@@ -291,6 +350,8 @@ int main(void)
   phase.phase = MothershipRemoteRuntimeRecoveryPhase::fenced;
   addPhaseReceipts(phase);
   assert(registry.advanceRemoteRuntimeRecoveryCohort(phase, phase.phase, recoveryStored, resumed, &failure));
+  assert(!registry.withdrawRemoteRuntimeRecoveryCohort(remote.clusterUUID, recovery.operationID, recoveryStored, &failure));
+  assert(failure == "remote runtime recovery cohort can be withdrawn only before fence"_ctv);
   phase.phase = MothershipRemoteRuntimeRecoveryPhase::frozen;
   addPhaseReceipts(phase);
   for (uint32_t index = 0; index < phase.members.size(); ++index)
