@@ -258,6 +258,24 @@ int main(void)
   approved.bundleSHA256 = envelope.approvedBundleSHA256;
   approved.contract = contract;
 
+  suite.expect(prodigyValidateRuntimeRecoveryDriver(approved,contract.mothershipSHA256,
+                   observedSource,"aarch64"_ctv,17,&releaseFailure),
+               "recovery_driver_accepts_exact_declared_target_and_executing_controller");
+  suite.expect(!prodigyValidateRuntimeRecoveryDriver(approved,observedSource.mothershipSHA256,
+                   observedSource,"aarch64"_ctv,17,&releaseFailure),
+               "recovery_driver_rejects_executable_outside_approved_bundle");
+  suite.expect(!prodigyValidateRuntimeRecoveryDriver(approved,contract.mothershipSHA256,
+                   undeclaredSource,"aarch64"_ctv,17,&releaseFailure),
+               "recovery_driver_rejects_substituted_admitted_target");
+  suite.expect(!prodigyValidateRuntimeRecoveryDriver(approved,contract.mothershipSHA256,
+                   observedSource,"x86_64"_ctv,17,&releaseFailure),
+               "recovery_driver_rejects_architecture_change");
+  approved.contract.compatibility.authorityState=MothershipUpgradeCompatibilityState::incompatible;
+  suite.expect(!prodigyValidateRuntimeRecoveryDriver(approved,contract.mothershipSHA256,
+                   observedSource,"aarch64"_ctv,17,&releaseFailure),
+               "recovery_driver_rejects_incompatible_authority_state");
+  approved.contract=contract;
+
   String preflightFailure = {};
   suite.expect(!prodigyPreflightLegacySameClusterUpdate(
                    approved, "aarch64"_ctv, 17, nullptr, false, &preflightFailure) &&

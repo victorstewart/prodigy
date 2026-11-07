@@ -79,6 +79,44 @@ int main(int argc, char **argv)
     execution.run(0,"export PATH="+quote((publication/"bin").string())+":$PATH; "+publish);
     execution.run(0,"touch "+quote(effect)+"; "+reconcile);
     assert(read(recoveryRoot+"/remote-recovery-fenced")==binding);
+    // A first fence probe has no writers-fenced file yet.  Its strict child
+    // must return false to the enclosing `if`, which then performs the action
+    // exactly once rather than treating that expected predicate miss as fatal.
+    const auto fenceRoot=(root/"runtime-fence").string(), fenceDropins=(root/"unit-dropins").string();
+    const auto fenceBin=root/"fence-bin";
+    const auto fenceAction=(root/"fence-action").string(), hostile=(root/"hostile-bash-env").string();
+    fs::create_directories(fenceRoot); fs::create_directories(fenceBin); ::chmod(fenceRoot.c_str(),0700);
+    const auto fencePath=fenceRoot+"/writers-fenced", dropin=runtimeStartupFenceDropinPath(binding,fenceDropins);
+    const auto reloaded=(root/"daemon-reloaded").string();
+    const auto writeExecutable = [](const fs::path& path,const std::string& script) {
+      std::ofstream output(path); output << script; output.close(); ::chmod(path.c_str(),0700);
+    };
+    writeExecutable(fenceBin/"systemctl", "#!/bin/sh\nif test \"$1\" = daemon-reload; then : > "+quote(reloaded)+"; exit 0; fi\n"
+        "if test \"$1\" = show; then case \"$*\" in *DropInPaths*) printf '%s\\n' "+quote(dropin)+";; *NeedDaemonReload*) test -e "+quote(reloaded)+" && printf 'no\\n' || printf 'yes\\n';; *) exit 1;; esac; exit 0; fi\nexit 1\n");
+    const auto busctlJSON = [&](const std::string& trigger,const std::string& negate,const std::string& path) {
+      return "{\"type\":\"a(sbbsi)\",\"data\":[[\"ConditionPathExists\","+trigger+","+negate+",\""+path+"\",0]]}";
+    };
+    writeExecutable(fenceBin/"busctl", "#!/bin/sh\ncase \"${FAKE_CONDITION_MODE:-positive}\" in positive) printf '%s\\n' "+quote(busctlJSON("false","true",fencePath))+";; negatedwrong) printf '%s\\n' "+quote(busctlJSON("false","false",fencePath))+";; triggered) printf '%s\\n' "+quote(busctlJSON("true","true",fencePath))+";; resetmissing) printf '%s\\n' '{\"type\":\"a(sbbsi)\",\"data\":[]}' ;; *) exit 1;; esac\n");
+    { std::ofstream output(hostile); output << ": \"$PS1\"\n"; }
+    const auto fencePredicate=runtimeStartupFencePredicate(fenceRoot,binding,fenceDropins);
+    const auto fenceCommand=remoteRecoveryAttestedCommand(fenceRoot,binding,"fence",
+        "test ! -e "+quote(fenceAction),fencePredicate,"printf x > "+quote(fenceAction)+"; "+runtimeStartupFenceCommand(fenceRoot,binding,fenceDropins));
+    assert(fenceCommand.size() < 30976);
+    execution.run(0,"BASH_ENV="+quote(hostile)+" PATH="+quote(fenceBin.string())+":$PATH "+fenceCommand);
+    assert(read(fenceAction)=="x" && read(fenceRoot+"/remote-recovery-fence")==binding);
+    execution.run(0,"BASH_ENV="+quote(hostile)+" PATH="+quote(fenceBin.string())+":$PATH "+fenceCommand);
+    assert(read(fenceAction)=="x");
+    for (const auto mode:{"negatedwrong","triggered","resetmissing"})
+      assert(!execution.command(0,"FAKE_CONDITION_MODE="+quote(mode)+" PATH="+quote(fenceBin.string())+":$PATH "+remoteRecoveryStrictShell(fencePredicate),&failure));
+    { std::ofstream output(dropin); output << "altered"; }
+    ::chmod(dropin.c_str(),0600);
+    assert(!execution.command(0,"PATH="+quote(fenceBin.string())+":$PATH "+remoteRecoveryStrictShell(fencePredicate),&failure));
+    { std::ofstream output(dropin); output << "[Unit]\nConditionPathExists=!" << fencePath << "\n"; }
+    ::chmod(dropin.c_str(),0600);
+    const auto sourceRejected=remoteRecoveryAttestedCommand(fenceRoot,binding,"source-rejected","false",
+        "false","touch "+quote(fenceAction+".unexpected"));
+    assert(!execution.command(0,"PATH="+quote(fenceBin.string())+":$PATH "+sourceRejected,&failure));
+    assert(!fs::exists(fenceAction+".unexpected") && !fs::exists(fenceRoot+"/remote-recovery-source-rejected"));
     const auto replay=remoteRecoveryAttestedCommand(recoveryRoot,binding,"fenced",
         "false","test -f "+quote(effect),"false");
     execution.run(0,replay);

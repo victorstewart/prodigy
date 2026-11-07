@@ -212,6 +212,28 @@ static inline bool prodigyValidateSameClusterUpgradeRelease(
   return true;
 }
 
+// A controller fix may resume an immutable recovery whose runtime target is
+// older. Approve that controller independently, and require its release policy
+// to name the exact admitted target as a compatible predecessor. This grants
+// no new runtime target or admission and does not replace live phase gates.
+static inline bool prodigyValidateRuntimeRecoveryDriver(
+    const ProdigyApprovedUpgradeBundle& driver,
+    const String& executingMothershipSHA256,
+    const MothershipUpgradeIdentity& admittedTarget,
+    const String& architecture,
+    uint128_t clusterUUID,
+    String *failure = nullptr)
+{
+  if (!prodigyIsSHA256HexDigest(executingMothershipSHA256) ||
+      executingMothershipSHA256 != driver.contract.mothershipSHA256)
+  {
+    if (failure) failure->assign("recovery controller does not match the approved driver bundle"_ctv);
+    return false;
+  }
+  return prodigyValidateSameClusterUpgradeRelease(driver, architecture, clusterUUID,
+                                                  &admittedTarget, true, failure);
+}
+
 static inline bool prodigyPreflightLegacySameClusterUpdate(
     const ProdigyApprovedUpgradeBundle& approved,
     const String& observedTargetArchitecture,

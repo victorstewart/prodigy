@@ -34,7 +34,6 @@
 #include <prodigy/bootstrap.config.h>
 #include <prodigy/additional.ingress.h>
 #include <prodigy/netdev.detect.h>
-#include <prodigy/additional.ingress.h>
 #include <prodigy/bundle.upgrade.h>
 #include <prodigy/container.contract.h>
 #include <prodigy/containerstore.h>
@@ -13283,9 +13282,14 @@ REMOTE_RUNTIME
     using Phase=MothershipRemoteRuntimeRecoveryPhase;
     String failure={}; MothershipRemoteRuntimeRecoveryCohortRecord record={};
     try {
-      const bool check=argc==5 && std::strcmp(argv[4],"--check")==0;
-      require((argc==4 || check) && std::strcmp(argv[3],"--accept-cohort-interruption")==0,
-              "usage: recoverRemoteClusterRuntime CLUSTER APPROVED_BUNDLE OPERATION_ID --accept-cohort-interruption [--check]");
+      require(argc>=4 && std::strcmp(argv[3],"--accept-cohort-interruption")==0,
+              "usage: recoverRemoteClusterRuntime CLUSTER APPROVED_BUNDLE OPERATION_ID --accept-cohort-interruption [--check] [--driver-bundle APPROVED_CONTROLLER_BUNDLE]");
+      bool check=false; String driverInput={};
+      for(int i=4;i<argc;++i) {
+        if(std::strcmp(argv[i],"--check")==0 && !check) check=true;
+        else if(std::strcmp(argv[i],"--driver-bundle")==0 && driverInput.empty() && i+1<argc) driverInput.assign(argv[++i]);
+        else require(false,"invalid or repeated recovery controller option");
+      }
       String identity(argv[0]), bundleInput(argv[1]), operationText(argv[2]);
       uint128_t operation=0;
       require(prodigyParseCanonicalHex128(operationText,operation) && operation!=0,"recovery operation ID is invalid");
@@ -13304,8 +13308,22 @@ REMOTE_RUNTIME
               prodigyApproveBundleUpgradeContract(bundlePath,approved,&failure) && approved.verifyRetainedSnapshot(&failure),
               "recovery target bundle approval failed");
       String driverSHA={};
-      require(prodigyComputeFileSHA256Hex("/proc/self/exe"_ctv,driverSHA,&failure) && driverSHA==approved.contract.mothershipSHA256,
-              "recovery must execute the Mothership from the approved target release");
+      require(prodigyComputeFileSHA256Hex("/proc/self/exe"_ctv,driverSHA,&failure),"recovery controller identity unavailable");
+      if(driverInput.empty()) require(driverSHA==approved.contract.mothershipSHA256,
+              "recovery must execute the target Mothership or name a separately approved compatible driver bundle");
+      else {
+        String driverPath={}; ProdigyApprovedUpgradeBundle driver={};
+        MothershipUpgradeIdentity targetIdentity={};
+        targetIdentity.releaseID=approved.contract.releaseID; targetIdentity.contractSHA256=approved.contract.contractSHA256;
+        targetIdentity.prodigySHA256=approved.contract.prodigySHA256; targetIdentity.mothershipSHA256=approved.contract.mothershipSHA256;
+        String architectureName={}; architectureName.assign(machineCpuArchitectureName(architecture));
+        require(prodigyResolveBundleArtifactInput(driverInput,architecture,driverPath,&failure) &&
+                prodigyApproveBundleUpgradeContract(driverPath,driver,&failure) && driver.verifyRetainedSnapshot(&failure) &&
+                prodigyValidateRuntimeRecoveryDriver(driver,driverSHA,targetIdentity,architectureName,cluster.clusterUUID,&failure),
+                "recovery controller artifact or exact target compatibility is unqualified");
+        basics_log("recoverRemoteClusterRuntime controllerBundleSHA256=%s controllerSHA256=%s targetBundleSHA256=%s\n",
+                   driver.bundleSHA256.c_str(),driverSHA.c_str(),approved.bundleSHA256.c_str());
+      }
       MothershipUpgradeAdmissionRecord admission={};
       bool recorded=false;
       {
@@ -13318,6 +13336,7 @@ REMOTE_RUNTIME
         require(recorded || failure=="record not found"_ctv,"recovery record is unreadable or invalid");
         failure.clear();
       }
+      require(driverInput.empty() || recorded,"a separate recovery controller may only resume an existing immutable operation");
       auto currentTopology=cluster.topology; String topologyBytes={},topologySHA={},admissionBytes={},admissionSHA={};
       BitseryEngine::serialize(topologyBytes,currentTopology); BitseryEngine::serialize(admissionBytes,admission);
       require(prodigyComputeSHA256Hex(topologyBytes,topologySHA,&failure) && prodigyComputeSHA256Hex(admissionBytes,admissionSHA,&failure),
@@ -13356,11 +13375,30 @@ REMOTE_RUNTIME
       }
       require(record.topologySHA256==topologySHA && record.admissionRecordSHA256==admissionSHA &&
               record.runtimeRoot==cluster.remoteProdigyPath && record.targetBundleSHA256==approved.bundleSHA256 &&
-              record.targetProdigySHA256==approved.contract.prodigySHA256 && record.targetMothershipSHA256==driverSHA,
+              record.targetProdigySHA256==approved.contract.prodigySHA256 && record.targetMothershipSHA256==approved.contract.mothershipSHA256,
               "recovery immutable record differs from registered topology, admission or target artifacts");
       if(check) {
         require(record.phase<Phase::fenced,"live recovery is already fenced; resume its exact operation");
         preflight();
+        if(record.phase==Phase::staged) {
+          auto initial=record; initial.phase=Phase::admitted;
+          for(auto& member:initial.members) member.phaseReceipts.clear();
+          MothershipRemoteRuntimeRecoveryRequest request; request.cohort=initial; request.topology=cluster.topology;
+          String bytes={},binding={},canonical={}; BitseryEngine::serialize(bytes,request); canonical.assignItoh(operation);
+          require(prodigyComputeSHA256Hex(bytes,binding,&failure),"recovery check binding digest failed");
+          const auto root="/var/lib/prodigy/runtime-recovery/"+str(canonical),fence=root+"/writers-fenced";
+          for(const auto& member:record.members) {
+            auto probe="test ! -L "+quote(fence)+"; if test -e "+quote(fence)+"; then "+
+                runtimeStartupFencePredicate(root,str(binding))+"fi; ";
+            for(const auto suffix:{"/remote-recovery-fenced","/remote-recovery-fenced.new"}) {
+              const auto marker=root+suffix;
+              probe+="test ! -L "+quote(marker)+"; if test -e "+quote(marker)+"; then "+
+                  remoteRecoveryMarkerPredicate(marker,str(binding))+runtimeStartupFencePredicate(root,str(binding))+"fi; ";
+            }
+            require(remoteRuntimeRecoveryCommand(cluster,member.machineUUID,text(remoteRecoveryStrictShell(probe)),nullptr,failure),
+                    "recovery check found an invalid partial startup fence");
+          }
+        }
         basics_log("recoverRemoteClusterRuntime success=1 checked=1 dispatched=0 operationID=%s phase=%u\n",operationText.c_str(),unsigned(record.phase));
         return;
       }
@@ -13412,7 +13450,7 @@ REMOTE_RUNTIME
                 "remote runtime recovery command failed; resume exact operation after reconciling recorded phase");
       };
       const auto run=[&](const auto& member,const std::string& command,String *output=nullptr) {
-        runStrict(member,"bash -euo pipefail -c "+quote(command),output);
+        runStrict(member,remoteRecoveryStrictShell(command),output);
       };
       const auto sealPhase=[&](Phase phase) {
         auto next=record; next.phase=phase;
@@ -13445,7 +13483,7 @@ REMOTE_RUNTIME
       if(record.phase==Phase::staged) {
         preflight();
         for(const auto& member:record.members) {
-          const auto fenceCheck=sourceGuard(member)+"test \"$(cat "+quote(root+"/writers-fenced")+")\" = "+quote(str(binding))+"; systemctl show -p Conditions --value prodigy | grep -F -- "+quote(root+"/writers-fenced")+" > /dev/null; ";
+          const auto fenceCheck=sourceGuard(member)+runtimeStartupFencePredicate(root,str(binding));
           runStrict(member,remoteRecoveryAttestedCommand(root,str(binding),"fenced",sourceGuard(member),fenceCheck,runtimeStartupFenceCommand(root,str(binding))));
         }
         sealPhase(Phase::fenced);
@@ -13586,7 +13624,7 @@ REMOTE_RUNTIME
           const auto path=root+"/"+name;
           guard+="test ! -e "+quote(path)+"; test ! -L "+quote(path)+"; test ! -e "+quote(path+".new")+"; test ! -L "+quote(path+".new")+"; ";
         }
-        require(remoteRuntimeRecoveryCommand(cluster,saved.machineUUID,text("bash -euo pipefail -c "+quote(guard)),nullptr,failure),
+        require(remoteRuntimeRecoveryCommand(cluster,saved.machineUUID,text(remoteRecoveryStrictShell(guard)),nullptr,failure),
                 "withdraw recovery found a partial fence or retained-state effect");
       }
       require(configureControlTarget(identity.c_str(),&failure),"withdraw recovery control target unavailable");
@@ -37547,9 +37585,11 @@ int main(int argc, char *argv[])
     message.append("faultRemoteCloudMachine [clusterName|clusterUUID] [machineUUID canonical hex] hard-reboot\n");
     message.append("\trefreshes authoritative topology, resolves one exact Mothership-created Vultr machine, and submits one bounded provider hard reboot\n");
     message.append("repairRemoteCloudMachineRuntime [clusterName|clusterUUID] [machineUUID canonical hex] [upgrade operationUUID] [approved bundle] [expected Linux machine ID] [--check]\n");
-    message.append("recoverRemoteClusterRuntime [clusterName|clusterUUID] [approved bundle] [upgrade operationUUID] --accept-cohort-interruption [--check]\n");
-    message.append("withdrawRemoteRuntimeRecovery [cluster] [original approved target bundle] [operationUUID] [--check]\n");
     message.append("\trepairs one failed, empty remote runtime only when its immutable upgrade admission, provider topology, target machine identity, and live two-Brain quorum still match; --check performs no upload or install\n");
+    message.append("recoverRemoteClusterRuntime [clusterName|clusterUUID] [approved bundle] [upgrade operationUUID] --accept-cohort-interruption [--check] [--driver-bundle approved compatible controller bundle]\n");
+    message.append("\trecovers the admitted runtime cohort on unchanged machines; a separately approved controller may resume the immutable target after a controller fix\n");
+    message.append("withdrawRemoteRuntimeRecovery [cluster] [original approved target bundle] [operationUUID] [--check]\n");
+    message.append("\tretires an untouched recovery admission only while every original source process and unfenced machine identity still match\n");
     message.append("faultTestCluster [name|clusterUUID] [link|crash|flap] [machine indices csv] [durationMs] [cycles] [downMs] [upMs]\n");
     message.append("\trequests a bounded virtual-datacenter machine fault through the Mothership-owned test provider\n");
     message.append("faultTestClusters [first name|clusterUUID] [first machineIndex] [second name|clusterUUID] [second machineIndex] [durationMs]\n");
