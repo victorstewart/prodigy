@@ -76,6 +76,33 @@ int main()
     failed += condition ? 0 : 1;
   };
 
+  // The low-level provider collector appends chunks. The recovery inspector
+  // owns a fresh observation even if its caller reuses an earlier SHA buffer.
+  {
+    String output = {}, failure = {};
+    output.assign("earlier observation"_ctv);
+    expect(mothershipRecoveryInspectLocal("printf fresh",output,&failure) && output=="fresh"_ctv,
+           "recovery inspection replaces prior output");
+    expect(!mothershipRecoveryInspectLocal("exit 7",output,&failure) && output.empty(),
+           "failed recovery inspection cannot retain an earlier observation");
+    char root[] = "./mothership-recovery-digest-unit.XXXXXX";
+    const char *created=::mkdtemp(root);
+    expect(created!=nullptr,"create private recovery digest fixture");
+    if(created) {
+      String path={}; path.assign(created);
+      String first={}; first.assign(std::string(64,'a').c_str());
+      expect(mothershipRecoveryTreeDigest(path,first,&failure),"first recovery digest replaces earlier SHA");
+      const String saved=first;
+      expect(mothershipRecoveryTreeDigest(path,first,&failure) && first==saved,
+             "repeated recovery digest is stable with a reused buffer");
+      const std::string file=std::string(created)+"/changed";
+      { std::ofstream stream(file); stream << "changed bytes"; }
+      expect(mothershipRecoveryTreeDigest(path,first,&failure) && first!=saved,
+             "recovery digest still detects changed store bytes");
+      ::unlink(file.c_str()); ::rmdir(created);
+    }
+  }
+
   MothershipProdigyClusterMachineSchemaPatch sourceSchema = {};
   sourceSchema.schema = "replacement-vm"_ctv;
   sourceSchema.hasKind = true;

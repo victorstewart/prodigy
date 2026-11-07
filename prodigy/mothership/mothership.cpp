@@ -5729,6 +5729,10 @@ template <typename S> static void serialize(S&& s, MothershipRemoteRuntimeRecove
 
 static bool mothershipRecoveryInspectLocal(const std::string& command, String& output, String *failure)
 {
+  // The bounded provider capture appends chunks. Each inspection is a fresh
+  // observation, including when its caller reuses a prior digest buffer.
+  output.clear();
+  if (failure) failure->clear();
   int fds[2] = {-1,-1};
   if (::pipe2(fds,O_CLOEXEC) != 0) return false;
   const pid_t child=::fork();
@@ -5863,10 +5867,14 @@ static bool mothershipRemoteRuntimeRecoveryLocal(const String& root, const Strin
       require(mothershipVDCReadApplicationIdentities(source,proof.applications,failure),"runtime recovery application inventory unavailable");
       std::sort(proof.applications.begin(),proof.applications.end(),[](const auto& a,const auto& b){return str(a.name)<str(b.name);});
       require(mothershipCaptureFrozenServicePrimaryTCX(source,proof.network,failure),"runtime recovery kernel retention failed");
-      require(mothershipRecoveryTreeDigest("/var/lib/prodigy/state"_ctv,sha,failure) && sha==proof.stateSHA256 &&
-              mothershipRecoveryTreeDigest("/var/lib/prodigy/state.secrets"_ctv,sha,failure) && sha==proof.secretsSHA256 &&
-              mothershipFrozenServiceCgroup(source) && mothershipVDCProcessMatches(source),
-              "runtime recovery original state changed during capture");
+      require(mothershipRecoveryTreeDigest("/var/lib/prodigy/state"_ctv,sha,failure),
+              "runtime recovery original state digest unavailable after capture");
+      require(sha==proof.stateSHA256,"runtime recovery original state bytes changed during capture");
+      require(mothershipRecoveryTreeDigest("/var/lib/prodigy/state.secrets"_ctv,sha,failure),
+              "runtime recovery original secrets digest unavailable after capture");
+      require(sha==proof.secretsSHA256,"runtime recovery original secrets bytes changed during capture");
+      require(mothershipFrozenServiceCgroup(source),"runtime recovery source cgroup thawed during capture");
+      require(mothershipVDCProcessMatches(source),"runtime recovery source process changed during capture");
       BitseryEngine::serialize(bytes,proof);
       require(mothershipVDCDurableWrite(root,"stopped-proof.bin",bytes,failure),"runtime recovery stopped proof publication failed");
     }
