@@ -1811,6 +1811,87 @@ static void assertInitialSeedRuntimeRepair()
   fs::remove_all(root);
 }
 
+struct LegacyInlineRuntimeStartupCapturedSource {
+  ProdigyPersistentLocalBrainState local;
+  String snapshotBytes, privateStatePath;
+  MothershipRetainedRecoveryMachineInput census;
+  Vector<String> parameterSHA256;
+};
+template<typename S> static void serialize(S&& s, LegacyInlineRuntimeStartupCapturedSource& source)
+{
+  s.object(source.local); s.text1b(source.snapshotBytes,256*1024*1024); s.text1b(source.privateStatePath,4096);
+  s.object(source.census); s.container(source.parameterSHA256,65536,[](auto& entry,auto& digest){entry.text1b(digest,64);});
+}
+
+static void assertRuntimeStartupCapturedSourceCodec()
+{
+  using namespace MothershipRetainedRecovery;
+  RuntimeStartupCapturedSource source = {};
+  source.local.uuid=0x91; source.local.ownerClusterUUID=0x92;
+  source.snapshotBytes.assign("opaque retained\0snapshot bytes"_ctv);
+  source.privateStatePath.assign("/operation/snapshot-private"_ctv);
+  source.census.machineUUID=source.local.uuid; source.census.machineFragment=1;
+  String expectedSnapshotSHA = {}, failure = {};
+  assert(prodigyComputeSHA256Hex(source.snapshotBytes,expectedSnapshotSHA));
+
+  // This is the former byte layout.  The local-state reader uses enclosing
+  // EOF to discover optional tails, so it consumes snapshot bytes as a marker.
+  LegacyInlineRuntimeStartupCapturedSource old = {};
+  old.local=source.local; old.snapshotBytes=source.snapshotBytes; old.privateStatePath=source.privateStatePath;
+  old.census=source.census;
+  String oldBytes = {};
+  assert(BitseryEngine::serialize(oldBytes,old));
+  LegacyInlineRuntimeStartupCapturedSource oldRead = {};
+  assert(!BitseryEngine::deserializeSafe(oldBytes,oldRead));
+
+  String framed = {};
+  assert(encodeRuntimeStartupCapturedSource(source,framed,&failure));
+  RuntimeStartupCapturedSource decoded = {};
+  assert(decodeRuntimeStartupCapturedSource(framed,decoded,&failure));
+  String decodedSnapshotSHA = {};
+  assert(decoded.local.uuid==source.local.uuid && decoded.local.ownerClusterUUID==source.local.ownerClusterUUID &&
+      decoded.privateStatePath==source.privateStatePath && prodigyComputeSHA256Hex(decoded.snapshotBytes,decodedSnapshotSHA) &&
+      decodedSnapshotSHA==expectedSnapshotSHA);
+  auto badMagic=framed; badMagic[0]^=1;
+  assert(!decodeRuntimeStartupCapturedSource(badMagic,decoded,&failure));
+  auto badVersion=framed; badVersion[8]^=1;
+  assert(!decodeRuntimeStartupCapturedSource(badVersion,decoded,&failure));
+  String framedTrailing=framed; framedTrailing.append("x"_ctv);
+  assert(!decodeRuntimeStartupCapturedSource(framedTrailing,decoded,&failure));
+  RuntimeStartupCapturedSourceEnvelope invalidLocal = {};
+  invalidLocal.localBytes.assign("x"_ctv); invalidLocal.tail.snapshotBytes=source.snapshotBytes;
+  assert(BitseryEngine::serialize(framed,invalidLocal));
+  assert(!decodeRuntimeStartupCapturedSource(framed,decoded,&failure));
+
+  // The present optional local tail is exactly the form that made an inline
+  // encoder especially ambiguous; standalone localBytes has its own EOF.
+  auto withOptionalLocal=source;
+  withOptionalLocal.local.transportCredentials.enabled=true;
+  assert(encodeRuntimeStartupCapturedSource(withOptionalLocal,framed,&failure));
+  assert(decodeRuntimeStartupCapturedSource(framed,decoded,&failure));
+  assert(decoded.local.transportCredentials.enabled && decoded.local.uuid==withOptionalLocal.local.uuid);
+
+  String canonicalLocal = {}, tailBytes = {}, legacyBytes = {};
+  RuntimeStartupCapturedSourceTail tail = {};
+  tail.snapshotBytes=source.snapshotBytes; tail.privateStatePath=source.privateStatePath; tail.census=source.census;
+  assert(BitseryEngine::serialize(canonicalLocal,source.local) && BitseryEngine::serialize(tailBytes,tail));
+  legacyBytes=canonicalLocal; legacyBytes.append(tailBytes);
+  assert(decodeLegacyRuntimeStartupCapturedSource(legacyBytes,source.local,decoded,&failure));
+  assert(prodigyComputeSHA256Hex(decoded.snapshotBytes,decodedSnapshotSHA) && decodedSnapshotSHA==expectedSnapshotSHA);
+  auto legacyOptional=withOptionalLocal;
+  assert(BitseryEngine::serialize(canonicalLocal,legacyOptional.local));
+  legacyBytes=canonicalLocal; legacyBytes.append(tailBytes);
+  assert(decodeLegacyRuntimeStartupCapturedSource(legacyBytes,legacyOptional.local,decoded,&failure));
+  assert(decoded.local.transportCredentials.enabled);
+  assert(BitseryEngine::serialize(canonicalLocal,source.local));
+  legacyBytes=canonicalLocal; legacyBytes.append(tailBytes);
+  auto wrongLocal=source.local; ++wrongLocal.ownerClusterUUID;
+  assert(!decodeLegacyRuntimeStartupCapturedSource(legacyBytes,wrongLocal,decoded,&failure));
+  assert(!decodeLegacyRuntimeStartupCapturedSource(String(legacyBytes.substr(0,legacyBytes.size()-1)),source.local,decoded,&failure));
+  legacyBytes.append("x"_ctv);
+  assert(!decodeLegacyRuntimeStartupCapturedSource(legacyBytes,source.local,decoded,&failure));
+}
+
 static void assertRuntimeRecoveryStartupAuthorityPreparation()
 {
   using namespace MothershipRetainedRecovery;
@@ -2113,6 +2194,7 @@ static void assertRuntimeRecoveryStartupAuthorityPreparation()
 
 int main()
 {
+  assertRuntimeStartupCapturedSourceCodec();
   assertRuntimeRecoveryStartupAuthorityPreparation();
   // Generic runtime recovery may inspect only decoded private copies.  Its
   // neutral admission must refuse any unfinished update coordinator rather

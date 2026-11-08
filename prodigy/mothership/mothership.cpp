@@ -5738,16 +5738,7 @@ template <typename S> static void serialize(S&& s, MothershipRemoteRuntimeRecove
   s.text1b(p.stateSHA256,64); s.text1b(p.secretsSHA256,64); s.text1b(p.snapshotSHA256,64);
   s.value8b(p.authorityGeneration);
 }
-struct MothershipRuntimeRecoveryCapturedSource {
-  ProdigyPersistentLocalBrainState local;
-  String snapshotBytes, privateStatePath;
-  MothershipRetainedRecoveryMachineInput census;
-  Vector<String> parameterSHA256;
-};
-template <typename S> static void serialize(S&& s,MothershipRuntimeRecoveryCapturedSource& source) {
-  s.object(source.local);s.text1b(source.snapshotBytes,256*1024*1024);s.text1b(source.privateStatePath,4096);
-  s.object(source.census);s.container(source.parameterSHA256,65536,[](auto& entry,auto& digest){entry.text1b(digest,64);});
-}
+using MothershipRuntimeRecoveryCapturedSource = MothershipRetainedRecovery::RuntimeStartupCapturedSource;
 struct MothershipRuntimeRecoveryCensus {
   MothershipRetainedRecovery::RuntimeStartupSource source;
   MothershipRetainedRecoveryMachineInput machine;
@@ -5844,6 +5835,55 @@ static bool mothershipRuntimeRecoveryReadCensus(
     }
     return true;
   } catch(const std::exception& error) {if(failure) failure->assign(error.what());return false;}
+}
+
+// The first startup envelope embedded an EOF-delimited local-state record.
+// Recover its boundary only from the canonical operation-private store, then
+// require an exact prefix and the original snapshot byte hash. Never rewrite
+// the sealed envelope/proof or open the live store to repair this framing.
+static bool mothershipRuntimeRecoveryLoadCapturedSource(
+    const String& root, const String& bytes, MothershipRuntimeRecoveryCapturedSource& captured,
+    String *failure)
+{
+  using namespace MothershipRetainedRecovery;
+  const auto reject=[&]() { if(failure) failure->assign("runtime recovery captured startup envelope decode failed"_ctv); return false; };
+  try {
+    const fs::path operationRoot(str(root));
+    MothershipRuntimeRecoveryCapturedSource framed={};String why={};
+    const bool framedValid=decodeRuntimeStartupCapturedSource(bytes,framed,&why);
+    uint32_t matches=0;
+    for(const auto& entry:fs::directory_iterator(operationRoot)) {
+      const auto name=entry.path().filename().string();
+      if(!name.starts_with("snapshot-") || name.ends_with(".secrets")) continue;
+      if(framedValid && str(framed.privateStatePath)!=entry.path().string()) continue;
+      for(const auto& path:{entry.path(),fs::path(entry.path().string()+".secrets")}) {
+        struct stat status={};
+        require(::lstat(path.c_str(),&status)==0 && S_ISDIR(status.st_mode) && status.st_uid==0 &&
+                (status.st_mode&0777)==0700 && fs::canonical(path)==path,
+                "runtime recovery private captured store ownership differs");
+        for(const auto& child:fs::recursive_directory_iterator(path)) {
+          require(::lstat(child.path().c_str(),&status)==0 && status.st_uid==0 &&
+                  (S_ISDIR(status.st_mode) || (S_ISREG(status.st_mode) && status.st_nlink==1)),
+                  "runtime recovery private captured store tree differs");
+        }
+      }
+      ProdigyPersistentLocalBrainState local={};
+      ProdigyPersistentStateStore state(text(entry.path().string()));
+      const bool loaded=state.loadLocalBrainState(local,&why);state.close();
+      if(!loaded) continue;
+      MothershipRuntimeRecoveryCapturedSource candidate={};
+      if(framedValid) {
+        if(!prodigyPersistentSerializedEqual(local,framed.local)) continue;
+        candidate=framed;
+      } else if(!decodeLegacyRuntimeStartupCapturedSource(bytes,local,candidate,&why)) continue;
+      if(str(candidate.privateStatePath)!=entry.path().string()) continue;
+      // The standalone persistent serializer strips projection secrets. Keep
+      // their canonical paired-store values for later local-state preparation.
+      candidate.local=std::move(local);captured=std::move(candidate);++matches;
+    }
+    if(matches!=1) return reject();
+    if(failure)failure->clear();return true;
+  } catch(const std::exception&) {return reject();}
 }
 
 // Local stopped-state attestation.  This command never opens the live DB and
@@ -5953,8 +5993,8 @@ static bool mothershipRemoteRuntimeRecoveryLocal(const String& root, const Strin
               "runtime recovery private snapshot admission failed");
       proof.authorityGeneration=snapshot.masterAuthority.runtimeState.generation;
       require(proof.authorityGeneration>=request.cohort.authorityGeneration,"runtime recovery private authority regressed");
-      BitseryEngine::serialize(bytes,snapshot);
-      require(prodigyComputeSHA256Hex(bytes,proof.snapshotSHA256,failure),"runtime recovery snapshot proof digest failed");
+      require(BitseryEngine::serialize(bytes,snapshot) && prodigyComputeSHA256Hex(bytes,proof.snapshotSHA256,failure),
+              "runtime recovery snapshot proof digest failed");
       require(mothershipVDCReadApplicationIdentities(source,proof.applications,failure),"runtime recovery application inventory unavailable");
       std::sort(proof.applications.begin(),proof.applications.end(),[](const auto& a,const auto& b){return str(a.name)<str(b.name);});
       require(mothershipCaptureFrozenServicePrimaryTCX(source,proof.network,failure),"runtime recovery kernel retention failed");
@@ -5968,7 +6008,7 @@ static bool mothershipRemoteRuntimeRecoveryLocal(const String& root, const Strin
       require(mothershipVDCProcessMatches(source),"runtime recovery source process changed during capture");
       if(request.version==2) {
         MothershipRuntimeRecoveryCapturedSource captured={};captured.local=local;
-        BitseryEngine::serialize(captured.snapshotBytes,snapshot);captured.privateStatePath=copy;
+        captured.snapshotBytes=bytes;captured.privateStatePath=copy;
         require(mothershipRuntimeRecoveryReadCensus(proof.applications,snapshot,memberUUID,captured.census,captured.parameterSHA256,failure),
                 "runtime recovery live startup census failed");
         const auto capturedPath=fs::path(str(root))/"startup-source.bin";
@@ -5976,7 +6016,7 @@ static bool mothershipRemoteRuntimeRecoveryLocal(const String& root, const Strin
           MothershipRetainedRecovery::privateFile(capturedPath.string());
           MothershipRuntimeRecoveryCapturedSource prior={};String priorBytes=text(read(capturedPath));
           ProdigyPersistentBrainSnapshot priorSnapshot={};
-          require(BitseryEngine::deserializeSafe(priorBytes,prior) && BitseryEngine::deserializeSafe(prior.snapshotBytes,priorSnapshot) &&
+          require(mothershipRuntimeRecoveryLoadCapturedSource(root,priorBytes,prior,failure) && BitseryEngine::deserializeSafe(prior.snapshotBytes,priorSnapshot) &&
                   prodigyPersistentBrainSnapshotsEqual(priorSnapshot,snapshot) &&
                   prodigyPersistentSerializedEqual(prior.local,local) && prior.parameterSHA256==captured.parameterSHA256 &&
                   prior.census.machineUUID==captured.census.machineUUID && prior.census.machineFragment==captured.census.machineFragment &&
@@ -5995,7 +6035,8 @@ static bool mothershipRemoteRuntimeRecoveryLocal(const String& root, const Strin
           }
           require(prodigyComputeSHA256Hex(captured.snapshotBytes,proof.snapshotSHA256,failure),"runtime recovery retained source digest failed");
         } else {
-          String capturedBytes={};BitseryEngine::serialize(capturedBytes,captured);
+          String capturedBytes={};
+          require(MothershipRetainedRecovery::encodeRuntimeStartupCapturedSource(captured,capturedBytes,failure),"runtime recovery startup source encoding failed");
           require(mothershipVDCDurableWrite(root,"startup-source.bin",capturedBytes,failure),"runtime recovery startup source publication failed");
         }
       }
@@ -6033,13 +6074,17 @@ static bool mothershipRemoteRuntimeRecoveryLocal(const String& root, const Strin
       const auto sourcePath=fs::path(operationRoot)/"startup-source.bin";
       privateFile(sourcePath.string(),256*1024*1024);
       MothershipRuntimeRecoveryCapturedSource captured={};ProdigyPersistentBrainSnapshot snapshot={};
-      require(BitseryEngine::deserializeSafe(text(read(sourcePath)),captured) &&
-              prodigyComputeSHA256Hex(captured.snapshotBytes,sha,failure) && sha==proof.snapshotSHA256 &&
-              BitseryEngine::deserializeSafe(captured.snapshotBytes,snapshot) &&
-              captured.local.uuid==memberUUID && captured.local.ownerClusterUUID==request.cohort.clusterUUID &&
-              fs::path(str(captured.privateStatePath)).parent_path()==fs::path(operationRoot) &&
+      require(mothershipRuntimeRecoveryLoadCapturedSource(root,text(read(sourcePath)),captured,failure),
+              "runtime recovery captured startup envelope decode failed");
+      require(prodigyComputeSHA256Hex(captured.snapshotBytes,sha,failure) && sha==proof.snapshotSHA256,
+              "runtime recovery captured startup snapshot digest differs");
+      require(BitseryEngine::deserializeSafe(captured.snapshotBytes,snapshot),
+              "runtime recovery captured startup snapshot decode failed");
+      require(captured.local.uuid==memberUUID && captured.local.ownerClusterUUID==request.cohort.clusterUUID,
+              "runtime recovery captured startup local identity differs");
+      require(fs::path(str(captured.privateStatePath)).parent_path()==fs::path(operationRoot) &&
               fs::path(str(captured.privateStatePath)).filename().string().starts_with("snapshot-"),
-              "runtime recovery captured startup source differs");
+              "runtime recovery captured startup private path differs");
       MothershipRetainedRecoveryMachineInput current={};Vector<String> currentDigests={};
       require(mothershipRuntimeRecoveryReadCensus(proof.applications,snapshot,memberUUID,current,currentDigests,failure) &&
               currentDigests==captured.parameterSHA256 && current.machineUUID==captured.census.machineUUID &&
@@ -14004,6 +14049,16 @@ REMOTE_RUNTIME
           if(!okay) {
             String id={};id.assignItoh(member.machineUUID);failure.assign("runtime recovery private startup operation failed member="_ctv);
             failure.append(id);failure.append(" mode="_ctv);failure.append(mode);
+            // Only fixed, credential-free verifier messages may cross this
+            // boundary. A census reply can contain live private credentials.
+            for(const char* reason:{"runtime recovery captured startup envelope decode failed",
+                                   "runtime recovery captured startup snapshot digest differs",
+                                   "runtime recovery captured startup snapshot decode failed",
+                                   "runtime recovery captured startup local identity differs",
+                                   "runtime recovery captured startup private path differs"}) {
+              const auto expected=std::string("remoteRuntimeRecoveryLocal success=0 failure=")+reason+"\n";
+              if(str(encoded)==expected) {failure.append(" reason="_ctv);failure.append(reason);break;}
+            }
           }
           require(okay,"runtime recovery private startup operation failed; inspect the member's private evidence");
           if(!encoded.empty() && encoded[encoded.size()-1]=='\n')encoded.resize(encoded.size()-1);

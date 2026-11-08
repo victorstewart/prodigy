@@ -28,6 +28,86 @@ template<typename S> void serialize(S&& s, MothershipRetainedRecoveryMachineInpu
 
 namespace MothershipRetainedRecovery {
 using namespace MothershipTidesMigration;
+// The persistent local-state codec has EOF-delimited optional tails.  Keep it
+// in a length-framed standalone byte string whenever it is carried beside
+// other recovery fields, rather than embedding it in an outer Bitsery object.
+struct RuntimeStartupCapturedSourceTail {
+  String snapshotBytes;
+  String privateStatePath;
+  MothershipRetainedRecoveryMachineInput census;
+  Vector<String> parameterSHA256;
+};
+template<typename S> void serialize(S&& s, RuntimeStartupCapturedSourceTail& source) {
+  s.text1b(source.snapshotBytes,256*1024*1024); s.text1b(source.privateStatePath,4096);
+  s.object(source.census); s.container(source.parameterSHA256,UINT16_MAX,[](auto& entry,auto& digest){entry.text1b(digest,64);});
+}
+struct RuntimeStartupCapturedSource {
+  ProdigyPersistentLocalBrainState local;
+  String snapshotBytes;
+  String privateStatePath;
+  MothershipRetainedRecoveryMachineInput census;
+  Vector<String> parameterSHA256;
+};
+struct RuntimeStartupCapturedSourceEnvelope {
+  uint64_t magic = 0x5254434150535632ULL;
+  uint32_t version = 2;
+  String localBytes;
+  RuntimeStartupCapturedSourceTail tail;
+};
+template<typename S> void serialize(S&& s, RuntimeStartupCapturedSourceEnvelope& source) {
+  s.value8b(source.magic); s.value4b(source.version); s.text1b(source.localBytes,16*1024*1024); s.object(source.tail);
+}
+inline bool encodeRuntimeStartupCapturedSource(const RuntimeStartupCapturedSource& captured, String& bytes, String *failure = nullptr) {
+  auto reject=[&](const char *why) { if(failure) failure->assign(why); return false; };
+  if(captured.local.uuid==0 || captured.local.ownerClusterUUID==0 || captured.snapshotBytes.size()>256*1024*1024 ||
+      captured.privateStatePath.size()>4096 || captured.census.parameters.size()>UINT16_MAX ||
+      captured.census.parameters.size()!=captured.census.observedCreatedAtMs.size() ||
+      captured.parameterSHA256.size()!=captured.census.parameters.size())
+    return reject("runtime startup captured source bounds are invalid");
+  for(const String& digest:captured.parameterSHA256) if(!prodigyIsSHA256HexDigest(digest))
+    return reject("runtime startup captured parameter digest is invalid");
+  RuntimeStartupCapturedSourceEnvelope envelope = {};
+  if(!BitseryEngine::serialize(envelope.localBytes,captured.local) || envelope.localBytes.empty() || envelope.localBytes.size()>16*1024*1024)
+    return reject("runtime startup captured local serialization failed");
+  envelope.tail.snapshotBytes=captured.snapshotBytes; envelope.tail.privateStatePath=captured.privateStatePath;
+  envelope.tail.census=captured.census; envelope.tail.parameterSHA256=captured.parameterSHA256;
+  bytes.clear();
+  if(!BitseryEngine::serialize(bytes,envelope)) return reject("runtime startup captured source serialization failed");
+  return true;
+}
+inline bool decodeRuntimeStartupCapturedSource(const String& bytes, RuntimeStartupCapturedSource& captured, String *failure = nullptr) {
+  auto reject=[&](const char *why) { if(failure) failure->assign(why); return false; };
+  uint64_t magic = 0; uint32_t version = 0;
+  if(bytes.size()<sizeof(magic)+sizeof(version)) return reject("runtime startup captured source envelope is invalid");
+  std::memcpy(&magic,bytes.data(),sizeof(magic)); std::memcpy(&version,bytes.data()+sizeof(magic),sizeof(version));
+  if(magic!=0x5254434150535632ULL || version!=2) return reject("runtime startup captured source envelope is invalid");
+  RuntimeStartupCapturedSourceEnvelope envelope = {};
+  if(!BitseryEngine::deserializeSafe(bytes,envelope) || envelope.magic!=magic || envelope.version!=version ||
+      envelope.localBytes.empty() || envelope.localBytes.size()>16*1024*1024) return reject("runtime startup captured source envelope is invalid");
+  RuntimeStartupCapturedSource result = {};
+  if(!BitseryEngine::deserializeSafe(envelope.localBytes,result.local) || result.local.uuid==0 || result.local.ownerClusterUUID==0)
+    return reject("runtime startup captured local bytes are invalid");
+  result.snapshotBytes=std::move(envelope.tail.snapshotBytes); result.privateStatePath=std::move(envelope.tail.privateStatePath);
+  result.census=std::move(envelope.tail.census); result.parameterSHA256=std::move(envelope.tail.parameterSHA256);
+  captured=std::move(result); return true;
+}
+inline bool decodeLegacyRuntimeStartupCapturedSource(const String& bytes, const ProdigyPersistentLocalBrainState& canonicalLocal,
+                                                     RuntimeStartupCapturedSource& captured, String *failure = nullptr) {
+  auto reject=[&](const char *why) { if(failure) failure->assign(why); return false; };
+  String localBytes = {};
+  if(canonicalLocal.uuid==0 || canonicalLocal.ownerClusterUUID==0 || !BitseryEngine::serialize(localBytes,canonicalLocal) ||
+      localBytes.empty() || bytes.size()<=localBytes.size() || std::memcmp(bytes.data(),localBytes.data(),localBytes.size())!=0)
+    return reject("legacy runtime startup captured local prefix differs");
+  ProdigyPersistentLocalBrainState decodedLocal = {};
+  if(!BitseryEngine::deserializeSafe(localBytes,decodedLocal)) return reject("legacy runtime startup captured local bytes are invalid");
+  String tailBytes = {}; tailBytes.assign(bytes.data()+localBytes.size(),bytes.size()-localBytes.size());
+  RuntimeStartupCapturedSourceTail tail = {};
+  if(!BitseryEngine::deserializeSafe(tailBytes,tail)) return reject("legacy runtime startup captured tail is invalid");
+  RuntimeStartupCapturedSource result = {};
+  result.local=std::move(decodedLocal); result.snapshotBytes=std::move(tail.snapshotBytes); result.privateStatePath=std::move(tail.privateStatePath);
+  result.census=std::move(tail.census); result.parameterSHA256=std::move(tail.parameterSHA256);
+  captured=std::move(result); return true;
+}
 struct Request {
   uint128_t clusterUUID = 0;
   String bundleSHA;
