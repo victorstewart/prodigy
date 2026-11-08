@@ -14049,6 +14049,16 @@ REMOTE_RUNTIME
           if(!okay) {
             String id={};id.assignItoh(member.machineUUID);failure.assign("runtime recovery private startup operation failed member="_ctv);
             failure.append(id);failure.append(" mode="_ctv);failure.append(mode);
+            // A failed SSH reply may still contain a credential-bearing partial
+            // census. Preserve both streams privately for diagnosis instead of
+            // discarding them or copying them into the public error log.
+            const auto evidence="private-startup-failure-"+str(id)+"-"+mode+"-"+
+                std::to_string(::getpid())+"-"+std::to_string(Time::msSinceBoot());
+            String evidenceFailure={};
+            if(mothershipVDCDurableWrite(text(localRoot.string()),(evidence+".stdout").c_str(),encoded,&evidenceFailure) &&
+               mothershipVDCDurableWrite(text(localRoot.string()),(evidence+".stderr").c_str(),privateFailure,&evidenceFailure)) {
+              failure.append(" evidence="_ctv);failure.append(text((localRoot/evidence).string()));
+            } else failure.append(" privateEvidenceWriteFailed=1"_ctv);
             // Only fixed, credential-free verifier messages may cross this
             // boundary. A census reply can contain live private credentials.
             for(const char* reason:{"runtime recovery captured startup envelope decode failed",
