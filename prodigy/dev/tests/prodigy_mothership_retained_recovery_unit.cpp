@@ -1863,6 +1863,40 @@ static void assertRuntimeStartupCapturedSourceCodec()
   assert(BitseryEngine::serialize(framed,invalidLocal));
   assert(!decodeRuntimeStartupCapturedSource(framed,decoded,&failure));
 
+  // The normal snapshot wire deliberately omits the private transport root.
+  // Restoration compares that public projection but returns the canonical
+  // private snapshot, rather than weakening its full-authority comparison.
+  ProdigyPersistentBrainSnapshot canonicalSnapshot = {};
+  auto& canonicalRoot=canonicalSnapshot.masterAuthority.runtimeState.transportCredentialAuthorityRoot;
+  canonicalRoot.authorityEpoch=7; canonicalRoot.keyEpoch=8; canonicalRoot.authorityGeneration=9;
+  for(uint32_t index=0; index<ProdigyTransportCredentialAuthorityRootBytes; ++index) canonicalRoot.root[index]=uint8_t(index+1);
+  RuntimeStartupCapturedSource authorityCaptured = {};
+  authorityCaptured.local=source.local;
+  auto wireCopy=canonicalSnapshot;
+  assert(BitseryEngine::serialize(authorityCaptured.snapshotBytes,wireCopy));
+  ProdigyPersistentBrainSnapshot publicProjection = {};
+  assert(BitseryEngine::deserializeSafe(authorityCaptured.snapshotBytes,publicProjection));
+  const auto& publicRoot=publicProjection.masterAuthority.runtimeState.transportCredentialAuthorityRoot;
+  assert(publicRoot.authorityEpoch==0 && publicRoot.keyEpoch==0 && publicRoot.authorityGeneration==0 &&
+      CRYPTO_memcmp(publicRoot.root,canonicalRoot.root,ProdigyTransportCredentialAuthorityRootBytes)!=0);
+  ProdigyPersistentBrainSnapshot restored = {};
+  assert(restoreRuntimeStartupCapturedAuthority(authorityCaptured,source.local,canonicalSnapshot,restored,&failure));
+  const auto& restoredRoot=restored.masterAuthority.runtimeState.transportCredentialAuthorityRoot;
+  assert(restoredRoot.authorityEpoch==canonicalRoot.authorityEpoch && restoredRoot.keyEpoch==canonicalRoot.keyEpoch &&
+      restoredRoot.authorityGeneration==canonicalRoot.authorityGeneration &&
+      CRYPTO_memcmp(restoredRoot.root,canonicalRoot.root,ProdigyTransportCredentialAuthorityRootBytes)==0);
+  auto alteredCaptured=authorityCaptured;
+  ProdigyPersistentBrainSnapshot alteredPublic = {};
+  assert(BitseryEngine::deserializeSafe(alteredCaptured.snapshotBytes,alteredPublic));
+  alteredPublic.brainConfig.datacenterFragment=1;
+  assert(BitseryEngine::serialize(alteredCaptured.snapshotBytes,alteredPublic));
+  auto unchangedRestored=restored;
+  assert(!restoreRuntimeStartupCapturedAuthority(alteredCaptured,source.local,canonicalSnapshot,restored,&failure));
+  assert(prodigyPersistentBrainSnapshotsEqual(restored,unchangedRestored));
+  auto alteredLocal=source.local; ++alteredLocal.ownerClusterUUID;
+  assert(!restoreRuntimeStartupCapturedAuthority(authorityCaptured,alteredLocal,canonicalSnapshot,restored,&failure));
+  assert(prodigyPersistentBrainSnapshotsEqual(restored,unchangedRestored));
+
   // The present optional local tail is exactly the form that made an inline
   // encoder especially ambiguous; standalone localBytes has its own EOF.
   auto withOptionalLocal=source;

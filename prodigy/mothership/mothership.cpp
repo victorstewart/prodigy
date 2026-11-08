@@ -5837,53 +5837,64 @@ static bool mothershipRuntimeRecoveryReadCensus(
   } catch(const std::exception& error) {if(failure) failure->assign(error.what());return false;}
 }
 
-// The first startup envelope embedded an EOF-delimited local-state record.
-// Recover its boundary only from the canonical operation-private store, then
-// require an exact prefix and the original snapshot byte hash. Never rewrite
-// the sealed envelope/proof or open the live store to repair this framing.
+// Decode legacy captures only with the exact standalone local-state prefix
+// obtained from a canonical sealed source. New captures frame that prefix.
 static bool mothershipRuntimeRecoveryLoadCapturedSource(
-    const String& root, const String& bytes, MothershipRuntimeRecoveryCapturedSource& captured,
-    String *failure)
+    const String& bytes, const ProdigyPersistentLocalBrainState& canonicalLocal,
+    MothershipRuntimeRecoveryCapturedSource& captured, String *failure)
 {
   using namespace MothershipRetainedRecovery;
-  const auto reject=[&]() { if(failure) failure->assign("runtime recovery captured startup envelope decode failed"_ctv); return false; };
+  String why={};
+  if(decodeRuntimeStartupCapturedSource(bytes,captured,&why) ||
+      decodeLegacyRuntimeStartupCapturedSource(bytes,canonicalLocal,captured,&why)) return true;
+  if(failure)failure->assign("runtime recovery captured startup envelope decode failed"_ctv);
+  return false;
+}
+
+// Public snapshot serialization intentionally omits private authority roots.
+// Recover the full state through the existing paired-store loader on a fresh
+// private copy of the byte-sealed originals. Opening a TidesDB copy may compact
+// it, so an earlier opened copy cannot prove the original file-tree digest.
+static bool mothershipRuntimeRecoveryReadSealedSource(
+    const String& root, const String& originalState, const String& originalSecrets,
+    const MothershipRemoteRuntimeRecoveryProof& proof,
+    ProdigyPersistentLocalBrainState& local, ProdigyPersistentBrainSnapshot& snapshot,
+    String *failure)
+{
+  using namespace MothershipTidesMigration;
+  std::string temporary=str(root)+"/source-read-XXXXXX";bool created=false;
+  const auto cleanup=[&]() {
+    if(!created)return true;
+    std::error_code error={};fs::remove_all(temporary,error);return !error;
+  };
   try {
-    const fs::path operationRoot(str(root));
-    MothershipRuntimeRecoveryCapturedSource framed={};String why={};
-    const bool framedValid=decodeRuntimeStartupCapturedSource(bytes,framed,&why);
-    uint32_t matches=0;
-    for(const auto& entry:fs::directory_iterator(operationRoot)) {
-      const auto name=entry.path().filename().string();
-      if(!name.starts_with("snapshot-") || name.ends_with(".secrets")) continue;
-      if(framedValid && str(framed.privateStatePath)!=entry.path().string()) continue;
-      for(const auto& path:{entry.path(),fs::path(entry.path().string()+".secrets")}) {
-        struct stat status={};
-        require(::lstat(path.c_str(),&status)==0 && S_ISDIR(status.st_mode) && status.st_uid==0 &&
-                (status.st_mode&0777)==0700 && fs::canonical(path)==path,
-                "runtime recovery private captured store ownership differs");
-        for(const auto& child:fs::recursive_directory_iterator(path)) {
-          require(::lstat(child.path().c_str(),&status)==0 && status.st_uid==0 &&
-                  (S_ISDIR(status.st_mode) || (S_ISREG(status.st_mode) && status.st_nlink==1)),
-                  "runtime recovery private captured store tree differs");
-        }
-      }
-      ProdigyPersistentLocalBrainState local={};
-      ProdigyPersistentStateStore state(text(entry.path().string()));
-      const bool loaded=state.loadLocalBrainState(local,&why);state.close();
-      if(!loaded) continue;
-      MothershipRuntimeRecoveryCapturedSource candidate={};
-      if(framedValid) {
-        if(!prodigyPersistentSerializedEqual(local,framed.local)) continue;
-        candidate=framed;
-      } else if(!decodeLegacyRuntimeStartupCapturedSource(bytes,local,candidate,&why)) continue;
-      if(str(candidate.privateStatePath)!=entry.path().string()) continue;
-      // The standalone persistent serializer strips projection secrets. Keep
-      // their canonical paired-store values for later local-state preparation.
-      candidate.local=std::move(local);captured=std::move(candidate);++matches;
+    String sha={},why={};
+    const auto sourceUnchanged=[&]() {
+      return mothershipRecoveryTreeDigest(originalState,sha,&why) && sha==proof.stateSHA256 &&
+          mothershipRecoveryTreeDigest(originalSecrets,sha,&why) && sha==proof.secretsSHA256;
+    };
+    require(sourceUnchanged(),"runtime recovery sealed source changed before private read");
+    require(::mkdtemp(temporary.data())!=nullptr,"runtime recovery temporary source directory unavailable");created=true;
+    const auto statePath=text(temporary+"/state");
+    require(mothershipVDCCopyPrivateStateTree(originalState,statePath,&why) &&
+            mothershipVDCCopyPrivateStateTree(originalSecrets,text(temporary+"/state.secrets"),&why),
+            "runtime recovery sealed private source copy failed");
+    ProdigyPersistentLocalBrainState canonicalLocal={};ProdigyPersistentBrainSnapshot canonicalSnapshot={};
+    {
+      ProdigyPersistentStateStore state(statePath);
+      require(state.loadLocalBrainState(canonicalLocal,&why) && state.loadBrainSnapshot(canonicalSnapshot,&why),
+              "runtime recovery sealed private source load failed");
+      state.close();
     }
-    if(matches!=1) return reject();
+    require(sourceUnchanged(),"runtime recovery sealed source changed during private read");
+    require(cleanup(),"runtime recovery temporary source cleanup failed");created=false;
+    local=std::move(canonicalLocal);snapshot=std::move(canonicalSnapshot);
     if(failure)failure->clear();return true;
-  } catch(const std::exception&) {return reject();}
+  } catch(const std::exception& error) {
+    if(failure)failure->assign(error.what());
+    if(!cleanup() && failure)failure->append("; temporary source cleanup failed"_ctv);
+    return false;
+  }
 }
 
 // Local stopped-state attestation.  This command never opens the live DB and
@@ -6016,8 +6027,8 @@ static bool mothershipRemoteRuntimeRecoveryLocal(const String& root, const Strin
           MothershipRetainedRecovery::privateFile(capturedPath.string());
           MothershipRuntimeRecoveryCapturedSource prior={};String priorBytes=text(read(capturedPath));
           ProdigyPersistentBrainSnapshot priorSnapshot={};
-          require(mothershipRuntimeRecoveryLoadCapturedSource(root,priorBytes,prior,failure) && BitseryEngine::deserializeSafe(prior.snapshotBytes,priorSnapshot) &&
-                  prodigyPersistentBrainSnapshotsEqual(priorSnapshot,snapshot) &&
+          require(mothershipRuntimeRecoveryLoadCapturedSource(priorBytes,local,prior,failure) &&
+                  MothershipRetainedRecovery::restoreRuntimeStartupCapturedAuthority(prior,local,snapshot,priorSnapshot,failure) &&
                   prodigyPersistentSerializedEqual(prior.local,local) && prior.parameterSHA256==captured.parameterSHA256 &&
                   prior.census.machineUUID==captured.census.machineUUID && prior.census.machineFragment==captured.census.machineFragment &&
                   prior.census.observedCreatedAtMs==captured.census.observedCreatedAtMs &&
@@ -6073,13 +6084,16 @@ static bool mothershipRemoteRuntimeRecoveryLocal(const String& root, const Strin
       const auto operationRoot=str(root),privateState=operationRoot+"/state.new10";
       const auto sourcePath=fs::path(operationRoot)/"startup-source.bin";
       privateFile(sourcePath.string(),256*1024*1024);
-      MothershipRuntimeRecoveryCapturedSource captured={};ProdigyPersistentBrainSnapshot snapshot={};
-      require(mothershipRuntimeRecoveryLoadCapturedSource(root,text(read(sourcePath)),captured,failure),
+      MothershipRuntimeRecoveryCapturedSource captured={};ProdigyPersistentBrainSnapshot snapshot={},canonicalSnapshot={};
+      ProdigyPersistentLocalBrainState canonicalLocal={};
+      require(mothershipRuntimeRecoveryReadSealedSource(root,originalState,originalSecrets,proof,canonicalLocal,canonicalSnapshot,failure),
+              "runtime recovery sealed private authority unavailable");
+      require(mothershipRuntimeRecoveryLoadCapturedSource(text(read(sourcePath)),canonicalLocal,captured,failure),
               "runtime recovery captured startup envelope decode failed");
       require(prodigyComputeSHA256Hex(captured.snapshotBytes,sha,failure) && sha==proof.snapshotSHA256,
               "runtime recovery captured startup snapshot digest differs");
-      require(BitseryEngine::deserializeSafe(captured.snapshotBytes,snapshot),
-              "runtime recovery captured startup snapshot decode failed");
+      require(restoreRuntimeStartupCapturedAuthority(captured,canonicalLocal,canonicalSnapshot,snapshot,failure),
+              "runtime recovery captured public authority differs from sealed source");
       require(captured.local.uuid==memberUUID && captured.local.ownerClusterUUID==request.cohort.clusterUUID,
               "runtime recovery captured startup local identity differs");
       require(fs::path(str(captured.privateStatePath)).parent_path()==fs::path(operationRoot) &&

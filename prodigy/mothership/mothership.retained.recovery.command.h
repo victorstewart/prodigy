@@ -108,6 +108,31 @@ inline bool decodeLegacyRuntimeStartupCapturedSource(const String& bytes, const 
   result.census=std::move(tail.census); result.parameterSHA256=std::move(tail.parameterSHA256);
   captured=std::move(result); return true;
 }
+// Persistent snapshot storage carries the transport-authority root in its
+// private paired sidecar. The ordinary snapshot wire intentionally omits that
+// root, so bind captured bytes to the canonical snapshot's public projection,
+// then retain the full canonical object for private preparation.
+inline bool restoreRuntimeStartupCapturedAuthority(RuntimeStartupCapturedSource& captured,
+                                                    const ProdigyPersistentLocalBrainState& canonicalLocal,
+                                                    const ProdigyPersistentBrainSnapshot& canonicalSnapshot,
+                                                    ProdigyPersistentBrainSnapshot& restoredSnapshot,
+                                                    String *failure = nullptr) {
+  auto reject=[&](const char *why) { if(failure) failure->assign(why); return false; };
+  String canonicalWire = {};
+  ProdigyPersistentBrainSnapshot canonicalCopy=canonicalSnapshot, canonicalPublic={}, capturedPublic={};
+  if(!BitseryEngine::serialize(canonicalWire,canonicalCopy) ||
+      !BitseryEngine::deserializeSafe(canonicalWire,canonicalPublic) ||
+      !BitseryEngine::deserializeSafe(captured.snapshotBytes,capturedPublic))
+    return reject("runtime startup captured snapshot public projection is invalid");
+  if(!prodigyPersistentBrainSnapshotsEqual(canonicalPublic,capturedPublic))
+    return reject("runtime startup captured snapshot public projection differs from canonical private authority");
+  if(!prodigyPersistentSerializedEqual(canonicalLocal,captured.local))
+    return reject("runtime startup captured local public projection differs from canonical private authority");
+  RuntimeStartupCapturedSource result=captured;
+  result.local=canonicalLocal;
+  captured=std::move(result); restoredSnapshot=canonicalSnapshot;
+  return true;
+}
 struct Request {
   uint128_t clusterUUID = 0;
   String bundleSHA;
