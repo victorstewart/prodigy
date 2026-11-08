@@ -7877,7 +7877,9 @@ static void testBrainHandlerReplicationPaths(TestSuite& suite)
   metricSamples.push_back(metric);
   {
     String serialized;
-    BitseryEngine::serialize(serialized, metricSamples);
+    ProdigyMetricSamplesSnapshot snapshot = {};
+    snapshot.samples = metricSamples;
+    BitseryEngine::serialize(serialized, snapshot);
     Message *message = buildBrainMessage(messageBuffer, BrainTopic::replicateMetricsSnapshot, serialized);
     brain.brainHandler(&peer, message);
   }
@@ -8036,8 +8038,8 @@ static void testReconcileStateReplicatesCredentialAndTlsState(TestSuite& suite)
       String serializedSamples;
       Message::extractToStringView(args, serializedSamples);
 
-      Vector<ProdigyMetricSample> decoded;
-      if (BitseryEngine::deserializeSafe(serializedSamples, decoded) && decoded.size() == 1)
+      ProdigyMetricSamplesSnapshot decoded = {};
+      if (BitseryEngine::deserializeSafe(serializedSamples, decoded) && decoded.samples.size() == 1)
       {
         foundMetricsSnapshot = true;
       }
@@ -8053,6 +8055,96 @@ static void testReconcileStateReplicatesCredentialAndTlsState(TestSuite& suite)
   suite.expect(foundMasterAuthority, "reconcile_state_emits_master_authority_replication");
   suite.expect(foundRecoveryWitness, "reconcile_state_projects_local_bundle_recovery_witness");
   suite.expect(foundMetricsSnapshot, "reconcile_state_emits_metrics_snapshot_replication");
+}
+
+static void testReconcileStateReplicatesWideMetricsSnapshot(TestSuite& suite)
+{
+  constexpr uint32_t sampleCount = uint32_t(UINT16_MAX) + 1;
+  constexpr uint32_t samplesPerSeries = 1024;
+  constexpr int64_t firstSampleMs = 1'700'000'100'000;
+  constexpr uint64_t deploymentID = 0x5511;
+  constexpr uint64_t metricKey = 0x5522;
+
+  TestBrain source;
+  BrainView follower;
+  for (uint32_t index = 0; index < sampleCount; ++index)
+  {
+    source.metrics.record(deploymentID, uint128_t(0x6600 + index / samplesPerSeries), metricKey,
+                          firstSampleMs + index, double(index % 251));
+  }
+
+  Vector<ProdigyMetricSample> expected;
+  source.metrics.exportSamples(expected);
+  suite.expect(expected.size() == sampleCount, "reconcile_state_wide_metrics_fixture_exceeds_16_bit_container");
+
+  ProdigyMetricSamplesSnapshot smallSnapshot = {};
+  smallSnapshot.samples.push_back(expected[0]);
+  String legacySmall = {}, wideSmall = {};
+  suite.expect(BitseryEngine::serialize(legacySmall, smallSnapshot.samples) &&
+                   BitseryEngine::serialize(wideSmall, smallSnapshot) && legacySmall == wideSmall,
+               "reconcile_state_wide_metrics_preserves_small_snapshot_wire");
+
+  BrainReconcileStateRequest request = {};
+  String serializedRequest = {}, requestBuffer = {}, serializedSamples = {};
+  BitseryEngine::serialize(serializedRequest, request);
+  source.brainHandler(&follower, buildBrainMessage(requestBuffer, BrainTopic::reconcileState, serializedRequest));
+  const bool captured = extractSerializedBrainPayload(follower.wBuffer, BrainTopic::replicateMetricsSnapshot, serializedSamples);
+
+  ProdigyMetricSamplesSnapshot capturedSnapshot = {};
+  const bool decoded = captured && BitseryEngine::deserializeSafe(serializedSamples, capturedSnapshot) &&
+                       capturedSnapshot.samples.size() == sampleCount;
+  suite.expect(decoded, "reconcile_state_wide_metrics_uses_wide_snapshot_payload");
+  if (!decoded) return;
+
+  TestBrain receiver;
+  BrainView peer;
+  String receiverBuffer = {};
+  receiver.brainHandler(&peer, buildBrainMessage(receiverBuffer, BrainTopic::replicateMetricsSnapshot, serializedSamples));
+
+  Vector<ProdigyMetricSample> received;
+  receiver.metrics.exportSamples(received);
+  Vector<uint8_t> seen;
+  seen.resize(sampleCount);
+  bool preserved = received.size() == sampleCount;
+  for (const ProdigyMetricSample& sample : received)
+  {
+    if (sample.ms < firstSampleMs || sample.ms >= firstSampleMs + sampleCount)
+    {
+      preserved = false;
+      break;
+    }
+    const uint32_t index = uint32_t(sample.ms - firstSampleMs);
+    if (sample.deploymentID != deploymentID || sample.containerUUID != uint128_t(0x6600 + index / samplesPerSeries) ||
+        sample.metricKey != metricKey || sample.value != float(index % 251) || seen[index] != 0)
+    {
+      preserved = false;
+      break;
+    }
+    seen[index] = 1;
+  }
+  for (uint8_t observed : seen) preserved &= observed == 1;
+  suite.expect(preserved && receiver.persistCalls == 1,
+               "reconcile_state_wide_metrics_receiver_imports_every_sample_once");
+
+  String truncated = serializedSamples;
+  truncated.resize(truncated.size() - 1);
+  const uint32_t persistedBeforeMalformed = receiver.persistCalls;
+  String malformedBuffer = {};
+  receiver.brainHandler(&peer, buildBrainMessage(malformedBuffer, BrainTopic::replicateMetricsSnapshot, truncated));
+  Vector<ProdigyMetricSample> afterMalformed;
+  receiver.metrics.exportSamples(afterMalformed);
+  bool unchanged = afterMalformed.size() == received.size() && receiver.persistCalls == persistedBeforeMalformed;
+  for (const ProdigyMetricSample& sample : afterMalformed)
+  {
+    if (sample.ms < firstSampleMs || sample.ms >= firstSampleMs + sampleCount ||
+        sample.deploymentID != deploymentID || sample.containerUUID != uint128_t(0x6600 + uint32_t(sample.ms - firstSampleMs) / samplesPerSeries) ||
+        sample.metricKey != metricKey || sample.value != float(uint32_t(sample.ms - firstSampleMs) % 251))
+    {
+      unchanged = false;
+      break;
+    }
+  }
+  suite.expect(unchanged, "reconcile_state_wide_metrics_rejects_truncated_payload_without_mutation");
 }
 
 static void testPreStagedSystemArtifactReplication(TestSuite& suite)
@@ -45344,6 +45436,13 @@ static void testAuthorityElectionFrontierRefreshesDurablePeerRevision(TestSuite&
 
 int main(void)
 {
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "credential-wide-metrics-snapshot") == 0)
+  {
+    TestSuite suite;
+    testReconcileStateReplicatesWideMetricsSnapshot(suite);
+    std::printf("WIDE_METRICS_SNAPSHOT_RESULT passed=%d failed=%d\n", suite.passed, suite.failed);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "persisted-inventory-runtime") == 0)
   {
@@ -45618,6 +45717,7 @@ int main(void)
     ScopedRing ring = {};
     testBrainHandlerReplicationPaths(suite);
     testReconcileStateReplicatesCredentialAndTlsState(suite);
+    testReconcileStateReplicatesWideMetricsSnapshot(suite);
     testMothershipTunnelProviderReconcileBackfillsDesiredStateAndArtifact(suite);
     testMothershipConfigureAppliesClusterUUID(suite);
     testMothershipConfigureRetriesPersistenceBackpressure(suite);
@@ -46345,6 +46445,7 @@ int main(void)
   testNeuronContainerHandlerRecordsMasterLocalTlsResumptionAckWithoutBrainStream(suite);
   testBrainHandlerReplicationPaths(suite);
   testReconcileStateReplicatesCredentialAndTlsState(suite);
+  testReconcileStateReplicatesWideMetricsSnapshot(suite);
   testPreStagedSystemArtifactReplication(suite);
   testSystemContainerArtifactKindAwareIO(suite);
   testSystemContainerArtifactReplicationQueuesTypedBlob(suite);

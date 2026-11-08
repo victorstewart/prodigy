@@ -44806,10 +44806,10 @@ public:
           String serialized;
           Message::extractToStringView(args, serialized);
 
-          Vector<ProdigyMetricSample> samples;
-          if (BitseryEngine::deserializeSafe(serialized, samples))
+          ProdigyMetricSamplesSnapshot snapshot;
+          if (BitseryEngine::deserializeSafe(serialized, snapshot))
           {
-            metrics.importSamples(samples);
+            metrics.importSamples(snapshot.samples);
             persistLocalRuntimeStateAsync();
           }
           break;
@@ -45196,12 +45196,12 @@ public:
             Message::construct(bv->wBuffer, BrainTopic::replicateMasterAuthorityState, serializedRuntimeState);
           }
           {
-            Vector<ProdigyMetricSample> metricSamples;
-            metrics.exportSamples(metricSamples);
-            if (metricSamples.empty() == false)
+            ProdigyMetricSamplesSnapshot snapshot;
+            metrics.exportSamples(snapshot.samples);
+            if (snapshot.samples.empty() == false)
             {
               String serializedMetricSamples;
-              BitseryEngine::serialize(serializedMetricSamples, metricSamples);
+              BitseryEngine::serialize(serializedMetricSamples, snapshot);
               Message::construct(bv->wBuffer, BrainTopic::replicateMetricsSnapshot, serializedMetricSamples);
             }
           }
