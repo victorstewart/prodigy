@@ -827,10 +827,100 @@ int main(void)
   completedChild.phase = MothershipRemoteRuntimeRecoveryPhase::activationStarted;
   addPhaseReceipts(completedChild);
   assert(registry.advanceRemoteRuntimeRecoveryCohort(completedChild, completedChild.phase, recoveryStored, resumed, &failure));
+  // A phase-six child may itself become the immutable activation parent of a
+  // new cohort.  This is the deployed f01 -> e20 -> bd successor shape: the
+  // prior frozen handoff remains an ancestor, not a cycle.
   completedChild = recoveryStored;
-  completedChild.phase = MothershipRemoteRuntimeRecoveryPhase::completed;
-  addPhaseReceipts(completedChild);
-  assert(registry.advanceRemoteRuntimeRecoveryCohort(completedChild, completedChild.phase, recoveryStored, resumed, &failure));
+  remote.topology = observedTopology;
+  String chainParentBytes = {}, chainParentSHA256 = {};
+  auto chainParentCopy = completedChild;
+  assert(BitseryEngine::serialize(chainParentBytes, chainParentCopy));
+  assert(prodigyComputeSHA256Hex(chainParentBytes, chainParentSHA256));
+  auto chainChild = completedChild;
+  chainChild.operationID = uint128_t(0xD32);
+  chainChild.phase = MothershipRemoteRuntimeRecoveryPhase::admitted;
+  chainChild.sourceBundleSHA256 = completedChild.targetBundleSHA256;
+  chainChild.sourceContractSHA256 = completedChild.targetContractSHA256;
+  chainChild.sourceProdigySHA256 = completedChild.targetProdigySHA256;
+  chainChild.sourceMothershipSHA256 = completedChild.targetMothershipSHA256;
+  for (auto& member : chainChild.members)
+  {
+    member.bootID = "00000000-0000-4000-8000-0000000000bb"_ctv;
+    member.sourceProcessPID += 1000; member.sourceProcessStartTicks += 1000;
+    member.stateSHA256.clear(); member.secretsSHA256.clear(); member.containerInventorySHA256.clear();
+    member.privateLoaderSHA256.clear(); member.retainedNetworkSHA256.clear();
+    member.targetRuntimeInstalled = false; member.phaseReceipts.clear();
+  }
+  String chainChildSHA256 = {};
+  assert(MothershipClusterRegistry::remoteRuntimeRecoveryActivationBindingDigest(
+      completedChild, chainChild, chainChild.admissionRecordSHA256));
+  assert(MothershipClusterRegistry::remoteRuntimeRecoveryInitialCohortDigest(chainChild, chainChildSHA256));
+  auto chainHandoff = activatedShape;
+  chainHandoff.clusterUUID = remote.clusterUUID;
+  chainHandoff.parentOperationID = completedChild.operationID;
+  chainHandoff.childOperationID = chainChild.operationID;
+  chainHandoff.parentCohortSHA256 = chainParentSHA256;
+  chainHandoff.childAdmissionSHA256 = chainChild.admissionRecordSHA256;
+  chainHandoff.childCohortSHA256 = chainChildSHA256;
+  chainHandoff.parentTopology = observedTopology;
+  chainHandoff.declaredTopology = remote.topology;
+  chainHandoff.observedTopology = remote.topology;
+  // The reverse edge would close the already-recorded frozen -> activation
+  // handoff.  Validate it before persistence so this is a real graph-cycle
+  // rejection, not merely the record's parent==child shape check.
+  auto backEdgeChild = chainChild;
+  backEdgeChild.operationID = handoffParent.operationID;
+  assert(MothershipClusterRegistry::remoteRuntimeRecoveryActivationBindingDigest(
+      completedChild, backEdgeChild, backEdgeChild.admissionRecordSHA256));
+  String backEdgeChildSHA256 = {};
+  assert(MothershipClusterRegistry::remoteRuntimeRecoveryInitialCohortDigest(backEdgeChild, backEdgeChildSHA256));
+  auto backEdge = chainHandoff;
+  backEdge.childOperationID = backEdgeChild.operationID;
+  backEdge.childAdmissionSHA256 = backEdgeChild.admissionRecordSHA256;
+  backEdge.childCohortSHA256 = backEdgeChildSHA256;
+  assert(!registry.validateRemoteRuntimeRecoveryHandoff(backEdge, remote, backEdgeChild, &failure));
+  assert(failure == "remote runtime recovery handoff cycle is invalid"_ctv);
+  MothershipRemoteRuntimeRecoveryHandoffRecord chainStored = {};
+  assert(registry.admitRemoteRuntimeRecoveryHandoff(
+      chainHandoff, remote, chainChild, chainStored, recoveryStored, resumed, &failure));
+  assert(!resumed && chainStored.childOperationID == chainChild.operationID);
+  bool chainParentSuperseded = false;
+  assert(registry.remoteRuntimeRecoveryParentSuperseded(completedChild, chainParentSuperseded, &failure) && chainParentSuperseded);
+  auto secondChainCohort = chainChild;
+  secondChainCohort.operationID = uint128_t(0xD34);
+  assert(MothershipClusterRegistry::remoteRuntimeRecoveryActivationBindingDigest(
+      completedChild, secondChainCohort, secondChainCohort.admissionRecordSHA256));
+  String secondChainCohortSHA256 = {};
+  assert(MothershipClusterRegistry::remoteRuntimeRecoveryInitialCohortDigest(secondChainCohort, secondChainCohortSHA256));
+  auto secondChainChild = chainHandoff;
+  secondChainChild.childOperationID = secondChainCohort.operationID;
+  secondChainChild.childAdmissionSHA256 = secondChainCohort.admissionRecordSHA256;
+  secondChainChild.childCohortSHA256 = secondChainCohortSHA256;
+  assert(!registry.validateRemoteRuntimeRecoveryHandoff(secondChainChild, remote, secondChainCohort, &failure));
+  // Once the parent has an immutable successor it remains activation-started;
+  // complete the child, which is the only live branch of the handoff chain.
+  auto completedChainChild = recoveryStored;
+  for (const auto nextPhase : {MothershipRemoteRuntimeRecoveryPhase::staged, MothershipRemoteRuntimeRecoveryPhase::fenced,
+                               MothershipRemoteRuntimeRecoveryPhase::frozen, MothershipRemoteRuntimeRecoveryPhase::quiesced,
+                               MothershipRemoteRuntimeRecoveryPhase::installed, MothershipRemoteRuntimeRecoveryPhase::activationStarted,
+                               MothershipRemoteRuntimeRecoveryPhase::completed})
+  {
+    completedChainChild.phase = nextPhase;
+    addPhaseReceipts(completedChainChild);
+    if (nextPhase == MothershipRemoteRuntimeRecoveryPhase::frozen)
+      for (uint32_t index = 0; index < completedChainChild.members.size(); ++index) {
+        completedChainChild.members[index].stateSHA256 = digest(char('a' + index));
+        completedChainChild.members[index].secretsSHA256 = digest(char('d' + index));
+        completedChainChild.members[index].containerInventorySHA256 = digest(char('1' + index));
+        completedChainChild.members[index].privateLoaderSHA256 = digest(char('4' + index));
+        completedChainChild.members[index].retainedNetworkSHA256 = digest(char('7' + index));
+      }
+    if (nextPhase == MothershipRemoteRuntimeRecoveryPhase::installed)
+      for (auto& member : completedChainChild.members) member.targetRuntimeInstalled = true;
+    assert(registry.advanceRemoteRuntimeRecoveryCohort(
+        completedChainChild, nextPhase, recoveryStored, resumed, &failure));
+    completedChainChild = recoveryStored;
+  }
   auto postHandoffRecovery = makeWithdrawableRecovery(uint128_t(0xD33));
   String postHandoffTopologyBytes = {}, postHandoffTopologySHA256 = {};
   auto postHandoffTopology = remote.topology;

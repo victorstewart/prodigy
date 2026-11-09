@@ -5143,7 +5143,31 @@ public:
       { if (failure) failure->assign("remote runtime recovery handoff parent already has a different child"_ctv); return false; }
       if (other.childOperationID == requested.childOperationID && other.parentOperationID != requested.parentOperationID)
       { if (failure) failure->assign("remote runtime recovery handoff child already has a different parent"_ctv); return false; }
-      if (other.parentOperationID == requested.childOperationID || other.childOperationID == requested.parentOperationID)
+    }
+    // A successor may extend an existing handoff (frozen -> activation-started
+    // -> successor).  It is a cycle only when the requested child already has
+    // a descendant path back to the requested parent.
+    uint128_t descendant = requested.childOperationID;
+    for (uint32_t depth = 0; depth <= existingHandoffs.size(); ++depth)
+    {
+      bool found = false;
+      for (const String& bytes : existingHandoffs)
+      {
+        MothershipRemoteRuntimeRecoveryHandoffRecord other = {};
+        if (!BitseryEngine::deserializeSafe(bytes, other) || !remoteRuntimeRecoveryHandoffValid(other))
+        { if (failure) failure->assign("remote runtime recovery handoff is corrupt or unsupported"_ctv); return false; }
+        if (other.clusterUUID != requested.clusterUUID || other.parentOperationID != descendant) continue;
+        if (other.childOperationID == requested.parentOperationID)
+        { if (failure) failure->assign("remote runtime recovery handoff cycle is invalid"_ctv); return false; }
+        descendant = other.childOperationID;
+        found = true;
+        break;
+      }
+      if (!found) break;
+      // More edges than the finite handoff set means we revisited a node.
+      // Reject even if that pre-existing cycle does not contain the requested
+      // parent: its successor relation is not a trustworthy lineage.
+      if (depth == existingHandoffs.size())
       { if (failure) failure->assign("remote runtime recovery handoff cycle is invalid"_ctv); return false; }
     }
     String parentKey = {}, encoded = {}, readFailure = {};
