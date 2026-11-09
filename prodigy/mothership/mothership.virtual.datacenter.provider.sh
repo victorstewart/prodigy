@@ -456,6 +456,55 @@ valid_retained_cgroup_root()
       "${retained_cgroup_root}" == /sys/fs/cgroup/*/prodigy-vdc-"${runtime_identity}" ]]
 }
 
+# An adopter may find that the empty control leaf was removed while the
+# retained provider and its machine leaves remained live.  The control leaf is
+# only the provider-launch parking leaf; it is never runtime ownership.  Do
+# not rebuild scope delegation here: recover only its exact empty pathname
+# while the live provider cgroup authenticates the retained root.
+retained_cgroup_control_absent_recoverable()
+{
+   local retained_cgroup_scope="$1" retained_cgroup_root="$2" runtime_identity="$3"
+   local canonical_scope="" child="" children="" enabled="" processes=""
+   valid_retained_cgroup_root "${retained_cgroup_root}" "${runtime_identity}" || return 1
+   canonical_scope="$(realpath -m -- "${retained_cgroup_scope}")" || return 1
+   [[ "${canonical_scope}" == "${retained_cgroup_scope}" &&
+      "${retained_cgroup_root}" == "${retained_cgroup_scope}/prodigy-vdc-${runtime_identity}" &&
+      ( "${retained_cgroup_scope}" == /sys/fs/cgroup || "${retained_cgroup_scope}" == /sys/fs/cgroup/* ) &&
+      -d "${retained_cgroup_scope}" && -d "${retained_cgroup_root}" &&
+      ! -e "${retained_cgroup_scope}/prodigy-vdc-control" && ! -L "${retained_cgroup_scope}/prodigy-vdc-control" &&
+      -r "${retained_cgroup_scope}/cgroup.procs" && -r "${retained_cgroup_scope}/cgroup.subtree_control" ]] || return 1
+   [[ "$(findmnt -n -o FSTYPE -T "${retained_cgroup_scope}")" == cgroup2 ]] || return 1
+   processes="$(cat -- "${retained_cgroup_scope}/cgroup.procs")" || return 1
+   [[ -z "${processes}" ]] || return 1
+   enabled=" $(<"${retained_cgroup_scope}/cgroup.subtree_control") "
+   local controller=""
+   for controller in cpuset cpu memory pids
+   do
+      [[ "${enabled}" == *" ${controller} "* ]] || return 1
+   done
+   children="$(find "${retained_cgroup_scope}" -mindepth 1 -maxdepth 1 -type d -print)" || return 1
+   while IFS= read -r child
+   do
+      [[ -z "${child}" ]] && continue
+      [[ "${child##*/}" =~ ^prodigy-vdc-[0-9]+$ ]] || return 1
+   done <<< "${children}"
+}
+
+restore_retained_cgroup_control_if_absent()
+{
+   local retained_cgroup_scope="$1" retained_cgroup_root="$2" runtime_identity="$3"
+   local retained_cgroup_lock=""
+   retained_cgroup_control_absent_recoverable "${retained_cgroup_scope}" "${retained_cgroup_root}" "${runtime_identity}" || return 1
+   retained_cgroup_lock="/run/prodigy-vdc-cgroup-$(stat -Lc %i "${retained_cgroup_scope}").lock" || return 1
+   (
+      exec {retained_cgroup_lock_fd}>"${retained_cgroup_lock}" || return 1
+      flock "${retained_cgroup_lock_fd}" || return 1
+      retained_cgroup_control_absent_recoverable "${retained_cgroup_scope}" "${retained_cgroup_root}" "${runtime_identity}" || return 1
+      mkdir "${retained_cgroup_scope}/prodigy-vdc-control" || return 1
+      flock -u "${retained_cgroup_lock_fd}"
+   )
+}
+
 restore_cgroup_scope_if_idle()
 {
    if [[ -n "${1:-}" ]]
@@ -4236,7 +4285,12 @@ else
    cgroup_scope="${cgroup_root%/prodigy-vdc-${runtime_identity}}"
    cgroup_control="${cgroup_scope}/prodigy-vdc-control"
    cgroup_lock="/run/prodigy-vdc-cgroup-$(stat -Lc %i "${cgroup_scope}").lock"
-   [[ -d "${filesystem_root}" && -r "${runtime_path}" && -d "${cgroup_root}" && -d "${cgroup_scope}" && -d "${cgroup_control}" && -w "${cgroup_root}/provider/cgroup.procs" ]] || failed 1 "$LINENO"
+   [[ -d "${filesystem_root}" && -r "${runtime_path}" && -d "${cgroup_root}" && -d "${cgroup_scope}" && -w "${cgroup_root}/provider/cgroup.procs" ]] || failed 1 "$LINENO"
+   if [[ ! -d "${cgroup_control}" ]]
+   then
+      restore_retained_cgroup_control_if_absent "${cgroup_scope}" "${cgroup_root}" "${runtime_identity}" || failed 1 "$LINENO"
+   fi
+   [[ -d "${cgroup_control}" && ! -L "${cgroup_control}" ]] || failed 1 "$LINENO"
    mapfile -t machine_pids < "${runtime_path}"
    [[ "${#machine_pids[@]}" -eq "${machine_count}" ]] || failed 1 "$LINENO"
    if [[ -r "${workspace}/virtual-datacenter.forwarding" ]]
