@@ -10205,6 +10205,57 @@ public:
     return upsertClusterWithBGPOriginPolicyMode(candidate, false, heldPolicyLock, storedCluster, failure, true);
   }
 
+  // DNS/ACME identity is otherwise immutable.  This is the sole durable
+  // reference rotation: caller holds the same full-record lock across its
+  // configure acknowledgement and this exact expected-old CAS.
+  bool rotateDNSCredentialReference(const String& identity,
+                                    const String& expectedOldCredentialName,
+                                    const String& newCredentialName,
+                                    MothershipProdigyCluster *storedCluster = nullptr,
+                                    String *failure = nullptr,
+                                    const BGPOriginPolicyLock *heldPolicyLock = nullptr)
+  {
+    BGPOriginPolicyLock ownedPolicyLock = {};
+    if (heldPolicyLock == nullptr)
+    {
+      if (lockBGPOriginPolicy(ownedPolicyLock, failure) == false) return false;
+      heldPolicyLock = &ownedPolicyLock;
+    }
+    else if (heldPolicyLock->fd < 0)
+    {
+      if (failure) failure->assign("BGP origin policy lock required"_ctv);
+      return false;
+    }
+
+    if (expectedOldCredentialName.empty() || newCredentialName.empty())
+    {
+      if (failure) failure->assign("DNS credential rotation requires expected and new credential names"_ctv);
+      return false;
+    }
+    MothershipProdigyCluster existing = {};
+    if (getClusterByIdentity(identity, existing, failure) == false) return false;
+    if (existing.dnsProvider == MothershipClusterProvider::unknown ||
+        existing.dnsProviderCredentialName.empty() || existing.acme.configured() == false)
+    {
+      if (failure) failure->assign("cluster requires complete configured DNS and ACME before credential rotation"_ctv);
+      return false;
+    }
+    if (existing.dnsProviderCredentialName.equals(expectedOldCredentialName) == false)
+    {
+      if (failure) failure->assign("cluster DNS credential reference does not match expected old credential"_ctv);
+      return false;
+    }
+    if (expectedOldCredentialName.equals(newCredentialName))
+    {
+      if (storedCluster) *storedCluster = existing;
+      if (failure) failure->clear();
+      return true;
+    }
+    MothershipProdigyCluster candidate = existing;
+    candidate.dnsProviderCredentialName = newCredentialName;
+    return upsertClusterWithBGPOriginPolicyMode(candidate, false, heldPolicyLock, storedCluster, failure, false, true);
+  }
+
   // Ordinary cluster writers do not own BGP origin policy. Serialize every
   // full-record update with the policy lock and retain the durable policy from
   // the latest record so a stale unrelated update cannot silently erase it.
@@ -10213,7 +10264,8 @@ public:
                                              const BGPOriginPolicyLock *heldPolicyLock,
                                              MothershipProdigyCluster *storedCluster = nullptr,
                                              String *failure = nullptr,
-                                             bool allowInitialDNSACMEEnablement = false)
+                                             bool allowInitialDNSACMEEnablement = false,
+                                             bool allowDNSCredentialRotation = false)
   {
     BGPOriginPolicyLock ownedPolicyLock = {};
     if (heldPolicyLock == nullptr)
@@ -10327,6 +10379,16 @@ public:
       if (failure)
       {
         failure->assign("acme config is immutable for an existing cluster");
+      }
+      return false;
+    }
+
+    if (hadExistingCluster && stored.dnsProviderCredentialName.equals(existingCluster.dnsProviderCredentialName) == false &&
+        initialDNSACMEEnablement == false && allowDNSCredentialRotation == false)
+    {
+      if (failure)
+      {
+        failure->assign("dnsProviderCredentialName is immutable for an existing cluster outside DNS credential rotation");
       }
       return false;
     }

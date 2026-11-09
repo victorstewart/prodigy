@@ -1423,8 +1423,48 @@ int main(void)
     MothershipProdigyCluster changedDNSCredential = storedRemoteCreated;
     changedDNSCredential.dnsProviderCredentialName = "cloudflare-rotated"_ctv;
     bool upsertChangedDNSCredential = registry.upsertCluster(changedDNSCredential, nullptr, &failure);
-    suite.expect(upsertChangedDNSCredential, "upsert_existing_dns_credential_change_allowed");
-    storedRemoteCreated = changedDNSCredential;
+    suite.expect(upsertChangedDNSCredential == false, "upsert_existing_dns_credential_change_rejected");
+    suite.expect(failure.equals("dnsProviderCredentialName is immutable for an existing cluster outside DNS credential rotation"_ctv),
+                 "upsert_existing_dns_credential_change_reason");
+    MothershipProdigyCluster rotatedDNSCredential = {};
+    suite.expect(registry.rotateDNSCredentialReference(storedRemoteCreated.name,
+                                                        storedRemoteCreated.dnsProviderCredentialName,
+                                                        "cloudflare-rotated"_ctv,
+                                                        &rotatedDNSCredential,
+                                                        &failure),
+                 "rotate_dns_credential_exact_expected_old");
+    suite.expect(rotatedDNSCredential.dnsProvider == storedRemoteCreated.dnsProvider &&
+                     rotatedDNSCredential.acme == storedRemoteCreated.acme &&
+                     rotatedDNSCredential.dnsProviderCredentialName.equals("cloudflare-rotated"_ctv),
+                 "rotate_dns_credential_preserves_provider_and_acme");
+    suite.expect(!registry.rotateDNSCredentialReference(storedRemoteCreated.name,
+                                                         "cloudflare-prod"_ctv,
+                                                         "cloudflare-next"_ctv,
+                                                         nullptr,
+                                                         &failure) &&
+                     failure.equals("cluster DNS credential reference does not match expected old credential"_ctv),
+                 "rotate_dns_credential_rejects_stale_expected_old");
+    suite.expect(registry.rotateDNSCredentialReference(storedRemoteCreated.name,
+                                                        "cloudflare-rotated"_ctv,
+                                                        "cloudflare-rotated"_ctv,
+                                                        &rotatedDNSCredential,
+                                                        &failure),
+                 "rotate_dns_credential_exact_same_name_is_idempotent");
+    suite.expect(!registry.rotateDNSCredentialReference(storedSecondTestLocal.name,
+                                                         "cloudflare-prod"_ctv,
+                                                         "cloudflare-rotated"_ctv,
+                                                         nullptr,
+                                                         &failure) &&
+                     failure.equals("cluster requires complete configured DNS and ACME before credential rotation"_ctv),
+                 "rotate_dns_credential_rejects_unconfigured_cluster");
+    suite.expect(!registry.rotateDNSCredentialReference(storedRemoteCreated.name,
+                                                         "cloudflare-prod"_ctv,
+                                                         "cloudflare-rotated"_ctv,
+                                                         nullptr,
+                                                         &failure) &&
+                     failure.equals("cluster DNS credential reference does not match expected old credential"_ctv),
+                 "rotate_dns_credential_rejects_non_idempotent_replay");
+    storedRemoteCreated = rotatedDNSCredential;
 
     MothershipProdigyCluster changedACME = storedRemoteCreated;
     changedACME.acme.accountEmail = "security@example.com"_ctv;

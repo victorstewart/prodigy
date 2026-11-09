@@ -8648,6 +8648,23 @@ private:
     return true;
   }
 
+  bool validateClusterNativeExactDNSCredentialReference(const MothershipProdigyCluster& cluster, String& failure, MothershipProviderCredential *credentialOut = nullptr)
+  {
+    MothershipProviderCredential credential = {};
+    if (validateClusterDNSProviderCredentialReference(cluster, failure, &credential) == false) return false;
+    auto scope = credential.metadata.find("dnsScope"_ctv);
+    auto records = credential.metadata.find("dnsRecords"_ctv);
+    if (scope == credential.metadata.end() || records == credential.metadata.end() ||
+        scope->second.equal("native-exact"_ctv) == false || records->second.empty())
+    {
+      failure.assign("cluster DNS credential requires native-exact dnsScope with declared dnsRecords"_ctv);
+      return false;
+    }
+    if (credentialOut) *credentialOut = std::move(credential);
+    failure.clear();
+    return true;
+  }
+
   static void inferClusterMachineSchemaCpuCapabilities(BrainIaaS& provider,
                                                        CoroutineStack *coro,
                                                        const MothershipProdigyCluster& cluster,
@@ -31814,6 +31831,76 @@ LOCAL_RUNTIME
                (unsigned long long)stored.clusterUUID);
   }
 
+  void runRotateClusterDNSCredential(int argc, char *argv[])
+  {
+    const bool check = argc == 4 && std::strcmp(argv[3], "--check") == 0;
+    if ((argc != 3 && argc != 4) || (argc == 4 && check == false))
+    {
+      basics_log("usage: rotateClusterDNSCredential [cluster name|UUID] [expected old credential] [new credential] [--check]\n");
+      exit(EXIT_FAILURE);
+    }
+    String identity = {}, expectedOld = {}, newName = {}, failure = {};
+    identity.assign(argv[0]); expectedOld.assign(argv[1]); newName.assign(argv[2]);
+    MothershipClusterRegistry registry = openClusterRegistry();
+    MothershipClusterRegistry::BGPOriginPolicyLock registryLock = {};
+    MothershipProdigyCluster existing = {};
+    if (registry.lockBGPOriginPolicy(registryLock, &failure) == false ||
+        registry.getClusterByIdentity(identity, existing, &failure) == false)
+    {
+      basics_log("rotateClusterDNSCredential success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    if (existing.dnsProvider == MothershipClusterProvider::unknown ||
+        existing.dnsProviderCredentialName.empty() || existing.acme.configured() == false ||
+        existing.dnsProviderCredentialName.equals(expectedOld) == false)
+    {
+      basics_log("rotateClusterDNSCredential success=0 failure=cluster DNS credential reference is not the expected complete configured value\n");
+      exit(EXIT_FAILURE);
+    }
+    MothershipProdigyCluster candidate = existing;
+    candidate.dnsProviderCredentialName = newName;
+    MothershipProviderCredential providerCredential = {}, dnsCredential = {};
+    if (validateClusterProviderCredentialReference(candidate, failure, &providerCredential) == false ||
+        validateClusterNativeExactDNSCredentialReference(candidate, failure, &dnsCredential) == false)
+    {
+      basics_log("rotateClusterDNSCredential success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    BrainConfig config = {};
+    const MothershipProviderCredential *providerCredentialPtr =
+        candidate.providerCredentialName.empty() ? nullptr : &providerCredential;
+    if (mothershipBuildClusterBrainConfig(candidate, providerCredentialPtr, config, &failure, &dnsCredential) == false)
+    {
+      basics_log("rotateClusterDNSCredential success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    if (expectedOld.equals(newName))
+    {
+      basics_log("rotateClusterDNSCredential success=1 idempotent=1 cluster=%s\n", existing.name.c_str());
+      return;
+    }
+    if (check)
+    {
+      basics_log("rotateClusterDNSCredential success=1 checked=1 cluster=%s\n", existing.name.c_str());
+      return;
+    }
+    ClusterCreateHooks hooks(this);
+    if (hooks.configureSeedCluster(candidate, config, &failure) == false)
+    {
+      basics_log("rotateClusterDNSCredential success=0 configured=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    MothershipProdigyCluster stored = {};
+    if (registry.rotateDNSCredentialReference(identity, expectedOld, newName, &stored, &failure, &registryLock) == false)
+    {
+      basics_log("rotateClusterDNSCredential success=0 configured=1 persisted=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    basics_log("rotateClusterDNSCredential success=1 cluster=%s clusterUUID=%016llx%016llx\n",
+               stored.name.c_str(), (unsigned long long)(stored.clusterUUID >> 64),
+               (unsigned long long)stored.clusterUUID);
+  }
+
   void runCheckClusterProviderPlan(int argc, char *argv[])
   {
     runCreateClusterRequest(argc, argv, true);
@@ -38325,6 +38412,7 @@ public:
         {"retireTestPairSource",            &Mothership::runRetireTestPairSource           },
         {"revokeBGPOriginPrefix",           &Mothership::runRevokeBGPOriginPrefix          },
         {"revokeClusterPair",               &Mothership::runRevokeClusterPair              },
+        {"rotateClusterDNSCredential",      &Mothership::runRotateClusterDNSCredential     },
         {"rotateClusterPairEpoch",          &Mothership::runRotateClusterPairEpoch         },
         {"setLocalClusterMembership",       &Mothership::runSetLocalClusterMembership      },
         {"setTestClusterMachineCount",      &Mothership::runSetTestClusterMachineCount     },
@@ -38442,6 +38530,8 @@ int main(int argc, char *argv[])
     message.append("\tan optional test initial bundle is a transient, approved explicit .zst archive used only to seed a test virtual datacenter\n");
     message.append("enableClusterDNSACME [name|clusterUUID] [json|-|@path]\n");
     message.append("\tenables complete DNS credential and ACME configuration exactly once on an existing unconfigured cluster through the durable configure acknowledgement; it does not restart or recreate machines\n");
+    message.append("rotateClusterDNSCredential [name|clusterUUID] [expected old credential] [new credential] [--check]\n");
+    message.append("\trotates only a complete cluster DNS credential reference through the configure acknowledgement and durable exact-old CAS; it does not restart or recreate machines\n");
     message.append("resumeClusterCreation [exact 0x cluster UUID] [expected seed cloud UUID]\n");
     message.append("printClusters\n");
     message.append("\tlists all managed Prodigy cluster records with their clusterUUIDs\n");
