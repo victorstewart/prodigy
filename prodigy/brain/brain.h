@@ -21012,6 +21012,117 @@ public:
     recoverDeploymentsAfterNeuronState();
   }
 
+  // Normal admission already collapses an empty queued middle version before
+  // persisting the new head. After a cold restore, durable plans are rebuilt
+  // first and runtime inventory is attached later, so that same harmless
+  // middle can survive between a materialized predecessor and the restored
+  // queued head. Reuse the admission predicate here, but do not infer a
+  // lifecycle state for either retained owner.
+  bool normalizeRecoveredUnmaterializedQueuedMiddle(ApplicationDeployment *head)
+  {
+    if (head == nullptr || head->state != DeploymentState::waitingToDeploy ||
+        head->lifecycleIsUnmaterialized() == false || head->previous == nullptr)
+    {
+      return false;
+    }
+    ApplicationDeployment *middle = head->previous;
+    ApplicationDeployment *predecessor = middle->previous;
+    if (middle->state != DeploymentState::none || middle->lifecycleIsUnmaterialized() == false ||
+        predecessor == nullptr || predecessor->lifecycleIsUnmaterialized() || predecessor->nHealthy() != 0 ||
+        predecessor->next != middle || middle->next != head ||
+        predecessor->plan.config.applicationID != head->plan.config.applicationID ||
+        middle->plan.config.applicationID != head->plan.config.applicationID)
+    {
+      return false;
+    }
+
+    const uint64_t middleID = middle->plan.config.deploymentID();
+    const uint64_t predecessorID = predecessor->plan.config.deploymentID();
+    const uint64_t headID = head->plan.config.deploymentID();
+    auto indexed = deployments.find(middleID);
+    if (indexed == deployments.end() || indexed->second != middle ||
+        deploymentHasRoutableResourceLease(middleID))
+    {
+      // A queued owner with a remaining routing lease is not the ordinary
+      // no-op admission shape. Leave it for the existing lease owner.
+      return true;
+    }
+    const UpdateSelfPersistenceAdmission admission = updateSelfPersistenceAdmission();
+    if (admission != UpdateSelfPersistenceAdmission::admitted)
+    {
+      recoveryPersistenceRetryPending = admission == UpdateSelfPersistenceAdmission::backpressured;
+      return true;
+    }
+
+    auto retainedPlan = deploymentPlans.find(middleID);
+    const bool hadRetainedPlan = retainedPlan != deploymentPlans.end();
+    DeploymentPlan retainedPlanCopy = {};
+    if (hadRetainedPlan)
+    {
+      retainedPlanCopy = retainedPlan->second;
+      deploymentPlans.erase(retainedPlan);
+    }
+    predecessor->next = head;
+    head->previous = predecessor;
+    deployments.erase(indexed);
+    const uint64_t epoch = masterAuthorityEpoch;
+    const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+    auto receipt = std::make_shared<PersistenceDispatchResult>();
+    recoveryPersistencePending = true;
+    persistLocalRuntimeStateAsync([this, lifetime, receipt, epoch, middle, predecessor, head,
+        middleID, predecessorID, headID, hadRetainedPlan, retainedPlanCopy = std::move(retainedPlanCopy)](bool durable) mutable {
+      if (lifetime.expired()) { delete middle; return; }
+      recoveryPersistencePending = false;
+      receipt->completed = true;
+      auto currentMiddle = deployments.find(middleID);
+      auto currentPredecessor = deployments.find(predecessorID);
+      auto currentHead = deployments.find(headID);
+      const bool exactDetachedChain = currentMiddle == deployments.end() &&
+          currentPredecessor != deployments.end() && currentPredecessor->second == predecessor &&
+          currentHead != deployments.end() && currentHead->second == head;
+      if (!exactDetachedChain)
+      {
+        if (currentMiddle == deployments.end() || currentMiddle->second != middle) delete middle;
+        return;
+      }
+      if (masterAuthorityEpoch != epoch)
+      {
+        if (predecessor->next == head && head->previous == predecessor)
+        {
+          deployments.insert_or_assign(middleID, middle);
+          predecessor->next = middle;
+          middle->previous = predecessor;
+          middle->next = head;
+          head->previous = middle;
+          if (hadRetainedPlan) deploymentPlans.insert_or_assign(middleID, std::move(retainedPlanCopy));
+        }
+        return;
+      }
+      if (predecessor->next != head || head->previous != predecessor)
+      {
+        delete middle;
+        return;
+      }
+      if (!durable)
+      {
+        deployments.insert_or_assign(middleID, middle);
+        predecessor->next = middle;
+        middle->previous = predecessor;
+        middle->next = head;
+        head->previous = middle;
+        if (hadRetainedPlan) deploymentPlans.insert_or_assign(middleID, std::move(retainedPlanCopy));
+        recoveryPersistenceRetryPending = true;
+        return;
+      }
+      receipt->durable = true;
+      recoveryPersistenceRetryPending = false;
+      delete middle;
+      if (receipt->returned) recoverDeploymentsAfterNeuronState();
+    });
+    receipt->returned = true;
+    return !receipt->completed || !receipt->durable;
+  }
+
   void recoverDeploymentsAfterNeuronState(void)
   {
     if (recoveryPersistencePending || !pendingMaterializedRecoveryPersistence.empty() ||
@@ -21454,6 +21565,11 @@ public:
         });
         receipt->returned = true;
         if (!receipt->completed || !receipt->durable) return;
+      }
+
+      if (normalizeRecoveredUnmaterializedQueuedMiddle(head))
+      {
+        return;
       }
 
       // A queued successor becomes the application index head before the
