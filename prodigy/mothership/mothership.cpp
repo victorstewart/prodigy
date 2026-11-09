@@ -32269,6 +32269,20 @@ LOCAL_RUNTIME
       }
     }
 
+    // Remote recovery and removal both manipulate the same operation roots
+    // and service fence.  Serialize the existing lifecycle owners before
+    // removal archives those roots and uninstalls the runtime.
+    MothershipRemoteRuntimeRecoveryExecutionLock recoveryLock;
+    if (cluster.deploymentMode == MothershipClusterDeploymentMode::remote)
+    {
+      auto registry = openClusterRegistry();
+      if (!recoveryLock.acquire(registry.path()))
+      {
+        basics_log("removeCluster success=0 removed=0 identity=%s failure=runtime recovery executor is active or lock ownership is invalid\n", name.c_str());
+        exit(EXIT_FAILURE);
+      }
+    }
+
 
     {
       auto registry = openClusterRegistry();
