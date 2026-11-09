@@ -753,12 +753,20 @@ static inline bool mothershipRuntimeRecoveryStartupSnapshotValid(
   const auto& authority=snapshot.masterAuthority.runtimeState;
   const bool unboundRejectedCapture=rejectedCandidateSHA256.empty() &&
       mothershipRetainedRecoveryRejectedUpdatePayloadValid(authority.updateSelf);
+  // A registered source envelope cannot validate itself: only the later
+  // copy-built canonical witness set may authenticate its registrations.
+  // Admit it to that existing preparation owner, never directly to runtime.
+  const bool registeredSourceEnvelope =
+      mothershipRetainedRecoveryEnvelopeMatches(authority.updateSelf,sourceBundleSHA256) &&
+      std::any_of(authority.updateSelf.machineRecoveryWitnesses.begin(),
+                  authority.updateSelf.machineRecoveryWitnesses.end(),
+                  [](const ProdigyPersistentUpdateSelfMachineRecoveryWitness& witness) { return witness.bundleRegistered; });
   if (!prodigyIsSHA256HexDigest(targetBundleSHA256) || !prodigyIsSHA256HexDigest(sourceBundleSHA256) ||
       (!rejectedCandidateSHA256.empty() && !prodigyIsSHA256HexDigest(rejectedCandidateSHA256)) ||
       authority.updateSelfFollowerConcurrency > ProdigyUpdateSelfMaximumConcurrency ||
       !authority.updateSelfFollowerTransitionIssuedPeerKeys.empty() ||
       !authority.updateSelfFollowerReadyPeerKeys.empty() ||
-      (!unboundRejectedCapture && !mothershipRetainedRecoveryCanReplaceUpdate(
+      (!unboundRejectedCapture && !registeredSourceEnvelope && !mothershipRetainedRecoveryCanReplaceUpdate(
           snapshot,targetBundleSHA256,sourceBundleSHA256,{},rejectedCandidateSHA256)))
   { if (failure) failure->assign("private Brain snapshot contains an unresumable update-self coordinator"); return false; }
   if (failure) failure->clear();

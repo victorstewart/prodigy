@@ -2104,6 +2104,47 @@ static void assertRuntimeRecoveryStartupAuthorityPreparation()
   String resumableAfterBytes = {};
   assert(BitseryEngine::serialize(resumableAfterBytes,resumableSource) && resumableAfterBytes==resumableBytes);
 
+  // Registered predecessor witnesses are only a route to the copy-built
+  // canonical comparison below; the saved witness bytes are never evidence by
+  // themselves.
+  auto registeredSource = resumableSource;
+  for (auto& witness : registeredSource.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses)
+    witness.bundleRegistered = true;
+  assert(mothershipRuntimeRecoveryStartupSnapshotValid(
+      local,registeredSource,cluster,member,source.topology,targetBundle,sourceBundle,{},&failure));
+  ProdigyPersistentBrainSnapshot registeredPrepared = {};
+  assert(mothershipPrepareRuntimeRecoveryStartupAuthority(
+      local,registeredSource,cluster,member,source.topology,approved,machines,targetBundle,
+      sourceBundle,{},registeredPrepared,&failure));
+  auto registeredWrongSource = registeredSource;
+  ProdigyPersistentBrainSnapshot unchangedRegistered = registeredPrepared;
+  String unchangedRegisteredBytes = {}, registeredSourceBytes = {};
+  assert(BitseryEngine::serialize(unchangedRegisteredBytes, unchangedRegistered));
+  assert(BitseryEngine::serialize(registeredSourceBytes, registeredSource));
+  assert(!mothershipPrepareRuntimeRecoveryStartupAuthority(
+      local,registeredWrongSource,cluster,member,source.topology,approved,machines,targetBundle,
+      wrongSourceBundle,{},unchangedRegistered,&failure));
+  auto registeredProgressed = registeredSource;
+  registeredProgressed.masterAuthority.runtimeState.updateSelf.state =
+      uint8_t(ProdigyPersistentUpdateSelfState::Phase::waitingForFollowerReboots);
+  assert(!mothershipRuntimeRecoveryStartupSnapshotValid(
+      local,registeredProgressed,cluster,member,source.topology,targetBundle,sourceBundle,{},&failure));
+  auto duplicateRegistered = registeredSource;
+  duplicateRegistered.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses.push_back(
+      duplicateRegistered.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[0]);
+  assert(!mothershipPrepareRuntimeRecoveryStartupAuthority(
+      local,duplicateRegistered,cluster,member,source.topology,approved,machines,targetBundle,
+      sourceBundle,{},unchangedRegistered,&failure));
+  auto alteredRegistered = registeredSource;
+  alteredRegistered.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[0].containerBootstraps[0] = "altered"_ctv;
+  assert(!mothershipPrepareRuntimeRecoveryStartupAuthority(
+      local,alteredRegistered,cluster,member,source.topology,approved,machines,targetBundle,
+      sourceBundle,{},unchangedRegistered,&failure));
+  String afterRegisteredRejections = {};
+  assert(BitseryEngine::serialize(afterRegisteredRejections, unchangedRegistered) &&
+      afterRegisteredRejections == unchangedRegisteredBytes);
+  assert(BitseryEngine::serialize(resumableAfterBytes, registeredSource) && resumableAfterBytes == registeredSourceBytes);
+
   // The operation request binds raw captured bytes supplied by the caller;
   // its structural gate cannot silently substitute another member's source.
   RuntimeStartupRequest request = {};
