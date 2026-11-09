@@ -4508,6 +4508,40 @@ static void mothershipVDCTestFaultAfterRecoveryTransition(MothershipVDCTestRecov
   _exit(86);
 }
 
+static bool mothershipVDCAdopterDiagnosticValid(const String& value)
+{
+  if (value.size() < 6 || value.size() > 192 || std::memcmp(value.data(), "stage=", 6) != 0) return false;
+  for (char byte : value)
+    if (!((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+          (byte >= '0' && byte <= '9') || byte == '=' || byte == '-' || byte == '_' || byte == ' ' || byte == '\n'))
+      return false;
+  return true;
+}
+
+static void mothershipVDCAdopterReadinessFailure(bool timedOut, bool exited, int status,
+                                                 int waitError, const String& diagnostic, String& failure)
+{
+  failure.assign("retained provider adopter did not become ready outcome="_ctv);
+  if (timedOut) failure.append("timeout"_ctv);
+  else if (exited && WIFEXITED(status))
+  {
+    String outcome = {}; outcome.snprintf<"exit={itoa}"_ctv>(uint64_t(WEXITSTATUS(status)));
+    failure.append(outcome);
+  }
+  else if (exited && WIFSIGNALED(status))
+  {
+    String outcome = {}; outcome.snprintf<"signal={itoa}"_ctv>(uint64_t(WTERMSIG(status)));
+    failure.append(outcome);
+  }
+  else if (waitError != 0)
+  {
+    String outcome = {}; outcome.snprintf<"wait-error={itoa}"_ctv>(uint64_t(waitError));
+    failure.append(outcome);
+  }
+  else failure.append("unobserved"_ctv);
+  if (!diagnostic.empty()) { failure.append(" preexec="_ctv); failure.append(diagnostic); }
+}
+
 static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyCluster& cluster,
     const String& bundlePath, const String& successorSHA, uint32_t machineIndex,
     const String& expectedOldSHA, const String& expectedIncompleteWorkerSHA,
@@ -4856,6 +4890,10 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
       providerPath.snprintf<"/proc/self/fd/{itoa}"_ctv>(uint64_t(providerFD));
       runtime.assignItoa(operation.runtimeIdentity);
       mothershipVirtualDatacenterPath(directory, "provider.log", logPath);
+      String preexecPath = {}, scriptFailurePath = {};
+      mothershipVirtualDatacenterPath(directory, "adopter-preexec-failure", preexecPath);
+      mothershipVirtualDatacenterPath(directory, "adopter-pre-ready-failure", scriptFailurePath);
+      (void)::unlink(preexecPath.c_str()); (void)::unlink(scriptFailurePath.c_str());
       Vector<char *> argv = {};
       argv.push_back(const_cast<char *>("/bin/bash")); argv.push_back(const_cast<char *>(providerPath.c_str()));
       argv.push_back(const_cast<char *>("--serve-adopt")); argv.push_back(const_cast<char *>(runtime.c_str())); argv.push_back(const_cast<char *>(directory.c_str()));
@@ -4864,24 +4902,56 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
       pid_t child = ::fork();
       if (child == 0)
       {
-        if (::setsid() < 0 || ::setns(mount.fd, CLONE_NEWNS) != 0 ||
-            ::setenv("PRODIGY_VDC_RECOVERY_CGROUP_FD", retainedCgroupFD.c_str(), 1) != 0) _exit(125);
-        int log = ::open(logPath.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
-        int input = ::open("/dev/null", O_RDONLY);
-        if (log < 0 || input < 0 || ::dup2(log, STDOUT_FILENO) < 0 || ::dup2(log, STDERR_FILENO) < 0 || ::dup2(input, STDIN_FILENO) < 0) _exit(125);
-        ::execv("/bin/bash", argv.data()); _exit(127);
+        const auto preexecFailure = [&](const char *stage, int exitCode = 125) {
+          const int savedErrno = errno;
+          const int fd = ::open(preexecPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+          if (fd >= 0) {
+            char message[128] = {};
+            const int bytes = std::snprintf(message, sizeof(message), "stage=%s errno=%d\n", stage, savedErrno);
+            if (bytes > 0) (void)::write(fd, message, size_t(std::min<int>(bytes, sizeof(message) - 1)));
+            ::close(fd);
+          }
+          _exit(exitCode);
+        };
+        if (::setsid() < 0) preexecFailure("setsid");
+        if (::setns(mount.fd, CLONE_NEWNS) != 0) preexecFailure("setns-mount");
+        if (::setenv("PRODIGY_VDC_RECOVERY_CGROUP_FD", retainedCgroupFD.c_str(), 1) != 0) preexecFailure("setenv-cgroup-fd");
+        const int log = ::open(logPath.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
+        if (log < 0) preexecFailure("open-provider-log");
+        const int input = ::open("/dev/null", O_RDONLY);
+        if (input < 0) preexecFailure("open-dev-null");
+        if (::dup2(log, STDOUT_FILENO) < 0) preexecFailure("dup2-stdout");
+        if (::dup2(log, STDERR_FILENO) < 0) preexecFailure("dup2-stderr");
+        if (::dup2(input, STDIN_FILENO) < 0) preexecFailure("dup2-stdin");
+        ::execv("/bin/bash", argv.data()); preexecFailure("execv-bash", 127);
       }
       if (child < 0) return reject("cannot launch retained provider adopter");
-      bool ready = false;
+      bool ready = false, exited = false, timedOut = false;
+      int status = 0, waitError = 0;
       for (unsigned attempt = 0; attempt < 200; ++attempt) {
         if (readReady()) { ready = true; break; }
-        int status = 0; if (::waitpid(child, &status, WNOHANG) == child) break;
+        const pid_t waited = ::waitpid(child, &status, WNOHANG);
+        if (waited == child) { exited = true; break; }
+        if (waited < 0 && errno != EINTR) { waitError = errno; break; }
         ::usleep(50000);
       }
       if (ready == false) {
+        timedOut = !exited && waitError == 0;
         MothershipVDCProcessIdentity pending = {};
-        if (mothershipVDCReadProcess(child, pending)) (void)mothershipVDCSignal(pending, SIGKILL);
-        return reject("retained provider adopter did not become ready");
+        if (mothershipVDCReadProcess(child, pending)) {
+          (void)mothershipVDCSignal(pending, SIGKILL);
+          const pid_t waited = ::waitpid(child, &status, WNOHANG);
+          if (waited == child) exited = true;
+          else if (waited < 0 && errno != EINTR) waitError = errno;
+        }
+        String diagnostic = {};
+        if (mothershipVDCRead(preexecPath, diagnostic, 256) == false || !mothershipVDCAdopterDiagnosticValid(diagnostic)) {
+          diagnostic.clear(); String scriptDiagnostic = {};
+          if (mothershipVDCRead(scriptFailurePath, scriptDiagnostic, 256) && mothershipVDCAdopterDiagnosticValid(scriptDiagnostic))
+            diagnostic = std::move(scriptDiagnostic);
+        }
+        if (failure) mothershipVDCAdopterReadinessFailure(timedOut, exited, status, waitError, diagnostic, *failure);
+        return false;
       }
     }
     operation.phase = MothershipVDCRecoveryPhase::ready;

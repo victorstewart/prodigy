@@ -95,6 +95,23 @@ int main()
            "activation successor rejects incomplete prepared authority seal");
   }
 
+  {
+    String diagnostic = "stage=setns-mount errno=1\n"_ctv, failure = {};
+    expect(mothershipVDCAdopterDiagnosticValid(diagnostic),
+           "provider adopter accepts bounded preexec stage diagnostic");
+    mothershipVDCAdopterReadinessFailure(false, true, 125 << 8, 0, diagnostic, failure);
+    expect(failure == "retained provider adopter did not become ready outcome=exit=125 preexec=stage=setns-mount errno=1\n"_ctv,
+           "provider adopter preserves preexec exit and errno diagnostic");
+    mothershipVDCAdopterReadinessFailure(false, true, SIGTERM, 0, {}, failure);
+    expect(failure == "retained provider adopter did not become ready outcome=signal=15"_ctv,
+           "provider adopter preserves signal outcome");
+    mothershipVDCAdopterReadinessFailure(true, false, SIGKILL, 0, {}, failure);
+    expect(failure == "retained provider adopter did not become ready outcome=timeout"_ctv,
+           "provider adopter preserves readiness timeout outcome");
+    expect(!mothershipVDCAdopterDiagnosticValid("stage=unsafe/path errno=1\n"_ctv),
+           "provider adopter rejects unbounded diagnostic text");
+  }
+
   // Exercise the exact predicate used by both the bounded capture receipt and
   // stopped-proof validation.  An absent pair remains interface-bound; a
   // wholly zero wire record is never recovery authority.

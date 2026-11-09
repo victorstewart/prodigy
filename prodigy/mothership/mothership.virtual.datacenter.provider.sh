@@ -3581,10 +3581,21 @@ fi
 # This is deliberately after the initial mount-namespace reexec.  It closes the
 # launch/arm race until the provider has published its durable identity/runtime.
 workspace_startup_lock_fd=""
-pair_lock_workspace "${workspace}" workspace_startup_lock_fd || exit 1
+adopter_pre_ready_failure()
+{
+   local stage="$1" status="$2" temporary=""
+   if [[ "${adopted_mode}" -eq 1 && -d "${adopted_operation_dir}" && ! -L "${adopted_operation_dir}" ]]
+   then
+      temporary="${adopted_operation_dir}/adopter-pre-ready-failure.$$.tmp"
+      printf 'stage=%s status=%s\n' "${stage}" "${status}" > "${temporary}" 2>/dev/null &&
+         mv -f "${temporary}" "${adopted_operation_dir}/adopter-pre-ready-failure" 2>/dev/null || true
+   fi
+}
+pair_lock_workspace "${workspace}" workspace_startup_lock_fd || { status="$?"; adopter_pre_ready_failure "workspace-lock" "${status}"; exit "${status}"; }
 if pair_workspace_reset_flagged "${workspace}"
 then
    pair_unlock_workspace "${workspace_startup_lock_fd}"
+   adopter_pre_ready_failure "workspace-reset" 1
    exit 1
 fi
 
@@ -3593,7 +3604,7 @@ runtime_identity="${pid}"
 if [[ "${adopted_mode}" -eq 1 ]]
 then
    [[ "${adopted_runtime_identity}" =~ ^[0-9]+$ && "${adopted_runtime_identity}" -gt 1 && -d "${adopted_operation_dir}" ]] || {
-      echo "invalid adopted provider identity" >&2; exit 2;
+      adopter_pre_ready_failure "adopted-identity" 2; echo "invalid adopted provider identity" >&2; exit 2;
    }
    runtime_identity="${adopted_runtime_identity}"
 fi
@@ -3814,6 +3825,7 @@ failed()
    local status="$1"
    local line="$2"
    atomic_write "${failure_path}" "provider failed status=${status} line=${line}\n"
+   adopter_pre_ready_failure "provider-runtime-line-${line}" "${status}"
    exit "${status}"
 }
 
