@@ -10090,7 +10090,8 @@ private:
     if (expected.truthRetirementStartedGeneration == 0) return true;
     // This receipt identifies the verified cleanup; it does not itself prove
     // absence. The caller reaches here only after the lifecycle owner has
-    // verified exact provider IDs absent and membership/graph cleanup passed.
+    // verified destruction of created machines or cleanup of the exact adopted
+    // or test runtimes, and membership/graph cleanup passed.
     String bytes;
     bytes.assign("PRODIGY-TRUTH-OWNER-CLUSTER-REMOVAL-v1\n"_ctv);
     auto binding = expected;

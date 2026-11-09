@@ -13,7 +13,7 @@ static String digest(char value)
   return result;
 }
 
-static void truthRetirementRegressions(const String& path)
+static void truthRetirementRegressions(const String& path, bool adoptedMode = false)
 {
   String failure;
   MothershipProdigyCluster owner = {};
@@ -33,11 +33,50 @@ static void truthRetirementRegressions(const String& path)
     machine.cloud.cloudID.snprintf<"vultr-{itoa}"_ctv>(i);
     owner.topology.machines.push_back(machine);
   }
+  if (adoptedMode) {
+    for (auto& machine : owner.topology.machines) {
+      machine.source = ClusterMachineSource::adopted;
+      machine.ssh.address.snprintf<"2001:db8::{itoh}"_ctv>(machine.uuid);
+      machine.ssh.user = "root"_ctv;
+      machine.ssh.privateKeyPath = "/keys/truth"_ctv;
+      machine.ssh.hostPublicKeyOpenSSH = "ssh-ed25519 pinned-key"_ctv;
+      MothershipProdigyClusterMachine registered;
+      registered.source = MothershipClusterMachineSource::adopted;
+      registered.backing = machine.backing; registered.kind = machine.kind;
+      registered.lifetime = machine.lifetime; registered.isBrain = machine.isBrain;
+      registered.uuid = machine.uuid; registered.rackUUID = machine.rackUUID;
+      registered.hasCloud = true; registered.cloud = machine.cloud; registered.ssh = machine.ssh;
+      owner.machines.push_back(registered);
+    }
+    String inventory;
+    assert(mothershipTruthRetirementInventoryDigest(owner, inventory));
+    auto invalid = owner;
+    invalid.topology.machines[1] = invalid.topology.machines[0];
+    assert(!mothershipTruthRetirementInventoryDigest(invalid, inventory));
+    invalid = owner; invalid.machines[1] = invalid.machines[0];
+    assert(!mothershipTruthRetirementInventoryDigest(invalid, inventory));
+    invalid = owner; invalid.machines.pop_back();
+    assert(!mothershipTruthRetirementInventoryDigest(invalid, inventory));
+    invalid = owner; invalid.machines[0].ssh.hostPublicKeyOpenSSH = "replacement"_ctv;
+    assert(!mothershipTruthRetirementInventoryDigest(invalid, inventory));
+    invalid = owner; invalid.machines[0].ssh.privateKeyPath.clear();
+    assert(!mothershipTruthRetirementInventoryDigest(invalid, inventory));
+    invalid = owner; invalid.topology.machines[0].ssh.port = 0;
+    assert(!mothershipTruthRetirementInventoryDigest(invalid, inventory));
+    invalid = owner; invalid.includeLocalMachine = true;
+    assert(!mothershipTruthRetirementInventoryDigest(invalid, inventory));
+    invalid = owner; invalid.nBrains = 2;
+    assert(!mothershipTruthRetirementInventoryDigest(invalid, inventory));
+  }
   MothershipProdigyCluster next = owner;
   next.name = "truth-next"_ctv; next.clusterUUID = 0x902;
   for (uint32_t i = 0; i < 3; ++i) {
     next.topology.machines[i].uuid = 0x920 + i;
     next.topology.machines[i].cloud.cloudID.snprintf<"next-{itoa}"_ctv>(i);
+    if (adoptedMode) {
+      next.machines[i].uuid = next.topology.machines[i].uuid;
+      next.machines[i].cloud = next.topology.machines[i].cloud;
+    }
   }
   auto writeCluster = [&](TidesDB& db, const MothershipProdigyCluster& cluster) {
     MothershipProdigyClusterRecordV5 record = {}; record.cluster = cluster;
@@ -71,7 +110,7 @@ static void truthRetirementRegressions(const String& path)
     assert(!registry.removeCluster(owner.name, &failure));
     auto bad = owner; bad.topology.machines[0].cloud.cloudID = "wrong"_ctv;
     assert(!registry.beginTruthOwnerRetirement(bad, placed, &failure));
-    bad = owner; bad.topology.machines[0].source = ClusterMachineSource::adopted;
+    bad = owner; bad.topology.machines[0].source = adoptedMode ? ClusterMachineSource::created : ClusterMachineSource::adopted;
     assert(!registry.beginTruthOwnerRetirement(bad, placed, &failure));
     assert(registry.beginTruthOwnerRetirement(next, placed, &failure) && placed.truthRetirementStartedGeneration == 0);
     String expectedInventory, actualInventory, identity;
@@ -1679,6 +1718,8 @@ int main()
   graphAllMastersPlacementRegressions(path);
   String truthPath; truthPath.snprintf<"{}/truth-retirement"_ctv>(path);
   truthRetirementRegressions(truthPath);
+  String adoptedTruthPath; adoptedTruthPath.snprintf<"{}/truth-adopted-retirement"_ctv>(path);
+  truthRetirementRegressions(adoptedTruthPath, true);
   String testTruthPath; testTruthPath.snprintf<"{}/truth-test-retirement"_ctv>(path);
   testTruthRetirementRegressions(testTruthPath);
   String localUpgradePath;localUpgradePath.snprintf<"{}/local-interrupted-upgrade"_ctv>(path);

@@ -1191,6 +1191,105 @@ static void serialize(S&& serializer, MothershipTruthRetirementTestInventory& in
   serializer.value4b(inventory.spareMachineCount);
   serializer.object(inventory.topology);
 }
+
+// An adopted remote cohort has no provider-created inventory to bind.  It is
+// nevertheless a durable remote identity: every topology member must have one
+// exact registered adopted-machine and complete SSH identity.  Keep this in a
+// separate domain so the legacy created-Vultr bytes stay stable.
+class MothershipTruthRetirementAdoptedMachineIdentity {
+public:
+  uint128_t uuid = 0;
+  String cloudID;
+  MachineLifetime lifetime = MachineLifetime::ondemand;
+  uint32_t rackUUID = 0;
+  bool isBrain = false;
+  ClusterMachineSSH ssh;
+};
+template <typename S>
+static void serialize(S&& serializer, MothershipTruthRetirementAdoptedMachineIdentity& machine)
+{
+  serializer.value16b(machine.uuid);
+  serializer.text1b(machine.cloudID, UINT32_MAX);
+  serializer.value1b(machine.lifetime);
+  serializer.value4b(machine.rackUUID);
+  serializer.value1b(machine.isBrain);
+  serializer.object(machine.ssh);
+}
+class MothershipTruthRetirementAdoptedInventory {
+public:
+  String domain;
+  uint128_t clusterUUID = 0;
+  String clusterName;
+  String providerScope;
+  String providerCredentialName;
+  uint32_t nBrains = 0;
+  Vector<MothershipTruthRetirementAdoptedMachineIdentity> machines;
+};
+template <typename S>
+static void serialize(S&& serializer, MothershipTruthRetirementAdoptedInventory& inventory)
+{
+  serializer.text1b(inventory.domain, UINT32_MAX);
+  serializer.value16b(inventory.clusterUUID);
+  serializer.text1b(inventory.clusterName, UINT32_MAX);
+  serializer.text1b(inventory.providerScope, UINT32_MAX);
+  serializer.text1b(inventory.providerCredentialName, UINT32_MAX);
+  serializer.value4b(inventory.nBrains);
+  serializer.container(inventory.machines, 65536);
+}
+
+static inline bool mothershipTruthRetirementAdoptedInventoryDigest(
+    const MothershipProdigyCluster& cluster, String& digest)
+{
+  digest.clear();
+  if (cluster.deploymentMode != MothershipClusterDeploymentMode::remote || cluster.clusterUUID == 0 ||
+      cluster.name.empty() || cluster.providerCredentialName.empty() ||
+      cluster.provider != MothershipClusterProvider::vultr || cluster.includeLocalMachine ||
+      cluster.nBrains == 0 || cluster.topology.machines.empty() ||
+      cluster.topology.machines.size() > 65536 || cluster.machines.size() != cluster.topology.machines.size()) return false;
+  MothershipTruthRetirementAdoptedInventory inventory;
+  inventory.domain = "mothership-truth-retirement-adopted-inventory-v1"_ctv;
+  inventory.clusterUUID = cluster.clusterUUID; inventory.clusterName = cluster.name;
+  inventory.providerScope = cluster.providerScope; inventory.providerCredentialName = cluster.providerCredentialName;
+  inventory.nBrains = cluster.nBrains;
+  uint32_t brains = 0;
+  for (const ClusterMachine& topologyMachine : cluster.topology.machines)
+  {
+    if (topologyMachine.source != ClusterMachineSource::adopted || topologyMachine.backing != ClusterMachineBacking::cloud ||
+        topologyMachine.kind != MachineConfig::MachineKind::vm || topologyMachine.uuid == 0 ||
+        !topologyMachine.cloudPresent() || topologyMachine.cloud.cloudID.empty() ||
+        topologyMachine.ssh.address.empty() || topologyMachine.ssh.port == 0 || topologyMachine.ssh.user.empty() ||
+        topologyMachine.ssh.privateKeyPath.empty() || topologyMachine.ssh.hostPublicKeyOpenSSH.empty()) return false;
+    for (const auto& prior : inventory.machines)
+      if (prior.uuid == topologyMachine.uuid || prior.cloudID == topologyMachine.cloud.cloudID) return false;
+    uint32_t matches = 0;
+    for (const MothershipProdigyClusterMachine& registeredMachine : cluster.machines)
+    {
+      if (registeredMachine.source != MothershipClusterMachineSource::adopted ||
+          registeredMachine.backing != ClusterMachineBacking::cloud ||
+          registeredMachine.kind != MachineConfig::MachineKind::vm || registeredMachine.uuid == 0 ||
+          !registeredMachine.cloudPresent() || registeredMachine.cloud.cloudID.empty() ||
+          registeredMachine.ssh.address.empty() || registeredMachine.ssh.port == 0 || registeredMachine.ssh.user.empty() ||
+          registeredMachine.ssh.privateKeyPath.empty() || registeredMachine.ssh.hostPublicKeyOpenSSH.empty()) return false;
+      if (registeredMachine.uuid == topologyMachine.uuid) {
+        ++matches;
+        if (registeredMachine.isBrain != topologyMachine.isBrain || registeredMachine.ssh != topologyMachine.ssh ||
+            registeredMachine.cloud.cloudID != topologyMachine.cloud.cloudID ||
+            registeredMachine.lifetime != topologyMachine.lifetime || registeredMachine.rackUUID != topologyMachine.rackUUID) return false;
+      }
+    }
+    if (matches != 1) return false;
+    if (topologyMachine.isBrain) ++brains;
+    inventory.machines.push_back({.uuid = topologyMachine.uuid, .cloudID = topologyMachine.cloud.cloudID,
+        .lifetime = topologyMachine.lifetime, .rackUUID = topologyMachine.rackUUID,
+        .isBrain = topologyMachine.isBrain, .ssh = topologyMachine.ssh});
+  }
+  if (brains != cluster.nBrains) return false;
+  std::sort(inventory.machines.begin(), inventory.machines.end(),
+      [](const auto& a, const auto& b) { return a.uuid < b.uuid; });
+  String bytes; BitseryEngine::serialize(bytes, inventory);
+  return prodigyComputeSHA256Hex(bytes, digest);
+}
+
 static inline bool mothershipTruthRetirementInventoryDigest(const MothershipProdigyCluster& cluster, String& digest)
 {
   digest.clear();
@@ -1198,6 +1297,13 @@ static inline bool mothershipTruthRetirementInventoryDigest(const MothershipProd
     if (cluster.clusterUUID == 0 || cluster.name.empty() || cluster.providerCredentialName.empty() ||
         cluster.provider != MothershipClusterProvider::vultr || cluster.includeLocalMachine ||
         cluster.nBrains == 0 || cluster.topology.machines.empty() || cluster.topology.machines.size() > 65536) return false;
+    bool allCreated = true, allAdopted = true;
+    for (const auto& machine : cluster.topology.machines) {
+      allCreated &= machine.source == ClusterMachineSource::created;
+      allAdopted &= machine.source == ClusterMachineSource::adopted;
+    }
+    if (allAdopted) return mothershipTruthRetirementAdoptedInventoryDigest(cluster, digest);
+    if (!allCreated) return false;
     MothershipTruthRetirementInventory inventory;
     inventory.clusterUUID = cluster.clusterUUID; inventory.clusterName = cluster.name;
     inventory.providerScope = cluster.providerScope; inventory.providerCredentialName = cluster.providerCredentialName;
@@ -5947,7 +6053,7 @@ public:
         !db.read(clustersByUUIDColumnFamily, identity, registeredName, failure) || registeredName != cluster.name ||
         !getCluster(registeredName, stored, failure) || stored.clusterUUID != cluster.clusterUUID ||
         !mothershipTruthRetirementInventoryDigest(stored, storedDigest) || digest != storedDigest) {
-      if (failure) failure->assign("Truth retirement requires exact registered created-Vultr inventory"_ctv);
+      if (failure) failure->assign("Truth retirement requires an exact supported registered inventory"_ctv);
       return false;
     }
     if (placement.version == 4 && placement.truthRetirementOwnerClusterUUID == cluster.clusterUUID) {
