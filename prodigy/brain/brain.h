@@ -46558,6 +46558,7 @@ public:
 
             deployment->previous = previous->previous;
             previous->previous->next = deployment;
+            deployment->state = DeploymentState::waitingToDeploy;
 
             if (auto it = deployments.find(previous->plan.config.deploymentID()); it != deployments.end() && it->second == previous)
             {

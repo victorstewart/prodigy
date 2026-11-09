@@ -10037,6 +10037,50 @@ int main(void)
     delete baseline;
   });
 
+  withUniqueMothershipSocket("spin_application_collapses_unmaterialized_middle_deployment_socket_dir_created", [&] {
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+
+    DeploymentPlan baselinePlan = makeDeploymentPlan(61'014, 1);
+    DeploymentPlan middlePlan = makeDeploymentPlan(61'014, 2);
+    DeploymentPlan headPlan = makeDeploymentPlan(61'014, 3);
+
+    ApplicationDeployment *baseline = new ApplicationDeployment();
+    baseline->plan = baselinePlan;
+    baseline->state = DeploymentState::running;
+    ApplicationDeployment *middle = new ApplicationDeployment();
+    middle->plan = middlePlan;
+    middle->state = DeploymentState::none;
+    ApplicationDeployment *head = new ApplicationDeployment();
+    head->plan = headPlan;
+
+    baseline->next = middle;
+    middle->previous = baseline;
+    brain.deployments.insert_or_assign(baselinePlan.config.deploymentID(), baseline);
+    brain.deployments.insert_or_assign(middlePlan.config.deploymentID(), middle);
+    brain.deploymentsByApp.insert_or_assign(middlePlan.config.applicationID, middle);
+
+    brain.testSpinApplication(head);
+
+    suite.expect(brain.deploymentsByApp[headPlan.config.applicationID] == head,
+                 "spin_application_collapses_unmaterialized_middle_repoints_application_head");
+    suite.expect(brain.deployments.contains(baselinePlan.config.deploymentID()) &&
+                     brain.deployments.contains(headPlan.config.deploymentID()) &&
+                     brain.deployments.contains(middlePlan.config.deploymentID()) == false,
+                 "spin_application_collapses_unmaterialized_middle_replaces_indexed_predecessor");
+    suite.expect(baseline->next == head && head->previous == baseline,
+                 "spin_application_collapses_unmaterialized_middle_preserves_original_predecessor_link");
+    suite.expect(head->state == DeploymentState::waitingToDeploy,
+                 "spin_application_collapses_unmaterialized_middle_keeps_new_head_waiting");
+
+    baseline->next = nullptr;
+    head->previous = nullptr;
+    brain.deployments.clear();
+    brain.deploymentsByApp.clear();
+    delete head;
+    delete baseline;
+  });
+
   {
     ScopedRing scopedRing = {};
 
