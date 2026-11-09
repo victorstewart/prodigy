@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstdlib>
+#include <filesystem>
 #include <memory>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <prodigy/cluster.machine.helpers.h>
@@ -1035,6 +1037,70 @@ static inline bool mothershipCanResumeVultrSeedCreation(const MothershipProdigyC
       cluster.provider == MothershipClusterProvider::vultr && !cluster.environmentConfigured &&
       cluster.topology.machines.empty() && cluster.machines.empty() &&
       cluster.mothershipConnectivity.kind != MothershipConnectivityKind::tunnelProvider;
+}
+
+// A failed virtual-datacenter creation is resumable only before its seed has
+// become a durable cluster member.  The caller separately owns the provider
+// workspace, pair-boundary, bundle, and lifecycle locks.
+static inline bool mothershipCanResumeEmptyTestCreation(const MothershipProdigyCluster& cluster,
+                                                        uint128_t requestedUUID)
+{
+  if (requestedUUID == 0 || cluster.clusterUUID != requestedUUID ||
+      cluster.deploymentMode != MothershipClusterDeploymentMode::test ||
+      !cluster.test.specified || cluster.test.workspaceRoot.empty() ||
+      cluster.includeLocalMachine || cluster.environmentConfigured ||
+      !cluster.topology.machines.empty() || !cluster.machines.empty() ||
+      cluster.lastRefreshFailure.empty() ||
+      cluster.mothershipConnectivity.kind == MothershipConnectivityKind::tunnelProvider) return false;
+  // The record has already passed MothershipClusterRegistry normalization.  Do
+  // not duplicate its configuration policy here; stand-up reuses its builders.
+  return mothershipTestClusterWorkspaceRootValid(cluster.test.workspaceRoot);
+}
+
+static inline bool mothershipEmptyTestCreationPathsSafe(const MothershipProdigyCluster& cluster,
+                                                        String *failure = nullptr)
+{
+  auto reject = [&](const char *reason) { if (failure) failure->assign(reason); return false; };
+  if (!mothershipCanResumeEmptyTestCreation(cluster, cluster.clusterUUID))
+    return reject("test creation is not eligible for empty-workspace resume");
+  auto canonicalPath = [&](const String& value, std::filesystem::path& path) {
+    path = std::filesystem::path(std::string(reinterpret_cast<const char *>(value.data()), value.size()));
+    return path.is_absolute() && path.lexically_normal() == path;
+  };
+  auto noSymlinkPrefix = [&](const std::filesystem::path& path) {
+    std::filesystem::path current = path.root_path(); std::error_code error;
+    for (const auto& component : path.relative_path()) {
+      current /= component;
+      const auto status = std::filesystem::symlink_status(current, error);
+      if (error && error != std::errc::no_such_file_or_directory) return false;
+      if (status.type() == std::filesystem::file_type::not_found) return true;
+      if (std::filesystem::is_symlink(status)) return false;
+    }
+    return true;
+  };
+  auto emptyOwnedDirectoryOrAbsent = [&](const std::filesystem::path& path) {
+    std::error_code error;
+    const auto status = std::filesystem::symlink_status(path, error);
+    if (error && error != std::errc::no_such_file_or_directory) return false;
+    if (status.type() == std::filesystem::file_type::not_found) return true;
+    if (!std::filesystem::is_directory(status) || std::filesystem::is_symlink(status)) return false;
+    struct stat state = {};
+    if (::lstat(path.c_str(), &state) != 0 || !S_ISDIR(state.st_mode) || state.st_uid != 0 ||
+        (state.st_mode & (S_IWGRP | S_IWOTH)) != 0) return false;
+    return std::filesystem::is_empty(path, error) && !error;
+  };
+  std::filesystem::path workspace, socket;
+  String controlSocket = {};
+  mothershipResolveTestClusterControlSocketPath(cluster, controlSocket);
+  if (!canonicalPath(cluster.test.workspaceRoot, workspace) || !canonicalPath(controlSocket, socket) ||
+      !noSymlinkPrefix(workspace) || !noSymlinkPrefix(socket.parent_path()) ||
+      !emptyOwnedDirectoryOrAbsent(workspace)) return reject("test creation workspace is unsafe or not empty");
+  std::error_code error;
+  const auto socketStatus = std::filesystem::symlink_status(socket, error);
+  if ((error && error != std::errc::no_such_file_or_directory) || socketStatus.type() != std::filesystem::file_type::not_found ||
+      !emptyOwnedDirectoryOrAbsent(socket.parent_path())) return reject("test creation control socket path is unsafe or not empty");
+  if (failure) failure->clear();
+  return true;
 }
 
 static inline bool mothershipStandUpCluster(MothershipProdigyCluster& cluster, const MothershipProviderCredential *credential, MothershipClusterCreateHooks& hooks, MothershipClusterCreateTimingSummary *timingSummary = nullptr, String *failure = nullptr, const MothershipProviderCredential *dnsCredential = nullptr, bool preserveCreatedSeedOnFailure = false)

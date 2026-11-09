@@ -31924,20 +31924,61 @@ LOCAL_RUNTIME
 
   void runResumeClusterCreation(int argc, char *argv[])
   {
-    if (argc != 2 || std::strlen(argv[0]) != 34 || std::strncmp(argv[0], "0x", 2) != 0 || std::strlen(argv[1]) != 36)
-    { basics_log("usage: resumeClusterCreation [exact 0x cluster UUID] [expected seed cloud UUID]\n"); exit(EXIT_FAILURE); }
+    if (argc != 2 || std::strlen(argv[0]) != 34 || std::strncmp(argv[0], "0x", 2) != 0)
+    { basics_log("usage: resumeClusterCreation [exact 0x cluster UUID] [expected seed cloud UUID|approved test bundle.zst]\n"); exit(EXIT_FAILURE); }
     for (unsigned i = 2; i < 34; ++i)
       if (!((argv[0][i] >= '0' && argv[0][i] <= '9') || (argv[0][i] >= 'a' && argv[0][i] <= 'f')))
       { basics_log("resumeClusterCreation invalid cluster UUID\n"); exit(EXIT_FAILURE); }
-    for (unsigned i = 0; i < 36; ++i)
-      if ((i == 8 || i == 13 || i == 18 || i == 23) ? argv[1][i] != '-' :
-          !((argv[1][i] >= '0' && argv[1][i] <= '9') || (argv[1][i] >= 'a' && argv[1][i] <= 'f')))
-      { basics_log("resumeClusterCreation invalid seed cloud UUID\n"); exit(EXIT_FAILURE); }
     String failure = {}, identity = {}; identity.assign(argv[0]);
     MothershipProdigyCluster cluster = {};
     uint128_t requestedUUID = 0;
     bool found = false;
     { auto registry = openClusterRegistry(); found = registry.getClusterByIdentity(identity, cluster, &failure); }
+    if (prodigyParseCanonicalHex128(identity, requestedUUID) && found &&
+        cluster.deploymentMode == MothershipClusterDeploymentMode::test)
+    {
+      // Resume the exact failed creation through its original stand-up owner.
+      // Empty provider paths are mandatory: a partial or live runtime must use
+      // its existing recovery owner, never this fresh-start path.
+      TestPairLifecycleLock pairLock;
+      bool openBoundary = false;
+      bool valid = lockTestPairLifecycle(pairLock, failure);
+      if (valid) {
+        auto registry = openClusterRegistry();
+        valid = registry.getClusterByIdentity(identity, cluster, &failure) &&
+            registry.clusterHasOpenTestPairBoundary(requestedUUID, openBoundary, &failure) && !openBoundary;
+      }
+      if (valid) valid = mothershipCanResumeEmptyTestCreation(cluster, requestedUUID) &&
+          mothershipEmptyTestCreationPathsSafe(cluster, &failure);
+      String bundlePath(argv[1]), bundleDigest;
+      if (valid) valid = !bundlePath.empty() && prodigyIsZstdFile(bundlePath) &&
+          prodigyApproveBundleArtifact(bundlePath, bundleDigest, &failure);
+      MothershipProviderCredential dnsCredential;
+      if (valid) valid = validateClusterDNSProviderCredentialReference(cluster, failure, &dnsCredential);
+      if (!valid) {
+        if (failure.empty()) failure.assign("test creation resume requires an exact failed empty creation, no pair boundary, empty owned paths and an approved bundle"_ctv);
+        basics_log("resumeClusterCreation success=0 failure=%s\n", failure.c_str());
+        exit(EXIT_FAILURE);
+      }
+      ClusterCreateHooks hooks(this, {}, std::move(bundlePath), std::move(bundleDigest));
+      MothershipClusterCreateTimingSummary timing;
+      const auto *dns = cluster.dnsProvider == MothershipClusterProvider::unknown ? nullptr : &dnsCredential;
+      if (!mothershipStandUpCluster(cluster, nullptr, hooks, &timing, &failure, dns)) {
+        persistClusterRefreshFailure(cluster, failure);
+        basics_log("resumeClusterCreation success=0 failure=%s\n", failure.c_str());
+        exit(EXIT_FAILURE);
+      }
+      persistClusterTopology(cluster, cluster.topology);
+      basics_log("resumeClusterCreation success=1 deploymentMode=test\n");
+      printManagedCluster(cluster);
+      return;
+    }
+    if (std::strlen(argv[1]) != 36)
+    { basics_log("resumeClusterCreation invalid seed cloud UUID\n"); exit(EXIT_FAILURE); }
+    for (unsigned i = 0; i < 36; ++i)
+      if ((i == 8 || i == 13 || i == 18 || i == 23) ? argv[1][i] != '-' :
+          !((argv[1][i] >= '0' && argv[1][i] <= '9') || (argv[1][i] >= 'a' && argv[1][i] <= 'f')))
+      { basics_log("resumeClusterCreation invalid seed cloud UUID\n"); exit(EXIT_FAILURE); }
     if (!prodigyParseCanonicalHex128(identity, requestedUUID) || !found ||
         !mothershipCanResumeVultrSeedCreation(cluster, requestedUUID))
     { basics_log("resumeClusterCreation success=0 failure=cluster is not an eligible incomplete Vultr creation\n"); exit(EXIT_FAILURE); }
@@ -38836,7 +38877,7 @@ int main(int argc, char *argv[])
     message.append("\tenables complete DNS credential and ACME configuration exactly once on an existing unconfigured cluster through the durable configure acknowledgement; it does not restart or recreate machines\n");
     message.append("rotateClusterDNSCredential [name|clusterUUID] [expected old credential] [new credential] [--check]\n");
     message.append("\trotates only a complete cluster DNS credential reference through the configure acknowledgement and durable exact-old CAS; it does not restart or recreate machines\n");
-    message.append("resumeClusterCreation [exact 0x cluster UUID] [expected seed cloud UUID]\n");
+    message.append("resumeClusterCreation [exact 0x cluster UUID] [expected seed cloud UUID|approved test bundle.zst]\n");
     message.append("printClusters\n");
     message.append("\tlists all managed Prodigy cluster records with their clusterUUIDs\n");
     message.append("setLocalClusterMembership [name|clusterUUID] [json]\n");
