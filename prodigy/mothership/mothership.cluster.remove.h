@@ -474,9 +474,8 @@ static inline void mothershipBuildRemoteProdigyUninstallCommand(const Mothership
   mothershipAppendProdigyMigrationResetCleanupCommand(cluster.clusterUUID, command);
   command.append("; "_ctv);
   mothershipAppendRemoteRuntimeRecoveryCleanupCommand(cluster.clusterUUID, command);
-  command.append("; "_ctv);
   mothershipAppendProdigyMigrationFenceCleanupCommand(command);
-  command.append("; rm -f /etc/systemd/system/prodigy.service /etc/systemd/system/prodigy.service.tmp /etc/systemd/system/multi-user.target.wants/prodigy.service"_ctv);
+  command.append("rm -f /etc/systemd/system/prodigy.service /etc/systemd/system/prodigy.service.tmp /etc/systemd/system/multi-user.target.wants/prodigy.service"_ctv);
   command.append(" "_ctv);
   prodigyAppendShellSingleQuoted(command, remoteUnitTempPath);
   command.append(" "_ctv);

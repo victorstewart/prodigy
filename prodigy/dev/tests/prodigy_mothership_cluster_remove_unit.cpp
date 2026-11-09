@@ -763,6 +763,8 @@ int main(void)
 
     String command = {};
     mothershipBuildRemoteProdigyUninstallCommand(cluster, command);
+    suite.expect(::system(("/bin/sh -n -c " + shellQuote(std::string(command.c_str()))).c_str()) == 0,
+                 "remove_remote_uninstall_complete_command_has_valid_shell_syntax");
     suite.expect(stringContains(command, "systemctl show --property=LoadState --value prodigy") && stringContains(command, "failed to stop prodigy"), "remove_remote_uninstall_stops_and_verifies");
     suite.expect(stringContains(command, "/etc/systemd/system/prodigy.service"), "remove_remote_uninstall_removes_unit");
     suite.expect(stringContains(command, "/srv/prodigy/current"), "remove_remote_uninstall_removes_install_root");
