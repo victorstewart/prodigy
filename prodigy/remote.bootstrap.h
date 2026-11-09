@@ -1598,6 +1598,55 @@ static inline void prodigyLogRemoteBootstrapStep(const char *stage, const char *
   std::fflush(stderr);
 }
 
+// DNS/ACME can be enabled after a remote Brain has been bootstrapped.  Keep the
+// managed Certbot and hook installation in this bootstrap owner so that the
+// later Mothership enablement path cannot accidentally select a host Certbot or
+// a second installation layout.
+static inline bool prodigyAppendManagedACMEToolsInstallCommand(
+    const String& toolsDirectory,
+    const ProdigyACMEConfig& acme,
+    String& command,
+    String *failure = nullptr)
+{
+  if (failure != nullptr)
+  {
+    failure->clear();
+  }
+  if (acme.configured() == false)
+  {
+    if (failure != nullptr)
+    {
+      failure->assign("managed ACME tools require configured ACME"_ctv);
+    }
+    return false;
+  }
+  if (toolsDirectory.size() == 0 || toolsDirectory[0] != '/')
+  {
+    if (failure != nullptr)
+    {
+      failure->assign("managed ACME tools require an absolute tools directory"_ctv);
+    }
+    return false;
+  }
+
+  String certbotWheelhousePath = {};
+  certbotWheelhousePath.assign(toolsDirectory);
+  if (certbotWheelhousePath[certbotWheelhousePath.size() - 1] != '/')
+  {
+    certbotWheelhousePath.append("/"_ctv);
+  }
+  certbotWheelhousePath.append(prodigyCertbotManagedWheelhouse);
+
+  command.append("managedCertbotHealthy=0; if [ -x /opt/prodigy/certbot/bin/certbot ] && /opt/prodigy/certbot/bin/certbot --version | grep -Fx 'certbot 5.6.0' >/dev/null 2>&1; then managedCertbotHealthy=1; fi; if [ \"$managedCertbotHealthy\" != 1 ]; then venvProbe=/tmp/prodigy-certbot-venv-probe.$$; rm -rf \"$venvProbe\"; if ! command -v python3 >/dev/null 2>&1 || ! python3 -m venv \"$venvProbe\" >/dev/null 2>&1; then rm -rf \"$venvProbe\"; if command -v apt-get >/dev/null 2>&1; then export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y --no-install-recommends python3 python3-venv ca-certificates; else echo 'missing python3 venv support on remote host' >&2; exit 1; fi; fi; rm -rf \"$venvProbe\"; test -r "_ctv);
+  prodigyAppendShellSingleQuoted(command, certbotWheelhousePath);
+  command.append("; rm -rf /opt/prodigy/certbot.5.6.0 /opt/prodigy/certbot.wheels /opt/prodigy/certbot.link.new; mkdir -p /opt/prodigy /opt/prodigy/certbot.wheels; python3 -m venv /opt/prodigy/certbot.5.6.0; tar --zstd -xf "_ctv);
+  prodigyAppendShellSingleQuoted(command, certbotWheelhousePath);
+  command.append(" -C /opt/prodigy/certbot.wheels; /opt/prodigy/certbot.5.6.0/bin/pip install --no-index --no-cache-dir --disable-pip-version-check --find-links /opt/prodigy/certbot.wheels 'certbot==5.6.0' >/dev/null; /opt/prodigy/certbot.5.6.0/bin/certbot --version | grep -Fx 'certbot 5.6.0' >/dev/null; rm -rf /opt/prodigy/certbot.wheels /opt/prodigy/certbot.prev; ln -s /opt/prodigy/certbot.5.6.0 /opt/prodigy/certbot.link.new; if [ -e /opt/prodigy/certbot ] || [ -L /opt/prodigy/certbot ]; then mv -T /opt/prodigy/certbot /opt/prodigy/certbot.prev; fi; if ! mv -T /opt/prodigy/certbot.link.new /opt/prodigy/certbot || ! /opt/prodigy/certbot/bin/certbot --version | grep -Fx 'certbot 5.6.0' >/dev/null; then rm -f /opt/prodigy/certbot; if [ -e /opt/prodigy/certbot.prev ] || [ -L /opt/prodigy/certbot.prev ]; then mv -T /opt/prodigy/certbot.prev /opt/prodigy/certbot; fi; exit 1; fi; rm -rf /opt/prodigy/certbot.prev; fi; mkdir -p /usr/lib/prodigy; for hook in acme-present-dns-01 acme-cleanup-dns-01 acme-import-lineage; do ln -sf "_ctv);
+  prodigyAppendShellSingleQuoted(command, toolsDirectory);
+  command.append("/$hook /usr/lib/prodigy/$hook; done"_ctv);
+  return true;
+}
+
 static inline uint64_t prodigyRemoteBootstrapHashBytes(const uint8_t *bytes, uint64_t size)
 {
   uint64_t hash = 1'469'598'103'934'665'603ULL;
@@ -2395,23 +2444,18 @@ static inline bool prodigyBuildRemoteBootstrapPlan(const ClusterMachine& cluster
   prodigyAppendShellSingleQuoted(plan.installCommand, remoteRootParent);
   if (plan.acme.configured())
   {
-    String certbotWheelhousePath = {};
-    certbotWheelhousePath.assign(plan.installPaths.toolsDirectory);
-    if (certbotWheelhousePath.size() > 0 && certbotWheelhousePath[certbotWheelhousePath.size() - 1] != '/')
+    plan.installCommand.append("; "_ctv);
+    if (prodigyAppendManagedACMEToolsInstallCommand(plan.installPaths.toolsDirectory, plan.acme, plan.installCommand, failure) == false)
     {
-      certbotWheelhousePath.append("/"_ctv);
+      return false;
     }
-    certbotWheelhousePath.append(prodigyCertbotManagedWheelhouse);
-
-    plan.installCommand.append("; venvProbe=/tmp/prodigy-certbot-venv-probe.$$; rm -rf \"$venvProbe\"; if ! command -v python3 >/dev/null 2>&1 || ! python3 -m venv \"$venvProbe\" >/dev/null 2>&1; then rm -rf \"$venvProbe\"; if command -v apt-get >/dev/null 2>&1; then export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y --no-install-recommends python3 python3-venv ca-certificates; else echo 'missing python3 venv support on remote host' >&2; exit 1; fi; fi; rm -rf \"$venvProbe\"; test -r "_ctv);
-    prodigyAppendShellSingleQuoted(plan.installCommand, certbotWheelhousePath);
-    plan.installCommand.append("; rm -rf /opt/prodigy/certbot.prev /opt/prodigy/certbot.wheels; if [ -e /opt/prodigy/certbot ]; then mv /opt/prodigy/certbot /opt/prodigy/certbot.prev; fi; mkdir -p /opt/prodigy /opt/prodigy/certbot.wheels; python3 -m venv /opt/prodigy/certbot; tar --zstd -xf "_ctv);
-    prodigyAppendShellSingleQuoted(plan.installCommand, certbotWheelhousePath);
-    plan.installCommand.append(" -C /opt/prodigy/certbot.wheels; /opt/prodigy/certbot/bin/pip install --no-index --no-cache-dir --disable-pip-version-check --find-links /opt/prodigy/certbot.wheels 'certbot==5.6.0'; /opt/prodigy/certbot/bin/certbot --version | grep -F '5.6.0'; rm -rf /opt/prodigy/certbot.wheels /opt/prodigy/certbot.prev"_ctv);
   }
-  plan.installCommand.append("; mkdir -p /usr/lib/prodigy; for hook in acme-present-dns-01 acme-cleanup-dns-01 acme-import-lineage; do ln -sf "_ctv);
-  prodigyAppendShellSingleQuoted(plan.installCommand, plan.installPaths.toolsDirectory);
-  plan.installCommand.append("/$hook /usr/lib/prodigy/$hook; done"_ctv);
+  else
+  {
+    plan.installCommand.append("; mkdir -p /usr/lib/prodigy; for hook in acme-present-dns-01 acme-cleanup-dns-01 acme-import-lineage; do ln -sf "_ctv);
+    prodigyAppendShellSingleQuoted(plan.installCommand, plan.installPaths.toolsDirectory);
+    plan.installCommand.append("/$hook /usr/lib/prodigy/$hook; done"_ctv);
+  }
   plan.installCommand.append("; "_ctv);
   plan.installCommand.append("LD_LIBRARY_PATH="_ctv);
   prodigyAppendShellSingleQuoted(plan.installCommand, plan.installPaths.libraryDirectory);

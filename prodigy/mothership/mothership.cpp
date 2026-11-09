@@ -32000,11 +32000,126 @@ LOCAL_RUNTIME
     runCreateClusterRequest(argc, argv, false);
   }
 
-  // DNS and ACME are cluster identity once configured.  This command is the
-  // sole exception for a durable record that was created completely
-  // unconfigured: configure the already-running Brain first, wait for its
-  // acknowledgement, and only then durably record the one-way enablement.
-  // It deliberately does not stand up, restart, or otherwise alter a machine.
+  // A remote cluster may receive its immutable DNS/ACME identity after its
+  // initial bootstrap.  The normal bootstrap already owns the managed Certbot
+  // and hook layout; use that exact command builder here before the Brain is
+  // configured, rather than relying on an ambient host tool or a rollout.
+  bool provisionManagedACMEToolsForExistingCluster(
+      const MothershipProdigyCluster& cluster,
+      const ProdigyACMEConfig& acme,
+      String& failure)
+  {
+    failure.clear();
+    if (acme.configured() == false || cluster.remoteProdigyPath.size() == 0 ||
+        cluster.remoteProdigyPath[0] != '/' ||
+        prodigyMachineCpuArchitectureSupportedTarget(cluster.architecture) == false)
+    {
+      failure.assign("existing cluster ACME provisioning requires configured ACME, an absolute runtime root, and a supported architecture"_ctv);
+      return false;
+    }
+    if (cluster.deploymentMode != MothershipClusterDeploymentMode::remote)
+    {
+      // Local and test providers configure their in-process or VM runtime via
+      // the existing configure protocol; they have no adopted remote Brain to
+      // repair over SSH.
+      return true;
+    }
+
+    String localExecutablePath = {};
+    String approvedBundlePath = {};
+    String approvedBundleSHA256 = {};
+    if (prodigyResolveCurrentExecutablePath(localExecutablePath) == false ||
+        prodigyResolveBuiltBundleArtifact(localExecutablePath, cluster.architecture,
+                                          approvedBundlePath, &failure) == false ||
+        prodigyApproveBundleArtifact(approvedBundlePath, approvedBundleSHA256, &failure) == false)
+    {
+      if (failure.size() == 0)
+      {
+        failure.assign("existing cluster ACME provisioning requires the approved bundle beside the qualified Mothership executable"_ctv);
+      }
+      return false;
+    }
+
+    ProdigyInstallRootPaths installPaths = {};
+    prodigyBuildInstallRootPaths(cluster.remoteProdigyPath, installPaths);
+    String installedBundlePath = {};
+    prodigyResolveInstalledBundlePathForRoot(cluster.remoteProdigyPath, installedBundlePath);
+
+    String command = {};
+    command.assign("set -eu; test -r "_ctv);
+    prodigyAppendShellSingleQuoted(command, installedBundlePath);
+    command.append("; actualBundleSHA256=$(sha256sum "_ctv);
+    prodigyAppendShellSingleQuoted(command, installedBundlePath);
+    command.append(" | awk '{print $1}'); test \"$actualBundleSHA256\" = "_ctv);
+    prodigyAppendShellSingleQuoted(command, approvedBundleSHA256);
+    command.append("; "_ctv);
+    if (prodigyAppendManagedACMEToolsInstallCommand(installPaths.toolsDirectory, acme, command, &failure) == false)
+    {
+      return false;
+    }
+    command.append("; managedCertbotVersion=$(/opt/prodigy/certbot/bin/certbot --version); test \"$managedCertbotVersion\" = 'certbot 5.6.0'; printf 'PRODIGY_MANAGED_ACME_TOOLS bundleSHA256=%s certbotVersion=%s\\n' \"$actualBundleSHA256\" \"$managedCertbotVersion\"; sync -f /opt/prodigy && sync -f /usr/lib/prodigy"_ctv);
+
+    uint32_t provisionedBrains = 0;
+    for (const ClusterMachine& topologyMachine : cluster.topology.machines)
+    {
+      if (topologyMachine.isBrain == false)
+      {
+        continue;
+      }
+      MothershipProdigyClusterMachine machine = {};
+      machine.kind = topologyMachine.kind;
+      machine.isBrain = topologyMachine.isBrain;
+      machine.uuid = topologyMachine.uuid;
+      machine.ssh = topologyMachine.ssh;
+      machine.addresses = topologyMachine.addresses;
+      mothershipHydrateTopologyRemoteCandidateSSH(cluster, machine);
+      if (machine.ssh.address.size() == 0 || machine.ssh.user.size() == 0 ||
+          machine.ssh.hostPublicKeyOpenSSH.size() == 0 || machine.ssh.privateKeyPath.size() == 0)
+      {
+        failure.assign("existing cluster ACME provisioning lacks a complete registered Brain SSH identity"_ctv);
+        return false;
+      }
+
+      LIBSSH2_SESSION *session = nullptr;
+      int fd = -1;
+      String output = {};
+      const bool provisioned =
+          mothershipConnectSSHSession(machine, session, fd, &failure,
+                                      &cluster.bootstrapSshKeyPackage, &cluster.bootstrapSshPrivateKeyPath) &&
+          prodigyRunBlockingSSHCommand(session, fd, command, &output, &failure, 120'000);
+      mothershipCloseSSHSession(session, fd);
+      String expectedMarker = {};
+      expectedMarker.snprintf<"PRODIGY_MANAGED_ACME_TOOLS bundleSHA256={} certbotVersion=certbot 5.6.0"_ctv>(approvedBundleSHA256);
+      if (provisioned && std::strstr(output.c_str(), expectedMarker.c_str()) == nullptr)
+      {
+        failure.assign("existing cluster ACME provisioning did not verify the approved bundle and managed Certbot version"_ctv);
+      }
+      if (provisioned == false || failure.size() > 0)
+      {
+        if (failure.size() == 0)
+        {
+          failure.assign("existing cluster ACME tools provisioning failed"_ctv);
+        }
+        return false;
+      }
+      String machineUUID = {};
+      machineUUID.assignItoh(machine.uuid);
+      basics_log("enableClusterDNSACME provisioned=1 machineUUID=%s bundleSHA256=%s certbotVersion=5.6.0\n",
+                 machineUUID.c_str(), approvedBundleSHA256.c_str());
+      ++provisionedBrains;
+    }
+    if (provisionedBrains == 0)
+    {
+      failure.assign("existing cluster ACME provisioning found no Brain machines"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  // DNS and ACME are cluster identity once configured. This command enables an
+  // unconfigured durable record, or idempotently repairs the matching managed
+  // toolset before replaying its existing configuration acknowledgement. It
+  // deliberately does not stand up, restart, or otherwise alter a machine.
   void runEnableClusterDNSACME(int argc, char *argv[])
   {
     if (argc != 2)
@@ -32099,17 +32214,25 @@ LOCAL_RUNTIME
       basics_log("enableClusterDNSACME success=0 failure=%s\n", failure.c_str());
       exit(EXIT_FAILURE);
     }
-    if (existing.dnsProvider != MothershipClusterProvider::unknown ||
-        existing.dnsProviderCredentialName.size() != 0 || existing.acme.configured())
-    {
-      basics_log("enableClusterDNSACME success=0 failure=cluster DNS/ACME is already configured\n");
-      exit(EXIT_FAILURE);
-    }
-
     MothershipProdigyCluster candidate = existing;
-    candidate.dnsProvider = dnsProvider;
-    candidate.dnsProviderCredentialName = dnsProviderCredentialName;
-    candidate.acme = acme;
+    const bool alreadyConfigured = existing.dnsProvider != MothershipClusterProvider::unknown ||
+                                   existing.dnsProviderCredentialName.size() != 0 || existing.acme.configured();
+    if (alreadyConfigured)
+    {
+      if (existing.dnsProvider != dnsProvider ||
+          existing.dnsProviderCredentialName.equals(dnsProviderCredentialName) == false ||
+          existing.acme != acme)
+      {
+        basics_log("enableClusterDNSACME success=0 failure=cluster DNS/ACME is already configured with a different identity\n");
+        exit(EXIT_FAILURE);
+      }
+    }
+    else
+    {
+      candidate.dnsProvider = dnsProvider;
+      candidate.dnsProviderCredentialName = dnsProviderCredentialName;
+      candidate.acme = acme;
+    }
 
     MothershipProviderCredential providerCredential = {}, dnsCredential = {};
     if (validateClusterProviderCredentialReference(candidate, failure, &providerCredential) == false ||
@@ -32128,6 +32251,12 @@ LOCAL_RUNTIME
       exit(EXIT_FAILURE);
     }
 
+    if (provisionManagedACMEToolsForExistingCluster(candidate, acme, failure) == false)
+    {
+      basics_log("enableClusterDNSACME success=0 provisioned=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
     // ClusterCreateHooks owns the existing configure request/acknowledgement
     // protocol and its bounded control-socket retry behavior.  Reusing it here
     // keeps credential propagation and runtime persistence in the one owner.
@@ -32138,9 +32267,9 @@ LOCAL_RUNTIME
       exit(EXIT_FAILURE);
     }
 
-    MothershipProdigyCluster stored = {};
-    if (registry.enableInitialDNSACME(identity, dnsProvider, dnsProviderCredentialName, acme,
-                                      &stored, &failure, &registryLock) == false)
+    MothershipProdigyCluster stored = candidate;
+    if (alreadyConfigured == false && registry.enableInitialDNSACME(identity, dnsProvider, dnsProviderCredentialName, acme,
+                                                                      &stored, &failure, &registryLock) == false)
     {
       // The acknowledged runtime configuration is intentionally not hidden:
       // a later normal configure derives only from the durable registry, so
@@ -32149,9 +32278,9 @@ LOCAL_RUNTIME
       exit(EXIT_FAILURE);
     }
 
-    basics_log("enableClusterDNSACME success=1 cluster=%s clusterUUID=%016llx%016llx\n",
-               stored.name.c_str(), (unsigned long long)(stored.clusterUUID >> 64),
-               (unsigned long long)stored.clusterUUID);
+    basics_log("enableClusterDNSACME success=1 repaired=%u cluster=%s clusterUUID=%016llx%016llx\n",
+               unsigned(alreadyConfigured), stored.name.c_str(),
+               (unsigned long long)(stored.clusterUUID >> 64), (unsigned long long)stored.clusterUUID);
   }
 
   void runRotateClusterDNSCredential(int argc, char *argv[])
