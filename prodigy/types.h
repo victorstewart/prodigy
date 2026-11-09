@@ -14337,6 +14337,70 @@ public:
   ProdigyStatefulStoreSeedAuthority statefulStoreSeedAuthority = {.protocolVersion = 0};
 };
 
+enum class StatefulInitialStoreDisposition : uint64_t {
+  mustRecover = 0,
+  initialEmptyAuthorized = 1
+};
+
+constexpr static uint32_t prodigyContainerStartupFlagShardGroupIndex = 0;
+constexpr static uint32_t prodigyContainerStartupFlagShardGroupCountIndex = 1;
+constexpr static uint32_t prodigyContainerStartupFlagInitialStoreDispositionIndex = 2;
+
+static inline StatefulInitialStoreDisposition prodigyStatefulInitialStoreDispositionFromStartupFlags(
+    const Vector<uint64_t>& flags)
+{
+  if (flags.size() <= prodigyContainerStartupFlagInitialStoreDispositionIndex ||
+      flags[prodigyContainerStartupFlagInitialStoreDispositionIndex] !=
+          uint64_t(StatefulInitialStoreDisposition::initialEmptyAuthorized))
+  {
+    return StatefulInitialStoreDisposition::mustRecover;
+  }
+  return StatefulInitialStoreDisposition::initialEmptyAuthorized;
+}
+
+static inline StatefulInitialStoreDisposition prodigyStatefulInitialStoreDispositionForPlan(
+    const ContainerPlan& plan)
+{
+  if (!plan.isStateful || plan.config.type != ApplicationType::stateful || plan.nShardGroups == 0 ||
+      plan.shardGroup >= plan.nShardGroups || plan.statefulTopology.shardGroup != plan.shardGroup ||
+      plan.statefulMeshRoles.sibling == 0 || plan.statefulMeshRoles.seeding == 0 ||
+      !prodigyStatefulMeshRolesConfigured(plan.statefulMeshRoles) ||
+      !plan.statefulMeshRoles.hasDistinctServices() ||
+      !prodigyStatefulTopologyServesClients(plan.statefulTopology) ||
+      (plan.statefulTopology.servingMode != StatefulTopologyServingMode::serve &&
+       !prodigyStatefulTopologyIsAllMastersSeedBootstrap(plan.statefulTopology)))
+  {
+    return StatefulInitialStoreDisposition::mustRecover;
+  }
+
+  bool siblingDeclared = false;
+  for (const auto& [service, subscription] : plan.subscriptions)
+  {
+    const StatefulMeshRole role = plan.statefulMeshRoles.classify(service);
+    if (role == StatefulMeshRole::sibling && service == plan.statefulMeshRoles.sibling &&
+        subscription.startAt == ContainerState::scheduled &&
+        subscription.stopAt == ContainerState::destroying && subscription.nature == SubscriptionNature::all)
+    {
+      siblingDeclared = true;
+    }
+    else if (role == StatefulMeshRole::seeding)
+    {
+      if (subscription.nature != SubscriptionNature::none ||
+          !prodigyStatefulTopologyIsAllMastersSeedBootstrap(plan.statefulTopology))
+      {
+        return StatefulInitialStoreDisposition::mustRecover;
+      }
+    }
+    else
+    {
+      return StatefulInitialStoreDisposition::mustRecover;
+    }
+  }
+
+  return siblingDeclared ? StatefulInitialStoreDisposition::initialEmptyAuthorized :
+      StatefulInitialStoreDisposition::mustRecover;
+}
+
 // A private listener declaration is carried to the process without publishing
 // a mesh advertisement. The application still needs authenticated writeOwner
 // authority before restoring its pruned client role and installing the socket.

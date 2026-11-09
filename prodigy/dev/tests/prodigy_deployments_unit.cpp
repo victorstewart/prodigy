@@ -3753,6 +3753,20 @@ static void testAllMastersBootstrapSeedingSubscription(TestSuite& suite)
           subscriptions.emplace(subscription.service, subscription);
           if (subscription.service == context.roles.seeding) { ++count; seeding = &subscription; }
         }
+        ContainerPlan startup = {};
+        startup.config = plan.config;
+        startup.isStateful = true;
+        startup.shardGroup = group;
+        startup.nShardGroups = groups;
+        startup.statefulMeshRoles = context.roles;
+        startup.statefulTopology = context.topology;
+        for (const auto& subscription : definitions.subscriptions)
+          startup.subscriptions.emplace(subscription.service, subscription);
+        Vector<uint64_t> startupFlags = {};
+        prodigyBuildContainerStartupFlags(startup, startupFlags);
+        const auto expectedDisposition = (expected == 0 || expectedNature == SubscriptionNature::none)
+            ? StatefulInitialStoreDisposition::initialEmptyAuthorized
+            : StatefulInitialStoreDisposition::mustRecover;
         ProdigyLocalCousinServicePermission permission;
         permission.protocolVersion = ProdigyLocalCousinServicePermission::purposeVersion;
         permission.purpose = ProdigyCousinServicePurpose::seeding;
@@ -3762,6 +3776,33 @@ static void testAllMastersBootstrapSeedingSubscription(TestSuite& suite)
         suite.expect(expected == 0 || (seeding != nullptr && seeding->nature == expectedNature &&
                      seeding->startAt == ContainerState::scheduled && seeding->stopAt == ContainerState::destroying),
                      "bootstrap_seeding_preserves_exact_nature_and_lifecycle");
+        suite.expect(startup.subscriptionPairings.size() == 0 && startupFlags.size() == 3 &&
+                     prodigyStatefulInitialStoreDispositionFromStartupFlags(startupFlags) == expectedDisposition,
+                     "startup_flags_classify_declared_recovery_subscriptions_without_live_pairings");
+        if (expectedDisposition == StatefulInitialStoreDisposition::initialEmptyAuthorized) {
+          startup.statefulMeshRoles.seeding = 0;
+          prodigyBuildContainerStartupFlags(startup, startupFlags);
+          suite.expect(prodigyStatefulInitialStoreDispositionFromStartupFlags(startupFlags) ==
+                           StatefulInitialStoreDisposition::mustRecover,
+                       "startup_flags_partial_stateful_roles_fail_closed");
+          startup.statefulMeshRoles = context.roles;
+          startup.statefulTopology.servingMode = StatefulTopologyServingMode::applicationDataAuthority;
+          auto& authority = startup.statefulTopology.dataAuthority;
+          authority.operationUUID = 21; authority.datasetUUID = 22; authority.snapshotUUID = 23;
+          authority.sourceClusterUUID = 24; authority.targetClusterUUID = 25;
+          authority.localClusterUUID = authority.writeOwnerClusterUUID = authority.targetClusterUUID;
+          authority.authorityEpoch = 1; authority.shardGroup = group; authority.nShardGroups = groups;
+          authority.mode = StatefulDataAuthorityMode::writeOwner;
+          authority.contractSHA256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv;
+          authority.shardManifestSHA256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"_ctv;
+          authority.snapshotBoundarySHA256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"_ctv;
+          authority.requiredAppliedWatermarkSHA256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"_ctv;
+          prodigyBuildContainerStartupFlags(startup, startupFlags);
+          suite.expect(prodigyStatefulTopologyServesClients(startup.statefulTopology) &&
+                       prodigyStatefulInitialStoreDispositionFromStartupFlags(startupFlags) ==
+                           StatefulInitialStoreDisposition::mustRecover,
+                       "startup_flags_data_authority_write_owner_stays_recovery_fenced");
+        }
         suite.expect(prodigyCousinSourceSubscriptionMatches(permission, context.roles.seeding,
                          subscriptions, ContainerState::healthy) == (expected == 1),
                      "bootstrap_seeding_subscription_allows_owner_session_after_readiness");
@@ -3798,6 +3839,34 @@ static void testAllMastersBootstrapSeedingSubscription(TestSuite& suite)
       verify(0, SubscriptionNature::none);
       context.dataStrategy = DataStrategy::changelog;
       verify(1, SubscriptionNature::all);
+    }
+    if (groups == 3) {
+      ProdigyContainerServiceDefinitionContext sharding = {};
+      sharding.isStateful = true;
+      sharding.roles = StatefulMeshRoles::forShardGroup(plan.stateful, applicationID, 2);
+      sharding.nShardGroups = groups;
+      sharding.dataStrategy = DataStrategy::sharding;
+      sharding.priorShardRoles.push_back(StatefulMeshRoles::forShardGroup(plan.stateful, applicationID, 0));
+      sharding.priorShardRoles.push_back(StatefulMeshRoles::forShardGroup(plan.stateful, applicationID, 1));
+      prodigyPopulateDefaultStatefulTopology(sharding.topology, 2, plan.config);
+      ProdigyContainerServiceDefinitions definitions = {};
+      const bool built = prodigyBuildContainerServiceDefinitions(plan, sharding, definitions);
+      ContainerPlan startup = {};
+      startup.config = plan.config;
+      startup.isStateful = true;
+      startup.shardGroup = 2;
+      startup.nShardGroups = groups;
+      startup.statefulMeshRoles = sharding.roles;
+      startup.statefulTopology = sharding.topology;
+      for (const auto& subscription : definitions.subscriptions)
+        startup.subscriptions.emplace(subscription.service, subscription);
+      Vector<uint64_t> startupFlags = {};
+      prodigyBuildContainerStartupFlags(startup, startupFlags);
+      suite.expect(built && startup.subscriptionPairings.size() == 0 &&
+                       sharding.roles.classify(sharding.priorShardRoles[0].sharding) == StatefulMeshRole::none &&
+                       prodigyStatefulInitialStoreDispositionFromStartupFlags(startupFlags) ==
+                           StatefulInitialStoreDisposition::mustRecover,
+                   "startup_flags_sharding_prior_group_subscriptions_stay_fenced_without_pairings");
     }
   };
   verifyApplication.template operator()<2>();
@@ -8132,9 +8201,20 @@ int main(void)
     Vector<uint64_t> flags = {};
     prodigyBuildContainerStartupFlags(plan, flags);
 
-    suite.expect(flags.size() == 2, "container_startup_flags_stateful_include_two_entries");
+    suite.expect(flags.size() == 3, "container_startup_flags_stateful_include_disposition_entry");
     suite.expect(flags[0] == 7, "container_startup_flags_stateful_preserve_shard_group");
     suite.expect(flags[1] == 13, "container_startup_flags_stateful_preserve_shard_group_count");
+    suite.expect(prodigyStatefulInitialStoreDispositionFromStartupFlags(flags) ==
+                     StatefulInitialStoreDisposition::mustRecover,
+                 "container_startup_flags_invalid_stateful_plan_fails_closed");
+    flags.pop_back();
+    suite.expect(prodigyStatefulInitialStoreDispositionFromStartupFlags(flags) ==
+                     StatefulInitialStoreDisposition::mustRecover,
+                 "container_startup_flags_legacy_two_entry_shape_fails_closed");
+    flags.push_back(99);
+    suite.expect(prodigyStatefulInitialStoreDispositionFromStartupFlags(flags) ==
+                     StatefulInitialStoreDisposition::mustRecover,
+                 "container_startup_flags_unknown_disposition_fails_closed");
   }
 
   {

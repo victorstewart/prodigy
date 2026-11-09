@@ -409,6 +409,7 @@ static inline void prodigyBuildContainerStartupFlags(const ContainerPlan& plan, 
   if (plan.isStateful && plan.nShardGroups > 0)
   {
     flags.push_back(plan.nShardGroups);
+    flags.push_back(uint64_t(prodigyStatefulInitialStoreDispositionForPlan(plan)));
   }
 }
 
