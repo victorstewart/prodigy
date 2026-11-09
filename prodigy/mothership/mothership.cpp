@@ -6009,7 +6009,10 @@ static bool mothershipRemoteRuntimeRecoveryLocal(const String& root, const Strin
       require(state.loadLocalBrainState(local,failure) && state.loadBrainSnapshot(snapshot,failure),
               "runtime recovery canonical private store loader rejected snapshot");
       state.close();
-      require(mothershipRuntimeRecoverySnapshotValid(local,snapshot,request.cohort.clusterUUID,memberUUID,request.topology,failure),
+      require(request.version < 2 ?
+          mothershipRuntimeRecoverySnapshotValid(local,snapshot,request.cohort.clusterUUID,memberUUID,request.topology,failure) :
+          mothershipRuntimeRecoveryStartupSnapshotValid(local,snapshot,request.cohort.clusterUUID,memberUUID,request.topology,
+              request.cohort.targetBundleSHA256,request.cohort.sourceBundleSHA256,{},failure),
               "runtime recovery private snapshot admission failed");
       proof.authorityGeneration=snapshot.masterAuthority.runtimeState.generation;
       require(proof.authorityGeneration>=request.cohort.authorityGeneration,"runtime recovery private authority regressed");
@@ -6128,6 +6131,8 @@ static bool mothershipRemoteRuntimeRecoveryLocal(const String& root, const Strin
       RuntimeStartupRequest startupRequest={};
       require(loadRuntimeStartupRequest(startupPath.string(),startupRequest,startupSHA,failure) && startupRequest.bindingSHA256==binding &&
               startupRequest.clusterUUID==request.cohort.clusterUUID && startupRequest.targetBundleSHA256==request.cohort.targetBundleSHA256 &&
+              (request.version < 2 || startupRequest.version==1 ||
+               startupRequest.sourceBundleSHA256==request.cohort.sourceBundleSHA256) &&
               startupRequest.topology==request.topology,"runtime recovery startup request binding differs");
       const auto* localSource=runtimeStartupSourceForMember(startupRequest,memberUUID);
       require(localSource && localSource->stoppedProofSHA256==census.source.stoppedProofSHA256 &&
@@ -13967,7 +13972,9 @@ REMOTE_RUNTIME
                   prodigyComputeSHA256Hex(parentTopologyBytes,parentTopologySHA,&failure) && parentTopologySHA==parent.topologySHA256 &&
                   BitseryEngine::deserializeSafe(text(read(startupPath)),parentStartup) && runtimeStartupRequestValid(parentStartup,&failure) &&
                   parentStartup.bindingSHA256==parentRequestSHA && parentStartup.clusterUUID==parent.clusterUUID &&
-                  parentStartup.targetBundleSHA256==parent.targetBundleSHA256 && parentStartup.topology==parentRequest.topology &&
+                  parentStartup.targetBundleSHA256==parent.targetBundleSHA256 &&
+                  (parentStartup.version==1 || parentStartup.sourceBundleSHA256==parent.sourceBundleSHA256) &&
+                  parentStartup.topology==parentRequest.topology &&
                   BitseryEngine::deserializeSafe(text(read(witnessesPath)),parentWitnesses) &&
                   parentWitnesses.requestSHA==parentStartupSHA && parentWitnesses.witnesses.size()==3,
                   "post-activation parent request or startup witness is invalid");
@@ -14243,8 +14250,8 @@ REMOTE_RUNTIME
           if(!preparedCohort) for(const auto& member:record.members) run(member,sourceGuard(member));
         }
         if(!preparedCohort) {
-        RuntimeStartupRequest startup={};startup.bindingSHA256=binding;startup.clusterUUID=record.clusterUUID;
-        startup.targetBundleSHA256=record.targetBundleSHA256;startup.topology=currentTopology;
+        RuntimeStartupRequest startup={};startup.version=2;startup.bindingSHA256=binding;startup.clusterUUID=record.clusterUUID;
+        startup.targetBundleSHA256=record.targetBundleSHA256;startup.sourceBundleSHA256=record.sourceBundleSHA256;startup.topology=currentTopology;
         for(const auto& member:record.members) {
           String bytes={};privateReply(member,"census",bytes);MothershipRuntimeRecoveryCensus census={};
           require(BitseryEngine::deserializeSafe(bytes,census) && census.machine.machineUUID==member.machineUUID &&
@@ -14264,7 +14271,9 @@ REMOTE_RUNTIME
           privateFile(startupFile.string());startupBytes=text(read(startupFile));RuntimeStartupRequest saved={};
           require(BitseryEngine::deserializeSafe(startupBytes,saved) && runtimeStartupRequestValid(saved,&failure) &&
                   saved.bindingSHA256==binding && saved.clusterUUID==record.clusterUUID && saved.topology==currentTopology &&
-                  saved.targetBundleSHA256==record.targetBundleSHA256,"runtime recovery saved startup request conflicts");
+                  saved.targetBundleSHA256==record.targetBundleSHA256 &&
+                  (saved.version==1 || (saved.version==2 &&
+                   saved.sourceBundleSHA256==record.sourceBundleSHA256)),"runtime recovery saved startup request conflicts");
           startup=std::move(saved);
         } else {
           BitseryEngine::serialize(startupBytes,startup);

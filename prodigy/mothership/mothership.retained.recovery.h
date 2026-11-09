@@ -37,7 +37,7 @@ static inline bool mothershipRetainedRecoveryRejectedUpdatePayloadValid(
 // update-self coordinator remains meaningful authority and blocks recovery.
 // An exact rejected-before-checkpoint payload and a concurrency preference
 // carry no transition intent; both remain unchanged in the retained store.
-static inline bool mothershipRuntimeRecoverySnapshotValid(
+static inline bool mothershipRuntimeRecoverySnapshotStructureValid(
     const ProdigyPersistentLocalBrainState& local,
     const ProdigyPersistentBrainSnapshot& snapshot,
     uint128_t expectedClusterUUID, uint128_t expectedMemberUUID,
@@ -62,13 +62,6 @@ static inline bool mothershipRuntimeRecoverySnapshotValid(
   const auto& authority=snapshot.masterAuthority.runtimeState;
   if (!authority.hasCompletedInitialMasterElection || authority.generation==0)
     return reject("private Brain snapshot lacks completed durable initial election");
-  const ProdigyPersistentUpdateSelfState idle = {};
-  if ((authority.updateSelf != idle &&
-       !mothershipRetainedRecoveryRejectedUpdatePayloadValid(authority.updateSelf)) ||
-      authority.updateSelfFollowerConcurrency > ProdigyUpdateSelfMaximumConcurrency ||
-      !authority.updateSelfFollowerTransitionIssuedPeerKeys.empty() ||
-      !authority.updateSelfFollowerReadyPeerKeys.empty())
-    return reject("private Brain snapshot contains an in-flight update-self coordinator");
   if (!authority.pendingAddMachinesOperations.empty() || !authority.pendingAddMachinesProvisioningIntents.empty() ||
       !authority.pendingAutonomousProvisioningOperations.empty() || !authority.pendingElasticAddressAssignments.empty() ||
       !authority.pendingElasticAddressReleases.empty() || !authority.statefulWorkerTopologyUpgradeOperations.empty() ||
@@ -76,6 +69,26 @@ static inline bool mothershipRuntimeRecoverySnapshotValid(
       !authority.materializedStatefulRecoveryRetries.empty() || !authority.retainedStatefulRearmProofs.empty() ||
       !authority.taskExecutions.empty())
     return reject("private Brain snapshot contains an unsupported in-flight authority operation");
+  return true;
+}
+
+static inline bool mothershipRuntimeRecoverySnapshotValid(
+    const ProdigyPersistentLocalBrainState& local,
+    const ProdigyPersistentBrainSnapshot& snapshot,
+    uint128_t expectedClusterUUID, uint128_t expectedMemberUUID,
+    const ClusterTopology& expectedTopology, String *failure = nullptr)
+{
+  if (!mothershipRuntimeRecoverySnapshotStructureValid(
+          local,snapshot,expectedClusterUUID,expectedMemberUUID,expectedTopology,failure)) return false;
+  const auto& authority=snapshot.masterAuthority.runtimeState;
+  const ProdigyPersistentUpdateSelfState idle = {};
+  if ((authority.updateSelf != idle &&
+       !mothershipRetainedRecoveryRejectedUpdatePayloadValid(authority.updateSelf)) ||
+      authority.updateSelfFollowerConcurrency > ProdigyUpdateSelfMaximumConcurrency ||
+      !authority.updateSelfFollowerTransitionIssuedPeerKeys.empty() ||
+      !authority.updateSelfFollowerReadyPeerKeys.empty())
+  { if (failure) failure->assign("private Brain snapshot contains an in-flight update-self coordinator"); return false; }
+  if (failure) failure->clear();
   return true;
 }
 
@@ -721,6 +734,35 @@ static inline bool mothershipRetainedRecoveryCanReplaceUpdate(
   if (previousEnvelope) return true;
   String digest;
   return prodigyComputeSHA256Hex(update.bundleBlob, digest) && digest == update.workerExpectedBundleSHA256;
+}
+
+// The activation-successor recovery path may consume only the coordinator
+// bound to its immutable installed source and replacement target.  Generic
+// stopped-runtime recovery remains stricter and continues to call the gate
+// above; this form is not a blanket exemption for active update state.
+static inline bool mothershipRuntimeRecoveryStartupSnapshotValid(
+    const ProdigyPersistentLocalBrainState& local,
+    const ProdigyPersistentBrainSnapshot& snapshot,
+    uint128_t expectedClusterUUID, uint128_t expectedMemberUUID,
+    const ClusterTopology& expectedTopology, const String& targetBundleSHA256,
+    const String& sourceBundleSHA256, const String& rejectedCandidateSHA256 = {},
+    String *failure = nullptr)
+{
+  if (!mothershipRuntimeRecoverySnapshotStructureValid(
+          local,snapshot,expectedClusterUUID,expectedMemberUUID,expectedTopology,failure)) return false;
+  const auto& authority=snapshot.masterAuthority.runtimeState;
+  const bool unboundRejectedCapture=rejectedCandidateSHA256.empty() &&
+      mothershipRetainedRecoveryRejectedUpdatePayloadValid(authority.updateSelf);
+  if (!prodigyIsSHA256HexDigest(targetBundleSHA256) || !prodigyIsSHA256HexDigest(sourceBundleSHA256) ||
+      (!rejectedCandidateSHA256.empty() && !prodigyIsSHA256HexDigest(rejectedCandidateSHA256)) ||
+      authority.updateSelfFollowerConcurrency > ProdigyUpdateSelfMaximumConcurrency ||
+      !authority.updateSelfFollowerTransitionIssuedPeerKeys.empty() ||
+      !authority.updateSelfFollowerReadyPeerKeys.empty() ||
+      (!unboundRejectedCapture && !mothershipRetainedRecoveryCanReplaceUpdate(
+          snapshot,targetBundleSHA256,sourceBundleSHA256,{},rejectedCandidateSHA256)))
+  { if (failure) failure->assign("private Brain snapshot contains an unresumable update-self coordinator"); return false; }
+  if (failure) failure->clear();
+  return true;
 }
 
 // A successor can retain either the exact interrupted recovery envelope, or
@@ -1373,10 +1415,11 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
 
 // Prepare the one startup-authority projection used by a replacement runtime
 // after Mothership has independently captured a complete live cohort.  This
-// does not admit a second recovery policy: it first applies the ordinary
-// private-snapshot gate, then delegates all bootstrap construction and
-// canonical inventory checks to the retained-recovery owner above.  Leave both
-// the source snapshot and the caller's output untouched on every rejection.
+// does not admit a second recovery policy: version-two startup binds the
+// installed source and replacement target through the retained coordinator
+// owner, then delegates all bootstrap construction and canonical inventory
+// checks there.  Leave both the source snapshot and caller output untouched
+// on every rejection.
 static inline bool mothershipPrepareRuntimeRecoveryStartupAuthority(
     const ProdigyPersistentLocalBrainState& local,
     const ProdigyPersistentBrainSnapshot& source,
@@ -1385,6 +1428,7 @@ static inline bool mothershipPrepareRuntimeRecoveryStartupAuthority(
     const bytell_hash_map<uint64_t, DeploymentPlan>& approvedPlans,
     const Vector<MothershipRetainedRecoveryMachineInput>& machines,
     const String& targetBundleSHA256,
+    const String& sourceBundleSHA256,
     const String& rejectedCandidateSHA256,
     ProdigyPersistentBrainSnapshot& prepared,
     String *failure = nullptr)
@@ -1408,8 +1452,12 @@ static inline bool mothershipPrepareRuntimeRecoveryStartupAuthority(
         !cohortMachines.insert(machine.machineUUID).second || !cohortFragments.insert(machine.machineFragment).second ||
         !topologyMachines.contains(machine.machineUUID))
       return reject("runtime recovery live cohort shape differs from frozen topology");
-  if (!mothershipRuntimeRecoverySnapshotValid(
-          local, source, expectedClusterUUID, expectedMemberUUID, expectedTopology, failure))
+  const bool legacyStartupRequest=sourceBundleSHA256.empty();
+  if ((legacyStartupRequest && !mothershipRuntimeRecoverySnapshotValid(
+          local,source,expectedClusterUUID,expectedMemberUUID,expectedTopology,failure)) ||
+      (!legacyStartupRequest && !mothershipRuntimeRecoveryStartupSnapshotValid(
+          local,source,expectedClusterUUID,expectedMemberUUID,expectedTopology,
+          targetBundleSHA256,sourceBundleSHA256,rejectedCandidateSHA256,failure)))
     return false;
 
   // The census is evidence, not new scheduler authority. Every observed live
@@ -1461,7 +1509,7 @@ static inline bool mothershipPrepareRuntimeRecoveryStartupAuthority(
   String preparationFailure = {};
   if (!mothershipPrepareRetainedRecoverySnapshot(
           candidate, approvedPlans, machines, targetBundleSHA256, &preparationFailure,
-          {}, {}, 0, nullptr, false, true, 0, {}, nullptr, rejectedCandidateSHA256))
+          sourceBundleSHA256, {}, 0, nullptr, false, true, 0, {}, nullptr,rejectedCandidateSHA256))
   {
     if (failure) failure->assign(preparationFailure);
     return false;

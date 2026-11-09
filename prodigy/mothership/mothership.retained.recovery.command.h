@@ -488,6 +488,7 @@ struct RuntimeStartupRequest {
   String bindingSHA256;
   uint128_t clusterUUID = 0;
   String targetBundleSHA256;
+  String sourceBundleSHA256;
   String rejectedCandidateSHA256;
   ClusterTopology topology;
   Vector<RuntimeStartupSource> sources;
@@ -496,6 +497,7 @@ struct RuntimeStartupRequest {
 template<typename S> void serialize(S&& s, RuntimeStartupRequest& request) {
   s.value4b(request.version); s.text1b(request.bindingSHA256,64);
   s.value16b(request.clusterUUID); s.text1b(request.targetBundleSHA256,64); s.text1b(request.rejectedCandidateSHA256,64);
+  if (request.version >= 2) s.text1b(request.sourceBundleSHA256,64);
   s.object(request.topology); s.object(request.sources); s.object(request.machines);
 }
 struct RuntimeStartupPrepared {
@@ -510,9 +512,10 @@ template<typename S> void serialize(S&& s, RuntimeStartupPrepared& prepared) {
 }
 inline bool runtimeStartupRequestValid(const RuntimeStartupRequest& request, String *failure = nullptr) {
   auto reject=[&](const char *why) { if (failure) failure->assign(why); return false; };
-  if (request.version != 1 || request.clusterUUID == 0 ||
+  if ((request.version != 1 && request.version != 2) || request.clusterUUID == 0 ||
       !prodigyIsSHA256HexDigest(request.bindingSHA256) ||
       !prodigyIsSHA256HexDigest(request.targetBundleSHA256) ||
+      (request.version >= 2 && !prodigyIsSHA256HexDigest(request.sourceBundleSHA256)) ||
       (!request.rejectedCandidateSHA256.empty() && !prodigyIsSHA256HexDigest(request.rejectedCandidateSHA256)) ||
       request.topology.machines.size() != 3 || request.sources.size() != 3 || request.machines.size() != 3)
     return reject("runtime startup request shape is invalid");
@@ -1087,7 +1090,7 @@ inline bool prepareRuntimeStartupPrivate(const RuntimeStartupRequest& request,
     ProdigyPersistentBrainSnapshot expected={};
     require(mothershipPrepareRuntimeRecoveryStartupAuthority(sourceLocal,sourceSnapshot,request.clusterUUID,memberUUID,
                 request.topology,sourceSnapshot.masterAuthority.deploymentPlans,request.machines,
-                request.targetBundleSHA256,request.rejectedCandidateSHA256,expected,&why),
+                request.targetBundleSHA256,request.sourceBundleSHA256,request.rejectedCandidateSHA256,expected,&why),
             why.size()?str(why).c_str():"runtime startup authority preparation failed");
     ProdigyPersistentBrainSnapshot comparable=expected;
     if (witnessesEquivalent(copiedSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses,

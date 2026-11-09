@@ -1931,6 +1931,7 @@ static void assertRuntimeRecoveryStartupAuthorityPreparation()
   using namespace MothershipRetainedRecovery;
   const uint128_t cluster = 0x7a01, member = 1;
   const String targetBundle = MothershipTidesMigration::text(std::string(64, 'd'));
+  const String sourceBundle = MothershipTidesMigration::text(std::string(64, 'c'));
   ProdigyPersistentLocalBrainState local = {};
   local.uuid = member;
   local.ownerClusterUUID = cluster;
@@ -2017,7 +2018,7 @@ static void assertRuntimeRecoveryStartupAuthorityPreparation()
   ProdigyPersistentBrainSnapshot prepared = {};
   assert(mothershipPrepareRuntimeRecoveryStartupAuthority(
       local, source, cluster, member, source.topology, approved, machines, targetBundle,
-      rejectedCandidateSHA256, prepared, &failure));
+      sourceBundle, rejectedCandidateSHA256, prepared, &failure));
   String sourceAfterBytes = {};
   assert(BitseryEngine::serialize(sourceAfterBytes, source) && sourceAfterBytes == originalBytes);
   const auto& witnesses = prepared.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;
@@ -2045,7 +2046,7 @@ static void assertRuntimeRecoveryStartupAuthorityPreparation()
     assert(BitseryEngine::serialize(before, untouched));
     assert(!mothershipPrepareRuntimeRecoveryStartupAuthority(
         local, source, cluster, member, source.topology, approved, badMachines, targetBundle,
-        rejectedCandidateSHA256, untouched, &failure));
+        sourceBundle, rejectedCandidateSHA256, untouched, &failure));
     String after = {};
     assert(BitseryEngine::serialize(after, source) && after == originalBytes);
     assert(BitseryEngine::serialize(after, untouched) && after == before);
@@ -2071,12 +2072,46 @@ static void assertRuntimeRecoveryStartupAuthorityPreparation()
   malformedCensus[1].observedCreatedAtMs.clear();
   rejectsWithoutChangingSource(std::move(malformedCensus));
 
+  // The activation-successor form is narrower than generic recovery: an
+  // existing sealed source envelope may be replaced only by its exact bound
+  // source/target pair, and it is still rejected by the generic gate.
+  auto resumableSource = source;
+  resumableSource.masterAuthority.runtimeState.updateSelf =
+      prepared.masterAuthority.runtimeState.updateSelf;
+  resumableSource.masterAuthority.runtimeState.updateSelf.workerExpectedBundleSHA256 = sourceBundle;
+  String resumableBytes = {};
+  assert(BitseryEngine::serialize(resumableBytes, resumableSource));
+  assert(!mothershipRuntimeRecoverySnapshotValid(
+      local,resumableSource,cluster,member,source.topology,&failure));
+  assert(mothershipRuntimeRecoveryStartupSnapshotValid(
+      local,resumableSource,cluster,member,source.topology,targetBundle,sourceBundle,{},&failure));
+  auto wrongSourceBundle = MothershipTidesMigration::text(std::string(64, 'e'));
+  assert(!mothershipRuntimeRecoveryStartupSnapshotValid(
+      local,resumableSource,cluster,member,source.topology,targetBundle,wrongSourceBundle,{},&failure));
+  auto progressedSource = resumableSource;
+  progressedSource.masterAuthority.runtimeState.updateSelf.state =
+      uint8_t(ProdigyPersistentUpdateSelfState::Phase::waitingForFollowerReboots);
+  assert(!mothershipRuntimeRecoveryStartupSnapshotValid(
+      local,progressedSource,cluster,member,source.topology,targetBundle,sourceBundle,{},&failure));
+  auto peerMismatch = resumableSource;
+  peerMismatch.masterAuthority.runtimeState.updateSelfFollowerReadyPeerKeys.push_back(1);
+  assert(!mothershipRuntimeRecoveryStartupSnapshotValid(
+      local,peerMismatch,cluster,member,source.topology,targetBundle,sourceBundle,{},&failure));
+  ProdigyPersistentBrainSnapshot resumablePrepared = {};
+  assert(mothershipPrepareRuntimeRecoveryStartupAuthority(
+      local,resumableSource,cluster,member,source.topology,approved,machines,targetBundle,
+      sourceBundle,{},resumablePrepared,&failure));
+  String resumableAfterBytes = {};
+  assert(BitseryEngine::serialize(resumableAfterBytes,resumableSource) && resumableAfterBytes==resumableBytes);
+
   // The operation request binds raw captured bytes supplied by the caller;
   // its structural gate cannot silently substitute another member's source.
   RuntimeStartupRequest request = {};
+  request.version = 2;
   request.bindingSHA256.assign(std::string(64, 'a').c_str());
   request.clusterUUID = cluster;
   request.targetBundleSHA256 = targetBundle;
+  request.sourceBundleSHA256 = sourceBundle;
   request.rejectedCandidateSHA256 = rejectedCandidateSHA256;
   request.topology = source.topology;
   request.machines = machines;
@@ -2090,6 +2125,36 @@ static void assertRuntimeRecoveryStartupAuthorityPreparation()
     request.sources.push_back(std::move(captured));
   }
   assert(runtimeStartupRequestValid(request, &failure));
+  // Version one is the original wire shape: sourceBundle was not encoded, so
+  // a sealed old request remains byte-identical and resumes via its legacy
+  // strict admission path.
+  auto v1WithIgnoredSource = request;
+  v1WithIgnoredSource.version = 1;
+  auto v1WithoutSource = v1WithIgnoredSource;
+  v1WithoutSource.sourceBundleSHA256.clear();
+  String v1WithIgnoredSourceBytes = {}, v1WithoutSourceBytes = {};
+  assert(BitseryEngine::serialize(v1WithIgnoredSourceBytes,v1WithIgnoredSource));
+  assert(BitseryEngine::serialize(v1WithoutSourceBytes,v1WithoutSource));
+  assert(v1WithIgnoredSourceBytes==v1WithoutSourceBytes);
+  RuntimeStartupRequest decodedV1 = {};
+  assert(BitseryEngine::deserializeSafe(v1WithoutSourceBytes,decodedV1) &&
+      runtimeStartupRequestValid(decodedV1,&failure) && decodedV1.version==1 &&
+      decodedV1.sourceBundleSHA256.empty());
+  String requestBytes = {}, requestSHA256 = {};
+  assert(BitseryEngine::serialize(requestBytes,request));
+  assert(prodigyComputeSHA256Hex(requestBytes,requestSHA256));
+  auto sourceTamperedRequest = request;
+  sourceTamperedRequest.sourceBundleSHA256 = MothershipTidesMigration::text(std::string(64, 'e'));
+  String sourceTamperedBytes = {}, sourceTamperedSHA256 = {};
+  assert(BitseryEngine::serialize(sourceTamperedBytes,sourceTamperedRequest));
+  assert(prodigyComputeSHA256Hex(sourceTamperedBytes,sourceTamperedSHA256));
+  assert(sourceTamperedSHA256!=requestSHA256);
+  auto targetTamperedRequest = request;
+  targetTamperedRequest.targetBundleSHA256 = MothershipTidesMigration::text(std::string(64, 'f'));
+  String targetTamperedBytes = {}, targetTamperedSHA256 = {};
+  assert(BitseryEngine::serialize(targetTamperedBytes,targetTamperedRequest));
+  assert(prodigyComputeSHA256Hex(targetTamperedBytes,targetTamperedSHA256));
+  assert(targetTamperedSHA256!=requestSHA256);
   assert(runtimeStartupSourceMatches(request, member, request.sources[0].snapshotSHA256));
   auto swappedSource = request;
   std::swap(swappedSource.sources[0].snapshotSHA256, swappedSource.sources[1].snapshotSHA256);
