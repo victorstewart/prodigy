@@ -95,6 +95,78 @@ int main()
            "activation successor rejects incomplete prepared authority seal");
   }
 
+  // Exercise the exact predicate used by both the bounded capture receipt and
+  // stopped-proof validation.  An absent pair remains interface-bound; a
+  // wholly zero wire record is never recovery authority.
+  {
+    struct WitnessPair { MothershipVDCRetainedTCX links[2] = {}; };
+    WitnessPair absent = {};
+    expect(!mothershipTCXWitnessLinksAdmissible(absent.links),
+           "TCX recovery rejects unbound zero witness");
+    absent.links[0].ifindex = absent.links[1].ifindex = 17;
+    absent.links[0].attachType = uint32_t(BPF_TCX_INGRESS);
+    absent.links[1].attachType = uint32_t(BPF_TCX_EGRESS);
+    expect(mothershipTCXWitnessLinksAdmissible(absent.links),
+           "TCX recovery capture accepts exact interface-bound absence witness");
+    expect(mothershipTCXWitnessLinksStageValid(absent.links,
+                                               MothershipTCXWitnessVerificationStage::frozenEvidence, true, false),
+           "TCX recovery frozen evidence preserves clean absence");
+    expect(!mothershipTCXWitnessLinksStageValid(absent.links,
+                                                MothershipTCXWitnessVerificationStage::frozenEvidence, false, true),
+           "TCX recovery frozen evidence rejects reappeared target TCX");
+    expect(!mothershipTCXWitnessLinksStageValid(absent.links,
+                                                MothershipTCXWitnessVerificationStage::activeTarget, true, false),
+           "TCX recovery active target rejects still-absent source witness");
+    expect(mothershipTCXWitnessLinksStageValid(absent.links,
+                                               MothershipTCXWitnessVerificationStage::activeTarget, false, true),
+           "TCX recovery active target accepts canonical replacement pair");
+    auto altered = absent;
+    altered.links[0].programID = 1;
+    expect(!mothershipTCXWitnessLinksAdmissible(altered.links),
+           "TCX recovery rejects absent witness program identity");
+    altered = absent;
+    altered.links[1].linkID = 1;
+    expect(!mothershipTCXWitnessLinksAdmissible(altered.links),
+           "TCX recovery rejects absent witness link identity");
+    altered = absent;
+    altered.links[0].wormholeFlowMapID = 1;
+    expect(!mothershipTCXWitnessLinksAdmissible(altered.links),
+           "TCX recovery rejects absent witness flow map identity");
+    altered = absent;
+    altered.links[1].wormholePendingFlowMapID = 1;
+    expect(!mothershipTCXWitnessLinksAdmissible(altered.links),
+           "TCX recovery rejects absent witness pending map identity");
+    altered = absent;
+    altered.links[0].programTag[0] = 1;
+    expect(!mothershipTCXWitnessLinksAdmissible(altered.links),
+           "TCX recovery rejects absent witness program tag");
+    altered = absent;
+    altered.links[1].ifindex = 18;
+    expect(!mothershipTCXWitnessLinksAdmissible(altered.links),
+           "TCX recovery rejects absent witness interface drift");
+    altered = absent;
+    altered.links[1].attachType = uint32_t(BPF_TCX_INGRESS);
+    expect(!mothershipTCXWitnessLinksAdmissible(altered.links),
+           "TCX recovery rejects absent witness direction drift");
+
+    WitnessPair complete = {};
+    for (uint32_t index = 0; index != 2; ++index)
+    {
+      complete.links[index].ifindex = 17;
+      complete.links[index].attachType = index == 0 ? uint32_t(BPF_TCX_INGRESS) : uint32_t(BPF_TCX_EGRESS);
+      complete.links[index].programID = 10 + index;
+      complete.links[index].linkID = 20 + index;
+      complete.links[index].wormholeFlowMapID = 30 + index;
+      complete.links[index].wormholePendingFlowMapID = 40 + index;
+      complete.links[index].programTag[0] = uint8_t(50 + index);
+    }
+    expect(mothershipTCXWitnessLinksAdmissible(complete.links),
+           "TCX recovery capture accepts complete retained witness");
+    expect(mothershipTCXWitnessLinksStageValid(complete.links,
+                                               MothershipTCXWitnessVerificationStage::activeTarget, false, false),
+           "TCX recovery active target preserves exact retained source pair");
+  }
+
   // The low-level provider collector appends chunks. The recovery inspector
   // owns a fresh observation even if its caller reuses an earlier SHA buffer.
   {

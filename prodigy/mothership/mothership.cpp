@@ -4340,6 +4340,55 @@ static bool mothershipTCXWitnessLinksValid(const MothershipVDCRetainedTCX (&link
       links[1].wormholePendingFlowMapID != 0 && links[1].attachType == uint32_t(BPF_TCX_EGRESS);
 }
 
+static bool mothershipTCXWitnessLinksAbsent(const MothershipVDCRetainedTCX (&links)[2])
+{
+  if (links[0].ifindex == 0 || links[1].ifindex != links[0].ifindex ||
+      links[0].attachType != uint32_t(BPF_TCX_INGRESS) || links[1].attachType != uint32_t(BPF_TCX_EGRESS))
+    return false;
+  for (const MothershipVDCRetainedTCX& link : links)
+  {
+    if (link.programID != 0 || link.linkID != 0 || link.wormholeFlowMapID != 0 || link.wormholePendingFlowMapID != 0)
+      return false;
+    for (uint8_t byte : link.programTag) if (byte != 0) return false;
+  }
+  return true;
+}
+
+// The only two serializable TCX states accepted by recovery are an exact
+// retained pair and the interface-bound, otherwise-zero clean-absence
+// sentinel.  Keep this predicate shared by receipt acceptance and stopped
+// proof validation so a capture cannot publish a proof its consumer rejects.
+static bool mothershipTCXWitnessLinksAdmissible(const MothershipVDCRetainedTCX (&links)[2])
+{
+  return mothershipTCXWitnessLinksValid(links) || mothershipTCXWitnessLinksAbsent(links);
+}
+
+enum class MothershipTCXWitnessVerificationStage : uint8_t { frozenEvidence, activeTarget };
+
+// A source absence witness is valid evidence only while the frozen source
+// remains absent.  Once the target is active, its packaged canonical routers
+// are required instead; a partial or still-absent target is never accepted.
+static bool mothershipTCXWitnessLinksStageValid(const MothershipVDCRetainedTCX (&links)[2],
+                                                MothershipTCXWitnessVerificationStage stage,
+                                                bool cleanlyAbsent,
+                                                bool currentCanonicalPair)
+{
+  if (mothershipTCXWitnessLinksValid(links)) return true;
+  return mothershipTCXWitnessLinksAbsent(links) &&
+      (stage == MothershipTCXWitnessVerificationStage::frozenEvidence ? cleanlyAbsent : currentCanonicalPair);
+}
+
+static bool mothershipTCXCurrentCanonicalPairValid(uint32_t ifindex)
+{
+  SwitchboardHostTCXRetentionIdentity ingress = {}, egress = {};
+  return switchboardHostTCXOpenCurrent(ifindex, "/sys/fs/bpf"_ctv, SwitchboardHostTCXDirection::ingress, 0, ingress) &&
+      switchboardHostTCXOpenCurrent(ifindex, "/sys/fs/bpf"_ctv, SwitchboardHostTCXDirection::egress, 0, egress) &&
+      ingress.interfaceIndex == ifindex && egress.interfaceIndex == ifindex &&
+      ingress.direction == SwitchboardHostTCXDirection::ingress && egress.direction == SwitchboardHostTCXDirection::egress &&
+      ingress.wormholeFlowMapID == egress.wormholeFlowMapID &&
+      ingress.wormholePendingFlowMapID == egress.wormholePendingFlowMapID;
+}
+
 static bool mothershipCaptureFrozenServicePrimaryTCX(const MothershipVDCProcessIdentity& process,
                                                      MothershipFrozenServiceTCXWitness& witness, String *failure)
 {
@@ -4371,9 +4420,19 @@ static bool mothershipCaptureFrozenServicePrimaryTCX(const MothershipVDCProcessI
     if (::setns(mount.fd, CLONE_NEWNS) != 0 || ::setns(network.fd, CLONE_NEWNET) != 0) _exit(125);
     const uint32_t ifindex = ::if_nametoindex(primary.c_str()); struct stat bpffs = {};
     SwitchboardHostTCXRetentionPair pair = {};
-    if (ifindex != 0 && ::stat("/sys/fs/bpf", &bpffs) == 0 && switchboardHostTCXValidBPFFSRoot("/sys/fs/bpf"_ctv) &&
-        switchboardHostTCXRetainCurrentPair(ifindex, "/sys/fs/bpf"_ctv, pair))
-    { mothershipTCXExport(pair.ingress, receipt.links[0]); mothershipTCXExport(pair.egress, receipt.links[1]); receipt.device = bpffs.st_dev; receipt.inode = bpffs.st_ino; receipt.result = mothershipTCXWitnessLinksValid(receipt.links) ? 0 : 1; }
+    if (ifindex != 0 && ::stat("/sys/fs/bpf", &bpffs) == 0 && switchboardHostTCXValidBPFFSRoot("/sys/fs/bpf"_ctv))
+    {
+      receipt.device = bpffs.st_dev; receipt.inode = bpffs.st_ino;
+      if (switchboardHostTCXPairCleanlyAbsent(ifindex, "/sys/fs/bpf"_ctv))
+      {
+        receipt.links[0].ifindex = receipt.links[1].ifindex = ifindex;
+        receipt.links[0].attachType = uint32_t(BPF_TCX_INGRESS);
+        receipt.links[1].attachType = uint32_t(BPF_TCX_EGRESS);
+        receipt.result = 0;
+      }
+      else if (switchboardHostTCXRetainCurrentPair(ifindex, "/sys/fs/bpf"_ctv, pair))
+      { mothershipTCXExport(pair.ingress, receipt.links[0]); mothershipTCXExport(pair.egress, receipt.links[1]); receipt.result = mothershipTCXWitnessLinksValid(receipt.links) ? 0 : 1; }
+    }
     size_t sent = 0; while (sent < sizeof(receipt)) { const ssize_t bytes = ::write(output.fd, reinterpret_cast<const char *>(&receipt) + sent, sizeof(receipt) - sent); if (bytes < 0 && errno == EINTR) continue; if (bytes <= 0) _exit(1); sent += size_t(bytes); }
     _exit(receipt.result == 0 ? 0 : 1);
   }
@@ -4381,7 +4440,11 @@ static bool mothershipCaptureFrozenServicePrimaryTCX(const MothershipVDCProcessI
   ::close(output.fd); output.fd = -1; size_t received = 0;
   while (received < sizeof(receipt)) { const ssize_t bytes = ::read(input.fd, reinterpret_cast<char *>(&receipt) + received, sizeof(receipt) - received); if (bytes < 0 && errno == EINTR) continue; if (bytes <= 0) break; received += size_t(bytes); }
   int status = 0; pid_t waited = -1; do { waited = ::waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
-  if (waited != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0 || received != sizeof(receipt) || receipt.result != 0 || !mothershipTCXWitnessLinksValid(receipt.links))
+  // A receipt is usable only when it is either an exact retained pair or the
+  // interface-bound clean-absence sentinel.  The latter is deliberately not a
+  // zeroed record: it still binds this frozen proof to the original ifindex.
+  if (waited != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0 || received != sizeof(receipt) || receipt.result != 0 ||
+      !mothershipTCXWitnessLinksAdmissible(receipt.links))
     return reject("exact primary TCX retention failed");
   if (!mothershipVDCProcessMatches(process) || !mothershipLocalNamespacesMatch(process) || !mothershipFrozenServiceCgroup(process))
     return reject("frozen service identity changed during TCX retention");
@@ -4392,6 +4455,7 @@ static bool mothershipCaptureFrozenServicePrimaryTCX(const MothershipVDCProcessI
 
 static bool mothershipVerifyReplacementServicePrimaryTCX(const MothershipFrozenServiceTCXWitness& witness,
                                                          const MothershipVDCProcessIdentity& replacement,
+                                                         MothershipTCXWitnessVerificationStage stage,
                                                          String *failure)
 {
   auto reject = [&](const char *message) { if (failure) failure->assign(message); return false; };
@@ -4406,7 +4470,21 @@ static bool mothershipVerifyReplacementServicePrimaryTCX(const MothershipFrozenS
       uint64_t(bpffs.st_ino) != witness.bpffsInode || !switchboardHostTCXValidBPFFSRoot("/sys/fs/bpf"_ctv))
     return reject("replacement service bpffs identity differs from frozen witness");
   const uint32_t ifindex = ::if_nametoindex(MothershipTidesMigration::str(witness.primaryInterface).c_str());
-  if (ifindex == 0 || witness.links[0].ifindex != ifindex || witness.links[1].ifindex != ifindex ||
+  if (ifindex == 0) return reject("replacement service primary interface differs from frozen witness");
+  if (mothershipTCXWitnessLinksAbsent(witness.links))
+  {
+    const bool frozenAbsence = stage == MothershipTCXWitnessVerificationStage::frozenEvidence &&
+        switchboardHostTCXPairCleanlyAbsent(ifindex, "/sys/fs/bpf"_ctv);
+    const bool currentCanonicalPair = stage == MothershipTCXWitnessVerificationStage::activeTarget &&
+        mothershipTCXCurrentCanonicalPairValid(ifindex);
+    if (witness.links[0].ifindex != ifindex || witness.links[1].ifindex != ifindex ||
+        !mothershipTCXWitnessLinksStageValid(witness.links, stage, frozenAbsence, currentCanonicalPair))
+      return reject(stage == MothershipTCXWitnessVerificationStage::activeTarget ?
+          "replacement service primary TCX target pair differs from frozen absence witness" :
+          "replacement service primary TCX absence differs from frozen witness");
+    if (failure) failure->clear(); return true;
+  }
+  if (!mothershipTCXWitnessLinksValid(witness.links) || witness.links[0].ifindex != ifindex || witness.links[1].ifindex != ifindex ||
       witness.links[0].attachType != uint32_t(BPF_TCX_INGRESS) || witness.links[1].attachType != uint32_t(BPF_TCX_EGRESS))
     return reject("replacement service primary interface differs from frozen witness");
   SwitchboardHostTCXRetentionPair pair = {};
@@ -6069,9 +6147,12 @@ static bool mothershipRemoteRuntimeRecoveryLocal(const String& root, const Strin
     require(prodigyIsSHA256HexDigest(proof.stateSHA256) && prodigyIsSHA256HexDigest(proof.secretsSHA256) &&
             prodigyIsSHA256HexDigest(proof.snapshotSHA256) && proof.authorityGeneration>=request.cohort.authorityGeneration &&
             proof.network.bootID==member->bootID && proof.network.process.pid==member->sourceProcessPID &&
-            proof.network.process.startTime==member->sourceProcessStartTicks,
+            proof.network.process.startTime==member->sourceProcessStartTicks &&
+            mothershipTCXWitnessLinksAdmissible(proof.network.links),
             "runtime recovery stopped proof identity differs");
-    require(mothershipVerifyReplacementServicePrimaryTCX(proof.network,inspector,failure),"runtime recovery retained kernel identity differs");
+    require(mothershipVerifyReplacementServicePrimaryTCX(proof.network,inspector,
+            active ? MothershipTCXWitnessVerificationStage::activeTarget : MothershipTCXWitnessVerificationStage::frozenEvidence,
+            failure),"runtime recovery retained kernel identity differs");
     if (capture) require(mothershipVDCProcessMatches(proof.network.process) && mothershipFrozenServiceCgroup(proof.network.process),
                         "runtime recovery source thawed or changed");
     const auto originalState=fs::exists(fs::path(str(root))/"source.state")?text(str(root)+"/source.state"):String("/var/lib/prodigy/state"_ctv);

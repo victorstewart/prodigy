@@ -299,8 +299,16 @@ int main(int argc, char **argv)
   bool present = true;
   suite.expect(switchboardHostTCXReadRetainedPair(pair.host, "/sys/fs/bpf"_ctv, retained, present) && present == false,
                "host_tcx_retention_admits_cold_missing_pins");
+  suite.expect(switchboardHostTCXPairCleanlyAbsent(pair.host.ifidx, "/sys/fs/bpf"_ctv),
+               "host_tcx_retention_accepts_cleanly_absent_primary_pair");
+  // A failed attach-point query is not absence.  UINT32_MAX cannot name this
+  // private veth and reaches the read-only kernel query after the pin checks.
+  suite.expect(!switchboardHostTCXPairCleanlyAbsent(uint32_t(-1), "/sys/fs/bpf"_ctv),
+               "host_tcx_retention_rejects_unqueryable_interface_as_absent");
   suite.expect(attachHostRouters(pair.host, ingressObjectPath, egressObjectPath), "host_tcx_retention_attaches_real_host_pair");
   if (suite.failed != 0) return 1;
+  suite.expect(!switchboardHostTCXPairCleanlyAbsent(pair.host.ifidx, "/sys/fs/bpf"_ctv),
+               "host_tcx_retention_rejects_live_unretained_pair_as_absent");
 
   String ingressPin = {};
   switchboardHostTCXRetentionPath(ingressPin, "/sys/fs/bpf"_ctv, pair.host.ifidx, SwitchboardHostTCXDirection::ingress);
@@ -322,6 +330,8 @@ int main(int argc, char **argv)
 
   suite.expect(switchboardHostTCXRetainCurrentPair(pair.host, "/sys/fs/bpf"_ctv, retained),
                "host_tcx_retention_retains_exact_live_pair");
+  suite.expect(!switchboardHostTCXPairCleanlyAbsent(pair.host.ifidx, "/sys/fs/bpf"_ctv),
+               "host_tcx_retention_rejects_complete_retained_pair_as_absent");
   suite.expect(switchboardHostTCXVerifyRetainedPair(pair.host, "/sys/fs/bpf"_ctv, retained),
                "host_tcx_retention_verifies_exact_live_pair");
 
@@ -469,15 +479,41 @@ int main(int argc, char **argv)
 
   suite.expect(switchboardHostTCXReleaseExact("/sys/fs/bpf"_ctv, retained.ingress),
                "host_tcx_retention_releases_exact_ingress_pin");
+  suite.expect(!switchboardHostTCXPairCleanlyAbsent(pair.host.ifidx, "/sys/fs/bpf"_ctv),
+               "host_tcx_retention_rejects_partial_retention_pin_as_absent");
   suite.expect(switchboardHostTCXReleaseExact("/sys/fs/bpf"_ctv, retained.egress),
                "host_tcx_retention_releases_exact_egress_pin");
   present = true;
   suite.expect(switchboardHostTCXReadRetainedPair(pair.host, "/sys/fs/bpf"_ctv, retained, present) && present == false,
                "host_tcx_retention_release_restores_cold_state");
+
+  // Preserve private map FDs only long enough to construct the two partial
+  // states below.  Neither state may be mistaken for a clean absent pair.
+  String flowPin = {}, pendingPin = {};
+  switchboardHostTCXMapPinPath(flowPin, "/sys/fs/bpf"_ctv, pair.host.ifidx, false);
+  switchboardHostTCXMapPinPath(pendingPin, "/sys/fs/bpf"_ctv, pair.host.ifidx, true);
+  const int flowFD = bpf_obj_get(flowPin.c_str());
+  const int pendingFD = bpf_obj_get(pendingPin.c_str());
+  suite.expect(flowFD >= 0 && pendingFD >= 0,
+               "host_tcx_retention_opens_authoritative_maps_for_partial_absence_cases");
   pair.host.detachBPF(BPF_TCX_INGRESS);
+  suite.expect(!switchboardHostTCXPairCleanlyAbsent(pair.host.ifidx, "/sys/fs/bpf"_ctv),
+               "host_tcx_retention_rejects_egress_only_live_direction_as_absent");
   pair.host.detachBPF(BPF_TCX_EGRESS);
   suite.expect(BPFProgram::openTCXIdentity(pair.host.ifidx, BPF_TCX_INGRESS, retained.ingress.programID, borrowed) == false,
                "host_tcx_retention_explicit_detach_removes_live_ingress_link");
+  const bool mapPinsRemoved = (::unlink(flowPin.c_str()) == 0 || errno == ENOENT) &&
+                              (::unlink(pendingPin.c_str()) == 0 || errno == ENOENT);
+  suite.expect(mapPinsRemoved && flowFD >= 0 && pendingFD >= 0 &&
+               bpf_obj_pin(flowFD, flowPin.c_str()) == 0 && bpf_obj_pin(pendingFD, pendingPin.c_str()) == 0,
+               "host_tcx_retention_constructs_map_only_partial_absence_state");
+  suite.expect(!switchboardHostTCXPairCleanlyAbsent(pair.host.ifidx, "/sys/fs/bpf"_ctv),
+               "host_tcx_retention_rejects_map_only_state_as_absent");
+  suite.expect(::unlink(flowPin.c_str()) == 0 && ::unlink(pendingPin.c_str()) == 0 &&
+               switchboardHostTCXPairCleanlyAbsent(pair.host.ifidx, "/sys/fs/bpf"_ctv),
+               "host_tcx_retention_accepts_only_complete_interface_bound_absence");
+  if (flowFD >= 0) ::close(flowFD);
+  if (pendingFD >= 0) ::close(pendingFD);
 
   (void)testCrashRetainsAndNewNeuronAdopts(suite, ingressObjectPath, egressObjectPath);
 
