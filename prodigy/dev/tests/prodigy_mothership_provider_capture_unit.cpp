@@ -76,6 +76,25 @@ int main()
     failed += condition ? 0 : 1;
   };
 
+  {
+    MothershipRuntimeRecoveryPreparedSeal seal={};
+    seal.requestSHA256.assign(std::string(64,'a').c_str());
+    seal.witnessesSHA256.assign(std::string(64,'b').c_str());
+    seal.preparedSnapshotSHA256.assign(std::string(64,'c').c_str());
+    seal.stateSHA256.assign(std::string(64,'d').c_str());
+    seal.secretsSHA256.assign(std::string(64,'e').c_str());
+    expect(mothershipRuntimeRecoveryPreparedSealMatches(seal,seal.requestSHA256,seal.witnessesSHA256),
+           "activation successor accepts exact prepared witness seal");
+    String alteredWitnesses={}; alteredWitnesses.assign(std::string(64,'f').c_str());
+    expect(!mothershipRuntimeRecoveryPreparedSealMatches(seal,seal.requestSHA256,alteredWitnesses),
+           "activation successor rejects altered bootstrap bytes through exact witness seal");
+    expect(!mothershipRuntimeRecoveryPreparedSealMatches(seal,alteredWitnesses,seal.witnessesSHA256),
+           "activation successor rejects foreign startup request seal");
+    seal.preparedSnapshotSHA256.clear();
+    expect(!mothershipRuntimeRecoveryPreparedSealMatches(seal,seal.requestSHA256,seal.witnessesSHA256),
+           "activation successor rejects incomplete prepared authority seal");
+  }
+
   // The low-level provider collector appends chunks. The recovery inspector
   // owns a fresh observation even if its caller reuses an earlier SHA buffer.
   {

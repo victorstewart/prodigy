@@ -1018,6 +1018,18 @@ int main(void)
     report.activeDeploymentCount = 1;
     suite.expect(!Mothership::unitTestActiveWorkloadInterruptionAccepted(nullptr, report, true),
                  "upgrade_unregistered_cluster_cannot_accept_active_workload_interruption");
+    cluster.deploymentMode = MothershipClusterDeploymentMode::test;
+    suite.expect(!Mothership::unitTestActiveWorkloadInterruptionAccepted(&cluster,report,true),
+                 "upgrade_test_requires_registered_test_configuration");
+    cluster.test.specified = true;
+    suite.expect(!Mothership::unitTestActiveWorkloadInterruptionAccepted(&cluster,report,false),
+                 "upgrade_test_requires_explicit_interruption_acceptance");
+    suite.expect(Mothership::unitTestActiveWorkloadInterruptionAccepted(&cluster,report,true),
+                 "upgrade_test_registered_active_workload_interruption_accepted");
+    report.clusterUUID += 1;
+    suite.expect(!Mothership::unitTestActiveWorkloadInterruptionAccepted(&cluster,report,true),
+                 "upgrade_test_foreign_cluster_interruption_rejected");
+    report.clusterUUID = cluster.clusterUUID;
     report.activeDeploymentCount = 0;
     cluster.deploymentMode = MothershipClusterDeploymentMode::remote;
     suite.expect(Mothership::unitTestNoManagedPublicWorkloads(&cluster, report),

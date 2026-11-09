@@ -134,4 +134,24 @@ string(REPLACE "\"wire\": \"compatible\"" "\"wire\": \"incompatible\"" NEW_CLUST
 file(WRITE "${WORK}/new-cluster.json" "${NEW_CLUSTER}")
 run_generator(new_cluster "${WORK}/new-cluster.json" TRUE)
 
+string(REPLACE "same-cluster-rollout" "same-cluster-cohort-recovery" COHORT_RECOVERY "${POLICY_TEXT}")
+string(REPLACE "\"wire\": \"compatible\"" "\"wire\": \"incompatible\"" COHORT_RECOVERY "${COHORT_RECOVERY}")
+file(WRITE "${WORK}/cohort-recovery.json" "${COHORT_RECOVERY}")
+run_generator(cohort_recovery "${WORK}/cohort-recovery.json" TRUE)
+file(READ "${cohort_recovery_OUTPUT}" COHORT_RECOVERY_CONTRACT)
+string(JSON COHORT_RECOVERY_DISPOSITION GET "${COHORT_RECOVERY_CONTRACT}" disposition)
+string(JSON COHORT_RECOVERY_WIRE GET "${COHORT_RECOVERY_CONTRACT}" compatibility wire)
+if (NOT COHORT_RECOVERY_DISPOSITION STREQUAL "same-cluster-cohort-recovery" OR
+    NOT COHORT_RECOVERY_WIRE STREQUAL "incompatible")
+   message(FATAL_ERROR "cohort recovery producer contract does not preserve the qualified wire-incompatible disposition")
+endif()
+
+string(REPLACE "\"minimumHealthyBrains\": 3" "\"minimumHealthyBrains\": 2" COHORT_TOO_FEW "${COHORT_RECOVERY}")
+file(WRITE "${WORK}/cohort-too-few-brains.json" "${COHORT_TOO_FEW}")
+run_generator(cohort_too_few_brains "${WORK}/cohort-too-few-brains.json" FALSE)
+
+string(REPLACE "\"authorityState\": \"compatible\"" "\"authorityState\": \"incompatible\"" COHORT_BAD_AUTHORITY "${COHORT_RECOVERY}")
+file(WRITE "${WORK}/cohort-bad-authority.json" "${COHORT_BAD_AUTHORITY}")
+run_generator(cohort_bad_authority "${WORK}/cohort-bad-authority.json" FALSE)
+
 file(REMOVE_RECURSE "${WORK}")

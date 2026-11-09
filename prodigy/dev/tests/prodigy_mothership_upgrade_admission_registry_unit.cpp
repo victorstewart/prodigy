@@ -137,7 +137,9 @@ int main(void)
   MothershipUpgradeAdmissionRecord recorded = {};
   bool resumed = false;
   String failure = {};
-  assert(registry.recordUpgradeAdmission(request, recorded, resumed, &failure));
+  if (!registry.recordUpgradeAdmission(request, recorded, resumed, &failure)) {
+    std::fprintf(stderr,"initial upgrade admission failure: %s\n",failure.c_str()); assert(false);
+  }
   assert(!resumed && recorded.firstStopGate == request.firstStopGate);
   assert(registry.recordUpgradeAdmission(request, recorded, resumed, &failure));
   assert(resumed);
@@ -260,9 +262,10 @@ int main(void)
       candidate.members[index].phaseReceipts.push_back(std::move(receipt));
     }
   };
-  const auto makeWithdrawableRecovery = [&](uint128_t operationID) {
+  const auto makeWithdrawableRecovery = [&](uint128_t operationID, MothershipUpgradePath path = MothershipUpgradePath::sameLogicalRollout) {
     auto admission = expectedEligibleAdmission;
     admission.operationID = operationID;
+    admission.approvedPath = uint8_t(path);
     assert(registry.recordUpgradeAdmission(admission, recorded, resumed, &failure));
     String bytes = {}, sha256 = {};
     auto copy = admission;
@@ -273,6 +276,9 @@ int main(void)
     cohort.admissionRecordSHA256 = sha256;
     return cohort;
   };
+  auto cohortOnlyAdmission = makeWithdrawableRecovery(uint128_t(0xD1F), MothershipUpgradePath::sameLogicalCohortRecovery);
+  assert(registry.admitRemoteRuntimeRecoveryCohort(cohortOnlyAdmission,remote,recoveryStored,resumed,&failure));
+  assert(registry.withdrawRemoteRuntimeRecoveryCohort(remote.clusterUUID,cohortOnlyAdmission.operationID,recoveryStored,&failure));
   auto withdrawnAtAdmission = makeWithdrawableRecovery(uint128_t(0xD20));
   assert(registry.admitRemoteRuntimeRecoveryCohort(withdrawnAtAdmission, remote, recoveryStored, resumed, &failure));
   assert(!resumed);
@@ -493,6 +499,125 @@ int main(void)
   assert(resumed);
   assert(registry.remoteRuntimeRecoveryPending(remote.clusterUUID, recoveryPending, &failure));
   assert(!recoveryPending);
+
+  // Version-three handoffs preserve the old frozen semantics while carrying
+  // separate lineage bytes for the phase-six successor form.  In particular,
+  // those archived bytes are mandatory evidence, never a replacement for the
+  // child cohort's fresh member identities.
+  MothershipRemoteRuntimeRecoveryHandoffRecord activatedShape = {};
+  activatedShape.version = 3;
+  activatedShape.clusterUUID = remote.clusterUUID;
+  activatedShape.parentOperationID = uint128_t(0xd2f0);
+  activatedShape.childOperationID = uint128_t(0xd2f1);
+  activatedShape.parentCohortSHA256 = digest('a');
+  activatedShape.childAdmissionSHA256 = digest('b');
+  activatedShape.childCohortSHA256 = digest('c');
+  activatedShape.parentTopology = remote.topology;
+  activatedShape.declaredTopology = remote.topology;
+  activatedShape.observedTopology = remote.topology;
+  activatedShape.restorationReceiptSHA256 = {digest('1'),digest('2'),digest('3')};
+  activatedShape.kind = MothershipRemoteRuntimeRecoveryHandoffRecord::Kind::activationStarted;
+  activatedShape.parentRequestSHA256 = digest('d');
+  activatedShape.parentStartupRequestSHA256 = digest('e');
+  activatedShape.parentStartupWitnessesSHA256 = digest('f');
+  assert(MothershipClusterRegistry::remoteRuntimeRecoveryHandoffValid(activatedShape));
+  auto missingActivatedLineage = activatedShape;
+  missingActivatedLineage.parentStartupWitnessesSHA256.clear();
+  assert(!MothershipClusterRegistry::remoteRuntimeRecoveryHandoffValid(missingActivatedLineage));
+  auto malformedActivatedKind = activatedShape;
+  malformedActivatedKind.kind = MothershipRemoteRuntimeRecoveryHandoffRecord::Kind(7);
+  assert(!MothershipClusterRegistry::remoteRuntimeRecoveryHandoffValid(malformedActivatedKind));
+  auto frozenWithActivatedBytes = activatedShape;
+  frozenWithActivatedBytes.kind = MothershipRemoteRuntimeRecoveryHandoffRecord::Kind::frozenBeforeInstallation;
+  assert(!MothershipClusterRegistry::remoteRuntimeRecoveryHandoffValid(frozenWithActivatedBytes));
+
+  // A phase-six successor is deliberately not an ordinary update admission:
+  // its authority is the sealed installed parent plus the new exact cohort.
+  // Exercise the complete registry path so a later refactor cannot silently
+  // reintroduce the ordinary-admission dependency.
+  auto activeParent = makeWithdrawableRecovery(uint128_t(0xd2f0));
+  String activeTopologyBytes = {}, activeTopologySHA = {};
+  auto activeTopology = remote.topology;
+  assert(BitseryEngine::serialize(activeTopologyBytes, activeTopology));
+  assert(prodigyComputeSHA256Hex(activeTopologyBytes, activeTopologySHA));
+  activeParent.topologySHA256 = activeTopologySHA;
+  assert(registry.admitRemoteRuntimeRecoveryCohort(activeParent, remote, recoveryStored, resumed, &failure));
+  activeParent = recoveryStored;
+  activeParent.phase=MothershipRemoteRuntimeRecoveryPhase::staged; addPhaseReceipts(activeParent);
+  assert(registry.advanceRemoteRuntimeRecoveryCohort(activeParent,activeParent.phase,recoveryStored,resumed,&failure)); activeParent=recoveryStored;
+  activeParent.phase=MothershipRemoteRuntimeRecoveryPhase::fenced; addPhaseReceipts(activeParent);
+  assert(registry.advanceRemoteRuntimeRecoveryCohort(activeParent,activeParent.phase,recoveryStored,resumed,&failure)); activeParent=recoveryStored;
+  activeParent.phase=MothershipRemoteRuntimeRecoveryPhase::frozen; addPhaseReceipts(activeParent);
+  for(uint32_t index=0;index<activeParent.members.size();++index) { activeParent.members[index].stateSHA256=digest(char('a'+index)); activeParent.members[index].secretsSHA256=digest(char('d'+index)); activeParent.members[index].containerInventorySHA256=digest(char('1'+index)); activeParent.members[index].privateLoaderSHA256=digest(char('4'+index)); activeParent.members[index].retainedNetworkSHA256=digest(char('7'+index)); }
+  assert(registry.advanceRemoteRuntimeRecoveryCohort(activeParent,activeParent.phase,recoveryStored,resumed,&failure)); activeParent=recoveryStored;
+  activeParent.phase=MothershipRemoteRuntimeRecoveryPhase::quiesced; addPhaseReceipts(activeParent);
+  assert(registry.advanceRemoteRuntimeRecoveryCohort(activeParent,activeParent.phase,recoveryStored,resumed,&failure)); activeParent=recoveryStored;
+  activeParent.phase=MothershipRemoteRuntimeRecoveryPhase::installed; addPhaseReceipts(activeParent);
+  for(auto& member:activeParent.members) member.targetRuntimeInstalled=true;
+  assert(registry.advanceRemoteRuntimeRecoveryCohort(activeParent,activeParent.phase,recoveryStored,resumed,&failure)); activeParent=recoveryStored;
+  activeParent.phase=MothershipRemoteRuntimeRecoveryPhase::activationStarted; addPhaseReceipts(activeParent);
+  assert(registry.advanceRemoteRuntimeRecoveryCohort(activeParent,activeParent.phase,recoveryStored,resumed,&failure)); activeParent=recoveryStored;
+  String activeParentBytes = {}, activeParentSHA = {};
+  auto activeParentCopy = recoveryStored;
+  assert(BitseryEngine::serialize(activeParentBytes, activeParentCopy));
+  assert(prodigyComputeSHA256Hex(activeParentBytes, activeParentSHA));
+  auto activeChild = activeParent;
+  activeChild.operationID = uint128_t(0xd2f1);
+  activeChild.phase = MothershipRemoteRuntimeRecoveryPhase::admitted;
+  activeChild.admissionRecordSHA256 = digest('9');
+  activeChild.sourceBundleSHA256 = activeParent.targetBundleSHA256;
+  activeChild.sourceContractSHA256 = activeParent.targetContractSHA256;
+  activeChild.sourceProdigySHA256 = activeParent.targetProdigySHA256;
+  activeChild.sourceMothershipSHA256 = activeParent.targetMothershipSHA256;
+  for (auto& member : activeChild.members) {
+    member.bootID = "00000000-0000-4000-8000-0000000000aa"_ctv;
+    member.sourceProcessPID += 7000; member.sourceProcessStartTicks += 7000;
+    member.stateSHA256.clear(); member.secretsSHA256.clear(); member.containerInventorySHA256.clear();
+    member.privateLoaderSHA256.clear(); member.retainedNetworkSHA256.clear(); member.targetRuntimeInstalled=false; member.phaseReceipts.clear();
+  }
+  String activeChildSHA = {};
+  assert(MothershipClusterRegistry::remoteRuntimeRecoveryActivationBindingDigest(activeParent, activeChild, activeChild.admissionRecordSHA256));
+  assert(MothershipClusterRegistry::remoteRuntimeRecoveryInitialCohortDigest(activeChild, activeChildSHA));
+  auto activeHandoff = activatedShape;
+  activeHandoff.clusterUUID=remote.clusterUUID; activeHandoff.parentOperationID=activeParent.operationID;
+  activeHandoff.childOperationID=activeChild.operationID; activeHandoff.parentCohortSHA256=activeParentSHA;
+  activeHandoff.childAdmissionSHA256=activeChild.admissionRecordSHA256; activeHandoff.childCohortSHA256=activeChildSHA;
+  activeHandoff.parentTopology=remote.topology; activeHandoff.declaredTopology=remote.topology; activeHandoff.observedTopology=remote.topology;
+  MothershipRemoteRuntimeRecoveryHandoffRecord activeStored = {};
+  assert(registry.admitRemoteRuntimeRecoveryHandoff(activeHandoff, remote, activeChild, activeStored, recoveryStored, resumed, &failure));
+  assert(!resumed && recoveryStored.operationID==activeChild.operationID);
+  bool activeSuperseded=false;
+  assert(registry.remoteRuntimeRecoveryParentSuperseded(activeParent,activeSuperseded,&failure) && activeSuperseded);
+  MothershipRemoteRuntimeRecoveryCohortRecord loadedParent={};
+  assert(registry.loadRemoteRuntimeRecoveryCohort(remote.clusterUUID,activeParent.operationID,loadedParent,&failure));
+  String loadedParentBytes={}; assert(BitseryEngine::serialize(loadedParentBytes,loadedParent)); assert(loadedParentBytes==activeParentBytes);
+  assert(registry.admitRemoteRuntimeRecoveryHandoff(activeHandoff, remote, activeChild, activeStored, recoveryStored, resumed, &failure) && resumed);
+  auto forgedActiveBinding=activeChild; forgedActiveBinding.admissionRecordSHA256=digest('9');
+  auto forgedActiveHandoff=activeHandoff; forgedActiveHandoff.childAdmissionSHA256=forgedActiveBinding.admissionRecordSHA256;
+  assert(MothershipClusterRegistry::remoteRuntimeRecoveryInitialCohortDigest(forgedActiveBinding,forgedActiveHandoff.childCohortSHA256));
+  assert(!registry.validateRemoteRuntimeRecoveryHandoff(forgedActiveHandoff,remote,forgedActiveBinding,&failure));
+  auto wrongActiveDigest=activeHandoff; wrongActiveDigest.parentCohortSHA256=digest('8');
+  assert(!registry.validateRemoteRuntimeRecoveryHandoff(wrongActiveDigest,remote,activeChild,&failure));
+  auto wrongActiveMember=activeChild; wrongActiveMember.members[0].linuxMachineID.assign("000000000000000000000000000000ff"_ctv);
+  assert(!registry.validateRemoteRuntimeRecoveryHandoff(activeHandoff,remote,wrongActiveMember,&failure));
+  auto wrongActiveArtifact=activeChild; wrongActiveArtifact.sourceProdigySHA256=digest('8');
+  assert(!registry.validateRemoteRuntimeRecoveryHandoff(activeHandoff,remote,wrongActiveArtifact,&failure));
+  auto secondActiveChild=activeHandoff; secondActiveChild.childOperationID=uint128_t(0xd2f2);
+  assert(!registry.validateRemoteRuntimeRecoveryHandoff(secondActiveChild,remote,activeChild,&failure));
+  auto activeTransition=recoveryStored; activeTransition.phase=MothershipRemoteRuntimeRecoveryPhase::staged;
+  addPhaseReceipts(activeTransition);
+  assert(registry.advanceRemoteRuntimeRecoveryCohort(activeTransition,activeTransition.phase,recoveryStored,resumed,&failure));
+  for (const auto nextPhase : {MothershipRemoteRuntimeRecoveryPhase::fenced, MothershipRemoteRuntimeRecoveryPhase::frozen,
+                               MothershipRemoteRuntimeRecoveryPhase::quiesced, MothershipRemoteRuntimeRecoveryPhase::installed,
+                               MothershipRemoteRuntimeRecoveryPhase::activationStarted, MothershipRemoteRuntimeRecoveryPhase::completed}) {
+    auto next=recoveryStored; next.phase=nextPhase; addPhaseReceipts(next);
+    if (nextPhase==MothershipRemoteRuntimeRecoveryPhase::frozen) for(uint32_t index=0;index<next.members.size();++index) { next.members[index].stateSHA256=digest(char('a'+index)); next.members[index].secretsSHA256=digest(char('d'+index)); next.members[index].containerInventorySHA256=digest(char('1'+index)); next.members[index].privateLoaderSHA256=digest(char('4'+index)); next.members[index].retainedNetworkSHA256=digest(char('7'+index)); }
+    if (nextPhase==MothershipRemoteRuntimeRecoveryPhase::installed) for(auto& member:next.members) member.targetRuntimeInstalled=true;
+    assert(registry.advanceRemoteRuntimeRecoveryCohort(next,nextPhase,recoveryStored,resumed,&failure));
+  }
+  assert(registry.remoteRuntimeRecoveryPending(remote.clusterUUID,recoveryPending,&failure) && !recoveryPending);
+  assert(registry.loadRemoteRuntimeRecoveryCohort(remote.clusterUUID,activeParent.operationID,loadedParent,&failure));
+  assert(BitseryEngine::serialize(loadedParentBytes,loadedParent) && loadedParentBytes==activeParentBytes);
 
   // A frozen, never-installed cohort may hand off only to one newly admitted
   // child. The child retains the restored host/boot identities but records

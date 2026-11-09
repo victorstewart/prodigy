@@ -47,6 +47,18 @@ static String contractWithIdentityMode(const char *mode)
   return result;
 }
 
+static String cohortRecoveryContractJSON(void)
+{
+  const String valid = validContractJSON();
+  std::string bytes(reinterpret_cast<const char *>(valid.data()), valid.size());
+  bytes.replace(bytes.find("same-cluster-rollout"), std::strlen("same-cluster-rollout"), "same-cluster-cohort-recovery");
+  bytes.replace(bytes.find("\"wire\":\"compatible\""), std::strlen("\"wire\":\"compatible\""), "\"wire\":\"incompatible\"");
+  bytes.replace(bytes.find("\"minimumHealthyBrains\":2"), std::strlen("\"minimumHealthyBrains\":2"), "\"minimumHealthyBrains\":3");
+  String result = {};
+  result.assign(bytes.data(), bytes.size());
+  return result;
+}
+
 static String unsupportedContractJSON(void)
 {
   String json;
@@ -133,6 +145,22 @@ int main(void)
   suite.expect(mothershipParseUpgradeContract(unsupportedJSON, validEnvelope(unsupportedJSON), unsupported, &failure), "parse_unsupported_unknown_axes_empty_sources");
   suite.expect(!mothershipPlanUpgrade(unsupported, validInput()).eligible, "reject_unsupported_unknown_contract");
 
+  const String cohortJSON = cohortRecoveryContractJSON();
+  MothershipUpgradeContract cohort;
+  const MothershipUpgradeEnvelope cohortEnvelope = validEnvelope(cohortJSON);
+  suite.expect(mothershipParseUpgradeContract(cohortJSON, cohortEnvelope, cohort, &failure) &&
+                   cohort.disposition == MothershipUpgradeDisposition::sameClusterCohortRecovery &&
+                   cohort.compatibility.wire == MothershipUpgradeCompatibilityState::incompatible,
+               "parse_qualified_same_cluster_cohort_recovery_contract");
+  std::string insufficientCohortBytes(reinterpret_cast<const char *>(cohortJSON.data()), cohortJSON.size());
+  insufficientCohortBytes.replace(insufficientCohortBytes.find("\"minimumHealthyBrains\":3"),
+                                  std::strlen("\"minimumHealthyBrains\":3"), "\"minimumHealthyBrains\":2");
+  String insufficientCohort = {};
+  insufficientCohort.assign(insufficientCohortBytes.data(), insufficientCohortBytes.size());
+  MothershipUpgradeContract rejectedCohort;
+  suite.expect(!mothershipParseUpgradeContract(insufficientCohort, validEnvelope(insufficientCohort), rejectedCohort, &failure),
+               "reject_cohort_recovery_contract_without_three_brains");
+
   MothershipUpgradePlannerInput input = validInput();
   MothershipUpgradePlan plan = mothershipPlanUpgrade(contract, input);
   suite.expect(plan.eligible && plan.path == MothershipUpgradePath::sameLogicalRollout && prodigyIsSHA256HexDigest(plan.inputSHA256), "select_same_cluster_serial_rollout");
@@ -216,8 +244,43 @@ int main(void)
   approved.bundleSHA256 = envelope.approvedBundleSHA256;
   approved.envelope = envelope;
   approved.contract = contract;
-  MothershipUpgradeIdentity observedSource = contract.sources.front();
   String releaseFailure = {};
+
+  ProdigyApprovedUpgradeBundle cohortApproved = {};
+  cohortApproved.bundleSHA256 = cohortEnvelope.approvedBundleSHA256;
+  cohortApproved.envelope = cohortEnvelope;
+  suite.expect(mothershipParseUpgradeContract(cohortJSON, cohortEnvelope, cohortApproved.contract, &failure),
+               "reparse_cohort_recovery_contract_for_runtime_policy");
+  suite.expect(!prodigyValidateSameClusterUpgradeTarget(
+                   cohortApproved, "aarch64"_ctv, 17, &releaseFailure) &&
+                   releaseFailure == "approved target release requires same-cluster cohort recovery"_ctv,
+               "ordinary_same_cluster_target_rejects_cohort_only_disposition");
+  suite.expect(prodigyValidateRuntimeRecoveryTarget(
+                   cohortApproved, "aarch64"_ctv, 17, &releaseFailure) &&
+                   mothershipUpgradeDeclaredSource(cohortApproved.contract, cohortApproved.contract.sources.front()),
+               "runtime_recovery_target_accepts_exact_cohort_policy_and_external_source_binding");
+  cohortApproved.contract.compatibility.authorityState = MothershipUpgradeCompatibilityState::incompatible;
+  suite.expect(!prodigyValidateRuntimeRecoveryTarget(cohortApproved, "aarch64"_ctv, 17, &releaseFailure),
+               "runtime_recovery_target_rejects_incompatible_retained_authority_axis");
+  cohortApproved.contract.compatibility = cohort.compatibility;
+  MothershipUpgradePlannerInput cohortInput = validInput();
+  cohortInput.envelope = cohortEnvelope;
+  cohortInput.currentUpdaterSupportsSerialFollowers = false;
+  cohortInput.publicBaselineHealthy = false;
+  cohortInput.workloads.clear();
+  cohortInput.operatorAcceptedActiveWorkloadInterruption = true;
+  plan = mothershipPlanUpgrade(cohortApproved.contract, cohortInput);
+  suite.expect(plan.eligible && plan.path == MothershipUpgradePath::sameLogicalCohortRecovery &&
+                   plan.requiredPreconditions.size() == 2,
+               "select_same_logical_cohort_recovery_without_serial_updater_claim");
+  cohortInput.operatorAcceptedActiveWorkloadInterruption = false;
+  suite.expect(!mothershipPlanUpgrade(cohortApproved.contract, cohortInput).eligible,
+               "cohort_recovery_requires_explicit_active_workload_interruption_acceptance");
+  cohortInput.operatorAcceptedActiveWorkloadInterruption = true;
+  cohortInput.requestProviderRelocation = true;
+  suite.expect(!mothershipPlanUpgrade(cohortApproved.contract, cohortInput).eligible,
+               "cohort_recovery_rejects_provider_relocation_path");
+  MothershipUpgradeIdentity observedSource = contract.sources.front();
   suite.expect(prodigyValidateSameClusterUpgradeRelease(
                    approved, "aarch64"_ctv, 17, &observedSource, true, &releaseFailure),
                "validate_same_cluster_release_accepts_declared_complete_source");
@@ -261,6 +324,9 @@ int main(void)
   suite.expect(prodigyValidateRuntimeRecoveryDriver(approved,contract.mothershipSHA256,
                    observedSource,"aarch64"_ctv,17,&releaseFailure),
                "recovery_driver_accepts_exact_declared_target_and_executing_controller");
+  suite.expect(prodigyValidateRuntimeRecoveryDriver(cohortApproved, cohortApproved.contract.mothershipSHA256,
+                   cohortApproved.contract.sources.front(), "aarch64"_ctv, 17, &releaseFailure),
+               "recovery_driver_accepts_exact_declared_cohort_recovery_target");
   suite.expect(!prodigyValidateRuntimeRecoveryDriver(approved,observedSource.mothershipSHA256,
                    observedSource,"aarch64"_ctv,17,&releaseFailure),
                "recovery_driver_rejects_executable_outside_approved_bundle");

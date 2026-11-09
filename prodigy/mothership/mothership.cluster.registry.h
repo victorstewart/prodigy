@@ -743,13 +743,16 @@ static void serialize(S&& serializer, MothershipRemoteRuntimeRecoveryCohortRecor
   serializer.container(record.members, 3);
 }
 
-// Links one already-frozen, never-installed cohort to exactly one fresh
-// recovery admission.  The parent remains byte-for-byte intact: this record
-// records a source restoration and permits the child to use the current
-// observed topology only when it differs from the registered declaration by
-// logical rack labels alone.
+// Links one recovery cohort to exactly one fresh successor.  The original
+// frozen path remains deliberately narrow.  Version three adds a separately
+// named post-activation form: it is not a source restoration and therefore
+// must bind the parent's immutable request/startup evidence before a child can
+// capture a new, reboot-aware source cohort.  The parent is never rewritten.
 class MothershipRemoteRuntimeRecoveryHandoffRecord {
 public:
+  enum class Kind : uint8_t { frozenBeforeInstallation = 0, activationStarted = 1 };
+  // Preserve the existing frozen handoff wire form; activation recovery opts
+  // into version three explicitly.
   uint32_t version = 2;
   uint128_t clusterUUID = 0;
   uint128_t parentOperationID = 0;
@@ -761,6 +764,10 @@ public:
   ClusterTopology declaredTopology;
   ClusterTopology observedTopology;
   Vector<String> restorationReceiptSHA256;
+  Kind kind = Kind::frozenBeforeInstallation;
+  String parentRequestSHA256;
+  String parentStartupRequestSHA256;
+  String parentStartupWitnessesSHA256;
 };
 
 template <typename S>
@@ -777,6 +784,12 @@ static void serialize(S&& serializer, MothershipRemoteRuntimeRecoveryHandoffReco
   serializer.object(record.declaredTopology);
   serializer.object(record.observedTopology);
   serializer.container(record.restorationReceiptSHA256, 3);
+  if (record.version >= 3) {
+    serializer.value1b(record.kind);
+    serializer.text1b(record.parentRequestSHA256, 64);
+    serializer.text1b(record.parentStartupRequestSHA256, 64);
+    serializer.text1b(record.parentStartupWitnessesSHA256, 64);
+  }
 }
 
 // Private Mothership intent.  It is deliberately separate from a Brain's
@@ -4458,7 +4471,7 @@ public:
         !prodigyIsSHA256HexDigest(requested.semanticObservationSHA256) ||
         !prodigyIsSHA256HexDigest(requested.observationReportSHA256) ||
         !prodigyIsSHA256HexDigest(requested.plannerInputSHA256) ||
-        requested.approvedPath > 3 || (requested.eligible && requested.approvedPath == 0))
+        requested.approvedPath > uint8_t(MothershipUpgradePath::sameLogicalCohortRecovery) || (requested.eligible && requested.approvedPath == 0))
     {
       if (failure) failure->assign("upgrade admission record is invalid"_ctv);
       return false;
@@ -4757,7 +4770,7 @@ public:
 
   static bool remoteRuntimeRecoveryHandoffValid(const MothershipRemoteRuntimeRecoveryHandoffRecord& handoff)
   {
-    if ((handoff.version != 1 && handoff.version != 2) || handoff.clusterUUID == 0 || handoff.parentOperationID == 0 ||
+    if ((handoff.version != 1 && handoff.version != 2 && handoff.version != 3) || handoff.clusterUUID == 0 || handoff.parentOperationID == 0 ||
         handoff.childOperationID == 0 || handoff.parentOperationID == handoff.childOperationID ||
         !prodigyIsSHA256HexDigest(handoff.parentCohortSHA256) ||
         !prodigyIsSHA256HexDigest(handoff.childAdmissionSHA256) ||
@@ -4769,7 +4782,14 @@ public:
     {
       if (!prodigyIsSHA256HexDigest(handoff.restorationReceiptSHA256[index])) return false;
     }
-    return true;
+    if (handoff.version < 3) return true;
+    if (handoff.kind != MothershipRemoteRuntimeRecoveryHandoffRecord::Kind::frozenBeforeInstallation &&
+        handoff.kind != MothershipRemoteRuntimeRecoveryHandoffRecord::Kind::activationStarted) return false;
+    if (handoff.kind == MothershipRemoteRuntimeRecoveryHandoffRecord::Kind::frozenBeforeInstallation)
+      return handoff.parentRequestSHA256.empty() && handoff.parentStartupRequestSHA256.empty() && handoff.parentStartupWitnessesSHA256.empty();
+    return prodigyIsSHA256HexDigest(handoff.parentRequestSHA256) &&
+           prodigyIsSHA256HexDigest(handoff.parentStartupRequestSHA256) &&
+           prodigyIsSHA256HexDigest(handoff.parentStartupWitnessesSHA256);
   }
 
   static bool remoteRuntimeRecoveryInitialCohortDigest(
@@ -4785,6 +4805,24 @@ public:
     }
     String bytes = {};
     return BitseryEngine::serialize(bytes, initial) && prodigyComputeSHA256Hex(bytes, digest, failure);
+  }
+
+  // This digest authorizes only the stopped-cohort successor. It cannot be
+  // mistaken for a serialized ordinary upgrade admission. Bind the immutable
+  // parent and the child's initial identities, including its fresh boots.
+  static bool remoteRuntimeRecoveryActivationBindingDigest(
+      const MothershipRemoteRuntimeRecoveryCohortRecord& parent,
+      const MothershipRemoteRuntimeRecoveryCohortRecord& child,
+      String& digest, String *failure = nullptr)
+  {
+    auto parentCopy = parent, childCopy = child;
+    childCopy.admissionRecordSHA256.clear();
+    String parentBytes = {}, childDigest = {};
+    if (!BitseryEngine::serialize(parentBytes, parentCopy) ||
+        !remoteRuntimeRecoveryInitialCohortDigest(childCopy, childDigest, failure)) return false;
+    String binding = "prodigy-remote-runtime-activation-successor-v1"_ctv;
+    binding.append('\0'); binding.append(parentBytes); binding.append('\0'); binding.append(childDigest);
+    return prodigyComputeSHA256Hex(binding, digest, failure);
   }
 
   bool admitRemoteRuntimeRecoveryCohort(const MothershipRemoteRuntimeRecoveryCohortRecord& requested,
@@ -4824,7 +4862,8 @@ public:
     MothershipUpgradeAdmissionRecord admission = {};
     String admissionBytes = {}, admissionSHA256 = {};
     if (!loadUpgradeAdmission(requested.clusterUUID, requested.operationID, admission, failure) || !admission.eligible ||
-        admission.approvedPath != uint8_t(MothershipUpgradePath::sameLogicalRollout) ||
+        (admission.approvedPath != uint8_t(MothershipUpgradePath::sameLogicalRollout) &&
+         admission.approvedPath != uint8_t(MothershipUpgradePath::sameLogicalCohortRecovery)) ||
         admission.authorityGeneration != requested.authorityGeneration ||
         admission.sourceBundleSHA256 != requested.sourceBundleSHA256 ||
         admission.sourceContractSHA256 != requested.sourceContractSHA256 || admission.sourceProdigySHA256 != requested.sourceProdigySHA256 ||
@@ -4859,7 +4898,8 @@ public:
           !remoteRuntimeRecoveryTerminal(other.phase))
       {
         bool superseded = false;
-        if (other.phase == MothershipRemoteRuntimeRecoveryPhase::frozen &&
+        if ((other.phase == MothershipRemoteRuntimeRecoveryPhase::frozen ||
+             other.phase == MothershipRemoteRuntimeRecoveryPhase::activationStarted) &&
             !remoteRuntimeRecoveryParentSuperseded(other, superseded, failure)) return false;
         if (!superseded)
         { if (failure) failure->assign("remote runtime recovery has an unresolved overlapping cohort"_ctv); return false; }
@@ -4923,8 +4963,10 @@ public:
       const MothershipRemoteRuntimeRecoveryCohortRecord& parent, bool& superseded, String *failure = nullptr)
   {
     superseded = false;
-    if (!remoteRuntimeRecoveryCohortValid(parent) || parent.phase != MothershipRemoteRuntimeRecoveryPhase::frozen)
-    { if (failure) failure->assign("remote runtime recovery parent is not frozen"_ctv); return false; }
+    if (!remoteRuntimeRecoveryCohortValid(parent) ||
+        (parent.phase != MothershipRemoteRuntimeRecoveryPhase::frozen &&
+         parent.phase != MothershipRemoteRuntimeRecoveryPhase::activationStarted))
+    { if (failure) failure->assign("remote runtime recovery parent is not handoff-eligible"_ctv); return false; }
     String parentBytes = {}, parentSHA256 = {};
     auto parentCopy = parent;
     if (!BitseryEngine::serialize(parentBytes, parentCopy) || !prodigyComputeSHA256Hex(parentBytes, parentSHA256, failure)) return false;
@@ -4937,7 +4979,11 @@ public:
       return false;
     }
     MothershipRemoteRuntimeRecoveryHandoffRecord handoff = {};
+    const auto expectedKind = parent.phase == MothershipRemoteRuntimeRecoveryPhase::frozen ?
+        MothershipRemoteRuntimeRecoveryHandoffRecord::Kind::frozenBeforeInstallation :
+        MothershipRemoteRuntimeRecoveryHandoffRecord::Kind::activationStarted;
     if (!BitseryEngine::deserializeSafe(handoffBytes, handoff) || !remoteRuntimeRecoveryHandoffValid(handoff) ||
+        (handoff.version >= 3 && handoff.kind != expectedKind) ||
         handoff.clusterUUID != parent.clusterUUID || handoff.parentOperationID != parent.operationID ||
         handoff.parentCohortSHA256 != parentSHA256)
     { if (failure) failure->assign("remote runtime recovery parent handoff is invalid"_ctv); return false; }
@@ -4951,20 +4997,27 @@ public:
     auto observedTopology = handoff.observedTopology;
     MothershipUpgradeAdmissionRecord childAdmission = {};
     String childAdmissionBytes = {}, childAdmissionSHA256 = {};
+    const bool activatedParent = parent.phase == MothershipRemoteRuntimeRecoveryPhase::activationStarted;
     if (!BitseryEngine::serialize(parentTopologyBytes, parentTopology) || !prodigyComputeSHA256Hex(parentTopologyBytes, parentTopologySHA256, failure) ||
         !BitseryEngine::serialize(observedBytes, observedTopology) || !prodigyComputeSHA256Hex(observedBytes, observedSHA256, failure) ||
         parent.topologySHA256 != parentTopologySHA256 ||
         !remoteRuntimeRecoveryParentToDeclaredTopologyValid(parentTopology, declaredTopology) ||
         !remoteRuntimeRecoveryRackOnlyTopologyDriftValid(declaredTopology, observedTopology) ||
-        !loadUpgradeAdmission(parent.clusterUUID, handoff.childOperationID, childAdmission, failure) ||
-        !childAdmission.eligible || childAdmission.approvedPath != uint8_t(MothershipUpgradePath::sameLogicalRollout) ||
+        (!activatedParent && (!loadUpgradeAdmission(parent.clusterUUID, handoff.childOperationID, childAdmission, failure) ||
+        !childAdmission.eligible || (childAdmission.approvedPath != uint8_t(MothershipUpgradePath::sameLogicalRollout) &&
+         childAdmission.approvedPath != uint8_t(MothershipUpgradePath::sameLogicalCohortRecovery)) ||
         !BitseryEngine::serialize(childAdmissionBytes, childAdmission) ||
         !prodigyComputeSHA256Hex(childAdmissionBytes, childAdmissionSHA256, failure) ||
-        childAdmissionSHA256 != handoff.childAdmissionSHA256 || child.admissionRecordSHA256 != childAdmissionSHA256 ||
-        child.sourceBundleSHA256 != parent.sourceBundleSHA256 || child.sourceContractSHA256 != parent.sourceContractSHA256 ||
-        child.sourceProdigySHA256 != parent.sourceProdigySHA256 || child.sourceMothershipSHA256 != parent.sourceMothershipSHA256 ||
-        childAdmission.sourceBundleSHA256 != child.sourceBundleSHA256 || childAdmission.sourceContractSHA256 != child.sourceContractSHA256 ||
-        childAdmission.sourceProdigySHA256 != child.sourceProdigySHA256 || childAdmission.sourceMothershipSHA256 != child.sourceMothershipSHA256 ||
+        childAdmissionSHA256 != handoff.childAdmissionSHA256 || child.admissionRecordSHA256 != childAdmissionSHA256)) ||
+        (activatedParent && (!remoteRuntimeRecoveryActivationBindingDigest(parent, child, childAdmissionSHA256, failure) ||
+                             childAdmissionSHA256 != handoff.childAdmissionSHA256 ||
+                             child.admissionRecordSHA256 != childAdmissionSHA256)) ||
+        child.sourceBundleSHA256 != (parent.phase == MothershipRemoteRuntimeRecoveryPhase::frozen ? parent.sourceBundleSHA256 : parent.targetBundleSHA256) ||
+        child.sourceContractSHA256 != (parent.phase == MothershipRemoteRuntimeRecoveryPhase::frozen ? parent.sourceContractSHA256 : parent.targetContractSHA256) ||
+        child.sourceProdigySHA256 != (parent.phase == MothershipRemoteRuntimeRecoveryPhase::frozen ? parent.sourceProdigySHA256 : parent.targetProdigySHA256) ||
+        child.sourceMothershipSHA256 != (parent.phase == MothershipRemoteRuntimeRecoveryPhase::frozen ? parent.sourceMothershipSHA256 : parent.targetMothershipSHA256) ||
+        (!activatedParent && (childAdmission.sourceBundleSHA256 != child.sourceBundleSHA256 || childAdmission.sourceContractSHA256 != child.sourceContractSHA256 ||
+        childAdmission.sourceProdigySHA256 != child.sourceProdigySHA256 || childAdmission.sourceMothershipSHA256 != child.sourceMothershipSHA256)) ||
         child.topologySHA256 != observedSHA256 ||
         !remoteRuntimeRecoveryInitialCohortDigest(child, childSHA256, failure) || childSHA256 != handoff.childCohortSHA256 ||
         child.phase == MothershipRemoteRuntimeRecoveryPhase::withdrawnBeforeFence ||
@@ -4973,7 +5026,9 @@ public:
     for (uint32_t index = 0; index < parent.members.size(); ++index)
       if (parent.members[index].machineUUID != child.members[index].machineUUID ||
           parent.members[index].linuxMachineID != child.members[index].linuxMachineID ||
-          parent.members[index].bootID != child.members[index].bootID)
+          (parent.phase == MothershipRemoteRuntimeRecoveryPhase::frozen &&
+           (
+            parent.members[index].bootID != child.members[index].bootID)))
       { if (failure) failure->assign("remote runtime recovery child handoff source identity differs"_ctv); return false; }
     superseded = true;
     if (failure) failure->clear();
@@ -5006,9 +5061,16 @@ public:
       { if (failure) failure->assign("remote runtime recovery handoff child member order differs"_ctv); return false; }
     MothershipRemoteRuntimeRecoveryCohortRecord parent = {};
     if (!loadRemoteRuntimeRecoveryCohort(requested.clusterUUID, requested.parentOperationID, parent, failure) ||
-        parent.phase != MothershipRemoteRuntimeRecoveryPhase::frozen || !remoteRuntimeRecoveryAllProofsSealed(parent) ||
-        remoteRuntimeRecoveryAllMembersInstalled(parent))
-    { if (failure && failure->empty()) failure->assign("remote runtime recovery handoff parent is not frozen uninstalled evidence"_ctv); return false; }
+        !remoteRuntimeRecoveryAllProofsSealed(parent))
+    { if (failure && failure->empty()) failure->assign("remote runtime recovery handoff parent lacks sealed evidence"_ctv); return false; }
+    const bool frozenParent = parent.phase == MothershipRemoteRuntimeRecoveryPhase::frozen &&
+        !remoteRuntimeRecoveryAllMembersInstalled(parent);
+    const bool activatedParent = parent.phase == MothershipRemoteRuntimeRecoveryPhase::activationStarted &&
+        remoteRuntimeRecoveryAllMembersInstalled(parent) && requested.version >= 3 &&
+        requested.kind == MothershipRemoteRuntimeRecoveryHandoffRecord::Kind::activationStarted;
+    if ((!frozenParent && !activatedParent) ||
+        (frozenParent && requested.version >= 3 && requested.kind != MothershipRemoteRuntimeRecoveryHandoffRecord::Kind::frozenBeforeInstallation))
+    { if (failure) failure->assign("remote runtime recovery handoff parent phase is not eligible"_ctv); return false; }
     String parentBytes = {}, parentSHA256 = {};
     if (!BitseryEngine::serialize(parentTopologyBytes, parentTopology) ||
         !prodigyComputeSHA256Hex(parentTopologyBytes, parentTopologySHA256, failure)) return false;
@@ -5020,27 +5082,35 @@ public:
     { if (failure) failure->assign("remote runtime recovery handoff parent topology digest differs"_ctv); return false; }
     if (!remoteRuntimeRecoveryParentToDeclaredTopologyValid(parentTopology, declared))
     { if (failure) failure->assign("remote runtime recovery handoff parent-to-declared topology differs beyond version"_ctv); return false; }
-    if (parent.sourceBundleSHA256 != childRequested.sourceBundleSHA256 ||
-        parent.sourceContractSHA256 != childRequested.sourceContractSHA256 ||
-        parent.sourceProdigySHA256 != childRequested.sourceProdigySHA256 ||
-        parent.sourceMothershipSHA256 != childRequested.sourceMothershipSHA256)
+    if ((frozenParent && (parent.sourceBundleSHA256 != childRequested.sourceBundleSHA256 ||
+                          parent.sourceContractSHA256 != childRequested.sourceContractSHA256 ||
+                          parent.sourceProdigySHA256 != childRequested.sourceProdigySHA256 ||
+                          parent.sourceMothershipSHA256 != childRequested.sourceMothershipSHA256)) ||
+        (activatedParent && (parent.targetBundleSHA256 != childRequested.sourceBundleSHA256 ||
+                             parent.targetContractSHA256 != childRequested.sourceContractSHA256 ||
+                             parent.targetProdigySHA256 != childRequested.sourceProdigySHA256 ||
+                             parent.targetMothershipSHA256 != childRequested.sourceMothershipSHA256)))
     { if (failure) failure->assign("remote runtime recovery handoff parent source artifact differs"_ctv); return false; }
     for (uint32_t index = 0; index < parent.members.size(); ++index)
       if (parent.members[index].machineUUID != childRequested.members[index].machineUUID ||
           parent.members[index].linuxMachineID != childRequested.members[index].linuxMachineID ||
-          parent.members[index].bootID != childRequested.members[index].bootID)
+          (frozenParent && parent.members[index].bootID != childRequested.members[index].bootID))
       { if (failure) failure->assign("remote runtime recovery handoff source machine or boot changed"_ctv); return false; }
     MothershipUpgradeAdmissionRecord admission = {};
     String admissionBytes = {}, admissionSHA256 = {};
-    if (!loadUpgradeAdmission(requested.clusterUUID, requested.childOperationID, admission, failure) || !admission.eligible ||
-        admission.approvedPath != uint8_t(MothershipUpgradePath::sameLogicalRollout) ||
+    if ((!activatedParent && (!loadUpgradeAdmission(requested.clusterUUID, requested.childOperationID, admission, failure) || !admission.eligible ||
+        (admission.approvedPath != uint8_t(MothershipUpgradePath::sameLogicalRollout) &&
+         admission.approvedPath != uint8_t(MothershipUpgradePath::sameLogicalCohortRecovery)) ||
         admission.authorityGeneration != childRequested.authorityGeneration ||
         admission.sourceBundleSHA256 != childRequested.sourceBundleSHA256 ||
         admission.sourceContractSHA256 != childRequested.sourceContractSHA256 ||
         admission.sourceProdigySHA256 != childRequested.sourceProdigySHA256 || admission.sourceMothershipSHA256 != childRequested.sourceMothershipSHA256 ||
         admission.targetBundleSHA256 != childRequested.targetBundleSHA256 || admission.targetContractSHA256 != childRequested.targetContractSHA256 ||
         !BitseryEngine::serialize(admissionBytes, admission) || !prodigyComputeSHA256Hex(admissionBytes, admissionSHA256, failure) ||
-        admissionSHA256 != requested.childAdmissionSHA256 || childRequested.admissionRecordSHA256 != admissionSHA256)
+        admissionSHA256 != requested.childAdmissionSHA256 || childRequested.admissionRecordSHA256 != admissionSHA256)) ||
+        (activatedParent && (!remoteRuntimeRecoveryActivationBindingDigest(parent, childRequested, admissionSHA256, failure) ||
+                             admissionSHA256 != requested.childAdmissionSHA256 ||
+                             childRequested.admissionRecordSHA256 != admissionSHA256)))
     { if (failure && failure->empty()) failure->assign("remote runtime recovery handoff child admission differs"_ctv); return false; }
     String childSHA256 = {};
     if (!remoteRuntimeRecoveryInitialCohortDigest(childRequested, childSHA256, failure) || childSHA256 != requested.childCohortSHA256)
@@ -5053,6 +5123,11 @@ public:
       if (!BitseryEngine::deserializeSafe(bytes, other) || !remoteRuntimeRecoveryCohortValid(other))
       { if (failure) failure->assign("remote runtime recovery handoff encountered an invalid prior cohort"_ctv); return false; }
       if (other.clusterUUID != requested.clusterUUID || remoteRuntimeRecoveryTerminal(other.phase)) continue;
+      bool otherSuperseded = false;
+      if ((other.phase == MothershipRemoteRuntimeRecoveryPhase::frozen ||
+           other.phase == MothershipRemoteRuntimeRecoveryPhase::activationStarted) &&
+          !remoteRuntimeRecoveryParentSuperseded(other, otherSuperseded, failure)) return false;
+      if (otherSuperseded) continue;
       if (other.operationID != requested.parentOperationID && other.operationID != requested.childOperationID)
       { if (failure) failure->assign("remote runtime recovery handoff has an unresolved overlapping cohort"_ctv); return false; }
     }
@@ -5185,7 +5260,8 @@ public:
       if (record.clusterUUID == clusterUUID && !remoteRuntimeRecoveryTerminal(record.phase))
       {
         bool superseded = false;
-        if (record.phase == MothershipRemoteRuntimeRecoveryPhase::frozen &&
+        if ((record.phase == MothershipRemoteRuntimeRecoveryPhase::frozen ||
+             record.phase == MothershipRemoteRuntimeRecoveryPhase::activationStarted) &&
             !remoteRuntimeRecoveryParentSuperseded(record, superseded, failure)) return false;
         if (!superseded) pending = true;
       }
@@ -5342,7 +5418,8 @@ public:
     if (!loadRemoteRuntimeRecoveryCohort(candidate.clusterUUID, candidate.operationID, current, failure) ||
         !remoteRuntimeRecoveryIdentityMatches(current, candidate))
     { if (failure && failure->empty()) failure->assign("remote runtime recovery transition identity differs"_ctv); return false; }
-    if (current.phase == MothershipRemoteRuntimeRecoveryPhase::frozen)
+    if (current.phase == MothershipRemoteRuntimeRecoveryPhase::frozen ||
+        current.phase == MothershipRemoteRuntimeRecoveryPhase::activationStarted)
     {
       bool superseded = false;
       if (!remoteRuntimeRecoveryParentSuperseded(current, superseded, failure)) return false;

@@ -5788,6 +5788,15 @@ static bool mothershipRecoveryTreeDigest(const String& path, String& digest, Str
 // Read the live startup descriptor through its existing memfd owner.  A
 // container's persisted plan supplies only the compact wire's omitted CPU
 // fields; credentials and all transmitted fields come from the live process.
+static bool mothershipRuntimeRecoveryPreparedSealMatches(
+    const MothershipRuntimeRecoveryPreparedSeal& seal,const String& requestSHA256,const String& witnessesSHA256)
+{
+  return prodigyIsSHA256HexDigest(requestSHA256) && prodigyIsSHA256HexDigest(witnessesSHA256) &&
+      seal.requestSHA256==requestSHA256 && seal.witnessesSHA256==witnessesSHA256 &&
+      prodigyIsSHA256HexDigest(seal.preparedSnapshotSHA256) &&
+      prodigyIsSHA256HexDigest(seal.stateSHA256) && prodigyIsSHA256HexDigest(seal.secretsSHA256);
+}
+
 static bool mothershipRuntimeRecoveryReadCensus(
     const Vector<MothershipVDCApplicationIdentity>& applications,
     const ProdigyPersistentBrainSnapshot& snapshot, uint128_t machineUUID,
@@ -12405,10 +12414,11 @@ private:
         operatorAcceptedActiveWorkloadInterruption && registeredCluster != nullptr &&
         registeredCluster->clusterUUID == report.clusterUUID &&
         (registeredCluster->deploymentMode == MothershipClusterDeploymentMode::remote ||
-         registeredCluster->deploymentMode == MothershipClusterDeploymentMode::local) &&
+         registeredCluster->deploymentMode == MothershipClusterDeploymentMode::local ||
+         (registeredCluster->deploymentMode == MothershipClusterDeploymentMode::test && registeredCluster->test.specified)) &&
         report.activeDeploymentCount != 0;
     if (operatorAcceptedActiveWorkloadInterruption && !input.operatorAcceptedActiveWorkloadInterruption)
-      failure.assign("active-workload interruption acceptance requires an exact registered local or remote cluster with active deployments"_ctv);
+      failure.assign("active-workload interruption acceptance requires an exact registered cluster with active deployments"_ctv);
     input.overlapCapacityAvailable =
         (report.activeDeploymentCount == 0 || input.operatorAcceptedActiveWorkloadInterruption) &&
         report.stagingCapacityComplete && report.requiredStagingBytes == targetBundle.contract.requiredFreeBytes &&
@@ -13591,9 +13601,10 @@ private:
   // double systemd PID read prevents an admitted source identity from being
   // assembled across a restart, and its exact cgroup check binds the main
   // executable to the service cohort that later phases may freeze.
+  template<typename SourceIdentity>
   bool observeRemoteRuntimeRecoverySource(const MothershipProdigyCluster& cluster,
                                           uint128_t machineUUID, const String& runtimeRoot,
-                                          const MothershipUpgradeAdmissionRecord& admission,
+                                          const SourceIdentity& admission,
                                           MothershipRemoteRuntimeRecoveryMember& member,
                                           String& failure)
   {
@@ -13751,12 +13762,13 @@ REMOTE_RUNTIME
     String failure={}; MothershipRemoteRuntimeRecoveryCohortRecord record={};
     try {
       require(argc>=4 && std::strcmp(argv[3],"--accept-cohort-interruption")==0,
-              "usage: recoverRemoteClusterRuntime CLUSTER APPROVED_BUNDLE OPERATION_ID --accept-cohort-interruption [--check] [--driver-bundle APPROVED_CONTROLLER_BUNDLE] [--handoff-before-installation PARENT_OPERATION_ID]");
-      bool check=false; String driverInput={},parentText={}; uint128_t parentOperation=0;
+              "usage: recoverRemoteClusterRuntime CLUSTER APPROVED_BUNDLE OPERATION_ID --accept-cohort-interruption [--check] [--driver-bundle APPROVED_CONTROLLER_BUNDLE] [--handoff-before-installation PARENT_OPERATION_ID|--successor-after-activation PARENT_OPERATION_ID]");
+      bool check=false, activationSuccessor=false; String driverInput={},parentText={}; uint128_t parentOperation=0;
       for(int i=4;i<argc;++i) {
         if(std::strcmp(argv[i],"--check")==0 && !check) check=true;
         else if(std::strcmp(argv[i],"--driver-bundle")==0 && driverInput.empty() && i+1<argc) driverInput.assign(argv[++i]);
         else if(std::strcmp(argv[i],"--handoff-before-installation")==0 && parentText.empty() && i+1<argc) parentText.assign(argv[++i]);
+        else if(std::strcmp(argv[i],"--successor-after-activation")==0 && parentText.empty() && i+1<argc) { parentText.assign(argv[++i]); activationSuccessor=true; }
         else require(false,"invalid or repeated recovery controller option");
       }
       require(parentText.empty() || (prodigyParseCanonicalHex128(parentText,parentOperation) && parentOperation),"recovery parent operation ID invalid");
@@ -13777,6 +13789,8 @@ REMOTE_RUNTIME
               prodigyResolveBundleArtifactInput(bundleInput,architecture,bundlePath,&failure) &&
               prodigyApproveBundleUpgradeContract(bundlePath,approved,&failure) && approved.verifyRetainedSnapshot(&failure),
               "recovery target bundle approval failed");
+      require(approved.contract.minimumHealthyBrains <= cluster.nBrains && approved.contract.requiredFreeBytes != 0,
+              "recovery target quorum or capacity policy does not fit the registered cohort");
       String driverSHA={};
       require(prodigyComputeFileSHA256Hex("/proc/self/exe"_ctv,driverSHA,&failure),"recovery controller identity unavailable");
       if(driverInput.empty()) require(driverSHA==approved.contract.mothershipSHA256,
@@ -13796,11 +13810,28 @@ REMOTE_RUNTIME
       }
       MothershipUpgradeAdmissionRecord admission={};
       MothershipRemoteRuntimeRecoveryHandoffRecord handoff={};
+      MothershipRemoteRuntimeRecoveryCohortRecord activationParent={};
       bool recorded=false,handedOff=false;
       {
         auto registry=openClusterRegistry();
-        require(registry.loadUpgradeAdmission(cluster.clusterUUID,operation,admission,&failure) && admission.eligible &&
-                admission.approvedPath==uint8_t(MothershipUpgradePath::sameLogicalRollout) &&
+        if (activationSuccessor) {
+          require(parentOperation && registry.loadRemoteRuntimeRecoveryCohort(cluster.clusterUUID,parentOperation,activationParent,&failure) &&
+                  activationParent.phase==Phase::activationStarted &&
+                  MothershipClusterRegistry::remoteRuntimeRecoveryAllProofsSealed(activationParent) &&
+                  MothershipClusterRegistry::remoteRuntimeRecoveryAllMembersInstalled(activationParent),
+                  "post-activation successor requires an installed phase-six parent");
+          String architectureName = {}; architectureName.assign(machineCpuArchitectureName(architecture));
+          require(prodigyValidateRuntimeRecoveryTarget(approved, architectureName, cluster.clusterUUID, &failure),
+                  "post-activation successor release policy is unqualified");
+          bool declaredSource = false;
+          for (const auto& source : approved.contract.sources)
+            declaredSource |= source.contractSHA256 == activationParent.targetContractSHA256 &&
+                source.prodigySHA256 == activationParent.targetProdigySHA256 &&
+                source.mothershipSHA256 == activationParent.targetMothershipSHA256;
+          require(declaredSource, "post-activation successor policy does not name the installed parent release");
+        } else require(registry.loadUpgradeAdmission(cluster.clusterUUID,operation,admission,&failure) && admission.eligible &&
+                (admission.approvedPath==uint8_t(MothershipUpgradePath::sameLogicalRollout) ||
+                 admission.approvedPath==uint8_t(MothershipUpgradePath::sameLogicalCohortRecovery)) &&
                 admission.targetBundleSHA256==approved.bundleSHA256 && admission.targetContractSHA256==approved.contract.contractSHA256,
                 "recovery lacks exact eligible immutable upgrade admission");
         recorded=registry.loadRemoteRuntimeRecoveryCohort(cluster.clusterUUID,operation,record,&failure);
@@ -13814,9 +13845,10 @@ REMOTE_RUNTIME
                   registry.remoteRuntimeRecoveryParentSuperseded(parent,superseded,&failure) && superseded,
                   "recovery child lost its immutable parent handoff");
         }
-        if(recorded && record.phase==Phase::frozen) {bool superseded=false;require(registry.remoteRuntimeRecoveryParentSuperseded(record,superseded,&failure) && !superseded,"recovery operation was handed off; resume its recorded child");}
+        if(recorded && (record.phase==Phase::frozen || record.phase==Phase::activationStarted)) {bool superseded=false;require(registry.remoteRuntimeRecoveryParentSuperseded(record,superseded,&failure) && !superseded,"recovery operation was handed off; resume its recorded child");}
       }
       require(!handedOff || (parentOperation==handoff.parentOperationID &&
+              activationSuccessor==(handoff.version>=3 && handoff.kind==MothershipRemoteRuntimeRecoveryHandoffRecord::Kind::activationStarted) &&
               MothershipClusterRegistry::remoteRuntimeRecoveryParentToDeclaredTopologyValid(handoff.declaredTopology,cluster.topology)),
               "recovery child registered configuration differs from its declared handoff");
       require(!parentOperation || parentOperation!=operation,"recovery cannot hand off to itself");
@@ -13845,8 +13877,10 @@ REMOTE_RUNTIME
             MothershipClusterRegistry::remoteRuntimeRecoveryRackOnlyTopologyDriftValid(cluster.topology,currentTopology),
             "recovery handoff topology differs beyond declared rack placement");}
       String topologyBytes={},topologySHA={},admissionBytes={},admissionSHA={};
-      BitseryEngine::serialize(topologyBytes,currentTopology); BitseryEngine::serialize(admissionBytes,admission);
-      require(prodigyComputeSHA256Hex(topologyBytes,topologySHA,&failure) && prodigyComputeSHA256Hex(admissionBytes,admissionSHA,&failure),
+      BitseryEngine::serialize(topologyBytes,currentTopology);
+      if (!activationSuccessor) BitseryEngine::serialize(admissionBytes,admission);
+      require(prodigyComputeSHA256Hex(topologyBytes,topologySHA,&failure) &&
+              (activationSuccessor || prodigyComputeSHA256Hex(admissionBytes,admissionSHA,&failure)),
               "recovery authority binding digest failed");
       const auto preflight=[&]() {
         ClusterTopology observed={}; ClusterCreateHooks hooks(this);
@@ -13856,30 +13890,49 @@ REMOTE_RUNTIME
         require(hooks.fetchSeedTopology(cluster,observed,&failure) && observed==currentTopology &&
                 mothershipValidateObservedMachineAuthorizationProjection(cluster.topology,observed,&failure),
                 "recovery authenticated topology or machine authorization differs");
+        if (activationSuccessor) {
+          require(approved.contract.requiredFreeBytes != 0, "recovery target lacks a staging-capacity bound");
+          const auto capacity = "import os,sys; required=int(sys.argv[1]); paths=sys.argv[2:]; "
+              "assert all(os.statvfs(p).f_bavail*os.statvfs(p).f_frsize>=required for p in paths)";
+          for (const auto& machine : currentTopology.machines) {
+            const auto command = "python3 -c " + quote(capacity) + " " +
+                std::to_string(approved.contract.requiredFreeBytes) + " " + quote(str(cluster.remoteProdigyPath)) + " /var/lib/prodigy";
+            require(remoteRuntimeRecoveryCommand(cluster,machine.uuid,text(command),nullptr,failure),
+                    "post-activation successor current member staging capacity is insufficient");
+          }
+          return;
+        }
         require(configureControlTarget(identity.c_str(),&failure),"recovery control target unavailable");
         ProdigyUpgradeAdmissionReportRequest request={}; request.operationID=operationText;
         request.targetBundleSHA256=approved.bundleSHA256; request.targetContractSHA256=approved.contract.contractSHA256;
         request.requiredStagingBytes=approved.contract.requiredFreeBytes;
         MothershipUpgradeAdmissionReport report={}; MothershipUpgradePlannerInput input={};
         require(request.requiredStagingBytes!=0 && validateFreshRuntimeUpgradeAdmission(approved,admission,architecture,&cluster,
-                  request,true,report,input,failure),"recovery fresh typed upgrade admission failed");
+                  request,true,report,input,failure,RuntimeAdmissionValidation::executeCohortRecovery),
+                "recovery fresh typed upgrade admission failed");
       };
       if (!recorded) {
         preflight();
         record.clusterUUID=cluster.clusterUUID; record.operationID=operation; record.runtimeRoot=cluster.remoteProdigyPath;
-        record.authorityGeneration=admission.authorityGeneration; record.cohortInterruptionAccepted=true;
-        record.topologySHA256=topologySHA; record.admissionRecordSHA256=admissionSHA;
-        record.sourceBundleSHA256=admission.sourceBundleSHA256; record.sourceContractSHA256=admission.sourceContractSHA256;
-        record.sourceProdigySHA256=admission.sourceProdigySHA256; record.sourceMothershipSHA256=admission.sourceMothershipSHA256;
+        record.authorityGeneration=activationSuccessor?activationParent.authorityGeneration:admission.authorityGeneration;
+        record.cohortInterruptionAccepted=true; record.topologySHA256=topologySHA;
+        record.sourceBundleSHA256=activationSuccessor?activationParent.targetBundleSHA256:admission.sourceBundleSHA256;
+        record.sourceContractSHA256=activationSuccessor?activationParent.targetContractSHA256:admission.sourceContractSHA256;
+        record.sourceProdigySHA256=activationSuccessor?activationParent.targetProdigySHA256:admission.sourceProdigySHA256;
+        record.sourceMothershipSHA256=activationSuccessor?activationParent.targetMothershipSHA256:admission.sourceMothershipSHA256;
         record.targetBundleSHA256=approved.bundleSHA256; record.targetContractSHA256=approved.contract.contractSHA256;
         record.targetProdigySHA256=approved.contract.prodigySHA256; record.targetMothershipSHA256=approved.contract.mothershipSHA256;
         for(const auto& machine:currentTopology.machines) {
           MothershipRemoteRuntimeRecoveryMember member={};
-          require(observeRemoteRuntimeRecoverySource(cluster,machine.uuid,cluster.remoteProdigyPath,admission,member,failure),
+          require(observeRemoteRuntimeRecoverySource(cluster,machine.uuid,cluster.remoteProdigyPath,record,member,failure),
                   "recovery source member observation failed");
           record.members.push_back(std::move(member));
         }
       }
+      if (activationSuccessor)
+        require(MothershipClusterRegistry::remoteRuntimeRecoveryActivationBindingDigest(activationParent,record,admissionSHA,&failure),
+                "post-activation successor authority binding digest failed");
+      if (!recorded) record.admissionRecordSHA256=admissionSHA;
       require(record.topologySHA256==topologySHA && record.admissionRecordSHA256==admissionSHA &&
               record.runtimeRoot==cluster.remoteProdigyPath && record.targetBundleSHA256==approved.bundleSHA256 &&
               record.targetProdigySHA256==approved.contract.prodigySHA256 && record.targetMothershipSHA256==approved.contract.mothershipSHA256,
@@ -13888,6 +13941,74 @@ REMOTE_RUNTIME
         MothershipRemoteRuntimeRecoveryCohortRecord parent={};
         Vector<MothershipRemoteRuntimeRecoveryMember> restored={};Vector<String> receipts={};
         require(registry.loadRemoteRuntimeRecoveryCohort(cluster.clusterUUID,parentOperation,parent,&failure),"recovery parent unavailable");
+        if (activationSuccessor) {
+          using namespace MothershipRetainedRecovery;
+          require(parent.phase==Phase::activationStarted && parent.operationID==activationParent.operationID,
+                  "post-activation successor parent changed");
+          String parentBytes={}, parentText={}; BitseryEngine::serialize(parentBytes,parent);
+          String parentOperationText={}; parentOperationText.assignItoh(parentOperation);
+          const auto parentRoot=fs::path(str(registryPath)).parent_path()/"runtime-recovery"/str(parentOperationText);
+          const auto digestPrivate=[&](const char *name,String& result) {
+            const auto path=parentRoot/name; MothershipRetainedRecovery::privateFile(path.string());
+            require(prodigyComputeFileSHA256Hex(text(path.string()),result,&failure),"post-activation parent evidence digest failed");
+          };
+          MothershipRemoteRuntimeRecoveryRequest parentRequest={};
+          RuntimeStartupRequest parentStartup={}; WitnessSet parentWitnesses={}; String parentRequestBytes={};
+          const auto requestPath=parentRoot/"request.bin", startupPath=parentRoot/"startup-request.bin", witnessesPath=parentRoot/"startup-witnesses.bin";
+          MothershipRetainedRecovery::privateFile(requestPath.string()); MothershipRetainedRecovery::privateFile(startupPath.string()); MothershipRetainedRecovery::privateFile(witnessesPath.string());
+          parentRequestBytes=text(read(requestPath));
+          String parentRequestSHA={},parentStartupSHA={},parentTopologyBytes={},parentTopologySHA={};
+          require(prodigyComputeSHA256Hex(parentRequestBytes,parentRequestSHA,&failure) &&
+                  prodigyComputeFileSHA256Hex(text(startupPath.string()),parentStartupSHA,&failure) &&
+                  BitseryEngine::deserializeSafe(parentRequestBytes,parentRequest) &&
+                  (parentRequest.version==1 || parentRequest.version==2) && parentRequest.cohort.phase==Phase::admitted &&
+                  MothershipClusterRegistry::remoteRuntimeRecoveryIdentityMatches(parentRequest.cohort,parent) &&
+                  BitseryEngine::serialize(parentTopologyBytes,parentRequest.topology) &&
+                  prodigyComputeSHA256Hex(parentTopologyBytes,parentTopologySHA,&failure) && parentTopologySHA==parent.topologySHA256 &&
+                  BitseryEngine::deserializeSafe(text(read(startupPath)),parentStartup) && runtimeStartupRequestValid(parentStartup,&failure) &&
+                  parentStartup.bindingSHA256==parentRequestSHA && parentStartup.clusterUUID==parent.clusterUUID &&
+                  parentStartup.targetBundleSHA256==parent.targetBundleSHA256 && parentStartup.topology==parentRequest.topology &&
+                  BitseryEngine::deserializeSafe(text(read(witnessesPath)),parentWitnesses) &&
+                  parentWitnesses.requestSHA==parentStartupSHA && parentWitnesses.witnesses.size()==3,
+                  "post-activation parent request or startup witness is invalid");
+          for (const auto& member : parent.members) {
+            const auto *source=runtimeStartupSourceForMember(parentStartup,member.machineUUID);
+            require(source && source->stateSHA256==member.stateSHA256 && source->secretsSHA256==member.secretsSHA256 &&
+                    source->snapshotSHA256==member.privateLoaderSHA256,
+                    "post-activation parent startup source differs from sealed capture");
+          }
+          handoff.version=3; handoff.kind=MothershipRemoteRuntimeRecoveryHandoffRecord::Kind::activationStarted;
+          handoff.clusterUUID=cluster.clusterUUID; handoff.parentOperationID=parentOperation; handoff.childOperationID=operation;
+          handoff.parentTopology=parentRequest.topology; handoff.declaredTopology=cluster.topology; handoff.observedTopology=currentTopology;
+          handoff.childAdmissionSHA256=admissionSHA;
+          digestPrivate("request.bin",handoff.parentRequestSHA256);
+          digestPrivate("startup-request.bin",handoff.parentStartupRequestSHA256);
+          digestPrivate("startup-witnesses.bin",handoff.parentStartupWitnessesSHA256);
+          // The three private archives must agree with the controller's
+          // immutable evidence before that evidence may authorize a successor.
+          const auto archiveRoot="/var/lib/prodigy/runtime-recovery/"+str(parentOperationText);
+          for (const auto& member : record.members) {
+            const auto verifyArchive="test \"$(cat /etc/machine-id)\" = "+quote(str(member.linuxMachineID))+
+                "; test \"$(sha256sum "+quote(archiveRoot+"/request.bin")+" | cut -d' ' -f1)\" = "+quote(str(handoff.parentRequestSHA256))+
+                "; test \"$(sha256sum "+quote(archiveRoot+"/startup-request.bin")+" | cut -d' ' -f1)\" = "+quote(str(handoff.parentStartupRequestSHA256))+
+                "; test \"$(sha256sum "+quote(archiveRoot+"/startup-witnesses.bin")+" | cut -d' ' -f1)\" = "+quote(str(handoff.parentStartupWitnessesSHA256))+"; ";
+            const auto sealPath=archiveRoot+"/startup-prepared.bin";
+            String encodedSeal={},sealBytes={}; MothershipRuntimeRecoveryPreparedSeal seal={};
+            const auto readSeal=verifyArchive+"test ! -L "+quote(sealPath)+"; test \"$(stat -c '%u:%a:%h' "+quote(sealPath)+
+                ")\" = 0:600:1; base64 -w0 "+quote(sealPath);
+            require(remoteRuntimeRecoveryCommand(cluster,member.machineUUID,text(remoteRecoveryStrictShell(readSeal)),&encodedSeal,failure) &&
+                    Base64::decode(encodedSeal,sealBytes) && BitseryEngine::deserializeSafe(sealBytes,seal) &&
+                    mothershipRuntimeRecoveryPreparedSealMatches(seal,handoff.parentStartupRequestSHA256,handoff.parentStartupWitnessesSHA256),
+                    "post-activation parent member archive or prepared witness seal differs");
+          }
+          for (const auto& member : record.members) { String bytes={},receipt={}; BitseryEngine::serialize(bytes,member);
+            require(prodigyComputeSHA256Hex(bytes,receipt,&failure),"post-activation current identity receipt failed"); receipts.push_back(std::move(receipt)); }
+          handoff.restorationReceiptSHA256=std::move(receipts);
+          require(prodigyComputeSHA256Hex(parentBytes,handoff.parentCohortSHA256,&failure) &&
+                  MothershipClusterRegistry::remoteRuntimeRecoveryInitialCohortDigest(record,handoff.childCohortSHA256,&failure),
+                  "post-activation successor identity digest failed");
+          return;
+        }
         require(verifyRestoredRemoteRuntimeRecoveryParent(cluster,parent,admission,registryPath,restored,receipts,handoff.parentTopology,failure),
                 "recovery parent restoration verification failed");
         for(uint32_t index=0;index<3;++index) {String left={},right={};BitseryEngine::serialize(left,restored[index]);BitseryEngine::serialize(right,record.members[index]);
@@ -32154,6 +32275,7 @@ LOCAL_RUNTIME
   // the fleet identity, authority, capacity or compatibility requirements.
   enum class RuntimeAdmissionValidation {
     executeAdmittedUpdate,
+    executeCohortRecovery,
     // Closing an abandoned, never-installed operation does not authorize an
     // update. Its source may have restarted, so validate fresh planner gates
     // without claiming the old process observation still holds.
@@ -32214,9 +32336,14 @@ LOCAL_RUNTIME
     MothershipUpgradePlan freshPlan = mothershipPlanUpgrade(approved.contract, input);
     if (failure.empty() && !freshPlan.eligible)
       failure = freshPlan.firstStopGate;
-    if (failure.empty() && freshPlan.path != MothershipUpgradePath::sameLogicalRollout)
-      failure.assign("fresh plan does not permit same-logical runtime recovery"_ctv);
-    if (failure.empty() && validation == RuntimeAdmissionValidation::executeAdmittedUpdate &&
+    const bool cohortPath = freshPlan.path == MothershipUpgradePath::sameLogicalCohortRecovery &&
+        validation != RuntimeAdmissionValidation::executeAdmittedUpdate && registeredCluster &&
+        registeredCluster->deploymentMode == MothershipClusterDeploymentMode::remote && registeredCluster->nBrains == 3 &&
+        registeredCluster->topology.machines.size() == 3;
+    if (failure.empty() && (uint8_t(freshPlan.path) != admission.approvedPath ||
+        (freshPlan.path != MothershipUpgradePath::sameLogicalRollout && !cohortPath)))
+      failure.assign("fresh plan does not permit the admitted runtime transition"_ctv);
+    if (failure.empty() && validation != RuntimeAdmissionValidation::restoreSourceBeforeInstallation &&
         (freshPlan.inputSHA256 != admission.plannerInputSHA256 ||
          report.authorityGeneration != admission.authorityGeneration || report.masterUUID != admission.masterUUID ||
          report.masterBootNs != admission.masterBootNs || semanticSHA256 != admission.semanticObservationSHA256))
@@ -32437,8 +32564,10 @@ LOCAL_RUNTIME
     const char *reason = "release declares upgrade unsupported";
     if (approved.contract.disposition == MothershipUpgradeDisposition::sameClusterRollout) disposition = "same-cluster-rollout";
     else if (approved.contract.disposition == MothershipUpgradeDisposition::newClusterRequired) disposition = "new-cluster-required";
+    else if (approved.contract.disposition == MothershipUpgradeDisposition::sameClusterCohortRecovery) disposition = "same-cluster-cohort-recovery";
     if (approved.contract.disposition == MothershipUpgradeDisposition::sameClusterRollout) reason = "cluster preflight is required before rollout";
     else if (approved.contract.disposition == MothershipUpgradeDisposition::newClusterRequired) reason = "separate-cluster migration still requires workload bridges";
+    else if (approved.contract.disposition == MothershipUpgradeDisposition::sameClusterCohortRecovery) reason = "complete stopped-cohort recovery is required";
     auto compatibility = [](MothershipUpgradeCompatibilityState state) {
       if (state == MothershipUpgradeCompatibilityState::compatible) return "compatible";
       if (state == MothershipUpgradeCompatibilityState::incompatible) return "incompatible";

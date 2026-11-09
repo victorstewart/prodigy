@@ -165,6 +165,12 @@ static inline bool prodigyValidateSameClusterUpgradeTarget(
     return false;
   }
 
+  if (approved.contract.disposition == MothershipUpgradeDisposition::sameClusterCohortRecovery)
+  {
+    if (failure) failure->assign("approved target release requires same-cluster cohort recovery"_ctv);
+    return false;
+  }
+
   if (!approved.contract.compatibility.allCompatible())
   {
     if (failure) failure->assign("approved target release lacks full same-cluster compatibility"_ctv);
@@ -177,6 +183,49 @@ static inline bool prodigyValidateSameClusterUpgradeTarget(
     return false;
   }
 
+  return true;
+}
+
+// A cohort recovery stops the whole qualified same-identity cohort before the
+// new runtime starts, so its wire axis may be incompatible.  It remains
+// stricter than a generic target check on every retained-state axis and leaves
+// exact source binding to the immutable recovery admission owner.
+static inline bool prodigyValidateRuntimeRecoveryTarget(
+    const ProdigyApprovedUpgradeBundle& approved,
+    const String& observedTargetArchitecture,
+    uint128_t targetClusterUUID,
+    String *failure = nullptr)
+{
+  if (approved.contract.disposition == MothershipUpgradeDisposition::sameClusterRollout)
+    return prodigyValidateSameClusterUpgradeTarget(approved, observedTargetArchitecture, targetClusterUUID, failure);
+
+  if (failure) failure->clear();
+  if (!mothershipUpgradeValidEnvelope(approved.envelope) ||
+      approved.envelope.approvedBundleSHA256 != approved.bundleSHA256 ||
+      approved.contract.contractSHA256 != approved.envelope.contractSHA256)
+  {
+    if (failure) failure->assign("approved bundle contract envelope is incomplete"_ctv);
+    return false;
+  }
+  if (!mothershipUpgradeCanonicalArchitecture(observedTargetArchitecture) ||
+      observedTargetArchitecture != approved.contract.architecture)
+  {
+    if (failure) failure->assign("observed target architecture does not match approved upgrade contract"_ctv);
+    return false;
+  }
+  if (targetClusterUUID == 0)
+  {
+    if (failure) failure->assign("target cluster UUID is unavailable for update admission"_ctv);
+    return false;
+  }
+  if (approved.contract.disposition != MothershipUpgradeDisposition::sameClusterCohortRecovery ||
+      approved.contract.transportIdentityMode != "preserveClusterIdentity"_ctv ||
+      approved.contract.minimumHealthyBrains < 3 || approved.contract.requiredFreeBytes == 0 ||
+      !approved.contract.compatibility.cohortRecoveryCompatible())
+  {
+    if (failure) failure->assign("approved target release is not qualified for same-cluster cohort recovery"_ctv);
+    return false;
+  }
   return true;
 }
 
@@ -230,8 +279,13 @@ static inline bool prodigyValidateRuntimeRecoveryDriver(
     if (failure) failure->assign("recovery controller does not match the approved driver bundle"_ctv);
     return false;
   }
-  return prodigyValidateSameClusterUpgradeRelease(driver, architecture, clusterUUID,
-                                                  &admittedTarget, true, failure);
+  if (!prodigyValidateRuntimeRecoveryTarget(driver, architecture, clusterUUID, failure)) return false;
+  if (!mothershipUpgradeDeclaredSource(driver.contract, admittedTarget))
+  {
+    if (failure) failure->assign("observed source release identity is not declared by approved target contract"_ctv);
+    return false;
+  }
+  return true;
 }
 
 static inline bool prodigyPreflightLegacySameClusterUpdate(

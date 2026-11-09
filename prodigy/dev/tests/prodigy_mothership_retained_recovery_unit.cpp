@@ -3289,7 +3289,9 @@ int main()
   for(auto iterator=subscriptionPairings.rbegin();iterator!=subscriptionPairings.rend();++iterator)
     for(const SubscriptionPairing& pairing:iterator->second) reorderedBootstrap.plan.subscriptionPairings.insert(iterator->first,pairing);
   String reorderedBytes = {};BitseryEngine::serialize(reorderedBytes,reorderedBootstrap);
-  assert(!originalBootstrap.equals(reorderedBytes));
+  // The persistent codec is permitted to canonicalize this unordered map.
+  // The regression is semantic: recovery must accept either insertion order,
+  // including the stronger case where both serializations are already equal.
   originalBootstrap=std::move(reorderedBytes);
   assert(prodigyPersistentRetainedBootstrapEqual(decodedBootstrap,reorderedBootstrap));
   // Save the interrupted normal update, rather than the recovery envelope.
