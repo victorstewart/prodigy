@@ -780,6 +780,24 @@ int main(void)
   }
 
   {
+    constexpr uint128_t clusterUUID = 0x1234;
+    String command = {};
+    mothershipBuildProdigyStateWipeCommand("/var/lib/prodigy/state"_ctv, clusterUUID, command);
+    suite.expect(::system(("/bin/sh -n -c " + shellQuote(std::string(command.c_str()))).c_str()) == 0,
+                 "remove_local_state_wipe_complete_default_command_has_valid_shell_syntax");
+    suite.expect(stringContains(command, "/var/lib/prodigy-retained/0x1234") &&
+                 stringContains(command, "rm -rf /run/prodigy /var/lib/prodigy"),
+                 "remove_local_state_wipe_default_command_preserves_then_wipes_owned_state");
+
+    mothershipBuildProdigyStateWipeCommand("/srv/prodigy/state"_ctv, clusterUUID, command);
+    suite.expect(::system(("/bin/sh -n -c " + shellQuote(std::string(command.c_str()))).c_str()) == 0,
+                 "remove_local_state_wipe_complete_external_command_has_valid_shell_syntax");
+    suite.expect(stringContains(command, "'/srv/prodigy/state'") &&
+                 stringContains(command, "rm -rf /run/prodigy /var/lib/prodigy"),
+                 "remove_local_state_wipe_external_command_removes_bound_external_state");
+  }
+
+  {
     MothershipProdigyCluster cluster = {};
     cluster.deploymentMode = MothershipClusterDeploymentMode::test;
 
