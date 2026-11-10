@@ -91,13 +91,20 @@ bool reconcileTruthSiblingRoutes(const MothershipTruthGroup& state,
       if (!truthSiblingPermissionMatches(sourcePermission.permission, candidate, CousinRouteHalf::source, state.group.deploymentID) ||
           !truthSiblingPermissionMatches(destinationPermission.permission, candidate, CousinRouteHalf::destination, state.group.deploymentID) ||
           !prodigyCousinServicePermissionPeerScopeMatches(sourcePermission.permission, destinationPermission.permission)) continue;
+      // Other pair installations can advance an authority revision while this
+      // route stays qualified. Recover through the existing owner so its
+      // authenticated live receipts are current before checking the witnesses.
+      ProdigyCousinRouteResponse sourceRoute = {}, destinationRoute = {};
+      if (!applyCousinRoute(candidate, source, destination, sourceRoute, destinationRoute, failure)) {
+        if (failure.empty()) failure.assign("Truth sibling route receipt recovery failed"_ctv);
+        return false;
+      }
       CousinRouteApplyReceipt sourceReceipt = {}, destinationReceipt = {};
       {
         auto registry = openClusterRegistry();
         if (!registry.loadCurrentCousinRouteApplyReceipt(candidate.routeUUID, CousinRouteHalf::source, sourceReceipt, &failure) ||
             !registry.loadCurrentCousinRouteApplyReceipt(candidate.routeUUID, CousinRouteHalf::destination, destinationReceipt, &failure)) return false;
       }
-      ProdigyCousinRouteResponse sourceRoute = {}, destinationRoute = {};
       if (!observeCousinRouteSide(source, candidate, CousinRouteHalf::source, sourceRoute, failure) ||
           !observeCousinRouteSide(destination, candidate, CousinRouteHalf::destination, destinationRoute, failure) ||
           !sourceRoute.found || !sourceRoute.qualified || !destinationRoute.found || !destinationRoute.qualified ||
@@ -109,7 +116,10 @@ bool reconcileTruthSiblingRoutes(const MothershipTruthGroup& state,
           sourcePermission.currentMasterUUID != sourceRoute.currentMasterUUID ||
           destinationPermission.currentMasterUUID != destinationRoute.currentMasterUUID ||
           sourcePermission.currentMasterBootNs != sourceRoute.currentMasterBootNs ||
-          destinationPermission.currentMasterBootNs != destinationRoute.currentMasterBootNs) return false;
+          destinationPermission.currentMasterBootNs != destinationRoute.currentMasterBootNs) {
+        if (failure.empty()) failure.assign("Truth sibling route permission, authority, or durable receipt changed during recovery; retry reconciliation"_ctv);
+        return false;
+      }
       ++exact;
     }
     if (exact != 1) {
