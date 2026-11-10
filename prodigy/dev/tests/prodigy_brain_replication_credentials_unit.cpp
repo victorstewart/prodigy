@@ -9620,6 +9620,80 @@ static void testCrossClusterMasqueGatewayLifecycleOnSharedHost(TestSuite& suite)
                          return runtime.launchDispatched;
                        }),
                "cross_cluster_masque_gateway_terminal_failure_reprojects_two_retained_active_authorities_without_launch");
+
+  // A newly added lower pair moves an already-running higher pair from the
+  // first reserved fragment to the second.  While its exact old process waits
+  // for a terminal kill acknowledgement, normal registration must replay no
+  // stale gateway bootstrap; an inventory report of that process must instead
+  // requeue its exact kill.
+  CrossClusterMasqueGatewayAuthority lower =
+      authority(0xc100, 0xc101, 0xc102, 2, "mtbgplower"_ctv);
+  {
+    ProdigyClusterPairEnrollment enrollment = {};
+    enrollment.pairUUID = lower.pairUUID;
+    enrollment.localClusterUUID = lower.localClusterUUID;
+    enrollment.peerClusterUUID = lower.peerClusterUUID;
+    enrollment.operationUUID = lower.pairOperationUUID;
+    enrollment.rootGeneration = 1;
+    enrollment.agreedKeyEpoch = lower.keyGeneration;
+    enrollment.localAuthorityGeneration = lower.pairAuthorityGeneration;
+    enrollment.state = ProdigyClusterPairEnrollmentState::active;
+    ProdigyClusterPairEnrollmentOperation operation = {};
+    operation.pairUUID = lower.pairUUID;
+    operation.operationUUID = lower.pairOperationUUID;
+    operation.localAuthorityGeneration = lower.pairAuthorityGeneration;
+    operation.initialProjectionDelivered = true;
+    brain.masterAuthorityRuntimeState.clusterPairEnrollments.push_back(
+        std::move(enrollment));
+    brain.masterAuthorityRuntimeState.clusterPairEnrollmentOperations.push_back(
+        std::move(operation));
+  }
+  brain.crossClusterMasqueGatewayBrainRuntimes.clear();
+  brain.pendingCrossClusterMasqueGatewayRetirements.clear();
+  brain.masterAuthorityRuntimeState.crossClusterMasqueGatewayAuthorities = {second};
+  brain.persistedMachineInventoryUploaded.insert(host.uuid);
+  host.runtimeReady = true;
+  host.neuron.wBuffer.clear();
+  brain.reconcileCrossClusterMasqueGatewayRuntimeState();
+  suite.require(brain.crossClusterMasqueGatewayBrainRuntimes.size() == 1 &&
+                    brain.crossClusterMasqueGatewayBrainRuntimes[0].plan.fragment ==
+                        prodigyCrossClusterMasqueGatewayRuntimeFragmentFirst,
+                "cross_cluster_masque_gateway_lower_pair_fixture_launches_high_pair_first");
+  const ContainerPlan displacedPlan =
+      brain.crossClusterMasqueGatewayBrainRuntimes[0].plan;
+  brain.masterAuthorityRuntimeState.crossClusterMasqueGatewayAuthorities = {lower, second};
+  suite.require(prodigyCrossClusterMasqueGatewayAuthoritiesValid(
+                    brain.masterAuthorityRuntimeState.crossClusterMasqueGatewayAuthorities,
+                    brain.brainConfig.clusterUUID),
+                "cross_cluster_masque_gateway_lower_pair_fixture_authorities_are_valid");
+  host.neuron.wBuffer.clear();
+  brain.reconcileCrossClusterMasqueGatewayRuntimeState();
+  const bool displacedPending =
+      brain.crossClusterMasqueGatewayBrainRuntimes.size() == 1 &&
+      brain.crossClusterMasqueGatewayBrainRuntimes[0].killPending;
+  Vector<String> pendingRegistrationBootstraps = {};
+  String pendingRegistrationFailure = {};
+  const bool pendingRegistrationAccepted =
+      brain.collectNeuronStateUploadBootstraps(
+          &host, pendingRegistrationBootstraps, &pendingRegistrationFailure);
+  suite.expect(displacedPending && pendingRegistrationAccepted &&
+                   pendingRegistrationBootstraps.empty(),
+               "cross_cluster_masque_gateway_pending_fragment_move_does_not_replay_stale_registration_bootstrap");
+
+  host.neuron.wBuffer.clear();
+  suite.require(brain.handleUploadedCrossClusterMasqueGatewayContainer(
+                    &host.neuron, displacedPlan),
+                "cross_cluster_masque_gateway_pending_fragment_move_accepts_old_inventory_for_retirement");
+  uint32_t requeuedKills = 0;
+  forEachMessageInBuffer(host.neuron.wBuffer, [&](Message *message) {
+    if (NeuronTopic(message->topic) != NeuronTopic::killContainer) return;
+    uint8_t *args = message->args;
+    uint128_t killed = 0;
+    Message::extractArg<ArgumentNature::fixed>(args, killed);
+    if (killed == displacedPlan.uuid) ++requeuedKills;
+  });
+  suite.expect(requeuedKills == 1,
+               "cross_cluster_masque_gateway_pending_fragment_move_requeues_exact_old_kill_after_registration");
 }
 
 static void testCrossClusterMasqueGatewayConnectorLeaseLifecycle(TestSuite& suite)

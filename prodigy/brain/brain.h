@@ -24387,6 +24387,13 @@ public:
     for (const auto& runtime : crossClusterMasqueGatewayBrainRuntimes)
     {
       if (runtime.authority.localMachineUUID != machine->uuid) continue;
+      // A replacement that changes this pair's reserved fragment is terminally
+      // fenced by the old runtime's kill acknowledgement.  Its plan is no
+      // longer a current authority-bound bootstrap, so ordinary registration
+      // must not reject the whole replay while it waits to observe that ACK.
+      // If this Neuron still reports the old process, the inventory owner
+      // requeues its exact kill instead of re-adopting it here.
+      if (runtime.killPending) continue;
       const auto *authority = desiredCrossClusterMasqueGatewayAuthority(
           runtime.authority.pairUUID, machine->uuid);
       const auto effective =
@@ -24397,7 +24404,7 @@ public:
               authority->pairUUID, authority->localMachineUUID);
       if (!masterAuthorityRuntimeStateDurable ||
           durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation ||
-          runtime.killPending || authority == nullptr ||
+          authority == nullptr ||
           !crossClusterMasqueGatewayAuthoritiesExactlyEqual(runtime.authority, *authority) ||
           !crossClusterMasqueGatewayPlanMatchesAuthority(runtime.plan, *authority, fragment) ||
           !replayedUUIDs.insert(runtime.plan.uuid).second)
