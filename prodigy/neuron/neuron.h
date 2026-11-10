@@ -4425,6 +4425,8 @@ protected:
     if (tcx_ingress_program)
     {
       tcx_ingress_program->setArrayElement("lc_subnet"_ctv, 0, lcsubnet6);
+      tcx_ingress_program->setArrayElement("mac_map"_ctv, 0, eth.mac);
+      tcx_ingress_program->setArrayElement("gw_mac_map"_ctv, 0, eth.gateway_mac);
     }
 
     if (tcx_egress_program)
