@@ -1654,7 +1654,7 @@ static void exerciseHostIngressRemotePortalRoute(TestSuite& suite, bool ipv6, ui
 
   int runResult = bpf_prog_test_run_opts(ingressProgram.prog_fd, &opts);
   expectNamed(runResult == 0, "test_run_succeeds");
-  expectNamed(opts.retval == TC_ACT_OK, "returns_ok_after_overlay_encap");
+  expectNamed(opts.retval == TC_ACT_REDIRECT, "redirects_physical_next_hop_after_overlay_encap");
   expectNamed(opts.data_size_out == frame.size() + outerBytes + sizeof(struct switchboard_wormhole_overlay_header), "adds_exact_underlay_and_provenance_headers");
 
   if (runResult == 0 && opts.data_size_out >= frame.size() + outerBytes + sizeof(struct switchboard_wormhole_overlay_header))
@@ -1726,7 +1726,7 @@ static void exerciseHostIngressRemotePortalRoute(TestSuite& suite, bool ipv6, ui
     char actionName[256] = {};
     std::snprintf(actionName, sizeof(actionName), "%s_action_matches", suffix);
     expectNamed(boundaryOpts.retval == expectedAction, actionName);
-    if (boundaryResult == 0 && expectedAction == TC_ACT_OK)
+    if (boundaryResult == 0 && expectedAction != TC_ACT_SHOT)
     {
       char budgetName[256] = {};
       std::snprintf(budgetName, sizeof(budgetName), "%s_outer_l3_fits_standard_underlay", suffix);
@@ -1734,7 +1734,7 @@ static void exerciseHostIngressRemotePortalRoute(TestSuite& suite, bool ipv6, ui
     }
   };
   runRemoteBoundary(WORMHOLE_PUBLIC_INGRESS_L3_MTU,
-                    TC_ACT_OK,
+                    TC_ACT_REDIRECT,
                     "accepts_exact_1448_byte_host_remote_encap_boundary");
   runRemoteBoundary(WORMHOLE_PUBLIC_INGRESS_L3_MTU + 1u,
                     TC_ACT_SHOT,

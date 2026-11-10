@@ -398,7 +398,10 @@ __attribute__((__always_inline__)) static inline int switchboardRouteSelectedWor
   {
     return TC_ACT_SHOT;
   }
-  return switchboardCompleteMasqueGatewayInjection(skb, route);
+  int action = switchboardCompleteMasqueGatewayInjection(skb, route);
+  // A physical next hop needs transmission from this ingress hook. Passing
+  // the rewritten frame up would deliver our own outer source to the host stack.
+  return action == TC_ACT_OK ? bpf_redirect(skb->ifindex, 0) : action;
 }
 
 __attribute__((__always_inline__)) static inline bool switchboardLearnAndRewriteLocalWormholeIPv6(struct __sk_buff *skb,
