@@ -54,9 +54,10 @@ def main():
         parser.error("--sites 3 requires --probe-endpoints 1 and a TRUTH_PROBE_MIN_ENDPOINTS=1 probe artifact")
     plan = json.loads(options.probe_plan.read_text())
     version = plan["config"]["versionID"]
-    if (plan["config"]["type"] != "ApplicationType::stateless" or not 0 < version < (1 << 48) - 2 or
+    probe_versions = 3 if options.sites == 2 else 8
+    if (plan["config"]["type"] != "ApplicationType::stateless" or not 0 < version <= (1 << 48) - probe_versions or
             not options.probe_artifact.is_file()):
-        parser.error("provide a stateless probe plan, three unused successive version IDs, and a built probe artifact")
+        parser.error(f"provide a stateless probe plan, {probe_versions} unused successive version IDs, and a built probe artifact")
     if options.outage_ms <= 0 or options.timeout * 1000 <= options.outage_ms:
         parser.error("timeout must exceed the positive fault duration")
     binary = str(options.mothership.resolve())
@@ -103,7 +104,7 @@ def main():
             logs = call("containerLogs", cluster, options.probe_name, "65536")
             return probe_passed(report, logs, version, options.probe_endpoints)
 
-        wait_for(f"{phase}: probe version {version} committed both generators and replayed them through opposite endpoints",
+        wait_for(f"{phase}: probe version {version} committed both generators and replayed them with {options.probe_endpoints} endpoint(s)",
                  ready, reconcile=False)
         version += 1
 
@@ -198,11 +199,8 @@ def main():
                 return None
             r, group, voting, reachable = current
             repaired_group = (len(voting) == len(group) == 3 and survivors < voting and old not in group and
-                              voting == reachable and int(r["config"]) > int(report["config"]))
-            if options.sites == 2:
-                repaired_group = repaired_group and all(m["cluster"] != site for m in group.values())
-            elif any(m["cluster"] == site for m in group.values()):
-                repaired_group = False
+                              voting == reachable and int(r["config"]) > int(report["config"]) and
+                              all(m["cluster"] != site for m in group.values()))
             if not repaired_group:
                 return None
             return unanimous(voting, r) and voting
