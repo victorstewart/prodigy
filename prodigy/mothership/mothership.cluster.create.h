@@ -1262,7 +1262,10 @@ static inline bool mothershipStandUpCluster(MothershipProdigyCluster& cluster, c
     String localFailure;
     ProdigyInitialTransportCredentialProjection initialTransportProjection = {};
     const ProdigyInitialTransportCredentialProjection *initialTransportProjectionPtr = nullptr;
-    if (cluster.internalTransportProfile == MothershipInternalTransportProfile::aegisX25519V1)
+    // The test provider builds the complete virtual-machine credential cohort
+    // in bootstrapRemoteSeed after it assigns the machines their real UUIDs.
+    if (cluster.internalTransportProfile == MothershipInternalTransportProfile::aegisX25519V1 &&
+        cluster.deploymentMode != MothershipClusterDeploymentMode::test)
     {
       if (cluster.deploymentMode != MothershipClusterDeploymentMode::remote ||
           mothershipBuildRemoteSeedInitialTransportCredentialProjection(
