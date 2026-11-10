@@ -554,8 +554,8 @@ provider_process()
    [[ "${arguments[0]:-}" == bash || "${arguments[0]:-}" == /bin/bash ]] || return 1
    [[ "${arguments[1]:-}" =~ ^/proc/self/fd/[0-9]+$ ]] || return 1
    case "${arguments[2]:-}" in
-      --serve) [[ ( "${#arguments[@]}" -eq 15 || "${#arguments[@]}" -eq 16 ) && "${arguments[3]}" == "${workspace}" ]] ;;
-      --serve-adopt) [[ "${#arguments[@]}" -eq 17 && "${arguments[3]}" =~ ^[0-9]+$ && "${arguments[5]}" == "${workspace}" && "${arguments[4]}" == "${workspace}/virtual-datacenter.recovery/"* ]] ;;
+      --serve) [[ ( "${#arguments[@]}" -eq 15 || "${#arguments[@]}" -eq 16 || "${#arguments[@]}" -eq 17 ) && "${arguments[3]}" == "${workspace}" ]] ;;
+      --serve-adopt) [[ ( "${#arguments[@]}" -eq 17 || "${#arguments[@]}" -eq 18 || "${#arguments[@]}" -eq 19 ) && "${arguments[3]}" =~ ^[0-9]+$ && "${arguments[5]}" == "${workspace}" && "${arguments[4]}" == "${workspace}/virtual-datacenter.recovery/"* ]] ;;
       *) return 1 ;;
    esac
 }
@@ -2303,8 +2303,18 @@ pair_control_cleanup_inside()
             "${pair_control_masque_destination_public6}/128" "$pair_control_masque_source_router" bond0 "$pair_control_masque_source_private6" || masque_cleanup=1
          [[ "${masque_cleanup:-0}" != 1 ]] && pair_control_remove_service_route "pc-$pair_control_masque_source_side" masque-source-route \
             "${pair_control_masque_destination_public6}/128" "$pair_control_masque_source_router" vdcbr0 || masque_cleanup=1
-         [[ "${masque_cleanup:-0}" != 1 ]] && pair_control_remove_service_route "$pair_control_router_ns" masque-router-destination-route \
-            "${pair_control_masque_destination_public6}/128" "$pair_control_masque_destination_private6" "${pair_control_masque_destination_side}0" || masque_cleanup=1
+         if [[ "${masque_cleanup:-0}" == 0 ]]; then
+            if [[ -e "/run/netns/$pair_control_router_ns" ]]; then
+               [[ -f "$pair_control_dir/router-namespace" && ! -L "$pair_control_dir/router-namespace" &&
+                  "$(stat -Lc %i "/run/netns/$pair_control_router_ns")" == "$(<"$pair_control_dir/router-namespace")" ]] &&
+                  pair_control_remove_service_route "$pair_control_router_ns" masque-router-destination-route \
+                     "${pair_control_masque_destination_public6}/128" "$pair_control_masque_destination_private6" "${pair_control_masque_destination_side}0" || masque_cleanup=1
+            else
+               # Recovery binds both surviving VDC parents into a fresh mount
+               # namespace. The dead supervisor's private router is gone.
+               pair_control_owner_dead || masque_cleanup=1
+            fi
+         fi
       else
          masque_cleanup=1
       fi
@@ -3726,7 +3736,9 @@ stop_datacenter()
 
 launch_datacenter()
 {
-   [[ ( "$#" -eq 12 || "$#" -eq 13 ) && "${EUID}" -eq 0 ]] || return 2
+   # The BGP/MASQUE underlay selector is an optional second tail argument.
+   # Keep the legacy twelve- and spare-machine thirteen-argument forms exact.
+   [[ ( "$#" -eq 12 || "$#" -eq 13 || "$#" -eq 14 ) && "${EUID}" -eq 0 ]] || return 2
    local workspace="$1"
    local control_socket_path="${12}"
    valid_workspace "${workspace}" && valid_control_socket_path "${control_socket_path}" || return 2
@@ -3825,7 +3837,9 @@ case "${1:-}" in
       exit
       ;;
    --serve-adopt)
-      [[ "$#" -eq 15 ]] || { echo "serve-adopt requires runtime identity, operation directory, and original provider arguments" >&2; exit 2; }
+      # Keep adoption compatible with the original 12/13 launch arguments and
+      # the optional BGP-underlay tail (14 arguments).
+      [[ "$#" -eq 15 || "$#" -eq 16 || "$#" -eq 17 ]] || { echo "serve-adopt requires runtime identity, operation directory, and original provider arguments" >&2; exit 2; }
       adopted_mode=1
       adopted_runtime_identity="$2"
       adopted_operation_dir="$3"
@@ -3846,7 +3860,7 @@ then
    exec unshare --mount --propagation private -- bash "$0" --serve "$@"
 fi
 
-if [[ ( "$#" -ne 12 && "$#" -ne 13 ) || "${EUID}" -ne 0 ]]
+if [[ ( "$#" -ne 12 && "$#" -ne 13 && "$#" -ne 14 ) || "${EUID}" -ne 0 ]]
 then
    echo "virtual datacenter provider requires workspace, machine count, brain count, MTU, fake-boundary flag, host netns inode, machine resources, storage devices, and control socket as root" >&2
    exit 2
@@ -3865,6 +3879,7 @@ storage_device_count="${10}"
 storage_device_mb="${11}"
 control_socket_path="${12}"
 spare_machine_count="${13:-0}"
+bgp_underlay="${14:-0}"
 [[ "$spare_machine_count" == 0 || "$spare_machine_count" == 1 ]]
 datacenter_fragment="$(network_fragment_from_control_socket_path "${control_socket_path}")"
 private_network_domain="$((datacenter_fragment - 1))"
@@ -3888,6 +3903,7 @@ if ! valid_workspace "${workspace}" ||
    ! [[ "${machine_storage_mb}" =~ ^[0-9]+$ ]] || [[ "${machine_storage_mb}" -lt 1 || "${machine_storage_mb}" -gt 1048576 ]] ||
    ! [[ "${storage_device_count}" =~ ^[0-9]+$ ]] || [[ "${storage_device_count}" -gt 16 ]] ||
    ! [[ "${storage_device_mb}" =~ ^[0-9]+$ ]] || [[ "${storage_device_mb}" -lt 1 || "${storage_device_mb}" -gt 1048576 ]] ||
+   [[ "${bgp_underlay}" != "0" && "${bgp_underlay}" != "1" ]] ||
    ! valid_control_socket_path "${control_socket_path}"
 then
    echo "invalid virtual datacenter provider arguments" >&2
@@ -3955,10 +3971,11 @@ then
 fi
 underlay_mtu=$((inter_container_mtu + 40))
 public_ingress_mtu=1500
-# Public wormholes require a standard 1500-byte underlay even when their
-# containers use the 1448-byte inner budget. Private-only fixtures retain the
-# selected inner MTU plus IPv6 encapsulation overhead.
-if [[ "${fake_boundary}" == "1" && "${underlay_mtu}" -lt "${public_ingress_mtu}" ]]
+# Public wormholes and Mothership-authorized private BGP/MASQUE carriers require
+# a standard 1500-byte underlay even when their containers use the 1448-byte
+# inner budget. Other private-only fixtures retain the selected inner MTU plus
+# IPv6 encapsulation overhead.
+if [[ ( "${fake_boundary}" == "1" || "${bgp_underlay}" == "1" ) && "${underlay_mtu}" -lt "${public_ingress_mtu}" ]]
 then
    underlay_mtu="${public_ingress_mtu}"
 fi

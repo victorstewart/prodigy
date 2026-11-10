@@ -4864,7 +4864,7 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
       Vector<String> args = {};
       if (mothershipVDCReadProcess(pid, observed) == false || observed.startTime != start || observed.mountNamespace != mount ||
           observed.networkNamespace != operation.supervisor.networkNamespace || mothershipVDCReadArguments(pid, args) == false ||
-          args.size() != 17 || args[2].equals("--serve-adopt"_ctv) == false || args[4].equals(directory) == false) return false;
+          args.size() < 17 || args.size() > 19 || args[2].equals("--serve-adopt"_ctv) == false || args[4].equals(directory) == false) return false;
       operation.adopter = observed;
       return true;
     };
@@ -4899,6 +4899,20 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
       argv.push_back(const_cast<char *>("/bin/bash")); argv.push_back(const_cast<char *>(providerPath.c_str()));
       argv.push_back(const_cast<char *>("--serve-adopt")); argv.push_back(const_cast<char *>(runtime.c_str())); argv.push_back(const_cast<char *>(directory.c_str()));
       for (String& argument : operation.providerArguments) argv.push_back(const_cast<char *>(argument.c_str()));
+      // Recovery records the stable twelve-argument provider identity. Rebuild
+      // the optional launch tail from the still-bound cluster policy so a
+      // private BGP/MASQUE fixture cannot lose its required 1500-byte underlay
+      // during an otherwise compatible provider handoff.
+      const bool requirePublicIngressMTU = !cluster.test.enableFakeIpv4Boundary && mothershipClusterBGPEnabled(cluster);
+      String recoverySpare = {}, recoveryBGPUnderlay = {};
+      if (cluster.test.spareMachineCount != 0 || requirePublicIngressMTU) {
+        recoverySpare.assignItoa(cluster.test.spareMachineCount);
+        argv.push_back(const_cast<char *>(recoverySpare.c_str()));
+      }
+      if (requirePublicIngressMTU) {
+        recoveryBGPUnderlay.assign("1"_ctv);
+        argv.push_back(const_cast<char *>(recoveryBGPUnderlay.c_str()));
+      }
       argv.push_back(nullptr);
       pid_t child = ::fork();
       if (child == 0)
@@ -5156,6 +5170,7 @@ static bool mothershipStartVirtualDatacenterProvider(const MothershipProdigyClus
   String machineStorageMB = {};
   String storageDeviceCount = {};
   String storageDeviceMB = {};
+  String bgpUnderlay = {};
   machineCount.assignItoa(cluster.test.machineCount);
   brainCount.assignItoa(cluster.nBrains);
   mtuText.assignItoa(mtu);
@@ -5166,6 +5181,11 @@ static bool mothershipStartVirtualDatacenterProvider(const MothershipProdigyClus
   machineStorageMB.assignItoa(cluster.test.machineStorageMB);
   storageDeviceCount.assignItoa(cluster.test.storageDeviceCount);
   storageDeviceMB.assignItoa(cluster.test.storageDeviceMB);
+  // A private cross-site BGP/MASQUE carrier still has to carry the listener's
+  // standard 1500-byte wormhole underlay.  This is deliberately separate from
+  // the test's container overlay budget and never turns on a public boundary.
+  const bool requirePublicIngressMTU = !cluster.test.enableFakeIpv4Boundary && mothershipClusterBGPEnabled(cluster);
+  bgpUnderlay.assignItoa(requirePublicIngressMTU ? 1 : 0);
   String controlSocketPath = {};
   mothershipResolveTestClusterControlSocketPath(cluster, controlSocketPath);
   Vector<String> arguments = {};
@@ -5182,10 +5202,14 @@ static bool mothershipStartVirtualDatacenterProvider(const MothershipProdigyClus
   arguments.push_back(std::move(storageDeviceCount));
   arguments.push_back(std::move(storageDeviceMB));
   arguments.push_back(std::move(controlSocketPath));
-  if (cluster.test.spareMachineCount != 0)
+  if (cluster.test.spareMachineCount != 0 || requirePublicIngressMTU)
   {
     arguments.emplace_back();
     arguments.back().assignItoa(cluster.test.spareMachineCount);
+  }
+  if (requirePublicIngressMTU)
+  {
+    arguments.push_back(std::move(bgpUnderlay));
   }
   // Launch first clears the previous disposable workspace. Publish new OS
   // material only afterward; the provider waits for the final ready receipt.

@@ -951,6 +951,27 @@ int main(void)
     providerArguments.emplace_back(argument);
   String originals[12];
   suite.expect(mothershipVDCProviderArguments(providerArguments, cluster.test.workspaceRoot, 917, originals), "recovery_binds_exact_original_provider_arguments");
+  providerArguments.emplace_back("0"_ctv);
+  providerArguments.emplace_back("1"_ctv);
+  suite.expect(mothershipVDCProviderArguments(providerArguments, cluster.test.workspaceRoot, 917, originals) &&
+                   originals[0].equals(cluster.test.workspaceRoot) && originals[11].equals("/tmp/prodigy-vdc-0x1234/mothership.sock"_ctv),
+               "recovery_accepts_explicit_bgp_underlay_provider_tail");
+  providerArguments.back().assign("0"_ctv);
+  suite.expect(mothershipVDCProviderArguments(providerArguments, cluster.test.workspaceRoot, 917, originals) == false,
+               "recovery_rejects_ambiguous_bgp_underlay_provider_tail");
+  providerArguments.back().assign("1"_ctv);
+  Vector<String> adoptedProviderArguments = {};
+  for (const char *argument : {"bash", "/proc/self/fd/7", "--serve-adopt", "917", "/tmp/prodigy/vdc-unit/virtual-datacenter.recovery/op",
+                               "/tmp/prodigy/vdc-unit", "3", "2", "65495", "0", "42", "4", "8192", "8192", "0", "1024",
+                               "/tmp/prodigy-vdc-0x1234/mothership.sock", "0", "1"})
+    adoptedProviderArguments.emplace_back(argument);
+  suite.expect(mothershipVDCProviderArguments(adoptedProviderArguments, cluster.test.workspaceRoot, 917, originals),
+               "recovery_accepts_explicit_bgp_underlay_adopter_tail");
+  adoptedProviderArguments[3].assign("918"_ctv);
+  suite.expect(mothershipVDCProviderArguments(adoptedProviderArguments, cluster.test.workspaceRoot, 917, originals) == false,
+               "recovery_rejects_wrong_runtime_for_bgp_underlay_adopter_tail");
+  providerArguments.pop_back();
+  providerArguments.pop_back();
   providerArguments[3].assign("/tmp/another-workspace"_ctv);
   providerArguments[14] = cluster.test.workspaceRoot;
   suite.expect(mothershipVDCProviderArguments(providerArguments, cluster.test.workspaceRoot, 917, originals) == false,
