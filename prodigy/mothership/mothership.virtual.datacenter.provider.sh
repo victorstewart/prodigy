@@ -2194,7 +2194,17 @@ pair_control_remove_owned_link()
    if pair_link_presence "pc-$side" "$link"; then :; else
       present=$?; [[ "$present" == 1 ]] && return 0; return 1
    fi
-   pair_control_link_owned "$side" "$link" || return 1
+   if pair_control_link_owned "$side" "$link"; then :; else
+      # The owned peer can disappear after the successful inventory above but
+      # before its identity read. Treat only a fresh successful absence as
+      # completion; a surviving replacement or an inventory error remains
+      # fail-closed.
+      if pair_link_presence "pc-$side" "$link"; then return 1; else
+         present=$?
+         [[ "$present" == 1 ]] && return 0
+         return 1
+      fi
+   fi
    ip -n "pc-$side" link del "$link" || {
       if pair_link_presence "pc-$side" "$link"; then return 1; else
          present=$?; [[ "$present" == 1 ]] && return 0; return 1

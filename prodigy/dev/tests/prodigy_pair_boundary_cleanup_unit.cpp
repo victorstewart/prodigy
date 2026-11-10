@@ -41,18 +41,25 @@ static void testPairOwnedLinkCleanupRace(TestSuite& suite)
   std::string text((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
   const size_t begin = text.find("pair_link_identity()\n{\n");
   const size_t end = text.find("\npair_require_no_clients()\n", begin);
-  suite.expect(begin != std::string::npos && end != std::string::npos,
+  const size_t controlBegin = text.find("pair_control_link_owned()\n{\n");
+  const size_t controlEnd = text.find("\npair_control_addresses()\n", controlBegin);
+  suite.expect(begin != std::string::npos && end != std::string::npos &&
+               controlBegin != std::string::npos && controlEnd != std::string::npos,
                "pair_cleanup_fixture_extracts_owned_link_owner");
-  if (begin == std::string::npos || end == std::string::npos) return;
+  if (begin == std::string::npos || end == std::string::npos ||
+      controlBegin == std::string::npos || controlEnd == std::string::npos) return;
 
   // Execute the real identity/remove helper with only a mocked `ip` command.
   // The race case models the kernel dropping the source veth peer after the
   // initial probe but before its JSON identity query.  A still-present foreign
   // link must remain an error and must never receive `link del`.
-  std::string script = "set -euo pipefail\n" + text.substr(begin, end - begin) + R"TEST(
+  std::string script = "set -euo pipefail\n" + text.substr(begin, end - begin) +
+                       text.substr(controlBegin, controlEnd - controlBegin) + R"TEST(
 pair_dir="$PWD/pair"
-mkdir -p "$pair_dir"
+pair_control_dir="$PWD/pair-control"
+mkdir -p "$pair_dir" "$pair_control_dir"
 printf '[1,2,"02:aa:bb:cc:dd:ee"]\n' > "$pair_dir/source-link"
+printf '[1,2,"02:aa:bb:cc:dd:ee"]\n' > "$pair_control_dir/first-link"
 cat > "$PWD/ip" <<'IP'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -60,7 +67,7 @@ mode="$(<"$PWD/mode")"
 args="$*"
 if [[ "$args" == *"-j link show"* && "$args" == *"pairSource0"* ]]; then
   case "$mode" in
-    vanished) echo 'Device "pairSource0" does not exist.' >&2; exit 1 ;;
+    vanished|control_vanished) echo 'Device "pairSource0" does not exist.' >&2; exit 1 ;;
     replacement) printf '[{"ifindex":9,"link_index":8,"address":"02:ff:ff:ff:ff:ff"}]\n'; exit 0 ;;
     owned|disappear_delete) printf '[{"ifindex":1,"link_index":2,"address":"02:aa:bb:cc:dd:ee"}]\n'; exit 0 ;;
   esac
@@ -72,7 +79,7 @@ if [[ "$args" == *"-j link show"* ]]; then
     lookup_error) echo 'RTNETLINK answers: Permission denied' >&2; exit 2 ;;
     malformed) printf '{not json}\n'; exit 0 ;;
     malformed_json) printf '[{}]\n'; exit 0 ;;
-    vanished|disappear_delete) [[ "$count" == 1 ]] && printf '[{"ifname":"pairSource0"}]\n' || printf '[]\n'; exit 0 ;;
+    vanished|disappear_delete|control_vanished) [[ "$count" == 1 ]] && printf '[{"ifname":"pairSource0"}]\n' || printf '[]\n'; exit 0 ;;
     replacement|owned) printf '[{"ifname":"pairSource0"}]\n'; exit 0 ;;
   esac
 fi
@@ -107,6 +114,10 @@ if run_case malformed_json; then exit 1; fi
 [[ ! -e deletions ]]
 run_case owned
 [[ "$(<deletions)" == del ]]
+rm -f inventory-count deletions
+printf 'control_vanished\n' > mode
+pair_control_remove_owned_link first pairSource0
+[[ ! -e deletions ]]
 )TEST";
   char temporary[] = "./pair-boundary-cleanup-unit.XXXXXX";
   if (::mkdtemp(temporary) == nullptr)
