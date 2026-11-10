@@ -81,6 +81,7 @@
 #include <prodigy/mothership/mothership.tidesdb.migration.command.h>
 #include <prodigy/mothership/mothership.retained.recovery.command.h>
 #include <prodigy/mothership/mothership.nametag.qualification.h>
+#include <prodigy/gateway.recovery.record.h>
 
 // for now every time we create a new application or service we're going to have to recompile the mothership so that
 // it can read the enum values from enums.datacenter.h, but in the future we can do something else more flexible
@@ -5945,8 +5946,54 @@ static bool mothershipRuntimeRecoveryPreparedSealMatches(
       prodigyIsSHA256HexDigest(seal.stateSHA256) && prodigyIsSHA256HexDigest(seal.secretsSHA256);
 }
 
+// A cross-cluster MASQUE gateway is a system runtime, so it deliberately has
+// no application startup memfd. Its root-owned recovery record carries the
+// non-secret tuple that binds the retained cgroup to a current durable
+// authority. The record owner validates its fixed layout, mode, and private
+// action token without exposing that token here.
+static bool mothershipRuntimeRecoveryGatewayRecordMatches(
+    const MothershipVDCApplicationIdentity& application,
+    const MothershipVDCProcessIdentity& inspector,
+    const ProdigyPersistentBrainSnapshot& snapshot, uint128_t machineUUID)
+{
+  if (!mothershipVDCProcessMatches(application.process) || !mothershipVDCProcessMatches(inspector) ||
+      snapshot.brainConfig.clusterUUID == 0 || machineUUID == 0)
+    return false;
+  String root = {};
+  root.snprintf<"/proc/{itoa}/root/run/prodigy/containers"_ctv>(inspector.pid);
+  const int rootFD = ::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (rootFD < 0) return false;
+  struct stat metadata = {};
+  const bool rootValid = ::fstat(rootFD, &metadata) == 0 && S_ISDIR(metadata.st_mode) &&
+      metadata.st_uid == 0 && (metadata.st_mode & (S_IWGRP | S_IWOTH)) == 0;
+  if (!rootValid) { ::close(rootFD); return false; }
+
+  const auto& state = snapshot.masterAuthority.runtimeState;
+  uint32_t matches = 0;
+  for (const auto& authority : state.crossClusterMasqueGatewayAuthorities)
+  {
+    if (authority.state != CrossClusterMasqueGatewayState::active ||
+        authority.localClusterUUID != snapshot.brainConfig.clusterUUID ||
+        authority.localMachineUUID != machineUUID ||
+        !prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(authority))
+      continue;
+    if (!state.crossClusterMasqueGatewayAuthorityPairCurrent(authority)) continue;
+    SystemContainerRuntimePlan gateway = {};
+    gateway.kind = SystemContainerKind::crossClusterMasqueGateway;
+    if (!prodigyBindCrossClusterMasqueGatewayRuntimePlanAuthority(gateway, authority) ||
+        !ProdigyGatewayRecovery::matchesRetainedGatewayAt(
+            rootFD, application.name, gateway, snapshot.masterAuthority.containerRuntimeStates))
+      continue;
+    ++matches;
+  }
+  ::close(rootFD);
+  return matches == 1 && mothershipVDCProcessMatches(application.process) &&
+      mothershipVDCProcessMatches(inspector);
+}
+
 static bool mothershipRuntimeRecoveryReadCensus(
     const Vector<MothershipVDCApplicationIdentity>& applications,
+    const MothershipVDCProcessIdentity& inspector,
     const ProdigyPersistentBrainSnapshot& snapshot, uint128_t machineUUID,
     MothershipRetainedRecoveryMachineInput& census, Vector<String>& parameterDigests,
     String *failure)
@@ -5969,6 +6016,14 @@ static bool mothershipRuntimeRecoveryReadCensus(
         if (!error && link=="/memfd:container.params (deleted)") {
           require(descriptor.empty(),"retained census has ambiguous startup parameters"); descriptor=entry.path();
         }
+      }
+      if (descriptor.empty() &&
+          mothershipRuntimeRecoveryGatewayRecordMatches(app, inspector, snapshot, machineUUID))
+      {
+        // System gateway identity is verified above through its root-owned
+        // recovery record and current authority; it has no app startup
+        // parameters and must not enter the application bootstrap census.
+        continue;
       }
       String bytes={},digest={}; ContainerParameters parameters={};
       require(!descriptor.empty() && mothershipVDCRead(text(descriptor.string()),bytes,16*1024*1024) &&
@@ -6180,7 +6235,7 @@ static bool mothershipRemoteRuntimeRecoveryLocal(const String& root, const Strin
       if(request.version==2) {
         MothershipRuntimeRecoveryCapturedSource captured={};captured.local=local;
         captured.snapshotBytes=bytes;captured.privateStatePath=copy;
-        require(mothershipRuntimeRecoveryReadCensus(proof.applications,snapshot,memberUUID,captured.census,captured.parameterSHA256,failure),
+        require(mothershipRuntimeRecoveryReadCensus(proof.applications,inspector,snapshot,memberUUID,captured.census,captured.parameterSHA256,failure),
                 "runtime recovery live startup census failed");
         const auto capturedPath=fs::path(str(root))/"startup-source.bin";
         if(fs::exists(capturedPath)) {
@@ -6263,7 +6318,7 @@ static bool mothershipRemoteRuntimeRecoveryLocal(const String& root, const Strin
               fs::path(str(captured.privateStatePath)).filename().string().starts_with("snapshot-"),
               "runtime recovery captured startup private path differs");
       MothershipRetainedRecoveryMachineInput current={};Vector<String> currentDigests={};
-      require(mothershipRuntimeRecoveryReadCensus(proof.applications,snapshot,memberUUID,current,currentDigests,failure) &&
+      require(mothershipRuntimeRecoveryReadCensus(proof.applications,inspector,snapshot,memberUUID,current,currentDigests,failure) &&
               currentDigests==captured.parameterSHA256 && current.machineUUID==captured.census.machineUUID &&
               current.machineFragment==captured.census.machineFragment && current.observedCreatedAtMs==captured.census.observedCreatedAtMs,
               "runtime recovery live startup parameters changed");

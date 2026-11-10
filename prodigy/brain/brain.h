@@ -10983,22 +10983,7 @@ public:
 
   bool crossClusterMasqueGatewayAuthorityPairCurrent(const CrossClusterMasqueGatewayAuthority& authority) const
   {
-    const auto enrollment = std::find_if(masterAuthorityRuntimeState.clusterPairEnrollments.begin(),
-        masterAuthorityRuntimeState.clusterPairEnrollments.end(), [&](const auto& value) {
-          return value.pairUUID == authority.pairUUID && value.operationUUID == authority.pairOperationUUID &&
-              value.localClusterUUID == authority.localClusterUUID && value.peerClusterUUID == authority.peerClusterUUID;
-        });
-    if (enrollment == masterAuthorityRuntimeState.clusterPairEnrollments.end() ||
-        enrollment->state != ProdigyClusterPairEnrollmentState::active ||
-        enrollment->localAuthorityGeneration != authority.pairAuthorityGeneration ||
-        enrollment->agreedKeyEpoch != authority.keyGeneration) return false;
-    const auto operation = std::find_if(masterAuthorityRuntimeState.clusterPairEnrollmentOperations.begin(),
-        masterAuthorityRuntimeState.clusterPairEnrollmentOperations.end(), [&](const auto& value) {
-          return value.pairUUID == authority.pairUUID && value.operationUUID == authority.pairOperationUUID;
-        });
-    return operation != masterAuthorityRuntimeState.clusterPairEnrollmentOperations.end() &&
-        operation->localAuthorityGeneration == authority.pairAuthorityGeneration &&
-        operation->initialProjectionDelivered && !operation->revocationRequested && !operation->projectionsWithdrawn;
+    return masterAuthorityRuntimeState.crossClusterMasqueGatewayAuthorityPairCurrent(authority);
   }
 
   ProdigyCrossClusterMasqueGatewayAuthorityResponse queryCrossClusterMasqueGatewayAuthority(

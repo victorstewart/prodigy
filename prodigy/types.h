@@ -11877,6 +11877,26 @@ public:
   // ProdigyPersistentBrainSnapshotSecrets before writing the snapshot.
   ProdigyTransportCredentialAuthorityRoot transportCredentialAuthorityRoot;
 
+  bool crossClusterMasqueGatewayAuthorityPairCurrent(const CrossClusterMasqueGatewayAuthority& authority) const
+  {
+    const auto enrollment = std::find_if(clusterPairEnrollments.begin(),
+        clusterPairEnrollments.end(), [&](const auto& value) {
+          return value.pairUUID == authority.pairUUID && value.operationUUID == authority.pairOperationUUID &&
+              value.localClusterUUID == authority.localClusterUUID && value.peerClusterUUID == authority.peerClusterUUID;
+        });
+    if (enrollment == clusterPairEnrollments.end() ||
+        enrollment->state != ProdigyClusterPairEnrollmentState::active ||
+        enrollment->localAuthorityGeneration != authority.pairAuthorityGeneration ||
+        enrollment->agreedKeyEpoch != authority.keyGeneration) return false;
+    const auto operation = std::find_if(clusterPairEnrollmentOperations.begin(),
+        clusterPairEnrollmentOperations.end(), [&](const auto& value) {
+          return value.pairUUID == authority.pairUUID && value.operationUUID == authority.pairOperationUUID;
+        });
+    return operation != clusterPairEnrollmentOperations.end() &&
+        operation->localAuthorityGeneration == authority.pairAuthorityGeneration &&
+        operation->initialProjectionDelivered && !operation->revocationRequested && !operation->projectionsWithdrawn;
+  }
+
   bool operator==(const ProdigyMasterAuthorityRuntimeState& other) const
   {
     if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || nextPendingElasticAddressOperationID != other.nextPendingElasticAddressOperationID || nextDNSIntentRevision != other.nextDNSIntentRevision || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || pendingAddMachinesProvisioningIntents.size() != other.pendingAddMachinesProvisioningIntents.size() || pendingAutonomousProvisioningOperations.size() != other.pendingAutonomousProvisioningOperations.size() || pendingElasticAddressAssignments.size() != other.pendingElasticAddressAssignments.size() || pendingElasticAddressReleases.size() != other.pendingElasticAddressReleases.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || statefulServingAuthorities.size() != other.statefulServingAuthorities.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || materializedStatefulRecoveryOperations.size() != other.materializedStatefulRecoveryOperations.size() || materializedStatefulRecoveryRetries.size() != other.materializedStatefulRecoveryRetries.size() || retainedStatefulRearmProofs.size() != other.retainedStatefulRearmProofs.size() || apiCredentialExpiryNotices.size() != other.apiCredentialExpiryNotices.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || taskExecutions.size() != other.taskExecutions.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf || updateSelfFollowerConcurrency != other.updateSelfFollowerConcurrency || updateSelfFollowerTransitionIssuedPeerKeys != other.updateSelfFollowerTransitionIssuedPeerKeys || updateSelfFollowerReadyPeerKeys != other.updateSelfFollowerReadyPeerKeys ||

@@ -40,6 +40,7 @@
 #include <prodigy/build.identity.h>
 #include <prodigy/bundle.artifact.h>
 #include <prodigy/container.contract.h>
+#include <prodigy/gateway.recovery.record.h>
 #include <prodigy/container.mesh.identity.h>
 #include <prodigy/cousin.session.h>
 #include <prodigy/declared.network.policy.h>
@@ -6131,30 +6132,6 @@ private:
     int64_t failureTimeMs = 0;
   };
 
-  static bool parseDecimal128(const char *text, uint128_t& value)
-  {
-    value = 0;
-    if (text == nullptr || *text == '\0')
-    {
-      return false;
-    }
-    constexpr uint128_t maximum = ~uint128_t(0);
-    for (const char *cursor = text; *cursor != '\0'; ++cursor)
-    {
-      if (*cursor < '0' || *cursor > '9')
-      {
-        return false;
-      }
-      uint8_t digit = uint8_t(*cursor - '0');
-      if (value > (maximum - digit) / 10)
-      {
-        return false;
-      }
-      value = value * 10 + digit;
-    }
-    return true;
-  }
-
   static bool readContainerLogAt(
       int rootFD,
       const String& relativePath,
@@ -6348,7 +6325,7 @@ private:
     const int64_t oldestFailureTimeMs = nowMs - failedContainerArtifactRetentionMs;
     ok &= forEachDirectoryName(applicationFD, [&](const char *containerName) {
       uint128_t containerUUID = 0;
-      if (parseDecimal128(containerName, containerUUID) == false ||
+      if (prodigyParseDecimal128(containerName, containerUUID) == false ||
           (operation.containerUUID != 0 && operation.containerUUID != containerUUID))
       {
         return;
@@ -6363,7 +6340,7 @@ private:
       }
       ok &= forEachDirectoryName(containerFD, [&](const char *failureTimeName) {
         uint128_t failureTime = 0;
-        if (parseDecimal128(failureTimeName, failureTime) && failureTime <= uint128_t(INT64_MAX) &&
+        if (prodigyParseDecimal128(failureTimeName, failureTime) && failureTime <= uint128_t(INT64_MAX) &&
             int64_t(failureTime) >= oldestFailureTimeMs && int64_t(failureTime) <= nowMs &&
             failedContainerArtifactBundleIsCompleteAt(containerFD, failureTimeName))
         {
@@ -7468,7 +7445,7 @@ private:
   }
 
   constexpr static uint64_t secureContainerResolveFlags =
-      RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS;
+      prodigySecureContainerResolveFlags;
 
   static bool validateContainerRelativePathComponent(const String& component, const String& fullPath, String *failureReport = nullptr)
   {
@@ -7654,59 +7631,7 @@ private:
     return true;
   }
 
-  // This root-owned record is consumed by a replacement binary, so its bytes
-  // cannot depend on compiler padding or host integer layout. All integers are
-  // big-endian and the reserved bytes must remain zero.
-  struct GatewayRecoveryRecord {
-    uint8_t version = 1;
-    uint8_t reserved[7] = {};
-    uint8_t containerUUID[16] = {}, pairUUID[16] = {};
-    uint8_t localClusterUUID[16] = {}, localMachineUUID[16] = {};
-    uint8_t keyEpoch[8] = {}, authorityGeneration[8] = {}, gatewayGeneration[8] = {};
-    char token[32] = {};
-  };
-  static_assert(sizeof(GatewayRecoveryRecord) == 128);
-
-  template <typename Integer, size_t N>
-  static void encodeGatewayRecoveryInteger(Integer value, uint8_t (&encoded)[N])
-  {
-    for (size_t i = N; i > 0; --i)
-    {
-      encoded[i - 1] = uint8_t(value & Integer(0xff));
-      value >>= 8;
-    }
-  }
-
-  static GatewayRecoveryRecord makeGatewayRecoveryRecord(const ContainerPlan& plan, const String& token)
-  {
-    GatewayRecoveryRecord record = {};
-    encodeGatewayRecoveryInteger(plan.uuid, record.containerUUID);
-    encodeGatewayRecoveryInteger(plan.system.gatewayPairUUID, record.pairUUID);
-    encodeGatewayRecoveryInteger(plan.system.gatewayLocalClusterUUID, record.localClusterUUID);
-    encodeGatewayRecoveryInteger(plan.system.gatewayLocalMachineUUID, record.localMachineUUID);
-    encodeGatewayRecoveryInteger(plan.system.gatewayKeyEpoch, record.keyEpoch);
-    encodeGatewayRecoveryInteger(plan.system.gatewayAuthorityGeneration, record.authorityGeneration);
-    encodeGatewayRecoveryInteger(plan.system.gatewayGeneration, record.gatewayGeneration);
-    memcpy(record.token, token.data(), sizeof(record.token));
-    return record;
-  }
-
-  static bool readGatewayRecoveryRecordFD(int fd, GatewayRecoveryRecord& record)
-  {
-    uint8_t *bytes = reinterpret_cast<uint8_t *>(&record);
-    size_t offset = 0;
-    while (offset < sizeof(record))
-    {
-      const ssize_t result = pread(fd, bytes + offset, sizeof(record) - offset, off_t(offset));
-      if (result > 0) { offset += size_t(result); continue; }
-      if (result < 0 && errno == EINTR) continue;
-      return false;
-    }
-    uint8_t trailing = 0;
-    return pread(fd, &trailing, 1, off_t(sizeof(record))) == 0;
-  }
-
-  static bool writeGatewayRecoveryRecordFD(int fd, const GatewayRecoveryRecord& record)
+  static bool writeGatewayRecoveryRecordFD(int fd, const ProdigyGatewayRecovery::GatewayRecoveryRecord& record)
   {
     const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&record);
     size_t offset = 0;
@@ -7728,10 +7653,7 @@ private:
 
   static bool gatewayRecoveryTokenValid(const String& token)
   {
-    if (token.size() != 32) return false;
-    for (uint64_t i = 0; i < token.size(); ++i)
-      if (!((token[i] >= '0' && token[i] <= '9') || (token[i] >= 'a' && token[i] <= 'f'))) return false;
-    return true;
+    return ProdigyGatewayRecovery::gatewayRecoveryTokenValid(token);
   }
 
   static void generateGatewayRecoveryToken(String& token)
@@ -7762,24 +7684,14 @@ private:
     return true;
   }
 
-  static bool gatewayRecoveryRecordMatches(const GatewayRecoveryRecord& record, const ContainerPlan& plan)
-  {
-    String storedToken = {};
-    storedToken.assign(record.token, sizeof(record.token));
-    if (record.version != 1 || !gatewayRecoveryTokenValid(storedToken)) return false;
-    for (uint8_t value : record.reserved) if (value != 0) return false;
-    const GatewayRecoveryRecord expected = makeGatewayRecoveryRecord(plan, storedToken);
-    return memcmp(&record, &expected, sizeof(record)) == 0;
-  }
-
   static bool gatewayRecoveryRecordFDMatches(int fd, const ContainerPlan& plan,
-                                             const GatewayRecoveryRecord& intended)
+                                             const ProdigyGatewayRecovery::GatewayRecoveryRecord& intended)
   {
     struct stat info = {};
-    GatewayRecoveryRecord existing = {};
+    ProdigyGatewayRecovery::GatewayRecoveryRecord existing = {};
     return fd >= 0 && fstat(fd, &info) == 0 && S_ISREG(info.st_mode) && info.st_uid == 0 &&
         (info.st_mode & 07777) == 0600 && info.st_size == off_t(sizeof(existing)) &&
-        readGatewayRecoveryRecordFD(fd, existing) && gatewayRecoveryRecordMatches(existing, plan) &&
+        ProdigyGatewayRecovery::readGatewayRecoveryRecordFD(fd, existing) && ProdigyGatewayRecovery::gatewayRecoveryRecordMatches(existing, plan) &&
         memcmp(existing.token, intended.token, sizeof(existing.token)) == 0;
   }
 
@@ -7789,7 +7701,7 @@ private:
     String name = {}; name.assignItoa(plan.uuid);
     int directoryFD = Filesystem::openDirectoryAt(rootFD, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC, secureContainerResolveFlags);
     if (directoryFD < 0) return false;
-    const GatewayRecoveryRecord record = makeGatewayRecoveryRecord(plan, token);
+    const ProdigyGatewayRecovery::GatewayRecoveryRecord record = ProdigyGatewayRecovery::makeGatewayRecoveryRecord(plan, token);
     struct stat prior = {}; if (fstatat(directoryFD, "masque-gateway-recovery.v1", &prior, AT_SYMLINK_NOFOLLOW) == 0) {
       int existingFD = openat(directoryFD, "masque-gateway-recovery.v1", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
       const bool identical = gatewayRecoveryRecordFDMatches(existingFD, plan, record);
@@ -7834,24 +7746,10 @@ private:
     const bool written = writeGatewayRecoveryRecordAt(rootFD, plan, token, failureReport); close(rootFD); return written;
   }
 
-  static bool readGatewayRecoveryRecordAt(int rootFD, const ContainerPlan& plan, String& token, String *failureReport = nullptr)
-  {
-    token.clear();
-    String name = {}; name.assignItoa(plan.uuid);
-    int directoryFD = Filesystem::openDirectoryAt(rootFD, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC, secureContainerResolveFlags);
-    if (directoryFD < 0) return false;
-    int fd = openat(directoryFD, "masque-gateway-recovery.v1", O_RDONLY | O_CLOEXEC | O_NOFOLLOW); close(directoryFD);
-    struct stat info = {}; GatewayRecoveryRecord record = {};
-    const bool ok = fd >= 0 && fstat(fd, &info) == 0 && S_ISREG(info.st_mode) && info.st_uid == 0 &&
-        (info.st_mode & 07777) == 0600 && info.st_size == off_t(sizeof(record)) &&
-        readGatewayRecoveryRecordFD(fd, record) && gatewayRecoveryRecordMatches(record, plan);
-    if (fd >= 0) close(fd); if (!ok) return false; token.assign(record.token, 32); return true;
-  }
-
   static bool readGatewayRecoveryRecord(const ContainerPlan& plan, String& token, String *failureReport = nullptr)
   {
     int rootFD = -1; if (!openContainerRuntimeRoot(rootFD, failureReport)) return false;
-    const bool read = readGatewayRecoveryRecordAt(rootFD, plan, token, failureReport); close(rootFD); return read;
+    const bool read = ProdigyGatewayRecovery::readGatewayRecoveryRecordAt(rootFD, plan, token); close(rootFD); return read;
   }
 
   static bool prepareContainerNeuronListener(Container *container, int& listenerFD, String *failureReport = nullptr)

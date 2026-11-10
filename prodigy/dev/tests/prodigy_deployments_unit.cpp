@@ -25,7 +25,7 @@
 
 class ContainerManagerGatewayRecoveryTestAccess {
 public:
-  using RecoveryRecord = ContainerManager::GatewayRecoveryRecord;
+  using RecoveryRecord = ProdigyGatewayRecovery::GatewayRecoveryRecord;
 
   static bool socketPath(uint128_t uuid, String& path)
   {
@@ -34,7 +34,7 @@ public:
 
   static bool tokenValid(const String& token)
   {
-    return ContainerManager::gatewayRecoveryTokenValid(token);
+    return ProdigyGatewayRecovery::gatewayRecoveryTokenValid(token);
   }
 
   static void generateToken(String& token)
@@ -54,7 +54,7 @@ public:
 
   static bool readRecordAt(int rootFD, const ContainerPlan& plan, String& token)
   {
-    return ContainerManager::readGatewayRecoveryRecordAt(rootFD, plan, token);
+    return ProdigyGatewayRecovery::readGatewayRecoveryRecordAt(rootFD, plan, token);
   }
 };
 
@@ -3270,6 +3270,22 @@ static void testGatewayRecoveryTokenRecord(TestSuite& suite)
   suite.expect(rootFD >= 0 && ContainerManagerGatewayRecoveryTestAccess::writeRecordAt(rootFD, plan, token) &&
                ContainerManagerGatewayRecoveryTestAccess::readRecordAt(rootFD, plan, observed) && observed == token,
                "gateway_recovery_record_exact_roundtrip");
+  plan.system.gatewayTunnelInterface = "mgw0"_ctv;
+  Vector<BrainReplicatedContainerRuntimeState> runtimes = {};
+  const auto matchesGateway = [&](const String& name) {
+    return ProdigyGatewayRecovery::matchesRetainedGatewayAt(rootFD, name, plan.system, runtimes);
+  };
+  suite.expect(matchesGateway("99123"_ctv) && !matchesGateway("099123"_ctv),
+               "recovery_census_identifies_exact_gateway_cgroup");
+  ++plan.system.gatewayAuthorityGeneration;
+  suite.expect(!matchesGateway("99123"_ctv), "recovery_census_rejects_stale_gateway_generation");
+  --plan.system.gatewayAuthorityGeneration;
+  BrainReplicatedContainerRuntimeState application = {};
+  application.plan.uuid = plan.uuid;
+  application.plan.config.applicationID = 1;
+  application.machineUUID = plan.system.gatewayLocalMachineUUID;
+  runtimes.push_back(application);
+  suite.expect(!matchesGateway("99123"_ctv), "recovery_census_preserves_application_with_colliding_uuid");
   struct stat record = {};
   suite.expect(stat((directory / "masque-gateway-recovery.v1").c_str(), &record) == 0 && record.st_uid == 0 &&
                (record.st_mode & 07777) == 0600, "gateway_recovery_record_root_0600");
