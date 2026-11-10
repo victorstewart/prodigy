@@ -1053,6 +1053,12 @@ static void testPairControlMasqueTransitContract(TestSuite& suite)
                    script.find("dev \"$device\" src \"$source\"") != std::string::npos &&
                    script.find("pair_control_validate_masque_inside") != std::string::npos,
                "pair_masque_provider_admits_one_journaled_udp_128_tuple_and_source_pinned_machine_route");
+  suite.expect(script.find("pair_control_masque_source_public6") != std::string::npos &&
+                   script.find("masque-router-source-public-route") != std::string::npos &&
+                   script.find("pair_control_masque_snat_present") != std::string::npos &&
+                   script.find("masque-router-snat-intent") != std::string::npos &&
+                   script.find("--to-source \"$pair_control_masque_destination_router\"") != std::string::npos,
+               "pair_masque_provider_derives_unique_connector_public_identity_and_journals_exact_reverse_snat");
   suite.expect(cpp.find("validatePairControlMasqueTransit") != std::string::npos &&
                    cpp.find("loadCrossClusterMasqueGateway(intent.pairUUID, localMachineUUID") != std::string::npos &&
                    cpp.find("local.localRole != CrossClusterMasqueGatewayRole::connector") != std::string::npos &&

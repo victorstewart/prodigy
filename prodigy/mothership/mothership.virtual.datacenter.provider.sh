@@ -2307,8 +2307,11 @@ pair_control_cleanup_inside()
             if [[ -e "/run/netns/$pair_control_router_ns" ]]; then
                [[ -f "$pair_control_dir/router-namespace" && ! -L "$pair_control_dir/router-namespace" &&
                   "$(stat -Lc %i "/run/netns/$pair_control_router_ns")" == "$(<"$pair_control_dir/router-namespace")" ]] &&
+                  pair_control_remove_masque_snat &&
                   pair_control_remove_service_route "$pair_control_router_ns" masque-router-destination-route \
                      "${pair_control_masque_destination_public6}/128" "$pair_control_masque_destination_private6" "${pair_control_masque_destination_side}0" || masque_cleanup=1
+               [[ "${masque_cleanup:-0}" != 1 ]] && pair_control_remove_service_route "$pair_control_router_ns" masque-router-source-public-route \
+                  "${pair_control_masque_source_public6}/128" "$pair_control_masque_source_private6" "${pair_control_masque_source_side}0" || masque_cleanup=1
             else
                # Recovery binds both surviving VDC parents into a fresh mount
                # namespace. The dead supervisor's private router is gone.
@@ -2539,14 +2542,18 @@ assert len(source_first)+len(source_second)==1 and len(destination_first)+len(de
 assert bool(source_first) != bool(destination_first)
 destination_nodes=second_nodes if source_first else first_nodes
 assert len([node for node in destination_nodes if ipaddress.IPv6Address(node['private6'])==destination and ipaddress.IPv6Address(node['public6'])==public])==1
+source_nodes=(first_nodes if source_first else second_nodes)
 node=(source_first if source_first else source_second)[0]
 assert isinstance(node.get('index'),int) and 1<=node['index']<=128
-print(('first' if source_first else 'second')+' '+str(node['index']))
+source_public=ipaddress.IPv6Address(node['public6'])
+assert source_public.compressed==node['public6'] and source_public != public
+assert len([candidate for candidate in source_nodes if ipaddress.IPv6Address(candidate['public6'])==source_public])==1
+print(('first' if source_first else 'second')+' '+str(node['index'])+' '+str(source_public))
 PAIR_CONTROL_MASQUE_SIDES
    )" || return 1
-   read -r pair_control_masque_source_side pair_control_masque_source_machine_index <<< "$side_index"
+   read -r pair_control_masque_source_side pair_control_masque_source_machine_index pair_control_masque_source_public6 <<< "$side_index"
    [[ ( "$pair_control_masque_source_side" == first || "$pair_control_masque_source_side" == second ) &&
-      "$pair_control_masque_source_machine_index" =~ ^[1-9][0-9]*$ ]] || return 1
+      "$pair_control_masque_source_machine_index" =~ ^[1-9][0-9]*$ && -n "$pair_control_masque_source_public6" ]] || return 1
    if [[ "$pair_control_masque_source_side" == first ]]; then
       pair_control_masque_destination_side=second
       pair_control_masque_source_router="$first_router"; pair_control_masque_destination_router="$second_router"
@@ -2858,6 +2865,11 @@ pair_control_install_masque_inside()
       "${pair_control_masque_destination_public6}/128" "$pair_control_masque_source_router" vdcbr0 || return 1
    pair_control_install_service_route "$pair_control_router_ns" masque-router-destination-route \
       "${pair_control_masque_destination_public6}/128" "$pair_control_masque_destination_private6" "${pair_control_masque_destination_side}0" || return 1
+   # The listener reply is reverse-SNATed to the connector's public identity.
+   # Its site can share the listener's synthetic /64, so a journaled /128 via
+   # the verified connector private endpoint must beat that connected route.
+   pair_control_install_service_route "$pair_control_router_ns" masque-router-source-public-route \
+      "${pair_control_masque_source_public6}/128" "$pair_control_masque_source_private6" "${pair_control_masque_source_side}0" || return 1
    # This route is the decisive override for the connector: its ordinary
    # public /64 connected route would otherwise issue NDP locally instead of
    # entering the Mothership-owned pair carrier.
@@ -2875,9 +2887,12 @@ pair_control_validate_masque_inside()
    pair_control_masque_bind_source_machine || return 1
    pair_control_service_route_journal_valid masque-source-route "${pair_control_masque_destination_public6}/128" "$pair_control_masque_source_router" vdcbr0 || return 1
    pair_control_service_route_journal_valid masque-router-destination-route "${pair_control_masque_destination_public6}/128" "$pair_control_masque_destination_private6" "${pair_control_masque_destination_side}0" || return 1
+   pair_control_service_route_journal_valid masque-router-source-public-route "${pair_control_masque_source_public6}/128" "$pair_control_masque_source_private6" "${pair_control_masque_source_side}0" || return 1
    pair_control_masque_machine_route_journal_valid masque-source-machine-route "${pair_control_masque_destination_public6}/128" "$pair_control_masque_source_router" bond0 "$pair_control_masque_source_private6" || return 1
    pair_control_service_route_exact "pc-$pair_control_masque_source_side" "${pair_control_masque_destination_public6}/128" "$pair_control_masque_source_router" vdcbr0 || return 1
    pair_control_service_route_exact "$pair_control_router_ns" "${pair_control_masque_destination_public6}/128" "$pair_control_masque_destination_private6" "${pair_control_masque_destination_side}0" || return 1
+   pair_control_service_route_exact "$pair_control_router_ns" "${pair_control_masque_source_public6}/128" "$pair_control_masque_source_private6" "${pair_control_masque_source_side}0" || return 1
+   pair_control_masque_snat_present || return 1
    pair_control_masque_machine_route_exact "$pair_control_masque_source_namespace" "${pair_control_masque_destination_public6}/128" "$pair_control_masque_source_router" bond0 "$pair_control_masque_source_private6"
 }
 
@@ -2940,8 +2955,10 @@ pair_control_firewall()
       pair_control_masque_side || return 1
       ip netns exec "$pair_control_router_ns" ip6tables -A FORWARD \
          -i "${pair_control_masque_source_side}0" -o "${pair_control_masque_destination_side}0" \
-         -s "$pair_control_masque_source_private6" -d "$pair_control_masque_destination_public6" \
+         -s "$pair_control_masque_source_public6" -d "$pair_control_masque_destination_public6" \
          -p udp --dport "$pair_control_masque_udp_port" -j ACCEPT || return 1
+      # Include the complete installed NAT and filter state in the receipt.
+      pair_control_install_masque_snat || return 1
    else
       masque_load=$?
       [[ "$masque_load" == 3 ]] || return 1
@@ -2951,6 +2968,78 @@ pair_control_firewall()
    digest="$(pair_control_firewall_digest)" || return 1
    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
    pair_write "$pair_control_dir/firewall-digest" "$digest"
+}
+
+# The carrier preserves the listener's public destination but translates only
+# this authenticated connector tuple to the router address on the listener's
+# private link.  Conntrack reverses that translation; the separately journaled
+# source-public /128 route then delivers the reply back to the connector.
+pair_control_masque_snat_expected()
+{
+   [[ "$#" -eq 0 ]] || return 2
+   printf 'POSTROUTING -o %s -s %s -d %s -p udp --dport %s SNAT %s\n' \
+      "${pair_control_masque_destination_side}0" "$pair_control_masque_source_public6" \
+      "$pair_control_masque_destination_public6" "$pair_control_masque_udp_port" "$pair_control_masque_destination_router"
+}
+
+pair_control_masque_snat_present()
+{
+   ip netns exec "$pair_control_router_ns" ip6tables -t nat -C POSTROUTING \
+      -o "${pair_control_masque_destination_side}0" -s "$pair_control_masque_source_public6" \
+      -d "$pair_control_masque_destination_public6" -p udp --dport "$pair_control_masque_udp_port" \
+      -j SNAT --to-source "$pair_control_masque_destination_router"
+}
+
+pair_control_install_masque_snat()
+{
+   local expected present owned=0
+   expected="$(pair_control_masque_snat_expected)" || return 1
+   if [[ -e "$pair_control_dir/masque-router-snat-intent" || -L "$pair_control_dir/masque-router-snat-intent" ]]; then
+      [[ -f "$pair_control_dir/masque-router-snat-intent" && ! -L "$pair_control_dir/masque-router-snat-intent" &&
+         "$(<"$pair_control_dir/masque-router-snat-intent")" == "$expected" ]] || return 1
+      owned=1
+   elif [[ -e "$pair_control_dir/masque-router-snat" || -L "$pair_control_dir/masque-router-snat" ]]; then
+      return 1
+   fi
+   if pair_control_masque_snat_present; then
+      [[ "$owned" == 1 ]] || return 1
+   else
+      present=$?
+      [[ "$present" == 1 ]] || return 1
+      [[ "$owned" == 1 ]] || pair_write "$pair_control_dir/masque-router-snat-intent" "$expected" || return 1
+      ip netns exec "$pair_control_router_ns" ip6tables -t nat -A POSTROUTING \
+         -o "${pair_control_masque_destination_side}0" -s "$pair_control_masque_source_public6" \
+         -d "$pair_control_masque_destination_public6" -p udp --dport "$pair_control_masque_udp_port" \
+         -j SNAT --to-source "$pair_control_masque_destination_router" || return 1
+      pair_control_masque_snat_present || return 1
+   fi
+   pair_write "$pair_control_dir/masque-router-snat" "$expected"
+}
+
+pair_control_remove_masque_snat()
+{
+   local expected present
+   [[ -e "$pair_control_dir/masque-router-snat-intent" || -L "$pair_control_dir/masque-router-snat-intent" ||
+      -e "$pair_control_dir/masque-router-snat" || -L "$pair_control_dir/masque-router-snat" ]] || return 0
+   expected="$(pair_control_masque_snat_expected)" || return 1
+   [[ -f "$pair_control_dir/masque-router-snat-intent" && ! -L "$pair_control_dir/masque-router-snat-intent" &&
+      "$(<"$pair_control_dir/masque-router-snat-intent")" == "$expected" ]] || return 1
+   if [[ -e "$pair_control_dir/masque-router-snat" || -L "$pair_control_dir/masque-router-snat" ]]; then
+      [[ -f "$pair_control_dir/masque-router-snat" && ! -L "$pair_control_dir/masque-router-snat" &&
+         "$(<"$pair_control_dir/masque-router-snat")" == "$expected" ]] || return 1
+   fi
+   if pair_control_masque_snat_present; then
+      ip netns exec "$pair_control_router_ns" ip6tables -t nat -D POSTROUTING \
+         -o "${pair_control_masque_destination_side}0" -s "$pair_control_masque_source_public6" \
+         -d "$pair_control_masque_destination_public6" -p udp --dport "$pair_control_masque_udp_port" \
+         -j SNAT --to-source "$pair_control_masque_destination_router" || return 1
+      if pair_control_masque_snat_present; then return 1; else present=$?; [[ "$present" == 1 ]] || return 1; fi
+   else
+      present=$?
+      # An owner may have persisted intent and then died before adding the
+      # rule.  Its absence is the completed no-op, as for owned route cleanup.
+      [[ "$present" == 1 ]] || return 1
+   fi
 }
 
 pair_control_serve()
