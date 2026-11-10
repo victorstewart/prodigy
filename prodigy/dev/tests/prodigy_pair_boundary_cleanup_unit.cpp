@@ -179,6 +179,7 @@ pair_control_service_side() { return 0; }
 pair_control_service_route_journal_valid() { [[ "$mode" != validation_fail ]]; }
 pair_control_service_route_exact() { [[ "$mode" != validation_fail ]]; }
 pair_control_remove_service_route() { [[ "$mode" != cleanup_fail ]]; }
+pair_control_load_masque_descriptor() { return 3; }
 pair_write() { printf '%s\n' "$2" > "$1"; }
 write_descriptor() { for _ in $(seq 1 13); do printf x; printf '\n'; done > "$pair_control_dir/service-descriptor"; }
 status_of() { if "$@"; then printf 0; else printf '%s' "$?"; fi; }
@@ -927,12 +928,14 @@ pair_control_netem_forget_removed_links
 # Exercise the actual supervisor/dead-owner cleanup integration as well as
 # the helpers. Namespace inventories below are only empty fixture files.
 pair_control_load_service_descriptor() { return 3; }
+pair_control_load_masque_descriptor() { return 3; }
 pair_control_service_path() { printf '%s/%s-%s' "$pair_control_dir" "$1" "$2"; }
 pair_control_remove_owned_link() {
   [[ "$failure:$1" != cleanup-link:second ]] || return 1
   rm -f "$PWD/state/pc-$1"
   if [[ "$1" == first ]]; then rm -f "$PWD/state/second0"; else rm -f "$PWD/state/first0"; fi
 }
+
 pair_link_presence() { [[ -e "$PWD/state/$1" ]] && return 0; return 1; }
 umount() { rm -f -- "$1"; }
 stat() { [[ "$*" == "-Lc %i $PWD/namespaces/pc-r-unit" ]] || return 1; printf 999; }
@@ -978,6 +981,86 @@ if pair_control_cleanup_inside; then exit 1; fi
   std::filesystem::remove_all(temporary, error);
 }
 
+static void testPairControlMasqueMachineRouteAbsent(TestSuite& suite)
+{
+  std::string sourcePath = __FILE__;
+  const size_t root = sourcePath.rfind("/dev/tests/");
+  suite.expect(root != std::string::npos, "pair_masque_route_fixture_locates_provider_owner");
+  if (root == std::string::npos) return;
+  sourcePath.resize(root);
+  sourcePath += "/mothership/mothership.virtual.datacenter.provider.sh";
+  std::ifstream source(sourcePath);
+  if (!source) { suite.expect(false, "pair_masque_route_fixture_reads_provider_owner"); return; }
+  const std::string text((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
+  const size_t begin = text.find("pair_control_masque_machine_route_exact()\n{\n");
+  const size_t end = text.find("\npair_control_masque_machine_route_journal_valid()\n", begin);
+  suite.expect(begin != std::string::npos && end != std::string::npos,
+               "pair_masque_route_fixture_extracts_exact_route_validator");
+  if (begin == std::string::npos || end == std::string::npos) return;
+
+  // Execute the production validator with a mocked read-only `ip` response.
+  // A clean [] is the expected state before the provider owns and installs its
+  // exact /128; it must be distinguishable from malformed JSON.
+  const std::string script = "set -euo pipefail\n" + text.substr(begin, end - begin) + R"TEST(
+mode=empty
+ip() {
+  [[ "$*" == "-n pcm-unit -j -6 route show exact 2001:db8:100::d/128" ]] || return 99
+  if [[ "$mode" == empty ]]; then printf '[]\n'; else printf '[{not-json}\n'; fi
+}
+check_status() {
+  local expected="$1" status=0
+  if pair_control_masque_machine_route_exact pcm-unit 2001:db8:100::d/128 fd00:10::1 bond0 fd00:10::a; then status=0; else status=$?; fi
+  [[ "$status" == "$expected" ]]
+}
+check_status 1
+mode=malformed
+check_status 2
+)TEST";
+  char temporary[] = "./pair-masque-route-unit.XXXXXX";
+  if (::mkdtemp(temporary) == nullptr) { suite.expect(false, "pair_masque_route_fixture_creates_directory"); return; }
+  String path = {}, failure = {};
+  mothershipVirtualDatacenterPath(String(temporary), "probe.sh", path);
+  const bool written = mothershipVirtualDatacenterWriteFile(path, String(script.c_str()), 0700, &failure);
+  const pid_t child = written ? ::fork() : -1;
+  if (child == 0) { if (::chdir(temporary) != 0) _exit(125); ::execl("/bin/bash", "bash", "probe.sh", static_cast<char *>(nullptr)); _exit(127); }
+  int status = 0; pid_t waited = -1;
+  if (child > 0) do { waited = ::waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+  suite.expect(written && child > 0 && waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+               "pair_masque_route_absence_is_installable_and_malformed_state_fails_closed");
+  std::error_code error;
+  std::filesystem::remove_all(temporary, error);
+}
+
+static void testPairControlMasqueTransitContract(TestSuite& suite)
+{
+  std::string sourcePath = __FILE__;
+  const size_t root = sourcePath.rfind("/dev/tests/");
+  suite.expect(root != std::string::npos, "pair_masque_fixture_locates_provider_owner");
+  if (root == std::string::npos) return;
+  sourcePath.resize(root);
+  const std::string providerPath = sourcePath + "/mothership/mothership.virtual.datacenter.provider.sh";
+  const std::string mothershipPath = sourcePath + "/mothership/mothership.cpp";
+  std::ifstream provider(providerPath), mothership(mothershipPath);
+  if (!provider || !mothership) { suite.expect(false, "pair_masque_fixture_reads_owned_sources"); return; }
+  const std::string script((std::istreambuf_iterator<char>(provider)), std::istreambuf_iterator<char>());
+  const std::string cpp((std::istreambuf_iterator<char>(mothership)), std::istreambuf_iterator<char>());
+  suite.expect(script.find("pair_control_parse_masque_args()") != std::string::npos &&
+                   script.find("-p udp --dport \"$pair_control_masque_udp_port\"") != std::string::npos &&
+                   script.find("${pair_control_masque_destination_public6}/128") != std::string::npos &&
+                   script.find("masque-source-machine-route") != std::string::npos &&
+                   script.find("pair_control_masque_bind_source_machine") != std::string::npos &&
+                   script.find("pair_control_masque_machine_route_exact") != std::string::npos &&
+                   script.find("dev \"$device\" src \"$source\"") != std::string::npos &&
+                   script.find("pair_control_validate_masque_inside") != std::string::npos,
+               "pair_masque_provider_admits_one_journaled_udp_128_tuple_and_source_pinned_machine_route");
+  suite.expect(cpp.find("validatePairControlMasqueTransit") != std::string::npos &&
+                   cpp.find("loadCrossClusterMasqueGateway(intent.pairUUID, localMachineUUID") != std::string::npos &&
+                   cpp.find("local.localRole != CrossClusterMasqueGatewayRole::connector") != std::string::npos &&
+                   cpp.find("peer.localRole != CrossClusterMasqueGatewayRole::listener") != std::string::npos &&
+                   cpp.find("action == \"masque\"_ctv") != std::string::npos,
+               "pair_masque_cli_derives_tuple_from_reciprocal_enrolled_authority");
+}
+
 int main()
 {
   TestSuite suite;
@@ -986,6 +1069,8 @@ int main()
   testPairControlFaultDirectionSelection(suite);
   testPairControlFaultEmitsOnlyFaultReceipt(suite);
   testPairControlNetemOwnershipAndCleanup(suite);
+  testPairControlMasqueMachineRouteAbsent(suite);
+  testPairControlMasqueTransitContract(suite);
   testPairDrainObservationParser(suite);
   testPairGuestResetFenceParser(suite);
   testPairGuestResetAbsenceProofFailsClosed(suite);

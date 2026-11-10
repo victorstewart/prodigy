@@ -31068,6 +31068,81 @@ LOCAL_RUNTIME
         mothershipPairControlBoundaryValid(boundary, &failure);
   }
 
+  // This is deliberately a one-tuple underlay admission, not a general VDC
+  // route.  The durable cross-cluster gateway authority is the sole source of
+  // the UDP listener; pair-control merely binds its two live VDC parents.
+  bool validatePairControlMasqueTransit(const MothershipClusterPairEnrollmentIntent& intent,
+                                        uint128_t localMachineUUID, uint128_t peerMachineUUID,
+                                        Vector<String>& arguments, String& failure)
+  {
+    arguments.clear();
+    CrossClusterMasqueGatewayAuthority local = {}, peer = {};
+    MothershipProdigyCluster source = {}, destination = {};
+    String sourceIdentity = {}, destinationIdentity = {};
+    {
+      auto registry = openClusterRegistry();
+      if (!registry.loadCrossClusterMasqueGateway(intent.pairUUID, localMachineUUID, local, &failure) ||
+          !registry.loadCrossClusterMasqueGateway(intent.pairUUID, peerMachineUUID, peer, &failure)) return false;
+      sourceIdentity.assignItoh(local.localClusterUUID); destinationIdentity.assignItoh(local.peerClusterUUID);
+      if (!registry.getClusterByIdentity(sourceIdentity, source, &failure) ||
+          !registry.getClusterByIdentity(destinationIdentity, destination, &failure)) return false;
+    }
+    if (local.state != CrossClusterMasqueGatewayState::active || peer.state != CrossClusterMasqueGatewayState::active ||
+        local.pairUUID != intent.pairUUID || peer.pairUUID != intent.pairUUID ||
+        local.pairOperationUUID != intent.operationUUID || peer.pairOperationUUID != intent.operationUUID ||
+        local.localRole != CrossClusterMasqueGatewayRole::connector || peer.localRole != CrossClusterMasqueGatewayRole::listener ||
+        local.localClusterUUID != source.clusterUUID || local.peerClusterUUID != destination.clusterUUID ||
+        peer.localClusterUUID != destination.clusterUUID || peer.peerClusterUUID != source.clusterUUID ||
+        local.localMachineUUID != localMachineUUID || local.peerMachineUUID != peerMachineUUID ||
+        peer.localMachineUUID != peerMachineUUID || peer.peerMachineUUID != localMachineUUID ||
+        !local.listenerPublicUDPEndpoint.equals(peer.listenerPublicUDPEndpoint) ||
+        local.listenerPublicUDPPort != peer.listenerPublicUDPPort || !local.listenerPublicUDPEndpoint.is6 ||
+        local.listenerPublicUDPPort == 0 || !mothershipClusterUsesVirtualDatacenter(source) ||
+        !mothershipClusterUsesVirtualDatacenter(destination) || source.test.enableFakeIpv4Boundary ||
+        destination.test.enableFakeIpv4Boundary)
+    { failure.assign("MASQUE transit requires one current reciprocal connector/listener authority on the enrolled plain-VDC pair"_ctv); return false; }
+
+    auto privateEndpoint = [&](const Vector<ClusterPairControlEndpoint>& endpoints, uint128_t machineUUID, IPAddress& out) {
+      uint32_t matches = 0;
+      for (const auto& endpoint : endpoints) if (endpoint.nodeUUID == machineUUID && endpoint.address.is6 && !endpoint.address.isNull()) { out = endpoint.address; ++matches; }
+      return matches == 1;
+    };
+    const auto& sourceEndpoints = source.clusterUUID == intent.firstClusterUUID ? intent.firstEndpoints : intent.secondEndpoints;
+    const auto& destinationEndpoints = destination.clusterUUID == intent.firstClusterUUID ? intent.firstEndpoints : intent.secondEndpoints;
+    IPAddress sourcePrivate = {}, destinationPrivate = {};
+    if (!privateEndpoint(sourceEndpoints, localMachineUUID, sourcePrivate) ||
+        !privateEndpoint(destinationEndpoints, peerMachineUUID, destinationPrivate))
+    { failure.assign("MASQUE transit gateway machine is not an exact enrolled private endpoint"_ctv); return false; }
+    uint32_t publicMatches = 0, localPublicCollisions = 0;
+    for (const auto& machine : destination.topology.machines) {
+      if (machine.uuid != peerMachineUUID) continue;
+      for (const auto& address : machine.addresses.publicAddresses) {
+        IPAddress parsed = {};
+        if (ClusterMachine::parseIPAddressLiteral(address.address, parsed) && parsed.equals(local.listenerPublicUDPEndpoint)) ++publicMatches;
+      }
+    }
+    for (const auto& machine : source.topology.machines)
+      for (const auto& address : machine.addresses.publicAddresses) {
+        IPAddress parsed = {};
+        if (ClusterMachine::parseIPAddressLiteral(address.address, parsed) && parsed.equals(local.listenerPublicUDPEndpoint)) ++localPublicCollisions;
+      }
+    if (publicMatches != 1 || localPublicCollisions != 0)
+    { failure.assign("MASQUE listener UDP endpoint is not a unique remote peer-machine address"_ctv); return false; }
+    MothershipPairControlBoundaryDescriptor boundary = intent.testControlBoundary;
+    if (!intent.testControlBoundaryAdmitted || intent.testControlBoundaryClosed ||
+        !mothershipPairControlBoundaryArguments(boundary, "query"_ctv, arguments, &failure)) return false;
+    arguments[1] = "masque"_ctv;
+    String sourceMachine = {}, destinationMachine = {}, sourceAddress = {}, destinationPrivateAddress = {}, listenerAddress = {}, port = {};
+    sourceMachine.assignItoh(localMachineUUID); destinationMachine.assignItoh(peerMachineUUID);
+    if (!ClusterMachine::renderIPAddressLiteral(sourcePrivate, sourceAddress) ||
+        !ClusterMachine::renderIPAddressLiteral(destinationPrivate, destinationPrivateAddress) ||
+        !ClusterMachine::renderIPAddressLiteral(local.listenerPublicUDPEndpoint, listenerAddress)) return false;
+    port.assignItoa(local.listenerPublicUDPPort);
+    arguments.push_back(sourceMachine); arguments.push_back(destinationMachine); arguments.push_back(sourceAddress);
+    arguments.push_back(destinationPrivateAddress); arguments.push_back(listenerAddress); arguments.push_back(port);
+    return true;
+  }
+
   void runTestClusterPairControl(int argc, char *argv[])
   {
     String failure = {}, action = {};
@@ -31075,11 +31150,15 @@ LOCAL_RUNTIME
     MothershipPairControlServiceTransit service = {};
     MothershipPairControlFault fault = {};
     TestPairLifecycleLock lock = {};
+    uint128_t masqueLocalMachineUUID = 0, masquePeerMachineUUID = 0;
     bool valid = argc >= 2 && argc <= 9 && prodigyParseCanonicalHex128(String(argv[0]), operationUUID) && operationUUID != 0;
     if (valid) action.assign(argv[1]);
-    valid = valid && (action == "prepare"_ctv || action == "query"_ctv || action == "remove"_ctv || action == "service"_ctv || action == "fault"_ctv);
+    valid = valid && (action == "prepare"_ctv || action == "query"_ctv || action == "remove"_ctv || action == "service"_ctv || action == "masque"_ctv || action == "fault"_ctv);
     if (valid && action == "service"_ctv)
       valid = argc == 3 && parsePairControlServiceTransitJSON(String(argv[2]), service, failure);
+    else if (valid && action == "masque"_ctv)
+      valid = argc == 4 && prodigyParseCanonicalHex128(String(argv[2]), masqueLocalMachineUUID) && masqueLocalMachineUUID != 0 &&
+          prodigyParseCanonicalHex128(String(argv[3]), masquePeerMachineUUID) && masquePeerMachineUUID != 0;
     else if (valid && action == "fault"_ctv)
     {
       String direction = {};
@@ -31122,8 +31201,14 @@ LOCAL_RUNTIME
         valid = registry.recordClusterPairTestControlServiceTransit(operationUUID, service, intent, &failure);
       }
     }
+    if (valid && action == "masque"_ctv)
+    {
+      Vector<String> arguments = {};
+      valid = validatePairControlMasqueTransit(intent, masqueLocalMachineUUID, masquePeerMachineUUID, arguments, failure) &&
+          mothershipRunVirtualDatacenterProvider(std::move(arguments), &failure);
+    }
 
-    if (valid && !(action == "remove"_ctv && intent.testControlBoundaryClosed))
+    if (valid && action != "masque"_ctv && !(action == "remove"_ctv && intent.testControlBoundaryClosed))
     {
       Vector<String> arguments = {};
       if (action == "prepare"_ctv)
@@ -31173,9 +31258,9 @@ LOCAL_RUNTIME
       if (::inet_ntop(AF_INET6, service.sourceWhiteholeAddress.v6, source, sizeof(source))) sourceAddress.assign(source);
       if (::inet_ntop(AF_INET6, service.destinationWormholeAddress.v6, destination, sizeof(destination))) destinationAddress.assign(destination);
     }
-    basics_log("testClusterPairControl success=%u action=%s operationUUID=%016llx%016llx service=%u faultDelayMs=%u faultDurationMs=%u faultDirection=%s source=%s:%u destination=%s:%u failure=%s\n",
+    basics_log("testClusterPairControl success=%u action=%s operationUUID=%016llx%016llx service=%u masque=%u faultDelayMs=%u faultDurationMs=%u faultDirection=%s source=%s:%u destination=%s:%u failure=%s\n",
         unsigned(valid), action.c_str(), (unsigned long long)(operationUUID >> 64),
-        (unsigned long long)operationUUID, unsigned(action == "service"_ctv), fault.delayMilliseconds, fault.durationMilliseconds,
+        (unsigned long long)operationUUID, unsigned(action == "service"_ctv), unsigned(action == "masque"_ctv), fault.delayMilliseconds, fault.durationMilliseconds,
         mothershipPairControlFaultDirectionName(fault.direction), sourceAddress.c_str(),
         unsigned(action == "service"_ctv ? service.sourceTCPPort : 0), destinationAddress.c_str(),
         unsigned(action == "service"_ctv ? service.destinationTCPPort : 0), failure.c_str());
@@ -39196,7 +39281,7 @@ int main(int argc, char *argv[])
     message.append("\tconfigurePair derives and stages both reciprocal enrolled-pair authorities before either readiness wait; an optional artifact blob is verified and stored as the dedicated gateway kind\n");
     message.append("transportCredentialLifecycle [clusterName|clusterUUID] [operationUUID canonical hex] [query|request brain|neuron rotate|revoke nodeUUID canonical hex]\n");
     message.append("\trequests a new epoch from the originating cluster, or observes both sides; clusters negotiate and finish autonomously\n");
-    message.append("testClusterPairControl [enrollment operationUUID canonical hex] [prepare|query|remove|service JSON|fault delayMs durationMs [both|first-to-second|second-to-first]]\n");
+    message.append("testClusterPairControl [enrollment operationUUID canonical hex] [prepare|query|remove|service JSON|masque CONNECTOR_MACHINE_UUID LISTENER_MACHINE_UUID|fault delayMs durationMs [both|first-to-second|second-to-first]]\n");
     message.append("\tmanages enrolled TCP control transit, up to two reciprocal permission-verified Whitehole-to-protected-Wormhole test flows, and a bounded directed partition fault\n");
     message.append("clusterReport [target: local|clusterName|clusterUUID]\n");
     message.append("\tfetches the current cluster-wide machine and application status report from the master brain\n");
