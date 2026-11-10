@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Qualify an already deployed, routed 2+1 Truth group on two Mothership test clusters."""
+"""Qualify an already deployed, routed Truth group on two or three Mothership test clusters."""
 
 import argparse
 from collections import Counter
@@ -14,7 +14,7 @@ def fields(line):
     return dict(re.findall(r"(\w+)=([^\s]+)", line))
 
 
-def probe_passed(report, logs, version):
+def probe_passed(report, logs, version, endpoints):
     # Only accept a receipt from a running container in this specific version.
     block = re.search(rf"(?ms)^\s*versionID: {version}\s*$\n(.*?)(?=^\s*versionID: |\Z)", report)
     if not block or not re.search(r"(?m)^\s*nHealthy: [1-9]\d*\s*$", block[1]):
@@ -25,7 +25,9 @@ def probe_passed(report, logs, version):
         if line.startswith("container="):
             row = fields(line)
             current = int(row["container"], 16) if row.get("state") == "running" else None
-        elif current in containers and line == "PASS truth.client.probe tokgen=16 pubidgen=14 stable-replay=identical distinct-endpoints=2":
+        elif current in containers and line == (
+                "PASS truth.client.probe tokgen=16 pubidgen=14 stable-replay=identical "
+                f"distinct-endpoints={endpoints}"):
             return True
     return False
 
@@ -41,7 +43,15 @@ def main():
     parser.add_argument("--probe-name", required=True, help="registered name of the lightweight Truth probe")
     parser.add_argument("--probe-plan", type=Path, required=True, help="stateless probe JSON with the first unused versionID")
     parser.add_argument("--probe-artifact", type=Path, required=True)
+    parser.add_argument("--sites", type=int, choices=(2, 3), default=2,
+                        help="initial voter-site topology (default: 2 for the existing 2+1 qualification)")
+    parser.add_argument("--probe-endpoints", type=int, choices=(1, 2), default=2,
+                        help="expected probe subscription count; 1 requires an artifact built with TRUTH_PROBE_MIN_ENDPOINTS=1")
     options = parser.parse_args()
+    if options.sites == 2 and options.probe_endpoints != 2:
+        parser.error("--probe-endpoints 1 is supported only with --sites 3")
+    if options.sites == 3 and options.probe_endpoints != 1:
+        parser.error("--sites 3 requires --probe-endpoints 1 and a TRUTH_PROBE_MIN_ENDPOINTS=1 probe artifact")
     plan = json.loads(options.probe_plan.read_text())
     version = plan["config"]["versionID"]
     if (plan["config"]["type"] != "ApplicationType::stateless" or not 0 < version < (1 << 48) - 2 or
@@ -91,7 +101,7 @@ def main():
                 raise RuntimeError("fault finished before a fresh generator write and replay completed")
             report = "\n".join(call("applicationReport", cluster, options.probe_name))
             logs = call("containerLogs", cluster, options.probe_name, "65536")
-            return probe_passed(report, logs, version)
+            return probe_passed(report, logs, version, options.probe_endpoints)
 
         wait_for(f"{phase}: probe version {version} committed both generators and replayed them through opposite endpoints",
                  ready, reconcile=False)
@@ -118,7 +128,7 @@ def main():
         return True
 
     # Read-only preflight. An unjoined singleton must never count as a passing
-    # 2+1 starting condition, even when the other two voters can already write.
+    # initial condition, even when the other two voters can already write.
     site, containers = inventory()
     if not site or len(containers) != 1:
         raise RuntimeError("fault target must report exactly one live Truth container")
@@ -126,8 +136,11 @@ def main():
     if not initial:
         raise RuntimeError("genesis member 1 cannot identify an elected writer")
     report, members, voters, live = initial
-    if len(voters) != 3 or len(members) != 3 or voters != live or sorted(Counter(m["cluster"] for m in members.values()).values()) != [1, 2]:
-        raise RuntimeError("preflight requires three communicating voters in a 2+1 placement")
+    initial_sites = {m["cluster"] for m in members.values()}
+    expected_distribution = [1, 2] if options.sites == 2 else [1, 1, 1]
+    if (len(voters) != 3 or len(members) != 3 or voters != live or
+            sorted(Counter(m["cluster"] for m in members.values()).values()) != expected_distribution):
+        raise RuntimeError(f"preflight requires three communicating voters in a {options.sites}-site placement")
     old = [i for i in voters if members[i]["cluster"] == site and members[i]["container"] in containers]
     if len(old) != 1:
         raise RuntimeError("fault target does not match the singleton in committed membership")
@@ -138,7 +151,11 @@ def main():
         raise RuntimeError("preflight requires the same committed configuration on all three voters")
 
     majority_site = "0x" + members[seed]["cluster"].removeprefix("0x")
-    run_probe(majority_site, "healthy pair")
+    if options.sites == 2:
+        run_probe(majority_site, "healthy pair")
+    else:
+        for probe_site in sorted(initial_sites):
+            run_probe("0x" + probe_site.removeprefix("0x"), f"healthy site {probe_site}")
 
     machines = [line.strip() for line in call("clusterReport", options.singleton)
                 if line.strip().startswith("Machine: state=")]
@@ -167,7 +184,11 @@ def main():
 
         wait_for("fault active: singleton voter unreachable before reconciliation", fault_active, reconcile=False)
 
-        run_probe(majority_site, "two surviving voters", fault)
+        if options.sites == 2:
+            run_probe(majority_site, "two surviving voters", fault)
+        else:
+            for probe_site in sorted({members[i]["cluster"] for i in survivors}):
+                run_probe("0x" + probe_site.removeprefix("0x"), f"surviving site {probe_site}", fault)
 
         def repaired():
             if fault.poll() is not None:
@@ -176,12 +197,16 @@ def main():
             if not current:
                 return None
             r, group, voting, reachable = current
-            if not (len(voting) == len(group) == 3 and survivors < voting and old not in group and
-                    voting == reachable and int(r["config"]) > int(report["config"]) and
-                    all(m["cluster"] != site for m in group.values())):
+            repaired_group = (len(voting) == len(group) == 3 and survivors < voting and old not in group and
+                              voting == reachable and int(r["config"]) > int(report["config"]))
+            if options.sites == 2:
+                repaired_group = repaired_group and all(m["cluster"] != site for m in group.values())
+            elif any(m["cluster"] == site for m in group.values()):
+                repaired_group = False
+            if not repaired_group:
                 return None
             return unanimous(voting, r) and voting
-        wait_for("majority committed three local voters during the outage", repaired)
+        wait_for("majority committed a replacement voter during the outage", repaired)
     finally:
         # Mothership owns restoration of the bounded fault even on failure.
         fault.wait(timeout=options.outage_ms / 1000 + 60)
@@ -196,15 +221,21 @@ def main():
         observed_site, active = inventory()
         remote = [(i, m) for i, m in group.items() if i in voting and m["cluster"] == site]
         local = [(i, m) for i, m in group.items() if i in voting and m["cluster"] != site]
+        expected_return_distribution = [1, 2] if options.sites == 2 else [1, 1, 1]
         if not (observed_site == site and len(remote) == 1 and len(voting) == len(group) == 3 and
                 len(local) == 2 and voting == reachable and old not in group and remote[0][0] != old and
                 remote[0][1]["caughtUp"] == "1" and remote[0][1]["container"] not in containers and
                 active == {remote[0][1]["container"]} and
-                sorted(Counter(member["cluster"] for _, member in remote + local).values()) == [1, 2]):
+                sorted(Counter(member["cluster"] for _, member in remote + local).values()) == expected_return_distribution and
+                (options.sites == 2 or {member["cluster"] for member in group.values()} == initial_sites)):
             return None
         return unanimous(voting, r)
-    wait_for("return restored 2+1 with a fresh caught-up remote voter and retired the old UUID", returned)
-    run_probe(majority_site, "restored pair")
+    wait_for(f"return restored {options.sites}-site placement with a fresh caught-up remote voter and retired the old UUID", returned)
+    if options.sites == 2:
+        run_probe(majority_site, "restored pair")
+    else:
+        for probe_site in sorted(initial_sites):
+            run_probe("0x" + probe_site.removeprefix("0x"), f"restored site {probe_site}")
 
 
 if __name__ == "__main__":
