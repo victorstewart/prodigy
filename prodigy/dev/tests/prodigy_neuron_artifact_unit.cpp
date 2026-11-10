@@ -31,7 +31,7 @@ public:
 
   static bool readRecordAt(int rootFD, const ContainerPlan& plan, String& token)
   {
-    return ContainerManager::readGatewayRecoveryRecordAt(rootFD, plan, token);
+    return ProdigyGatewayRecovery::readGatewayRecoveryRecordAt(rootFD, plan, token);
   }
 };
 
