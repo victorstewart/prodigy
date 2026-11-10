@@ -123,7 +123,9 @@ enum class MothershipTopic : uint16_t {
   repairLocalBundleRecoveryWitness,
   // Desired-only Truth membership projection.  An old Brain rejects it; this
   // frame never grants a writer or installs a Raft voting configuration.
-  commitTruthGlobalMembership
+  commitTruthGlobalMembership,
+  truthPlacement,
+  truthGlobalControl
 };
 
 constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
@@ -272,6 +274,10 @@ constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
       return "repairLocalBundleRecoveryWitness";
     case MothershipTopic::commitTruthGlobalMembership:
       return "commitTruthGlobalMembership";
+    case MothershipTopic::truthPlacement:
+      return "truthPlacement";
+    case MothershipTopic::truthGlobalControl:
+      return "truthGlobalControl";
   }
 
   return "unknown";
@@ -410,7 +416,8 @@ enum class NeuronTopic : uint16_t {
   nametagQualificationReplay,
   nametagQualificationWriterIsolation,
   nametagQualificationSeedFault,
-  nametagQualificationMachineBoot
+  nametagQualificationMachineBoot,
+  truthGlobalControl
 };
 
 enum class ContainerTopic : uint16_t {
@@ -452,6 +459,7 @@ enum class ContainerTopic : uint16_t {
   nametagQualificationCousinTransport,
   nametagQualificationReplay,
   nametagQualificationSeedFault,
+  truthGlobalControl
 };
 
 enum class PulseTopic : uint16_t {

@@ -16,17 +16,24 @@ public:
 
   uint128_t meshAddress; // container-network IPv6, used for all subscriptions and advertisements
 
-  void setMeshAddress(const struct container_network_subnet6_prefix& subnet, uint8_t datacenterFragment, uint32_t machineFragment, uint8_t containerFragment)
+  static uint128_t addressForFragment(const struct container_network_subnet6_prefix& subnet, uint8_t datacenterFragment, uint32_t machineFragment, uint8_t containerFragment)
   {
     // Assemble IPv6 address bytes: 11-byte container-network prefix, 1-byte datacenter fragment,
     // 3-byte machine fragment, 1-byte container fragment.
-    uint8_t *p = reinterpret_cast<uint8_t *>(&meshAddress);
+    uint128_t address = 0;
+    uint8_t *p = reinterpret_cast<uint8_t *>(&address);
     memcpy(p + 0, subnet.value, 11);
     p[11] = datacenterFragment;
     p[12] = static_cast<uint8_t>((machineFragment >> 16) & 0xFF);
     p[13] = static_cast<uint8_t>((machineFragment >> 8) & 0xFF);
     p[14] = static_cast<uint8_t>(machineFragment & 0xFF);
     p[15] = containerFragment;
+    return address;
+  }
+
+  void setMeshAddress(const struct container_network_subnet6_prefix& subnet, uint8_t datacenterFragment,
+                      uint32_t machineFragment, uint8_t containerFragment) {
+    meshAddress = addressForFragment(subnet,datacenterFragment,machineFragment,containerFragment);
   }
 
   virtual uint128_t pairingAddress(void) const

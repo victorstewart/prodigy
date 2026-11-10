@@ -4014,6 +4014,20 @@ public:
 
   uint32_t desiredReplicaCountForShardGroup(uint32_t shardGroup) const
   {
+    // A global Truth deployment is a set of exact local incarnations, not a
+    // three-replica autoscaling group.  A site with no current voter/learner
+    // owns no local target (a retired-only projection is intentionally zero).
+    if (thisBrain && plan.config.applicationID == MeshRegistry::Truth::applicationID) {
+      TruthGlobalMembershipProjection group;
+      if (thisBrain->desiredTruthGlobalMembership(plan.config.deploymentID(), group) &&
+          group.protocolVersion != 0 && prodigyTruthGlobalMembershipProjectionValid(group)) {
+        if (shardGroup != 0) return 0;
+        uint32_t local = 0;
+        for (const auto& member : group.members)
+          if (member.clusterUUID == group.localClusterUUID) ++local;
+        return local;
+      }
+    }
     uint32_t replicas = 0;
     if (thisBrain && thisBrain->desiredStatefulReplicaCount(plan.config.deploymentID(), shardGroup, replicas)) return replicas;
     bool keepBlueAndGreen = (statefulWorkerTopologyUpgradeLocksShardGroup(shardGroup) && statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::greenBootstrap);
@@ -4446,6 +4460,115 @@ private:
   }
 
 public:
+
+  // Called by Brain only after the membership projection (and, for a
+  // retirement, its committed Raft-removal proof) is durable.  This is not an
+  // election path: it materializes exactly the control-plane binding and lets
+  // the ordinary construct/destruct owner reserve resources and launch it.
+  bool reconcileTruthPlacement(const TruthGlobalMembershipProjection& current,
+                               const TruthGlobalMember* retired = nullptr)
+  {
+    if (thisBrain == nullptr || plan.config.applicationID != MeshRegistry::Truth::applicationID ||
+        current.deploymentID != plan.config.deploymentID() || current.localClusterUUID != thisBrain->brainConfig.clusterUUID ||
+        prodigyTruthGlobalMembershipProjectionValid(current) == false) return false;
+
+    bool changed = false;
+    auto incomplete = [&]() -> bool {
+      // Earlier exact constructions remain owned by the ordinary scheduler.
+      // Start them before asking Brain to retry the still-missing binding.
+      if (changed) schedule();
+      return false;
+    };
+    for (const TruthGlobalMember& member : current.members)
+    {
+      if (member.clusterUUID != current.localClusterUUID) continue;
+      uint128_t address = 0;
+      std::memcpy(&address, member.privateIPv6.v6, sizeof(address));
+      auto existing = thisBrain->containers.find(member.containerUUID);
+      if (existing != thisBrain->containers.end())
+      {
+        ContainerView* container = existing->second;
+        if (container == nullptr || container->deploymentID != plan.config.deploymentID() ||
+            container->shardGroup != 0 || (container->truthMemberID && container->truthMemberID != member.memberID) ||
+            (container->meshAddress != address && container->requiredTruthMeshAddress != address)) return incomplete();
+        continue;
+      }
+
+      Machine* selected = nullptr;
+      const uint8_t* endpoint = reinterpret_cast<const uint8_t*>(&address);
+      for (Machine* machine : thisBrain->machines)
+      {
+        if (prodigyMachineReadyForScheduling(machine) == false ||
+            endpoint[11] != thisBrain->brainConfig.datacenterFragment ||
+            endpoint[12] != uint8_t(machine->fragment >> 16) || endpoint[13] != uint8_t(machine->fragment >> 8) ||
+            endpoint[14] != uint8_t(machine->fragment) || nFitOnMachine(this, machine, 1, {}) == 0) continue;
+        selected = machine;
+        break;
+      }
+      if (selected == nullptr || selected->claimContainerFragment(endpoint[15]) == false) return incomplete();
+
+      Vector<uint32_t> gpuMemory = {};
+      Vector<AssignedGPUDevice> gpuDevices = {};
+      if (prodigyTakeAssignedGPUsForScheduling(selected, nullptr, nullptr, plan.config, gpuMemory, gpuDevices) == false)
+      {
+        selected->relinquishContainerFragment(endpoint[15]);
+        return incomplete();
+      }
+      prodigyDebitMachineScalarResources(selected, plan.config, 1);
+      nDeployedBase += 1;
+      countPerMachine[selected] += 1;
+      countPerRack[selected->rack] += 1;
+      ContainerView* container = constructOnMachine(selected, ApplicationLifetime::base, std::move(gpuMemory), std::move(gpuDevices), member.containerUUID);
+      container->shardGroup = 0;
+      containersByShardGroup.insert(0, container);
+      container->explicitStatefulMeshRoles = statefulMeshRolesForShardGroup(0);
+      prodigyPopulateDefaultStatefulTopology(container->explicitStatefulTopology, 0, plan.config);
+      container->fragment = endpoint[15];
+      container->requiredTruthMeshAddress = address;
+      container->truthMemberID = member.memberID;
+      toSchedule.push_back(planStatefulConstruction(selected, container, DataStrategy::genesis));
+      changed = true;
+    }
+
+    if (retired != nullptr && retired->clusterUUID == current.localClusterUUID &&
+        std::find(current.retiredMemberIDs.begin(), current.retiredMemberIDs.end(), retired->memberID) != current.retiredMemberIDs.end())
+    {
+      if (std::any_of(current.members.begin(), current.members.end(), [&](const auto& active) {
+        return active.containerUUID == retired->containerUUID || active.privateIPv6.equals(retired->privateIPv6);
+      })) return incomplete();
+      uint128_t retiredAddress = 0;
+      std::memcpy(&retiredAddress, retired->privateIPv6.v6, sizeof(retiredAddress));
+      auto found = thisBrain->containers.find(retired->containerUUID);
+      if (found != thisBrain->containers.end() && found->second != nullptr)
+      {
+        ContainerView* container = found->second;
+        if (container->deploymentID != plan.config.deploymentID() ||
+            (container->meshAddress != retiredAddress && container->requiredTruthMeshAddress != retiredAddress) ||
+            (container->truthMemberID != 0 && container->truthMemberID != retired->memberID)) return false;
+        if (containers.contains(container) && container->plannedWork == nullptr &&
+            container->state != ContainerState::destroyed && container->state != ContainerState::destroying)
+        {
+          toSchedule.push_back(planStatefulDestruction(container));
+          changed = true;
+        }
+        else if (container->state == ContainerState::destroying && container->plannedWork == nullptr)
+        {
+          // The ordinary destruction owner keeps this exact view alive until
+          // Neuron has acknowledged the terminal kill.  A Mothership retry is
+          // therefore allowed to repeat that idempotent kill, but must neither
+          // create another destruction work item nor infer completion from the
+          // local state transition alone.
+          auto waiting = waitingOnContainers.find(container);
+          if (waiting == waitingOnContainers.end() || waiting->second != ContainerState::destroyed ||
+              container->machine == nullptr || BrainBase::neuronControlStreamActive(container->machine) == false)
+            return false;
+          queueSend(container->machine, NeuronTopic::killContainer, container->uuid);
+        }
+      }
+    }
+    if (changed) schedule();
+    return true;
+  }
 
   // Calculate declarations on detached views. Preparing authority must not
   // publish pairings, change the live master map, or mutate runtime state.
@@ -10335,7 +10458,22 @@ public:
             container->state = ContainerState::scheduled;
             container->remainingSubscriberCapacity = plan.minimumSubscriberCapacity;
 
-            container->fragment = machine->getContainerFragment();
+            if (container->requiredTruthMeshAddress)
+            {
+              const uint8_t *expected = reinterpret_cast<const uint8_t *>(&container->requiredTruthMeshAddress);
+              const uint8_t *prefix = container_network_subnet6.value;
+              if (std::memcmp(expected, prefix, 11) != 0 ||
+                  expected[11] != thisBrain->brainConfig.datacenterFragment ||
+                  expected[12] != uint8_t(machine->fragment >> 16) ||
+                  expected[13] != uint8_t(machine->fragment >> 8) ||
+                  expected[14] != uint8_t(machine->fragment) ||
+                  container->fragment != expected[15])
+              {
+                basics_log("Truth placement endpoint no longer matches its allocated machine fragment\n");
+                return;
+              }
+            }
+            else container->fragment = machine->getContainerFragment();
             if (container->fragment == 0)
             {
               basics_log("container fragment allocation returned reserved fragment zero\n");
@@ -10344,6 +10482,7 @@ public:
             container->setMeshAddress(container_network_subnet6, thisBrain->brainConfig.datacenterFragment, machine->fragment, container->fragment);
             container->addresses.clear();
             container->addresses.emplace_back(container->meshAddress, uint8_t(128));
+            container->requiredTruthMeshAddress = 0;
             container->wormholes = plan.wormholes;
             container->networkAccess = plan.networkAccess;
 
@@ -10731,6 +10870,65 @@ public:
   // this calculates a deployment of an application over a cluster, including transitioning from the last version(s) to this most recent
   void architect(CoroutineStack *coro, bool onlyMeasure, bool allowCompactionForScheduling = true, bool allowNewMachinesForScheduling = true)
   {
+    // Global Truth membership is an exact durable placement, not an
+    // autoscaling target. Brain invokes reconcileTruthPlacement() after the
+    // projection commit; ordinary architecting must never create an unbound
+    // voter or learner in the meantime.
+    if (plan.config.applicationID == MeshRegistry::Truth::applicationID && thisBrain) {
+      TruthGlobalMembershipProjection group;
+      if (thisBrain->desiredTruthGlobalMembership(plan.config.deploymentID(),group) && group.protocolVersion != 0) {
+        if (!prodigyTruthGlobalMembershipProjectionValid(group)) co_return;
+        if (!onlyMeasure) {
+          // reconcileTruthPlacement() owns exact UUID/address construction and
+          // schedules it itself. Do not fall into generic architecting, which
+          // would create unbound replicas or requeue this same dispatch.
+          (void)reconcileTruthPlacement(group);
+          co_return;
+        }
+        // Capacity reporting must test the assigned member endpoint, not an
+        // arbitrary scheduler candidate. This mutates only temporary deltas;
+        // the surrounding measure transaction restores normal target state.
+        uint32_t localTarget = 0, fitted = 0;
+        bytell_hash_map<Machine *, MachineResourcesDelta> deltas;
+        for (const auto& member : group.members) {
+          if (member.clusterUUID != group.localClusterUUID) continue;
+          ++localTarget;
+          uint128_t address = 0;
+          std::memcpy(&address, member.privateIPv6.v6, sizeof(address));
+          const uint8_t* endpoint = reinterpret_cast<const uint8_t*>(&address);
+          auto existing = thisBrain->containers.find(member.containerUUID);
+          if (existing != thisBrain->containers.end()) {
+            ContainerView* container = existing->second;
+            if (!container || container->deploymentID != plan.config.deploymentID() || container->shardGroup != 0 ||
+                (container->truthMemberID && container->truthMemberID != member.memberID) || container->machine == nullptr ||
+                (container->meshAddress != address && container->requiredTruthMeshAddress != address) ||
+                container->fragment != endpoint[15]) break;
+            ++fitted;
+            continue;
+          }
+          Machine* selected = nullptr;
+          for (Machine* machine : thisBrain->machines) {
+            if (!prodigyMachineReadyForScheduling(machine) || !machine->containerFragmentAvailable(endpoint[15]) ||
+                endpoint[11] != thisBrain->brainConfig.datacenterFragment ||
+                endpoint[12] != uint8_t(machine->fragment >> 16) || endpoint[13] != uint8_t(machine->fragment >> 8) ||
+                endpoint[14] != uint8_t(machine->fragment) || nFitOnMachine(this, machine, 1, deltas[machine]) == 0) continue;
+            selected = machine;
+            break;
+          }
+          if (!selected) break;
+          Vector<uint32_t> gpuMemory = {};
+          Vector<AssignedGPUDevice> gpuDevices = {};
+          if (!prodigyTakeAssignedGPUsForScheduling(selected, nullptr, &deltas[selected], plan.config, gpuMemory, gpuDevices)) break;
+          prodigyApplyPlannedMachineScalarDelta(deltas[selected], plan.config, 1);
+          ++fitted;
+        }
+        nShardGroups = 1;
+        nTargetBase = localTarget;
+        nTargetSurge = nTargetCanary = 0;
+        nDeployedBase = fitted;
+        co_return;
+      }
+    }
     if (plan.isStateful)
     {
       prodigyLogDeployHeapSnapshot(

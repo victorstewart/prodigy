@@ -339,7 +339,71 @@ static void assignFixtureBootstrapSSHKeyPackage(MothershipProdigyCluster& cluste
   }
 }
 
-int main(void)
+static void testTruthRegistry(TestSuite& suite, const String& directory)
+{
+  MothershipTruthGroup state{};
+  auto& group = state.group;
+  group.genesisMemberIDs = {1, 2, 3};
+  group.highestAllocatedMemberID = 3;
+  group.membershipUUID = 71;
+  group.operationUUID = 72;
+  group.deploymentID = (uint64_t(10) << 48) | 8;
+  group.localClusterUUID = 73;
+  group.generation = group.expectedCommittedConfigIndex = 1;
+  state.graceMs = 5000;
+  state.sites = {73, 74};
+  for (int32_t id : group.genesisMemberIDs) {
+    TruthGlobalMember member{};
+    member.memberID = id;
+    member.clusterUUID = id == 2 ? 74 : 73;
+    member.containerUUID = 100 + id;
+    member.privateIPv6 = IPAddress(uint128_t(id));
+    group.members.push_back(member);
+  }
+  String path, failure;
+  path.snprintf<"{}/truth"_ctv>(directory);
+  suite.expect(prodigyTruthCommittedConfigDigest(group.membershipUUID, group.deploymentID, 1,
+      group.members, group.expectedCommittedConfigSHA256), "Truth genesis digest");
+  MothershipTruthGrant grant{};
+  grant.membershipUUID = group.membershipUUID;
+  grant.operationUUID = group.operationUUID;
+  grant.deploymentID = group.deploymentID;
+  grant.localClusterUUID = group.localClusterUUID;
+  grant.memberID = group.members.front().memberID;
+  grant.containerUUID = group.members.front().containerUUID;
+  grant.bootNonce = 75;
+  {
+    MothershipClusterRegistry registry(path);
+    suite.expect(registry.saveTruthGroup(0, state, &failure) && state.revision == 1, "Truth durable genesis");
+    auto wrong = grant;
+    ++wrong.operationUUID;
+    suite.expect(!registry.recordTruthGrantBeforeDispatch(wrong, &failure), "Truth rejects mismatched first grant");
+    suite.expect(registry.recordTruthGrantBeforeDispatch(grant, &failure), "Truth persists exact grant before send");
+  }
+  {
+    MothershipClusterRegistry reopened(path);
+    MothershipTruthGroup recovered;
+    suite.expect(reopened.loadTruthGroup(recovered, &failure) && recovered.revision == 1 &&
+        recovered.group.members.size() == 3 && recovered.sites == state.sites, "Truth 2+1 group survives reopen");
+    suite.expect(reopened.recordTruthGrantBeforeDispatch(grant, &failure), "Truth exact grant retry after reopen");
+    ++grant.bootNonce;
+    suite.expect(!reopened.recordTruthGrantBeforeDispatch(grant, &failure), "Truth consumed grant fences empty replacement disk");
+    suite.expect(reopened.saveTruthGroup(1, recovered, &failure) && !reopened.saveTruthGroup(1, state, &failure),
+        "Truth stale registry writer rejected");
+    MothershipApplicationPlacement placement;
+    bool resumed = false;
+    suite.expect(!reopened.admitApplicationPlacement(10, group.localClusterUUID, group.expectedCommittedConfigSHA256,
+        placement, resumed, &failure), "Truth global group fences legacy singleton");
+  }
+  path.snprintf<"{}/truth-legacy"_ctv>(directory);
+  MothershipClusterRegistry legacy(path);
+  MothershipApplicationPlacement placement;
+  bool resumed = false;
+  suite.expect(legacy.admitApplicationPlacement(10, group.localClusterUUID, group.expectedCommittedConfigSHA256,
+      placement, resumed, &failure) && !legacy.saveTruthGroup(0, state, &failure), "Truth legacy singleton fences new group");
+}
+
+int main(int argc, char** argv)
 {
   TestSuite suite;
 
@@ -353,6 +417,11 @@ int main(void)
 
   String dbPath;
   dbPath.assign(created);
+  testTruthRegistry(suite, dbPath);
+  if (argc == 2 && std::strcmp(argv[1], "--truth") == 0) {
+    std::filesystem::remove_all(created);
+    return suite.failed ? EXIT_FAILURE : EXIT_SUCCESS;
+  }
   String pathFaultReopenPath;
   ProdigyCrossClusterPathFaultGatewayLifecycleRecord pathFaultReopenExpected = {};
   bool pathFaultReopenExpectedRecorded = false;

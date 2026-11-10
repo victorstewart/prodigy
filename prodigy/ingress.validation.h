@@ -277,6 +277,10 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
 
   switch (MothershipTopic(rawTopic))
   {
+    case MothershipTopic::commitTruthGlobalMembership:
+    case MothershipTopic::truthPlacement:
+    case MothershipTopic::truthGlobalControl:
+      return consumeVariableBounded(cursor, terminal, 16 * 1024) && cursor == terminal;
     case MothershipTopic::statefulDataAuthority:
       return consumeVariableBounded(cursor, terminal, 2 * 1024 * 1024) &&
              (cursor == terminal || consumeVariable(cursor, terminal)) && cursor == terminal;
@@ -768,6 +772,8 @@ static bool validateNeuronPayloadForBrain(uint16_t rawTopic, uint8_t *args, uint
 
   switch (NeuronTopic(rawTopic))
   {
+    case NeuronTopic::truthGlobalControl:
+      return consumeVariableBounded(cursor, terminal, 16 * 1024) && cursor == terminal;
     case NeuronTopic::nametagQualificationMachineBoot:
       return consumeVariableBounded(cursor, terminal, 1024) && cursor == terminal;
     case NeuronTopic::crossClusterPathFault:
@@ -1077,6 +1083,12 @@ static bool validateNeuronPayloadForNeuron(uint16_t rawTopic, uint8_t *args, uin
 
   switch (NeuronTopic(rawTopic))
   {
+    case NeuronTopic::truthGlobalControl:
+      {
+        uint128_t containerUUID = 0;
+        return extractFixed(cursor, terminal, containerUUID) && containerUUID != 0 &&
+            consumeVariableBounded(cursor, terminal, 16 * 1024) && cursor == terminal;
+      }
     case NeuronTopic::nametagQualificationMachineBoot:
       return consumeVariableBounded(cursor, terminal, 1024) && cursor == terminal;
     case NeuronTopic::crossClusterPathFault:
@@ -1472,6 +1484,8 @@ static bool validateContainerPayloadForNeuron(uint16_t rawTopic, uint8_t *args, 
 
   switch (ContainerTopic(rawTopic))
   {
+    case ContainerTopic::truthGlobalControl:
+      return consumeVariableBounded(cursor, terminal, 16 * 1024) && cursor == terminal;
     case ContainerTopic::nametagQualificationCousinTransport:
     case ContainerTopic::nametagQualificationReplay:
     case ContainerTopic::nametagQualificationSeedFault:
@@ -1543,6 +1557,8 @@ static bool validateContainerPayloadForHub(uint16_t rawTopic, uint8_t *args, uin
 
   switch (ContainerTopic(rawTopic))
   {
+    case ContainerTopic::truthGlobalControl:
+      return consumeVariableBounded(cursor, terminal, 16 * 1024) && cursor == terminal;
     case ContainerTopic::nametagQualificationCousinTransport:
     case ContainerTopic::nametagQualificationReplay:
     case ContainerTopic::nametagQualificationSeedFault:

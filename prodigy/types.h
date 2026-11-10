@@ -11872,7 +11872,7 @@ static inline bool prodigyTruthGlobalMembershipProjectionValid(const TruthGlobal
         std::any_of(v.members.begin(), v.members.end(), [retired](const auto& m) { return m.memberID == retired; })) return false;
     prior = retired;
   }
-  if (!local) return false;
+  if (!local && v.retiredMemberIDs.empty()) return false;
   if (voters == 3) return v.members.size() == 3 || v.replacementPending;
   // The old voter has been removed and the caught-up learner is awaiting
   // promotion. Both remaining voters must participate in this transition.
@@ -11882,7 +11882,7 @@ static inline bool prodigyTruthGlobalMembershipProjectionValid(const TruthGlobal
 // vote by changing the binding in a newer launch plan.
 static inline bool prodigyTruthMembershipSuccessor(const TruthGlobalMembershipProjection& old,
                                                    const TruthGlobalMembershipProjection& next) {
-  if (old.membershipUUID != next.membershipUUID || old.localClusterUUID != next.localClusterUUID ||
+  if (old.membershipUUID != next.membershipUUID || old.operationUUID != next.operationUUID || old.localClusterUUID != next.localClusterUUID ||
       old.deploymentID != next.deploymentID || old.genesisMemberIDs != next.genesisMemberIDs ||
       next.highestAllocatedMemberID < old.highestAllocatedMemberID ||
       next.generation < old.generation || next.expectedCommittedConfigIndex < old.expectedCommittedConfigIndex ||
@@ -11918,6 +11918,129 @@ public:
 };
 template <typename S> static void serialize(S&& s, CommitTruthGlobalMembershipResponse& v) {
   s.value1b(v.success); s.text1b(v.failure, 4096); s.value8b(v.durableGeneration); s.object(v.projection);
+}
+
+// The application owns the Raft state. Brain and Neuron attest the transport
+// endpoints; a desired placement cannot supply a committed report.
+#define PRODIGY_TRUTH_GLOBAL_CONTROL_VERSION 1
+enum class TruthControlAction : uint8_t { inspect = 1, provisionOnce, addLearner, removeVoter, promoteLearner };
+
+class ProdigyTruthGlobalControl : public MothershipResponse {
+public:
+  uint32_t protocolVersion = 1;
+  TruthControlAction action = TruthControlAction::inspect;
+  bool response = false, provisioned = false;
+  uint128_t membershipUUID = 0, operationUUID = 0, localClusterUUID = 0, containerUUID = 0, bootNonce = 0, exchangeUUID = 0;
+  uint64_t deploymentID = 0, generation = 0, expectedCommittedConfigIndex = 0, committedConfigIndex = 0, term = 0, appliedIndex = 0;
+  int32_t memberID = 0, targetMemberID = 0, leaderMemberID = 0;
+  String expectedCommittedConfigSHA256, committedConfigSHA256;
+  Vector<TruthGlobalMember> members;
+  Vector<int32_t> reachableMemberIDs, caughtUpMemberIDs;
+  TruthGlobalMembershipProjection bindings = {.protocolVersion = 0};
+};
+template<typename S> static void serialize(S&& s, ProdigyTruthGlobalControl& v) {
+  s.value4b(v.protocolVersion); s.value1b(v.action); s.value1b(v.response); s.value1b(v.success);
+  s.text1b(v.failure, 4096); s.value1b(v.provisioned);
+  s.value16b(v.membershipUUID); s.value16b(v.operationUUID); s.value16b(v.localClusterUUID); s.value16b(v.containerUUID);
+  s.value16b(v.bootNonce); s.value16b(v.exchangeUUID); s.value8b(v.deploymentID); s.value8b(v.generation); s.value8b(v.expectedCommittedConfigIndex);
+  s.value8b(v.committedConfigIndex); s.value8b(v.term); s.value8b(v.appliedIndex); s.value4b(v.memberID);
+  s.value4b(v.targetMemberID); s.value4b(v.leaderMemberID); s.text1b(v.expectedCommittedConfigSHA256,64);
+  s.text1b(v.committedConfigSHA256,64); s.container(v.members,4); s.container4b(v.reachableMemberIDs,4); s.container4b(v.caughtUpMemberIDs,4); s.object(v.bindings);
+}
+
+static inline bool prodigyTruthCommittedConfigDigest(uint128_t group, uint64_t deployment, uint64_t index,
+    const Vector<TruthGlobalMember>& members, String& digest) {
+  if (!group || uint16_t(deployment >> 48) != 10 || !index || members.size() < 2 || members.size() > 4) return false;
+  String bytes; bytes.assign("Truth configuration v1"_ctv);
+  // All fields have fixed widths; integers are in network byte order.
+  auto append = [&](uint128_t value, size_t width) {
+    while (width) { --width; bytes.append(uint8_t(value >> (width * 8))); }
+  };
+  append(group,16); append(deployment,8); append(index,8); append(members.size(),1);
+  int32_t previous = 0;
+  size_t voters = 0;
+  for (const auto& m : members) {
+    if (m.memberID <= previous || !m.clusterUUID || !m.containerUUID || !m.privateIPv6.is6 || m.privateIPv6.isNull() ||
+        (m.role != TruthGlobalMemberRole::voter && m.role != TruthGlobalMemberRole::learner)) return false;
+    for (const auto& other : members) {
+      if (other.memberID == m.memberID) break;
+      if (other.containerUUID == m.containerUUID || other.privateIPv6.equals(m.privateIPv6)) return false;
+    }
+    previous = m.memberID;
+    voters += m.role == TruthGlobalMemberRole::voter;
+    append(uint32_t(m.memberID),4); append(m.clusterUUID,16); append(m.containerUUID,16);
+    bytes.append(reinterpret_cast<const uint8_t *>(m.privateIPv6.v6),16); append(uint8_t(m.role),1);
+  }
+  return voters >= 2 && voters <= 3 && members.size()-voters <= 1 && prodigyComputeSHA256Hex(bytes,digest);
+}
+static inline bool prodigyTruthControlAddressValid(const ProdigyTruthGlobalControl& v) {
+  return v.protocolVersion == 1 && v.membershipUUID && v.operationUUID && v.localClusterUUID && v.containerUUID &&
+      uint16_t(v.deploymentID >> 48) == 10 && v.memberID > 0 &&
+      v.action >= TruthControlAction::inspect && v.action <= TruthControlAction::promoteLearner;
+}
+
+static inline bool prodigyTruthControlRequestValid(const ProdigyTruthGlobalControl& v) {
+  if (!prodigyTruthControlAddressValid(v) || v.response || v.success || !v.failure.empty() ||
+      v.provisioned || v.committedConfigIndex || v.term || v.appliedIndex || v.leaderMemberID ||
+      !v.committedConfigSHA256.empty() || !v.members.empty() || !v.reachableMemberIDs.empty() || !v.caughtUpMemberIDs.empty())
+    return false;
+  if (v.action == TruthControlAction::inspect) return v.targetMemberID == 0;
+  if (!v.bootNonce || !v.generation) return false;
+  if (v.action == TruthControlAction::provisionOnce) return v.targetMemberID == 0;
+  return v.targetMemberID > 0 && v.expectedCommittedConfigIndex && prodigyIsSHA256HexDigest(v.expectedCommittedConfigSHA256);
+}
+
+static inline bool prodigyTruthControlReportValid(const ProdigyTruthGlobalControl& v) {
+  if (!prodigyTruthControlAddressValid(v) || !v.response || !v.exchangeUUID || v.bindings.protocolVersion) return false;
+  if (!v.success) return !v.failure.empty();
+  if (!v.failure.empty() || !v.generation || !v.bootNonce) return false;
+  // A bound journal can be inspected before genesis or the first election.
+  if (!v.committedConfigIndex)
+    return v.leaderMemberID == 0 && v.members.empty() && v.committedConfigSHA256.empty() &&
+           v.reachableMemberIDs.empty() && v.caughtUpMemberIDs.empty();
+  String digest;
+  if (!v.provisioned || !v.term || v.appliedIndex < v.committedConfigIndex ||
+      !prodigyTruthCommittedConfigDigest(v.membershipUUID,v.deploymentID,v.committedConfigIndex,v.members,digest) ||
+      !digest.equals(v.committedConfigSHA256)) return false;
+  auto present = [&](int32_t id, bool voter) {
+    return std::any_of(v.members.begin(),v.members.end(),[&](const auto& m) {
+      return m.memberID == id && (!voter || m.role == TruthGlobalMemberRole::voter);
+    });
+  };
+  if (v.leaderMemberID && !present(v.leaderMemberID,true)) return false;
+  for (const auto* ids : {&v.reachableMemberIDs,&v.caughtUpMemberIDs}) {
+    int32_t previous = 0;
+    for (int32_t id : *ids) {
+      if (id <= previous || !present(id,false)) return false;
+      previous = id;
+    }
+  }
+  return true;
+}
+
+static inline bool prodigyTruthControlForProjection(const ProdigyTruthGlobalControl& v, const TruthGlobalMembershipProjection& group) {
+  if (!prodigyTruthLocalMember(group, v.deploymentID, v.containerUUID) || group.membershipUUID != v.membershipUUID ||
+      group.localClusterUUID != v.localClusterUUID || group.generation != v.generation) return false;
+  return std::any_of(group.members.begin(),group.members.end(),[&](const auto& m) {
+    return m.memberID == v.memberID && m.containerUUID == v.containerUUID && m.clusterUUID == v.localClusterUUID;
+  });
+}
+
+enum class TruthPlacementAction : uint8_t { offerAddress = 1, reconcile, retire };
+class ProdigyTruthPlacementExchange : public MothershipResponse {
+public:
+  TruthPlacementAction action = TruthPlacementAction::offerAddress;
+  uint128_t membershipUUID = 0, localClusterUUID = 0;
+  uint64_t deploymentID = 0, generation = 0, committedConfigIndex = 0;
+  String committedConfigSHA256;
+  TruthGlobalMember member;
+  Vector<TruthGlobalMember> reserved;
+};
+template<class S> static void serialize(S&& s, ProdigyTruthPlacementExchange& r) {
+  s.value1b(r.action); s.value1b(r.success); s.text1b(r.failure,4096);
+  s.value16b(r.membershipUUID); s.value16b(r.localClusterUUID); s.value8b(r.deploymentID);
+  s.value8b(r.generation); s.value8b(r.committedConfigIndex); s.text1b(r.committedConfigSHA256,64);
+  s.object(r.member); s.container(r.reserved,4);
 }
 
 class ProdigyMasterAuthorityRuntimeState {

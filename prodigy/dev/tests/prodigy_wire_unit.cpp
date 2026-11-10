@@ -1628,6 +1628,85 @@ int main(void)
             reinterpret_cast<uint8_t *>(taskResult.data()),
             reinterpret_cast<uint8_t *>(taskResult.data() + taskResult.size())),
         "task_result_valid_for_neuron");
+    // Global Truth control is a normal bounded control exchange at every
+    // boundary.  Exercise each production direction with a real encoded
+    // request, not a hand-built variable-length payload.
+    ProdigyTruthGlobalControl truthControl = {};
+    truthControl.action = TruthControlAction::inspect;
+    truthControl.membershipUUID = 1; truthControl.operationUUID = 2;
+    truthControl.localClusterUUID = 3; truthControl.containerUUID = 4;
+    truthControl.deploymentID = (uint64_t(10) << 48) | 1;
+    truthControl.memberID = 1;
+    suite.expect(prodigyTruthControlRequestValid(truthControl), "truth_global_control_fixture_is_valid_request");
+    String truthControlPayload = {};
+    suite.expect(BitseryEngine::serialize(truthControlPayload, truthControl), "truth_global_control_fixture_encodes");
+    frame.clear(); Message::construct(frame, MothershipTopic::truthGlobalControl, truthControlPayload);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal()),
+                 "truth_global_control_mothership_ingress_accepts_encoded_frame");
+    suite.expect(!ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal() - 1),
+                 "truth_global_control_mothership_ingress_rejects_truncated_frame");
+
+    frame.clear(); Message::construct(frame, NeuronTopic::truthGlobalControl, truthControlPayload);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(ProdigyIngressValidation::validateNeuronPayloadForBrain(message->topic, message->args, message->terminal()),
+                 "truth_global_control_neuron_to_brain_accepts_encoded_frame");
+    suite.expect(!ProdigyIngressValidation::validateNeuronPayloadForBrain(message->topic, message->args, message->terminal() - 1),
+                 "truth_global_control_neuron_to_brain_rejects_truncated_frame");
+    frame.clear(); Message::construct(frame, NeuronTopic::truthGlobalControl, truthControl.containerUUID, truthControlPayload);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(ProdigyIngressValidation::validateNeuronPayloadForNeuron(message->topic, message->args, message->terminal()),
+                 "truth_global_control_brain_to_neuron_accepts_encoded_frame");
+    suite.expect(!ProdigyIngressValidation::validateNeuronPayloadForNeuron(message->topic, message->args, message->terminal() - 1),
+                 "truth_global_control_brain_to_neuron_rejects_truncated_frame");
+
+    frame.clear(); Message::construct(frame, ContainerTopic::truthGlobalControl, truthControlPayload);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(ProdigyIngressValidation::validateContainerPayloadForNeuron(message->topic, message->args, message->terminal()),
+                 "truth_global_control_container_to_neuron_accepts_encoded_frame");
+    suite.expect(!ProdigyIngressValidation::validateContainerPayloadForNeuron(message->topic, message->args, message->terminal() - 1),
+                 "truth_global_control_container_to_neuron_rejects_truncated_frame");
+    suite.expect(ProdigyIngressValidation::validateContainerPayloadForHub(message->topic, message->args, message->terminal()),
+                 "truth_global_control_neuron_to_container_accepts_encoded_frame");
+    suite.expect(!ProdigyIngressValidation::validateContainerPayloadForHub(message->topic, message->args, message->terminal() - 1),
+                 "truth_global_control_neuron_to_container_rejects_truncated_frame");
+
+    String truthControlAtCap;
+    std::array<uint8_t, 16 * 1024> capBytes{};
+    truthControlAtCap.assign(capBytes.data(), capBytes.size());
+    auto truthControlCapChecks = [&](const char *name, auto topic, auto validator, bool withContainer) {
+      frame.clear();
+      if (withContainer) Message::construct(frame, topic, truthControl.containerUUID, truthControlAtCap);
+      else Message::construct(frame, topic, truthControlAtCap);
+      message = reinterpret_cast<Message *>(frame.data());
+      suite.expect(validator(message->topic, message->args, message->terminal()), name);
+      truthControlAtCap.append(uint8_t(0));
+      frame.clear();
+      if (withContainer) Message::construct(frame, topic, truthControl.containerUUID, truthControlAtCap);
+      else Message::construct(frame, topic, truthControlAtCap);
+      message = reinterpret_cast<Message *>(frame.data());
+      suite.expect(!validator(message->topic, message->args, message->terminal()), "truth_global_control_rejects_over_16k");
+      truthControlAtCap.resize(truthControlAtCap.size() - 1);
+    };
+    // The two remaining families have distinct direction validators; Mothership
+    // is checked explicitly because its topic is not a Neuron/Container enum.
+    frame.clear(); Message::construct(frame, MothershipTopic::truthGlobalControl, truthControlAtCap);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal()),
+                 "truth_global_control_mothership_accepts_16k");
+    truthControlAtCap.append(uint8_t(0)); frame.clear(); Message::construct(frame, MothershipTopic::truthGlobalControl, truthControlAtCap);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(!ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal()),
+                 "truth_global_control_mothership_rejects_over_16k");
+    truthControlAtCap.resize(truthControlAtCap.size() - 1);
+    truthControlCapChecks("truth_global_control_neuron_to_brain_accepts_16k", NeuronTopic::truthGlobalControl,
+        ProdigyIngressValidation::validateNeuronPayloadForBrain, false);
+    truthControlCapChecks("truth_global_control_brain_to_neuron_accepts_16k", NeuronTopic::truthGlobalControl,
+        ProdigyIngressValidation::validateNeuronPayloadForNeuron, true);
+    truthControlCapChecks("truth_global_control_container_to_neuron_accepts_16k", ContainerTopic::truthGlobalControl,
+        ProdigyIngressValidation::validateContainerPayloadForNeuron, false);
+    truthControlCapChecks("truth_global_control_neuron_to_container_accepts_16k", ContainerTopic::truthGlobalControl,
+        ProdigyIngressValidation::validateContainerPayloadForHub, false);
     // New control topics use the ordinary bounded variable framing. These
     // tests pass explicit frame bounds so truncation/trailing bytes cannot be
     // hidden by a stale Message::size field.

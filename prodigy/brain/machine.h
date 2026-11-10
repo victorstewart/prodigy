@@ -445,6 +445,19 @@ public:
     return 0;
   }
 
+  // A durable placement may carry an already allocated mesh endpoint.  Claim
+  // its final fragment through the same allocator used by ordinary launches;
+  // never manufacture a parallel address allocation path.
+  bool claimContainerFragment(uint8_t fragment)
+  {
+    if (containerFragmentAvailable(fragment) == false)
+    {
+      return false;
+    }
+    usedContainerFragments.insert(fragment);
+    return true;
+  }
+
   void relinquishContainerFragment(uint8_t fragment)
   {
     usedContainerFragments.erase(fragment);

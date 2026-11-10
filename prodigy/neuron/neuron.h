@@ -6915,6 +6915,26 @@ public:
           Ring::queueSend(stream);
           break;
         }
+      case ContainerTopic::truthGlobalControl:
+        {
+          String bytes; Message::extractToStringView(args,bytes);
+          ProdigyTruthGlobalControl report{};
+          auto* stream = brain;
+          const bool localBrainAuthenticated = stream == brain && stream != nullptr && streamIsActive(stream) &&
+              (stream->transportEncryptionEnabled() == false ||
+               (stream->isTransportNegotiated() && stream->tlsPeerVerified));
+          if (args != terminal || !stream || container->pendingDestroy || container->plan.config.applicationID != 10 ||
+              !BitseryEngine::deserializeSafe(bytes,report) || !prodigyTruthControlReportValid(report) ||
+              report.containerUUID != container->plan.uuid || report.deploymentID != container->plan.config.deploymentID() ||
+              report.localClusterUUID != controlTransportCredentials.self.clusterUUID ||
+              !localBrainAuthenticated) {
+            basics_log("neuron truthGlobalControl reject stage=reply-validation member=%d\n", report.memberID);
+            break;
+          }
+          Message::construct(stream->wBuffer,NeuronTopic::truthGlobalControl,bytes);
+          Ring::queueSend(stream);
+          break;
+        }
       case ContainerTopic::statefulStoreProofRecovery:
         {
           String encoded = {}; Message::extractToStringView(args, encoded);
@@ -9032,6 +9052,26 @@ public:
           topology.servingMode = StatefulTopologyServingMode::applicationDataAuthority;
           topology.dataAuthority = command.authority;
           Message::construct(live->second->wBuffer, ContainerTopic::statefulDataAuthority, encoded);
+          Ring::queueSend(live->second);
+          break;
+        }
+      case NeuronTopic::truthGlobalControl:
+        {
+          uint128_t uuid = 0; String bytes;
+          Message::extractArg<ArgumentNature::fixed>(args,uuid); Message::extractToStringView(args,bytes);
+          auto live = containers.find(uuid);
+          ProdigyTruthGlobalControl command{};
+          if (args != terminal || live == containers.end() || !live->second || live->second->pendingDestroy ||
+              live->second->plan.config.applicationID != 10 || !BitseryEngine::deserializeSafe(bytes,command) ||
+              !prodigyTruthControlRequestValid(command) || !command.exchangeUUID || command.containerUUID != uuid ||
+              !prodigyTruthControlForProjection(command,command.bindings) ||
+              command.localClusterUUID != controlTransportCredentials.self.clusterUUID ||
+              command.deploymentID != live->second->plan.config.deploymentID() ||
+              !streamIsActive(live->second)) {
+            basics_log("neuron truthGlobalControl reject stage=request-validation member=%d\n", command.memberID);
+            break;
+          }
+          Message::construct(live->second->wBuffer,ContainerTopic::truthGlobalControl,bytes);
           Ring::queueSend(live->second);
           break;
         }

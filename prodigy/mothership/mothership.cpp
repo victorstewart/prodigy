@@ -23645,6 +23645,22 @@ LOCAL_RUNTIME
   {
     const uint16_t applicationID = plan.config.applicationID;
     if (!mothershipApplicationPlacementRequired(applicationID)) return true;
+    if (applicationID == 10) {
+      MothershipTruthGroup state;
+      String reason;
+      const bool managed = [&] {
+        auto registry = openClusterRegistry();
+        return registry.loadTruthGroup(state, &reason);
+      }();
+      if (managed) {
+        const auto site = socket.configuredClusterUUID();
+        if (state.group.deploymentID == plan.config.deploymentID() && plan.isStateful &&
+            std::any_of(state.group.members.begin(),state.group.members.end(),[&](const auto& m){return m.clusterUUID==site;})) return projectTruth(state, site, failure);
+        failure.assign("Truth deployment conflicts with the global membership"_ctv);
+        return false;
+      }
+      if (reason != "record not found"_ctv) { failure=reason; return false; }
+    }
     const bool graph = applicationID == 2 || applicationID == 5;
     const bool graphReplica = prodigyGraphDeploymentPlanCanonical(plan, true);
     if (graph && !graphReplica && !prodigyGraphDeploymentPlanCanonical(plan, false)) {
@@ -33040,6 +33056,9 @@ LOCAL_RUNTIME
     if (!response.success) exit(EXIT_FAILURE);
   }
 
+#include <prodigy/mothership/mothership.truth.routes.inc>
+#include <prodigy/mothership/mothership.truth.control.inc>
+
   void runCancelDeployment(int argc, char *argv[])
   {
     if (argc < 2)
@@ -38859,6 +38878,7 @@ public:
         {"checkClusterProviderPlan",        &Mothership::runCheckClusterProviderPlan       },
         {"clusterReport",                   &Mothership::runClusterReport                  },
         {"configureLocalVMClusterLANIPv6",  &Mothership::runConfigureLocalVMClusterLANIPv6 },
+        {"configureTruthGroup",             &Mothership::configureTruthGroup                },
         {"containerLogs",                   &Mothership::runContainerLogs                  },
         {"cousinPermission",                &Mothership::runCousinPermission               },
         {"cousinRoute",                     &Mothership::runCousinRoute                    },
@@ -38916,6 +38936,7 @@ public:
         {"pullRoutableSubnets",             &Mothership::runPullRoutableSubnets            },
         {"rearmRetainedStatefulDeployment", &Mothership::runRearmRetainedStatefulDeployment},
         {"recommendClusterForApplications", &Mothership::runRecommendClusterForApplications},
+        {"reconcileTruth",                 &Mothership::runReconcileTruth                 },
         {"recoverLocalClusterAuthority",    &Mothership::runRecoverLocalClusterAuthority   },
         {"recoverMaterializedStatefulDeployment", &Mothership::runRecoverMaterializedStatefulDeployment },
         {"recoverRemoteClusterRuntime", &Mothership::runRecoverRemoteClusterRuntime},
@@ -38949,6 +38970,7 @@ public:
         {"taskReport",                      &Mothership::runTaskReport                     },
         {"testClusterPairControl",          &Mothership::runTestClusterPairControl         },
         {"transportCredentialLifecycle",    &Mothership::runTransportCredentialLifecycle   },
+        {"truthGlobalControl",              &Mothership::runTruthGlobalControl              },
         {"unregisterRoutableSubnet",        &Mothership::runUnregisterRoutableSubnet       },
         {"updateAdoptedMachineRacks",       &Mothership::runUpdateAdoptedMachineRacks      },
         {"updateProdigy",                   &Mothership::runUpdateProdigy                  },
@@ -39027,6 +39049,9 @@ int main(int argc, char *argv[])
     message.append("\tjournals and launches the exact remote all-masters cohorts with native client access fenced until their retained source cut is applied\n");
     message.append("observeStatefulStoreSourceCut [cluster] [Hot deploymentID] [containerUUID] [operationUUID] [shardGroup] [shardCount]\n");
     message.append("\tcaptures, freshly queries, and releases one exact healthy Hot native source-cut proof; it does not deploy, reseed, reset, or alter serving state\n");
+    message.append("configureTruthGroup GROUP OPERATION DEPLOYMENT GRACE_MS CLUSTER [CLUSTER [CLUSTER]]\n");
+    message.append("truthGlobalControl GROUP inspect|provisionOnce MEMBER\n");
+    message.append("reconcileTruth GROUP [--watch]\n");
     message.append("configureLocalVMClusterLANIPv6 [cluster]\n");
     message.append("\tconfigures one deterministic private IPv6 /64 on the exact three sealed local-VM cluster LAN owners without changing their QEMU or WAN boundaries\n");
     message.append("createProviderCredential [json|-|@path]\n");

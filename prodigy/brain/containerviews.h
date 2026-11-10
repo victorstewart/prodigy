@@ -22,6 +22,11 @@ public:
   Vector<uint32_t> assignedGPUMemoryMBs;
   Vector<AssignedGPUDevice> assignedGPUDevices;
   uint8_t fragment;
+  // Ephemeral launch fence for a durable Truth placement.  The resulting
+  // meshAddress is persisted in the ordinary ContainerPlan; this only stops
+  // the scheduler from replacing an assigned endpoint with a random fragment.
+  uint128_t requiredTruthMeshAddress = 0;
+  int32_t truthMemberID = 0;
 
   uint32_t nCrashes;
 

@@ -2266,6 +2266,14 @@ public:
     RoutableResourceLeaseReport *inlineResponse = nullptr;
     uint32_t outstanding = 0;
   };
+  struct PendingTruthControl {
+    ProdigyTruthGlobalControl command;
+    Mothership* stream;
+    uint64_t streamIncarnation, epoch, neuronGeneration, crashes;
+    int64_t deadlineMs;
+  };
+  bytell_hash_map<uint128_t, PendingTruthControl> pendingTruthControls;
+
   class PendingContainerLogs
   {
   public:
@@ -9630,6 +9638,147 @@ public:
         return true;
       }
     return false;
+  }
+
+  void replyTruthControl(Mothership* stream, const ProdigyTruthGlobalControl& source, const char* error = nullptr) {
+    auto response = source;
+    response.bindings = {.protocolVersion = 0};
+    response.response = true;
+    if (error) { response.success = false; response.failure.assign(error); }
+    String encoded;
+    if (BitseryEngine::serialize(encoded,response)) {
+      Message::construct(stream->wBuffer,MothershipTopic::truthGlobalControl,encoded);
+      (void)flushActiveMothershipSendBuffer(stream,"truth-control");
+    }
+  }
+
+  bool applyTruthPlacement(ProdigyTruthPlacementExchange& r) {
+    if (!weAreMaster || !ignited || !masterAuthorityRuntimeStateDurable || masterAuthorityPersistencePending ||
+        durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation || r.success ||
+        !r.membershipUUID || r.localClusterUUID != brainConfig.clusterUUID || uint16_t(r.deploymentID >> 48) != 10)
+      return false;
+    TruthGlobalMembershipProjection current;
+    const bool exists = desiredTruthGlobalMembership(r.deploymentID,current);
+    if (exists && current.membershipUUID != r.membershipUUID) return false;
+    if (r.action == TruthPlacementAction::offerAddress) {
+      if (r.member.memberID <= 0 || !r.member.containerUUID || r.member.clusterUUID != r.localClusterUUID) return false;
+      // An offer is advisory. The scheduler rechecks and claims the fragment
+      // through Machine at launch. Never substitute another endpoint.
+      const auto deployment = deployments.find(r.deploymentID);
+      size_t bestOccupancy = SIZE_MAX;
+      uint32_t bestMachine = UINT32_MAX;
+      for (auto* machine : machines) {
+        if (!prodigyMachineReadyForScheduling(machine) || !neuronControlStreamActive(machine) ||
+            (deployment != deployments.end() && (!deployment->second ||
+                !ApplicationDeployment::nFitOnMachine(deployment->second, machine, 1)))) continue;
+        const auto prefix = MeshNode::addressForFragment(container_network_subnet6, brainConfig.datacenterFragment,
+                                                          machine->fragment, 0);
+        const auto occupancy = size_t(std::count_if(r.reserved.begin(), r.reserved.end(), [&](const auto& member) {
+          return member.clusterUUID == r.localClusterUUID && std::memcmp(member.privateIPv6.v6, &prefix, 15) == 0;
+        }));
+        if (occupancy > bestOccupancy || (occupancy == bestOccupancy && machine->fragment >= bestMachine)) continue;
+        for (uint16_t fragment = 1; fragment <= 255; ++fragment) {
+          if (!machine->containerFragmentAvailable(uint8_t(fragment))) continue;
+          IPAddress candidate(MeshNode::addressForFragment(container_network_subnet6, brainConfig.datacenterFragment,
+                                                            machine->fragment, uint8_t(fragment)));
+          auto used = [&](const auto& member) { return member.privateIPv6.equals(candidate); };
+          if (std::any_of(r.reserved.begin(),r.reserved.end(),used) ||
+              (exists && std::any_of(current.members.begin(),current.members.end(),used))) continue;
+          r.member.privateIPv6 = candidate;
+          bestMachine = machine->fragment;
+          bestOccupancy = occupancy;
+          break;
+        }
+      }
+      return bestOccupancy != SIZE_MAX;
+    }
+    if (!exists || r.generation != current.generation || r.committedConfigIndex != current.expectedCommittedConfigIndex ||
+        r.committedConfigSHA256 != current.expectedCommittedConfigSHA256) return false;
+    auto deployed = deployments.find(r.deploymentID);
+    if (deployed == deployments.end() || !deployed->second) return false;
+    if (r.action == TruthPlacementAction::reconcile) return deployed->second->reconcileTruthPlacement(current);
+    if (r.action != TruthPlacementAction::retire || r.member.clusterUUID != brainConfig.clusterUUID ||
+        !std::binary_search(current.retiredMemberIDs.begin(),current.retiredMemberIDs.end(),r.member.memberID)) return false;
+    if (!deployed->second->reconcileTruthPlacement(current,&r.member)) {
+      r.failure.assign("retired container does not match its placement or its Neuron is unavailable"_ctv);
+      return false;
+    }
+    auto retiring = containers.find(r.member.containerUUID);
+    if (retiring == containers.end()) return true;
+    const auto* pending = retiring->second;
+    char status[128];
+    std::snprintf(status, sizeof(status), "retired member %d awaits terminal destruction (state=%u work=%u)",
+        r.member.memberID, pending ? unsigned(pending->state) : 0, unsigned(pending && pending->plannedWork));
+    r.failure.assign(status);
+    return false;
+  }
+
+  void beginTruthControl(Mothership* stream, ProdigyTruthGlobalControl command) {
+    if (!prodigyTruthControlRequestValid(command) || command.exchangeUUID || command.bindings.protocolVersion ||
+        !weAreMaster || !ignited || !masterAuthorityRuntimeStateDurable || masterAuthorityPersistencePending ||
+        durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation ||
+        command.localClusterUUID != brainConfig.clusterUUID ||
+        !desiredTruthGlobalMembership(command.deploymentID,command.bindings)) {
+      replyTruthControl(stream,command,"Truth control needs an admitted local group and durable master");
+      return;
+    }
+    if (!command.generation && command.action == TruthControlAction::inspect) command.generation = command.bindings.generation;
+    auto container = containers.find(command.containerUUID);
+    if (!prodigyTruthControlForProjection(command,command.bindings) || container == containers.end() ||
+        !container->second || container->second->applicationID != 10 || container->second->deploymentID != command.deploymentID ||
+        !container->second->machine || !neuronControlStreamActive(container->second->machine) ||
+        pendingTruthControls.size() >= 64) {
+      replyTruthControl(stream,command,"Truth member or its authenticated Neuron is unavailable");
+      return;
+    }
+    // Each hop echoes a per-dispatch nonce even when a durable operation is retried.
+    command.exchangeUUID = Random::generateNumberWithNBits<128,uint128_t>();
+    if (!command.exchangeUUID || pendingTruthControls.contains(command.exchangeUUID)) {
+      replyTruthControl(stream,command,"unable to allocate Truth exchange");
+      return;
+    }
+    String encoded;
+    if (!BitseryEngine::serialize(encoded,command)) { replyTruthControl(stream,command,"invalid Truth command"); return; }
+    auto* target = container->second;
+    auto& neuron = target->machine->neuron;
+    pendingTruthControls[command.exchangeUUID] = {command,stream,stream->connectionIncarnation,masterAuthorityEpoch,
+        neuron.ioGeneration,uint64_t(target->nCrashes),Time::now<TimeResolution::ms>() + 5000};
+    Message::construct(neuron.wBuffer,NeuronTopic::truthGlobalControl,target->uuid,encoded);
+    Ring::queueSend(&neuron);
+  }
+
+  void acceptTruthControl(NeuronView* neuron, const ProdigyTruthGlobalControl& r) {
+    if (!neuron || !neuron->machine || !prodigyTruthControlReportValid(r)) return;
+    auto it = pendingTruthControls.find(r.exchangeUUID);
+    if (it == pendingTruthControls.end()) return;
+    const auto& pending = it->second;
+    const auto& q = pending.command;
+    auto live = containers.find(q.containerUUID);
+    if (!weAreMaster || pending.epoch != masterAuthorityEpoch || pending.deadlineMs <= Time::now<TimeResolution::ms>() ||
+        live == containers.end() || !live->second || live->second->machine != neuron->machine ||
+        !neuronControlStreamActive(neuron->machine) || &neuron->machine->neuron != neuron ||
+        pending.neuronGeneration != neuron->ioGeneration || pending.crashes != uint64_t(live->second->nCrashes) ||
+        r.operationUUID != q.operationUUID || r.membershipUUID != q.membershipUUID || r.containerUUID != q.containerUUID ||
+        r.memberID != q.memberID || r.deploymentID != q.deploymentID || r.localClusterUUID != q.localClusterUUID ||
+        r.action != q.action || r.generation != q.generation || r.targetMemberID != q.targetMemberID ||
+        r.expectedCommittedConfigIndex != q.expectedCommittedConfigIndex || r.expectedCommittedConfigSHA256 != q.expectedCommittedConfigSHA256 ||
+        (q.bootNonce && r.bootNonce != q.bootNonce)) return;
+    auto* stream = pending.stream;
+    const auto incarnation = pending.streamIncarnation;
+    pendingTruthControls.erase(it);
+    if (activeMotherships.contains(stream) && stream->connectionIncarnation == incarnation)
+      replyTruthControl(stream,r);
+  }
+
+  void expireTruthControls() {
+    const auto now = Time::now<TimeResolution::ms>();
+    for (auto it = pendingTruthControls.begin(); it != pendingTruthControls.end();) {
+      if (it->second.deadlineMs > now && weAreMaster && it->second.epoch == masterAuthorityEpoch) { ++it; continue; }
+      auto pending = std::move(it->second);
+      it = pendingTruthControls.erase(it);
+      if (activeMotherships.contains(pending.stream) && pending.stream->connectionIncarnation == pending.streamIncarnation)
+        replyTruthControl(pending.stream,pending.command,"Truth exchange expired; inspect before retry");
+    }
   }
 
   bool desiredTruthGlobalMembership(uint64_t deploymentID,
@@ -34625,6 +34774,7 @@ public:
         {
           runBrainPeerHeartbeatTick();
           expireContainerLogRequests();
+          expireTruthControls();
           brainPeerHeartbeatTicker.setTimeoutMs(brainPeerHeartbeatIntervalMs);
           Ring::queueTimeout(&brainPeerHeartbeatTicker);
           break;
@@ -55055,6 +55205,24 @@ public:
           });
           break;
         }
+      case MothershipTopic::truthPlacement:
+        {
+          String bytes; Message::extractToStringView(args,bytes); ProdigyTruthPlacementExchange r{};
+          r.success = args == message->terminal() && BitseryEngine::deserializeSafe(bytes,r) && applyTruthPlacement(r);
+          if (!r.success && r.failure.empty()) r.failure.assign("Truth placement unavailable or stale"_ctv);
+          String payload;
+          if (BitseryEngine::serialize(payload,r))
+            Message::construct(mothership->wBuffer,MothershipTopic::truthPlacement,payload);
+          break;
+        }
+      case MothershipTopic::truthGlobalControl:
+        {
+          String bytes; Message::extractToStringView(args,bytes);
+          ProdigyTruthGlobalControl control{};
+          if (args == message->terminal() && BitseryEngine::deserializeSafe(bytes,control)) beginTruthControl(mothership,std::move(control));
+          else replyTruthControl(mothership,control,"invalid Truth control frame");
+          break;
+        }
       case MothershipTopic::commitTruthGlobalMembership:
         {
           String serializedRequest = {}; Message::extractToStringView(args, serializedRequest);
@@ -56648,6 +56816,13 @@ public:
           ProdigyApp6TruthMeshReceipt receipt = {};
           if (args == message->terminal() && BitseryEngine::deserializeSafe(encoded, receipt))
             receiveApp6TruthMeshReceipt(neuron, receipt);
+          break;
+        }
+      case NeuronTopic::truthGlobalControl:
+        {
+          String bytes; Message::extractToStringView(args,bytes);
+          ProdigyTruthGlobalControl response{};
+          if (args == message->terminal() && BitseryEngine::deserializeSafe(bytes,response)) acceptTruthControl(neuron,response);
           break;
         }
       case NeuronTopic::statefulStoreProofRecovery:

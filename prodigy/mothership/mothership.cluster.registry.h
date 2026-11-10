@@ -31,6 +31,8 @@
 #include <prodigy/cross.cluster.path.fault.h>
 #include <prodigy/retained.container.recovery.h>
 
+#include <prodigy/mothership/mothership.truth.group.h>
+
 // Provider BGP is a public-origin plane.  ULA prefixes are reserved for
 // authenticated private BGP carried inside MASQUE and must never be persisted
 // or admitted as provider origins.
@@ -3794,6 +3796,75 @@ private:
   }
 
 public:
+  bool loadTruthGroup(MothershipTruthGroup& state, String* failure) {
+    String bytes;
+    if (!db.read(applicationPlacementsColumnFamily,"truth/global"_ctv,bytes,failure)) return false;
+    if (BitseryEngine::deserializeSafe(bytes,state) && mothershipTruthGroupValid(state)) return true;
+    if (failure) failure->assign("invalid durable Truth group"_ctv);
+    return false;
+  }
+
+  bool saveTruthGroup(uint64_t expectedRevision, MothershipTruthGroup& state, String* failure) {
+    G6OperationLock lock;
+    if (!lockG6Operations(lock,failure) || expectedRevision == UINT64_MAX) return false;
+    MothershipTruthGroup previous{};
+    String reason;
+    if (loadTruthGroup(previous,&reason)) {
+      if (!expectedRevision || previous.revision != expectedRevision ||
+          previous.group.membershipUUID != state.group.membershipUUID ||
+          previous.sites != state.sites || previous.graceMs != state.graceMs ||
+          !prodigyTruthMembershipSuccessor(previous.group,state.group)) {
+        if (failure) failure->assign("Truth registry revision or group binding changed"_ctv);
+        return false;
+      }
+      if (previous.group.generation == state.group.generation) {
+        String before, after;
+        if (!BitseryEngine::serialize(before, previous.group) || !BitseryEngine::serialize(after, state.group) ||
+            before != after) {
+          if (failure) failure->assign("conflicting Truth projection at this generation"_ctv);
+          return false;
+        }
+      }
+    } else {
+      if (expectedRevision || reason != "record not found"_ctv) { if (failure) *failure = reason; return false; }
+      MothershipApplicationPlacement legacy{};
+      if (loadApplicationPlacement(10,legacy,&reason) || reason != "record not found"_ctv) {
+        if (failure) failure->assign("existing Truth writer placement must be fenced before genesis"_ctv);
+        return false;
+      }
+    }
+    auto next = state;
+    next.revision = expectedRevision + 1;
+    String bytes;
+    if (!mothershipTruthGroupValid(next) || !BitseryEngine::serialize(bytes,next) ||
+        !db.write(applicationPlacementsColumnFamily,"truth/global"_ctv,bytes,failure)) return false;
+    state = std::move(next);
+    return true;
+  }
+
+  bool recordTruthGrantBeforeDispatch(const MothershipTruthGrant& grant, String* failure) {
+    if (!grant.membershipUUID || !grant.operationUUID || !grant.containerUUID || !grant.localClusterUUID ||
+        !grant.bootNonce || grant.memberID <= 0 || uint16_t(grant.deploymentID >> 48) != 10) return false;
+    G6OperationLock lock;
+    if (!lockG6Operations(lock,failure)) return false;
+    MothershipTruthGroup stored;
+    if (!loadTruthGroup(stored,failure) || stored.group.membershipUUID != grant.membershipUUID ||
+        stored.group.operationUUID != grant.operationUUID || stored.group.deploymentID != grant.deploymentID ||
+        std::none_of(stored.group.members.begin(),stored.group.members.end(),[&](const auto& m) {
+          return m.memberID == grant.memberID && m.clusterUUID == grant.localClusterUUID && m.containerUUID == grant.containerUUID;
+        })) return false;
+    String key, bytes, prior, reason;
+    key.snprintf<"truth/grant/{}/{}"_ctv>(grant.membershipUUID,uint32_t(grant.memberID));
+    auto copy = grant;
+    if (!BitseryEngine::serialize(bytes,copy)) return false;
+    if (db.read(applicationPlacementsColumnFamily,key,prior,&reason)) {
+      if (bytes.equals(prior)) return true;
+      if (failure) failure->assign("Truth grant already belongs to another operation, binding, or boot"_ctv);
+      return false;
+    }
+    if (reason != "record not found"_ctv) { if (failure) *failure = reason; return false; }
+    return db.write(applicationPlacementsColumnFamily,key,bytes,failure);
+  }
 
   // Serializes the registry authorization decision with the corresponding
   // Brain registration RPC.  This is intentionally a process-shared lock:
@@ -5969,6 +6040,11 @@ public:
         clusterUUID == 0 || !prodigyIsSHA256HexDigest(observationReceiptSHA256)) return false;
     G6OperationLock lock;
     if (!lockG6Operations(lock, failure)) return false;
+    if (applicationID == 10) {
+      MothershipTruthGroup global; String globalFailure;
+      if (loadTruthGroup(global, &globalFailure)) { if (failure) failure->assign("global Truth group fences legacy admission"_ctv); return false; }
+      if (globalFailure != "record not found"_ctv) { if (failure) *failure = globalFailure; return false; }
+    }
     String readFailure;
     if (loadApplicationPlacement(applicationID, placement, &readFailure)) {
       if (applicationID == 10 && placement.version == 4) {
