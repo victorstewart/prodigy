@@ -2896,6 +2896,19 @@ pair_control_validate_masque_inside()
    pair_control_masque_machine_route_exact "$pair_control_masque_source_namespace" "${pair_control_masque_destination_public6}/128" "$pair_control_masque_source_router" bond0 "$pair_control_masque_source_private6"
 }
 
+pair_control_router_namespace_missing_owned()
+{
+   local namespace="$1" recorded
+   [[ -n "${pair_control_router_ns:-}" && "$namespace" == "$pair_control_router_ns" &&
+      ! -e "/run/netns/$namespace" ]] || return 1
+   [[ -f "$pair_control_dir/router-namespace" && ! -L "$pair_control_dir/router-namespace" ]] || return 2
+   recorded="$(<"$pair_control_dir/router-namespace")"
+   [[ "$recorded" =~ ^[1-9][0-9]*$ ]] || return 2
+   # A live pair owner may still recreate its private router.  Only recovery of
+   # a dead owner can treat its recorded, now-unreachable mount as removed.
+   pair_control_owner_dead || return 2
+}
+
 pair_control_remove_service_route()
 {
    local namespace="$1" name="$2" prefix="$3" gateway="$4" device="$5" expected state
@@ -2905,6 +2918,17 @@ pair_control_remove_service_route()
    [[ -f "$pair_control_dir/$name-intent" && ! -L "$pair_control_dir/$name-intent" && "$(<"$pair_control_dir/$name-intent")" == "$expected" ]] || return 1
    if [[ -e "$pair_control_dir/$name" || -L "$pair_control_dir/$name" ]]; then
       [[ -f "$pair_control_dir/$name" && ! -L "$pair_control_dir/$name" && "$(<"$pair_control_dir/$name")" == "$expected" ]] || return 1
+   fi
+   # The router namespace is private to the pair supervisor.  A recovery mount
+   # can still clean both durable parent routes after that supervisor has died,
+   # but must not try `ip -n` against the absent private router.
+   if pair_control_router_namespace_missing_owned "$namespace"; then
+      return 0
+   else
+      state=$?
+      # A matching private router name that is absent is never an `ip -n`
+      # target unless the durable record proves its dead-owner completion.
+      [[ "$state" == 1 ]] || return 1
    fi
    if pair_control_service_route_exact "$namespace" "$prefix" "$gateway" "$device"; then
       ip -n "$namespace" -6 route del "$prefix" via "$gateway" dev "$device" || return 1

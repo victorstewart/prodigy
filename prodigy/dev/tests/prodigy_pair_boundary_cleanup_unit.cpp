@@ -1031,6 +1031,68 @@ check_status 2
   std::filesystem::remove_all(temporary, error);
 }
 
+static void testPairControlAbsentRouterServiceRouteCleanup(TestSuite& suite)
+{
+  std::string sourcePath = __FILE__;
+  const size_t root = sourcePath.rfind("/dev/tests/");
+  if (root == std::string::npos) { suite.expect(false, "pair_absent_router_service_fixture_locates_provider"); return; }
+  sourcePath.resize(root);
+  sourcePath += "/mothership/mothership.virtual.datacenter.provider.sh";
+  std::ifstream source(sourcePath);
+  if (!source) { suite.expect(false, "pair_absent_router_service_fixture_reads_provider"); return; }
+  const std::string text((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
+  const size_t begin = text.find("pair_control_router_namespace_missing_owned()\n{\n");
+  const size_t end = text.find("\npair_control_firewall_digest()\n", begin);
+  suite.expect(begin != std::string::npos && end != std::string::npos,
+               "pair_absent_router_service_fixture_extracts_owned_cleanup");
+  if (begin == std::string::npos || end == std::string::npos) return;
+
+  // A recovery process must leave parent-route cleanup to its callers, but an
+  // already-gone private router is a completed no-op only with its immutable
+  // route journal and a dead recorded owner.  No `ip -n` operation is allowed.
+  const std::string script = "set -euo pipefail\n" + text.substr(begin, end - begin) + R"TEST(
+pair_control_dir="$PWD/pair"; pair_dir="$pair_control_dir"; mkdir -p "$pair_control_dir"
+pair_control_router_ns="pc-r-cleanup-fixture-$$"
+pair_control_owner_dead() { [[ "$owner" == dead ]]; }
+pair_control_service_route_expected() { printf '%s via %s dev %s\n' "$1" "$2" "$3"; }
+pair_control_service_route_exact() { : > "$PWD/ip-was-called"; return 2; }
+ip() { : > "$PWD/ip-was-called"; return 2; }
+prefix=2001:db8:42::2/128; gateway=fd42::1; device=first0; name=service-router-source-route
+expected="$prefix via $gateway dev $device"
+seed() {
+  rm -f "$PWD/ip-was-called" "$pair_control_dir"/*
+  printf '999\n' > "$pair_control_dir/router-namespace"
+  printf '%s\n' "$expected" > "$pair_control_dir/$name-intent"
+  printf '%s\n' "$expected" > "$pair_control_dir/$name"
+}
+owner=dead; seed
+pair_control_remove_service_route "$pair_control_router_ns" "$name" "$prefix" "$gateway" "$device"
+[[ ! -e "$PWD/ip-was-called" ]]
+owner=live; seed
+if pair_control_remove_service_route "$pair_control_router_ns" "$name" "$prefix" "$gateway" "$device"; then exit 1; fi
+[[ ! -e "$PWD/ip-was-called" ]]
+owner=dead; seed; printf foreign > "$pair_control_dir/$name-intent"
+if pair_control_remove_service_route "$pair_control_router_ns" "$name" "$prefix" "$gateway" "$device"; then exit 1; fi
+[[ ! -e "$PWD/ip-was-called" ]]
+owner=dead; seed; rm -f "$pair_control_dir/router-namespace"
+if pair_control_remove_service_route "$pair_control_router_ns" "$name" "$prefix" "$gateway" "$device"; then exit 1; fi
+[[ ! -e "$PWD/ip-was-called" ]]
+)TEST";
+  char temporary[] = "./pair-absent-router-service-unit.XXXXXX";
+  if (::mkdtemp(temporary) == nullptr) { suite.expect(false, "pair_absent_router_service_fixture_creates_directory"); return; }
+  String path = {}, failure = {};
+  mothershipVirtualDatacenterPath(String(temporary), "probe.sh", path);
+  const bool written = mothershipVirtualDatacenterWriteFile(path, String(script.c_str()), 0700, &failure);
+  const pid_t child = written ? ::fork() : -1;
+  if (child == 0) { if (::chdir(temporary) != 0) _exit(125); ::execl("/bin/bash", "bash", "probe.sh", static_cast<char *>(nullptr)); _exit(127); }
+  int status = 0; pid_t waited = -1;
+  if (child > 0) do { waited = ::waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+  suite.expect(written && child > 0 && waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+               "pair_absent_router_service_cleanup_requires_dead_owner_and_exact_journal");
+  std::error_code error;
+  std::filesystem::remove_all(temporary, error);
+}
+
 static void testPairControlMasqueTransitContract(TestSuite& suite)
 {
   std::string sourcePath = __FILE__;
@@ -1076,6 +1138,7 @@ int main()
   testPairControlFaultEmitsOnlyFaultReceipt(suite);
   testPairControlNetemOwnershipAndCleanup(suite);
   testPairControlMasqueMachineRouteAbsent(suite);
+  testPairControlAbsentRouterServiceRouteCleanup(suite);
   testPairControlMasqueTransitContract(suite);
   testPairDrainObservationParser(suite);
   testPairGuestResetFenceParser(suite);
