@@ -53497,7 +53497,22 @@ public:
           if (args == message->terminal() && BitseryEngine::deserializeSafe(encoded, response) && prodigyPairPrivateBGPSecretScopeValid(response.scope))
           {
             Machine *machine = nullptr; for (Machine *candidate : machines) if (candidate->uuid == response.scope.machineUUID) { machine = candidate; break; }
-            response.success = machine != nullptr && neuronControlStreamActive(machine);
+            const auto authority = std::find_if(
+                masterAuthorityRuntimeState.crossClusterMasqueGatewayAuthorities.begin(),
+                masterAuthorityRuntimeState.crossClusterMasqueGatewayAuthorities.end(), [&](const auto& value) {
+                  return value.state == CrossClusterMasqueGatewayState::active &&
+                      value.pairUUID == response.scope.pairUUID &&
+                      value.pairOperationUUID == response.scope.operationUUID &&
+                      value.localClusterUUID == response.scope.clusterUUID &&
+                      value.localMachineUUID == response.scope.machineUUID &&
+                      value.keyGeneration == response.scope.keyEpoch &&
+                      value.tunnelSlot == response.scope.tunnelSlot &&
+                      value.pairAuthorityGeneration == response.scope.authorityGeneration &&
+                      value.generation == response.scope.gatewayGeneration;
+                });
+            response.success = machine != nullptr && masterAuthorityRuntimeStateDurable &&
+                authority != masterAuthorityRuntimeState.crossClusterMasqueGatewayAuthorities.end() &&
+                neuronControlStreamActive(machine);
             if (response.success) { Message::construct(machine->neuron.wBuffer, NeuronTopic::withdrawCrossClusterPrivateBGPSecret,
                 response.scope.pairUUID, response.scope.operationUUID, response.scope.keyEpoch, response.scope.tunnelSlot, response.scope.clusterUUID,
                 response.scope.machineUUID, response.scope.authorityGeneration, response.scope.gatewayGeneration); Ring::queueSend(&machine->neuron); response.acknowledged = true; }

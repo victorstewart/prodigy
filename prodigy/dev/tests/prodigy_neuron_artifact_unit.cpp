@@ -315,6 +315,11 @@ public:
     return installGatewayAuthorityForStateUploadTest(authority);
   }
 
+  void forgetGatewayPrivateBGPRuntimeForTest()
+  {
+    crossClusterMasqueGatewayRuntimes.clear();
+  }
+
   bool withdrawGatewayPrivateBGPForTest(const ProdigyPairPrivateBGPSecretScope& scope,
                                         bool& acknowledged)
   {
@@ -1203,6 +1208,28 @@ static void testGatewayPrivateBGPWithdrawalIdempotence(TestSuite& suite)
   const bool newerParsed = repeatedParsed && neuron.withdrawGatewayPrivateBGPForTest(newer, newerRejected);
   suite.expect(firstParsed && repeatedParsed && newerParsed && firstAcknowledged && repeatedAcknowledged && !newerRejected,
                "neuron_gateway_private_bgp_withdrawal_acknowledges_exact_empty_owner_idempotently_and_rejects_newer_authority");
+
+  TestNeuron absent = {};
+  bool absentAcknowledged = false;
+  suite.expect(absent.prepareGatewayPrivateBGPWithdrawalForTest(authority),
+               "neuron_gateway_private_bgp_withdrawal_absent_scope_fixture_is_authenticated");
+  absent.forgetGatewayPrivateBGPRuntimeForTest();
+  Container anchored = {};
+  anchored.plan.uuid = 0x9107;
+  anchored.plan.system.kind = SystemContainerKind::crossClusterMasqueGateway;
+  anchored.plan.system.gatewayPairUUID = scope.pairUUID;
+  anchored.plan.system.gatewayLocalClusterUUID = scope.clusterUUID;
+  anchored.plan.system.gatewayLocalMachineUUID = scope.machineUUID;
+  anchored.plan.system.gatewayKeyEpoch = scope.keyEpoch;
+  anchored.plan.system.gatewayAuthorityGeneration = scope.authorityGeneration;
+  anchored.plan.system.gatewayGeneration = scope.gatewayGeneration;
+  absent.trackContainerForReplyTest(&anchored);
+  bool anchoredAcknowledged = true;
+  const bool anchoredParsed = absent.withdrawGatewayPrivateBGPForTest(scope, anchoredAcknowledged);
+  absent.untrackContainerForReplyTest(anchored.plan.uuid);
+  const bool absentParsed = absent.withdrawGatewayPrivateBGPForTest(scope, absentAcknowledged);
+  suite.expect(anchoredParsed && !anchoredAcknowledged && absentParsed && absentAcknowledged,
+               "neuron_gateway_private_bgp_withdrawal_requires_exactly_absent_gateway_scope");
   ring.shutdownRing();
 }
 
