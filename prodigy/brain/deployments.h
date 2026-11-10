@@ -10165,7 +10165,9 @@ public:
         return;
       }
       if constexpr (std::is_same_v<T, StatefulWork>) {
-        if (!work.container) return; // cancelled exact target while this coroutine was suspended
+        // Destruction carries only oldContainer. A suspended work item is
+        // cancelled when its own lifecycle target has been cleared.
+        if (!(work.lifecycle == LifecycleOp::destruct ? work.oldContainer : work.container)) return;
         StatefulDataAuthority desired;
         if (work.container && thisBrain->desiredStatefulDataAuthority(plan.config.deploymentID(), desired, work.container->shardGroup) &&
             thisBrain->statefulCatchupCompensationFenced(plan.config.deploymentID(), work.container->shardGroup, desired.operationUUID)) {
