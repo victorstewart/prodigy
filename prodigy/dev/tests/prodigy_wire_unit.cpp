@@ -1006,6 +1006,60 @@ int main(void)
   }
 
   {
+    ContainerParameters params{};
+    params.deploymentID = (uint64_t(10) << 48) | 7;
+    auto& group = params.truthMembership;
+    group.protocolVersion = 1; group.genesisMemberIDs = {1, 2, 3}; group.highestAllocatedMemberID = 3;
+    group.membershipUUID = 15; group.operationUUID = 16; group.localClusterUUID = 17;
+    group.deploymentID = params.deploymentID; group.generation = 1; group.expectedCommittedConfigIndex = 22;
+    group.expectedCommittedConfigSHA256.assign("1111111111111111111111111111111111111111111111111111111111111111"_ctv);
+    for (int i = 1; i <= 3; ++i) {
+      TruthGlobalMember member{}; member.memberID = i; member.clusterUUID = group.localClusterUUID;
+      member.containerUUID = 100 + i; member.privateIPv6 = IPAddress(uint128_t(i));
+      group.members.push_back(member);
+    }
+    params.uuid = group.members[0].containerUUID;
+    String bytes; ContainerParameters decoded{};
+    suite.expect(ProdigyWire::serializeContainerParameters(bytes, params) &&
+        ProdigyWire::deserializeContainerParameters(bytes, decoded) &&
+        decoded.truthMembership.members.size() == 3 && decoded.truthMembership.genesisMemberIDs == group.genesisMemberIDs &&
+        decoded.truthMembership.membershipUUID == group.membershipUUID,
+        "three Truth identities survive startup wire");
+    if (bytes.size()) bytes.resize(bytes.size()-1);
+    suite.expect(!ProdigyWire::deserializeContainerParameters(bytes,decoded),"reject truncated Truth projection");
+    ProdigyMasterAuthorityRuntimeState state{}, restored{};
+    state.generation = 2; state.truthGlobalMembershipProjections.push_back(group);
+    bytes.clear(); BitseryEngine::serialize(bytes,state);
+    suite.expect(BitseryEngine::deserializeSafe(bytes,restored) && restored.truthGlobalMembershipProjections.size()==1 &&
+        restored.truthGlobalMembershipProjections[0].members.size()==3, "durable Truth projection round trip");
+    auto successor = group;
+    ++successor.generation;
+    ++successor.members[0].containerUUID;
+    suite.expect(!prodigyTruthMembershipSuccessor(group, successor), "an existing vote cannot move to another container");
+    successor = group;
+    successor.genesisMemberIDs = {2, 3, 4};
+    suite.expect(!prodigyTruthMembershipSuccessor(group, successor), "genesis is immutable after replacement");
+    successor = group;
+    successor.highestAllocatedMemberID = 4;
+    successor.retiredMemberIDs = {1};
+    successor.members.erase(successor.members.begin());
+    auto fresh = group.members[0]; fresh.memberID = 4; fresh.containerUUID = 104; fresh.privateIPv6 = IPAddress(uint128_t(4));
+    successor.members.push_back(fresh);
+    suite.expect(prodigyTruthGlobalMembershipProjectionValid(successor) && prodigyTruthMembershipSuccessor(group, successor),
+                 "fresh voter supersedes retired binding");
+    auto intermediate = successor;
+    intermediate.members.back().role = TruthGlobalMemberRole::learner;
+    suite.expect(!prodigyTruthGlobalMembershipProjectionValid(intermediate), "two voters require a replacement in progress");
+    intermediate.replacementPending = true;
+    suite.expect(prodigyTruthGlobalMembershipProjectionValid(intermediate), "removed voter and caught-up learner before promotion");
+    successor.retiredMemberIDs.clear();
+    auto recycled = group; recycled.highestAllocatedMemberID = 4;
+    suite.expect(!prodigyTruthMembershipSuccessor(successor, recycled), "retired voter remains fenced after cleanup");
+    group.retiredMemberIDs.push_back(1); bytes.clear();
+    suite.expect(!ProdigyWire::serializeContainerParameters(bytes,params),"retired Truth voter cannot be projected");
+  }
+
+  {
     ContainerParameters expected = makeContainerParameters();
     String encoded;
     suite.expect(ProdigyWire::serializeContainerParameters(encoded, expected), "container_params_encode_wire");

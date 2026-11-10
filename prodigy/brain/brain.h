@@ -9632,6 +9632,20 @@ public:
     return false;
   }
 
+  bool desiredTruthGlobalMembership(uint64_t deploymentID,
+                                    TruthGlobalMembershipProjection& out) const override
+  {
+    for (const auto& value : masterAuthorityRuntimeState.truthGlobalMembershipProjections) {
+      if (value.deploymentID == deploymentID && value.localClusterUUID == brainConfig.clusterUUID) {
+        // Neuron checks the exact local UUID. Projecting to an unlisted UUID
+        // therefore refuses the launch instead of falling back to legacy Truth.
+        out = value;
+        return true;
+      }
+    }
+    return false;
+  }
+
   bool desiredAllMastersSeedBootstrap(uint64_t deploymentID, uint32_t shardGroup, ProdigyAllMastersSeedBootstrap& out) const override
   {
     for (const auto& saved : masterAuthorityRuntimeState.statefulServingAuthorities)
@@ -55038,6 +55052,55 @@ public:
             String payload = {}; BitseryEngine::serialize(payload, response);
             Message::construct(mothership->wBuffer, MothershipTopic::commitDeploymentPlacementPolicy, payload);
             (void)flushActiveMothershipSendBuffer(mothership, "placement-policy-durable");
+          });
+          break;
+        }
+      case MothershipTopic::commitTruthGlobalMembership:
+        {
+          String serializedRequest = {}; Message::extractToStringView(args, serializedRequest);
+          TruthGlobalMembershipProjection request = {}; CommitTruthGlobalMembershipResponse response = {};
+          auto reply = [&]() { String payload = {}; BitseryEngine::serialize(payload, response);
+            Message::construct(mothership->wBuffer, MothershipTopic::commitTruthGlobalMembership, payload); };
+          if (args != message->terminal() || !BitseryEngine::deserializeSafe(serializedRequest, request) ||
+              !prodigyTruthGlobalMembershipProjectionValid(request))
+          { response.failure.assign("invalid Truth global membership projection"_ctv); reply(); break; }
+          response.projection = request;
+          if (!weAreMaster || !ignited || request.localClusterUUID != brainConfig.clusterUUID || masterAuthorityPersistencePending ||
+              !masterAuthorityRuntimeStateDurable || durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation)
+          { response.failure.assign("Truth membership authority is not ready for this cluster"_ctv); reply(); break; }
+          // A single durable group owns Truth in this cluster. An update is a
+          // request to reconcile placement; only Truth can commit voting rights.
+          auto& groups = masterAuthorityRuntimeState.truthGlobalMembershipProjections;
+          auto existing = groups.begin();
+          if (existing != groups.end()) {
+            if (!prodigyTruthMembershipSuccessor(*existing, request)) {
+              response.failure.assign("conflicting Truth group or stale revision"_ctv); reply(); break;
+            }
+            if (existing->generation == request.generation) {
+              String admitted; BitseryEngine::serialize(admitted, *existing);
+              response.success = admitted.equals(serializedRequest);
+              if (response.success) response.durableGeneration = durableMasterAuthorityRuntimeStateGeneration;
+              else response.failure.assign("conflicting Truth membership at this revision"_ctv);
+              reply(); break;
+            }
+          }
+          if (masterAuthorityRuntimeState.generation == UINT64_MAX) {
+            response.failure.assign("Truth authority generation exhausted"_ctv); reply(); break;
+          }
+          const auto before = masterAuthorityRuntimeState; const uint64_t generation = before.generation + 1;
+          if (existing == masterAuthorityRuntimeState.truthGlobalMembershipProjections.end()) masterAuthorityRuntimeState.truthGlobalMembershipProjections.push_back(request);
+          else *existing = request;
+          const uint64_t epoch = masterAuthorityEpoch, incarnation = mothership->connectionIncarnation;
+          commitMasterAuthorityStateChangeAsync([this, mothership, epoch, incarnation, before, generation, request](bool durable) mutable {
+            if (masterAuthorityEpoch != epoch) return;
+            if (!durable && masterAuthorityRuntimeState.generation == generation) masterAuthorityRuntimeState = before;
+            if (!activeMotherships.contains(mothership) || mothership->connectionIncarnation != incarnation) return;
+            CommitTruthGlobalMembershipResponse response = {}; response.projection = request; response.success = durable;
+            response.durableGeneration = durable ? generation : 0;
+            if (!durable) response.failure.assign("Truth membership durable acceptance failed"_ctv);
+            String payload = {}; BitseryEngine::serialize(payload, response);
+            Message::construct(mothership->wBuffer, MothershipTopic::commitTruthGlobalMembership, payload);
+            (void)flushActiveMothershipSendBuffer(mothership, "truth-membership-durable");
           });
           break;
         }

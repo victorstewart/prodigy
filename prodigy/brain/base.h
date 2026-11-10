@@ -825,6 +825,7 @@ public:
   virtual bool statefulServingDecisionExists(uint64_t) const { return false; }
   virtual bool statefulServingRecoveryReady() const { return true; }
   virtual bool desiredStatefulDataAuthority(uint64_t, StatefulDataAuthority&, uint32_t = UINT32_MAX) const { return false; }
+  virtual bool desiredTruthGlobalMembership(uint64_t, TruthGlobalMembershipProjection&) const { return false; }
   virtual bool desiredAllMastersSeedBootstrap(uint64_t, uint32_t, ProdigyAllMastersSeedBootstrap&) const { return false; }
   virtual bool allMastersSeedBootstrapAwaitingCancellation(uint64_t) const { return false; }
   virtual bool statefulCatchupCompensationFenced(uint64_t, uint32_t, uint128_t) const { return false; }

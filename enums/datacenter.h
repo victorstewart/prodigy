@@ -120,7 +120,10 @@ enum class MothershipTopic : uint16_t {
   rearmRetainedStatefulDeployment,
   // Read-only inspection and narrowly fenced retirement of a dormant local
   // bundle recovery witness. Appended so older Brains fail closed.
-  repairLocalBundleRecoveryWitness
+  repairLocalBundleRecoveryWitness,
+  // Desired-only Truth membership projection.  An old Brain rejects it; this
+  // frame never grants a writer or installs a Raft voting configuration.
+  commitTruthGlobalMembership
 };
 
 constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
@@ -267,6 +270,8 @@ constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
       return "rearmRetainedStatefulDeployment";
     case MothershipTopic::repairLocalBundleRecoveryWitness:
       return "repairLocalBundleRecoveryWitness";
+    case MothershipTopic::commitTruthGlobalMembership:
+      return "commitTruthGlobalMembership";
   }
 
   return "unknown";

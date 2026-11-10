@@ -2859,6 +2859,9 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=upgrade-admission-inventory
               $<TARGET_FILE:prodigy_brain_replication_credentials_unit>)
    set_tests_properties(prodigy_upgrade_admission_inventory_owner_unit PROPERTIES TIMEOUT 30)
+   add_executable(truth_placement_selector_unit tests/truth_placement_selector_unit.cpp)
+   target_include_directories(truth_placement_selector_unit PRIVATE "${PRODIGY_ROOT}")
+   add_test(NAME truth_placement_selector_unit COMMAND truth_placement_selector_unit)
    add_test(NAME prodigy_cousin_route_unit COMMAND $<TARGET_FILE:prodigy_cousin_route_unit>)
    add_test(NAME prodigy_cluster_pair_keys_unit COMMAND $<TARGET_FILE:prodigy_cluster_pair_keys_unit>)
    add_test(NAME prodigy_transport_credential_authority_unit

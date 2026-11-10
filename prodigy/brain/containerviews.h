@@ -537,6 +537,8 @@ public:
 
     plan.uuid = uuid;
     plan.config = (configOverride ? *configOverride : dplan.config);
+    if (plan.config.applicationID == MeshRegistry::Truth::applicationID && thisBrain)
+      thisBrain->desiredTruthGlobalMembership(plan.config.deploymentID(), plan.truthMembership);
     plan.subscriptions = subscriptions;
     plan.advertisements = advertisements;
     plan.requiresDatacenterUniqueTag = dplan.requiresDatacenterUniqueTag;

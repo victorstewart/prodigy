@@ -14,6 +14,7 @@
 
 namespace ProdigyWire {
 constexpr static uint8_t containerParametersMagic[8] = {'P', 'R', 'D', 'P', 'A', 'R', '0', '1'};
+constexpr static uint8_t truthMembershipTailMagic[8] = {'P', 'R', 'D', 'T', 'R', 'U', '0', '1'};
 constexpr static uint8_t credentialBundleMagic[8] = {'P', 'R', 'D', 'B', 'U', 'N', '0', '1'};
 constexpr static uint8_t credentialDeltaMagic[8] = {'P', 'R', 'D', 'D', 'E', 'L', '0', '1'};
 constexpr static uint8_t tlsResumptionApplyAckMagic[8] = {'P', 'R', 'D', 'A', 'C', 'K', '0', '1'};
@@ -1360,6 +1361,28 @@ static bool serializeContainerParameters(String& output, const ContainerParamete
   }
   writer.u64(parameters.deploymentID);
   writer.u32(parameters.taskAttemptNumber);
+  // Leave legacy launch bytes byte-for-byte unchanged unless the receiver was
+  // capability-gated for this appended tail.
+  if (parameters.truthMembership.protocolVersion != 0)
+  {
+    const auto& membership = parameters.truthMembership;
+    if (!prodigyTruthLocalMember(membership,parameters.deploymentID,parameters.uuid)) return false;
+    writer.header(truthMembershipTailMagic); writer.u8(uint8_t(membership.protocolVersion));
+    writer.u128(membership.membershipUUID); writer.u128(membership.operationUUID); writer.u128(membership.localClusterUUID);
+    writer.u64(membership.deploymentID); writer.u64(membership.generation); writer.u64(membership.expectedCommittedConfigIndex);
+    if (!writer.string(membership.expectedCommittedConfigSHA256)) return false;
+    for (auto id : membership.genesisMemberIDs) writer.i32(id);
+    writer.i32(membership.highestAllocatedMemberID);
+    writer.u8(uint8_t(membership.members.size()));
+    for (const auto& member : membership.members) {
+      writer.i32(member.memberID); writer.u128(member.clusterUUID); writer.u128(member.containerUUID);
+      if (!appendIPAddress(writer, member.privateIPv6)) return false;
+      writer.u8(uint8_t(member.role));
+    }
+    writer.u16(uint16_t(membership.retiredMemberIDs.size()));
+    for (int32_t retired : membership.retiredMemberIDs) writer.i32(retired);
+    writer.boolean(membership.replacementPending);
+  }
 
   return true;
 }
@@ -1510,11 +1533,30 @@ static bool deserializeContainerParameters(const String& input, ContainerParamet
       return true;
     }
 
-    if (reader.u64(decoded.deploymentID) == false ||
-        reader.u32(decoded.taskAttemptNumber) == false ||
-        reader.done() == false)
+    if (reader.u64(decoded.deploymentID) == false || reader.u32(decoded.taskAttemptNumber) == false)
     {
       return false;
+    }
+    if (!reader.done()) {
+      uint8_t version = 0, memberCount = 0; uint16_t retiredCount = 0;
+      if (!reader.header(truthMembershipTailMagic) || !reader.u8(version) || version != TruthGlobalMembershipProjection::version) return false;
+      auto& membership = decoded.truthMembership; membership.protocolVersion = version;
+      if (!reader.u128(membership.membershipUUID) || !reader.u128(membership.operationUUID) || !reader.u128(membership.localClusterUUID) ||
+          !reader.u64(membership.deploymentID) || !reader.u64(membership.generation) || !reader.u64(membership.expectedCommittedConfigIndex) ||
+          !reader.string(membership.expectedCommittedConfigSHA256) || membership.expectedCommittedConfigSHA256.size() != 64) return false;
+      for (auto& id : membership.genesisMemberIDs) if (!reader.i32(id)) return false;
+      if (!reader.i32(membership.highestAllocatedMemberID) || !reader.u8(memberCount) || memberCount > 4) return false;
+      membership.members.reserve(memberCount);
+      for (uint8_t index = 0; index < memberCount; ++index) {
+        TruthGlobalMember member; uint8_t role = 0;
+        if (!reader.i32(member.memberID) || !reader.u128(member.clusterUUID) || !reader.u128(member.containerUUID) ||
+            !extractIPAddress(reader, member.privateIPv6) || !reader.u8(role)) return false;
+        member.role = TruthGlobalMemberRole(role); membership.members.push_back(std::move(member));
+      }
+      if (!reader.u16(retiredCount) || retiredCount > 256) return false;
+      membership.retiredMemberIDs.reserve(retiredCount);
+      for (uint16_t index = 0; index < retiredCount; ++index) { int32_t retired = 0; if (!reader.i32(retired)) return false; membership.retiredMemberIDs.push_back(retired); }
+      if (!reader.boolean(membership.replacementPending) || !reader.done() || !prodigyTruthLocalMember(membership,decoded.deploymentID,decoded.uuid)) return false;
     }
 
     parameters = std::move(decoded);

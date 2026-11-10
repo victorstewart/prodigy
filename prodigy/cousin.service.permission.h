@@ -320,6 +320,10 @@ static inline bool prodigyCousinServicePermissionPurposeValid(
     const uint64_t expected = sourceApp == 3 ? MeshRegistry::Hot::seeding : MeshRegistry::Cold::seeding;
     return sourceApp == destinationApp && sourcePrefix == expected && destinationPrefix == expected;
   }
+  if (sourceApp == MeshRegistry::Truth::applicationID)
+    return destinationApp == sourceApp && permission.purpose == ProdigyCousinServicePurpose::sibling &&
+        sourcePrefix == MeshRegistry::Truth::siblings && destinationPrefix == sourcePrefix &&
+        permission.destinationShardGroup == 0 && permission.destinationShardGroups == 1 && slot == 0;
   // Retained graph peers are one-group, same-application, non-client roles.
   if (sourceApp != destinationApp || (sourceApp != 2 && sourceApp != 5) || sourcePrefix != destinationPrefix ||
       permission.destinationShardGroup != 0 || permission.destinationShardGroups != 1 || slot != 0) return false;
