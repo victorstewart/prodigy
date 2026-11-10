@@ -3972,10 +3972,51 @@ static void testBoundedFailureReport(TestSuite& suite)
                "failure_summary_display_preserves_human_report");
 }
 
+static void testTruthPlacementShardInvariant(TestSuite& suite)
+{
+  // Reconciliation may have to return through incomplete() before a local
+  // machine is eligible. That path must still initialize the launch-plan
+  // shard invariant consumed by Truth peer admission.
+  ScopedFreshRing ring;
+  TestBrain brain = {};
+  BrainBase *savedBrain = thisBrain;
+  thisBrain = &brain;
+  brain.brainConfig.clusterUUID = 17;
+  ApplicationDeployment deployment = {};
+  seedCommonPlan(deployment, true);
+  deployment.plan.config.applicationID = MeshRegistry::Truth::applicationID;
+  deployment.nShardGroups = 0;
+  TruthGlobalMembershipProjection group = {};
+  group.protocolVersion = 1; group.membershipUUID = 15; group.operationUUID = 16;
+  group.localClusterUUID = brain.brainConfig.clusterUUID;
+  group.deploymentID = deployment.plan.config.deploymentID(); group.generation = 1;
+  group.expectedCommittedConfigIndex = 22;
+  group.expectedCommittedConfigSHA256.assign("1111111111111111111111111111111111111111111111111111111111111111"_ctv);
+  group.genesisMemberIDs = {1, 2, 3}; group.highestAllocatedMemberID = 3;
+  for (int memberID = 1; memberID <= 3; ++memberID)
+  {
+    TruthGlobalMember member = {};
+    member.memberID = memberID; member.clusterUUID = group.localClusterUUID;
+    member.containerUUID = 100 + memberID; member.privateIPv6 = IPAddress(uint128_t(memberID));
+    group.members.push_back(member);
+  }
+  suite.expect(prodigyTruthGlobalMembershipProjectionValid(group) &&
+                   deployment.reconcileTruthPlacement(group) == false && deployment.nShardGroups == 1,
+               "truth_reconcile_incomplete_path_initializes_one_shard_before_scheduler_launch");
+  thisBrain = savedBrain;
+}
+
 int main(void)
 {
   TestSuite suite;
   const char *selector = std::getenv("PRODIGY_TEST_ONLY");
+  if (selector != nullptr && std::strcmp(selector, "truth-placement") == 0)
+  {
+    testTruthPlacementShardInvariant(suite);
+    dprintf(STDOUT_FILENO, "truth_placement passed=%d failed=%d\n", suite.passed, suite.failed);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (selector == nullptr) testTruthPlacementShardInvariant(suite);
   if (selector != nullptr && std::strcmp(selector, "storage-parent-traversal") == 0)
   {
     testStorageParentTraversal(suite);

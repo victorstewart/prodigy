@@ -4472,6 +4472,12 @@ public:
         current.deploymentID != plan.config.deploymentID() || current.localClusterUUID != thisBrain->brainConfig.clusterUUID ||
         prodigyTruthGlobalMembershipProjectionValid(current) == false) return false;
 
+    // Truth is an exact global membership with one local stateful shard. This
+    // must precede every scheduling exit, including incomplete(), because the
+    // ordinary launch serializer carries nShardGroups into ContainerPlan and
+    // peer admission rejects an uninitialized (zero) shard count.
+    nShardGroups = 1;
+
     bool changed = false;
     auto incomplete = [&]() -> bool {
       // Earlier exact constructions remain owned by the ordinary scheduler.
