@@ -277,6 +277,15 @@ public:
   }
   bool withdrawDeliveredSecret(const ProdigyPairPrivateBGPSecretScope& scope)
   { if (!prodigyPairPrivateBGPSecretScopeEqual(deliveredScope, scope)) return false; withdrawAll(); return true; }
+  // Reconciliation can allocate this owner before Vault delivery.  That
+  // empty owner is safe to retire on an exact authority withdrawal, but no
+  // nonempty owner may be treated as the requested scope by inference.
+  bool empty(void) const
+  {
+    return deliveredScope.pairUUID == 0 && deliveredSecret.empty() && paths.empty() &&
+        !pathFaultPaused && pathFaultRequest.operationUUID == 0 &&
+        completedPathFaultRequest.operationUUID == 0;
+  }
   bool beginCrossClusterPathFault(const ProdigyCrossClusterPathFaultRequest& request,
                                   const String& authenticatedControlIdentitySHA256)
   {

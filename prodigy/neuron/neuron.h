@@ -119,6 +119,10 @@ protected:
     SwitchboardOverlayMachineRoute privateBGPFallback = {};
     bool privateBGPFallbackInstalled = false;
     bool privateBGPFallbackProgrammed = false;
+    // A failed program removal must survive a BGP-owner observer/replay.  The
+    // next authenticated terminal withdrawal retries the existing overlay
+    // reconciler instead of inferring absence from cleared desired-state bits.
+    bool privateBGPFallbackRemovalPending = false;
     std::unique_ptr<NeuronPrivateTunnelBGPRuntime> privateTunnelBGP;
     ProdigyCrossClusterPathFaultRequest faultLease = {};
     ProdigyCrossClusterPathFaultRequest completedFaultLease = {};
@@ -3848,16 +3852,68 @@ protected:
   // handler.  It intentionally accepts the move-only response rather than a
   // serializable control object, so the BGP credential cannot enter Brain
   // state or a replayable authority snapshot.
+  static bool crossClusterPrivateBGPSecretScopeMatchesAuthority(
+      const ProdigyPairPrivateBGPSecretScope& scope,
+      const CrossClusterMasqueGatewayAuthority& authority)
+  {
+    return prodigyPairPrivateBGPSecretScopeValid(scope) &&
+        authority.state == CrossClusterMasqueGatewayState::active &&
+        scope.pairUUID == authority.pairUUID && scope.operationUUID == authority.pairOperationUUID &&
+        scope.keyEpoch == authority.keyGeneration && scope.tunnelSlot == authority.tunnelSlot &&
+        scope.clusterUUID == authority.localClusterUUID && scope.machineUUID == authority.localMachineUUID &&
+        scope.authorityGeneration == authority.pairAuthorityGeneration &&
+        scope.gatewayGeneration == authority.generation;
+  }
+
+  bool withdrawCrossClusterPrivateBGPSecret(const ProdigyPairPrivateBGPSecretScope& scope)
+  {
+    auto *runtime = crossClusterMasqueGatewayRuntimeForPair(scope.pairUUID);
+    if (runtime == nullptr ||
+        !crossClusterPrivateBGPSecretScopeMatchesAuthority(scope, runtime->authority) ||
+        runtime->faultLeaseActive ||
+        (runtime->gatewayBootstrap &&
+         !prodigyPairPrivateBGPSecretScopeEqual(runtime->gatewayBootstrap->scope, scope)))
+      return false;
+
+    // Capture the fallback before withdrawAll() notifies its observer.  That
+    // observer can reconcile desired state and clear the ordinary flags even
+    // when programming the removal did not converge.
+    const bool fallbackInstalled = runtime->privateBGPFallbackInstalled ||
+        runtime->privateBGPFallbackProgrammed;
+    runtime->privateBGPFallbackRemovalPending |= fallbackInstalled;
+    // A BGP owner can exist before secret delivery.  It is terminally empty
+    // only when it has no scope, key, path, or unacknowledged fault state.
+    if (runtime->privateTunnelBGP &&
+        !runtime->privateTunnelBGP->withdrawDeliveredSecret(scope) &&
+        !runtime->privateTunnelBGP->empty())
+      return false;
+
+    runtime->gatewayBootstrap.reset();
+    runtime->pendingLaunch.reset();
+    runtime->privateTunnelBGP.reset();
+    runtime->faultLease = {};
+    runtime->completedFaultLease = {};
+    runtime->faultLeaseActive = false;
+    runtime->faultResumeAcknowledged = false;
+    runtime->faultMonotonicDeadlineNs = 0;
+    runtime->sitePrefixAdvertised = false;
+    runtime->revokeReadiness();
+    // This is the single owner that removes only runtime-owned fallbacks from
+    // the overlay config and programs the resulting route set.  An empty BGP
+    // owner has no fallback to program; otherwise no receipt is issued until
+    // the removal converged.
+    if (!runtime->privateBGPFallbackRemovalPending && switchboard == nullptr) return true;
+    return reconcileCrossClusterPrivateBGPSwitchboardFallback() &&
+        !runtime->privateBGPFallbackRemovalPending &&
+        !runtime->privateBGPFallbackInstalled && !runtime->privateBGPFallbackProgrammed;
+  }
+
   bool installCrossClusterPrivateBGPSecret(ProdigyPairPrivateBGPSecretDeliveryResponse& response)
   {
     auto *runtime = crossClusterMasqueGatewayRuntimeForPair(response.scope.pairUUID);
     if (!response.accepted || runtime == nullptr) return false;
     const auto& authority = runtime->authority;
-    if (authority.state != CrossClusterMasqueGatewayState::active ||
-        response.scope.pairUUID != authority.pairUUID || response.scope.operationUUID != authority.pairOperationUUID ||
-        response.scope.keyEpoch != authority.keyGeneration || response.scope.tunnelSlot != authority.tunnelSlot ||
-        response.scope.clusterUUID != authority.localClusterUUID || response.scope.machineUUID != authority.localMachineUUID ||
-        response.scope.authorityGeneration != authority.pairAuthorityGeneration || response.scope.gatewayGeneration != authority.generation)
+    if (!crossClusterPrivateBGPSecretScopeMatchesAuthority(response.scope, authority))
       return false;
     if (!prodigyPairPrivateGatewayTLSMaterialMatchesAuthority(authority,
             response.gatewayRootCertPem, response.localLeafCertPem, response.localLeafKeyPem,
@@ -3994,7 +4050,7 @@ protected:
     return reconciled;
   }
 
-  void reconcileCrossClusterPrivateBGPSwitchboardFallback(void)
+  bool reconcileCrossClusterPrivateBGPSwitchboardFallback(void)
   {
     bool needsBoundaryRouter = false;
     for (auto& runtime : crossClusterMasqueGatewayRuntimes) {
@@ -4020,6 +4076,8 @@ protected:
     else if (switchboard) boundaryReady = switchboard->setPrivateBGPBoundaryConsumer(false);
     const bool routingConverged = syncOverlayRoutingPrograms() && boundaryReady;
     for (auto& runtime : crossClusterMasqueGatewayRuntimes) {
+      if (routingConverged && !runtime.privateBGPFallbackInstalled)
+        runtime.privateBGPFallbackRemovalPending = false;
       runtime.privateBGPFallbackProgrammed = routingConverged && runtime.privateBGPFallbackInstalled &&
           crossClusterPrivateBGPFallbackProgrammed(runtime.privateBGPFallback);
       if (!prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(runtime.authority) ||
@@ -4036,6 +4094,7 @@ protected:
         Vault::secureClearString(encoded); Ring::queueSend(brain);
       }
     }
+    return routingConverged;
   }
 
   bool retainExactHostTCXForUnexpectedRestart(EthDevice& device,
@@ -8577,21 +8636,9 @@ public:
           Message::extractArg<ArgumentNature::fixed>(args, scope.keyEpoch); Message::extractArg<ArgumentNature::fixed>(args, scope.tunnelSlot);
           Message::extractArg<ArgumentNature::fixed>(args, scope.clusterUUID); Message::extractArg<ArgumentNature::fixed>(args, scope.machineUUID);
           Message::extractArg<ArgumentNature::fixed>(args, scope.authorityGeneration); Message::extractArg<ArgumentNature::fixed>(args, scope.gatewayGeneration);
-          auto *runtime = crossClusterMasqueGatewayRuntimeForPair(scope.pairUUID);
-          bool acknowledged = false;
-          if (args == terminal && scope.machineUUID == uuid &&
-              scope.clusterUUID == controlTransportCredentials.self.clusterUUID && runtime != nullptr)
-          {
-            if (runtime->gatewayBootstrap &&
-                prodigyPairPrivateBGPSecretScopeEqual(runtime->gatewayBootstrap->scope, scope))
-            {
-              runtime->gatewayBootstrap.reset();
-              runtime->pendingLaunch.reset();
-              acknowledged = true;
-            }
-            if (runtime->privateTunnelBGP && runtime->privateTunnelBGP->withdrawDeliveredSecret(scope))
-              acknowledged = true;
-          }
+          const bool acknowledged = args == terminal && scope.machineUUID == uuid &&
+              scope.clusterUUID == controlTransportCredentials.self.clusterUUID &&
+              withdrawCrossClusterPrivateBGPSecret(scope);
           if (brain && brain->fd >= 0) { Message::construct(brain->wBuffer, NeuronTopic::crossClusterPrivateBGPSecretRevocationAck,
               scope.pairUUID, scope.operationUUID, scope.keyEpoch, scope.tunnelSlot, scope.clusterUUID, scope.machineUUID,
               scope.authorityGeneration, scope.gatewayGeneration, uint8_t(acknowledged)); Ring::queueSend(brain); }
