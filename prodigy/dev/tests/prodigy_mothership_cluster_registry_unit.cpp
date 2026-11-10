@@ -375,6 +375,53 @@ static void testTruthRegistry(TestSuite& suite, const String& directory)
   {
     MothershipClusterRegistry registry(path);
     suite.expect(registry.saveTruthGroup(0, state, &failure) && state.revision == 1, "Truth durable genesis");
+    auto v1 = state;
+    v1.version = 1;
+    v1.retiredBindings.clear();
+    String v1Bytes;
+    MothershipTruthGroup v1Recovered = {};
+    suite.expect(BitseryEngine::serialize(v1Bytes, v1) && BitseryEngine::deserializeSafe(v1Bytes, v1Recovered) &&
+        v1Recovered.version == 1 && v1Recovered.retiredBindings.empty() &&
+        v1Recovered.group.members.size() == v1.group.members.size() &&
+        v1Recovered.group.members.front().containerUUID == v1.group.members.front().containerUUID,
+        "Truth v1 group codec has no retired-binding history");
+    auto unretiredBinding = state;
+    unretiredBinding.retiredBindings.push_back(state.group.members.front());
+    suite.expect(!mothershipTruthGroupValid(unretiredBinding),
+        "Truth rejects retired binding absent from retired member IDs");
+    auto replacement = state;
+    const auto oldRemote = group.members[1];
+    replacement.retiredBindings.push_back(oldRemote);
+    replacement.incoming = oldRemote;
+    replacement.incoming.memberID = 5;
+    replacement.incoming.containerUUID = 105;
+    replacement.incoming.privateIPv6 = IPAddress(uint128_t(5));
+    auto committed = group.members;
+    committed[1] = replacement.incoming;
+    suite.expect(mothershipTruthReplacementRouteEndpoint(replacement, committed, 74, oldRemote.privateIPv6) &&
+        mothershipTruthReplacementRouteEndpoint(replacement, committed, 74, replacement.incoming.privateIPv6) &&
+        !mothershipTruthReplacementRouteEndpoint(replacement, committed, 73, oldRemote.privateIPv6),
+        "Truth uses the retired remote binding for rebalance and resumes only at the exact incoming endpoint");
+    auto survivor = oldRemote;
+    survivor.memberID = 6;
+    survivor.containerUUID = 106;
+    committed.push_back(survivor);
+    suite.expect(!mothershipTruthReplacementRouteEndpoint(replacement, committed, 74, oldRemote.privateIPv6),
+        "Truth preserves a current voter that reused a retired endpoint");
+    replacement.group.highestAllocatedMemberID = 5;
+    replacement.group.members = {group.members[0], group.members[2], replacement.incoming};
+    replacement.group.retiredMemberIDs = {oldRemote.memberID};
+    replacement.group.generation = 3;
+    replacement.group.expectedCommittedConfigIndex = 4;
+    String replacementBytes;
+    MothershipTruthGroup restored = {};
+    suite.expect(prodigyTruthCommittedConfigDigest(group.membershipUUID, group.deploymentID, 4,
+        replacement.group.members, replacement.group.expectedCommittedConfigSHA256) && mothershipTruthGroupValid(replacement) &&
+        BitseryEngine::serialize(replacementBytes, replacement) &&
+        BitseryEngine::deserializeSafe(replacementBytes, restored) && mothershipTruthGroupValid(restored) &&
+        restored.retiredBindings.size() == 1 && restored.retiredBindings[0].containerUUID == oldRemote.containerUUID &&
+        restored.retiredBindings[0].privateIPv6.equals(oldRemote.privateIPv6),
+        "Truth restores the retired remote identity and endpoint from its v2 registry record");
     auto wrong = grant;
     ++wrong.operationUUID;
     suite.expect(!registry.recordTruthGrantBeforeDispatch(wrong, &failure), "Truth rejects mismatched first grant");
@@ -489,11 +536,20 @@ int main(int argc, char** argv)
     bindings.clear();
     suite.expect(resumedRoutes.loadGraphReplicaRouteBindings(5, owner, replica, now, bindings, &failure) && bindings.size() == 2,
         "graph_route_restart_resume_accepted");
-    auto stale = sibling; stale.generation = 2; stale.operationUUID++; stale.issuedAtMs = now; stale.expiresAtMs = now + 60'000;
+    auto endpointSuccessor = sibling; endpointSuccessor.generation = 2; endpointSuccessor.operationUUID++;
+    endpointSuccessor.destinationPublicAddress.v6[15]++;
+    endpointSuccessor.issuedAtMs = now; endpointSuccessor.expiresAtMs = now + 60'000;
+    CousinRouteRecord loadedSuccessor = {};
+    suite.expect(recordRoute(resumedRoutes, endpointSuccessor) && recordReceipts(resumedRoutes, endpointSuccessor) &&
+        resumedRoutes.loadCousinRoute(endpointSuccessor.routeUUID, loadedSuccessor, &failure) &&
+        loadedSuccessor.generation == endpointSuccessor.generation &&
+        loadedSuccessor.destinationPublicAddress.equals(endpointSuccessor.destinationPublicAddress),
+        "graph_route_successor_replaces_exact_endpoint_after_receipts");
+    auto stale = endpointSuccessor; stale.generation = 3; stale.operationUUID++; stale.issuedAtMs = now; stale.expiresAtMs = now + 60'000;
     suite.expect(recordRoute(resumedRoutes, stale) && !resumedRoutes.loadGraphReplicaRouteBindings(5, owner, replica, now, bindings, &failure),
         "graph_route_stale_receipt_rejected");
     suite.expect(recordReceipts(resumedRoutes, stale), "graph_route_new_generation_receipts_recorded");
-    auto withdrawn = stale; withdrawn.generation = 3; withdrawn.operationUUID++; withdrawn.issuedAtMs = now + 1;
+    auto withdrawn = stale; withdrawn.generation = 4; withdrawn.operationUUID++; withdrawn.issuedAtMs = now + 1;
     withdrawn.expiresAtMs = now + 60'000; withdrawn.state = CousinRouteState::withdrawn;
     withdrawn.withdrawalGeneration = withdrawn.generation; withdrawn.withdrawnAtMs = now + 1;
     suite.expect(recordRoute(resumedRoutes, withdrawn) && !resumedRoutes.loadGraphReplicaRouteBindings(5, owner, replica, now + 2, bindings, &failure),

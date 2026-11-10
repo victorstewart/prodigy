@@ -200,6 +200,11 @@ bool reconcileTruthOnce(MothershipTruthGroup state, String& failure) {
       (leader->committedConfigIndex==g.expectedCommittedConfigIndex && leader->committedConfigSHA256!=g.expectedCommittedConfigSHA256)) {
     failure.assign("committed configuration disagrees with registry"_ctv); return false;
   }
+  if (g.replacementPending && state.incoming.memberID &&
+      !reconcileTruthReplacementRoute(state, *leader, eligible, failure)) {
+    basics_log("reconcileTruth waiting for the replacement's sibling route: %s\n", failure.c_str());
+    return true;
+  }
   if (state.cleanup) {
     if (leader->members.size()!=3 || isVoter(leader->members,state.outgoing.memberID) ||
         !isVoter(leader->members,state.incoming.memberID) || leader->committedConfigSHA256!=g.expectedCommittedConfigSHA256) {
@@ -275,6 +280,16 @@ bool reconcileTruthOnce(MothershipTruthGroup state, String& failure) {
       auto obsolete=std::find_if(g.retiredMemberIDs.begin(),g.retiredMemberIDs.end(),[&](int32_t id){return id!=state.outgoing.memberID;});
       g.retiredMemberIDs.erase(obsolete);
     }
+    // Keep the endpoint that belonged to each retained Raft tombstone. A later
+    // rebalance can then identify the exact private route to the former voter.
+    state.version = 2;
+    auto obsolete = std::remove_if(state.retiredBindings.begin(), state.retiredBindings.end(), [&](const auto& member) {
+      return !std::binary_search(g.retiredMemberIDs.begin(), g.retiredMemberIDs.end(), member.memberID);
+    });
+    state.retiredBindings.erase(obsolete, state.retiredBindings.end());
+    auto position = std::lower_bound(state.retiredBindings.begin(), state.retiredBindings.end(), state.outgoing.memberID,
+        [](const auto& member, int32_t id) { return member.memberID < id; });
+    state.retiredBindings.insert(position, state.outgoing);
     g.expectedCommittedConfigIndex=leader->committedConfigIndex; g.expectedCommittedConfigSHA256=leader->committedConfigSHA256;
     g.replacementPending=false; ++g.generation; state.cleanup=true;
     return save();
