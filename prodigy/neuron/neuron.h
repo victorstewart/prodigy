@@ -3865,11 +3865,45 @@ protected:
         scope.gatewayGeneration == authority.generation;
   }
 
+  static bool crossClusterPrivateBGPSecretScopeMatchesGatewayPlan(
+      const ProdigyPairPrivateBGPSecretScope& scope, const ContainerPlan& plan)
+  {
+    const auto& gateway = plan.system;
+    return gateway.kind == SystemContainerKind::crossClusterMasqueGateway &&
+        gateway.gatewayPairUUID == scope.pairUUID &&
+        gateway.gatewayLocalClusterUUID == scope.clusterUUID &&
+        gateway.gatewayLocalMachineUUID == scope.machineUUID &&
+        gateway.gatewayKeyEpoch == scope.keyEpoch &&
+        gateway.gatewayAuthorityGeneration == scope.authorityGeneration &&
+        gateway.gatewayGeneration == scope.gatewayGeneration;
+  }
+
+  // Brain forwards a terminal request only after its durable authority proves
+  // the complete scope. A retired, never-admitted authority can therefore be
+  // acknowledged here only after proving that no live container or pending
+  // launch still names that exact scope. Any local owner remains an anchor and
+  // must take the ordinary BGP/fallback cleanup path below.
+  bool crossClusterPrivateBGPSecretScopeHasNoGatewayAnchor(
+      const ProdigyPairPrivateBGPSecretScope& scope) const
+  {
+    for (const auto& [containerUUID, container] : containers)
+      if (container != nullptr &&
+          crossClusterPrivateBGPSecretScopeMatchesGatewayPlan(scope, container->plan))
+        return false;
+    for (const auto& [containerUUID, plan] : pendingContainerLaunchPlans)
+      if (crossClusterPrivateBGPSecretScopeMatchesGatewayPlan(scope, plan)) return false;
+    for (const auto& [containerUUID, operation] : pendingStateUploadRestores)
+      if (operation != nullptr && operation->container != nullptr &&
+          crossClusterPrivateBGPSecretScopeMatchesGatewayPlan(scope, operation->container->plan))
+        return false;
+    return true;
+  }
+
   bool withdrawCrossClusterPrivateBGPSecret(const ProdigyPairPrivateBGPSecretScope& scope)
   {
     auto *runtime = crossClusterMasqueGatewayRuntimeForPair(scope.pairUUID);
-    if (runtime == nullptr ||
-        !crossClusterPrivateBGPSecretScopeMatchesAuthority(scope, runtime->authority) ||
+    if (runtime == nullptr) return crossClusterPrivateBGPSecretScopeHasNoGatewayAnchor(scope);
+    if (!crossClusterPrivateBGPSecretScopeMatchesAuthority(scope, runtime->authority) ||
         runtime->faultLeaseActive ||
         (runtime->gatewayBootstrap &&
          !prodigyPairPrivateBGPSecretScopeEqual(runtime->gatewayBootstrap->scope, scope)))
