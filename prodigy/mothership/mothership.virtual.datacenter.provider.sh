@@ -2739,8 +2739,149 @@ pair_control_remove_masque_machine_route()
    fi
 }
 
+# Only parent-local delivery routes can be shared between pair operations.
+# The parent runtime and namespace inode, rather than pc-first/pc-second (which
+# are operation-local aliases), identify their existing VDC lifecycle owner.
+pair_control_parent_local_service_route_name()
+{
+   [[ "$1" =~ ^service-(source|destination)-local-route(-opposite|-flow-([2-9]|[1-5][0-9]|6[0-3]))?$ ]]
+}
+
+pair_control_parent_local_service_route()
+{
+   local action="$1" namespace="$2" name="$3" prefix="$4" gateway="$5" device="$6" side workspace runtime route_lock_fd status
+   pair_control_parent_local_service_route_name "$name" || return 1
+   case "$namespace" in
+      pc-first) side=first; workspace="$pair_control_first_workspace"; runtime="$pair_control_first_runtime" ;;
+      pc-second) side=second; workspace="$pair_control_second_workspace"; runtime="$pair_control_second_runtime" ;;
+      *) return 1 ;;
+   esac
+   # Fault admission already retains both workspace locks across its query.
+   # Read-only validation must not try to acquire those same locks again.
+   if [[ "$action" == validate ]]; then
+      pair_control_parent_local_service_route_locked "$@"
+      return
+   fi
+   pair_lock_workspace "$workspace" route_lock_fd || return 1
+   if pair_control_parent_local_service_route_locked "$action" "$namespace" "$name" "$prefix" "$gateway" "$device"; then
+      status=0
+   else status=$?; fi
+   pair_unlock_workspace "$route_lock_fd" || return 1
+   return "$status"
+}
+
+pair_control_parent_local_service_route_locked()
+{
+   local action="$1" namespace="$2" name="$3" prefix="$4" gateway="$5" device="$6"
+   local inode expected identity digest operation directory reference entry owner entries other=0 state legacy=0
+   # side, workspace and runtime are selected by the locked caller. This also
+   # rejects a live replacement provider before reading or changing its routes.
+   pair_control_current_parent_bound "$side" || return 1
+   inode="$(<"$pair_control_dir/$side-namespace")"
+   [[ "$inode" =~ ^[1-9][0-9]*$ && "$runtime" =~ ^[1-9][0-9]*$ && "$device" == vdcbr0 ]] || return 1
+   expected="$(pair_control_service_route_expected "$prefix" "$gateway" "$device")" || return 1
+   identity="$runtime $inode $expected"
+   digest="$(printf '%s\n' "$identity" | sha256sum | awk '{print $1}')" || return 1
+   operation="$(pair_control_digest)" || return 1
+   [[ "$digest" =~ ^[0-9a-f]{64}$ && "$operation" =~ ^[0-9a-f]{64}$ ]] || return 1
+   directory="$workspace/virtual-datacenter.service-routes"
+   [[ ! -L "$directory" && ( ! -e "$directory" || -d "$directory" ) ]] || return 1
+   if [[ -e "$pair_control_dir/$name-intent" || -L "$pair_control_dir/$name-intent" ]]; then
+      pair_regular_root_receipt "$pair_control_dir/$name-intent" &&
+         [[ "$(<"$pair_control_dir/$name-intent")" == "$expected" ]] || return 1
+      legacy=1
+   fi
+   if [[ -e "$pair_control_dir/$name" || -L "$pair_control_dir/$name" ]]; then
+      [[ "$legacy" == 1 ]] && pair_regular_root_receipt "$pair_control_dir/$name" &&
+         [[ "$(<"$pair_control_dir/$name")" == "$expected" ]] || return 1
+   fi
+   directory="$directory/$digest"
+   [[ ! -L "$directory" && ( ! -e "$directory" || -d "$directory" ) ]] || return 1
+   reference="$directory/ref-$operation-$name"
+   if [[ -e "$directory/owner" || -L "$directory/owner" ]]; then
+      pair_regular_root_receipt "$directory/owner" && [[ "$(<"$directory/owner")" == "$identity" ]] || return 1
+   else
+      # A legacy operation can migrate its exact intent on replay or clean it
+      # up directly. Never adopt an unjournaled, already-present kernel route.
+      if [[ -d "$directory" ]]; then
+         entries="$(ls -A -- "$directory")" || return 1
+         [[ -z "$entries" ]] || return 1
+      fi
+      if pair_control_service_route_exact "$namespace" "$prefix" "$gateway" "$device"; then
+         [[ "$legacy" == 1 ]] || return 1
+         state=0
+      else state=$?; [[ "$state" == 1 ]] || return 1; fi
+      if [[ "$action" == remove ]]; then
+         [[ "$legacy" == 1 ]] || return 0
+         [[ "$state" == 1 ]] || ip -n "$namespace" -6 route del "$prefix" via "$gateway" dev "$device" || return 1
+         return 0
+      fi
+      [[ "$action" != validate ]] || { [[ "$legacy" == 1 && "$state" == 0 ]]; return; }
+      [[ "$action" == install ]] || return 1
+      mkdir -p -m 0700 "$directory" || return 1
+      pair_write "$directory/owner" "$identity" || return 1
+   fi
+   # References survive process loss until their exact operation is recovered.
+   # A corrupt/symlinked reference must never turn another owner into absence.
+   for entry in "$directory"/ref-*; do
+      [[ -e "$entry" || -L "$entry" ]] || continue
+      owner="${entry##*/ref-}"; owner="${owner:0:64}"
+      [[ "$owner" =~ ^[0-9a-f]{64}$ ]] &&
+         pair_control_parent_local_service_route_name "${entry##*/ref-$owner-}" &&
+         pair_regular_root_receipt "$entry" && [[ "$(<"$entry")" == "$owner $identity" ]] || return 1
+      [[ "$entry" == "$reference" ]] || other=1
+   done
+   if [[ -e "$directory/removed" || -L "$directory/removed" ]]; then
+      pair_regular_root_receipt "$directory/removed" && [[ "$(<"$directory/removed")" == "$identity" ]] || return 1
+   fi
+   case "$action" in
+      install)
+         # A released owner is a retry witness, not permission to adopt an
+         # identical route subsequently installed by somebody else.
+         if [[ -e "$directory/removed" ]]; then
+            if pair_control_service_route_exact "$namespace" "$prefix" "$gateway" "$device"; then return 1; else
+               state=$?; [[ "$state" == 1 ]] || return 1
+            fi
+         fi
+         pair_write "$pair_control_dir/$name-intent" "$expected" || return 1
+         pair_write "$reference" "$operation $identity" || return 1
+         if [[ -e "$directory/removed" ]]; then rm -- "$directory/removed" && sync -f "$directory" || return 1; fi
+         if pair_control_service_route_exact "$namespace" "$prefix" "$gateway" "$device"; then :; else
+            state=$?; [[ "$state" == 1 ]] || return 1
+            ip -n "$namespace" -6 route add "$prefix" via "$gateway" dev "$device" || return 1
+            pair_control_service_route_exact "$namespace" "$prefix" "$gateway" "$device" || return 1
+         fi
+         pair_write "$pair_control_dir/$name" "$expected"
+         ;;
+      validate)
+         [[ -f "$reference" && ! -L "$reference" && ! -e "$directory/removed" ]]
+         ;;
+      remove)
+         # Absence means a crash before reference publication, or a completed
+         # previous release. In either case another operation still owns its
+         # own refs; a retry must not fall back to legacy route deletion.
+         [[ -e "$reference" ]] || return 0
+         if pair_control_service_route_exact "$namespace" "$prefix" "$gateway" "$device"; then
+            if [[ "$other" == 0 ]]; then
+               ip -n "$namespace" -6 route del "$prefix" via "$gateway" dev "$device" || return 1
+               if pair_control_service_route_exact "$namespace" "$prefix" "$gateway" "$device"; then return 1; else
+                  state=$?; [[ "$state" == 1 ]] || return 1
+               fi
+            fi
+         else state=$?; [[ "$state" == 1 ]] || return 1; fi
+         [[ "$other" == 1 ]] || pair_write "$directory/removed" "$identity" || return 1
+         rm -- "$reference" && sync -f "$directory"
+         ;;
+      *) return 1 ;;
+   esac
+}
+
 pair_control_install_service_route()
 {
+   if pair_control_parent_local_service_route_name "$2"; then
+      pair_control_parent_local_service_route install "$@"
+      return
+   fi
    local namespace="$1" name="$2" prefix="$3" gateway="$4" device="$5" expected state owned=0 shared digest
    expected="$(pair_control_service_route_expected "$prefix" "$gateway" "$device")" || return 1
    digest="$(printf '%s\n%s\n' "$namespace" "$expected" | sha256sum | awk '{print $1}')" || return 1
@@ -2839,6 +2980,11 @@ pair_control_validate_service_one_inside()
    pair_control_service_route_journal_valid "$name" "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" vdcbr0 || return 1
    name="$(pair_control_service_name service-destination-local-route "$slot")" || return 1
    pair_control_service_route_journal_valid "$name" "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" vdcbr0 || return 1
+   pair_control_parent_local_service_route validate "pc-$pair_control_service_destination_side" "$name" \
+      "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" vdcbr0 || return 1
+   name="$(pair_control_service_name service-source-local-route "$slot")" || return 1
+   pair_control_parent_local_service_route validate "pc-$pair_control_service_source_side" "$name" \
+      "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" vdcbr0 || return 1
    pair_control_service_route_exact "pc-$pair_control_service_source_side" "${pair_control_service_destination_address}/128" "$pair_control_service_source_router" vdcbr0 || return 1
    pair_control_service_route_exact "pc-$pair_control_service_destination_side" "${pair_control_service_source_address}/128" "$pair_control_service_destination_router" vdcbr0 || return 1
    pair_control_service_route_exact "$pair_control_router_ns" "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" "${pair_control_service_source_side}0" || return 1
@@ -2929,6 +3075,10 @@ pair_control_remove_service_route()
    [[ -f "$pair_control_dir/$name-intent" && ! -L "$pair_control_dir/$name-intent" && "$(<"$pair_control_dir/$name-intent")" == "$expected" ]] || return 1
    if [[ -e "$pair_control_dir/$name" || -L "$pair_control_dir/$name" ]]; then
       [[ -f "$pair_control_dir/$name" && ! -L "$pair_control_dir/$name" && "$(<"$pair_control_dir/$name")" == "$expected" ]] || return 1
+   fi
+   if pair_control_parent_local_service_route_name "$name"; then
+      pair_control_parent_local_service_route remove "$@"
+      return
    fi
    # The router namespace is private to the pair supervisor.  A recovery mount
    # can still clean both durable parent routes after that supervisor has died,

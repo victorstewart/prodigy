@@ -200,29 +200,31 @@ bool reconcileTruthOnce(MothershipTruthGroup state, String& failure) {
       (leader->committedConfigIndex==g.expectedCommittedConfigIndex && leader->committedConfigSHA256!=g.expectedCommittedConfigSHA256)) {
     failure.assign("committed configuration disagrees with registry"_ctv); return false;
   }
-  if (g.replacementPending && state.incoming.memberID &&
-      !reconcileTruthReplacementRoute(state, *leader, eligible, failure)) {
-    basics_log("reconcileTruth waiting for the replacement's sibling route: %s\n", failure.c_str());
+  if (!reconcileTruthMemberRoutes(state, *leader, eligible, failure)) {
+    basics_log("reconcileTruth waiting for the committed members' sibling routes: %s\n", failure.c_str());
     return true;
   }
   if (state.cleanup) {
+    // Migrate the v1/v2 single cleanup slot only after the same committed
+    // successor that originally authorized retirement has been certified.
     if (leader->members.size()!=3 || isVoter(leader->members,state.outgoing.memberID) ||
         !isVoter(leader->members,state.incoming.memberID) || leader->committedConfigSHA256!=g.expectedCommittedConfigSHA256) {
       failure.assign("retirement needs its exact committed successor"_ctv); return false;
     }
-    if (std::find(eligible.begin(),eligible.end(),state.outgoing.clusterUUID)==eligible.end()) {
-      basics_log("reconcileTruth waiting for retired member %d's site\n", state.outgoing.memberID);
-      return true;
-    }
-    if (!truthPlacement(state,state.outgoing.clusterUUID,&state.outgoing,failure)) {
-      basics_log("reconcileTruth retired member %d cleanup pending: %s\n", state.outgoing.memberID, failure.c_str());
-      return true;
-    }
-    basics_log("reconcileTruth retired member %d after committed configuration %llu\n",
-        state.outgoing.memberID, (unsigned long long)leader->committedConfigIndex);
-    state.incoming={}; state.outgoing={}; state.cleanup=false;
-    return save();
+    if (!mothershipTruthDeferRetirement(state,state.outgoing) || !save()) return false;
   }
+  bool retired = false;
+  if (!mothershipTruthRetryRetirements(state,leader->members,[&](const auto& binding) {
+    String unavailable;
+    if (std::find(eligible.begin(),eligible.end(),binding.clusterUUID)==eligible.end() ||
+        !truthPlacement(state,binding.clusterUUID,&binding,unavailable)) return false;
+    basics_log("reconcileTruth retired member %d after committed configuration %llu\n",
+        binding.memberID, (unsigned long long)leader->committedConfigIndex);
+    return true;
+  },retired)) {
+    failure.assign("retirement is not fenced by the committed configuration"_ctv); return false;
+  }
+  if (retired && !save()) return false;
   const auto now=uint64_t(Time::now<TimeResolution::ms>());
   Vector<MothershipTruthGroup::Missing> missing;
   std::vector<ProdigyTruthPlacement::Voter> voters;
@@ -263,6 +265,11 @@ bool reconcileTruthOnce(MothershipTruthGroup state, String& failure) {
       binding.newID ? &binding : nullptr,learnerPresent,caught);
   if (d.action==Action::wait) { basics_log("reconcileTruth waiting config=%llu\n",(unsigned long long)leader->committedConfigIndex); return true; }
   if (d.action==Action::addLearner && !state.incoming.memberID) {
+    // Never age out a still-unconfirmed physical retirement to make room for
+    // another replacement. Completed tombstones remain bounded separately.
+    if (state.pendingRetirementIDs.size() == 256) {
+      basics_log("reconcileTruth waiting for retirement capacity\n"); return true;
+    }
     auto old=std::find_if(g.members.begin(),g.members.end(),[&](const auto& m){return m.memberID==d.replacement.oldID;});
     if (old==g.members.end()) return false;
     state.outgoing=*old;
@@ -277,21 +284,22 @@ bool reconcileTruthOnce(MothershipTruthGroup state, String& failure) {
     std::sort(g.retiredMemberIDs.begin(),g.retiredMemberIDs.end());
     // IDs below the durable high-water mark can never be issued again.
     if (g.retiredMemberIDs.size()>256) {
-      auto obsolete=std::find_if(g.retiredMemberIDs.begin(),g.retiredMemberIDs.end(),[&](int32_t id){return id!=state.outgoing.memberID;});
+      auto obsolete=std::find_if(g.retiredMemberIDs.begin(),g.retiredMemberIDs.end(),[&](int32_t id){
+        return id!=state.outgoing.memberID &&
+            !std::binary_search(state.pendingRetirementIDs.begin(),state.pendingRetirementIDs.end(),id);
+      });
+      if (obsolete == g.retiredMemberIDs.end()) return false;
       g.retiredMemberIDs.erase(obsolete);
     }
     // Keep the endpoint that belonged to each retained Raft tombstone. A later
     // rebalance can then identify the exact private route to the former voter.
-    state.version = 2;
     auto obsolete = std::remove_if(state.retiredBindings.begin(), state.retiredBindings.end(), [&](const auto& member) {
       return !std::binary_search(g.retiredMemberIDs.begin(), g.retiredMemberIDs.end(), member.memberID);
     });
     state.retiredBindings.erase(obsolete, state.retiredBindings.end());
-    auto position = std::lower_bound(state.retiredBindings.begin(), state.retiredBindings.end(), state.outgoing.memberID,
-        [](const auto& member, int32_t id) { return member.memberID < id; });
-    state.retiredBindings.insert(position, state.outgoing);
     g.expectedCommittedConfigIndex=leader->committedConfigIndex; g.expectedCommittedConfigSHA256=leader->committedConfigSHA256;
-    g.replacementPending=false; ++g.generation; state.cleanup=true;
+    g.replacementPending=false; ++g.generation;
+    if (!mothershipTruthDeferRetirement(state,state.outgoing)) return false;
     return save();
   }
   if (std::none_of(reports.begin(),reports.end(),[&](const auto& r){return r.memberID==state.incoming.memberID && r.provisioned;}))

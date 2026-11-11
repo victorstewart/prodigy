@@ -7062,14 +7062,14 @@ public:
   // This is a candidate scan, not a deployment identity assertion: the
   // caller must authenticate both permission bodies against their Brains.
   bool listNametagSeedSuccessorRouteCandidates(uint128_t site, const Vector<uint16_t>& applications,
-      int64_t nowMs, Vector<CousinRouteRecord>& routes, String *failure = nullptr) {
+      int64_t nowMs, Vector<CousinRouteRecord>& routes, String *failure = nullptr, bool includeTerminal = false) {
     routes.clear(); if (!site || applications.empty() || nowMs <= 0) return false;
     CousinRouteLock lock; if (!lockCousinRoutes(lock, failure)) return false;
     Vector<String> entries; if (!db.listValues(cousinRoutesColumnFamily, entries, failure)) return false;
     for (const auto& bytes : entries) {
       CousinRouteRecord route = {};
       if (!BitseryEngine::deserializeSafe(bytes, route) || !cousinRouteStructurallyValid(route)) return false;
-      if (cousinRouteTerminal(route) || (route.sourceClusterUUID != site && route.destinationClusterUUID != site) ||
+      if ((!includeTerminal && cousinRouteTerminal(route)) || (route.sourceClusterUUID != site && route.destinationClusterUUID != site) ||
           std::find(applications.begin(), applications.end(), route.sourceApplicationID) == applications.end()) continue;
       // Historical routes can remain until expiry after their deployment is
       // replaced. Only the authenticated permission bodies identify the DID;

@@ -17,7 +17,7 @@ int main() {
   expect(next(members,{a},18,3,109,10).action == Action::wait, "retain missing member during grace");
   auto action = next(members,{a},18,3,110,10);
   auto operation = action.replacement;
-  expect(action.action == Action::addLearner && action.expectedConfigIndex == 18 &&
+  expect(action.action == Action::addLearner &&
          operation.newID == 4 && operation.oldID == 3 && operation.target == a, "repair locally after grace");
   members[1].reachable = false;
   expect(next(members,{a},18,3,200,10).action == Action::wait, "single live voter cannot repair");

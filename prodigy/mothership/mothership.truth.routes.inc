@@ -2,9 +2,10 @@
 
 #include <prodigy/types.h>
 
-static bool truthSiblingRouteSlotZero(const CousinRouteRecord& route)
+static bool truthSiblingRouteSlotZero(const CousinRouteRecord& route, bool includeTerminal = false)
 {
-  if (!cousinRouteAllowsNewAdmissionAt(route, Time::now<TimeResolution::ms>()) ||
+  if (!(includeTerminal && cousinRouteTerminal(route) ? cousinRouteStructurallyValid(route) :
+        cousinRouteAllowsNewAdmissionAt(route, Time::now<TimeResolution::ms>())) ||
       route.sourceApplicationID != MeshRegistry::Truth::applicationID ||
       route.destinationApplicationID != MeshRegistry::Truth::applicationID ||
       route.sourceCousinServicePrefix != MeshRegistry::Truth::siblings ||
@@ -96,9 +97,8 @@ bool reconcileTruthTestServiceTransits(const MothershipTruthGroup& state,
 
 // Permissions bind deployments on a cluster pair. The resulting authenticated
 // sibling session binds both individual containers and the current Raft group.
-// Included in Mothership. Route and permission UUIDs, ingress endpoints, and
-// pair epochs are operator-/registry-owned, so this reconciler never mints
-// them. It finds only existing contracts, then invokes the normal authenticated
+// Included in Mothership. Permissions, ingress scopes, and pair epochs are
+// operator-/registry-owned. Reconciliation invokes the normal authenticated
 // Brain observation owner for both halves before considering a remote Truth
 // member connectable.
 bool reconcileTruthSiblingRoutes(const MothershipTruthGroup& state,
@@ -139,7 +139,8 @@ bool reconcileTruthSiblingRoutes(const MothershipTruthGroup& state,
   };
   for (const auto& need : required) {
     if (!eligibleSite(need.first) || !eligibleSite(need.second)) continue;
-    uint32_t exact = 0;
+    uint32_t publicRoutes = 0;
+    Vector<CousinRouteRecord> privateRoutes;
     for (const auto& candidate : candidates) {
       if (!routeMatches(candidate, need)) continue;
       MothershipProdigyCluster source = {}, destination = {};
@@ -183,25 +184,26 @@ bool reconcileTruthSiblingRoutes(const MothershipTruthGroup& state,
         return false;
       }
       if (!reconcileTruthTestServiceTransits(state, candidate, source, failure)) return false;
-      ++exact;
+      if (candidate.version == 3 && candidate.endpointKind == CousinRouteEndpointKind::privateContainer)
+        privateRoutes.push_back(candidate);
+      else ++publicRoutes;
     }
-    if (exact != 1) {
-      failure.assign("Truth needs exactly one qualified app-10 sibling COUSIN contract per eligible cluster pair; install two slot/group-0/1 permissions and one active cousinRoute with current receipts"_ctv);
+    if (publicRoutes ? (publicRoutes != 1 || !privateRoutes.empty()) :
+        (privateRoutes.empty() || !mothershipTruthPrivateRoutesCoverMembers(privateRoutes,state.group.members,need.first,need.second))) {
+      failure.assign("Truth needs one qualified public sibling contract or exact private routes covering every member on each eligible cluster pair"_ctv);
       return false;
     }
   }
   return true;
 }
 
-// A private v3 route binds an authenticated counterpart's exact mesh address
-// and service port.  A voter replacement changes that endpoint while retaining
-// the permission-bound route scope.  Advance the existing route UUID only
-// after the new binding is in the majority-certified Truth report; the route
-// registry then fences the transition on receipts for the prior generation.
-bool reconcileTruthReplacementRoute(const MothershipTruthGroup& state,
-                                    const ProdigyTruthGlobalControl& leader,
-                                    const std::vector<uint128_t>& eligible,
-                                    String& failure)
+// Preserve each current private endpoint while adding independently authorized
+// routes for other committed members. A learner is covered after Raft admits
+// it, before catch-up can require its own cross-site connection.
+bool reconcileTruthMemberRoutes(const MothershipTruthGroup& state,
+                                const ProdigyTruthGlobalControl& leader,
+                                const std::vector<uint128_t>& eligible,
+                                String& failure)
 {
   failure.clear();
   if (!mothershipTruthGroupValid(state) || !prodigyTruthControlReportValid(leader) ||
@@ -214,129 +216,139 @@ bool reconcileTruthReplacementRoute(const MothershipTruthGroup& state,
        leader.committedConfigSHA256 != state.group.expectedCommittedConfigSHA256) ||
       leader.memberID != leader.leaderMemberID)
   {
-    failure.assign("Truth replacement route requires the matching certified leader projection"_ctv);
+    failure.assign("Truth member routes require the matching certified leader projection"_ctv);
     return false;
   }
-
-  const TruthGlobalMember& incoming = state.incoming;
-  if (incoming.memberID == 0) return true;
-  if (std::find(eligible.begin(), eligible.end(), incoming.clusterUUID) == eligible.end()) return true;
-  const auto projected = std::find_if(state.group.members.begin(), state.group.members.end(), [&](const auto& member) {
-    return member.memberID == incoming.memberID && member.clusterUUID == incoming.clusterUUID &&
-        member.containerUUID == incoming.containerUUID && member.privateIPv6.equals(incoming.privateIPv6);
-  });
-  const auto committed = std::find_if(leader.members.begin(), leader.members.end(), [&](const auto& member) {
-    return member.memberID == incoming.memberID && member.clusterUUID == incoming.clusterUUID &&
-        member.containerUUID == incoming.containerUUID && member.privateIPv6.equals(incoming.privateIPv6) &&
-        (member.role == TruthGlobalMemberRole::learner || member.role == TruthGlobalMemberRole::voter);
-  });
-  if (projected == state.group.members.end()) {
-    failure.assign("Truth replacement endpoint is not the exact committed incoming member"_ctv);
-    return false;
-  }
-  // The placement is projected before Raft admits its learner.  Defer until
-  // this majority-certified report proves the exact binding, so route setup
-  // cannot become an add-learner prerequisite.
-  if (committed == leader.members.end()) return true;
-
-  const auto leaderMember = std::find_if(leader.members.begin(), leader.members.end(), [&](const auto& member) {
-    return member.memberID == leader.memberID && member.role == TruthGlobalMemberRole::voter;
-  });
-  if (leaderMember == leader.members.end()) {
-    failure.assign("Truth replacement route report does not identify a voter leader"_ctv);
-    return false;
-  }
+  for (const auto& member : leader.members)
+    if (std::none_of(state.group.members.begin(),state.group.members.end(),[&](const auto& projected) {
+      return projected.memberID == member.memberID && projected.clusterUUID == member.clusterUUID &&
+          projected.containerUUID == member.containerUUID && projected.privateIPv6.equals(member.privateIPv6);
+    })) { failure.assign("Truth route member is not an exact projected binding"_ctv); return false; }
 
   Vector<uint16_t> applications;
   applications.push_back(MeshRegistry::Truth::applicationID);
-  Vector<CousinRouteRecord> candidates;
+  Vector<CousinRouteRecord> candidates, contracts;
   const int64_t now = Time::now<TimeResolution::ms>();
   {
     auto registry = openClusterRegistry();
     for (uint128_t site : eligible) {
       Vector<CousinRouteRecord> siteCandidates;
-      if (!registry.listNametagSeedSuccessorRouteCandidates(site, applications, now, siteCandidates, &failure)) return false;
+      if (!registry.listNametagSeedSuccessorRouteCandidates(site, applications, now, siteCandidates, &failure, true)) return false;
       for (const auto& route : siteCandidates)
         if (std::none_of(candidates.begin(), candidates.end(), [&](const auto& prior) { return prior.routeUUID == route.routeUUID; }))
           candidates.push_back(route);
     }
   }
-
-  const auto routeMatches = [&](const CousinRouteRecord& route) {
-    if (route.version != 3 || route.endpointKind != CousinRouteEndpointKind::privateContainer ||
-        !truthSiblingRouteSlotZero(route)) return false;
-    return route.destinationClusterUUID == incoming.clusterUUID;
+  const auto eligibleSite = [&](uint128_t site) {
+    return std::find(eligible.begin(),eligible.end(),site) != eligible.end();
+  };
+  const auto sameContract = [](const CousinRouteRecord& a,const CousinRouteRecord& b) {
+    auto normalized = b; normalized.routeUUID = a.routeUUID;
+    return cousinRouteScopeMatches(a,normalized) && a.keyEpoch == b.keyEpoch && a.rootGeneration == b.rootGeneration;
   };
   for (const auto& route : candidates) {
-    if (!routeMatches(route) || !mothershipTruthReplacementRouteEndpoint(state, leader.members,
-        route.destinationClusterUUID, route.destinationPublicAddress)) continue;
+    if (route.version != 3 || route.endpointKind != CousinRouteEndpointKind::privateContainer ||
+        !truthSiblingRouteSlotZero(route) || !eligibleSite(route.sourceClusterUUID) || !eligibleSite(route.destinationClusterUUID)) continue;
+    if (std::none_of(contracts.begin(),contracts.end(),[&](const auto& contract) { return sameContract(contract,route); }))
+      contracts.push_back(route);
+  }
+  for (const auto& contract : contracts) {
     MothershipProdigyCluster source = {}, destination = {};
     {
       auto registry = openClusterRegistry();
-      if (!loadCousinRouteClusters(registry, route, source, destination, failure)) return false;
+      if (!loadCousinRouteClusters(registry, contract, source, destination, failure)) return false;
     }
-    if (std::find(eligible.begin(), eligible.end(), source.clusterUUID) == eligible.end()) continue;
     ProdigyLocalCousinServicePermissionResponse sourcePermission = {}, destinationPermission = {};
-    if (!readLocalCousinServicePermission(source, route.sourcePermissionUUID, sourcePermission, failure) ||
-        !readLocalCousinServicePermission(destination, route.destinationPermissionUUID, destinationPermission, failure) ||
-        !truthSiblingPermissionMatches(sourcePermission.permission, route, CousinRouteHalf::source, state.group.deploymentID) ||
-        !truthSiblingPermissionMatches(destinationPermission.permission, route, CousinRouteHalf::destination, state.group.deploymentID) ||
-        !prodigyCousinServicePermissionPeerScopeMatches(sourcePermission.permission, destinationPermission.permission))
-    {
-      if (failure.empty()) failure.assign("Truth replacement route permission does not match the committed app-10 sibling group"_ctv);
-      return false;
-    }
+    if (!readLocalCousinServicePermission(source, contract.sourcePermissionUUID, sourcePermission, failure) ||
+        !readLocalCousinServicePermission(destination, contract.destinationPermissionUUID, destinationPermission, failure)) return false;
+    if (!truthSiblingPermissionMatches(sourcePermission.permission, contract, CousinRouteHalf::source, state.group.deploymentID) ||
+        !truthSiblingPermissionMatches(destinationPermission.permission, contract, CousinRouteHalf::destination, state.group.deploymentID) ||
+        !prodigyCousinServicePermissionPeerScopeMatches(sourcePermission.permission, destinationPermission.permission)) continue;
 
     ProdigyCousinDiscoveryQuery query = {};
-    query.permissionUUID = route.sourcePermissionUUID;
-    query.slot = 0;
+    query.permissionUUID = contract.sourcePermissionUUID; query.slot = 0;
     ProdigyCousinDiscoveryResponse discovery = {};
     if (!configureControlTarget(source.name.c_str(), &failure) ||
         !requestTopicRoundTrip(MothershipTopic::pullCousinCounterparts, query, discovery, failure) ||
-        discovery.protocolVersion != ProdigyCousinDiscoveryResponse::version || !discovery.success)
-    {
-      if (failure.empty()) failure.assign("Truth replacement route counterpart discovery is unavailable"_ctv);
-      return false;
-    }
-    const ProdigyCousinCounterpart* fresh = nullptr;
-    for (const auto& counterpart : discovery.records) {
-      if (counterpart.containerUUID != incoming.containerUUID || !counterpart.publicAddress.equals(incoming.privateIPv6) ||
-          counterpart.routablePrefixUUID != 0 || counterpart.wormholeRevision.size() != 0 || counterpart.shardGroup != 0 ||
-          counterpart.shardGroups != 1 || counterpart.service != MeshServices::constrainPrefixToGroup(MeshRegistry::Truth::siblings, 0) ||
-          counterpart.servicePort == 0 || counterpart.publicTCPPort != counterpart.servicePort ||
-          !prodigyCousinCounterpartMatchesPermission(counterpart, sourcePermission.permission, 0, true) ||
-          !prodigyLocalCousinServicePermissionEqual(counterpart.permission, destinationPermission.permission)) continue;
-      if (fresh != nullptr) {
-        failure.assign("Truth replacement route has ambiguous fresh committed counterpart"_ctv);
-        return false;
-      }
-      fresh = &counterpart;
-    }
-    if (fresh == nullptr) {
-      failure.assign("Truth replacement route has no authenticated fresh committed counterpart"_ctv);
-      return false;
-    }
+        discovery.protocolVersion != ProdigyCousinDiscoveryResponse::version || !discovery.success) return false;
 
-    CousinRouteRecord desired = route;
-    if (!route.destinationPublicAddress.equals(fresh->publicAddress) || route.destinationTCPPort != fresh->publicTCPPort) {
-      if (route.generation == UINT64_MAX || RAND_priv_bytes(reinterpret_cast<unsigned char*>(&desired.operationUUID),
-                                                             sizeof(desired.operationUUID)) != 1 || !desired.operationUUID) {
-        failure.assign("Truth replacement route cannot allocate a successor operation"_ctv);
-        return false;
+    bool installedDestination = false;
+    for (const auto& member : leader.members) {
+      if (member.clusterUUID != contract.destinationClusterUUID) continue;
+      const ProdigyCousinCounterpart* fresh = nullptr;
+      for (const auto& counterpart : discovery.records) {
+        if (counterpart.containerUUID != member.containerUUID || !counterpart.publicAddress.equals(member.privateIPv6) ||
+            counterpart.routablePrefixUUID != 0 || !counterpart.wormholeRevision.empty() || counterpart.shardGroup != 0 ||
+            counterpart.shardGroups != 1 || counterpart.service != MeshServices::constrainPrefixToGroup(MeshRegistry::Truth::siblings, 0) ||
+            !counterpart.servicePort || counterpart.publicTCPPort != counterpart.servicePort ||
+            !prodigyCousinCounterpartMatchesPermission(counterpart, sourcePermission.permission, 0, true) ||
+            !prodigyLocalCousinServicePermissionEqual(counterpart.permission, destinationPermission.permission)) continue;
+        if (fresh) { failure.assign("Truth member route has ambiguous authenticated counterparts"_ctv); return false; }
+        fresh = &counterpart;
       }
-      desired.generation++;
+      if (!fresh) {
+        // A missing voter must not veto its own replacement. Its established
+        // exact route stays intact while the ordinary grace policy runs.
+        if (member.role == TruthGlobalMemberRole::voter &&
+            !std::binary_search(leader.reachableMemberIDs.begin(),leader.reachableMemberIDs.end(),member.memberID)) continue;
+        failure.assign("Truth member route awaits its authenticated committed counterpart"_ctv); return false;
+      }
+      CousinRouteRecord desired = contract;
       desired.destinationPublicAddress = fresh->publicAddress;
       desired.destinationTCPPort = fresh->publicTCPPort;
-      desired.priorOperationUUIDs.clear();
-      bool resumed = false;
-      CousinRouteRecord recorded = {};
-      auto registry = openClusterRegistry();
-      if (!registry.recordCousinRoute(desired, recorded, resumed, &failure)) return false;
-      desired = std::move(recorded);
+      const CousinRouteRecord* existing = nullptr;
+      for (const auto& route : candidates) {
+        if (!truthSiblingRouteSlotZero(route) || !cousinRoutePeerRangeScopeMatches(route,desired)) continue;
+        if (existing) { failure.assign("Truth member endpoint has ambiguous route owners"_ctv); return false; }
+        existing = &route;
+      }
+      if (existing) desired = *existing;
+      else {
+        if (RAND_priv_bytes(reinterpret_cast<unsigned char*>(&desired.routeUUID),sizeof(desired.routeUUID)) != 1 || !desired.routeUUID ||
+            RAND_priv_bytes(reinterpret_cast<unsigned char*>(&desired.operationUUID),sizeof(desired.operationUUID)) != 1 || !desired.operationUUID)
+        { failure.assign("Truth member route cannot allocate its durable identity"_ctv); return false; }
+        desired.generation = 1; desired.priorOperationUUIDs.clear();
+        // Inherit the admitted scope, epoch, MTU and remaining lifetime. Adding
+        // a member cannot renew or widen the operator's authorization.
+        bool resumed = false; CousinRouteRecord recorded;
+        {
+          auto registry = openClusterRegistry();
+          if (!registry.recordCousinRoute(desired,recorded,resumed,&failure)) return false;
+        }
+        desired = std::move(recorded);
+        candidates.push_back(desired);
+      }
+      ProdigyCousinRouteResponse sourceRoute = {}, destinationRoute = {};
+      if (!applyCousinRoute(desired,source,destination,sourceRoute,destinationRoute,failure)) return false;
+      installedDestination = true;
     }
 
-    ProdigyCousinRouteResponse sourceRoute = {}, destinationRoute = {};
-    if (!applyCousinRoute(desired, source, destination, sourceRoute, destinationRoute, failure)) return false;
+    // Keep the sole active contract for an empty destination as the admitted
+    // template for its return; membership/session identity checks fence the
+    // retired process. Once a committed endpoint is installed, obsolete exact
+    // routes can become terminal. Terminal records only finish their receipts;
+    // they never authorize or seed another active route.
+    for (auto& route : candidates) {
+      if (!sameContract(contract,route) || !truthSiblingRouteSlotZero(route,true) ||
+          !mothershipTruthPrivateRouteRetirementRequired(state,leader.members,route,installedDestination)) continue;
+      CousinRouteRecord desired = route;
+      if (!cousinRouteTerminal(desired)) {
+        if (desired.generation == UINT64_MAX ||
+            RAND_priv_bytes(reinterpret_cast<unsigned char*>(&desired.operationUUID),sizeof(desired.operationUUID)) != 1 || !desired.operationUUID)
+        { failure.assign("Truth retired route cannot allocate its withdrawal"_ctv); return false; }
+        ++desired.generation; desired.state = CousinRouteState::withdrawn;
+        desired.withdrawalGeneration = desired.generation; desired.withdrawnAtMs = now;
+        desired.priorOperationUUIDs.clear();
+        bool resumed = false; CousinRouteRecord recorded;
+        {
+          auto registry = openClusterRegistry();
+          if (!registry.recordCousinRoute(desired,recorded,resumed,&failure)) return false;
+        }
+        desired = std::move(recorded); route = desired;
+      }
+      ProdigyCousinRouteResponse sourceRoute = {}, destinationRoute = {};
+      if (!applyCousinRoute(desired,source,destination,sourceRoute,destinationRoute,failure)) return false;
+    }
   }
   return true;
 }

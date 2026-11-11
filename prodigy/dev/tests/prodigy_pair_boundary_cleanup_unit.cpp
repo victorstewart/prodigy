@@ -159,7 +159,7 @@ static void testPairControlServiceDescriptorStatusIsolation(TestSuite& suite)
     return begin == std::string::npos || end == std::string::npos ? std::string{} : text.substr(begin, end - begin);
   };
   const std::string descriptors = extract("pair_control_service_slots()\n{\n", "\npair_control_service_side()\n");
-  const std::string installRoute = extract("pair_control_install_service_route()\n{\n", "\npair_control_install_service_inside()\n");
+  const std::string installRoute = extract("pair_control_parent_local_service_route_name()\n{\n", "\npair_control_install_service_inside()\n");
   const std::string validation = extract("pair_control_validate_service_one_inside()\n{\n", "\npair_control_remove_service_route()\n");
   const std::string cleanup = extract("pair_control_cleanup_inside()\n{\n", "\npair_control_bind_parents()\n");
   suite.expect(!descriptors.empty() && !validation.empty() && !cleanup.empty() && !installRoute.empty(),
@@ -1095,6 +1095,7 @@ static void testPairControlAbsentRouterServiceRouteCleanup(TestSuite& suite)
 pair_control_dir="$PWD/pair"; pair_dir="$pair_control_dir"; mkdir -p "$pair_control_dir"
 pair_control_router_ns="pc-r-cleanup-fixture-$$"
 pair_control_owner_dead() { [[ "$owner" == dead ]]; }
+pair_control_parent_local_service_route_name() { return 1; }
 pair_control_service_route_expected() { printf '%s via %s dev %s\n' "$1" "$2" "$3"; }
 pair_control_service_route_exact() { : > "$PWD/ip-was-called"; return 2; }
 ip() { : > "$PWD/ip-was-called"; return 2; }
@@ -1130,6 +1131,173 @@ if pair_control_remove_service_route "$pair_control_router_ns" "$name" "$prefix"
   if (child > 0) do { waited = ::waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
   suite.expect(written && child > 0 && waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
                "pair_absent_router_service_cleanup_requires_dead_owner_and_exact_journal");
+  std::error_code error;
+  std::filesystem::remove_all(temporary, error);
+}
+
+static void testPairControlSharedParentDeliveryRoutes(TestSuite& suite)
+{
+  std::string sourcePath = __FILE__;
+  const size_t root = sourcePath.rfind("/dev/tests/");
+  if (root == std::string::npos) { suite.expect(false, "pair_shared_parent_fixture_locates_provider"); return; }
+  sourcePath.resize(root); sourcePath += "/mothership/mothership.virtual.datacenter.provider.sh";
+  std::ifstream source(sourcePath);
+  if (!source) { suite.expect(false, "pair_shared_parent_fixture_reads_provider"); return; }
+  const std::string text((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
+  const auto extract = [&](const char *first, const char *after) {
+    const size_t begin = text.find(first), end = text.find(after, begin);
+    return begin == std::string::npos || end == std::string::npos ? std::string{} : text.substr(begin, end - begin);
+  };
+  const auto install = extract("pair_control_parent_local_service_route_name()\n{\n", "\npair_control_install_service_inside()\n");
+  const auto remove = extract("pair_control_remove_service_route()\n{\n", "\npair_control_firewall_digest()\n");
+  suite.expect(!install.empty() && !remove.empty(), "pair_shared_parent_fixture_extracts_production_owners");
+  if (install.empty() || remove.empty()) return;
+  // Only the route inventory, kernel mutation, live namespace proof and the
+  // external lock/durable-write primitives are mocked. The actual install,
+  // reference validation, crash replay and cleanup owners execute below.
+  const std::string script = "set -euo pipefail\n" + install + remove + R"TEST(
+mkdir -p "$PWD/vdc" "$PWD/ab" "$PWD/cb"
+pair_control_first_workspace="$PWD/vdc"; pair_control_second_workspace="$PWD/vdc"
+pair_control_first_runtime=1001; pair_control_second_runtime=1001
+printf '901\n' > "$PWD/ab/second-namespace"
+printf '901\n' > "$PWD/cb/first-namespace"
+pair_control_current_parent_bound() { [[ "$(<"$pair_control_dir/$1-namespace")" == 901 && "$runtime" == 1001 ]]; }
+pair_lock_workspace() { mkdir "$1/lock" 2>/dev/null || return 1; printf -v "$2" '%s' "$1/lock"; }
+pair_unlock_workspace() { rmdir "$1"; }
+pair_regular_root_receipt() { [[ -f "$1" && ! -L "$1" ]]; }
+pair_write() { [[ "$1" != "$fail_write" ]] || return 1; printf '%s\n' "$2" > "$1"; }
+sync() { :; }
+pair_control_digest() { printf '%064d\n' "$operation_id"; }
+pair_control_service_route_expected() { printf '%s via %s dev %s\n' "$1" "$2" "$3"; }
+pair_control_router_namespace_missing_owned() { return 1; }
+prefix=2001:db8::b/128; gateway=fd00:b::1; expected="$prefix via $gateway dev vdcbr0"
+pair_control_service_route_exact() {
+  [[ -f "$PWD/kernel-route" ]] || return 1
+  [[ "$(<"$PWD/kernel-route")" == "$(pair_control_service_route_expected "$2" "$3" "$4")" ]] || return 2
+}
+ip() {
+  [[ "$1" == -n && "$3" == -6 && "$4" == route ]] || return 99
+  printf '%s\n' "$5" >> "$PWD/kernel-operations"
+  case "$5" in
+    add) printf '%s\n' "$expected" > "$PWD/kernel-route" ;;
+    del) rm "$PWD/kernel-route" ;;
+    *) return 99 ;;
+  esac
+}
+select_ab() { pair_control_dir="$PWD/ab"; operation_id=1; namespace=pc-second; }
+select_cb() { pair_control_dir="$PWD/cb"; operation_id=2; namespace=pc-first; }
+name=service-destination-local-route; fail_write=""
+install() { pair_control_install_service_route "$namespace" "$name" "$prefix" "$gateway" vdcbr0; }
+remove() { pair_control_remove_service_route "$namespace" "$name" "$prefix" "$gateway" vdcbr0; }
+validate() { pair_control_parent_local_service_route validate "$namespace" "$name" "$prefix" "$gateway" vdcbr0; }
+ref() { printf '%s/ref-%064d-%s' "$route_directory" "$operation_id" "$name"; }
+
+# Two pairs can use opposite aliases for the same verified VDC namespace.
+select_ab; install; validate
+route_directory="$(printf '%s\n' "$PWD/vdc/virtual-datacenter.service-routes/"*)"
+select_cb; install; validate
+[[ "$(cat "$PWD/kernel-operations")" == add ]]
+select_ab; remove; remove
+[[ -f "$PWD/kernel-route" && ! -e "$(ref)" ]]
+select_cb; validate; remove; remove
+[[ ! -e "$PWD/kernel-route" && "$(cat "$PWD/kernel-operations")" == $'add\ndel' ]]
+# The retained retry witness cannot reclaim an identical foreign route after
+# every reference was released. Repeated cleanup must leave that route alone.
+printf '%s\n' "$expected" > "$PWD/kernel-route"
+if install; then exit 1; fi
+remove
+[[ -f "$PWD/kernel-route" ]]
+rm "$PWD/kernel-route"
+
+# Multiple source ports within one pair also retain independent references.
+select_ab; install
+name=service-destination-local-route-flow-2; install
+name=service-destination-local-route; remove
+[[ -f "$PWD/kernel-route" ]]
+name=service-destination-local-route-flow-2; remove
+[[ ! -e "$PWD/kernel-route" ]]
+name=service-destination-local-route
+
+# A crash before reference publication cannot release another pair's route.
+select_ab; install
+select_cb; fail_write="$(ref)"
+if install; then exit 1; fi
+fail_write=""; remove
+[[ -f "$PWD/kernel-route" ]]
+install
+# A crash after reference publication but before completion replays exactly.
+rm "$pair_control_dir/$name"
+fail_write="$pair_control_dir/$name"
+if install; then exit 1; fi
+fail_write=""; install; validate
+select_ab; remove
+select_cb
+# A dead supervisor's last route may already have vanished; recovery releases
+# its durable reference without attempting a kernel mutation against absence.
+rm "$PWD/kernel-route"
+before="$(cat "$PWD/kernel-operations")"; remove
+[[ ! -e "$(ref)" && "$(cat "$PWD/kernel-operations")" == "$before" ]]
+
+# Reject a changed namespace, a held lifecycle lock and foreign kernel state.
+select_ab; install
+select_cb; printf '902\n' > "$pair_control_dir/first-namespace"
+if install || remove || validate; then exit 1; fi
+printf '901\n' > "$pair_control_dir/first-namespace"
+pair_control_first_runtime=1002
+if install; then exit 1; fi
+pair_control_first_runtime=1001
+mkdir "$PWD/vdc/lock"
+if install || remove; then exit 1; fi
+select_ab; validate
+select_cb
+rmdir "$PWD/vdc/lock"
+install
+printf foreign > "$PWD/kernel-route"
+if remove; then exit 1; fi
+[[ -e "$(ref)" ]]
+printf '%s\n' "$expected" > "$PWD/kernel-route"
+
+# Malformed, symlinked or mismatched owner/reference receipts fail closed.
+badref="$(ref)"; cp "$badref" "$PWD/reference-copy"
+printf foreign > "$badref"
+select_ab
+if install || remove || validate; then exit 1; fi
+cp "$PWD/reference-copy" "$badref"
+rm "$badref"; ln -s "$PWD/reference-copy" "$badref"
+if install || remove; then exit 1; fi
+rm "$badref"; cp "$PWD/reference-copy" "$badref"
+cp "$route_directory/owner" "$PWD/owner-copy"
+printf foreign > "$route_directory/owner"
+if install || remove; then exit 1; fi
+cp "$PWD/owner-copy" "$route_directory/owner"
+remove; select_cb; remove
+[[ ! -f "$PWD/kernel-route" ]]
+
+# Legacy exact intents remain recoverable, but foreign routes are not adopted.
+rm -rf "$PWD/vdc/virtual-datacenter.service-routes"
+select_ab; rm -f "$pair_control_dir/$name" "$pair_control_dir/$name-intent"
+printf '%s\n' "$expected" > "$PWD/kernel-route"
+if install; then exit 1; fi
+[[ ! -e "$pair_control_dir/$name-intent" ]]
+printf '%s\n' "$expected" > "$pair_control_dir/$name-intent"
+remove
+[[ ! -e "$PWD/kernel-route" ]]
+printf '%s\n' "$expected" > "$PWD/kernel-route"
+install; validate; remove
+[[ ! -e "$PWD/kernel-route" ]]
+printf 'PASS shared parent delivery routes, cleanup, crash recovery and identity rejection\n'
+)TEST";
+  char temporary[] = "./pair-shared-parent-unit.XXXXXX";
+  if (::mkdtemp(temporary) == nullptr) { suite.expect(false, "pair_shared_parent_fixture_creates_directory"); return; }
+  String path = {}, failure = {};
+  mothershipVirtualDatacenterPath(String(temporary), "probe.sh", path);
+  const bool written = mothershipVirtualDatacenterWriteFile(path, String(script.c_str()), 0700, &failure);
+  const pid_t child = written ? ::fork() : -1;
+  if (child == 0) { if (::chdir(temporary) != 0) _exit(125); ::execl("/bin/bash", "bash", "probe.sh", static_cast<char *>(nullptr)); _exit(127); }
+  int status = 0; pid_t waited = -1;
+  if (child > 0) do { waited = ::waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+  suite.expect(written && child > 0 && waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+               "pair_shared_parent_routes_preserve_other_pairs_and_fail_closed_on_foreign_state");
   std::error_code error;
   std::filesystem::remove_all(temporary, error);
 }
@@ -1180,6 +1348,7 @@ int main()
   testPairControlNetemOwnershipAndCleanup(suite);
   testPairControlMasqueMachineRouteAbsent(suite);
   testPairControlAbsentRouterServiceRouteCleanup(suite);
+  testPairControlSharedParentDeliveryRoutes(suite);
   testPairControlMasqueTransitContract(suite);
   testPairDrainObservationParser(suite);
   testPairGuestResetFenceParser(suite);

@@ -40200,6 +40200,22 @@ public:
     return true;
   }
 
+  bool truthGlobalSiblingMembership(const ContainerView& container,
+                                    const ProdigyLocalCousinServicePermission& permission,
+                                    TruthGlobalMembershipProjection& membership) const
+  {
+    return permission.localApplicationID == MeshRegistry::Truth::applicationID &&
+        permission.peerApplicationID == MeshRegistry::Truth::applicationID &&
+        permission.purpose == ProdigyCousinServicePurpose::sibling &&
+        permission.localCousinServicePrefix == MeshRegistry::Truth::siblings &&
+        permission.peerCousinServicePrefix == MeshRegistry::Truth::siblings &&
+        permission.localHalf == CousinRouteHalf::source &&
+        desiredTruthGlobalMembership(container.deploymentID, membership) &&
+        membership.localClusterUUID == brainConfig.clusterUUID &&
+        prodigyTruthLocalMember(membership, container.deploymentID, container.uuid) &&
+        container.whiteholes.size() <= prodigyTruthGlobalSiblingMaximumWhiteholes;
+  }
+
   bool cousinSessionSourceRequest(NeuronView *neuron, uint128_t containerUUID,
                                  const ProdigyCousinSessionRequest& request, bool ownerDesired = false,
                                  const TruthGlobalMember *desiredTruthCounterpart = nullptr)
@@ -40251,25 +40267,15 @@ public:
     // launch plan.  The durable master projection is the only authority for
     // this opt-in global Truth path.
     TruthGlobalMembershipProjection truthMembership;
-    const bool hasTruthMembership = desiredTruthGlobalMembership(container->deploymentID, truthMembership);
     const bool truthGlobalSiblingPool = desiredTruthCounterpart != nullptr &&
-        permission->localApplicationID == MeshRegistry::Truth::applicationID &&
-        permission->peerApplicationID == MeshRegistry::Truth::applicationID &&
-        permission->purpose == ProdigyCousinServicePurpose::sibling &&
-        permission->localCousinServicePrefix == MeshRegistry::Truth::siblings &&
-        permission->peerCousinServicePrefix == MeshRegistry::Truth::siblings &&
-        permission->localHalf == CousinRouteHalf::source &&
-        hasTruthMembership && prodigyTruthGlobalMembershipProjectionValid(truthMembership) &&
-        truthMembership.localClusterUUID == brainConfig.clusterUUID &&
-        prodigyTruthLocalMember(truthMembership, container->deploymentID, container->uuid) &&
+        truthGlobalSiblingMembership(*container, *permission, truthMembership) &&
         std::any_of(truthMembership.members.begin(), truthMembership.members.end(), [&](const auto& member) {
           return member.memberID == desiredTruthCounterpart->memberID &&
               member.clusterUUID == desiredTruthCounterpart->clusterUUID &&
               member.containerUUID == desiredTruthCounterpart->containerUUID &&
               member.privateIPv6.equals(desiredTruthCounterpart->privateIPv6) && member.role == desiredTruthCounterpart->role;
         }) && desiredTruthCounterpart->containerUUID != container->uuid &&
-        desiredTruthCounterpart->clusterUUID != truthMembership.localClusterUUID &&
-        container->whiteholes.size() <= prodigyTruthGlobalSiblingMaximumWhiteholes;
+        desiredTruthCounterpart->clusterUUID != truthMembership.localClusterUUID;
     if (desiredTruthCounterpart != nullptr && !truthGlobalSiblingPool) return reject();
     // All purpose-bound permissions are driven by this owner, including KV
     // cousins. Legacy permissions retain the explicit application request.
@@ -40291,7 +40297,8 @@ public:
           return session.record.sourceContainerUUID == containerUUID &&
               (session.record.sourceBindingNonce == request.bindingNonce ||
                (privateRequest && prodigyCousinSessionUsesPrivateContainerEndpoints(session.record) &&
-                session.record.sourcePermission.permissionUUID == request.permissionUUID && session.record.slot == request.slot)) &&
+                session.record.sourcePermission.permissionUUID == request.permissionUUID && session.record.slot == request.slot &&
+                (!truthGlobalSiblingPool || session.record.destination.containerUUID == desiredTruthCounterpart->containerUUID))) &&
               prodigyCousinSourcePermissionsConflict(*permission, session.record.sourcePermission) &&
               session.expiresAtMs > Time::msSinceBoot(); })) return false;
     ProdigyCousinDiscoveryResponse counterparts = queryCousinCounterparts({1, request.permissionUUID, request.slot});
@@ -40330,7 +40337,8 @@ public:
         if (!cousinRouteMatchesCounterpart(route, *candidate) ||
             (cutAuthority && !prodigySourceCutCounterpartMatches(*cutAuthority, route, *candidate))) continue;
         if (truthGlobalSiblingPool && (candidate->containerUUID != desiredTruthCounterpart->containerUUID ||
-            candidate->permission.localClusterUUID != desiredTruthCounterpart->clusterUUID)) continue;
+            candidate->permission.localClusterUUID != desiredTruthCounterpart->clusterUUID ||
+            (privateRequest && !candidate->publicAddress.equals(desiredTruthCounterpart->privateIPv6)))) continue;
         if (destination != counterparts.records.end()) {
           // Legacy callers intentionally retain first-live-counterpart
           // selection.  The Truth owner supplied an exact membership target,
@@ -40531,27 +40539,23 @@ public:
           prodigyCousinPermissionServiceForRoles(*permission, app->effectiveStatefulMeshRoles(deployment->second->plan)) != state.record.sourceService ||
           (app->isStateful ? deployment->second->nShardGroups : 1) != state.record.sourceShardGroups ||
           (app->isStateful ? app->shardGroup : 0) != state.record.sourceShardGroup) return false;
+      TruthGlobalMembershipProjection truthMembership;
+      const bool truthSibling = permission->localApplicationID == MeshRegistry::Truth::applicationID &&
+          permission->purpose == ProdigyCousinServicePurpose::sibling;
+      const bool truthGlobalSiblingPool = truthGlobalSiblingMembership(*app, *permission, truthMembership) &&
+          std::any_of(truthMembership.members.begin(), truthMembership.members.end(), [&](const auto& member) {
+            return member.containerUUID == state.record.destination.containerUUID &&
+                member.clusterUUID == state.record.destination.permission.localClusterUUID &&
+                (!prodigyCousinSessionUsesPrivateContainerEndpoints(state.record) ||
+                 member.privateIPv6.equals(state.record.destination.publicAddress));
+          });
+      if (truthSibling && !truthGlobalSiblingPool &&
+          desiredTruthGlobalMembership(app->deploymentID, truthMembership)) return false;
       if (prodigyCousinSessionUsesPrivateContainerEndpoints(state.record)) {
         IPAddress mesh = {}; mesh.is6 = true; std::memcpy(mesh.v6, &app->meshAddress, 16);
         if (machine->neuron.cousinDiscoveryVersion < 3 || !mesh.equals(state.record.sourceAddress) ||
             state.record.sourceBindingNonce == 0 || state.record.sourceTCPPort < 49152) return false;
       } else {
-        TruthGlobalMembershipProjection truthMembership;
-        const bool hasTruthMembership = desiredTruthGlobalMembership(app->deploymentID, truthMembership);
-        const bool truthGlobalSiblingPool = permission->localApplicationID == MeshRegistry::Truth::applicationID &&
-            permission->peerApplicationID == MeshRegistry::Truth::applicationID &&
-            permission->purpose == ProdigyCousinServicePurpose::sibling &&
-            permission->localCousinServicePrefix == MeshRegistry::Truth::siblings &&
-            permission->peerCousinServicePrefix == MeshRegistry::Truth::siblings &&
-            permission->localHalf == CousinRouteHalf::source &&
-            hasTruthMembership && prodigyTruthGlobalMembershipProjectionValid(truthMembership) &&
-            truthMembership.localClusterUUID == brainConfig.clusterUUID &&
-            prodigyTruthLocalMember(truthMembership, app->deploymentID, app->uuid) &&
-            app->whiteholes.size() <= prodigyTruthGlobalSiblingMaximumWhiteholes &&
-            std::any_of(truthMembership.members.begin(), truthMembership.members.end(), [&](const auto& member) {
-              return member.containerUUID == state.record.destination.containerUUID &&
-                  member.clusterUUID == state.record.destination.permission.localClusterUUID;
-            });
         if (permission->purpose != ProdigyCousinServicePurpose::statefulCousin &&
             (machine->neuron.cousinDiscoveryVersion < 2 ||
              (truthGlobalSiblingPool ? app->whiteholes.empty() : app->whiteholes.size() != 1))) return false;
@@ -41823,29 +41827,21 @@ public:
                       Time::now<TimeResolution::ms>());
             });
         TruthGlobalMembershipProjection truthMembership;
-        const bool hasTruthMembership = desiredTruthGlobalMembership(container->deploymentID, truthMembership);
-        const bool truthGlobalSiblingPool = !privateRoute &&
-            permission.localApplicationID == MeshRegistry::Truth::applicationID &&
-            permission.peerApplicationID == MeshRegistry::Truth::applicationID &&
-            permission.purpose == ProdigyCousinServicePurpose::sibling &&
-            permission.localCousinServicePrefix == MeshRegistry::Truth::siblings &&
-            permission.peerCousinServicePrefix == MeshRegistry::Truth::siblings &&
-            hasTruthMembership && prodigyTruthGlobalMembershipProjectionValid(truthMembership) &&
-            truthMembership.localClusterUUID == brainConfig.clusterUUID &&
-            prodigyTruthLocalMember(truthMembership, container->deploymentID, container->uuid) &&
-            !container->whiteholes.empty() &&
-            container->whiteholes.size() <= prodigyTruthGlobalSiblingMaximumWhiteholes;
+        const bool truthGlobalSiblingPool = truthGlobalSiblingMembership(*container, permission, truthMembership) &&
+            (privateRoute || !container->whiteholes.empty());
         if (truthGlobalSiblingPool) {
           const auto counterparts = queryCousinCounterparts({1, permission.permissionUUID, request.slot});
           if (!counterparts.success) continue;
           for (const TruthGlobalMember& member : truthMembership.members) {
-            // Same-site voters use the ordinary local mesh.  The COUSIN pool
-            // is only for independently leased public source tuples.
+            // Same-site voters use the local mesh. Every remote voter or
+            // learner needs its own exact authenticated session on either transport.
             if (member.clusterUUID == truthMembership.localClusterUUID || member.containerUUID == container->uuid) continue;
             const ProdigyCousinCounterpart *target = nullptr;
             for (const auto& counterpart : counterparts.records)
               if (counterpart.containerUUID == member.containerUUID &&
-                  counterpart.permission.localClusterUUID == member.clusterUUID && counterpart.routablePrefixUUID != 0) {
+                  counterpart.permission.localClusterUUID == member.clusterUUID &&
+                  (privateRoute ? (counterpart.routablePrefixUUID == 0 && counterpart.publicAddress.equals(member.privateIPv6)) :
+                                  counterpart.routablePrefixUUID != 0)) {
                 if (target != nullptr) { target = nullptr; break; }
                 target = &counterpart;
               }
@@ -41856,27 +41852,32 @@ public:
                   session.record.destination.containerUUID == member.containerUUID && session.expiresAtMs > now;
             });
             if (current) continue;
-            const Whitehole *selected = nullptr;
-            for (const Whitehole& candidate : container->whiteholes) {
-              if (!whiteholeDeclarationValid(candidate) || !candidate.hasAddress || candidate.address.isNull() ||
-                  !prodigyCousinDirectIPv6AddressValid(candidate.address) || candidate.family != ExternalAddressFamily::ipv6 ||
-                  candidate.transport != ExternalAddressTransport::tcp || candidate.sourcePort == 0 || candidate.bindingNonce == 0) continue;
-              const bool leased = std::any_of(cousinSessions.begin(), cousinSessions.end(), [&](const auto& session) {
-                const bool sameSocketTuple = session.record.sourceAddress.equals(candidate.address) &&
-                    session.record.sourceTCPPort == candidate.sourcePort &&
-                    session.record.destination.publicAddress.equals(target->publicAddress) &&
-                    session.record.destination.publicTCPPort == target->publicTCPPort;
-                return session.record.sourceContainerUUID == container->uuid &&
-                    session.expiresAtMs > now && (sameSocketTuple ||
-                      (session.record.sourceBindingNonce == candidate.bindingNonce &&
-                       prodigyCousinSourcePermissionsConflict(permission, session.record.sourcePermission)));
-              });
-              if (!leased) { selected = &candidate; break; }
+            if (privateRoute) {
+              if (RAND_priv_bytes(reinterpret_cast<unsigned char *>(&request.bindingNonce), sizeof(request.bindingNonce)) != 1 ||
+                  !request.bindingNonce) continue;
+            } else {
+              const Whitehole *selected = nullptr;
+              for (const Whitehole& candidate : container->whiteholes) {
+                if (!whiteholeDeclarationValid(candidate) || !candidate.hasAddress || candidate.address.isNull() ||
+                    !prodigyCousinDirectIPv6AddressValid(candidate.address) || candidate.family != ExternalAddressFamily::ipv6 ||
+                    candidate.transport != ExternalAddressTransport::tcp || candidate.sourcePort == 0 || candidate.bindingNonce == 0) continue;
+                const bool leased = std::any_of(cousinSessions.begin(), cousinSessions.end(), [&](const auto& session) {
+                  const bool sameSocketTuple = session.record.sourceAddress.equals(candidate.address) &&
+                      session.record.sourceTCPPort == candidate.sourcePort &&
+                      session.record.destination.publicAddress.equals(target->publicAddress) &&
+                      session.record.destination.publicTCPPort == target->publicTCPPort;
+                  return session.record.sourceContainerUUID == container->uuid &&
+                      session.expiresAtMs > now && (sameSocketTuple ||
+                        (session.record.sourceBindingNonce == candidate.bindingNonce &&
+                         prodigyCousinSourcePermissionsConflict(permission, session.record.sourcePermission)));
+                });
+                if (!leased) { selected = &candidate; break; }
+              }
+              // Capacity exhaustion is a safe deferral.  In particular, do not
+              // revoke an established voter session merely to admit a learner.
+              if (!selected) continue;
+              request.bindingNonce = selected->bindingNonce;
             }
-            // Capacity exhaustion is a safe deferral.  In particular, do not
-            // revoke an established voter session merely to admit a learner.
-            if (!selected) continue;
-            request.bindingNonce = selected->bindingNonce;
             if (RAND_priv_bytes(reinterpret_cast<unsigned char *>(&request.requestUUID), sizeof(request.requestUUID)) != 1 || request.requestUUID == 0) continue;
             (void)cousinSessionSourceRequest(&container->machine->neuron, container->uuid, request, true, &member);
           }

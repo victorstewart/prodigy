@@ -44232,6 +44232,238 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite, bool handof
           selfMachine.neuron.cousinDiscoveryVersion = savedDiscoveryVersion;
           suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA), "automatic_client_authority_restores_legacy_fixture_scope");
         }
+        {
+          // A replacement learner overlaps an existing remote voter. Both use
+          // the same sibling permission and slot, but need independent private
+          // sessions. Exercise the real driver behind its authenticated gates.
+          const auto savedAuthority = permissionBrain.masterAuthorityRuntimeState;
+          const auto savedDiscovery = permissionBrain.cousinDiscoveryReceipts;
+          const auto savedMasque = permissionBrain.crossClusterMasqueReadinessReceipts;
+          const auto savedBGP = permissionBrain.crossClusterPrivateBGPReadinessReceipts;
+          const auto savedAutomaticDrive = permissionBrain.lastCousinAutomaticSessionDriveMs;
+          struct SavedPrivateNeuron {
+            bool member, neuronMember, ready, cousinCapable;
+            uint8_t cousinVersion; uint32_t projectionVersion;
+            uint64_t generation; String fingerprint, acknowledgedFingerprint;
+          };
+          std::array<Machine *, 3> privateMachines = {&selfMachine, &peerAMachine, &peerBMachine};
+          std::array<SavedPrivateNeuron, 3> savedPrivateNeurons = {};
+          for (size_t index = 0; index < privateMachines.size(); ++index) {
+            auto *machine = privateMachines[index]; auto& neuron = machine->neuron;
+            savedPrivateNeurons[index] = {permissionBrain.machines.contains(machine), permissionBrain.neurons.contains(&neuron),
+                machine->runtimeReady, neuron.cousinDiscoveryCapable, neuron.cousinDiscoveryVersion,
+                neuron.clusterPairProjectionVersion, neuron.clusterPairProjectionGeneration,
+                neuron.clusterPairProjectionFingerprint, neuron.clusterPairProjectionAcknowledgedFingerprint};
+            machine->runtimeReady = true; neuron.cousinDiscoveryCapable = true; neuron.cousinDiscoveryVersion = 3;
+            neuron.clusterPairProjectionVersion = 3;
+            permissionBrain.machines.insert(machine); permissionBrain.neurons.insert(&neuron);
+          }
+          permissionBrain.cousinSessions.clear(); selfMachine.neuron.wBuffer.clear();
+          for (BrainView *peer : {&permissionPeerA, &permissionPeerB}) {
+            String capabilityFrame = {};
+            permissionBrain.brainHandler(peer, buildBrainMessage(capabilityFrame, BrainTopic::acknowledgeCapabilities,
+                uint64_t(2 | 32 | 64 | 256 | 512 | 1024 | 8192 | 32768 | 65536)));
+          }
+          auto& privateOperation = permissionBrain.masterAuthorityRuntimeState.clusterPairEnrollmentOperations.front();
+          privateOperation.protocolVersion = ProdigyClusterPairEnrollmentOperation::privateDiscoveryVersion;
+          privateOperation.privateDiscoveryActivationUUID = privateOperation.operationUUID;
+          privateOperation.privateDiscoveryPhase = ProdigyPairPrivateDiscoveryPhase::active;
+          privateOperation.privateDiscoveryTransitionGeneration = permissionBrain.masterAuthorityRuntimeState.generation;
+
+          ApplicationDeployment truth = {};
+          truth.plan.config = live.plan.config; truth.plan.config.applicationID = MeshRegistry::Truth::applicationID;
+          truth.plan.config.type = ApplicationType::stateful; truth.plan.isStateful = true;
+          truth.plan.stateful.neverShard = true; truth.nShardGroups = 1;
+          truth.plan.stateful.clientPrefix = MeshRegistry::Truth::clients;
+          truth.plan.stateful.siblingPrefix = MeshRegistry::Truth::siblings;
+          truth.plan.stateful.cousinPrefix = prodigyRuntimeStatefulServicePrefix(10, 3);
+          truth.plan.stateful.seedingPrefix = prodigyRuntimeStatefulServicePrefix(10, 4);
+          truth.plan.stateful.shardingPrefix = prodigyRuntimeStatefulServicePrefix(10, 5);
+          const uint64_t sibling = MeshServices::constrainPrefixToGroup(MeshRegistry::Truth::siblings, 0);
+          truth.plan.subscriptions.emplace_back(sibling, ContainerState::healthy, ContainerState::destroying, SubscriptionNature::all);
+          ContainerView truthSource = {};
+          truthSource.uuid = 0x9e10; truthSource.machine = &selfMachine; truthSource.fragment = 3;
+          truthSource.deploymentID = truth.plan.config.deploymentID(); truthSource.isStateful = true;
+          truthSource.state = ContainerState::healthy; truthSource.runtimeReady = true;
+          truthSource.subscriptions.emplace(sibling, truth.plan.subscriptions.front());
+          IPAddress localAddress = prodigyContainerDatacenterSitePrefix(1).network; localAddress.v6[15] = 1;
+          std::memcpy(&truthSource.meshAddress, localAddress.v6, 16);
+          truth.containers.insert(&truthSource);
+          permissionBrain.deployments.insert_or_assign(truthSource.deploymentID, &truth);
+          permissionBrain.containers.insert_or_assign(truthSource.uuid, &truthSource);
+
+          auto truthPermission = activePermission.permission;
+          truthPermission.protocolVersion = ProdigyLocalCousinServicePermission::purposeVersion;
+          truthPermission.permissionUUID = 0x9e01; truthPermission.purpose = ProdigyCousinServicePurpose::sibling;
+          truthPermission.localApplicationID = truthPermission.peerApplicationID = MeshRegistry::Truth::applicationID;
+          truthPermission.localCousinServicePrefix = truthPermission.peerCousinServicePrefix = MeshRegistry::Truth::siblings;
+          truthPermission.localDeploymentID = truthPermission.peerDeploymentID = truthSource.deploymentID;
+          truthPermission.authorizedService = sibling; truthPermission.destinationShardGroup = 0; truthPermission.destinationShardGroups = 1;
+          truthPermission.slots = {}; truthPermission.slots.insert(0);
+          String truthPlanBytes = {};
+          suite.require(BitseryEngine::serialize(truthPlanBytes, truth.plan) &&
+              prodigyComputeSHA256Hex(truthPlanBytes, truthPermission.canonicalPlanSHA256),
+              "truth_private_sessions_bind_exact_live_sibling_plan");
+          truthPermission.peerCanonicalPlanSHA256 = truthPermission.canonicalPlanSHA256;
+          truthPermission.peerArtifactSHA256 = truthPermission.artifactSHA256;
+          truthPermission.peerArtifactBytes = truthPermission.artifactBytes;
+          auto remoteTruthPermission = truthPermission;
+          remoteTruthPermission.permissionUUID = 0x9e02; remoteTruthPermission.localHalf = CousinRouteHalf::destination;
+          std::swap(remoteTruthPermission.localClusterUUID, remoteTruthPermission.peerClusterUUID);
+          permissionBrain.masterAuthorityRuntimeState.localCousinServicePermissions = {truthPermission};
+
+          TruthGlobalMembershipProjection membership = {};
+          membership.membershipUUID = 0x9e03; membership.operationUUID = 0x9e04;
+          membership.localClusterUUID = clusterUUID; membership.deploymentID = truthSource.deploymentID;
+          membership.generation = 1; membership.expectedCommittedConfigIndex = 5;
+          membership.expectedCommittedConfigSHA256 = truthPermission.canonicalPlanSHA256;
+          membership.genesisMemberIDs = {1, 2, 3}; membership.highestAllocatedMemberID = 4; membership.replacementPending = true;
+          for (int32_t id = 1; id <= 4; ++id) {
+            TruthGlobalMember member = {}; member.memberID = id;
+            member.clusterUUID = id % 2 ? clusterUUID : truthPermission.peerClusterUUID;
+            member.containerUUID = id == 1 ? truthSource.uuid : uint128_t(0x9e10 + id);
+            member.privateIPv6 = prodigyContainerDatacenterSitePrefix(id % 2 ? 1 : 2).network;
+            member.privateIPv6.v6[15] = uint8_t(id);
+            member.role = id == 4 ? TruthGlobalMemberRole::learner : TruthGlobalMemberRole::voter;
+            membership.members.push_back(member);
+          }
+          suite.require(prodigyTruthGlobalMembershipProjectionValid(membership), "truth_private_sessions_committed_voters_overlap_learner");
+          permissionBrain.masterAuthorityRuntimeState.truthGlobalMembershipProjections = {membership};
+
+          auto gateway = makeGatewayReadinessReplayAuthority();
+          const auto& pair = permissionBrain.masterAuthorityRuntimeState.clusterPairEnrollments.front();
+          gateway.pairUUID = pair.pairUUID; gateway.pairOperationUUID = pair.operationUUID;
+          gateway.localClusterUUID = clusterUUID; gateway.peerClusterUUID = pair.peerClusterUUID;
+          gateway.localMachineUUID = selfMachine.uuid; gateway.peerMachineUUID = cacheRemote.nodeUUID;
+          gateway.pairAuthorityGeneration = pair.localAuthorityGeneration; gateway.keyGeneration = pair.agreedKeyEpoch;
+          suite.require(prodigyDeriveCrossClusterMasquePrivateBGPTuple(gateway), "truth_private_sessions_derive_gateway_scope");
+          gateway.privateSessionCredentialSHA256 = gateway.artifactSHA256;
+          permissionBrain.masterAuthorityRuntimeState.crossClusterMasqueGatewayAuthorities = {gateway};
+          auto truthReceipt = cacheReceipt;
+          truthReceipt.snapshot.protocolVersion = ProdigyCousinDiscoverySnapshot::privateContainerVersion;
+          truthReceipt.snapshot.records.clear(); truthReceipt.sequence += 100;
+          permissionBrain.masterAuthorityRuntimeState.cousinRoutes.clear();
+          for (size_t index : {size_t(1), size_t(3)}) {
+            auto counterpart = remoteCounterpart; counterpart.permission = remoteTruthPermission;
+            counterpart.containerUUID = membership.members[index].containerUUID;
+            counterpart.containerID = uint32_t(0x01020300 + index); counterpart.shardGroup = 0; counterpart.shardGroups = 1;
+            counterpart.service = sibling; counterpart.ownedSlots = truthPermission.slots;
+            counterpart.routablePrefixUUID = 0; counterpart.publicAddress = membership.members[index].privateIPv6;
+            counterpart.publicTCPPort = counterpart.servicePort; counterpart.wormholeRevision.clear();
+            truthReceipt.snapshot.records.push_back(counterpart);
+            auto route = sessionRoute; route.version = 3; route.endpointKind = CousinRouteEndpointKind::privateContainer;
+            route.routeUUID = uint128_t(0x9e20 + index); route.operationUUID = uint128_t(0x9e30 + index);
+            route.sourceApplicationID = route.destinationApplicationID = MeshRegistry::Truth::applicationID;
+            route.sourceCousinServicePrefix = route.destinationCousinServicePrefix = MeshRegistry::Truth::siblings;
+            route.sourcePermissionUUID = truthPermission.permissionUUID; route.destinationPermissionUUID = remoteTruthPermission.permissionUUID;
+            route.slots = truthPermission.slots; route.destinationRoutablePrefixUUID = 0; route.destinationCIDR = 128;
+            route.destinationPublicAddress = counterpart.publicAddress; route.destinationTCPPort = counterpart.publicTCPPort;
+            suite.require(cousinRouteStructurallyValid(route), "truth_private_sessions_exact_remote_route_valid");
+            permissionBrain.masterAuthorityRuntimeState.cousinRoutes.push_back(route);
+          }
+          suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA), "truth_private_sessions_qualify_current_authority");
+          for (auto *machine : privateMachines) {
+            ProdigyLocalClusterPairControlProjection privateProjection = {}; String privateFingerprint = {};
+            suite.require(permissionBrain.buildLocalClusterPairControlProjection(machine->uuid, privateProjection, privateFingerprint),
+                "truth_private_sessions_build_private_discovery_projection");
+            machine->neuron.clusterPairProjectionGeneration = privateProjection.committedAuthorityGeneration;
+            machine->neuron.clusterPairProjectionFingerprint = machine->neuron.clusterPairProjectionAcknowledgedFingerprint = privateFingerprint;
+          }
+          // The surrounding fixture committed a newer permission generation
+          // after cacheReceipt was made. Bind this receipt to the freshly
+          // acknowledged private-discovery carrier projection above.
+          truthReceipt.projectionGeneration = selfMachine.neuron.clusterPairProjectionGeneration;
+          suite.require(permissionBrain.localCousinServicePermissionMatchesCurrentLivePlan(truthPermission),
+              "truth_private_sessions_permission_matches_current_live_plan");
+          suite.require(permissionBrain.clusterPairPrivateDiscoveryActive(pair.pairUUID, pair.rootGeneration, pair.peerClusterUUID),
+              "truth_private_sessions_require_acknowledged_private_discovery");
+          ProdigyCrossClusterMasqueGatewayReadiness masque = {};
+          masque.pairUUID = gateway.pairUUID; masque.localClusterUUID = clusterUUID; masque.localMachineUUID = selfMachine.uuid;
+          masque.keyEpoch = gateway.keyGeneration; masque.authorityGeneration = gateway.pairAuthorityGeneration;
+          masque.gatewayGeneration = gateway.generation; masque.authenticatedMasqueQUICReady = true;
+          ProdigyCrossClusterPrivateBGPReadiness bgp = {};
+          bgp.scope.pairUUID = gateway.pairUUID; bgp.scope.operationUUID = gateway.pairOperationUUID;
+          bgp.scope.keyEpoch = gateway.keyGeneration; bgp.scope.tunnelSlot = gateway.tunnelSlot;
+          bgp.scope.clusterUUID = clusterUUID; bgp.scope.machineUUID = selfMachine.uuid;
+          bgp.scope.authorityGeneration = gateway.pairAuthorityGeneration; bgp.scope.gatewayGeneration = gateway.generation;
+          bgp.peerMachineUUID = gateway.peerMachineUUID; bgp.localSitePrefix = gateway.localSitePrefix; bgp.peerSitePrefix = gateway.peerSitePrefix;
+          bgp.localSitePrefixAnnounced = bgp.sessionEstablished = bgp.peerSitePrefixImported = bgp.switchboardFallbackInstalled = true;
+          String readinessBytes = {}, readinessFrame = {};
+          BitseryEngine::serialize(readinessBytes, masque);
+          permissionBrain.neuronHandler(&selfMachine.neuron, buildNeuronMessage(readinessFrame, NeuronTopic::crossClusterMasqueGatewayReadinessReceipt, readinessBytes));
+          readinessBytes.clear(); readinessFrame.clear(); BitseryEngine::serialize(readinessBytes, bgp);
+          permissionBrain.neuronHandler(&selfMachine.neuron, buildNeuronMessage(readinessFrame, NeuronTopic::crossClusterPrivateBGPReadinessReceipt, readinessBytes));
+          suite.require(permissionBrain.cousinPrivateRouteGatewayReady(permissionBrain.masterAuthorityRuntimeState.cousinRoutes.front(), CousinRouteHalf::source),
+              "truth_private_sessions_require_live_authenticated_gateway_and_bgp_receipts");
+          permissionBrain.cousinDiscoveryReceipts.clear();
+          auto wrongAddressReceipt = truthReceipt;
+          ++wrongAddressReceipt.snapshot.records.front().publicAddress.v6[15];
+          permissionBrain.masterAuthorityRuntimeState.cousinRoutes.front().destinationPublicAddress = wrongAddressReceipt.snapshot.records.front().publicAddress;
+          suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA), "truth_private_sessions_qualify_mismatched_discovered_address_route");
+          suite.require(prodigyCousinDiscoveryReceiptValid(wrongAddressReceipt), "truth_private_sessions_wrong_address_receipt_is_authenticated_and_well_formed");
+          permissionBrain.receiveCousinDiscoverySnapshot(&selfMachine.neuron, wrongAddressReceipt);
+          suite.require(permissionBrain.queryCousinCounterparts({1, truthPermission.permissionUUID, 0}).records.size() == 2,
+              "truth_private_sessions_wrong_address_reaches_membership_admission_gate");
+          ProdigyCousinSessionRequest truthRequest = {};
+          truthRequest.requestUUID = 0x9e40; truthRequest.permissionUUID = truthPermission.permissionUUID; truthRequest.bindingNonce = 0x9e41;
+          suite.expect(!permissionBrain.cousinSessionSourceRequest(&selfMachine.neuron, truthSource.uuid, truthRequest, true, &membership.members[1]),
+              "truth_private_sessions_reject_discovered_ip_outside_exact_member_binding");
+          permissionBrain.masterAuthorityRuntimeState.cousinRoutes.front().destinationPublicAddress = membership.members[1].privateIPv6;
+          suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA), "truth_private_sessions_restore_exact_member_address_route");
+          ++truthReceipt.sequence;
+          permissionBrain.receiveCousinDiscoverySnapshot(&selfMachine.neuron, truthReceipt);
+          suite.require(permissionBrain.queryCousinCounterparts({1, truthPermission.permissionUUID, 0}).records.size() == 2,
+              "truth_private_sessions_discover_overlapping_remote_voter_and_learner");
+          auto wrongMember = membership.members[1]; ++wrongMember.containerUUID;
+          suite.expect(!permissionBrain.cousinSessionSourceRequest(&selfMachine.neuron, truthSource.uuid, truthRequest, true, &wrongMember),
+              "truth_private_sessions_reject_uncommitted_counterpart_identity");
+          auto driveTruth = [&] { permissionBrain.lastCousinAutomaticSessionDriveMs = 0; permissionBrain.driveCousinSessions(); };
+          driveTruth();
+          if (suite.require(permissionBrain.cousinSessions.size() == 2, "truth_private_sessions_driver_preserves_voter_and_adds_learner")) {
+            const auto first = permissionBrain.cousinSessions[0]; const auto second = permissionBrain.cousinSessions[1];
+            suite.expect(prodigyCousinSessionUsesPrivateContainerEndpoints(first.record) && prodigyCousinSessionUsesPrivateContainerEndpoints(second.record) &&
+                first.record.sourcePermission.permissionUUID == truthPermission.permissionUUID &&
+                second.record.sourcePermission.permissionUUID == truthPermission.permissionUUID && first.record.slot == 0 && second.record.slot == 0 &&
+                first.record.destination.containerUUID == membership.members[1].containerUUID &&
+                second.record.destination.containerUUID == membership.members[3].containerUUID &&
+                first.record.sourceBindingNonce != second.record.sourceBindingNonce && first.record.sourceTCPPort != second.record.sourceTCPPort &&
+                permissionBrain.cousinSessionLocalCurrent(first) && permissionBrain.cousinSessionLocalCurrent(second),
+                "truth_private_sessions_bind_two_exact_members_with_distinct_private_source_tuples");
+            driveTruth();
+            suite.expect(permissionBrain.cousinSessions.size() == 2 &&
+                prodigyCousinSessionExact(permissionBrain.cousinSessions[0].record, first.record) &&
+                prodigyCousinSessionExact(permissionBrain.cousinSessions[1].record, second.record),
+                "truth_private_sessions_repeated_driver_keeps_both_leases_without_duplicates");
+            auto retired = membership; retired.members.erase(retired.members.begin() + 1); retired.retiredMemberIDs = {2};
+            ++retired.generation; ++retired.expectedCommittedConfigIndex;
+            suite.require(prodigyTruthGlobalMembershipProjectionValid(retired), "truth_private_sessions_retirement_projection_valid");
+            permissionBrain.masterAuthorityRuntimeState.truthGlobalMembershipProjections = {retired};
+            suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA), "truth_private_sessions_qualify_retirement_projection");
+            suite.expect(!permissionBrain.cousinSessionLocalCurrent(first) && permissionBrain.cousinSessionLocalCurrent(second),
+                "truth_private_sessions_retired_voter_fenced_while_learner_remains_current");
+            driveTruth();
+            suite.expect(permissionBrain.cousinSessions.size() == 1 &&
+                prodigyCousinSessionExact(permissionBrain.cousinSessions.front().record, second.record),
+                "truth_private_sessions_driver_retires_only_removed_member");
+          }
+          permissionBrain.cousinSessions.clear(); permissionBrain.containers.erase(truthSource.uuid);
+          permissionBrain.deployments.erase(truthSource.deploymentID); truth.containers.erase(&truthSource);
+          permissionBrain.lastCousinAutomaticSessionDriveMs = savedAutomaticDrive;
+          selfMachine.neuron.wBuffer.clear();
+          permissionBrain.masterAuthorityRuntimeState = savedAuthority;
+          permissionBrain.cousinDiscoveryReceipts = savedDiscovery;
+          permissionBrain.crossClusterMasqueReadinessReceipts = savedMasque; permissionBrain.crossClusterPrivateBGPReadinessReceipts = savedBGP;
+          for (size_t index = 0; index < privateMachines.size(); ++index) {
+            auto *machine = privateMachines[index]; auto& neuron = machine->neuron; const auto& saved = savedPrivateNeurons[index];
+            machine->runtimeReady = saved.ready; neuron.cousinDiscoveryCapable = saved.cousinCapable;
+            neuron.cousinDiscoveryVersion = saved.cousinVersion; neuron.clusterPairProjectionVersion = saved.projectionVersion;
+            neuron.clusterPairProjectionGeneration = saved.generation; neuron.clusterPairProjectionFingerprint = saved.fingerprint;
+            neuron.clusterPairProjectionAcknowledgedFingerprint = saved.acknowledgedFingerprint;
+            if (!saved.member) permissionBrain.machines.erase(machine);
+            if (!saved.neuronMember) permissionBrain.neurons.erase(&neuron);
+          }
+          suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA), "truth_private_sessions_restore_surrounding_authority_fixture");
+        }
         permissionBrain.cousinSessions.clear(); permissionBrain.containers.erase(sourceApp.uuid);
         permissionBrain.masterAuthorityRuntimeState.cousinRoutes.clear();
         suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA),

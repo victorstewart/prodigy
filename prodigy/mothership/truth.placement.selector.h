@@ -29,7 +29,6 @@ struct Replacement {
 struct Decision {
   Action action = Action::wait;
   Replacement replacement{};
-  uint64_t expectedConfigIndex = 0;
 };
 
 inline std::vector<ClusterID> eligibleSites(std::vector<ClusterID> sites) {
@@ -73,14 +72,14 @@ inline Decision next(const std::vector<Voter>& voters, std::vector<ClusterID> si
     const auto replacement = match(pending->newID);
     if (replacement != voters.end()) {
       if (!oldPresent && replacement->cluster == pending->target && voters.size() == 3)
-        return {Action::retireContainer, *pending, configIndex};
+        return {Action::retireContainer, *pending};
       return {};
     }
-    if (!learnerPresent) return oldPresent ? Decision{Action::addLearner, *pending, configIndex} : Decision{};
+    if (!learnerPresent) return oldPresent ? Decision{Action::addLearner, *pending} : Decision{};
     if (!learnerCaughtUp) return {};
     // Removing a live voter must leave both remaining committed voters live.
     if (oldPresent && reachable - unsigned(match(pending->oldID)->reachable) < 2) return {};
-    return {oldPresent ? Action::removeVoter : Action::promoteLearner, *pending, configIndex};
+    return {oldPresent ? Action::removeVoter : Action::promoteLearner, *pending};
   }
 
   if (sites.empty() || voters.size() != 3 || learnerPresent || highestAllocated == std::numeric_limits<MemberID>::max())
@@ -104,6 +103,6 @@ inline Decision next(const std::vector<Voter>& voters, std::vector<ClusterID> si
       old = &v;
   }
   if (!old) return {};
-  return {Action::addLearner, {old->id, highestAllocated+1, target}, configIndex};
+  return {Action::addLearner, {old->id, highestAllocated+1, target}};
 }
 }

@@ -396,18 +396,10 @@ static void testTruthRegistry(TestSuite& suite, const String& directory)
     replacement.incoming.memberID = 5;
     replacement.incoming.containerUUID = 105;
     replacement.incoming.privateIPv6 = IPAddress(uint128_t(5));
-    auto committed = group.members;
-    committed[1] = replacement.incoming;
-    suite.expect(mothershipTruthReplacementRouteEndpoint(replacement, committed, 74, oldRemote.privateIPv6) &&
-        mothershipTruthReplacementRouteEndpoint(replacement, committed, 74, replacement.incoming.privateIPv6) &&
-        !mothershipTruthReplacementRouteEndpoint(replacement, committed, 73, oldRemote.privateIPv6),
-        "Truth uses the retired remote binding for rebalance and resumes only at the exact incoming endpoint");
-    auto survivor = oldRemote;
-    survivor.memberID = 6;
-    survivor.containerUUID = 106;
-    committed.push_back(survivor);
-    suite.expect(!mothershipTruthReplacementRouteEndpoint(replacement, committed, 74, oldRemote.privateIPv6),
-        "Truth preserves a current voter that reused a retired endpoint");
+    replacement.incoming.clusterUUID = group.localClusterUUID;
+    replacement.outgoing = oldRemote;
+    replacement.cleanup = true;
+    replacement.version = 2;
     replacement.group.highestAllocatedMemberID = 5;
     replacement.group.members = {group.members[0], group.members[2], replacement.incoming};
     replacement.group.retiredMemberIDs = {oldRemote.memberID};
@@ -422,6 +414,71 @@ static void testTruthRegistry(TestSuite& suite, const String& directory)
         restored.retiredBindings.size() == 1 && restored.retiredBindings[0].containerUUID == oldRemote.containerUUID &&
         restored.retiredBindings[0].privateIPv6.equals(oldRemote.privateIPv6),
         "Truth restores the retired remote identity and endpoint from its v2 registry record");
+    suite.expect(restored.cleanup && restored.pendingRetirementIDs.empty() &&
+        mothershipTruthDeferRetirement(restored,restored.outgoing) && restored.version == 3 &&
+        !restored.cleanup && !restored.outgoing.memberID && !restored.incoming.memberID &&
+        restored.pendingRetirementIDs == Vector<int32_t>{oldRemote.memberID} && mothershipTruthGroupValid(restored),
+        "Truth migrates v2 cleanup without retaining a completed replacement as pending membership");
+    auto v1Cleanup = replacement;
+    v1Cleanup.version = 1; v1Cleanup.retiredBindings.clear();
+    String v1CleanupBytes;
+    MothershipTruthGroup v1CleanupRecovered;
+    suite.expect(BitseryEngine::serialize(v1CleanupBytes,v1Cleanup) &&
+        BitseryEngine::deserializeSafe(v1CleanupBytes,v1CleanupRecovered) &&
+        mothershipTruthDeferRetirement(v1CleanupRecovered,v1CleanupRecovered.outgoing) &&
+        mothershipTruthGroupValid(v1CleanupRecovered) &&
+        v1CleanupRecovered.retiredBindings.front().containerUUID == oldRemote.containerUUID,
+        "Truth migrates v1 cleanup and recovers its exact binding from the legacy slot");
+    bool cleanupChanged = true;
+    unsigned attempted = 0;
+    suite.expect(mothershipTruthRetryRetirements(restored,restored.group.members,[&](const auto& retired) {
+          ++attempted;
+          return retired.clusterUUID != oldRemote.clusterUUID;
+        },cleanupChanged) && attempted == 1 && !cleanupChanged &&
+        restored.pendingRetirementIDs == Vector<int32_t>{oldRemote.memberID},
+        "Truth unavailable retired site preserves its obligation without vetoing reconciliation");
+    std::vector<ProdigyTruthPlacement::Voter> currentVoters;
+    for (const auto& member : restored.group.members)
+      currentVoters.push_back({member.memberID,member.clusterUUID,member.memberID != 5,member.memberID == 5 ? 100u : 0u});
+    const auto second = ProdigyTruthPlacement::next(currentVoters,{group.localClusterUUID},4,
+        restored.group.highestAllocatedMemberID,200,10);
+    suite.expect(second.action == ProdigyTruthPlacement::Action::addLearner && second.replacement.oldID == 5 &&
+        second.replacement.newID == 6 && second.replacement.target == group.localClusterUUID &&
+        !restored.outgoing.memberID && !restored.incoming.memberID,
+        "Truth can repair a later voter loss while the first retired site is still offline");
+    const auto oldLocal = restored.group.members.back();
+    auto freshLocal = oldLocal;
+    freshLocal.memberID = 6; freshLocal.containerUUID = 106; freshLocal.privateIPv6 = IPAddress(uint128_t(6));
+    restored.group.members.back() = freshLocal;
+    restored.group.highestAllocatedMemberID = 6;
+    restored.group.retiredMemberIDs.push_back(oldLocal.memberID);
+    restored.group.generation = 4; restored.group.expectedCommittedConfigIndex = 7;
+    suite.expect(prodigyTruthCommittedConfigDigest(group.membershipUUID,group.deploymentID,7,
+        restored.group.members,restored.group.expectedCommittedConfigSHA256) &&
+        mothershipTruthDeferRetirement(restored,oldLocal) && mothershipTruthGroupValid(restored),
+        "Truth retains both exact physical retirements after a second committed replacement");
+    String deferredBytes;
+    MothershipTruthGroup deferred;
+    suite.expect(BitseryEngine::serialize(deferredBytes,restored) && BitseryEngine::deserializeSafe(deferredBytes,deferred) &&
+        mothershipTruthGroupValid(deferred) && deferred.pendingRetirementIDs == Vector<int32_t>({2,5}) &&
+        deferred.retiredBindings.front().containerUUID == oldRemote.containerUUID &&
+        deferred.retiredBindings.back().containerUUID == oldLocal.containerUUID,
+        "Truth v3 restart preserves all exact deferred physical retirements");
+    suite.expect(mothershipTruthRetryRetirements(deferred,deferred.group.members,[&](const auto& retired) {
+          return retired.memberID == oldLocal.memberID;
+        },cleanupChanged) && cleanupChanged && deferred.pendingRetirementIDs == Vector<int32_t>{2} &&
+        deferred.retiredBindings.size() == 2,
+        "Truth removes only terminally destroyed cleanup while retaining route tombstones");
+    auto unsafeCommitted = deferred.group.members;
+    unsafeCommitted.push_back(oldRemote);
+    attempted = 0;
+    suite.expect(!mothershipTruthRetryRetirements(deferred,unsafeCommitted,[&](const auto&) {
+          ++attempted; return true;
+        },cleanupChanged) && attempted == 0 && deferred.pendingRetirementIDs == Vector<int32_t>{2},
+        "Truth never physically retires a member present in the committed configuration");
+    auto wrongRetired = oldRemote; ++wrongRetired.containerUUID;
+    suite.expect(!mothershipTruthDeferRetirement(deferred,wrongRetired),
+        "Truth cannot replace the exact binding of an outstanding retirement");
     auto wrong = grant;
     ++wrong.operationUUID;
     suite.expect(!registry.recordTruthGrantBeforeDispatch(wrong, &failure), "Truth rejects mismatched first grant");
@@ -450,6 +507,97 @@ static void testTruthRegistry(TestSuite& suite, const String& directory)
       placement, resumed, &failure) && !legacy.saveTruthGroup(0, state, &failure), "Truth legacy singleton fences new group");
 }
 
+static void testTruthPrivateRoutes(TestSuite& suite, const String& directory)
+{
+  const int64_t now = Time::now<TimeResolution::ms>();
+  Vector<TruthGlobalMember> members;
+  for (int32_t id = 1; id <= 4; ++id) {
+    TruthGlobalMember member;
+    member.memberID = id; member.clusterUUID = id == 1 ? 73 : 74; member.containerUUID = 100 + id;
+    member.privateIPv6 = IPAddress(uint128_t(id));
+    if (id == 4) member.role = TruthGlobalMemberRole::learner;
+    members.push_back(member);
+  }
+  CousinRouteRecord seed;
+  seed.version = 3; seed.routeUUID = 501; seed.operationUUID = 601; seed.pairUUID = 701;
+  seed.logicalWorkloadUUID = 801; seed.logicalServiceUUID = 901;
+  seed.sourceClusterUUID = 73; seed.destinationClusterUUID = 74;
+  seed.sourceApplicationID = seed.destinationApplicationID = MeshRegistry::Truth::applicationID;
+  seed.sourceCousinServicePrefix = seed.destinationCousinServicePrefix = MeshRegistry::Truth::siblings;
+  seed.slots.insert(0); seed.destinationPublicAddress = members[1].privateIPv6; seed.destinationTCPPort = 443;
+  seed.sourcePermissionUUID = 1001; seed.destinationPermissionUUID = 1002;
+  seed.transportProtocol = IPPROTO_TCP; seed.destinationCIDR = 128; seed.pathMTU = 1500;
+  seed.endpointKind = CousinRouteEndpointKind::privateContainer;
+  seed.generation = seed.keyEpoch = seed.rootGeneration = 1;
+  seed.issuedAtMs = now - 1; seed.expiresAtMs = now + 60'000;
+  auto second = seed; second.routeUUID++; second.operationUUID++; second.destinationPublicAddress = members[2].privateIPv6;
+  auto learner = seed; learner.routeUUID += 2; learner.operationUUID += 2; learner.destinationPublicAddress = members[3].privateIPv6;
+  auto voters = members; voters.pop_back();
+  suite.expect(!mothershipTruthPrivateRoutesCoverMembers({seed},voters,73,74) &&
+      mothershipTruthPrivateRoutesCoverMembers({seed,second},voters,73,74) &&
+      !mothershipTruthPrivateRoutesCoverMembers({seed,second},members,73,74) &&
+      mothershipTruthPrivateRoutesCoverMembers({seed,second,learner},members,73,74),
+      "Truth private routes cover both destination voters and the overlapping learner independently");
+  suite.expect(!mothershipTruthPrivateRoutesCoverMembers({seed,seed,second},voters,73,74),
+      "Truth private member coverage rejects ambiguous endpoint owners");
+  String path, failure;
+  path.snprintf<"{}/truth-private-routes"_ctv>(directory);
+  auto record = [&](auto& registry,const auto& route) {
+    CousinRouteRecord saved; bool resumed = false;
+    return registry.recordCousinRoute(route,saved,resumed,&failure);
+  };
+  auto receipt = [&](auto& registry,const auto& route,CousinRouteHalf half) {
+    CousinRouteApplyReceipt value;
+    value.routeUUID = route.routeUUID; value.generation = route.generation;
+    value.localClusterUUID = half == CousinRouteHalf::source ? route.sourceClusterUUID : route.destinationClusterUUID;
+    value.localHalf = half; value.keyEpoch = route.keyEpoch; value.installedState = route.state;
+    value.localRuntimeRevision = route.generation;
+    CousinRouteApplyReceipt saved; bool resumed = false;
+    return cousinRouteAuthorizationDigest(route,value.authorizationSHA256) &&
+        registry.recordCousinRouteApplyReceipt(value,saved,resumed,&failure);
+  };
+  {
+    MothershipClusterRegistry registry(path);
+    suite.expect(record(registry,seed) && record(registry,second) && record(registry,learner),
+        "Truth private member routes share the admitted permission contract without replacing a surviving endpoint");
+    auto duplicate = learner; duplicate.routeUUID++; duplicate.operationUUID++;
+    suite.expect(!record(registry,duplicate),"Truth retry cannot mint a second route owner for the learner endpoint");
+    suite.expect(receipt(registry,seed,CousinRouteHalf::source) && receipt(registry,seed,CousinRouteHalf::destination),
+        "Truth existing private endpoint has both ordinary durable route receipts");
+  }
+  MothershipClusterRegistry registry(path);
+  Vector<uint16_t> applications = {MeshRegistry::Truth::applicationID};
+  Vector<CousinRouteRecord> recovered;
+  suite.expect(registry.listNametagSeedSuccessorRouteCandidates(73,applications,now,recovered,&failure) && recovered.size() == 3 &&
+      mothershipTruthPrivateRoutesCoverMembers(recovered,members,73,74),
+      "Truth restart discovers the durable learner route instead of allocating it again");
+  MothershipTruthGroup group;
+  group.retiredBindings.push_back(members[1]);
+  auto current = members; current.erase(current.begin()+1);
+  suite.expect(!mothershipTruthPrivateRouteRetirementRequired(group,{members[0]},seed,false) &&
+      mothershipTruthPrivateRouteRetirementRequired(group,current,seed,true),
+      "Truth retains an empty site's authorization template until its returning endpoint is installed");
+  auto reused = members[1]; reused.memberID = 5; reused.containerUUID = 105;
+  current.push_back(reused);
+  suite.expect(!mothershipTruthPrivateRouteRetirementRequired(group,current,seed,true),
+      "Truth endpoint withdrawal preserves a current member that reused a retired address");
+  auto withdrawn = seed;
+  withdrawn.operationUUID += 10; ++withdrawn.generation; withdrawn.state = CousinRouteState::withdrawn;
+  withdrawn.withdrawalGeneration = withdrawn.generation; withdrawn.withdrawnAtMs = now;
+  suite.expect(record(registry,withdrawn) && receipt(registry,withdrawn,CousinRouteHalf::source),
+      "Truth retired endpoint records withdrawal before an interrupted second-half apply");
+  recovered.clear();
+  suite.expect(registry.listNametagSeedSuccessorRouteCandidates(73,applications,now,recovered,&failure,true) && recovered.size() == 3 &&
+      std::any_of(recovered.begin(),recovered.end(),[&](const auto& route) {
+        return cousinRouteExactMatches(route,withdrawn) &&
+            mothershipTruthPrivateRouteRetirementRequired(group,{members[0]},route,false);
+      }) && receipt(registry,withdrawn,CousinRouteHalf::destination),
+      "Truth terminal scan resumes the exact pending withdrawal receipt without reviving its authorization");
+  recovered.clear();
+  suite.expect(registry.listNametagSeedSuccessorRouteCandidates(73,applications,now,recovered,&failure) && recovered.size() == 2,
+      "Truth normal route discovery excludes the terminal retired endpoint");
+}
+
 int main(int argc, char** argv)
 {
   TestSuite suite;
@@ -465,6 +613,7 @@ int main(int argc, char** argv)
   String dbPath;
   dbPath.assign(created);
   testTruthRegistry(suite, dbPath);
+  testTruthPrivateRoutes(suite, dbPath);
   if (argc == 2 && std::strcmp(argv[1], "--truth") == 0) {
     std::filesystem::remove_all(created);
     return suite.failed ? EXIT_FAILURE : EXIT_SUCCESS;
