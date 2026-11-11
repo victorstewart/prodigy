@@ -75,8 +75,8 @@ def main():
         rows = {int(m["member"]): m for m in (fields(s) for s in lines if s.startswith("truthCommittedMember "))}
         return (reports[0], rows) if len(reports) == 1 else ({}, {})
 
-    def inventory():
-        lines = call("deploymentIdentity", options.singleton, options.deployment)
+    def inventory(cluster=None):
+        lines = call("deploymentIdentity", cluster or options.singleton, options.deployment)
         report = next((fields(s) for s in lines if s.startswith("deploymentIdentity success=1 ")), {})
         return report.get("clusterUUID"), {fields(s)["containerUUID"] for s in lines if s.startswith("deploymentIdentityMember ")}
 
@@ -247,6 +247,14 @@ def main():
                 sorted(Counter(member["cluster"] for _, member in remote + local).values()) == expected_return_distribution and
                 (options.sites == 2 or {member["cluster"] for member in group.values()} == initial_sites)):
             return None
+        # The final membership commit precedes physical retirement. Keep
+        # reconciling until every site has exactly its committed containers;
+        # otherwise the restored probe can still discover the retired sibling.
+        for cluster in initial_sites:
+            observed, active = inventory("0x" + cluster.removeprefix("0x"))
+            expected = {member["container"] for member in group.values() if member["cluster"] == cluster}
+            if observed != cluster or active != expected:
+                return None
         return unanimous(voting, r)
     wait_for(f"return restored {options.sites}-site placement with a fresh caught-up remote voter and retired the old UUID", returned)
     if options.sites == 2:
