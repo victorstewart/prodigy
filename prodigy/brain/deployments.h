@@ -4014,19 +4014,21 @@ public:
 
   uint32_t desiredReplicaCountForShardGroup(uint32_t shardGroup) const
   {
-    // A global Truth deployment is a set of exact local incarnations, not a
+    // A global single-writer deployment is a set of exact local incarnations, not a
     // three-replica autoscaling group.  A site with no current voter/learner
     // owns no local target (a retired-only projection is intentionally zero).
-    if (thisBrain && plan.config.applicationID == MeshRegistry::Truth::applicationID) {
-      TruthGlobalMembershipProjection group;
-      if (thisBrain->desiredTruthGlobalMembership(plan.config.deploymentID(), group) &&
-          group.protocolVersion != 0 && prodigyTruthGlobalMembershipProjectionValid(group)) {
+    if (plan.stateful.globalSingleWriter) {
+      if (!thisBrain || !prodigyGlobalSingleWriterPlanValid(plan)) return 0;
+      GlobalSingleWriterMembershipProjection group;
+      if (thisBrain->desiredGlobalSingleWriterMembership(plan.config.deploymentID(), group) &&
+          group.protocolVersion != 0 && prodigyGlobalSingleWriterMembershipProjectionValid(group)) {
         if (shardGroup != 0) return 0;
         uint32_t local = 0;
         for (const auto& member : group.members)
           if (member.clusterUUID == group.localClusterUUID) ++local;
         return local;
       }
+      return 0;
     }
     uint32_t replicas = 0;
     if (thisBrain && thisBrain->desiredStatefulReplicaCount(plan.config.deploymentID(), shardGroup, replicas)) return replicas;
@@ -4465,14 +4467,14 @@ public:
   // retirement, its committed Raft-removal proof) is durable.  This is not an
   // election path: it materializes exactly the control-plane binding and lets
   // the ordinary construct/destruct owner reserve resources and launch it.
-  bool reconcileTruthPlacement(const TruthGlobalMembershipProjection& current,
-                               const TruthGlobalMember* retired = nullptr)
+  bool reconcileGlobalSingleWriterPlacement(const GlobalSingleWriterMembershipProjection& current,
+                               const GlobalSingleWriterMember* retired = nullptr)
   {
-    if (thisBrain == nullptr || plan.config.applicationID != MeshRegistry::Truth::applicationID ||
+    if (thisBrain == nullptr || !prodigyGlobalSingleWriterPlanValid(plan) ||
         current.deploymentID != plan.config.deploymentID() || current.localClusterUUID != thisBrain->brainConfig.clusterUUID ||
-        prodigyTruthGlobalMembershipProjectionValid(current) == false) return false;
+        prodigyGlobalSingleWriterMembershipProjectionValid(current) == false) return false;
 
-    // Truth is an exact global membership with one local stateful shard. This
+    // The group is an exact global membership with one local stateful shard. This
     // must precede every scheduling exit, including incomplete(), because the
     // ordinary launch serializer carries nShardGroups into ContainerPlan and
     // peer admission rejects an uninitialized (zero) shard count.
@@ -4494,7 +4496,7 @@ public:
       if (changed) schedule();
       return false;
     };
-    for (const TruthGlobalMember& member : current.members)
+    for (const GlobalSingleWriterMember& member : current.members)
     {
       if (member.clusterUUID != current.localClusterUUID) continue;
       uint128_t address = 0;
@@ -4504,8 +4506,8 @@ public:
       {
         ContainerView* container = existing->second;
         if (container == nullptr || container->deploymentID != plan.config.deploymentID() ||
-            container->shardGroup != 0 || (container->truthMemberID && container->truthMemberID != member.memberID) ||
-            (container->meshAddress != address && container->requiredTruthMeshAddress != address)) return incomplete();
+            container->shardGroup != 0 || (container->globalSingleWriterMemberID && container->globalSingleWriterMemberID != member.memberID) ||
+            (container->meshAddress != address && container->requiredGlobalSingleWriterMeshAddress != address)) return incomplete();
         continue;
       }
 
@@ -4539,8 +4541,8 @@ public:
       container->explicitStatefulMeshRoles = statefulMeshRolesForShardGroup(0);
       prodigyPopulateDefaultStatefulTopology(container->explicitStatefulTopology, 0, plan.config);
       container->fragment = endpoint[15];
-      container->requiredTruthMeshAddress = address;
-      container->truthMemberID = member.memberID;
+      container->requiredGlobalSingleWriterMeshAddress = address;
+      container->globalSingleWriterMemberID = member.memberID;
       toSchedule.push_back(planStatefulConstruction(selected, container, DataStrategy::genesis));
       changed = true;
     }
@@ -4558,8 +4560,8 @@ public:
       {
         ContainerView* container = found->second;
         if (container->deploymentID != plan.config.deploymentID() ||
-            (container->meshAddress != retiredAddress && container->requiredTruthMeshAddress != retiredAddress) ||
-            (container->truthMemberID != 0 && container->truthMemberID != retired->memberID)) return false;
+            (container->meshAddress != retiredAddress && container->requiredGlobalSingleWriterMeshAddress != retiredAddress) ||
+            (container->globalSingleWriterMemberID != 0 && container->globalSingleWriterMemberID != retired->memberID)) return false;
         if (containers.contains(container) && container->plannedWork == nullptr &&
             container->state != ContainerState::destroyed && container->state != ContainerState::destroying)
         {
@@ -10473,9 +10475,9 @@ public:
             container->state = ContainerState::scheduled;
             container->remainingSubscriberCapacity = plan.minimumSubscriberCapacity;
 
-            if (container->requiredTruthMeshAddress)
+            if (container->requiredGlobalSingleWriterMeshAddress)
             {
-              const uint8_t *expected = reinterpret_cast<const uint8_t *>(&container->requiredTruthMeshAddress);
+              const uint8_t *expected = reinterpret_cast<const uint8_t *>(&container->requiredGlobalSingleWriterMeshAddress);
               const uint8_t *prefix = container_network_subnet6.value;
               if (std::memcmp(expected, prefix, 11) != 0 ||
                   expected[11] != thisBrain->brainConfig.datacenterFragment ||
@@ -10497,7 +10499,7 @@ public:
             container->setMeshAddress(container_network_subnet6, thisBrain->brainConfig.datacenterFragment, machine->fragment, container->fragment);
             container->addresses.clear();
             container->addresses.emplace_back(container->meshAddress, uint8_t(128));
-            container->requiredTruthMeshAddress = 0;
+            container->requiredGlobalSingleWriterMeshAddress = 0;
             container->wormholes = plan.wormholes;
             container->networkAccess = plan.networkAccess;
 
@@ -10885,19 +10887,20 @@ public:
   // this calculates a deployment of an application over a cluster, including transitioning from the last version(s) to this most recent
   void architect(CoroutineStack *coro, bool onlyMeasure, bool allowCompactionForScheduling = true, bool allowNewMachinesForScheduling = true)
   {
-    // Global Truth membership is an exact durable placement, not an
-    // autoscaling target. Brain invokes reconcileTruthPlacement() after the
+    // Global single-writer membership is an exact durable placement, not an
+    // autoscaling target. Brain invokes reconcileGlobalSingleWriterPlacement() after the
     // projection commit; ordinary architecting must never create an unbound
     // voter or learner in the meantime.
-    if (plan.config.applicationID == MeshRegistry::Truth::applicationID && thisBrain) {
-      TruthGlobalMembershipProjection group;
-      if (thisBrain->desiredTruthGlobalMembership(plan.config.deploymentID(),group) && group.protocolVersion != 0) {
-        if (!prodigyTruthGlobalMembershipProjectionValid(group)) co_return;
+    if (plan.stateful.globalSingleWriter) {
+      if (!thisBrain || !prodigyGlobalSingleWriterPlanValid(plan)) co_return;
+      GlobalSingleWriterMembershipProjection group;
+      if (thisBrain->desiredGlobalSingleWriterMembership(plan.config.deploymentID(),group) && group.protocolVersion != 0) {
+        if (!prodigyGlobalSingleWriterMembershipProjectionValid(group)) co_return;
         if (!onlyMeasure) {
-          // reconcileTruthPlacement() owns exact UUID/address construction and
+          // reconcileGlobalSingleWriterPlacement() owns exact UUID/address construction and
           // schedules it itself. Do not fall into generic architecting, which
           // would create unbound replicas or requeue this same dispatch.
-          (void)reconcileTruthPlacement(group);
+          (void)reconcileGlobalSingleWriterPlacement(group);
           co_return;
         }
         // Capacity reporting must test the assigned member endpoint, not an
@@ -10915,8 +10918,8 @@ public:
           if (existing != thisBrain->containers.end()) {
             ContainerView* container = existing->second;
             if (!container || container->deploymentID != plan.config.deploymentID() || container->shardGroup != 0 ||
-                (container->truthMemberID && container->truthMemberID != member.memberID) || container->machine == nullptr ||
-                (container->meshAddress != address && container->requiredTruthMeshAddress != address) ||
+                (container->globalSingleWriterMemberID && container->globalSingleWriterMemberID != member.memberID) || container->machine == nullptr ||
+                (container->meshAddress != address && container->requiredGlobalSingleWriterMeshAddress != address) ||
                 container->fragment != endpoint[15]) break;
             ++fitted;
             continue;
@@ -10943,6 +10946,7 @@ public:
         nDeployedBase = fitted;
         co_return;
       }
+      co_return;
     }
     if (plan.isStateful)
     {

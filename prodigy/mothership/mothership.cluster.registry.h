@@ -3796,24 +3796,94 @@ private:
   }
 
 public:
-  bool loadTruthGroup(MothershipTruthGroup& state, String* failure) {
-    String bytes;
-    if (!db.read(applicationPlacementsColumnFamily,"truth/global"_ctv,bytes,failure)) return false;
-    if (BitseryEngine::deserializeSafe(bytes,state) && mothershipTruthGroupValid(state)) return true;
-    if (failure) failure->assign("invalid durable Truth group"_ctv);
+  // A typed value envelope lets these groups share the placement column family
+  // with legacy application records and once-per-identity grants.
+  static constexpr auto globalSingleWriterGroupHeader = "PRODIGY-GLOBAL-SINGLE-WRITER-GROUP\n"_ctv;
+
+  bool loadGlobalSingleWriterGroup(uint128_t groupUUID, MothershipGlobalSingleWriterGroup& state, String* failure) {
+    state = {};
+    String key, bytes, reason;
+    key.snprintf<"global-single-writer/group/{}"_ctv>(groupUUID);
+    bool legacy = false;
+    if (!db.read(applicationPlacementsColumnFamily,key,bytes,&reason)) {
+      if (reason != "record not found"_ctv) { if (failure) *failure=reason; return false; }
+      if (!db.read(applicationPlacementsColumnFamily,"truth/global"_ctv,bytes,failure)) return false;
+      legacy = true;
+    }
+    if (!legacy) {
+      if (bytes.size() < globalSingleWriterGroupHeader.size() ||
+          std::memcmp(bytes.data(),globalSingleWriterGroupHeader.data(),globalSingleWriterGroupHeader.size()) != 0) {
+        if (failure) failure->assign("invalid durable global single-writer group envelope"_ctv);
+        return false;
+      }
+      bytes = bytes.substr(globalSingleWriterGroupHeader.size(),bytes.size()-globalSingleWriterGroupHeader.size(),Copy::yes);
+    }
+    if (!BitseryEngine::deserializeSafe(bytes,state) || !mothershipGlobalSingleWriterGroupValid(state)) {
+      if (failure) failure->assign("invalid durable global single-writer group"_ctv);
+      return false;
+    }
+    if (state.group.membershipUUID != groupUUID) {
+      if (failure) failure->assign(legacy ? "record not found" : "global single-writer group key mismatch");
+      state = {}; return false;
+    }
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool listGlobalSingleWriterGroups(Vector<MothershipGlobalSingleWriterGroup>& groups, String* failure) {
+    groups.clear(); Vector<String> values;
+    if (!db.listValues(applicationPlacementsColumnFamily,values,failure)) return false;
+    for (const auto& bytes : values) {
+      if (bytes.size() < globalSingleWriterGroupHeader.size() ||
+          std::memcmp(bytes.data(),globalSingleWriterGroupHeader.data(),globalSingleWriterGroupHeader.size()) != 0) continue;
+      String payload = bytes.substr(globalSingleWriterGroupHeader.size(),bytes.size()-globalSingleWriterGroupHeader.size(),Copy::yes);
+      MothershipGlobalSingleWriterGroup state;
+      if (!BitseryEngine::deserializeSafe(payload,state) || !mothershipGlobalSingleWriterGroupValid(state)) {
+        if (failure) failure->assign("invalid durable global single-writer group"_ctv); return false;
+      }
+      groups.push_back(std::move(state));
+    }
+    String bytes, reason;
+    if (db.read(applicationPlacementsColumnFamily,"truth/global"_ctv,bytes,&reason)) {
+      MothershipGlobalSingleWriterGroup legacy;
+      if (!BitseryEngine::deserializeSafe(bytes,legacy) || !mothershipGlobalSingleWriterGroupValid(legacy)) {
+        if (failure) failure->assign("invalid legacy Truth group"_ctv); return false;
+      }
+      // Saving a legacy group creates its typed record. That newer record is
+      // authoritative; retaining the old key preserves migration crash safety.
+      if (std::none_of(groups.begin(),groups.end(),[&](const auto& group) {
+        return group.group.membershipUUID == legacy.group.membershipUUID;
+      })) groups.push_back(std::move(legacy));
+    } else if (reason != "record not found"_ctv) { if (failure) *failure=reason; return false; }
+    for (size_t i=0;i<groups.size();++i) for (size_t j=i+1;j<groups.size();++j)
+      if (groups[i].group.membershipUUID == groups[j].group.membershipUUID ||
+          groups[i].group.deploymentID == groups[j].group.deploymentID) {
+        if (failure) failure->assign("conflicting durable global single-writer groups"_ctv); return false;
+      }
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool findGlobalSingleWriterGroupForDeployment(uint64_t deploymentID, MothershipGlobalSingleWriterGroup& state, String* failure) {
+    state = {}; Vector<MothershipGlobalSingleWriterGroup> groups;
+    if (!listGlobalSingleWriterGroups(groups,failure)) return false;
+    for (auto& group : groups) if (group.group.deploymentID == deploymentID) {
+      state=std::move(group); if (failure) failure->clear(); return true;
+    }
+    if (failure) failure->assign("record not found"_ctv);
     return false;
   }
 
-  bool saveTruthGroup(uint64_t expectedRevision, MothershipTruthGroup& state, String* failure) {
+  bool saveGlobalSingleWriterGroup(uint64_t expectedRevision, MothershipGlobalSingleWriterGroup& state, String* failure) {
     G6OperationLock lock;
     if (!lockG6Operations(lock,failure) || expectedRevision == UINT64_MAX) return false;
-    MothershipTruthGroup previous{};
+    MothershipGlobalSingleWriterGroup previous{};
     String reason;
-    if (loadTruthGroup(previous,&reason)) {
+    if (loadGlobalSingleWriterGroup(state.group.membershipUUID,previous,&reason)) {
       if (!expectedRevision || previous.revision != expectedRevision ||
           previous.group.membershipUUID != state.group.membershipUUID ||
           previous.sites != state.sites || previous.graceMs != state.graceMs ||
-          !prodigyTruthMembershipSuccessor(previous.group,state.group)) {
+          !prodigyGlobalSingleWriterMembershipSuccessor(previous.group,state.group)) {
         if (failure) failure->assign("Truth registry revision or group binding changed"_ctv);
         return false;
       }
@@ -3828,32 +3898,43 @@ public:
     } else {
       if (expectedRevision || reason != "record not found"_ctv) { if (failure) *failure = reason; return false; }
       MothershipApplicationPlacement legacy{};
-      if (loadApplicationPlacement(10,legacy,&reason) || reason != "record not found"_ctv) {
+      if (uint16_t(state.group.deploymentID >> 48) == 10 &&
+          (loadApplicationPlacement(10,legacy,&reason) || reason != "record not found"_ctv)) {
         if (failure) failure->assign("existing Truth writer placement must be fenced before genesis"_ctv);
         return false;
       }
     }
+    Vector<MothershipGlobalSingleWriterGroup> groups;
+    if (!listGlobalSingleWriterGroups(groups,failure)) return false;
+    for (const auto& existing : groups)
+      if (existing.group.deploymentID == state.group.deploymentID && existing.group.membershipUUID != state.group.membershipUUID) {
+        if (failure) failure->assign("deployment already belongs to another global single-writer group"_ctv);
+        return false;
+      }
     auto next = state;
     next.revision = expectedRevision + 1;
-    String bytes;
-    if (!mothershipTruthGroupValid(next) || !BitseryEngine::serialize(bytes,next) ||
-        !db.write(applicationPlacementsColumnFamily,"truth/global"_ctv,bytes,failure)) return false;
+    String payload, bytes, key;
+    key.snprintf<"global-single-writer/group/{}"_ctv>(next.group.membershipUUID);
+    if (!mothershipGlobalSingleWriterGroupValid(next) || !BitseryEngine::serialize(payload,next)) return false;
+    bytes.assign(globalSingleWriterGroupHeader); bytes.append(payload);
+    if (!db.write(applicationPlacementsColumnFamily,key,bytes,failure)) return false;
     state = std::move(next);
     return true;
   }
 
-  bool recordTruthGrantBeforeDispatch(const MothershipTruthGrant& grant, String* failure) {
+  bool recordGlobalSingleWriterGrantBeforeDispatch(const MothershipGlobalSingleWriterGrant& grant, String* failure) {
     if (!grant.membershipUUID || !grant.operationUUID || !grant.containerUUID || !grant.localClusterUUID ||
-        !grant.bootNonce || grant.memberID <= 0 || uint16_t(grant.deploymentID >> 48) != 10) return false;
+        !grant.bootNonce || grant.memberID <= 0 || !uint16_t(grant.deploymentID >> 48) || !(grant.deploymentID & 0xFFFFFFFFFFFFULL)) return false;
     G6OperationLock lock;
     if (!lockG6Operations(lock,failure)) return false;
-    MothershipTruthGroup stored;
-    if (!loadTruthGroup(stored,failure) || stored.group.membershipUUID != grant.membershipUUID ||
+    MothershipGlobalSingleWriterGroup stored;
+    if (!loadGlobalSingleWriterGroup(grant.membershipUUID,stored,failure) || stored.group.membershipUUID != grant.membershipUUID ||
         stored.group.operationUUID != grant.operationUUID || stored.group.deploymentID != grant.deploymentID ||
         std::none_of(stored.group.members.begin(),stored.group.members.end(),[&](const auto& m) {
           return m.memberID == grant.memberID && m.clusterUUID == grant.localClusterUUID && m.containerUUID == grant.containerUUID;
         })) return false;
     String key, bytes, prior, reason;
+    // Retain the existing grant key so migration cannot reprovision an identity.
     key.snprintf<"truth/grant/{}/{}"_ctv>(grant.membershipUUID,uint32_t(grant.memberID));
     auto copy = grant;
     if (!BitseryEngine::serialize(bytes,copy)) return false;
@@ -6062,9 +6143,11 @@ public:
     G6OperationLock lock;
     if (!lockG6Operations(lock, failure)) return false;
     if (applicationID == 10) {
-      MothershipTruthGroup global; String globalFailure;
-      if (loadTruthGroup(global, &globalFailure)) { if (failure) failure->assign("global Truth group fences legacy admission"_ctv); return false; }
-      if (globalFailure != "record not found"_ctv) { if (failure) *failure = globalFailure; return false; }
+      Vector<MothershipGlobalSingleWriterGroup> groups;
+      if (!listGlobalSingleWriterGroups(groups,failure)) return false;
+      for (const auto& global : groups) if (uint16_t(global.group.deploymentID >> 48) == 10) {
+        if (failure) failure->assign("global Truth group fences legacy admission"_ctv); return false;
+      }
     }
     String readFailure;
     if (loadApplicationPlacement(applicationID, placement, &readFailure)) {

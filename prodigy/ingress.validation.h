@@ -277,9 +277,9 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
 
   switch (MothershipTopic(rawTopic))
   {
-    case MothershipTopic::commitTruthGlobalMembership:
-    case MothershipTopic::truthPlacement:
-    case MothershipTopic::truthGlobalControl:
+    case MothershipTopic::commitGlobalSingleWriterMembership:
+    case MothershipTopic::globalSingleWriterPlacement:
+    case MothershipTopic::globalSingleWriterControl:
       return consumeVariableBounded(cursor, terminal, 16 * 1024) && cursor == terminal;
     case MothershipTopic::statefulDataAuthority:
       return consumeVariableBounded(cursor, terminal, 2 * 1024 * 1024) &&
@@ -772,7 +772,7 @@ static bool validateNeuronPayloadForBrain(uint16_t rawTopic, uint8_t *args, uint
 
   switch (NeuronTopic(rawTopic))
   {
-    case NeuronTopic::truthGlobalControl:
+    case NeuronTopic::globalSingleWriterControl:
       return consumeVariableBounded(cursor, terminal, 16 * 1024) && cursor == terminal;
     case NeuronTopic::nametagQualificationMachineBoot:
       return consumeVariableBounded(cursor, terminal, 1024) && cursor == terminal;
@@ -1083,7 +1083,7 @@ static bool validateNeuronPayloadForNeuron(uint16_t rawTopic, uint8_t *args, uin
 
   switch (NeuronTopic(rawTopic))
   {
-    case NeuronTopic::truthGlobalControl:
+    case NeuronTopic::globalSingleWriterControl:
       {
         uint128_t containerUUID = 0;
         return extractFixed(cursor, terminal, containerUUID) && containerUUID != 0 &&
@@ -1484,7 +1484,7 @@ static bool validateContainerPayloadForNeuron(uint16_t rawTopic, uint8_t *args, 
 
   switch (ContainerTopic(rawTopic))
   {
-    case ContainerTopic::truthGlobalControl:
+    case ContainerTopic::globalSingleWriterControl:
       return consumeVariableBounded(cursor, terminal, 16 * 1024) && cursor == terminal;
     case ContainerTopic::nametagQualificationCousinTransport:
     case ContainerTopic::nametagQualificationReplay:
@@ -1557,7 +1557,7 @@ static bool validateContainerPayloadForHub(uint16_t rawTopic, uint8_t *args, uin
 
   switch (ContainerTopic(rawTopic))
   {
-    case ContainerTopic::truthGlobalControl:
+    case ContainerTopic::globalSingleWriterControl:
       return consumeVariableBounded(cursor, terminal, 16 * 1024) && cursor == terminal;
     case ContainerTopic::nametagQualificationCousinTransport:
     case ContainerTopic::nametagQualificationReplay:

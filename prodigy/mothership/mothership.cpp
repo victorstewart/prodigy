@@ -10499,8 +10499,25 @@ private:
     return true;
   }
 
+  bool requireGlobalSingleWriterControlVersion(String& failure)
+  {
+    Message::construct(socket.wBuffer,MothershipTopic::pullClusterReport);
+    if (!socket.send()) { failure=socket.ioFailureDetail(); socket.close(); return false; }
+    auto* response=socket.recvExpectedTopic(MothershipTopic::pullClusterReport,1024);
+    String bytes; ClusterStatusReport report;
+    if (response) {
+      auto* args=response->args;
+      Message::extractToStringView(args,bytes);
+      if (args==response->terminal() && BitseryEngine::deserializeSafe(bytes,report) &&
+          mothershipGlobalSingleWriterControlVersionSupported(report)) return true;
+    }
+    failure.assign("global single-writer requires an authenticated current master running Prodigy 67 or newer"_ctv);
+    socket.close(); return false;
+  }
+
   template <typename Request, typename Response>
-  bool requestTopicRoundTrip(MothershipTopic topic, const Request& request, Response& response, String& failure)
+  bool requestTopicRoundTrip(MothershipTopic topic, const Request& request, Response& response, String& failure,
+                            bool requireGlobalSingleWriter = false)
   {
     response = {};
     String topicName = {};
@@ -10518,6 +10535,8 @@ private:
       }
       return false;
     }
+
+    if (requireGlobalSingleWriter && !requireGlobalSingleWriterControlVersion(failure)) return false;
 
     String serializedRequest = {};
     Request requestCopy = request;
@@ -23674,23 +23693,23 @@ LOCAL_RUNTIME
   bool admitTruthDeploymentPlacement(const DeploymentPlan& plan, String& failure)
   {
     const uint16_t applicationID = plan.config.applicationID;
-    if (!mothershipApplicationPlacementRequired(applicationID)) return true;
-    if (applicationID == 10) {
-      MothershipTruthGroup state;
-      String reason;
-      const bool managed = [&] {
-        auto registry = openClusterRegistry();
-        return registry.loadTruthGroup(state, &reason);
-      }();
-      if (managed) {
-        const auto site = socket.configuredClusterUUID();
-        if (state.group.deploymentID == plan.config.deploymentID() && plan.isStateful &&
-            std::any_of(state.group.members.begin(),state.group.members.end(),[&](const auto& m){return m.clusterUUID==site;})) return projectTruth(state, site, failure);
-        failure.assign("Truth deployment conflicts with the global membership"_ctv);
-        return false;
-      }
-      if (reason != "record not found"_ctv) { failure=reason; return false; }
+    MothershipGlobalSingleWriterGroup state; String reason;
+    const bool managed = [&] {
+      auto registry = openClusterRegistry();
+      return registry.findGlobalSingleWriterGroupForDeployment(plan.config.deploymentID(),state,&reason);
+    }();
+    if (managed) {
+      const auto site = socket.configuredClusterUUID();
+      if (mothershipGlobalSingleWriterDeploymentMatches(state,plan,site)) return projectGlobalSingleWriter(state,site,failure);
+      failure.assign("deployment must explicitly select its admitted global single-writer mode and site"_ctv);
+      return false;
     }
+    if (reason != "record not found"_ctv) { failure=reason; return false; }
+    if (plan.stateful.globalSingleWriter) {
+      failure.assign("global single-writer deployment requires an admitted group before dispatch"_ctv);
+      return false;
+    }
+    if (!mothershipApplicationPlacementRequired(applicationID)) return true;
     const bool graph = applicationID == 2 || applicationID == 5;
     const bool graphReplica = prodigyGraphDeploymentPlanCanonical(plan, true);
     if (graph && !graphReplica && !prodigyGraphDeploymentPlanCanonical(plan, false)) {
@@ -23910,6 +23929,8 @@ LOCAL_RUNTIME
       if (result.failure.empty()) result.failure.assign("failed to connect to deployment control target"_ctv);
       return false;
     }
+
+    if (plan.stateful.globalSingleWriter && !requireGlobalSingleWriterControlVersion(result.failure)) return false;
 
     debugLog("socket_connected");
     socket.wBuffer.reserve(socket.wBuffer.size() + 1024);
@@ -25472,6 +25493,15 @@ LOCAL_RUNTIME
             (void)subfield.value.get(b);
             plan.stateful.neverShard = b;
           }
+          else if (key.equal("globalSingleWriter"_ctv))
+          {
+            if (subfield.value.type() != simdjson::dom::element_type::BOOL)
+            {
+              deploymentFailure.assign("stateful.globalSingleWriter requires a bool"_ctv);
+              return false;
+            }
+            (void)subfield.value.get(plan.stateful.globalSingleWriter);
+          }
           else if (key.equal("allMasters"_ctv))
           {
             if (subfield.value.type() != simdjson::dom::element_type::BOOL)
@@ -26858,6 +26888,10 @@ LOCAL_RUNTIME
       }
     }
 
+    if (plan.stateful.globalSingleWriter && !prodigyGlobalSingleWriterPlanValid(plan)) {
+      deploymentFailure.assign("globalSingleWriter requires a stateful unsharded single-writer plan with distinct mesh roles and no hostnet or horizontal scalers"_ctv);
+      return false;
+    }
     if (plan.stateful.clientPrefix == 0 && (plan.isStateful || statefulClientPrefixPresent) &&
         !prodigyGraphDeploymentPlanCanonical(plan, true)) {
       deploymentFailure.assign("only the canonical non-client graph replica may omit writer authority"_ctv);
@@ -38992,8 +39026,8 @@ public:
         {"captureBrainStateLocal",          &Mothership::runCaptureBrainStateLocal         },
         {"checkClusterProviderPlan",        &Mothership::runCheckClusterProviderPlan       },
         {"clusterReport",                   &Mothership::runClusterReport                  },
+        {"configureGlobalSingleWriterGroup",             &Mothership::configureGlobalSingleWriterGroup                },
         {"configureLocalVMClusterLANIPv6",  &Mothership::runConfigureLocalVMClusterLANIPv6 },
-        {"configureTruthGroup",             &Mothership::configureTruthGroup                },
         {"containerLogs",                   &Mothership::runContainerLogs                  },
         {"cousinPermission",                &Mothership::runCousinPermission               },
         {"cousinRoute",                     &Mothership::runCousinRoute                    },
@@ -39016,6 +39050,7 @@ public:
         {"faultRemoteCloudMachine",         &Mothership::runFaultRemoteCloudMachine        },
         {"faultTestCluster",                &Mothership::runFaultTestCluster               },
         {"faultTestClusters",               &Mothership::runFaultTestClusters              },
+        {"globalSingleWriterControl",              &Mothership::runGlobalSingleWriterControl              },
         {"growContainerPool",              &Mothership::runGrowContainerPool              },
         {"inspectLocalVMBoundaries",        &Mothership::runInspectLocalVMBoundaries       },
         {"inspectUpgradeBundle",            &Mothership::runInspectUpgradeBundle           },
@@ -39051,7 +39086,7 @@ public:
         {"pullRoutableSubnets",             &Mothership::runPullRoutableSubnets            },
         {"rearmRetainedStatefulDeployment", &Mothership::runRearmRetainedStatefulDeployment},
         {"recommendClusterForApplications", &Mothership::runRecommendClusterForApplications},
-        {"reconcileTruth",                 &Mothership::runReconcileTruth                 },
+        {"reconcileGlobalSingleWriter",                 &Mothership::runReconcileGlobalSingleWriter                 },
         {"recoverLocalClusterAuthority",    &Mothership::runRecoverLocalClusterAuthority   },
         {"recoverMaterializedStatefulDeployment", &Mothership::runRecoverMaterializedStatefulDeployment },
         {"recoverRemoteClusterRuntime", &Mothership::runRecoverRemoteClusterRuntime},
@@ -39085,7 +39120,6 @@ public:
         {"taskReport",                      &Mothership::runTaskReport                     },
         {"testClusterPairControl",          &Mothership::runTestClusterPairControl         },
         {"transportCredentialLifecycle",    &Mothership::runTransportCredentialLifecycle   },
-        {"truthGlobalControl",              &Mothership::runTruthGlobalControl              },
         {"unregisterRoutableSubnet",        &Mothership::runUnregisterRoutableSubnet       },
         {"updateAdoptedMachineRacks",       &Mothership::runUpdateAdoptedMachineRacks      },
         {"updateProdigy",                   &Mothership::runUpdateProdigy                  },
@@ -39164,9 +39198,9 @@ int main(int argc, char *argv[])
     message.append("\tjournals and launches the exact remote all-masters cohorts with native client access fenced until their retained source cut is applied\n");
     message.append("observeStatefulStoreSourceCut [cluster] [Hot deploymentID] [containerUUID] [operationUUID] [shardGroup] [shardCount]\n");
     message.append("\tcaptures, freshly queries, and releases one exact healthy Hot native source-cut proof; it does not deploy, reseed, reset, or alter serving state\n");
-    message.append("configureTruthGroup GROUP OPERATION DEPLOYMENT GRACE_MS CLUSTER [CLUSTER [CLUSTER]]\n");
-    message.append("truthGlobalControl GROUP inspect|provisionOnce MEMBER\n");
-    message.append("reconcileTruth GROUP [--watch]\n");
+    message.append("configureGlobalSingleWriterGroup GROUP OPERATION DEPLOYMENT GRACE_MS CLUSTER [CLUSTER [CLUSTER]]\n");
+    message.append("globalSingleWriterControl GROUP inspect|provisionOnce MEMBER\n");
+    message.append("reconcileGlobalSingleWriter GROUP [--watch]\n");
     message.append("configureLocalVMClusterLANIPv6 [cluster]\n");
     message.append("\tconfigures one deterministic private IPv6 /64 on the exact three sealed local-VM cluster LAN owners without changing their QEMU or WAN boundaries\n");
     message.append("createProviderCredential [json|-|@path]\n");

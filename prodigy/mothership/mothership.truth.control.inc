@@ -1,84 +1,84 @@
 // Included in Mothership beside the deployment commands so every exchange
 // uses its authenticated cluster socket and its exclusive durable registry.
 template<class Request, class Response>
-bool truthExchange(MothershipTopic topic, uint128_t site, const Request& source, Response& response, String& failure) {
+bool globalSingleWriterExchange(MothershipTopic topic, uint128_t site, const Request& source, Response& response, String& failure) {
   String name;
   name.assignItoh(site);
-  return configureControlTarget(name.c_str(), &failure) && requestTopicRoundTrip(topic, source, response, failure);
+  return configureControlTarget(name.c_str(), &failure) && requestTopicRoundTrip(topic, source, response, failure, true);
 }
 
-bool truthControl(const ProdigyTruthGlobalControl& q, ProdigyTruthGlobalControl& r, String& failure) {
-  return prodigyTruthControlRequestValid(q) && truthExchange(MothershipTopic::truthGlobalControl,q.localClusterUUID,q,r,failure) &&
-      prodigyTruthControlReportValid(r) && r.membershipUUID == q.membershipUUID && r.deploymentID == q.deploymentID &&
+bool globalSingleWriterControl(const ProdigyGlobalSingleWriterControl& q, ProdigyGlobalSingleWriterControl& r, String& failure) {
+  return prodigyGlobalSingleWriterControlRequestValid(q) && globalSingleWriterExchange(MothershipTopic::globalSingleWriterControl,q.localClusterUUID,q,r,failure) &&
+      prodigyGlobalSingleWriterControlReportValid(r) && r.membershipUUID == q.membershipUUID && r.deploymentID == q.deploymentID &&
       r.operationUUID == q.operationUUID && r.localClusterUUID == q.localClusterUUID && r.containerUUID == q.containerUUID &&
       r.memberID == q.memberID && r.action == q.action && r.targetMemberID == q.targetMemberID &&
       (!q.generation || q.generation == r.generation) && (!q.bootNonce || q.bootNonce == r.bootNonce) &&
       q.expectedCommittedConfigIndex == r.expectedCommittedConfigIndex && q.expectedCommittedConfigSHA256 == r.expectedCommittedConfigSHA256;
 }
 
-static ProdigyTruthGlobalControl memberCommand(const MothershipTruthGroup& state, const TruthGlobalMember& m) {
-  ProdigyTruthGlobalControl q{};
+static ProdigyGlobalSingleWriterControl memberCommand(const MothershipGlobalSingleWriterGroup& state, const GlobalSingleWriterMember& m) {
+  ProdigyGlobalSingleWriterControl q{};
   q.membershipUUID = state.group.membershipUUID; q.operationUUID = state.group.operationUUID;
   q.localClusterUUID = m.clusterUUID; q.containerUUID = m.containerUUID; q.memberID = m.memberID;
   q.deploymentID = state.group.deploymentID; q.generation = state.group.generation;
   return q;
 }
 
-bool provisionTruth(const MothershipTruthGroup& state, const TruthGlobalMember& m,
-                    const ProdigyTruthGlobalControl& inspected, String& failure) {
+bool provisionGlobalSingleWriter(const MothershipGlobalSingleWriterGroup& state, const GlobalSingleWriterMember& m,
+                    const ProdigyGlobalSingleWriterControl& inspected, String& failure) {
   if (inspected.provisioned) return true;
   auto q = memberCommand(state,m);
-  q.action = TruthControlAction::provisionOnce;
+  q.action = GlobalSingleWriterControlAction::provisionOnce;
   q.bootNonce = inspected.bootNonce;
-  MothershipTruthGrant grant;
+  MothershipGlobalSingleWriterGrant grant;
   grant.membershipUUID=q.membershipUUID; grant.operationUUID=q.operationUUID; grant.localClusterUUID=q.localClusterUUID;
   grant.containerUUID=q.containerUUID; grant.bootNonce=q.bootNonce; grant.deploymentID=q.deploymentID; grant.memberID=q.memberID;
-  { auto registry=openClusterRegistry(); if (!registry.recordTruthGrantBeforeDispatch(grant,&failure)) return false; }
-  ProdigyTruthGlobalControl reply{};
-  return truthControl(q,reply,failure) && reply.provisioned;
+  { auto registry=openClusterRegistry(); if (!registry.recordGlobalSingleWriterGrantBeforeDispatch(grant,&failure)) return false; }
+  ProdigyGlobalSingleWriterControl reply{};
+  return globalSingleWriterControl(q,reply,failure) && reply.provisioned;
 }
 
-bool offerTruthMember(const MothershipTruthGroup& state, int32_t id, uint128_t site, TruthGlobalMemberRole role,
-                      TruthGlobalMember& result, String& failure) {
-  ProdigyTruthPlacementExchange q{}, r{};
+bool offerGlobalSingleWriterMember(const MothershipGlobalSingleWriterGroup& state, int32_t id, uint128_t site, GlobalSingleWriterMemberRole role,
+                      GlobalSingleWriterMember& result, String& failure) {
+  ProdigyGlobalSingleWriterPlacementExchange q{}, r{};
   q.membershipUUID=state.group.membershipUUID; q.deploymentID=state.group.deploymentID; q.localClusterUUID=site;
   q.member.memberID=id; q.member.clusterUUID=site; q.member.role=role;
   q.member.containerUUID=Random::generateNumberWithNBits<128,uint128_t>(); q.reserved=state.group.members;
-  if (!truthExchange(MothershipTopic::truthPlacement,site,q,r,failure) || r.member.memberID!=id ||
+  if (!globalSingleWriterExchange(MothershipTopic::globalSingleWriterPlacement,site,q,r,failure) || r.member.memberID!=id ||
       r.member.clusterUUID!=site || q.member.containerUUID!=r.member.containerUUID || !r.member.privateIPv6.is6 ||
       r.member.privateIPv6.isNull() || r.member.role!=role) return false;
   result = r.member; return true;
 }
 
-bool projectTruth(const MothershipTruthGroup& state, uint128_t site, String& failure) {
+bool projectGlobalSingleWriter(const MothershipGlobalSingleWriterGroup& state, uint128_t site, String& failure) {
   auto group=state.group; group.localClusterUUID=site;
-  CommitTruthGlobalMembershipResponse reply{};
-  if (!truthExchange(MothershipTopic::commitTruthGlobalMembership,site,group,reply,failure) || !reply.durableGeneration) return false;
+  CommitGlobalSingleWriterMembershipResponse reply{};
+  if (!globalSingleWriterExchange(MothershipTopic::commitGlobalSingleWriterMembership,site,group,reply,failure) || !reply.durableGeneration) return false;
   String wanted,received;
   return BitseryEngine::serialize(wanted,group) && BitseryEngine::serialize(received,reply.projection) && wanted==received;
 }
 
-bool truthPlacement(const MothershipTruthGroup& state,uint128_t site,const TruthGlobalMember* retired,String& failure) {
-  ProdigyTruthPlacementExchange q{},r{};
-  q.action=retired ? TruthPlacementAction::retire : TruthPlacementAction::reconcile;
+bool globalSingleWriterPlacement(const MothershipGlobalSingleWriterGroup& state,uint128_t site,const GlobalSingleWriterMember* retired,String& failure) {
+  ProdigyGlobalSingleWriterPlacementExchange q{},r{};
+  q.action=retired ? GlobalSingleWriterPlacementAction::retire : GlobalSingleWriterPlacementAction::reconcile;
   q.membershipUUID=state.group.membershipUUID; q.localClusterUUID=site; q.deploymentID=state.group.deploymentID;
   q.generation=state.group.generation; q.committedConfigIndex=state.group.expectedCommittedConfigIndex;
   q.committedConfigSHA256=state.group.expectedCommittedConfigSHA256;
   if (retired) q.member=*retired;
-  return truthExchange(MothershipTopic::truthPlacement,site,q,r,failure);
+  return globalSingleWriterExchange(MothershipTopic::globalSingleWriterPlacement,site,q,r,failure);
 }
 
-static bool truthHex(const char* raw,uint128_t& out) {
+static bool globalSingleWriterHex(const char* raw,uint128_t& out) {
   String text; text.setInvariant(raw); return prodigyParseCanonicalHex128(text,out) && out;
 }
 
-void configureTruthGroup(int argc,char** argv) {
-  MothershipTruthGroup state{};
+void configureGlobalSingleWriterGroup(int argc,char** argv) {
+  MothershipGlobalSingleWriterGroup state{};
   auto& g=state.group;
-  if (argc < 5 || argc > 7 || !truthHex(argv[0],g.membershipUUID) || !truthHex(argv[1],g.operationUUID) ||
-      !mothershipParseUnsignedArgument(argv[2],UINT64_MAX,g.deploymentID) || uint16_t(g.deploymentID>>48)!=10 ||
+  if (argc < 5 || argc > 7 || !globalSingleWriterHex(argv[0],g.membershipUUID) || !globalSingleWriterHex(argv[1],g.operationUUID) ||
+      !mothershipParseUnsignedArgument(argv[2],UINT64_MAX,g.deploymentID) || (!uint16_t(g.deploymentID>>48) || !(g.deploymentID & 0xFFFFFFFFFFFFULL)) ||
       !mothershipParseUnsignedArgument(argv[3],UINT64_MAX,state.graceMs) || !state.graceMs) {
-    basics_log("usage: configureTruthGroup GROUP OPERATION DEPLOYMENT GRACE_MS CLUSTER [CLUSTER [CLUSTER]]\n"); exit(EXIT_FAILURE);
+    basics_log("usage: configureGlobalSingleWriterGroup GROUP OPERATION DEPLOYMENT GRACE_MS CLUSTER [CLUSTER [CLUSTER]]\n"); exit(EXIT_FAILURE);
   }
   String failure;
   for (int i=4;i<argc;++i) {
@@ -89,59 +89,60 @@ void configureTruthGroup(int argc,char** argv) {
   if (std::adjacent_find(state.sites.begin(),state.sites.end())!=state.sites.end()) exit(EXIT_FAILURE);
   bool resumed=false;
   Vector<MothershipProdigyCluster> inventory;
-  { auto registry=openClusterRegistry(); MothershipTruthGroup saved;
-    if (registry.loadTruthGroup(saved,&failure)) {
+  { auto registry=openClusterRegistry(); MothershipGlobalSingleWriterGroup saved;
+    if (registry.loadGlobalSingleWriterGroup(g.membershipUUID,saved,&failure)) {
       if (saved.group.membershipUUID!=g.membershipUUID || saved.group.operationUUID!=g.operationUUID ||
           saved.group.deploymentID!=g.deploymentID || saved.graceMs!=state.graceMs || saved.sites!=state.sites) exit(EXIT_FAILURE);
       state=std::move(saved); resumed=true;
     } else if (failure!="record not found"_ctv || !registry.listClusters(inventory,&failure)) exit(EXIT_FAILURE);
   }
   if (!resumed) {
-    // Initial genesis may not run alongside a retained singleton or a second
-    // independently created group. Require fresh observations of the registry.
+    // Initial genesis must not reuse a live deployment identity. Other
+    // applications and deployments retain their independent groups.
     for (const auto& site:inventory) {
       ClusterStatusReport report;
       if (!readManagedClusterStatus(site,report,failure)) exit(EXIT_FAILURE);
-      for (const auto& app:report.applicationReports) if (app.applicationID==10 && !app.deploymentReports.empty()) {
-        basics_log("existing Truth deployment must be fenced before genesis\n"); exit(EXIT_FAILURE);
+      for (const auto& app:report.applicationReports) for (const auto& deployment:app.deploymentReports)
+        if (((uint64_t(app.applicationID) << 48) | deployment.versionID) == g.deploymentID) {
+        basics_log("existing deployment must be fenced before global single-writer genesis\n"); exit(EXIT_FAILURE);
       }
     }
     g.genesisMemberIDs={1,2,3}; g.highestAllocatedMemberID=3; g.localClusterUUID=state.sites.front();
     g.expectedCommittedConfigIndex=1; g.generation=1;
-    const auto sites=ProdigyTruthPlacement::initial({state.sites.begin(),state.sites.end()});
+    const auto sites=ProdigyGlobalSingleWriterPlacement::initial({state.sites.begin(),state.sites.end()});
     for (int i=0;i<3;++i) {
-      TruthGlobalMember m;
-      if (!offerTruthMember(state,i+1,sites[i],TruthGlobalMemberRole::voter,m,failure)) exit(EXIT_FAILURE);
+      GlobalSingleWriterMember m;
+      if (!offerGlobalSingleWriterMember(state,i+1,sites[i],GlobalSingleWriterMemberRole::voter,m,failure)) exit(EXIT_FAILURE);
       g.members.push_back(m);
     }
-    if (!prodigyTruthCommittedConfigDigest(g.membershipUUID,g.deploymentID,1,g.members,g.expectedCommittedConfigSHA256)) exit(EXIT_FAILURE);
-    auto registry=openClusterRegistry(); if (!registry.saveTruthGroup(0,state,&failure)) exit(EXIT_FAILURE);
+    if (!prodigyGlobalSingleWriterCommittedConfigDigest(g.membershipUUID,g.deploymentID,1,g.members,g.expectedCommittedConfigSHA256)) exit(EXIT_FAILURE);
+    auto registry=openClusterRegistry(); if (!registry.saveGlobalSingleWriterGroup(0,state,&failure)) exit(EXIT_FAILURE);
   }
-  for (const auto site:state.sites) if (!projectTruth(state,site,failure)) { basics_log("Truth projection failed: %s\n",failure.c_str()); exit(EXIT_FAILURE); }
-  basics_log("configureTruthGroup success=1 voters=3 sites=%u resumed=%d\n",unsigned(state.sites.size()),int(resumed));
+  for (const auto site:state.sites) if (!projectGlobalSingleWriter(state,site,failure)) { basics_log("global single-writer projection failed: %s\n",failure.c_str()); exit(EXIT_FAILURE); }
+  basics_log("configureGlobalSingleWriterGroup success=1 voters=3 sites=%u resumed=%d\n",unsigned(state.sites.size()),int(resumed));
 }
 
-void runTruthGlobalControl(int argc,char** argv) {
+void runGlobalSingleWriterControl(int argc,char** argv) {
   uint128_t groupID=0;
   uint64_t member=0;
-  if (argc!=3 || !truthHex(argv[0],groupID) || !mothershipParseUnsignedArgument(argv[2],INT32_MAX,member) || !member) {
-    basics_log("usage: truthGlobalControl GROUP inspect|provisionOnce MEMBER\n"); exit(EXIT_FAILURE);
+  if (argc!=3 || !globalSingleWriterHex(argv[0],groupID) || !mothershipParseUnsignedArgument(argv[2],INT32_MAX,member) || !member) {
+    basics_log("usage: globalSingleWriterControl GROUP inspect|provisionOnce MEMBER\n"); exit(EXIT_FAILURE);
   }
-  MothershipTruthGroup state; String failure;
-  { auto registry=openClusterRegistry(); if (!registry.loadTruthGroup(state,&failure) || state.group.membershipUUID!=groupID) exit(EXIT_FAILURE); }
+  MothershipGlobalSingleWriterGroup state; String failure;
+  { auto registry=openClusterRegistry(); if (!registry.loadGlobalSingleWriterGroup(groupID,state,&failure)) exit(EXIT_FAILURE); }
   auto m=std::find_if(state.group.members.begin(),state.group.members.end(),[&](const auto& m){return m.memberID==int32_t(member);});
   if (m==state.group.members.end()) exit(EXIT_FAILURE);
-  ProdigyTruthGlobalControl report{};
-  if (!truthControl(memberCommand(state,*m),report,failure)) { basics_log("Truth inspect failed: %s\n",failure.c_str()); exit(EXIT_FAILURE); }
+  ProdigyGlobalSingleWriterControl report{};
+  if (!globalSingleWriterControl(memberCommand(state,*m),report,failure)) { basics_log("global single-writer inspect failed: %s\n",failure.c_str()); exit(EXIT_FAILURE); }
   if (!std::strcmp(argv[1],"provisionOnce")) {
-    if (!provisionTruth(state,*m,report,failure) || !truthControl(memberCommand(state,*m),report,failure)) exit(EXIT_FAILURE);
+    if (!provisionGlobalSingleWriter(state,*m,report,failure) || !globalSingleWriterControl(memberCommand(state,*m),report,failure)) exit(EXIT_FAILURE);
   } else if (std::strcmp(argv[1],"inspect")) exit(EXIT_FAILURE);
-  basics_log("truthGlobalControl success=1 member=%d provisioned=%d leader=%d term=%llu config=%llu applied=%llu digest=%s\n",
+  basics_log("globalSingleWriterControl success=1 member=%d provisioned=%d leader=%d term=%llu config=%llu applied=%llu digest=%s\n",
       m->memberID,int(report.provisioned),report.leaderMemberID,(unsigned long long)report.term,
       (unsigned long long)report.committedConfigIndex,(unsigned long long)report.appliedIndex,report.committedConfigSHA256.c_str());
   for (const auto& member : report.members) {
-    basics_log("truthCommittedMember member=%d role=%s cluster=%016llx%016llx container=%016llx%016llx reachable=%u caughtUp=%u\n",
-        member.memberID, member.role == TruthGlobalMemberRole::voter ? "voter" : "learner",
+    basics_log("globalSingleWriterCommittedMember member=%d role=%s cluster=%016llx%016llx container=%016llx%016llx reachable=%u caughtUp=%u\n",
+        member.memberID, member.role == GlobalSingleWriterMemberRole::voter ? "voter" : "learner",
         (unsigned long long)(member.clusterUUID >> 64), (unsigned long long)member.clusterUUID,
         (unsigned long long)(member.containerUUID >> 64), (unsigned long long)member.containerUUID,
         unsigned(std::binary_search(report.reachableMemberIDs.begin(), report.reachableMemberIDs.end(), member.memberID)),
@@ -149,40 +150,40 @@ void runTruthGlobalControl(int argc,char** argv) {
   }
 }
 
-bool reconcileTruthOnce(MothershipTruthGroup state, String& failure) {
-  auto save = [&]() { auto registry=openClusterRegistry(); return registry.saveTruthGroup(state.revision,state,&failure); };
+bool reconcileGlobalSingleWriterOnce(MothershipGlobalSingleWriterGroup state, String& failure) {
+  auto save = [&]() { auto registry=openClusterRegistry(); return registry.saveGlobalSingleWriterGroup(state.revision,state,&failure); };
   auto& g=state.group;
   // An unreachable site cannot veto an existing majority. A projection is
   // replayed to that site before it is considered for any further action.
   std::vector<uint128_t> eligible;
   for (auto site:state.sites) {
     String unavailable;
-    if (projectTruth(state,site,unavailable)) {
+    if (projectGlobalSingleWriter(state,site,unavailable)) {
       eligible.push_back(site);
-      (void)truthPlacement(state,site,nullptr,unavailable);
+      (void)globalSingleWriterPlacement(state,site,nullptr,unavailable);
     }
   }
-  std::vector<ProdigyTruthGlobalControl> reports;
+  std::vector<ProdigyGlobalSingleWriterControl> reports;
   for (const auto& member:g.members) {
     if (std::find(eligible.begin(),eligible.end(),member.clusterUUID)==eligible.end()) continue;
-    auto q=memberCommand(state,member); ProdigyTruthGlobalControl r{}; String unavailable;
-    if (!truthControl(q,r,unavailable)) continue;
+    auto q=memberCommand(state,member); ProdigyGlobalSingleWriterControl r{}; String unavailable;
+    if (!globalSingleWriterControl(q,r,unavailable)) continue;
     if (!r.provisioned) {
-      if (!provisionTruth(state,member,r,unavailable))
-        basics_log("Truth member %d is awaiting provisioning: %s\n", member.memberID, unavailable.c_str());
+      if (!provisionGlobalSingleWriter(state,member,r,unavailable))
+        basics_log("global single-writer member %d is awaiting provisioning: %s\n", member.memberID, unavailable.c_str());
       continue;
     }
     reports.push_back(std::move(r));
   }
   String routeFailure;
-  const bool routed = reconcileTruthSiblingRoutes(state, eligible, routeFailure);
-  if (!routed) basics_log("Truth sibling route unavailable: %s\n", routeFailure.c_str());
+  const bool routed = reconcileGlobalSingleWriterSiblingRoutes(state, eligible, routeFailure);
+  if (!routed) basics_log("global single-writer sibling route unavailable: %s\n", routeFailure.c_str());
   // Independent authenticated reports from two current voters must agree on
   // the leader, term and committed configuration. A learner is never a vote.
   auto isVoter=[](const auto& members,int32_t id) {
-    return std::any_of(members.begin(),members.end(),[&](const auto& m){return m.memberID==id && m.role==TruthGlobalMemberRole::voter;});
+    return std::any_of(members.begin(),members.end(),[&](const auto& m){return m.memberID==id && m.role==GlobalSingleWriterMemberRole::voter;});
   };
-  const ProdigyTruthGlobalControl* leader=nullptr;
+  const ProdigyGlobalSingleWriterControl* leader=nullptr;
   for (const auto& l:reports) {
     if (!l.committedConfigIndex || !l.term || l.memberID!=l.leaderMemberID || !isVoter(l.members,l.memberID)) continue;
     size_t votes=0;
@@ -195,13 +196,13 @@ bool reconcileTruthOnce(MothershipTruthGroup state, String& failure) {
       leader=&l;
     }
   }
-  if (!leader) { basics_log("reconcileTruth waiting for two matching voter reports\n"); return true; }
+  if (!leader) { basics_log("reconcileGlobalSingleWriter waiting for two matching voter reports\n"); return true; }
   if (leader->committedConfigIndex<g.expectedCommittedConfigIndex ||
       (leader->committedConfigIndex==g.expectedCommittedConfigIndex && leader->committedConfigSHA256!=g.expectedCommittedConfigSHA256)) {
     failure.assign("committed configuration disagrees with registry"_ctv); return false;
   }
-  if (!reconcileTruthMemberRoutes(state, *leader, eligible, failure)) {
-    basics_log("reconcileTruth waiting for the committed members' sibling routes: %s\n", failure.c_str());
+  if (!reconcileGlobalSingleWriterMemberRoutes(state, *leader, eligible, failure)) {
+    basics_log("reconcileGlobalSingleWriter waiting for the committed members' sibling routes: %s\n", failure.c_str());
     return true;
   }
   if (state.cleanup) {
@@ -211,14 +212,14 @@ bool reconcileTruthOnce(MothershipTruthGroup state, String& failure) {
         !isVoter(leader->members,state.incoming.memberID) || leader->committedConfigSHA256!=g.expectedCommittedConfigSHA256) {
       failure.assign("retirement needs its exact committed successor"_ctv); return false;
     }
-    if (!mothershipTruthDeferRetirement(state,state.outgoing) || !save()) return false;
+    if (!mothershipGlobalSingleWriterDeferRetirement(state,state.outgoing) || !save()) return false;
   }
   bool retired = false;
-  if (!mothershipTruthRetryRetirements(state,leader->members,[&](const auto& binding) {
+  if (!mothershipGlobalSingleWriterRetryRetirements(state,leader->members,[&](const auto& binding) {
     String unavailable;
     if (std::find(eligible.begin(),eligible.end(),binding.clusterUUID)==eligible.end() ||
-        !truthPlacement(state,binding.clusterUUID,&binding,unavailable)) return false;
-    basics_log("reconcileTruth retired member %d after committed configuration %llu\n",
+        !globalSingleWriterPlacement(state,binding.clusterUUID,&binding,unavailable)) return false;
+    basics_log("reconcileGlobalSingleWriter retired member %d after committed configuration %llu\n",
         binding.memberID, (unsigned long long)leader->committedConfigIndex);
     return true;
   },retired)) {
@@ -226,14 +227,14 @@ bool reconcileTruthOnce(MothershipTruthGroup state, String& failure) {
   }
   if (retired && !save()) return false;
   const auto now=uint64_t(Time::now<TimeResolution::ms>());
-  Vector<MothershipTruthGroup::Missing> missing;
-  std::vector<ProdigyTruthPlacement::Voter> voters;
+  Vector<MothershipGlobalSingleWriterGroup::Missing> missing;
+  std::vector<ProdigyGlobalSingleWriterPlacement::Voter> voters;
   bool learnerPresent=false;
   for (const auto& m:leader->members) {
     auto known=std::find_if(g.members.begin(),g.members.end(),[&](const auto& v){return v.memberID==m.memberID;});
     if (known==g.members.end() || known->containerUUID!=m.containerUUID || known->clusterUUID!=m.clusterUUID ||
         !known->privateIPv6.equals(m.privateIPv6)) { failure.assign("unknown committed member binding"_ctv); return false; }
-    if (m.role==TruthGlobalMemberRole::learner) {
+    if (m.role==GlobalSingleWriterMemberRole::learner) {
       if (m.memberID!=state.incoming.memberID) { failure.assign("unowned committed learner"_ctv); return false; }
       learnerPresent=true; continue;
     }
@@ -249,7 +250,7 @@ bool reconcileTruthOnce(MothershipTruthGroup state, String& failure) {
   bool changed=missing.size()!=state.missing.size() || !std::equal(missing.begin(),missing.end(),state.missing.begin(),
       [](const auto& a,const auto& b){return a.id==b.id && a.sinceMs==b.sinceMs;});
   if (changed) { state.missing=std::move(missing); if (!save()) return false; }
-  using namespace ProdigyTruthPlacement;
+  using namespace ProdigyGlobalSingleWriterPlacement;
   Replacement binding{state.outgoing.memberID,state.incoming.memberID,state.incoming.clusterUUID};
   bool caught=std::binary_search(leader->caughtUpMemberIDs.begin(),leader->caughtUpMemberIDs.end(),binding.newID);
   // A site whose voter has lost contact with the elected leader is not
@@ -263,17 +264,17 @@ bool reconcileTruthOnce(MothershipTruthGroup state, String& failure) {
   if (!routed && state.missing.empty() && !binding.newID) return true;
   auto d=next(voters,destinations,leader->committedConfigIndex,g.highestAllocatedMemberID,now,state.graceMs,
       binding.newID ? &binding : nullptr,learnerPresent,caught);
-  if (d.action==Action::wait) { basics_log("reconcileTruth waiting config=%llu\n",(unsigned long long)leader->committedConfigIndex); return true; }
+  if (d.action==Action::wait) { basics_log("reconcileGlobalSingleWriter waiting config=%llu\n",(unsigned long long)leader->committedConfigIndex); return true; }
   if (d.action==Action::addLearner && !state.incoming.memberID) {
     // Never age out a still-unconfirmed physical retirement to make room for
     // another replacement. Completed tombstones remain bounded separately.
     if (state.pendingRetirementIDs.size() == 256) {
-      basics_log("reconcileTruth waiting for retirement capacity\n"); return true;
+      basics_log("reconcileGlobalSingleWriter waiting for retirement capacity\n"); return true;
     }
     auto old=std::find_if(g.members.begin(),g.members.end(),[&](const auto& m){return m.memberID==d.replacement.oldID;});
     if (old==g.members.end()) return false;
     state.outgoing=*old;
-    if (!offerTruthMember(state,d.replacement.newID,d.replacement.target,TruthGlobalMemberRole::learner,state.incoming,failure)) return false;
+    if (!offerGlobalSingleWriterMember(state,d.replacement.newID,d.replacement.target,GlobalSingleWriterMemberRole::learner,state.incoming,failure)) return false;
     g.highestAllocatedMemberID=state.incoming.memberID; g.members.push_back(state.incoming);
     g.replacementPending=true; g.expectedCommittedConfigIndex=leader->committedConfigIndex;
     g.expectedCommittedConfigSHA256=leader->committedConfigSHA256; ++g.generation;
@@ -299,7 +300,7 @@ bool reconcileTruthOnce(MothershipTruthGroup state, String& failure) {
     state.retiredBindings.erase(obsolete, state.retiredBindings.end());
     g.expectedCommittedConfigIndex=leader->committedConfigIndex; g.expectedCommittedConfigSHA256=leader->committedConfigSHA256;
     g.replacementPending=false; ++g.generation;
-    if (!mothershipTruthDeferRetirement(state,state.outgoing)) return false;
+    if (!mothershipGlobalSingleWriterDeferRetirement(state,state.outgoing)) return false;
     return save();
   }
   if (std::none_of(reports.begin(),reports.end(),[&](const auto& r){return r.memberID==state.incoming.memberID && r.provisioned;}))
@@ -307,26 +308,26 @@ bool reconcileTruthOnce(MothershipTruthGroup state, String& failure) {
   auto m=std::find_if(g.members.begin(),g.members.end(),[&](const auto& v){return v.memberID==leader->memberID;});
   if (m==g.members.end()) return false;
   auto q=memberCommand(state,*m); q.bootNonce=leader->bootNonce;
-  q.action=d.action==Action::addLearner ? TruthControlAction::addLearner :
-           d.action==Action::removeVoter ? TruthControlAction::removeVoter : TruthControlAction::promoteLearner;
+  q.action=d.action==Action::addLearner ? GlobalSingleWriterControlAction::addLearner :
+           d.action==Action::removeVoter ? GlobalSingleWriterControlAction::removeVoter : GlobalSingleWriterControlAction::promoteLearner;
   q.targetMemberID=d.action==Action::removeVoter ? state.outgoing.memberID : state.incoming.memberID;
   q.expectedCommittedConfigIndex=leader->committedConfigIndex; q.expectedCommittedConfigSHA256=leader->committedConfigSHA256;
-  ProdigyTruthGlobalControl r{};
-  if (truthControl(q,r,failure)) return true;
+  ProdigyGlobalSingleWriterControl r{};
+  if (globalSingleWriterControl(q,r,failure)) return true;
   // Proposal admission can race a leader change. Re-observe the durable
   // configuration on the next pass; never infer it from an RPC outcome.
-  basics_log("reconcileTruth change pending: %s\n",failure.c_str()); return true;
+  basics_log("reconcileGlobalSingleWriter change pending: %s\n",failure.c_str()); return true;
 }
 
-void runReconcileTruth(int argc,char** argv) {
+void runReconcileGlobalSingleWriter(int argc,char** argv) {
   uint128_t group=0;
-  if ((argc!=1 && argc!=2) || !truthHex(argv[0],group) || (argc==2 && std::strcmp(argv[1],"--watch"))) {
-    basics_log("usage: reconcileTruth GROUP [--watch]\n"); exit(EXIT_FAILURE);
+  if ((argc!=1 && argc!=2) || !globalSingleWriterHex(argv[0],group) || (argc==2 && std::strcmp(argv[1],"--watch"))) {
+    basics_log("usage: reconcileGlobalSingleWriter GROUP [--watch]\n"); exit(EXIT_FAILURE);
   }
   do {
-    MothershipTruthGroup state; String failure;
-    { auto registry=openClusterRegistry(); if (!registry.loadTruthGroup(state,&failure) || state.group.membershipUUID!=group) exit(EXIT_FAILURE); }
-    if (!reconcileTruthOnce(std::move(state),failure)) { basics_log("reconcileTruth failed: %s\n",failure.c_str()); exit(EXIT_FAILURE); }
+    MothershipGlobalSingleWriterGroup state; String failure;
+    { auto registry=openClusterRegistry(); if (!registry.loadGlobalSingleWriterGroup(group,state,&failure)) exit(EXIT_FAILURE); }
+    if (!reconcileGlobalSingleWriterOnce(std::move(state),failure)) { basics_log("reconcileGlobalSingleWriter failed: %s\n",failure.c_str()); exit(EXIT_FAILURE); }
     if (argc==1) return;
     ::sleep(1);
   } while (true);

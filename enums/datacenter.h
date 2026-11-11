@@ -121,11 +121,11 @@ enum class MothershipTopic : uint16_t {
   // Read-only inspection and narrowly fenced retirement of a dormant local
   // bundle recovery witness. Appended so older Brains fail closed.
   repairLocalBundleRecoveryWitness,
-  // Desired-only Truth membership projection.  An old Brain rejects it; this
-  // frame never grants a writer or installs a Raft voting configuration.
-  commitTruthGlobalMembership,
-  truthPlacement,
-  truthGlobalControl
+  // Desired-only global membership projection. This frame never grants a
+  // writer or installs a committed application voting configuration.
+  commitGlobalSingleWriterMembership,
+  globalSingleWriterPlacement,
+  globalSingleWriterControl
 };
 
 constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
@@ -272,12 +272,12 @@ constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
       return "rearmRetainedStatefulDeployment";
     case MothershipTopic::repairLocalBundleRecoveryWitness:
       return "repairLocalBundleRecoveryWitness";
-    case MothershipTopic::commitTruthGlobalMembership:
-      return "commitTruthGlobalMembership";
-    case MothershipTopic::truthPlacement:
-      return "truthPlacement";
-    case MothershipTopic::truthGlobalControl:
-      return "truthGlobalControl";
+    case MothershipTopic::commitGlobalSingleWriterMembership:
+      return "commitGlobalSingleWriterMembership";
+    case MothershipTopic::globalSingleWriterPlacement:
+      return "globalSingleWriterPlacement";
+    case MothershipTopic::globalSingleWriterControl:
+      return "globalSingleWriterControl";
   }
 
   return "unknown";
@@ -417,7 +417,7 @@ enum class NeuronTopic : uint16_t {
   nametagQualificationWriterIsolation,
   nametagQualificationSeedFault,
   nametagQualificationMachineBoot,
-  truthGlobalControl
+  globalSingleWriterControl
 };
 
 enum class ContainerTopic : uint16_t {
@@ -459,7 +459,7 @@ enum class ContainerTopic : uint16_t {
   nametagQualificationCousinTransport,
   nametagQualificationReplay,
   nametagQualificationSeedFault,
-  truthGlobalControl
+  globalSingleWriterControl
 };
 
 enum class PulseTopic : uint16_t {

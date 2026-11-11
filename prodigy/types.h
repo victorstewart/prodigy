@@ -4439,6 +4439,8 @@ static inline bool taskExecutionCommitAttempt(TaskExecutionRecord& record, const
   return true;
 }
 
+constexpr inline uint64_t ProdigyGlobalSingleWriterMinimumVersion = 67;
+
 class StatefulDeploymentPlan {
 public:
 
@@ -4468,6 +4470,10 @@ public:
 
   // every instance accepts writes and reads
   bool allMasters;
+
+  // One application-owned consensus group spans the admitted datacenters.
+  // This is placement intent; only the application's committed quorum grants writes.
+  bool globalSingleWriter = false;
 };
 
 template <typename S>
@@ -4482,7 +4488,17 @@ static void serialize(S&& serializer, StatefulDeploymentPlan& plan)
   serializer.value1b(plan.allowUpdateInPlace);
   serializer.value1b(plan.seedingAlways);
   serializer.value1b(plan.neverShard);
-  serializer.value1b(plan.allMasters);
+  // Preserve legacy local/all-masters bytes. Legacy value1b(bool) readers do
+  // not reject 2, so global plans additionally require runtime version 67.
+  uint8_t writerMode = 0;
+  if constexpr (!requires { serializer.adapter().isCompletedSuccessfully(); })
+    writerMode = uint8_t(plan.allMasters) | (uint8_t(plan.globalSingleWriter) << 1);
+  serializer.value1b(writerMode);
+  if constexpr (requires { serializer.adapter().isCompletedSuccessfully(); }) {
+    plan.allMasters = writerMode == 1;
+    plan.globalSingleWriter = writerMode == 2;
+    if (writerMode > 2) serializer.adapter().error(bitsery::ReaderError::InvalidData);
+  }
 }
 
 static inline uint64_t prodigyRuntimeStatefulServicePrefix(uint16_t applicationID, uint8_t serviceID)
@@ -11811,22 +11827,22 @@ public:
 template <typename S> static void serialize(S&& s, ProdigyCrossClusterMasqueGatewayAuthorityResponse& r) { s.value1b(r.success); s.text1b(r.failure, 4096); s.value16b(r.localClusterUUID); s.value8b(r.currentAuthorityGeneration); s.value1b(r.found); s.value1b(r.qualified); s.object(r.authority); }
 
 // An opt-in desired membership.  This is deliberately not a writer grant:
-// only Truth's committed Raft configuration can elect and publish a leader.
-#define PRODIGY_TRUTH_GLOBAL_MEMBERSHIP_VERSION 1
-enum class TruthGlobalMemberRole : uint8_t { voter = 1, learner = 2 };
-class TruthGlobalMember {
+// only the application's committed consensus configuration grants writes.
+#define PRODIGY_GLOBAL_SINGLE_WRITER_MEMBERSHIP_VERSION 1
+enum class GlobalSingleWriterMemberRole : uint8_t { voter = 1, learner = 2 };
+class GlobalSingleWriterMember {
 public:
   int32_t memberID = 0;
   uint128_t clusterUUID = 0, containerUUID = 0;
   IPAddress privateIPv6 = {};
-  TruthGlobalMemberRole role = TruthGlobalMemberRole::voter;
+  GlobalSingleWriterMemberRole role = GlobalSingleWriterMemberRole::voter;
 };
-template <typename S> static void serialize(S&& s, TruthGlobalMember& v) {
+template <typename S> static void serialize(S&& s, GlobalSingleWriterMember& v) {
   s.value4b(v.memberID); s.value16b(v.clusterUUID); s.value16b(v.containerUUID); s.object(v.privateIPv6); s.value1b(v.role);
 }
-class TruthGlobalMembershipProjection {
+class GlobalSingleWriterMembershipProjection {
 public:
-  static constexpr uint32_t version = PRODIGY_TRUTH_GLOBAL_MEMBERSHIP_VERSION;
+  static constexpr uint32_t version = PRODIGY_GLOBAL_SINGLE_WRITER_MEMBERSHIP_VERSION;
   uint32_t protocolVersion = version;
   uint128_t membershipUUID = 0, operationUUID = 0, localClusterUUID = 0;
   uint64_t deploymentID = 0, generation = 0, expectedCommittedConfigIndex = 0;
@@ -11834,11 +11850,11 @@ public:
   // Stable for the lifetime of this group, including after voter replacement.
   std::array<int32_t, 3> genesisMemberIDs{};
   int32_t highestAllocatedMemberID = 0;
-  Vector<TruthGlobalMember> members;
+  Vector<GlobalSingleWriterMember> members;
   Vector<int32_t> retiredMemberIDs;
   bool replacementPending = false;
 };
-template <typename S> static void serialize(S&& s, TruthGlobalMembershipProjection& v) {
+template <typename S> static void serialize(S&& s, GlobalSingleWriterMembershipProjection& v) {
   s.value4b(v.protocolVersion); s.value16b(v.membershipUUID); s.value16b(v.operationUUID); s.value16b(v.localClusterUUID);
   s.value8b(v.deploymentID); s.value8b(v.generation); s.value8b(v.expectedCommittedConfigIndex);
   s.text1b(v.expectedCommittedConfigSHA256, 64);
@@ -11847,9 +11863,12 @@ template <typename S> static void serialize(S&& s, TruthGlobalMembershipProjecti
   s.container(v.members, 4); s.container4b(v.retiredMemberIDs, 256);
   s.value1b(v.replacementPending);
 }
-static inline bool prodigyTruthGlobalMembershipProjectionValid(const TruthGlobalMembershipProjection& v) {
-  if (v.protocolVersion != TruthGlobalMembershipProjection::version || v.membershipUUID == 0 || v.localClusterUUID == 0 ||
-      !v.operationUUID || uint16_t(v.deploymentID >> 48) != 10 || v.generation == 0 || v.expectedCommittedConfigIndex == 0 ||
+static inline bool prodigyGlobalSingleWriterDeploymentIDValid(uint64_t deployment) {
+  return ApplicationConfig::extractApplicationID(deployment) != 0 && (deployment & 0x0000FFFFFFFFFFFFULL) != 0;
+}
+static inline bool prodigyGlobalSingleWriterMembershipProjectionValid(const GlobalSingleWriterMembershipProjection& v) {
+  if (v.protocolVersion != GlobalSingleWriterMembershipProjection::version || v.membershipUUID == 0 || v.localClusterUUID == 0 ||
+      !v.operationUUID || !prodigyGlobalSingleWriterDeploymentIDValid(v.deploymentID) || v.generation == 0 || v.expectedCommittedConfigIndex == 0 ||
       !prodigyIsSHA256HexDigest(v.expectedCommittedConfigSHA256) || v.members.empty() || v.members.size() > 4 || v.retiredMemberIDs.size() > 256) return false;
   if (v.genesisMemberIDs[0] <= 0 || v.genesisMemberIDs[0] >= v.genesisMemberIDs[1] ||
       v.genesisMemberIDs[1] >= v.genesisMemberIDs[2] || v.highestAllocatedMemberID < v.genesisMemberIDs[2]) return false;
@@ -11857,8 +11876,8 @@ static inline bool prodigyTruthGlobalMembershipProjectionValid(const TruthGlobal
   for (const auto& member : v.members) {
     if (member.memberID <= 0 || member.memberID <= prior || member.memberID > v.highestAllocatedMemberID || member.clusterUUID == 0 ||
         member.containerUUID == 0 || !member.privateIPv6.is6 || member.privateIPv6.isNull() ||
-        (member.role != TruthGlobalMemberRole::voter && member.role != TruthGlobalMemberRole::learner)) return false;
-    if (member.role == TruthGlobalMemberRole::voter) ++voters;
+        (member.role != GlobalSingleWriterMemberRole::voter && member.role != GlobalSingleWriterMemberRole::learner)) return false;
+    if (member.role == GlobalSingleWriterMemberRole::voter) ++voters;
     if (member.clusterUUID == v.localClusterUUID) local = true;
     for (const auto& earlier : v.members) {
       if (earlier.memberID >= member.memberID) break;
@@ -11878,10 +11897,20 @@ static inline bool prodigyTruthGlobalMembershipProjectionValid(const TruthGlobal
   // promotion. Both remaining voters must participate in this transition.
   return v.replacementPending && voters == 2 && v.members.size() == 3;
 }
+static inline bool prodigyGlobalSingleWriterMembershipProjectionsValid(const Vector<GlobalSingleWriterMembershipProjection>& groups) {
+  if (groups.size() > 64) return false;
+  for (size_t index = 0; index < groups.size(); ++index) {
+    if (!prodigyGlobalSingleWriterMembershipProjectionValid(groups[index])) return false;
+    for (size_t prior = 0; prior < index; ++prior)
+      if (groups[prior].membershipUUID == groups[index].membershipUUID || groups[prior].deploymentID == groups[index].deploymentID)
+        return false;
+  }
+  return true;
+}
 // Member IDs are storage incarnations. An endpoint cannot acquire an old
 // vote by changing the binding in a newer launch plan.
-static inline bool prodigyTruthMembershipSuccessor(const TruthGlobalMembershipProjection& old,
-                                                   const TruthGlobalMembershipProjection& next) {
+static inline bool prodigyGlobalSingleWriterMembershipSuccessor(const GlobalSingleWriterMembershipProjection& old,
+                                                   const GlobalSingleWriterMembershipProjection& next) {
   if (old.membershipUUID != next.membershipUUID || old.operationUUID != next.operationUUID || old.localClusterUUID != next.localClusterUUID ||
       old.deploymentID != next.deploymentID || old.genesisMemberIDs != next.genesisMemberIDs ||
       next.highestAllocatedMemberID < old.highestAllocatedMemberID ||
@@ -11904,41 +11933,41 @@ static inline bool prodigyTruthMembershipSuccessor(const TruthGlobalMembershipPr
   }
   return true;
 }
-static inline bool prodigyTruthLocalMember(const TruthGlobalMembershipProjection& group, uint64_t deployment,
+static inline bool prodigyGlobalSingleWriterLocalMember(const GlobalSingleWriterMembershipProjection& group, uint64_t deployment,
     uint128_t container) {
-  if (group.deploymentID != deployment || !prodigyTruthGlobalMembershipProjectionValid(group)) return false;
+  if (group.deploymentID != deployment || !prodigyGlobalSingleWriterMembershipProjectionValid(group)) return false;
   return std::any_of(group.members.begin(), group.members.end(), [&](const auto& m) {
     return m.clusterUUID == group.localClusterUUID && m.containerUUID == container;
   });
 }
-class CommitTruthGlobalMembershipResponse : public MothershipResponse {
+class CommitGlobalSingleWriterMembershipResponse : public MothershipResponse {
 public:
   uint64_t durableGeneration = 0;
-  TruthGlobalMembershipProjection projection;
+  GlobalSingleWriterMembershipProjection projection;
 };
-template <typename S> static void serialize(S&& s, CommitTruthGlobalMembershipResponse& v) {
+template <typename S> static void serialize(S&& s, CommitGlobalSingleWriterMembershipResponse& v) {
   s.value1b(v.success); s.text1b(v.failure, 4096); s.value8b(v.durableGeneration); s.object(v.projection);
 }
 
 // The application owns the Raft state. Brain and Neuron attest the transport
 // endpoints; a desired placement cannot supply a committed report.
-#define PRODIGY_TRUTH_GLOBAL_CONTROL_VERSION 1
-enum class TruthControlAction : uint8_t { inspect = 1, provisionOnce, addLearner, removeVoter, promoteLearner };
+#define PRODIGY_GLOBAL_SINGLE_WRITER_CONTROL_VERSION 1
+enum class GlobalSingleWriterControlAction : uint8_t { inspect = 1, provisionOnce, addLearner, removeVoter, promoteLearner };
 
-class ProdigyTruthGlobalControl : public MothershipResponse {
+class ProdigyGlobalSingleWriterControl : public MothershipResponse {
 public:
   uint32_t protocolVersion = 1;
-  TruthControlAction action = TruthControlAction::inspect;
+  GlobalSingleWriterControlAction action = GlobalSingleWriterControlAction::inspect;
   bool response = false, provisioned = false;
   uint128_t membershipUUID = 0, operationUUID = 0, localClusterUUID = 0, containerUUID = 0, bootNonce = 0, exchangeUUID = 0;
   uint64_t deploymentID = 0, generation = 0, expectedCommittedConfigIndex = 0, committedConfigIndex = 0, term = 0, appliedIndex = 0;
   int32_t memberID = 0, targetMemberID = 0, leaderMemberID = 0;
   String expectedCommittedConfigSHA256, committedConfigSHA256;
-  Vector<TruthGlobalMember> members;
+  Vector<GlobalSingleWriterMember> members;
   Vector<int32_t> reachableMemberIDs, caughtUpMemberIDs;
-  TruthGlobalMembershipProjection bindings = {.protocolVersion = 0};
+  GlobalSingleWriterMembershipProjection bindings = {.protocolVersion = 0};
 };
-template<typename S> static void serialize(S&& s, ProdigyTruthGlobalControl& v) {
+template<typename S> static void serialize(S&& s, ProdigyGlobalSingleWriterControl& v) {
   s.value4b(v.protocolVersion); s.value1b(v.action); s.value1b(v.response); s.value1b(v.success);
   s.text1b(v.failure, 4096); s.value1b(v.provisioned);
   s.value16b(v.membershipUUID); s.value16b(v.operationUUID); s.value16b(v.localClusterUUID); s.value16b(v.containerUUID);
@@ -11948,9 +11977,11 @@ template<typename S> static void serialize(S&& s, ProdigyTruthGlobalControl& v) 
   s.text1b(v.committedConfigSHA256,64); s.container(v.members,4); s.container4b(v.reachableMemberIDs,4); s.container4b(v.caughtUpMemberIDs,4); s.object(v.bindings);
 }
 
-static inline bool prodigyTruthCommittedConfigDigest(uint128_t group, uint64_t deployment, uint64_t index,
-    const Vector<TruthGlobalMember>& members, String& digest) {
-  if (!group || uint16_t(deployment >> 48) != 10 || !index || members.size() < 2 || members.size() > 4) return false;
+static inline bool prodigyGlobalSingleWriterCommittedConfigDigest(uint128_t group, uint64_t deployment, uint64_t index,
+    const Vector<GlobalSingleWriterMember>& members, String& digest) {
+  if (!group || !prodigyGlobalSingleWriterDeploymentIDValid(deployment) || !index || members.size() < 2 || members.size() > 4) return false;
+  // Retain the original domain tag so already committed configuration digests
+  // remain stable when the application-independent contract is upgraded.
   String bytes; bytes.assign("Truth configuration v1"_ctv);
   // All fields have fixed widths; integers are in network byte order.
   auto append = [&](uint128_t value, size_t width) {
@@ -11961,37 +11992,37 @@ static inline bool prodigyTruthCommittedConfigDigest(uint128_t group, uint64_t d
   size_t voters = 0;
   for (const auto& m : members) {
     if (m.memberID <= previous || !m.clusterUUID || !m.containerUUID || !m.privateIPv6.is6 || m.privateIPv6.isNull() ||
-        (m.role != TruthGlobalMemberRole::voter && m.role != TruthGlobalMemberRole::learner)) return false;
+        (m.role != GlobalSingleWriterMemberRole::voter && m.role != GlobalSingleWriterMemberRole::learner)) return false;
     for (const auto& other : members) {
       if (other.memberID == m.memberID) break;
       if (other.containerUUID == m.containerUUID || other.privateIPv6.equals(m.privateIPv6)) return false;
     }
     previous = m.memberID;
-    voters += m.role == TruthGlobalMemberRole::voter;
+    voters += m.role == GlobalSingleWriterMemberRole::voter;
     append(uint32_t(m.memberID),4); append(m.clusterUUID,16); append(m.containerUUID,16);
     bytes.append(reinterpret_cast<const uint8_t *>(m.privateIPv6.v6),16); append(uint8_t(m.role),1);
   }
   return voters >= 2 && voters <= 3 && members.size()-voters <= 1 && prodigyComputeSHA256Hex(bytes,digest);
 }
-static inline bool prodigyTruthControlAddressValid(const ProdigyTruthGlobalControl& v) {
+static inline bool prodigyGlobalSingleWriterControlAddressValid(const ProdigyGlobalSingleWriterControl& v) {
   return v.protocolVersion == 1 && v.membershipUUID && v.operationUUID && v.localClusterUUID && v.containerUUID &&
-      uint16_t(v.deploymentID >> 48) == 10 && v.memberID > 0 &&
-      v.action >= TruthControlAction::inspect && v.action <= TruthControlAction::promoteLearner;
+      prodigyGlobalSingleWriterDeploymentIDValid(v.deploymentID) && v.memberID > 0 &&
+      v.action >= GlobalSingleWriterControlAction::inspect && v.action <= GlobalSingleWriterControlAction::promoteLearner;
 }
 
-static inline bool prodigyTruthControlRequestValid(const ProdigyTruthGlobalControl& v) {
-  if (!prodigyTruthControlAddressValid(v) || v.response || v.success || !v.failure.empty() ||
+static inline bool prodigyGlobalSingleWriterControlRequestValid(const ProdigyGlobalSingleWriterControl& v) {
+  if (!prodigyGlobalSingleWriterControlAddressValid(v) || v.response || v.success || !v.failure.empty() ||
       v.provisioned || v.committedConfigIndex || v.term || v.appliedIndex || v.leaderMemberID ||
       !v.committedConfigSHA256.empty() || !v.members.empty() || !v.reachableMemberIDs.empty() || !v.caughtUpMemberIDs.empty())
     return false;
-  if (v.action == TruthControlAction::inspect) return v.targetMemberID == 0;
+  if (v.action == GlobalSingleWriterControlAction::inspect) return v.targetMemberID == 0;
   if (!v.bootNonce || !v.generation) return false;
-  if (v.action == TruthControlAction::provisionOnce) return v.targetMemberID == 0;
+  if (v.action == GlobalSingleWriterControlAction::provisionOnce) return v.targetMemberID == 0;
   return v.targetMemberID > 0 && v.expectedCommittedConfigIndex && prodigyIsSHA256HexDigest(v.expectedCommittedConfigSHA256);
 }
 
-static inline bool prodigyTruthControlReportValid(const ProdigyTruthGlobalControl& v) {
-  if (!prodigyTruthControlAddressValid(v) || !v.response || !v.exchangeUUID || v.bindings.protocolVersion) return false;
+static inline bool prodigyGlobalSingleWriterControlReportValid(const ProdigyGlobalSingleWriterControl& v) {
+  if (!prodigyGlobalSingleWriterControlAddressValid(v) || !v.response || !v.exchangeUUID || v.bindings.protocolVersion) return false;
   if (!v.success) return !v.failure.empty();
   if (!v.failure.empty() || !v.generation || !v.bootNonce) return false;
   // A bound journal can be inspected before genesis or the first election.
@@ -12000,11 +12031,11 @@ static inline bool prodigyTruthControlReportValid(const ProdigyTruthGlobalContro
            v.reachableMemberIDs.empty() && v.caughtUpMemberIDs.empty();
   String digest;
   if (!v.provisioned || !v.term || v.appliedIndex < v.committedConfigIndex ||
-      !prodigyTruthCommittedConfigDigest(v.membershipUUID,v.deploymentID,v.committedConfigIndex,v.members,digest) ||
+      !prodigyGlobalSingleWriterCommittedConfigDigest(v.membershipUUID,v.deploymentID,v.committedConfigIndex,v.members,digest) ||
       !digest.equals(v.committedConfigSHA256)) return false;
   auto present = [&](int32_t id, bool voter) {
     return std::any_of(v.members.begin(),v.members.end(),[&](const auto& m) {
-      return m.memberID == id && (!voter || m.role == TruthGlobalMemberRole::voter);
+      return m.memberID == id && (!voter || m.role == GlobalSingleWriterMemberRole::voter);
     });
   };
   if (v.leaderMemberID && !present(v.leaderMemberID,true)) return false;
@@ -12018,25 +12049,25 @@ static inline bool prodigyTruthControlReportValid(const ProdigyTruthGlobalContro
   return true;
 }
 
-static inline bool prodigyTruthControlForProjection(const ProdigyTruthGlobalControl& v, const TruthGlobalMembershipProjection& group) {
-  if (!prodigyTruthLocalMember(group, v.deploymentID, v.containerUUID) || group.membershipUUID != v.membershipUUID ||
+static inline bool prodigyGlobalSingleWriterControlForProjection(const ProdigyGlobalSingleWriterControl& v, const GlobalSingleWriterMembershipProjection& group) {
+  if (!prodigyGlobalSingleWriterLocalMember(group, v.deploymentID, v.containerUUID) || group.membershipUUID != v.membershipUUID ||
       group.localClusterUUID != v.localClusterUUID || group.generation != v.generation) return false;
   return std::any_of(group.members.begin(),group.members.end(),[&](const auto& m) {
     return m.memberID == v.memberID && m.containerUUID == v.containerUUID && m.clusterUUID == v.localClusterUUID;
   });
 }
 
-enum class TruthPlacementAction : uint8_t { offerAddress = 1, reconcile, retire };
-class ProdigyTruthPlacementExchange : public MothershipResponse {
+enum class GlobalSingleWriterPlacementAction : uint8_t { offerAddress = 1, reconcile, retire };
+class ProdigyGlobalSingleWriterPlacementExchange : public MothershipResponse {
 public:
-  TruthPlacementAction action = TruthPlacementAction::offerAddress;
+  GlobalSingleWriterPlacementAction action = GlobalSingleWriterPlacementAction::offerAddress;
   uint128_t membershipUUID = 0, localClusterUUID = 0;
   uint64_t deploymentID = 0, generation = 0, committedConfigIndex = 0;
   String committedConfigSHA256;
-  TruthGlobalMember member;
-  Vector<TruthGlobalMember> reserved;
+  GlobalSingleWriterMember member;
+  Vector<GlobalSingleWriterMember> reserved;
 };
-template<class S> static void serialize(S&& s, ProdigyTruthPlacementExchange& r) {
+template<class S> static void serialize(S&& s, ProdigyGlobalSingleWriterPlacementExchange& r) {
   s.value1b(r.action); s.value1b(r.success); s.text1b(r.failure,4096);
   s.value16b(r.membershipUUID); s.value16b(r.localClusterUUID); s.value8b(r.deploymentID);
   s.value8b(r.generation); s.value8b(r.committedConfigIndex); s.text1b(r.committedConfigSHA256,64);
@@ -12081,9 +12112,9 @@ public:
   // Version-six master-authority tail.  This registry is deliberately separate
   // from positional DeploymentPlan bytes.
   Vector<ProdigyDeploymentPlacementPolicy> deploymentPlacementPolicies;
-  // Version-twenty-five desired Truth membership projections.  Pending means
+  // Version-twenty-five desired global membership projections. Pending means
   // exactly that: Brain must not turn this admin input into a voting config.
-  Vector<TruthGlobalMembershipProjection> truthGlobalMembershipProjections;
+  Vector<GlobalSingleWriterMembershipProjection> globalSingleWriterMembershipProjections;
   Vector<ProdigyStatelessDeploymentAdmission> statelessDeploymentAdmissions;
   Vector<ProdigyStatelessDeploymentRetirement> statelessDeploymentRetirements;
   // Zero is the pre-v21 unlimited follower behavior. Explicit requests use
@@ -12147,7 +12178,7 @@ public:
         transportCredentialEnrollmentOperations.size() != other.transportCredentialEnrollmentOperations.size() ||
         prodigyCousinRoutesEqual(cousinRoutes, other.cousinRoutes) == false ||
         prodigyCrossClusterMasqueGatewayAuthoritiesEqual(crossClusterMasqueGatewayAuthorities, other.crossClusterMasqueGatewayAuthorities) == false ||
-        truthGlobalMembershipProjections.size() != other.truthGlobalMembershipProjections.size() ||
+        globalSingleWriterMembershipProjections.size() != other.globalSingleWriterMembershipProjections.size() ||
         transportCredentialAuthorityRoot.authorityEpoch != other.transportCredentialAuthorityRoot.authorityEpoch ||
         transportCredentialAuthorityRoot.keyEpoch != other.transportCredentialAuthorityRoot.keyEpoch ||
         transportCredentialAuthorityRoot.authorityGeneration != other.transportCredentialAuthorityRoot.authorityGeneration ||
@@ -12169,10 +12200,10 @@ public:
       const auto& left = transportCredentialEnrollmentOperations[index]; const auto& right = other.transportCredentialEnrollmentOperations[index];
       if (!(left == right)) return false;
     }
-    for (uint32_t index = 0; index < truthGlobalMembershipProjections.size(); ++index)
+    for (uint32_t index = 0; index < globalSingleWriterMembershipProjections.size(); ++index)
     {
       String left = {}, right = {};
-      auto a = truthGlobalMembershipProjections[index], b = other.truthGlobalMembershipProjections[index];
+      auto a = globalSingleWriterMembershipProjections[index], b = other.globalSingleWriterMembershipProjections[index];
       BitseryEngine::serialize(left, a); BitseryEngine::serialize(right, b);
       if (left != right) return false;
     }
@@ -12965,9 +12996,9 @@ public:
   // Append-only seed authority. A zero protocolVersion is the explicit
   // absence until a remote seed is scheduled, including initial all-master boot.
   ProdigyStatefulStoreSeedAuthority statefulStoreSeedAuthority = {.protocolVersion = 0};
-  // Desired-only global Truth membership. Truth independently verifies its
-  // committed Raft configuration before making this active.
-  TruthGlobalMembershipProjection truthMembership = {.protocolVersion = 0};
+  // Desired-only global membership. The application independently verifies
+  // its committed consensus configuration before making this active.
+  GlobalSingleWriterMembershipProjection globalSingleWriterMembership = {.protocolVersion = 0};
   uint64_t declaredStatefulClientService = 0;
   uint16_t declaredStatefulClientPort = 0;
 
@@ -13277,21 +13308,31 @@ public:
   NeuronContainerMetricPolicy metricPolicy;
 };
 
+static inline bool prodigyGlobalSingleWriterContainerPlanValid(const ContainerPlan& plan)
+{
+  return plan.isStateful && plan.config.type == ApplicationType::stateful && !plan.useHostNetworkNamespace &&
+      plan.config.applicationID != 0 && plan.config.versionID != 0 && plan.config.versionID <= 0x0000FFFFFFFFFFFFULL &&
+      plan.shardGroup == 0 && plan.nShardGroups == 1 && plan.statefulMeshRoles.sibling != 0 &&
+      ApplicationConfig::extractApplicationID(plan.statefulMeshRoles.sibling) == plan.config.applicationID &&
+      plan.statefulMeshRoles.hasDistinctServices() &&
+      prodigyGlobalSingleWriterLocalMember(plan.globalSingleWriterMembership,plan.config.deploymentID(),plan.uuid);
+}
+
 template <typename S>
 static void serialize(S&& serializer, NeuronContainerBootstrap& bootstrap)
 {
   serializer.object(bootstrap.plan);
   serializer.object(bootstrap.metricPolicy);
   if constexpr (requires { serializer.adapter().isCompletedSuccessfully(); }) {
-    bootstrap.plan.truthMembership = {.protocolVersion = 0};
+    bootstrap.plan.globalSingleWriterMembership = {.protocolVersion = 0};
     if (!serializer.adapter().isCompletedSuccessfully()) {
-      serializer.object(bootstrap.plan.truthMembership);
-      if (!prodigyTruthLocalMember(bootstrap.plan.truthMembership,bootstrap.plan.config.deploymentID(),bootstrap.plan.uuid) ||
+      serializer.object(bootstrap.plan.globalSingleWriterMembership);
+      if (!prodigyGlobalSingleWriterContainerPlanValid(bootstrap.plan) ||
           !serializer.adapter().isCompletedSuccessfully())
         serializer.adapter().error(bitsery::ReaderError::InvalidData);
     }
-  } else if (bootstrap.plan.truthMembership.protocolVersion) {
-    serializer.object(bootstrap.plan.truthMembership);
+  } else if (bootstrap.plan.globalSingleWriterMembership.protocolVersion) {
+    serializer.object(bootstrap.plan.globalSingleWriterMembership);
   }
 }
 
@@ -13386,7 +13427,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   bool hasRetainedStatefulRearmProofs = false;
   bool hasRetiredStoreSelections = false;
   bool hasRetiredMemberRepairs = false;
-  bool hasTruthGlobalMembershipProjections = false;
+  bool hasGlobalSingleWriterMembershipProjections = false;
 
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
@@ -13424,8 +13465,8 @@ static void prodigySerializeMasterAuthorityRuntimeState(
     hasCousinRoutes = state.cousinRoutes.empty() == false;
     hasPendingAddMachinesProvisioningIntents = state.pendingAddMachinesProvisioningIntents.empty() == false;
     hasStatelessDeploymentRetirements = !state.statelessDeploymentRetirements.empty();
-    hasTruthGlobalMembershipProjections = !state.truthGlobalMembershipProjections.empty();
-    hasRetainedStatefulRearmProofs = !state.retainedStatefulRearmProofs.empty() || hasTruthGlobalMembershipProjections;
+    hasGlobalSingleWriterMembershipProjections = !state.globalSingleWriterMembershipProjections.empty();
+    hasRetainedStatefulRearmProofs = !state.retainedStatefulRearmProofs.empty() || hasGlobalSingleWriterMembershipProjections;
     hasCrossClusterMasqueGatewayAuthorities = !state.crossClusterMasqueGatewayAuthorities.empty() || hasStatelessDeploymentRetirements;
     // Version 22 is cumulative through the v21 retirement container. Emit
     // every earlier tail, even when empty, before the re-arm proof sidecar.
@@ -13504,7 +13545,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
       if (hasCrossClusterMasqueGatewayAuthorities) version = 20;
       if (hasStatelessDeploymentRetirements) version = 21;
       if (hasRetainedStatefulRearmProofs) version = 22;
-      if (hasTruthGlobalMembershipProjections) version = 25;
+      if (hasGlobalSingleWriterMembershipProjections) version = 25;
       serializer.value8b(version);
     }
     serializer.value8b(state.generation);
@@ -13557,7 +13598,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
       hasRetainedStatefulRearmProofs = version >= 22;
       hasRetiredStoreSelections = version == 23 || version == 24;
       hasRetiredMemberRepairs = version == 24;
-      hasTruthGlobalMembershipProjections = version >= 25;
+      hasGlobalSingleWriterMembershipProjections = version >= 25;
     }
   }
 
@@ -13827,16 +13868,16 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   {
     state.retainedStatefulRearmProofs.clear();
   }
-  if (hasTruthGlobalMembershipProjections)
+  if (hasGlobalSingleWriterMembershipProjections)
   {
-    serializer.container(state.truthGlobalMembershipProjections, 64);
+    serializer.container(state.globalSingleWriterMembershipProjections, 64);
     if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
-      for (const auto& projection : state.truthGlobalMembershipProjections)
-        if (!prodigyTruthGlobalMembershipProjectionValid(projection)) serializer.adapter().error(bitsery::ReaderError::InvalidData);
+      if (!prodigyGlobalSingleWriterMembershipProjectionsValid(state.globalSingleWriterMembershipProjections))
+        serializer.adapter().error(bitsery::ReaderError::InvalidData);
   }
   else if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
-    state.truthGlobalMembershipProjections.clear();
+    state.globalSingleWriterMembershipProjections.clear();
   }
   if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
@@ -13909,6 +13950,16 @@ public:
   DeploymentApiCredentialPolicy apiCredentialPolicy;
 };
 
+static inline bool prodigyGlobalSingleWriterPlanValid(const DeploymentPlan& plan)
+{
+  if (!plan.stateful.globalSingleWriter || !plan.isStateful || plan.config.type != ApplicationType::stateful ||
+      plan.config.applicationID == 0 || plan.config.versionID == 0 || plan.config.versionID > 0x0000FFFFFFFFFFFFULL ||
+      !plan.stateful.neverShard || plan.stateful.allMasters || plan.useHostNetworkNamespace || !plan.horizontalScalers.empty() ||
+      !MeshServices::isPrefix(plan.stateful.siblingPrefix) ||
+      ApplicationConfig::extractApplicationID(plan.stateful.siblingPrefix) != plan.config.applicationID) return false;
+  return StatefulMeshRoles::forShardGroup(plan.stateful, plan.config.applicationID, 0).hasDistinctServices();
+}
+
 template <typename S>
 static void serialize(S&& serializer, DeploymentPlan& plan)
 {
@@ -13942,6 +13993,9 @@ static void serialize(S&& serializer, DeploymentPlan& plan)
   serializer.object(plan.tlsIssuancePolicy);
   serializer.value1b(plan.hasApiCredentialPolicy);
   serializer.object(plan.apiCredentialPolicy);
+  if constexpr (requires { serializer.adapter().isCompletedSuccessfully(); })
+    if (plan.stateful.globalSingleWriter && !prodigyGlobalSingleWriterPlanValid(plan))
+      serializer.adapter().error(bitsery::ReaderError::InvalidData);
 }
 
 // Validate both exact declarations against the authority's retained plan map.
@@ -13978,26 +14032,27 @@ static inline bool prodigyCousinAutomaticWhiteholePlanValid(const Vector<Whiteho
       whiteholes[0].family == ExternalAddressFamily::ipv6 && whiteholes[0].transport == ExternalAddressTransport::tcp;
 }
 
-// A global Truth group has at most three remote members while a replacement
+// A global single-writer group has at most three remote members while a replacement
 // learner overlaps the three committed voters.  Its owner-driven sibling
 // sessions therefore need a bounded pool of independently leased public
 // source tuples.  This is deliberately narrower than the legacy automatic
-// COUSIN declaration: the runtime additionally requires the durable Truth
+// COUSIN declaration: the runtime additionally requires the durable membership
 // projection before it can use a pool.
-constexpr static uint32_t prodigyTruthGlobalSiblingMaximumWhiteholes = 3;
+constexpr static uint32_t prodigyGlobalSingleWriterSiblingMaximumWhiteholes = 3;
 
-static inline bool prodigyTruthGlobalSiblingWhiteholePlanValid(
+static inline bool prodigyGlobalSingleWriterSiblingWhiteholePlanValid(
     const ProdigyLocalCousinServicePermission& permission, const DeploymentPlan& plan)
 {
   return permission.protocolVersion == ProdigyLocalCousinServicePermission::purposeVersion &&
       permission.localHalf == CousinRouteHalf::source &&
       permission.purpose == ProdigyCousinServicePurpose::sibling &&
-      permission.localApplicationID == MeshRegistry::Truth::applicationID &&
-      permission.peerApplicationID == MeshRegistry::Truth::applicationID &&
-      permission.localCousinServicePrefix == MeshRegistry::Truth::siblings &&
-      permission.peerCousinServicePrefix == MeshRegistry::Truth::siblings &&
-      plan.config.applicationID == MeshRegistry::Truth::applicationID &&
-      !plan.whiteholes.empty() && plan.whiteholes.size() <= prodigyTruthGlobalSiblingMaximumWhiteholes &&
+      prodigyGlobalSingleWriterPlanValid(plan) &&
+      permission.localApplicationID == plan.config.applicationID &&
+      permission.peerApplicationID == plan.config.applicationID &&
+      permission.localDeploymentID == plan.config.deploymentID() && permission.peerDeploymentID == plan.config.deploymentID() &&
+      permission.localCousinServicePrefix == plan.stateful.siblingPrefix &&
+      permission.peerCousinServicePrefix == plan.stateful.siblingPrefix &&
+      !plan.whiteholes.empty() && plan.whiteholes.size() <= prodigyGlobalSingleWriterSiblingMaximumWhiteholes &&
       std::all_of(plan.whiteholes.begin(), plan.whiteholes.end(), [](const Whitehole& whitehole) {
         return whiteholeDeclarationValid(whitehole) &&
             whitehole.family == ExternalAddressFamily::ipv6 && whitehole.transport == ExternalAddressTransport::tcp;
@@ -14078,6 +14133,16 @@ static inline bool prodigyCousinPermissionPlanServiceMatches(
   // permissions opt into the service and endpoint topology checks below.
   if (permission.protocolVersion < ProdigyLocalCousinServicePermission::purposeVersion)
     return plan.isStateful && plan.stateful.cousinPrefix == permission.localCousinServicePrefix;
+  if (permission.purpose == ProdigyCousinServicePurpose::sibling) {
+    if (plan.stateful.globalSingleWriter) {
+      if (!prodigyGlobalSingleWriterPlanValid(plan) || permission.peerDeploymentID != plan.config.deploymentID()) return false;
+    } else {
+      const uint64_t legacySibling = plan.config.applicationID == 2 ? MeshRegistry::Pulse::siblings :
+          (plan.config.applicationID == 5 ? MeshRegistry::Radar::siblings :
+           (plan.config.applicationID == 10 ? MeshRegistry::Truth::siblings : 0));
+      if (!legacySibling || permission.localCousinServicePrefix != legacySibling) return false;
+    }
+  }
   const bool automatic = permission.purpose != ProdigyCousinServicePurpose::statefulCousin;
   const bool source = permission.localHalf == CousinRouteHalf::source;
   if (!automatic) {
@@ -14092,7 +14157,7 @@ static inline bool prodigyCousinPermissionPlanServiceMatches(
   }
   if (plan.useHostNetworkNamespace) return false;
   if (source && !plan.whiteholes.empty() && !prodigyCousinAutomaticWhiteholePlanValid(plan.whiteholes) &&
-      !prodigyTruthGlobalSiblingWhiteholePlanValid(permission, plan)) {
+      !prodigyGlobalSingleWriterSiblingWhiteholePlanValid(permission, plan)) {
     if (permission.purpose != ProdigyCousinServicePurpose::clientAuthority ||
         !std::all_of(plan.whiteholes.begin(), plan.whiteholes.end(), [](const Whitehole& whitehole) {
           return whiteholeDeclarationValid(whitehole) && whitehole.transport == ExternalAddressTransport::quic;
@@ -14192,7 +14257,8 @@ static inline bool prodigyMaterializedStatefulRecoveryPlansAreCompatible(
          successor.stateful.seedingPrefix == active.stateful.seedingPrefix &&
          successor.stateful.shardingPrefix == active.stateful.shardingPrefix &&
          successor.stateful.seedingAlways == active.stateful.seedingAlways &&
-         successor.stateful.allMasters == active.stateful.allMasters;
+         successor.stateful.allMasters == active.stateful.allMasters &&
+         successor.stateful.globalSingleWriter == active.stateful.globalSingleWriter;
 }
 
 class FailedDeploymentRecordPayload {
@@ -14655,7 +14721,7 @@ public:
   // startup authority was supplied, including initial all-master boot and
   // legacy producers without the appended tail.
   ProdigyStatefulStoreSeedAuthority statefulStoreSeedAuthority = {.protocolVersion = 0};
-  TruthGlobalMembershipProjection truthMembership = {.protocolVersion = 0};
+  GlobalSingleWriterMembershipProjection globalSingleWriterMembership = {.protocolVersion = 0};
 };
 
 enum class StatefulInitialStoreDisposition : uint64_t {
@@ -14799,20 +14865,20 @@ static void serialize(S&& serializer, ContainerParameters& params)
       // A retired selected-home extension requires explicit migration; it
       // must never be ignored while launching against the canonical app home.
       if (!serializer.adapter().isCompletedSuccessfully()) {
-        serializer.object(params.truthMembership);
-        if (!prodigyTruthLocalMember(params.truthMembership,params.deploymentID,params.uuid) || !serializer.adapter().isCompletedSuccessfully())
+        serializer.object(params.globalSingleWriterMembership);
+        if (!prodigyGlobalSingleWriterLocalMember(params.globalSingleWriterMembership,params.deploymentID,params.uuid) || !serializer.adapter().isCompletedSuccessfully())
           serializer.adapter().error(bitsery::ReaderError::InvalidData);
-      } else params.truthMembership = {.protocolVersion = 0};
+      } else params.globalSingleWriterMembership = {.protocolVersion = 0};
     }
     else
     {
       params.statefulStoreSeedAuthority = {.protocolVersion = 0};
-      params.truthMembership = {.protocolVersion = 0};
+      params.globalSingleWriterMembership = {.protocolVersion = 0};
     }
   }
   else
   {
     serializer.object(params.statefulStoreSeedAuthority);
-    if (params.truthMembership.protocolVersion) serializer.object(params.truthMembership);
+    if (params.globalSingleWriterMembership.protocolVersion) serializer.object(params.globalSingleWriterMembership);
   }
 }

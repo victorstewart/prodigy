@@ -3934,6 +3934,75 @@ static void testSpinApplicationInvalidPlanUsesSingleTopicFrame(TestSuite& suite)
   suite.expect(invalidPlanReason == "invalid plan: applicationID not reserved"_ctv, "spin_application_invalid_plan_includes_reason");
 }
 
+static void testMalformedWriterModeRejectedBeforeAdmission(TestSuite& suite)
+{
+  StreamingTestBrain brain = {};
+  NoopBrainIaaS iaas = {};
+  Mothership mothership = {};
+  brain.iaas = &iaas; brain.weAreMaster = true; brain.noMasterYet = false;
+  brain.ignited = true; brain.persistedMachineInventoryEnumerated = true; brain.mothership = &mothership;
+  mothership.isFixedFile = true; mothership.fslot = 1;
+
+  DeploymentPlan plan = {};
+  seedStatefulDeployRequestPlan(plan, 42);
+  plan.stateful.neverShard = true; plan.stateful.globalSingleWriter = true;
+  plan.stateful.clientPrefix = prodigyRuntimeStatefulServicePrefix(42, 1);
+  plan.stateful.siblingPrefix = prodigyRuntimeStatefulServicePrefix(42, 2);
+  plan.stateful.cousinPrefix = prodigyRuntimeStatefulServicePrefix(42, 3);
+  plan.stateful.seedingPrefix = prodigyRuntimeStatefulServicePrefix(42, 4);
+  plan.stateful.shardingPrefix = prodigyRuntimeStatefulServicePrefix(42, 5);
+  String encoded = {}, stateful = {};
+  BitseryEngine::serialize(encoded, plan); BitseryEngine::serialize(stateful, plan.stateful);
+  DeploymentPlan decoded = {};
+  if (!suite.require(BitseryEngine::deserializeSafe(encoded, decoded) && prodigyGlobalSingleWriterPlanValid(decoded),
+                     "malformed_writer_mode_starts_from_valid_global_plan")) return;
+  // Locate the separately encoded stateful object, proving it is unique, so
+  // only its final writer-mode byte changes when surrounding fields evolve.
+  const auto* first = encoded.data(); const auto* end = first + encoded.size();
+  const auto* statefulAt = std::search(first, end, stateful.data(), stateful.data() + stateful.size());
+  if (!suite.require(stateful.size() == 44 && statefulAt != end &&
+      std::search(statefulAt + 1, end, stateful.data(), stateful.data() + stateful.size()) == end &&
+      statefulAt[stateful.size() - 1] == 2, "malformed_writer_mode_locates_exact_serialized_mode_byte")) return;
+  const uint64_t modeOffset = uint64_t(statefulAt - first) + stateful.size() - 1;
+  const uint64_t authorityGeneration = brain.masterAuthorityRuntimeState.generation;
+
+  for (uint8_t mode : {uint8_t(3), uint8_t(255)}) {
+    String malformed = encoded; malformed[modeOffset] = mode;
+    decoded = {};
+    suite.require(!BitseryEngine::deserializeSafe(malformed, decoded), "malformed_writer_mode_fixture_fails_codec");
+    mothership.wBuffer.clear(); String request = {};
+    brain.mothershipHandler(&mothership, buildMothershipMessage(request, MothershipTopic::spinApplication,
+        plan.config.applicationID, malformed, "must not inspect artifact"_ctv));
+    uint32_t replies = 0; bool rejected = false;
+    forEachMessageInBuffer(mothership.wBuffer, [&](Message* frame) {
+      ++replies;
+      if (MothershipTopic(frame->topic) != MothershipTopic::spinApplication) return;
+      uint8_t* args = frame->args; uint8_t code = 0; String reason = {};
+      Message::extractArg<ArgumentNature::fixed>(args, code); Message::extractToStringView(args, reason);
+      rejected = args == frame->terminal() && code == uint8_t(SpinApplicationResponseCode::invalidPlan) &&
+          reason == "invalid plan: unsupported or malformed deployment plan"_ctv;
+    });
+    suite.expect(replies == 1 && rejected, "malformed_writer_mode_spin_rejects_before_application_admission");
+
+    mothership.wBuffer.clear(); request.clear();
+    brain.mothershipHandler(&mothership, buildMothershipMessage(request, MothershipTopic::measureApplication, malformed));
+    replies = 0; bool emptyMeasurement = false;
+    forEachMessageInBuffer(mothership.wBuffer, [&](Message* frame) {
+      ++replies;
+      if (MothershipTopic(frame->topic) != MothershipTopic::measureApplication) return;
+      uint8_t* args = frame->args; uint32_t base = 1, surge = 1, fit = 1;
+      Message::extractArg<ArgumentNature::fixed>(args, base);
+      Message::extractArg<ArgumentNature::fixed>(args, surge);
+      Message::extractArg<ArgumentNature::fixed>(args, fit);
+      emptyMeasurement = args == frame->terminal() && base == 0 && surge == 0 && fit == 0;
+    });
+    suite.expect(replies == 1 && emptyMeasurement, "malformed_writer_mode_measure_returns_zero_capacity");
+    suite.expect(brain.deployments.empty() && brain.deploymentPlans.empty() && brain.pendingMothershipSpinArtifacts.empty() &&
+        brain.masterAuthorityRuntimeState.generation == authorityGeneration,
+        "malformed_writer_mode_handlers_leave_deployment_and_authority_unchanged");
+  }
+}
+
 static void testSpinApplicationCredentialPolicyAdmission(TestSuite& suite)
 {
   StreamingTestBrain brain = {};
@@ -44232,7 +44301,7 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite, bool handof
           selfMachine.neuron.cousinDiscoveryVersion = savedDiscoveryVersion;
           suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA), "automatic_client_authority_restores_legacy_fixture_scope");
         }
-        {
+        for (uint16_t globalApplication : {uint16_t(10), uint16_t(42)}) {
           // A replacement learner overlaps an existing remote voter. Both use
           // the same sibling permission and slot, but need independent private
           // sessions. Exercise the real driver behind its authenticated gates.
@@ -44271,15 +44340,15 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite, bool handof
           privateOperation.privateDiscoveryTransitionGeneration = permissionBrain.masterAuthorityRuntimeState.generation;
 
           ApplicationDeployment truth = {};
-          truth.plan.config = live.plan.config; truth.plan.config.applicationID = MeshRegistry::Truth::applicationID;
+          truth.plan.config = live.plan.config; truth.plan.config.applicationID = globalApplication;
           truth.plan.config.type = ApplicationType::stateful; truth.plan.isStateful = true;
-          truth.plan.stateful.neverShard = true; truth.nShardGroups = 1;
-          truth.plan.stateful.clientPrefix = MeshRegistry::Truth::clients;
-          truth.plan.stateful.siblingPrefix = MeshRegistry::Truth::siblings;
-          truth.plan.stateful.cousinPrefix = prodigyRuntimeStatefulServicePrefix(10, 3);
-          truth.plan.stateful.seedingPrefix = prodigyRuntimeStatefulServicePrefix(10, 4);
-          truth.plan.stateful.shardingPrefix = prodigyRuntimeStatefulServicePrefix(10, 5);
-          const uint64_t sibling = MeshServices::constrainPrefixToGroup(MeshRegistry::Truth::siblings, 0);
+          truth.plan.stateful.neverShard = true; truth.plan.stateful.globalSingleWriter = true; truth.nShardGroups = 1;
+          truth.plan.stateful.clientPrefix = prodigyRuntimeStatefulServicePrefix(globalApplication, 1);
+          truth.plan.stateful.siblingPrefix = prodigyRuntimeStatefulServicePrefix(globalApplication, 11);
+          truth.plan.stateful.cousinPrefix = prodigyRuntimeStatefulServicePrefix(globalApplication, 3);
+          truth.plan.stateful.seedingPrefix = prodigyRuntimeStatefulServicePrefix(globalApplication, 4);
+          truth.plan.stateful.shardingPrefix = prodigyRuntimeStatefulServicePrefix(globalApplication, 5);
+          const uint64_t sibling = MeshServices::constrainPrefixToGroup(prodigyRuntimeStatefulServicePrefix(globalApplication, 11), 0);
           truth.plan.subscriptions.emplace_back(sibling, ContainerState::healthy, ContainerState::destroying, SubscriptionNature::all);
           ContainerView truthSource = {};
           truthSource.uuid = 0x9e10; truthSource.machine = &selfMachine; truthSource.fragment = 3;
@@ -44295,15 +44364,15 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite, bool handof
           auto truthPermission = activePermission.permission;
           truthPermission.protocolVersion = ProdigyLocalCousinServicePermission::purposeVersion;
           truthPermission.permissionUUID = 0x9e01; truthPermission.purpose = ProdigyCousinServicePurpose::sibling;
-          truthPermission.localApplicationID = truthPermission.peerApplicationID = MeshRegistry::Truth::applicationID;
-          truthPermission.localCousinServicePrefix = truthPermission.peerCousinServicePrefix = MeshRegistry::Truth::siblings;
+          truthPermission.localApplicationID = truthPermission.peerApplicationID = globalApplication;
+          truthPermission.localCousinServicePrefix = truthPermission.peerCousinServicePrefix = prodigyRuntimeStatefulServicePrefix(globalApplication, 11);
           truthPermission.localDeploymentID = truthPermission.peerDeploymentID = truthSource.deploymentID;
           truthPermission.authorizedService = sibling; truthPermission.destinationShardGroup = 0; truthPermission.destinationShardGroups = 1;
           truthPermission.slots = {}; truthPermission.slots.insert(0);
           String truthPlanBytes = {};
           suite.require(BitseryEngine::serialize(truthPlanBytes, truth.plan) &&
               prodigyComputeSHA256Hex(truthPlanBytes, truthPermission.canonicalPlanSHA256),
-              "truth_private_sessions_bind_exact_live_sibling_plan");
+              "global_single_writer_private_sessions_bind_exact_live_sibling_plan");
           truthPermission.peerCanonicalPlanSHA256 = truthPermission.canonicalPlanSHA256;
           truthPermission.peerArtifactSHA256 = truthPermission.artifactSHA256;
           truthPermission.peerArtifactBytes = truthPermission.artifactBytes;
@@ -44312,23 +44381,32 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite, bool handof
           std::swap(remoteTruthPermission.localClusterUUID, remoteTruthPermission.peerClusterUUID);
           permissionBrain.masterAuthorityRuntimeState.localCousinServicePermissions = {truthPermission};
 
-          TruthGlobalMembershipProjection membership = {};
+          GlobalSingleWriterMembershipProjection membership = {};
           membership.membershipUUID = 0x9e03; membership.operationUUID = 0x9e04;
           membership.localClusterUUID = clusterUUID; membership.deploymentID = truthSource.deploymentID;
           membership.generation = 1; membership.expectedCommittedConfigIndex = 5;
           membership.expectedCommittedConfigSHA256 = truthPermission.canonicalPlanSHA256;
           membership.genesisMemberIDs = {1, 2, 3}; membership.highestAllocatedMemberID = 4; membership.replacementPending = true;
           for (int32_t id = 1; id <= 4; ++id) {
-            TruthGlobalMember member = {}; member.memberID = id;
+            GlobalSingleWriterMember member = {}; member.memberID = id;
             member.clusterUUID = id % 2 ? clusterUUID : truthPermission.peerClusterUUID;
             member.containerUUID = id == 1 ? truthSource.uuid : uint128_t(0x9e10 + id);
             member.privateIPv6 = prodigyContainerDatacenterSitePrefix(id % 2 ? 1 : 2).network;
             member.privateIPv6.v6[15] = uint8_t(id);
-            member.role = id == 4 ? TruthGlobalMemberRole::learner : TruthGlobalMemberRole::voter;
+            member.role = id == 4 ? GlobalSingleWriterMemberRole::learner : GlobalSingleWriterMemberRole::voter;
             membership.members.push_back(member);
           }
-          suite.require(prodigyTruthGlobalMembershipProjectionValid(membership), "truth_private_sessions_committed_voters_overlap_learner");
-          permissionBrain.masterAuthorityRuntimeState.truthGlobalMembershipProjections = {membership};
+          suite.require(prodigyGlobalSingleWriterMembershipProjectionValid(membership), "global_single_writer_private_sessions_committed_voters_overlap_learner");
+          permissionBrain.masterAuthorityRuntimeState.globalSingleWriterMembershipProjections = {membership};
+          const auto savedPeerVersion = permissionPeerA.version;
+          permissionPeerA.version = ProdigyGlobalSingleWriterMinimumVersion - 1;
+          suite.expect(!permissionBrain.deploymentReplicationAllowedForPeer(truthSource.deploymentID, &permissionPeerA) &&
+              !permissionBrain.peerCanReceiveMasterAuthorityState(&permissionPeerA),
+              "global_single_writer_rejects_legacy_plan_and_authority_replication");
+          permissionPeerA.version = ProdigyGlobalSingleWriterMinimumVersion;
+          suite.expect(permissionBrain.deploymentReplicationAllowedForPeer(truthSource.deploymentID, &permissionPeerA),
+              "global_single_writer_accepts_current_plan_replication");
+          permissionPeerA.version = savedPeerVersion;
 
           auto gateway = makeGatewayReadinessReplayAuthority();
           const auto& pair = permissionBrain.masterAuthorityRuntimeState.clusterPairEnrollments.front();
@@ -44336,7 +44414,7 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite, bool handof
           gateway.localClusterUUID = clusterUUID; gateway.peerClusterUUID = pair.peerClusterUUID;
           gateway.localMachineUUID = selfMachine.uuid; gateway.peerMachineUUID = cacheRemote.nodeUUID;
           gateway.pairAuthorityGeneration = pair.localAuthorityGeneration; gateway.keyGeneration = pair.agreedKeyEpoch;
-          suite.require(prodigyDeriveCrossClusterMasquePrivateBGPTuple(gateway), "truth_private_sessions_derive_gateway_scope");
+          suite.require(prodigyDeriveCrossClusterMasquePrivateBGPTuple(gateway), "global_single_writer_private_sessions_derive_gateway_scope");
           gateway.privateSessionCredentialSHA256 = gateway.artifactSHA256;
           permissionBrain.masterAuthorityRuntimeState.crossClusterMasqueGatewayAuthorities = {gateway};
           auto truthReceipt = cacheReceipt;
@@ -44353,19 +44431,19 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite, bool handof
             truthReceipt.snapshot.records.push_back(counterpart);
             auto route = sessionRoute; route.version = 3; route.endpointKind = CousinRouteEndpointKind::privateContainer;
             route.routeUUID = uint128_t(0x9e20 + index); route.operationUUID = uint128_t(0x9e30 + index);
-            route.sourceApplicationID = route.destinationApplicationID = MeshRegistry::Truth::applicationID;
-            route.sourceCousinServicePrefix = route.destinationCousinServicePrefix = MeshRegistry::Truth::siblings;
+            route.sourceApplicationID = route.destinationApplicationID = globalApplication;
+            route.sourceCousinServicePrefix = route.destinationCousinServicePrefix = prodigyRuntimeStatefulServicePrefix(globalApplication, 11);
             route.sourcePermissionUUID = truthPermission.permissionUUID; route.destinationPermissionUUID = remoteTruthPermission.permissionUUID;
             route.slots = truthPermission.slots; route.destinationRoutablePrefixUUID = 0; route.destinationCIDR = 128;
             route.destinationPublicAddress = counterpart.publicAddress; route.destinationTCPPort = counterpart.publicTCPPort;
-            suite.require(cousinRouteStructurallyValid(route), "truth_private_sessions_exact_remote_route_valid");
+            suite.require(cousinRouteStructurallyValid(route), "global_single_writer_private_sessions_exact_remote_route_valid");
             permissionBrain.masterAuthorityRuntimeState.cousinRoutes.push_back(route);
           }
-          suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA), "truth_private_sessions_qualify_current_authority");
+          suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA), "global_single_writer_private_sessions_qualify_current_authority");
           for (auto *machine : privateMachines) {
             ProdigyLocalClusterPairControlProjection privateProjection = {}; String privateFingerprint = {};
             suite.require(permissionBrain.buildLocalClusterPairControlProjection(machine->uuid, privateProjection, privateFingerprint),
-                "truth_private_sessions_build_private_discovery_projection");
+                "global_single_writer_private_sessions_build_private_discovery_projection");
             machine->neuron.clusterPairProjectionGeneration = privateProjection.committedAuthorityGeneration;
             machine->neuron.clusterPairProjectionFingerprint = machine->neuron.clusterPairProjectionAcknowledgedFingerprint = privateFingerprint;
           }
@@ -44374,9 +44452,9 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite, bool handof
           // acknowledged private-discovery carrier projection above.
           truthReceipt.projectionGeneration = selfMachine.neuron.clusterPairProjectionGeneration;
           suite.require(permissionBrain.localCousinServicePermissionMatchesCurrentLivePlan(truthPermission),
-              "truth_private_sessions_permission_matches_current_live_plan");
+              "global_single_writer_private_sessions_permission_matches_current_live_plan");
           suite.require(permissionBrain.clusterPairPrivateDiscoveryActive(pair.pairUUID, pair.rootGeneration, pair.peerClusterUUID),
-              "truth_private_sessions_require_acknowledged_private_discovery");
+              "global_single_writer_private_sessions_require_acknowledged_private_discovery");
           ProdigyCrossClusterMasqueGatewayReadiness masque = {};
           masque.pairUUID = gateway.pairUUID; masque.localClusterUUID = clusterUUID; masque.localMachineUUID = selfMachine.uuid;
           masque.keyEpoch = gateway.keyGeneration; masque.authorityGeneration = gateway.pairAuthorityGeneration;
@@ -44394,32 +44472,32 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite, bool handof
           readinessBytes.clear(); readinessFrame.clear(); BitseryEngine::serialize(readinessBytes, bgp);
           permissionBrain.neuronHandler(&selfMachine.neuron, buildNeuronMessage(readinessFrame, NeuronTopic::crossClusterPrivateBGPReadinessReceipt, readinessBytes));
           suite.require(permissionBrain.cousinPrivateRouteGatewayReady(permissionBrain.masterAuthorityRuntimeState.cousinRoutes.front(), CousinRouteHalf::source),
-              "truth_private_sessions_require_live_authenticated_gateway_and_bgp_receipts");
+              "global_single_writer_private_sessions_require_live_authenticated_gateway_and_bgp_receipts");
           permissionBrain.cousinDiscoveryReceipts.clear();
           auto wrongAddressReceipt = truthReceipt;
           ++wrongAddressReceipt.snapshot.records.front().publicAddress.v6[15];
           permissionBrain.masterAuthorityRuntimeState.cousinRoutes.front().destinationPublicAddress = wrongAddressReceipt.snapshot.records.front().publicAddress;
-          suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA), "truth_private_sessions_qualify_mismatched_discovered_address_route");
-          suite.require(prodigyCousinDiscoveryReceiptValid(wrongAddressReceipt), "truth_private_sessions_wrong_address_receipt_is_authenticated_and_well_formed");
+          suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA), "global_single_writer_private_sessions_qualify_mismatched_discovered_address_route");
+          suite.require(prodigyCousinDiscoveryReceiptValid(wrongAddressReceipt), "global_single_writer_private_sessions_wrong_address_receipt_is_authenticated_and_well_formed");
           permissionBrain.receiveCousinDiscoverySnapshot(&selfMachine.neuron, wrongAddressReceipt);
           suite.require(permissionBrain.queryCousinCounterparts({1, truthPermission.permissionUUID, 0}).records.size() == 2,
-              "truth_private_sessions_wrong_address_reaches_membership_admission_gate");
+              "global_single_writer_private_sessions_wrong_address_reaches_membership_admission_gate");
           ProdigyCousinSessionRequest truthRequest = {};
           truthRequest.requestUUID = 0x9e40; truthRequest.permissionUUID = truthPermission.permissionUUID; truthRequest.bindingNonce = 0x9e41;
           suite.expect(!permissionBrain.cousinSessionSourceRequest(&selfMachine.neuron, truthSource.uuid, truthRequest, true, &membership.members[1]),
-              "truth_private_sessions_reject_discovered_ip_outside_exact_member_binding");
+              "global_single_writer_private_sessions_reject_discovered_ip_outside_exact_member_binding");
           permissionBrain.masterAuthorityRuntimeState.cousinRoutes.front().destinationPublicAddress = membership.members[1].privateIPv6;
-          suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA), "truth_private_sessions_restore_exact_member_address_route");
+          suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA), "global_single_writer_private_sessions_restore_exact_member_address_route");
           ++truthReceipt.sequence;
           permissionBrain.receiveCousinDiscoverySnapshot(&selfMachine.neuron, truthReceipt);
           suite.require(permissionBrain.queryCousinCounterparts({1, truthPermission.permissionUUID, 0}).records.size() == 2,
-              "truth_private_sessions_discover_overlapping_remote_voter_and_learner");
+              "global_single_writer_private_sessions_discover_overlapping_remote_voter_and_learner");
           auto wrongMember = membership.members[1]; ++wrongMember.containerUUID;
           suite.expect(!permissionBrain.cousinSessionSourceRequest(&selfMachine.neuron, truthSource.uuid, truthRequest, true, &wrongMember),
-              "truth_private_sessions_reject_uncommitted_counterpart_identity");
+              "global_single_writer_private_sessions_reject_uncommitted_counterpart_identity");
           auto driveTruth = [&] { permissionBrain.lastCousinAutomaticSessionDriveMs = 0; permissionBrain.driveCousinSessions(); };
           driveTruth();
-          if (suite.require(permissionBrain.cousinSessions.size() == 2, "truth_private_sessions_driver_preserves_voter_and_adds_learner")) {
+          if (suite.require(permissionBrain.cousinSessions.size() == 2, "global_single_writer_private_sessions_driver_preserves_voter_and_adds_learner")) {
             const auto first = permissionBrain.cousinSessions[0]; const auto second = permissionBrain.cousinSessions[1];
             suite.expect(prodigyCousinSessionUsesPrivateContainerEndpoints(first.record) && prodigyCousinSessionUsesPrivateContainerEndpoints(second.record) &&
                 first.record.sourcePermission.permissionUUID == truthPermission.permissionUUID &&
@@ -44428,23 +44506,23 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite, bool handof
                 second.record.destination.containerUUID == membership.members[3].containerUUID &&
                 first.record.sourceBindingNonce != second.record.sourceBindingNonce && first.record.sourceTCPPort != second.record.sourceTCPPort &&
                 permissionBrain.cousinSessionLocalCurrent(first) && permissionBrain.cousinSessionLocalCurrent(second),
-                "truth_private_sessions_bind_two_exact_members_with_distinct_private_source_tuples");
+                "global_single_writer_private_sessions_bind_two_exact_members_with_distinct_private_source_tuples");
             driveTruth();
             suite.expect(permissionBrain.cousinSessions.size() == 2 &&
                 prodigyCousinSessionExact(permissionBrain.cousinSessions[0].record, first.record) &&
                 prodigyCousinSessionExact(permissionBrain.cousinSessions[1].record, second.record),
-                "truth_private_sessions_repeated_driver_keeps_both_leases_without_duplicates");
+                "global_single_writer_private_sessions_repeated_driver_keeps_both_leases_without_duplicates");
             auto retired = membership; retired.members.erase(retired.members.begin() + 1); retired.retiredMemberIDs = {2};
             ++retired.generation; ++retired.expectedCommittedConfigIndex;
-            suite.require(prodigyTruthGlobalMembershipProjectionValid(retired), "truth_private_sessions_retirement_projection_valid");
-            permissionBrain.masterAuthorityRuntimeState.truthGlobalMembershipProjections = {retired};
-            suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA), "truth_private_sessions_qualify_retirement_projection");
+            suite.require(prodigyGlobalSingleWriterMembershipProjectionValid(retired), "global_single_writer_private_sessions_retirement_projection_valid");
+            permissionBrain.masterAuthorityRuntimeState.globalSingleWriterMembershipProjections = {retired};
+            suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA), "global_single_writer_private_sessions_qualify_retirement_projection");
             suite.expect(!permissionBrain.cousinSessionLocalCurrent(first) && permissionBrain.cousinSessionLocalCurrent(second),
-                "truth_private_sessions_retired_voter_fenced_while_learner_remains_current");
+                "global_single_writer_private_sessions_retired_voter_fenced_while_learner_remains_current");
             driveTruth();
             suite.expect(permissionBrain.cousinSessions.size() == 1 &&
                 prodigyCousinSessionExact(permissionBrain.cousinSessions.front().record, second.record),
-                "truth_private_sessions_driver_retires_only_removed_member");
+                "global_single_writer_private_sessions_driver_retires_only_removed_member");
           }
           permissionBrain.cousinSessions.clear(); permissionBrain.containers.erase(truthSource.uuid);
           permissionBrain.deployments.erase(truthSource.deploymentID); truth.containers.erase(&truthSource);
@@ -44462,7 +44540,7 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite, bool handof
             if (!saved.member) permissionBrain.machines.erase(machine);
             if (!saved.neuronMember) permissionBrain.neurons.erase(&neuron);
           }
-          suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA), "truth_private_sessions_restore_surrounding_authority_fixture");
+          suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA), "global_single_writer_private_sessions_restore_surrounding_authority_fixture");
         }
         permissionBrain.cousinSessions.clear(); permissionBrain.containers.erase(sourceApp.uuid);
         permissionBrain.masterAuthorityRuntimeState.cousinRoutes.clear();
@@ -46016,6 +46094,7 @@ int main(void)
   {
     ScopedRing ring = {};
     testSpinApplicationInvalidPlanUsesSingleTopicFrame(suite);
+    testMalformedWriterModeRejectedBeforeAdmission(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "credential-fixture-repairs") == 0)
@@ -46777,6 +46856,7 @@ int main(void)
   testMothershipConfigureLowersSharedCPUOvercommitWithoutMovingClaims(suite);
   testReplicateMasterAuthorityRejectsClusterTakeover(suite);
   testSpinApplicationInvalidPlanUsesSingleTopicFrame(suite);
+  testMalformedWriterModeRejectedBeforeAdmission(suite);
   testSpinApplicationRejectsDuplicateNonTaskDeploymentIDWithoutMutation(suite);
   testSpinApplicationProgressAppendsAfterOkayFrame(suite);
   testSpinApplicationProgressAcceptsDirectFdMothership(suite);

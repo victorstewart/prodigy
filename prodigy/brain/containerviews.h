@@ -25,8 +25,8 @@ public:
   // Ephemeral launch fence for a durable Truth placement.  The resulting
   // meshAddress is persisted in the ordinary ContainerPlan; this only stops
   // the scheduler from replacing an assigned endpoint with a random fragment.
-  uint128_t requiredTruthMeshAddress = 0;
-  int32_t truthMemberID = 0;
+  uint128_t requiredGlobalSingleWriterMeshAddress = 0;
+  int32_t globalSingleWriterMemberID = 0;
 
   uint32_t nCrashes;
 
@@ -542,8 +542,12 @@ public:
 
     plan.uuid = uuid;
     plan.config = (configOverride ? *configOverride : dplan.config);
-    if (plan.config.applicationID == MeshRegistry::Truth::applicationID && thisBrain)
-      thisBrain->desiredTruthGlobalMembership(plan.config.deploymentID(), plan.truthMembership);
+    if (dplan.stateful.globalSingleWriter) {
+      // Preserve the opt-in on replay even if authority is unavailable. An
+      // incomplete present projection is rejected by the launch decoder.
+      plan.globalSingleWriterMembership.protocolVersion = GlobalSingleWriterMembershipProjection::version;
+      if (thisBrain) thisBrain->desiredGlobalSingleWriterMembership(plan.config.deploymentID(), plan.globalSingleWriterMembership);
+    }
     plan.subscriptions = subscriptions;
     plan.advertisements = advertisements;
     plan.requiresDatacenterUniqueTag = dplan.requiresDatacenterUniqueTag;

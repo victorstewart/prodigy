@@ -461,13 +461,13 @@ static inline bool prodigyCousinSessionTransportSourceValid(const ProdigyCousinS
 static inline bool prodigyCousinAutomaticSessionDesired(
     const ProdigyLocalCousinServicePermission& permission, const CousinRouteRecord& route,
     bool exactLivePlanService, uint32_t usableWhiteholes, int64_t nowMs,
-    bool truthGlobalSiblingPool = false)
+    bool globalSingleWriterSiblingPool = false)
 {
   return prodigyLocalCousinServicePermissionValid(permission) &&
       permission.protocolVersion == ProdigyLocalCousinServicePermission::purposeVersion &&
       permission.state == ProdigyLocalCousinServicePermissionState::active && permission.localHalf == CousinRouteHalf::source &&
       exactLivePlanService &&
-      (truthGlobalSiblingPool ? (usableWhiteholes != 0 && usableWhiteholes <= 3) :
+      (globalSingleWriterSiblingPool ? (usableWhiteholes != 0 && usableWhiteholes <= 3) :
                                 usableWhiteholes == 1) &&
       cousinRouteCurrentContract(route) &&
       cousinRouteAllowsNewAdmissionAt(route, nowMs) && route.sourcePermissionUUID == permission.permissionUUID &&

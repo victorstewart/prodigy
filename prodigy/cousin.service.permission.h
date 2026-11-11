@@ -320,16 +320,16 @@ static inline bool prodigyCousinServicePermissionPurposeValid(
     const uint64_t expected = sourceApp == 3 ? MeshRegistry::Hot::seeding : MeshRegistry::Cold::seeding;
     return sourceApp == destinationApp && sourcePrefix == expected && destinationPrefix == expected;
   }
-  if (sourceApp == MeshRegistry::Truth::applicationID)
-    return destinationApp == sourceApp && permission.purpose == ProdigyCousinServicePurpose::sibling &&
-        sourcePrefix == MeshRegistry::Truth::siblings && destinationPrefix == sourcePrefix &&
+  // Sibling role identity comes from each admitted application plan. The
+  // structural permission binds equal application-owned services; plan
+  // admission separately requires global mode or an existing legacy profile.
+  if (permission.purpose == ProdigyCousinServicePurpose::sibling)
+    return destinationApp == sourceApp && destinationPrefix == sourcePrefix &&
         permission.destinationShardGroup == 0 && permission.destinationShardGroups == 1 && slot == 0;
   // Retained graph peers are one-group, same-application, non-client roles.
   if (sourceApp != destinationApp || (sourceApp != 2 && sourceApp != 5) || sourcePrefix != destinationPrefix ||
       permission.destinationShardGroup != 0 || permission.destinationShardGroups != 1 || slot != 0) return false;
-  const uint64_t expected = permission.purpose == ProdigyCousinServicePurpose::sibling ?
-      (sourceApp == 2 ? MeshRegistry::Pulse::siblings : MeshRegistry::Radar::siblings) :
-      (sourceApp == 2 ? MeshRegistry::Pulse::seeding : MeshRegistry::Radar::seeding);
+  const uint64_t expected = sourceApp == 2 ? MeshRegistry::Pulse::seeding : MeshRegistry::Radar::seeding;
   return sourcePrefix == expected;
 }
 

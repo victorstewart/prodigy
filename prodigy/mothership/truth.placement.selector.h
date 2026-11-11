@@ -6,7 +6,7 @@
 #include <limits>
 #include <vector>
 
-namespace ProdigyTruthPlacement {
+namespace ProdigyGlobalSingleWriterPlacement {
 using ClusterID = __uint128_t;
 using MemberID = int32_t;
 

@@ -1,7 +1,7 @@
 #include <prodigy/mothership/truth.placement.selector.h>
 #include <cstdio>
 #include <cstdlib>
-using namespace ProdigyTruthPlacement;
+using namespace ProdigyGlobalSingleWriterPlacement;
 
 static void expect(bool value, const char* check) {
   if (!value) { std::fprintf(stderr, "FAIL %s\n", check); std::exit(1); }

@@ -70,9 +70,9 @@ def main():
         return p.stdout.splitlines() if p.returncode == 0 else []
 
     def inspect(member):
-        lines = call("truthGlobalControl", options.group, "inspect", str(member))
-        reports = [fields(s) for s in lines if s.startswith("truthGlobalControl success=1 ")]
-        rows = {int(m["member"]): m for m in (fields(s) for s in lines if s.startswith("truthCommittedMember "))}
+        lines = call("globalSingleWriterControl", options.group, "inspect", str(member))
+        reports = [fields(s) for s in lines if s.startswith("globalSingleWriterControl success=1 ")]
+        rows = {int(m["member"]): m for m in (fields(s) for s in lines if s.startswith("globalSingleWriterCommittedMember "))}
         return (reports[0], rows) if len(reports) == 1 else ({}, {})
 
     def inventory(cluster=None):
@@ -84,7 +84,7 @@ def main():
     def wait_for(description, observation, reconcile=True):
         while time.monotonic() < deadline:
             if reconcile:
-                call("reconcileTruth", options.group)
+                call("reconcileGlobalSingleWriter", options.group)
             result = observation()
             if result:
                 print(description, flush=True)

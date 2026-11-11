@@ -169,6 +169,35 @@ duplicate['apiCredentials']['requiredCredentialNames'] = ['token', 'token']
 cases.append(('duplicate-names', duplicate,
               'apiCredentials.requiredCredentialNames contains duplicate name'))
 
+# Exercise the actual Mothership stateful parser and shared mode validator.
+# A valid global plan stops at missing durable group admission, before RPCs.
+global_plan = copy.deepcopy(plan)
+global_plan['config']['type'] = 'ApplicationType::stateful'
+global_plan['isStateful'] = True
+del global_plan['stateless']
+global_plan['stateful'] = {
+    role + 'Prefix': (42 << 48) | (service << 40) | 1023
+    for role, service in [('client', 9), ('sibling', 11), ('cousin', 12), ('seeding', 13), ('sharding', 14)]
+}
+global_plan['stateful'].update(neverShard=True, allMasters=False, globalSingleWriter=True)
+cases.append(('global-app42', global_plan,
+              'deploy failed: global single-writer deployment requires an admitted group before dispatch'))
+local_plan = copy.deepcopy(global_plan)
+local_plan['stateful']['globalSingleWriter'] = False
+cases.append(('global-opt-out', local_plan, 'no file exists at containerPath provided'))
+invalid_mode = 'deploy failed: globalSingleWriter requires a stateful unsharded single-writer plan with distinct mesh roles and no hostnet or horizontal scalers'
+for name, field, value in [('global-allmasters', 'allMasters', True), ('global-sharded', 'neverShard', False),
+                            ('global-role-collision', 'siblingPrefix', global_plan['stateful']['clientPrefix'])]:
+    candidate = copy.deepcopy(global_plan)
+    candidate['stateful'][field] = value
+    cases.append((name, candidate, invalid_mode))
+wrong_type = copy.deepcopy(global_plan)
+wrong_type['stateful']['globalSingleWriter'] = 'true'
+cases.append(('global-bool-required', wrong_type, 'deploy failed: stateful.globalSingleWriter requires a bool'))
+hostnet = copy.deepcopy(global_plan)
+hostnet['useHostNetworkNamespace'] = True
+cases.append(('global-hostnet', hostnet, invalid_mode))
+
 try:
     for name, candidate, expected in cases:
         path = directory / (name + '.json')

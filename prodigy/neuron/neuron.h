@@ -6917,23 +6917,23 @@ public:
           Ring::queueSend(stream);
           break;
         }
-      case ContainerTopic::truthGlobalControl:
+      case ContainerTopic::globalSingleWriterControl:
         {
           String bytes; Message::extractToStringView(args,bytes);
-          ProdigyTruthGlobalControl report{};
+          ProdigyGlobalSingleWriterControl report{};
           auto* stream = brain;
           const bool localBrainAuthenticated = stream == brain && stream != nullptr && streamIsActive(stream) &&
               (stream->transportEncryptionEnabled() == false ||
                (stream->isTransportNegotiated() && stream->tlsPeerVerified));
-          if (args != terminal || !stream || container->pendingDestroy || container->plan.config.applicationID != 10 ||
-              !BitseryEngine::deserializeSafe(bytes,report) || !prodigyTruthControlReportValid(report) ||
+          if (args != terminal || !stream || container->pendingDestroy || !prodigyGlobalSingleWriterContainerPlanValid(container->plan) ||
+              !BitseryEngine::deserializeSafe(bytes,report) || !prodigyGlobalSingleWriterControlReportValid(report) ||
               report.containerUUID != container->plan.uuid || report.deploymentID != container->plan.config.deploymentID() ||
               report.localClusterUUID != controlTransportCredentials.self.clusterUUID ||
               !localBrainAuthenticated) {
-            basics_log("neuron truthGlobalControl reject stage=reply-validation member=%d\n", report.memberID);
+            basics_log("neuron globalSingleWriterControl reject stage=reply-validation member=%d\n", report.memberID);
             break;
           }
-          Message::construct(stream->wBuffer,NeuronTopic::truthGlobalControl,bytes);
+          Message::construct(stream->wBuffer,NeuronTopic::globalSingleWriterControl,bytes);
           Ring::queueSend(stream);
           break;
         }
@@ -9057,23 +9057,24 @@ public:
           Ring::queueSend(live->second);
           break;
         }
-      case NeuronTopic::truthGlobalControl:
+      case NeuronTopic::globalSingleWriterControl:
         {
           uint128_t uuid = 0; String bytes;
           Message::extractArg<ArgumentNature::fixed>(args,uuid); Message::extractToStringView(args,bytes);
           auto live = containers.find(uuid);
-          ProdigyTruthGlobalControl command{};
+          ProdigyGlobalSingleWriterControl command{};
           if (args != terminal || live == containers.end() || !live->second || live->second->pendingDestroy ||
-              live->second->plan.config.applicationID != 10 || !BitseryEngine::deserializeSafe(bytes,command) ||
-              !prodigyTruthControlRequestValid(command) || !command.exchangeUUID || command.containerUUID != uuid ||
-              !prodigyTruthControlForProjection(command,command.bindings) ||
+              !prodigyGlobalSingleWriterContainerPlanValid(live->second->plan) || !BitseryEngine::deserializeSafe(bytes,command) ||
+              !prodigyGlobalSingleWriterControlRequestValid(command) || !command.exchangeUUID || command.containerUUID != uuid ||
+              !prodigyGlobalSingleWriterControlForProjection(command,command.bindings) ||
+              command.membershipUUID != live->second->plan.globalSingleWriterMembership.membershipUUID ||
               command.localClusterUUID != controlTransportCredentials.self.clusterUUID ||
               command.deploymentID != live->second->plan.config.deploymentID() ||
               !streamIsActive(live->second)) {
-            basics_log("neuron truthGlobalControl reject stage=request-validation member=%d\n", command.memberID);
+            basics_log("neuron globalSingleWriterControl reject stage=request-validation member=%d\n", command.memberID);
             break;
           }
-          Message::construct(live->second->wBuffer,ContainerTopic::truthGlobalControl,bytes);
+          Message::construct(live->second->wBuffer,ContainerTopic::globalSingleWriterControl,bytes);
           Ring::queueSend(live->second);
           break;
         }

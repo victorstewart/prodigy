@@ -682,9 +682,143 @@ static void expectWireRoundTrip(TestSuite& suite, const T& expected, const char 
   suite.expect(equal(expected, decoded), roundTripName);
 }
 
+// Keep the pre-global-mode layout independent of the new serializer so the
+// compatibility test detects changes to any existing stateful-plan byte.
+struct LegacyStatefulDeploymentPlan {
+  StatefulDeploymentPlan plan = {};
+};
+template<class S> static void serialize(S&& serializer, LegacyStatefulDeploymentPlan& legacy)
+{
+  auto& plan = legacy.plan;
+  serializer.value8b(plan.clientPrefix); serializer.value8b(plan.siblingPrefix);
+  serializer.value8b(plan.cousinPrefix); serializer.value8b(plan.seedingPrefix); serializer.value8b(plan.shardingPrefix);
+  serializer.value1b(plan.allowUpdateInPlace); serializer.value1b(plan.seedingAlways);
+  serializer.value1b(plan.neverShard); serializer.value1b(plan.allMasters);
+}
+
+static DeploymentPlan makeGlobalSingleWriterPlan()
+{
+  DeploymentPlan plan = {};
+  plan.config.applicationID = 42; plan.config.versionID = 7; plan.config.type = ApplicationType::stateful;
+  plan.config.nLogicalCores = 1; plan.config.memoryMB = 64; plan.config.storageMB = 64;
+  plan.config.containerBlobSHA256.assign("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
+  plan.config.containerBlobBytes = 1;
+  plan.isStateful = true; plan.stateful.neverShard = true; plan.stateful.globalSingleWriter = true;
+  // Deliberately use application-owned service IDs, not Truth's defaults.
+  plan.stateful.clientPrefix = prodigyRuntimeStatefulServicePrefix(42, 9);
+  plan.stateful.siblingPrefix = prodigyRuntimeStatefulServicePrefix(42, 11);
+  plan.stateful.cousinPrefix = prodigyRuntimeStatefulServicePrefix(42, 12);
+  plan.stateful.seedingPrefix = prodigyRuntimeStatefulServicePrefix(42, 13);
+  plan.stateful.shardingPrefix = prodigyRuntimeStatefulServicePrefix(42, 14);
+  return plan;
+}
+
+static void testGlobalSingleWriterPlan(TestSuite& suite)
+{
+  static_assert(uint16_t(MothershipTopic::commitGlobalSingleWriterMembership) == 70);
+  static_assert(uint16_t(MothershipTopic::globalSingleWriterPlacement) == 71);
+  static_assert(uint16_t(MothershipTopic::globalSingleWriterControl) == 72);
+  static_assert(uint16_t(NeuronTopic::globalSingleWriterControl) == 76);
+  static_assert(uint16_t(ContainerTopic::globalSingleWriterControl) == 33);
+  const auto plan = makeGlobalSingleWriterPlan();
+  suite.expect(prodigyGlobalSingleWriterPlanValid(plan), "global_single_writer_non_truth_plan_valid");
+  String bytes = {}; DeploymentPlan decoded = {};
+  BitseryEngine::serialize(bytes, plan);
+  suite.expect(BitseryEngine::deserializeSafe(bytes, decoded) && prodigyGlobalSingleWriterPlanValid(decoded) &&
+      decoded.stateful.siblingPrefix == plan.stateful.siblingPrefix && !decoded.stateful.allMasters,
+      "global_single_writer_non_truth_plan_roundtrip");
+
+  auto reject = [&](DeploymentPlan invalid, const char* name) {
+    bytes.clear(); BitseryEngine::serialize(bytes, invalid); decoded = {};
+    suite.expect(!prodigyGlobalSingleWriterPlanValid(invalid) && !BitseryEngine::deserializeSafe(bytes, decoded), name);
+  };
+  auto invalid = plan; invalid.stateful.allMasters = true; reject(invalid, "global_single_writer_rejects_all_masters");
+  invalid = plan; invalid.isStateful = false; reject(invalid, "global_single_writer_rejects_stateless_plan");
+  invalid = plan; invalid.config.type = ApplicationType::stateless; reject(invalid, "global_single_writer_rejects_stateless_application");
+  invalid = plan; invalid.stateful.neverShard = false; reject(invalid, "global_single_writer_rejects_sharding");
+  invalid = plan; invalid.horizontalScalers.push_back(HorizontalScaler{}); reject(invalid, "global_single_writer_rejects_horizontal_growth");
+  invalid = plan; invalid.useHostNetworkNamespace = true; reject(invalid, "global_single_writer_rejects_host_network");
+  invalid = plan; invalid.config.applicationID = 0; reject(invalid, "global_single_writer_rejects_missing_application");
+  invalid = plan; invalid.config.versionID = 0; reject(invalid, "global_single_writer_rejects_missing_version");
+  invalid = plan; invalid.stateful.siblingPrefix = prodigyRuntimeStatefulServicePrefix(43, 11);
+  reject(invalid, "global_single_writer_rejects_foreign_sibling_service");
+  invalid = plan; invalid.stateful.clientPrefix = invalid.stateful.siblingPrefix;
+  reject(invalid, "global_single_writer_rejects_aliased_service_roles");
+
+  auto publicSibling = plan; publicSibling.whiteholes = {Whitehole{}, Whitehole{}, Whitehole{}};
+  ProdigyLocalCousinServicePermission permission = {};
+  permission.protocolVersion = ProdigyLocalCousinServicePermission::purposeVersion;
+  permission.localHalf = CousinRouteHalf::source; permission.purpose = ProdigyCousinServicePurpose::sibling;
+  permission.localApplicationID = permission.peerApplicationID = plan.config.applicationID;
+  permission.localDeploymentID = permission.peerDeploymentID = plan.config.deploymentID();
+  permission.localCousinServicePrefix = permission.peerCousinServicePrefix = plan.stateful.siblingPrefix;
+  permission.permissionUUID = 1; permission.pairUUID = 2; permission.logicalWorkloadUUID = 3; permission.logicalServiceUUID = 4;
+  permission.localClusterUUID = 5; permission.peerClusterUUID = 6;
+  permission.generation = permission.acceptedAuthorityGeneration = 1;
+  permission.slots.insert(0); permission.destinationShardGroups = 1;
+  permission.authorizedService = MeshServices::constrainPrefixToGroup(plan.stateful.siblingPrefix, 0);
+  permission.baselineLogicalCores = plan.config.nLogicalCores;
+  permission.baselineMemoryMB = plan.config.memoryMB; permission.baselineStorageMB = plan.config.storageMB;
+  permission.artifactSHA256 = permission.peerArtifactSHA256 = plan.config.containerBlobSHA256;
+  permission.artifactBytes = permission.peerArtifactBytes = plan.config.containerBlobBytes;
+  String permissionPlanBytes = {}; BitseryEngine::serialize(permissionPlanBytes, plan);
+  suite.expect(prodigyComputeSHA256Hex(permissionPlanBytes, permission.canonicalPlanSHA256),
+      "global_single_writer_permission_hashes_exact_admitted_plan");
+  permission.peerCanonicalPlanSHA256 = permission.canonicalPlanSHA256;
+  suite.expect(prodigyLocalCousinServicePermissionValid(permission),
+      "global_single_writer_app42_sibling_permission_structurally_valid");
+  suite.expect(prodigyCousinPermissionPlanServiceMatches(permission,plan),
+      "global_single_writer_app42_sibling_permission_matches_explicit_global_plan");
+  auto optedOut = plan; optedOut.stateful.globalSingleWriter = false;
+  suite.expect(!prodigyCousinPermissionPlanServiceMatches(permission,optedOut),
+      "global_single_writer_app42_sibling_permission_rejects_plan_opt_out");
+  ++permission.peerDeploymentID;
+  suite.expect(prodigyLocalCousinServicePermissionValid(permission) && !prodigyCousinPermissionPlanServiceMatches(permission,plan),
+      "global_single_writer_app42_sibling_permission_requires_same_peer_deployment");
+  --permission.peerDeploymentID;
+  suite.expect(prodigyGlobalSingleWriterSiblingWhiteholePlanValid(permission,publicSibling),
+      "global_single_writer_sibling_pool_uses_admitted_application_prefix");
+  ++permission.peerDeploymentID;
+  suite.expect(!prodigyGlobalSingleWriterSiblingWhiteholePlanValid(permission,publicSibling),
+      "global_single_writer_sibling_pool_rejects_foreign_deployment");
+  --permission.peerDeploymentID; publicSibling.whiteholes.push_back(Whitehole{});
+  suite.expect(!prodigyGlobalSingleWriterSiblingWhiteholePlanValid(permission,publicSibling),
+      "global_single_writer_sibling_pool_remains_bounded");
+
+  auto mode = plan.stateful;
+  mode.globalSingleWriter = false;
+  for (bool allMasters : {false, true}) {
+    mode.allMasters = allMasters;
+    LegacyStatefulDeploymentPlan legacy{mode}; String oldBytes = {}, newBytes = {};
+    BitseryEngine::serialize(oldBytes, legacy); BitseryEngine::serialize(newBytes, mode);
+    StatefulDeploymentPlan restored = {}; restored.globalSingleWriter = true;
+    suite.expect(oldBytes == newBytes && BitseryEngine::deserializeSafe(oldBytes, restored) &&
+        restored.allMasters == allMasters && !restored.globalSingleWriter,
+        allMasters ? "all_masters_plan_preserves_legacy_bytes" : "local_writer_plan_preserves_legacy_bytes");
+  }
+  mode = plan.stateful; bytes.clear(); BitseryEngine::serialize(bytes, mode);
+  suite.expect(bytes.size() == 44 && bytes[43] == 2, "global_single_writer_uses_reserved_writer_byte");
+  LegacyStatefulDeploymentPlan legacy = {};
+  const bool legacyAccepted = BitseryEngine::deserializeSafe(bytes, legacy);
+  uint8_t legacyByte = 0; std::memcpy(&legacyByte, &legacy.plan.allMasters, 1);
+  suite.expect(legacyAccepted && legacyByte == 2 && ProdigyGlobalSingleWriterMinimumVersion == 67,
+      "global_single_writer_requires_version_fence_for_raw_legacy_bool_decoder");
+  for (uint8_t unsupported : {uint8_t(3), uint8_t(255)}) {
+    auto malformed = bytes; malformed[43] = unsupported;
+    StatefulDeploymentPlan restored = {};
+    suite.expect(!BitseryEngine::deserializeSafe(malformed, restored), "global_single_writer_rejects_unknown_writer_mode");
+  }
+  auto local = plan; local.stateful.globalSingleWriter = false;
+  suite.expect(!prodigyGlobalSingleWriterPlanValid(local), "global_single_writer_requires_explicit_opt_in");
+  local.stateful.allowUpdateInPlace = true;
+  suite.expect(!prodigyMaterializedStatefulRecoveryPlansAreCompatible(plan, local),
+      "global_single_writer_mode_cannot_change_during_materialized_recovery");
+}
+
 int main(void)
 {
   TestSuite suite;
+  testGlobalSingleWriterPlan(suite);
 
   {
     ProdigyStatelessDeploymentAdmission admission = {};
@@ -1007,14 +1141,14 @@ int main(void)
 
   {
     ContainerParameters params{};
-    params.deploymentID = (uint64_t(10) << 48) | 7;
-    auto& group = params.truthMembership;
+    params.deploymentID = (uint64_t(42) << 48) | 7;
+    auto& group = params.globalSingleWriterMembership;
     group.protocolVersion = 1; group.genesisMemberIDs = {1, 2, 3}; group.highestAllocatedMemberID = 3;
     group.membershipUUID = 15; group.operationUUID = 16; group.localClusterUUID = 17;
     group.deploymentID = params.deploymentID; group.generation = 1; group.expectedCommittedConfigIndex = 22;
     group.expectedCommittedConfigSHA256.assign("1111111111111111111111111111111111111111111111111111111111111111"_ctv);
     for (int i = 1; i <= 3; ++i) {
-      TruthGlobalMember member{}; member.memberID = i; member.clusterUUID = group.localClusterUUID;
+      GlobalSingleWriterMember member{}; member.memberID = i; member.clusterUUID = group.localClusterUUID;
       member.containerUUID = 100 + i; member.privateIPv6 = IPAddress(uint128_t(i));
       group.members.push_back(member);
     }
@@ -1022,41 +1156,80 @@ int main(void)
     String bytes; ContainerParameters decoded{};
     suite.expect(ProdigyWire::serializeContainerParameters(bytes, params) &&
         ProdigyWire::deserializeContainerParameters(bytes, decoded) &&
-        decoded.truthMembership.members.size() == 3 && decoded.truthMembership.genesisMemberIDs == group.genesisMemberIDs &&
-        decoded.truthMembership.membershipUUID == group.membershipUUID,
-        "three Truth identities survive startup wire");
+        decoded.globalSingleWriterMembership.members.size() == 3 && decoded.globalSingleWriterMembership.genesisMemberIDs == group.genesisMemberIDs &&
+        decoded.globalSingleWriterMembership.membershipUUID == group.membershipUUID,
+        "three non-Truth global identities survive startup wire");
     if (bytes.size()) bytes.resize(bytes.size()-1);
-    suite.expect(!ProdigyWire::deserializeContainerParameters(bytes,decoded),"reject truncated Truth projection");
+    suite.expect(!ProdigyWire::deserializeContainerParameters(bytes,decoded),"reject truncated global membership projection");
     ProdigyMasterAuthorityRuntimeState state{}, restored{};
-    state.generation = 2; state.truthGlobalMembershipProjections.push_back(group);
+    state.generation = 2; state.globalSingleWriterMembershipProjections.push_back(group);
     bytes.clear(); BitseryEngine::serialize(bytes,state);
-    suite.expect(BitseryEngine::deserializeSafe(bytes,restored) && restored.truthGlobalMembershipProjections.size()==1 &&
-        restored.truthGlobalMembershipProjections[0].members.size()==3, "durable Truth projection round trip");
+    suite.expect(BitseryEngine::deserializeSafe(bytes,restored) && restored.globalSingleWriterMembershipProjections.size()==1 &&
+        restored.globalSingleWriterMembershipProjections[0].members.size()==3, "durable non-Truth global projection round trip");
+    auto secondGroup = group; ++secondGroup.membershipUUID; ++secondGroup.deploymentID;
+    state.globalSingleWriterMembershipProjections.push_back(secondGroup); bytes.clear(); BitseryEngine::serialize(bytes,state);
+    suite.expect(BitseryEngine::deserializeSafe(bytes,restored) && restored.globalSingleWriterMembershipProjections.size()==2,
+                 "independent global groups share one durable authority");
+    state.globalSingleWriterMembershipProjections.back().membershipUUID = group.membershipUUID;
+    bytes.clear(); BitseryEngine::serialize(bytes,state);
+    suite.expect(!BitseryEngine::deserializeSafe(bytes,restored), "duplicate global group identity is rejected");
+    state.globalSingleWriterMembershipProjections.back() = secondGroup;
+    state.globalSingleWriterMembershipProjections.back().deploymentID = group.deploymentID;
+    bytes.clear(); BitseryEngine::serialize(bytes,state);
+    suite.expect(!BitseryEngine::deserializeSafe(bytes,restored), "duplicate global deployment binding is rejected");
+    auto unbound = group; unbound.deploymentID = 7;
+    suite.expect(!prodigyGlobalSingleWriterMembershipProjectionValid(unbound), "global membership requires application identity");
+    unbound = group; unbound.deploymentID = uint64_t(42) << 48;
+    suite.expect(!prodigyGlobalSingleWriterMembershipProjectionValid(unbound), "global membership requires exact deployment version");
+    suite.expect(!prodigyGlobalSingleWriterLocalMember(group,group.deploymentID+1,params.uuid), "global launch rejects wrong deployment");
+    NeuronContainerBootstrap bootstrap = {}, restoredBootstrap = {};
+    bootstrap.plan.uuid = params.uuid; bootstrap.plan.config = makeGlobalSingleWriterPlan().config;
+    bootstrap.plan.isStateful = true; bootstrap.plan.nShardGroups = 1;
+    bootstrap.plan.statefulMeshRoles = StatefulMeshRoles::forShardGroup(makeGlobalSingleWriterPlan().stateful, 42, 0);
+    bootstrap.plan.globalSingleWriterMembership = group;
+    bytes.clear(); BitseryEngine::serialize(bytes,bootstrap);
+    suite.expect(BitseryEngine::deserializeSafe(bytes,restoredBootstrap) &&
+        prodigyGlobalSingleWriterContainerPlanValid(restoredBootstrap.plan), "non_truth_global_neuron_bootstrap_roundtrip");
+    bootstrap.plan.nShardGroups = 2; bytes.clear(); BitseryEngine::serialize(bytes,bootstrap);
+    suite.expect(!BitseryEngine::deserializeSafe(bytes,restoredBootstrap), "global_neuron_bootstrap_rejects_multiple_shards");
+    bootstrap.plan.nShardGroups = 1; bootstrap.plan.isStateful = false; bytes.clear(); BitseryEngine::serialize(bytes,bootstrap);
+    suite.expect(!BitseryEngine::deserializeSafe(bytes,restoredBootstrap), "global_neuron_bootstrap_rejects_stateless_launch");
+    ProdigyGlobalSingleWriterControl report = {};
+    report.response = report.success = report.provisioned = true; report.exchangeUUID = 1; report.bootNonce = 2;
+    report.membershipUUID = group.membershipUUID; report.operationUUID = group.operationUUID;
+    report.localClusterUUID = group.localClusterUUID; report.containerUUID = params.uuid; report.memberID = 1;
+    report.deploymentID = group.deploymentID; report.generation = 1; report.committedConfigIndex = report.appliedIndex = 3;
+    report.term = 1; report.leaderMemberID = 1; report.members = group.members;
+    suite.expect(prodigyGlobalSingleWriterCommittedConfigDigest(report.membershipUUID,report.deploymentID,report.committedConfigIndex,
+        report.members,report.committedConfigSHA256) && prodigyGlobalSingleWriterControlReportValid(report),
+        "non_truth_committed_quorum_report_valid");
+    ++report.deploymentID;
+    suite.expect(!prodigyGlobalSingleWriterControlReportValid(report), "global report digest binds exact deployment");
     auto successor = group;
     ++successor.generation;
     ++successor.members[0].containerUUID;
-    suite.expect(!prodigyTruthMembershipSuccessor(group, successor), "an existing vote cannot move to another container");
+    suite.expect(!prodigyGlobalSingleWriterMembershipSuccessor(group, successor), "an existing vote cannot move to another container");
     successor = group;
     successor.genesisMemberIDs = {2, 3, 4};
-    suite.expect(!prodigyTruthMembershipSuccessor(group, successor), "genesis is immutable after replacement");
+    suite.expect(!prodigyGlobalSingleWriterMembershipSuccessor(group, successor), "genesis is immutable after replacement");
     successor = group;
     successor.highestAllocatedMemberID = 4;
     successor.retiredMemberIDs = {1};
     successor.members.erase(successor.members.begin());
     auto fresh = group.members[0]; fresh.memberID = 4; fresh.containerUUID = 104; fresh.privateIPv6 = IPAddress(uint128_t(4));
     successor.members.push_back(fresh);
-    suite.expect(prodigyTruthGlobalMembershipProjectionValid(successor) && prodigyTruthMembershipSuccessor(group, successor),
+    suite.expect(prodigyGlobalSingleWriterMembershipProjectionValid(successor) && prodigyGlobalSingleWriterMembershipSuccessor(group, successor),
                  "fresh voter supersedes retired binding");
     auto intermediate = successor;
-    intermediate.members.back().role = TruthGlobalMemberRole::learner;
-    suite.expect(!prodigyTruthGlobalMembershipProjectionValid(intermediate), "two voters require a replacement in progress");
+    intermediate.members.back().role = GlobalSingleWriterMemberRole::learner;
+    suite.expect(!prodigyGlobalSingleWriterMembershipProjectionValid(intermediate), "two voters require a replacement in progress");
     intermediate.replacementPending = true;
-    suite.expect(prodigyTruthGlobalMembershipProjectionValid(intermediate), "removed voter and caught-up learner before promotion");
+    suite.expect(prodigyGlobalSingleWriterMembershipProjectionValid(intermediate), "removed voter and caught-up learner before promotion");
     successor.retiredMemberIDs.clear();
     auto recycled = group; recycled.highestAllocatedMemberID = 4;
-    suite.expect(!prodigyTruthMembershipSuccessor(successor, recycled), "retired voter remains fenced after cleanup");
+    suite.expect(!prodigyGlobalSingleWriterMembershipSuccessor(successor, recycled), "retired voter remains fenced after cleanup");
     group.retiredMemberIDs.push_back(1); bytes.clear();
-    suite.expect(!ProdigyWire::serializeContainerParameters(bytes,params),"retired Truth voter cannot be projected");
+    suite.expect(!ProdigyWire::serializeContainerParameters(bytes,params),"retired global voter cannot be projected");
   }
 
   {
@@ -1628,84 +1801,84 @@ int main(void)
             reinterpret_cast<uint8_t *>(taskResult.data()),
             reinterpret_cast<uint8_t *>(taskResult.data() + taskResult.size())),
         "task_result_valid_for_neuron");
-    // Global Truth control is a normal bounded control exchange at every
+    // Global single-writer control is a normal bounded exchange at every
     // boundary.  Exercise each production direction with a real encoded
     // request, not a hand-built variable-length payload.
-    ProdigyTruthGlobalControl truthControl = {};
-    truthControl.action = TruthControlAction::inspect;
-    truthControl.membershipUUID = 1; truthControl.operationUUID = 2;
-    truthControl.localClusterUUID = 3; truthControl.containerUUID = 4;
-    truthControl.deploymentID = (uint64_t(10) << 48) | 1;
-    truthControl.memberID = 1;
-    suite.expect(prodigyTruthControlRequestValid(truthControl), "truth_global_control_fixture_is_valid_request");
-    String truthControlPayload = {};
-    suite.expect(BitseryEngine::serialize(truthControlPayload, truthControl), "truth_global_control_fixture_encodes");
-    frame.clear(); Message::construct(frame, MothershipTopic::truthGlobalControl, truthControlPayload);
+    ProdigyGlobalSingleWriterControl globalControl = {};
+    globalControl.action = GlobalSingleWriterControlAction::inspect;
+    globalControl.membershipUUID = 1; globalControl.operationUUID = 2;
+    globalControl.localClusterUUID = 3; globalControl.containerUUID = 4;
+    globalControl.deploymentID = (uint64_t(42) << 48) | 1;
+    globalControl.memberID = 1;
+    suite.expect(prodigyGlobalSingleWriterControlRequestValid(globalControl), "global_single_writer_control_fixture_is_valid_request");
+    String globalControlPayload = {};
+    suite.expect(BitseryEngine::serialize(globalControlPayload, globalControl), "global_single_writer_control_fixture_encodes");
+    frame.clear(); Message::construct(frame, MothershipTopic::globalSingleWriterControl, globalControlPayload);
     message = reinterpret_cast<Message *>(frame.data());
     suite.expect(ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal()),
-                 "truth_global_control_mothership_ingress_accepts_encoded_frame");
+                 "global_single_writer_control_mothership_ingress_accepts_encoded_frame");
     suite.expect(!ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal() - 1),
-                 "truth_global_control_mothership_ingress_rejects_truncated_frame");
+                 "global_single_writer_control_mothership_ingress_rejects_truncated_frame");
 
-    frame.clear(); Message::construct(frame, NeuronTopic::truthGlobalControl, truthControlPayload);
+    frame.clear(); Message::construct(frame, NeuronTopic::globalSingleWriterControl, globalControlPayload);
     message = reinterpret_cast<Message *>(frame.data());
     suite.expect(ProdigyIngressValidation::validateNeuronPayloadForBrain(message->topic, message->args, message->terminal()),
-                 "truth_global_control_neuron_to_brain_accepts_encoded_frame");
+                 "global_single_writer_control_neuron_to_brain_accepts_encoded_frame");
     suite.expect(!ProdigyIngressValidation::validateNeuronPayloadForBrain(message->topic, message->args, message->terminal() - 1),
-                 "truth_global_control_neuron_to_brain_rejects_truncated_frame");
-    frame.clear(); Message::construct(frame, NeuronTopic::truthGlobalControl, truthControl.containerUUID, truthControlPayload);
+                 "global_single_writer_control_neuron_to_brain_rejects_truncated_frame");
+    frame.clear(); Message::construct(frame, NeuronTopic::globalSingleWriterControl, globalControl.containerUUID, globalControlPayload);
     message = reinterpret_cast<Message *>(frame.data());
     suite.expect(ProdigyIngressValidation::validateNeuronPayloadForNeuron(message->topic, message->args, message->terminal()),
-                 "truth_global_control_brain_to_neuron_accepts_encoded_frame");
+                 "global_single_writer_control_brain_to_neuron_accepts_encoded_frame");
     suite.expect(!ProdigyIngressValidation::validateNeuronPayloadForNeuron(message->topic, message->args, message->terminal() - 1),
-                 "truth_global_control_brain_to_neuron_rejects_truncated_frame");
+                 "global_single_writer_control_brain_to_neuron_rejects_truncated_frame");
 
-    frame.clear(); Message::construct(frame, ContainerTopic::truthGlobalControl, truthControlPayload);
+    frame.clear(); Message::construct(frame, ContainerTopic::globalSingleWriterControl, globalControlPayload);
     message = reinterpret_cast<Message *>(frame.data());
     suite.expect(ProdigyIngressValidation::validateContainerPayloadForNeuron(message->topic, message->args, message->terminal()),
-                 "truth_global_control_container_to_neuron_accepts_encoded_frame");
+                 "global_single_writer_control_container_to_neuron_accepts_encoded_frame");
     suite.expect(!ProdigyIngressValidation::validateContainerPayloadForNeuron(message->topic, message->args, message->terminal() - 1),
-                 "truth_global_control_container_to_neuron_rejects_truncated_frame");
+                 "global_single_writer_control_container_to_neuron_rejects_truncated_frame");
     suite.expect(ProdigyIngressValidation::validateContainerPayloadForHub(message->topic, message->args, message->terminal()),
-                 "truth_global_control_neuron_to_container_accepts_encoded_frame");
+                 "global_single_writer_control_neuron_to_container_accepts_encoded_frame");
     suite.expect(!ProdigyIngressValidation::validateContainerPayloadForHub(message->topic, message->args, message->terminal() - 1),
-                 "truth_global_control_neuron_to_container_rejects_truncated_frame");
+                 "global_single_writer_control_neuron_to_container_rejects_truncated_frame");
 
-    String truthControlAtCap;
+    String globalControlAtCap;
     std::array<uint8_t, 16 * 1024> capBytes{};
-    truthControlAtCap.assign(capBytes.data(), capBytes.size());
-    auto truthControlCapChecks = [&](const char *name, auto topic, auto validator, bool withContainer) {
+    globalControlAtCap.assign(capBytes.data(), capBytes.size());
+    auto globalControlCapChecks = [&](const char *name, auto topic, auto validator, bool withContainer) {
       frame.clear();
-      if (withContainer) Message::construct(frame, topic, truthControl.containerUUID, truthControlAtCap);
-      else Message::construct(frame, topic, truthControlAtCap);
+      if (withContainer) Message::construct(frame, topic, globalControl.containerUUID, globalControlAtCap);
+      else Message::construct(frame, topic, globalControlAtCap);
       message = reinterpret_cast<Message *>(frame.data());
       suite.expect(validator(message->topic, message->args, message->terminal()), name);
-      truthControlAtCap.append(uint8_t(0));
+      globalControlAtCap.append(uint8_t(0));
       frame.clear();
-      if (withContainer) Message::construct(frame, topic, truthControl.containerUUID, truthControlAtCap);
-      else Message::construct(frame, topic, truthControlAtCap);
+      if (withContainer) Message::construct(frame, topic, globalControl.containerUUID, globalControlAtCap);
+      else Message::construct(frame, topic, globalControlAtCap);
       message = reinterpret_cast<Message *>(frame.data());
-      suite.expect(!validator(message->topic, message->args, message->terminal()), "truth_global_control_rejects_over_16k");
-      truthControlAtCap.resize(truthControlAtCap.size() - 1);
+      suite.expect(!validator(message->topic, message->args, message->terminal()), "global_single_writer_control_rejects_over_16k");
+      globalControlAtCap.resize(globalControlAtCap.size() - 1);
     };
     // The two remaining families have distinct direction validators; Mothership
     // is checked explicitly because its topic is not a Neuron/Container enum.
-    frame.clear(); Message::construct(frame, MothershipTopic::truthGlobalControl, truthControlAtCap);
+    frame.clear(); Message::construct(frame, MothershipTopic::globalSingleWriterControl, globalControlAtCap);
     message = reinterpret_cast<Message *>(frame.data());
     suite.expect(ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal()),
-                 "truth_global_control_mothership_accepts_16k");
-    truthControlAtCap.append(uint8_t(0)); frame.clear(); Message::construct(frame, MothershipTopic::truthGlobalControl, truthControlAtCap);
+                 "global_single_writer_control_mothership_accepts_16k");
+    globalControlAtCap.append(uint8_t(0)); frame.clear(); Message::construct(frame, MothershipTopic::globalSingleWriterControl, globalControlAtCap);
     message = reinterpret_cast<Message *>(frame.data());
     suite.expect(!ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal()),
-                 "truth_global_control_mothership_rejects_over_16k");
-    truthControlAtCap.resize(truthControlAtCap.size() - 1);
-    truthControlCapChecks("truth_global_control_neuron_to_brain_accepts_16k", NeuronTopic::truthGlobalControl,
+                 "global_single_writer_control_mothership_rejects_over_16k");
+    globalControlAtCap.resize(globalControlAtCap.size() - 1);
+    globalControlCapChecks("global_single_writer_control_neuron_to_brain_accepts_16k", NeuronTopic::globalSingleWriterControl,
         ProdigyIngressValidation::validateNeuronPayloadForBrain, false);
-    truthControlCapChecks("truth_global_control_brain_to_neuron_accepts_16k", NeuronTopic::truthGlobalControl,
+    globalControlCapChecks("global_single_writer_control_brain_to_neuron_accepts_16k", NeuronTopic::globalSingleWriterControl,
         ProdigyIngressValidation::validateNeuronPayloadForNeuron, true);
-    truthControlCapChecks("truth_global_control_container_to_neuron_accepts_16k", ContainerTopic::truthGlobalControl,
+    globalControlCapChecks("global_single_writer_control_container_to_neuron_accepts_16k", ContainerTopic::globalSingleWriterControl,
         ProdigyIngressValidation::validateContainerPayloadForNeuron, false);
-    truthControlCapChecks("truth_global_control_neuron_to_container_accepts_16k", ContainerTopic::truthGlobalControl,
+    globalControlCapChecks("global_single_writer_control_neuron_to_container_accepts_16k", ContainerTopic::globalSingleWriterControl,
         ProdigyIngressValidation::validateContainerPayloadForHub, false);
     // New control topics use the ordinary bounded variable framing. These
     // tests pass explicit frame bounds so truncation/trailing bytes cannot be

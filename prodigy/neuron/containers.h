@@ -13851,7 +13851,7 @@ public:
         parameters.whiteholes = container->plan.whiteholes;
         parameters.statefulMeshRoles = container->plan.statefulMeshRoles;
         parameters.statefulTopology = container->plan.statefulTopology;
-        parameters.truthMembership = container->plan.truthMembership;
+        parameters.globalSingleWriterMembership = container->plan.globalSingleWriterMembership;
         // This is a private startup port declaration, not a mesh advertisement.
         // Catchup starts with client role zero; only authenticated writeOwner
         // may install this already-bound IPv6 listener at the application.

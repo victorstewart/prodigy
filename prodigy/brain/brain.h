@@ -2266,13 +2266,13 @@ public:
     RoutableResourceLeaseReport *inlineResponse = nullptr;
     uint32_t outstanding = 0;
   };
-  struct PendingTruthControl {
-    ProdigyTruthGlobalControl command;
+  struct PendingGlobalSingleWriterControl {
+    ProdigyGlobalSingleWriterControl command;
     Mothership* stream;
     uint64_t streamIncarnation, epoch, neuronGeneration, crashes;
     int64_t deadlineMs;
   };
-  bytell_hash_map<uint128_t, PendingTruthControl> pendingTruthControls;
+  bytell_hash_map<uint128_t, PendingGlobalSingleWriterControl> pendingGlobalSingleWriterControls;
 
   class PendingContainerLogs
   {
@@ -9640,27 +9640,30 @@ public:
     return false;
   }
 
-  void replyTruthControl(Mothership* stream, const ProdigyTruthGlobalControl& source, const char* error = nullptr) {
+  void replyGlobalSingleWriterControl(Mothership* stream, const ProdigyGlobalSingleWriterControl& source, const char* error = nullptr) {
     auto response = source;
     response.bindings = {.protocolVersion = 0};
     response.response = true;
     if (error) { response.success = false; response.failure.assign(error); }
     String encoded;
     if (BitseryEngine::serialize(encoded,response)) {
-      Message::construct(stream->wBuffer,MothershipTopic::truthGlobalControl,encoded);
+      Message::construct(stream->wBuffer,MothershipTopic::globalSingleWriterControl,encoded);
       (void)flushActiveMothershipSendBuffer(stream,"truth-control");
     }
   }
 
-  bool applyTruthPlacement(ProdigyTruthPlacementExchange& r) {
+  bool applyGlobalSingleWriterPlacement(ProdigyGlobalSingleWriterPlacementExchange& r) {
     if (!weAreMaster || !ignited || !masterAuthorityRuntimeStateDurable || masterAuthorityPersistencePending ||
         durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation || r.success ||
-        !r.membershipUUID || r.localClusterUUID != brainConfig.clusterUUID || uint16_t(r.deploymentID >> 48) != 10)
+        !r.membershipUUID || r.localClusterUUID != brainConfig.clusterUUID || !prodigyGlobalSingleWriterDeploymentIDValid(r.deploymentID))
       return false;
-    TruthGlobalMembershipProjection current;
-    const bool exists = desiredTruthGlobalMembership(r.deploymentID,current);
+    GlobalSingleWriterMembershipProjection current;
+    const bool exists = desiredGlobalSingleWriterMembership(r.deploymentID,current);
     if (exists && current.membershipUUID != r.membershipUUID) return false;
-    if (r.action == TruthPlacementAction::offerAddress) {
+    auto livePlan = deployments.find(r.deploymentID);
+    if (livePlan != deployments.end() && (!livePlan->second ||
+        !prodigyGlobalSingleWriterPlanValid(livePlan->second->plan))) return false;
+    if (r.action == GlobalSingleWriterPlacementAction::offerAddress) {
       if (r.member.memberID <= 0 || !r.member.containerUUID || r.member.clusterUUID != r.localClusterUUID) return false;
       // An offer is advisory. The scheduler rechecks and claims the fragment
       // through Machine at launch. Never substitute another endpoint.
@@ -9695,11 +9698,11 @@ public:
     if (!exists || r.generation != current.generation || r.committedConfigIndex != current.expectedCommittedConfigIndex ||
         r.committedConfigSHA256 != current.expectedCommittedConfigSHA256) return false;
     auto deployed = deployments.find(r.deploymentID);
-    if (deployed == deployments.end() || !deployed->second) return false;
-    if (r.action == TruthPlacementAction::reconcile) return deployed->second->reconcileTruthPlacement(current);
-    if (r.action != TruthPlacementAction::retire || r.member.clusterUUID != brainConfig.clusterUUID ||
+    if (deployed == deployments.end() || !deployed->second || !prodigyGlobalSingleWriterPlanValid(deployed->second->plan)) return false;
+    if (r.action == GlobalSingleWriterPlacementAction::reconcile) return deployed->second->reconcileGlobalSingleWriterPlacement(current);
+    if (r.action != GlobalSingleWriterPlacementAction::retire || r.member.clusterUUID != brainConfig.clusterUUID ||
         !std::binary_search(current.retiredMemberIDs.begin(),current.retiredMemberIDs.end(),r.member.memberID)) return false;
-    if (!deployed->second->reconcileTruthPlacement(current,&r.member)) {
+    if (!deployed->second->reconcileGlobalSingleWriterPlacement(current,&r.member)) {
       r.failure.assign("retired container does not match its placement or its Neuron is unavailable"_ctv);
       return false;
     }
@@ -9713,44 +9716,46 @@ public:
     return false;
   }
 
-  void beginTruthControl(Mothership* stream, ProdigyTruthGlobalControl command) {
-    if (!prodigyTruthControlRequestValid(command) || command.exchangeUUID || command.bindings.protocolVersion ||
+  void beginGlobalSingleWriterControl(Mothership* stream, ProdigyGlobalSingleWriterControl command) {
+    if (!prodigyGlobalSingleWriterControlRequestValid(command) || command.exchangeUUID || command.bindings.protocolVersion ||
         !weAreMaster || !ignited || !masterAuthorityRuntimeStateDurable || masterAuthorityPersistencePending ||
         durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation ||
         command.localClusterUUID != brainConfig.clusterUUID ||
-        !desiredTruthGlobalMembership(command.deploymentID,command.bindings)) {
-      replyTruthControl(stream,command,"Truth control needs an admitted local group and durable master");
+        !desiredGlobalSingleWriterMembership(command.deploymentID,command.bindings)) {
+      replyGlobalSingleWriterControl(stream,command,"global single-writer control needs an admitted local group and durable master");
       return;
     }
-    if (!command.generation && command.action == TruthControlAction::inspect) command.generation = command.bindings.generation;
+    if (!command.generation && command.action == GlobalSingleWriterControlAction::inspect) command.generation = command.bindings.generation;
+    auto deployment = deployments.find(command.deploymentID);
     auto container = containers.find(command.containerUUID);
-    if (!prodigyTruthControlForProjection(command,command.bindings) || container == containers.end() ||
-        !container->second || container->second->applicationID != 10 || container->second->deploymentID != command.deploymentID ||
+    if (!prodigyGlobalSingleWriterControlForProjection(command,command.bindings) || container == containers.end() ||
+        !container->second || deployment == deployments.end() || !deployment->second ||
+        !prodigyGlobalSingleWriterPlanValid(deployment->second->plan) || container->second->deploymentID != command.deploymentID ||
         !container->second->machine || !neuronControlStreamActive(container->second->machine) ||
-        pendingTruthControls.size() >= 64) {
-      replyTruthControl(stream,command,"Truth member or its authenticated Neuron is unavailable");
+        pendingGlobalSingleWriterControls.size() >= 64) {
+      replyGlobalSingleWriterControl(stream,command,"global single-writer member or its authenticated Neuron is unavailable");
       return;
     }
     // Each hop echoes a per-dispatch nonce even when a durable operation is retried.
     command.exchangeUUID = Random::generateNumberWithNBits<128,uint128_t>();
-    if (!command.exchangeUUID || pendingTruthControls.contains(command.exchangeUUID)) {
-      replyTruthControl(stream,command,"unable to allocate Truth exchange");
+    if (!command.exchangeUUID || pendingGlobalSingleWriterControls.contains(command.exchangeUUID)) {
+      replyGlobalSingleWriterControl(stream,command,"unable to allocate global single-writer exchange");
       return;
     }
     String encoded;
-    if (!BitseryEngine::serialize(encoded,command)) { replyTruthControl(stream,command,"invalid Truth command"); return; }
+    if (!BitseryEngine::serialize(encoded,command)) { replyGlobalSingleWriterControl(stream,command,"invalid global single-writer command"); return; }
     auto* target = container->second;
     auto& neuron = target->machine->neuron;
-    pendingTruthControls[command.exchangeUUID] = {command,stream,stream->connectionIncarnation,masterAuthorityEpoch,
+    pendingGlobalSingleWriterControls[command.exchangeUUID] = {command,stream,stream->connectionIncarnation,masterAuthorityEpoch,
         neuron.ioGeneration,uint64_t(target->nCrashes),Time::now<TimeResolution::ms>() + 5000};
-    Message::construct(neuron.wBuffer,NeuronTopic::truthGlobalControl,target->uuid,encoded);
+    Message::construct(neuron.wBuffer,NeuronTopic::globalSingleWriterControl,target->uuid,encoded);
     Ring::queueSend(&neuron);
   }
 
-  void acceptTruthControl(NeuronView* neuron, const ProdigyTruthGlobalControl& r) {
-    if (!neuron || !neuron->machine || !prodigyTruthControlReportValid(r)) return;
-    auto it = pendingTruthControls.find(r.exchangeUUID);
-    if (it == pendingTruthControls.end()) return;
+  void acceptGlobalSingleWriterControl(NeuronView* neuron, const ProdigyGlobalSingleWriterControl& r) {
+    if (!neuron || !neuron->machine || !prodigyGlobalSingleWriterControlReportValid(r)) return;
+    auto it = pendingGlobalSingleWriterControls.find(r.exchangeUUID);
+    if (it == pendingGlobalSingleWriterControls.end()) return;
     const auto& pending = it->second;
     const auto& q = pending.command;
     auto live = containers.find(q.containerUUID);
@@ -9765,29 +9770,29 @@ public:
         (q.bootNonce && r.bootNonce != q.bootNonce)) return;
     auto* stream = pending.stream;
     const auto incarnation = pending.streamIncarnation;
-    pendingTruthControls.erase(it);
+    pendingGlobalSingleWriterControls.erase(it);
     if (activeMotherships.contains(stream) && stream->connectionIncarnation == incarnation)
-      replyTruthControl(stream,r);
+      replyGlobalSingleWriterControl(stream,r);
   }
 
-  void expireTruthControls() {
+  void expireGlobalSingleWriterControls() {
     const auto now = Time::now<TimeResolution::ms>();
-    for (auto it = pendingTruthControls.begin(); it != pendingTruthControls.end();) {
+    for (auto it = pendingGlobalSingleWriterControls.begin(); it != pendingGlobalSingleWriterControls.end();) {
       if (it->second.deadlineMs > now && weAreMaster && it->second.epoch == masterAuthorityEpoch) { ++it; continue; }
       auto pending = std::move(it->second);
-      it = pendingTruthControls.erase(it);
+      it = pendingGlobalSingleWriterControls.erase(it);
       if (activeMotherships.contains(pending.stream) && pending.stream->connectionIncarnation == pending.streamIncarnation)
-        replyTruthControl(pending.stream,pending.command,"Truth exchange expired; inspect before retry");
+        replyGlobalSingleWriterControl(pending.stream,pending.command,"global single-writer exchange expired; inspect before retry");
     }
   }
 
-  bool desiredTruthGlobalMembership(uint64_t deploymentID,
-                                    TruthGlobalMembershipProjection& out) const override
+  bool desiredGlobalSingleWriterMembership(uint64_t deploymentID,
+                                    GlobalSingleWriterMembershipProjection& out) const override
   {
-    for (const auto& value : masterAuthorityRuntimeState.truthGlobalMembershipProjections) {
+    for (const auto& value : masterAuthorityRuntimeState.globalSingleWriterMembershipProjections) {
       if (value.deploymentID == deploymentID && value.localClusterUUID == brainConfig.clusterUUID) {
         // Neuron checks the exact local UUID. Projecting to an unlisted UUID
-        // therefore refuses the launch instead of falling back to legacy Truth.
+        // therefore refuses the launch instead of falling back to a local writer.
         out = value;
         return true;
       }
@@ -11530,6 +11535,13 @@ public:
   bool deploymentReplicationAllowedForPeer(uint64_t deploymentID, BrainView *peer) const override
   {
     if (statelessDeploymentRetired(deploymentID)) return false;
+    const auto savedPlan = deploymentPlans.find(deploymentID);
+    const auto livePlan = deployments.find(deploymentID);
+    GlobalSingleWriterMembershipProjection group;
+    const bool global = (savedPlan != deploymentPlans.end() && savedPlan->second.stateful.globalSingleWriter) ||
+        (livePlan != deployments.end() && livePlan->second && livePlan->second->plan.stateful.globalSingleWriter) ||
+        desiredGlobalSingleWriterMembership(deploymentID, group);
+    if (global && (!peer || peer->version < ProdigyGlobalSingleWriterMinimumVersion)) return false;
     const auto admission = std::find_if(masterAuthorityRuntimeState.statelessDeploymentAdmissions.begin(),
         masterAuthorityRuntimeState.statelessDeploymentAdmissions.end(), [&](const auto& candidate) {
           return candidate.deploymentID == deploymentID;
@@ -14767,6 +14779,8 @@ public:
   bool peerCanReceiveMasterAuthorityState(BrainView *peer) const
   {
     return weAreMaster && peerCanExchangeMasterAuthorityState(peer) && !peer->isMasterBrain &&
+           (masterAuthorityRuntimeState.globalSingleWriterMembershipProjections.empty() ||
+            peer->version >= ProdigyGlobalSingleWriterMinimumVersion) &&
            (!qualificationCancellationPresent() || (containerRetirementPeerCapabilityCurrent(peer) && peer->qualificationCancellationCapabilityAcknowledged)) &&
            (!transportCredentialLifecycleOperationsPresent() || transportCredentialLifecyclePeerCapabilityCurrent(peer, true)) &&
            (masterAuthorityRuntimeState.localCousinServicePermissions.empty() ||
@@ -34774,7 +34788,7 @@ public:
         {
           runBrainPeerHeartbeatTick();
           expireContainerLogRequests();
-          expireTruthControls();
+          expireGlobalSingleWriterControls();
           brainPeerHeartbeatTicker.setTimeoutMs(brainPeerHeartbeatIntervalMs);
           Ring::queueTimeout(&brainPeerHeartbeatTicker);
           break;
@@ -40200,25 +40214,30 @@ public:
     return true;
   }
 
-  bool truthGlobalSiblingMembership(const ContainerView& container,
+  bool globalSingleWriterSiblingMembership(const ContainerView& container,
                                     const ProdigyLocalCousinServicePermission& permission,
-                                    TruthGlobalMembershipProjection& membership) const
+                                    GlobalSingleWriterMembershipProjection& membership) const
   {
-    return permission.localApplicationID == MeshRegistry::Truth::applicationID &&
-        permission.peerApplicationID == MeshRegistry::Truth::applicationID &&
+    auto deployment = deployments.find(container.deploymentID);
+    if (deployment == deployments.end() || !deployment->second ||
+        !prodigyGlobalSingleWriterPlanValid(deployment->second->plan)) return false;
+    const auto& plan = deployment->second->plan;
+    return permission.localApplicationID == plan.config.applicationID &&
+        permission.peerApplicationID == plan.config.applicationID &&
+        permission.localDeploymentID == container.deploymentID && permission.peerDeploymentID == container.deploymentID &&
         permission.purpose == ProdigyCousinServicePurpose::sibling &&
-        permission.localCousinServicePrefix == MeshRegistry::Truth::siblings &&
-        permission.peerCousinServicePrefix == MeshRegistry::Truth::siblings &&
+        permission.localCousinServicePrefix == plan.stateful.siblingPrefix &&
+        permission.peerCousinServicePrefix == plan.stateful.siblingPrefix &&
         permission.localHalf == CousinRouteHalf::source &&
-        desiredTruthGlobalMembership(container.deploymentID, membership) &&
+        desiredGlobalSingleWriterMembership(container.deploymentID, membership) &&
         membership.localClusterUUID == brainConfig.clusterUUID &&
-        prodigyTruthLocalMember(membership, container.deploymentID, container.uuid) &&
-        container.whiteholes.size() <= prodigyTruthGlobalSiblingMaximumWhiteholes;
+        prodigyGlobalSingleWriterLocalMember(membership, container.deploymentID, container.uuid) &&
+        container.whiteholes.size() <= prodigyGlobalSingleWriterSiblingMaximumWhiteholes;
   }
 
   bool cousinSessionSourceRequest(NeuronView *neuron, uint128_t containerUUID,
                                  const ProdigyCousinSessionRequest& request, bool ownerDesired = false,
-                                 const TruthGlobalMember *desiredTruthCounterpart = nullptr)
+                                 const GlobalSingleWriterMember *desiredGlobalSingleWriterCounterpart = nullptr)
   {
     if (!weAreMaster || !neuron || !neuron->machine || neuron != &neuron->machine->neuron ||
         !prodigyCousinSessionRequestValid(request) ||
@@ -40265,18 +40284,18 @@ public:
         !localCousinServicePermissionMatchesCurrentLivePlan(*permission)) return reject();
     // ContainerView deliberately carries runtime state, not the admitted
     // launch plan.  The durable master projection is the only authority for
-    // this opt-in global Truth path.
-    TruthGlobalMembershipProjection truthMembership;
-    const bool truthGlobalSiblingPool = desiredTruthCounterpart != nullptr &&
-        truthGlobalSiblingMembership(*container, *permission, truthMembership) &&
-        std::any_of(truthMembership.members.begin(), truthMembership.members.end(), [&](const auto& member) {
-          return member.memberID == desiredTruthCounterpart->memberID &&
-              member.clusterUUID == desiredTruthCounterpart->clusterUUID &&
-              member.containerUUID == desiredTruthCounterpart->containerUUID &&
-              member.privateIPv6.equals(desiredTruthCounterpart->privateIPv6) && member.role == desiredTruthCounterpart->role;
-        }) && desiredTruthCounterpart->containerUUID != container->uuid &&
-        desiredTruthCounterpart->clusterUUID != truthMembership.localClusterUUID;
-    if (desiredTruthCounterpart != nullptr && !truthGlobalSiblingPool) return reject();
+    // this opt-in global single-writer path.
+    GlobalSingleWriterMembershipProjection globalSingleWriterMembership;
+    const bool globalSingleWriterSiblingPool = desiredGlobalSingleWriterCounterpart != nullptr &&
+        globalSingleWriterSiblingMembership(*container, *permission, globalSingleWriterMembership) &&
+        std::any_of(globalSingleWriterMembership.members.begin(), globalSingleWriterMembership.members.end(), [&](const auto& member) {
+          return member.memberID == desiredGlobalSingleWriterCounterpart->memberID &&
+              member.clusterUUID == desiredGlobalSingleWriterCounterpart->clusterUUID &&
+              member.containerUUID == desiredGlobalSingleWriterCounterpart->containerUUID &&
+              member.privateIPv6.equals(desiredGlobalSingleWriterCounterpart->privateIPv6) && member.role == desiredGlobalSingleWriterCounterpart->role;
+        }) && desiredGlobalSingleWriterCounterpart->containerUUID != container->uuid &&
+        desiredGlobalSingleWriterCounterpart->clusterUUID != globalSingleWriterMembership.localClusterUUID;
+    if (desiredGlobalSingleWriterCounterpart != nullptr && !globalSingleWriterSiblingPool) return reject();
     // All purpose-bound permissions are driven by this owner, including KV
     // cousins. Legacy permissions retain the explicit application request.
     const bool automatic =
@@ -40290,15 +40309,15 @@ public:
           container->subscriptions, container->state)) return reject();
     if (automatic != ownerDesired || (!automatic && !container->isStateful) ||
         (automatic && (neuron->cousinDiscoveryVersion < 2 || (!privateRequest &&
-            (truthGlobalSiblingPool ? (usableWhiteholes == 0 || usableWhiteholes > prodigyTruthGlobalSiblingMaximumWhiteholes ||
-                                        container->whiteholes.size() > prodigyTruthGlobalSiblingMaximumWhiteholes) :
+            (globalSingleWriterSiblingPool ? (usableWhiteholes == 0 || usableWhiteholes > prodigyGlobalSingleWriterSiblingMaximumWhiteholes ||
+                                        container->whiteholes.size() > prodigyGlobalSingleWriterSiblingMaximumWhiteholes) :
                                       (usableWhiteholes != 1 || container->whiteholes.size() != 1)))))) return reject();
     if (std::any_of(cousinSessions.begin(), cousinSessions.end(), [&](const auto& session) {
           return session.record.sourceContainerUUID == containerUUID &&
               (session.record.sourceBindingNonce == request.bindingNonce ||
                (privateRequest && prodigyCousinSessionUsesPrivateContainerEndpoints(session.record) &&
                 session.record.sourcePermission.permissionUUID == request.permissionUUID && session.record.slot == request.slot &&
-                (!truthGlobalSiblingPool || session.record.destination.containerUUID == desiredTruthCounterpart->containerUUID))) &&
+                (!globalSingleWriterSiblingPool || session.record.destination.containerUUID == desiredGlobalSingleWriterCounterpart->containerUUID))) &&
               prodigyCousinSourcePermissionsConflict(*permission, session.record.sourcePermission) &&
               session.expiresAtMs > Time::msSinceBoot(); })) return false;
     ProdigyCousinDiscoveryResponse counterparts = queryCousinCounterparts({1, request.permissionUUID, request.slot});
@@ -40331,19 +40350,19 @@ public:
       if (privateRequest != (route.endpointKind == CousinRouteEndpointKind::privateContainer)) continue;
       if (cutAuthority && route.routeUUID != cutAuthority->seedRouteUUID) continue;
       if (automatic && !prodigyCousinAutomaticSessionDesired(*permission, route, true,
-          privateRequest ? 1 : usableWhiteholes, routeNowMs, truthGlobalSiblingPool)) continue;
+          privateRequest ? 1 : usableWhiteholes, routeNowMs, globalSingleWriterSiblingPool)) continue;
       auto destination = counterparts.records.end();
       for (auto candidate = counterparts.records.begin(); candidate != counterparts.records.end(); ++candidate) {
         if (!cousinRouteMatchesCounterpart(route, *candidate) ||
             (cutAuthority && !prodigySourceCutCounterpartMatches(*cutAuthority, route, *candidate))) continue;
-        if (truthGlobalSiblingPool && (candidate->containerUUID != desiredTruthCounterpart->containerUUID ||
-            candidate->permission.localClusterUUID != desiredTruthCounterpart->clusterUUID ||
-            (privateRequest && !candidate->publicAddress.equals(desiredTruthCounterpart->privateIPv6)))) continue;
+        if (globalSingleWriterSiblingPool && (candidate->containerUUID != desiredGlobalSingleWriterCounterpart->containerUUID ||
+            candidate->permission.localClusterUUID != desiredGlobalSingleWriterCounterpart->clusterUUID ||
+            (privateRequest && !candidate->publicAddress.equals(desiredGlobalSingleWriterCounterpart->privateIPv6)))) continue;
         if (destination != counterparts.records.end()) {
           // Legacy callers intentionally retain first-live-counterpart
           // selection.  The Truth owner supplied an exact membership target,
           // so ambiguity there is unsafe and must fail closed.
-          if (truthGlobalSiblingPool) return reject();
+          if (globalSingleWriterSiblingPool) return reject();
           break;
         }
         destination = candidate;
@@ -40539,18 +40558,17 @@ public:
           prodigyCousinPermissionServiceForRoles(*permission, app->effectiveStatefulMeshRoles(deployment->second->plan)) != state.record.sourceService ||
           (app->isStateful ? deployment->second->nShardGroups : 1) != state.record.sourceShardGroups ||
           (app->isStateful ? app->shardGroup : 0) != state.record.sourceShardGroup) return false;
-      TruthGlobalMembershipProjection truthMembership;
-      const bool truthSibling = permission->localApplicationID == MeshRegistry::Truth::applicationID &&
+      GlobalSingleWriterMembershipProjection globalSingleWriterMembership;
+      const bool globalSibling = deployment->second->plan.stateful.globalSingleWriter &&
           permission->purpose == ProdigyCousinServicePurpose::sibling;
-      const bool truthGlobalSiblingPool = truthGlobalSiblingMembership(*app, *permission, truthMembership) &&
-          std::any_of(truthMembership.members.begin(), truthMembership.members.end(), [&](const auto& member) {
+      const bool globalSingleWriterSiblingPool = globalSingleWriterSiblingMembership(*app, *permission, globalSingleWriterMembership) &&
+          std::any_of(globalSingleWriterMembership.members.begin(), globalSingleWriterMembership.members.end(), [&](const auto& member) {
             return member.containerUUID == state.record.destination.containerUUID &&
                 member.clusterUUID == state.record.destination.permission.localClusterUUID &&
                 (!prodigyCousinSessionUsesPrivateContainerEndpoints(state.record) ||
                  member.privateIPv6.equals(state.record.destination.publicAddress));
           });
-      if (truthSibling && !truthGlobalSiblingPool &&
-          desiredTruthGlobalMembership(app->deploymentID, truthMembership)) return false;
+      if (globalSibling && !globalSingleWriterSiblingPool) return false;
       if (prodigyCousinSessionUsesPrivateContainerEndpoints(state.record)) {
         IPAddress mesh = {}; mesh.is6 = true; std::memcpy(mesh.v6, &app->meshAddress, 16);
         if (machine->neuron.cousinDiscoveryVersion < 3 || !mesh.equals(state.record.sourceAddress) ||
@@ -40558,7 +40576,7 @@ public:
       } else {
         if (permission->purpose != ProdigyCousinServicePurpose::statefulCousin &&
             (machine->neuron.cousinDiscoveryVersion < 2 ||
-             (truthGlobalSiblingPool ? app->whiteholes.empty() : app->whiteholes.size() != 1))) return false;
+             (globalSingleWriterSiblingPool ? app->whiteholes.empty() : app->whiteholes.size() != 1))) return false;
         uint32_t bindings = 0;
         for (const auto& whitehole : app->whiteholes)
           if (whitehole.bindingNonce == state.record.sourceBindingNonce && whitehole.hasAddress &&
@@ -41826,16 +41844,16 @@ public:
                   localCousinServicePermissionAllowsRoute(permission.permissionUUID, route, request.slot,
                       Time::now<TimeResolution::ms>());
             });
-        TruthGlobalMembershipProjection truthMembership;
-        const bool truthGlobalSiblingPool = truthGlobalSiblingMembership(*container, permission, truthMembership) &&
+        GlobalSingleWriterMembershipProjection globalSingleWriterMembership;
+        const bool globalSingleWriterSiblingPool = globalSingleWriterSiblingMembership(*container, permission, globalSingleWriterMembership) &&
             (privateRoute || !container->whiteholes.empty());
-        if (truthGlobalSiblingPool) {
+        if (globalSingleWriterSiblingPool) {
           const auto counterparts = queryCousinCounterparts({1, permission.permissionUUID, request.slot});
           if (!counterparts.success) continue;
-          for (const TruthGlobalMember& member : truthMembership.members) {
+          for (const GlobalSingleWriterMember& member : globalSingleWriterMembership.members) {
             // Same-site voters use the local mesh. Every remote voter or
             // learner needs its own exact authenticated session on either transport.
-            if (member.clusterUUID == truthMembership.localClusterUUID || member.containerUUID == container->uuid) continue;
+            if (member.clusterUUID == globalSingleWriterMembership.localClusterUUID || member.containerUUID == container->uuid) continue;
             const ProdigyCousinCounterpart *target = nullptr;
             for (const auto& counterpart : counterparts.records)
               if (counterpart.containerUUID == member.containerUUID &&
@@ -53429,7 +53447,12 @@ public:
 
           ApplicationDeployment *deployment = new ApplicationDeployment();
 
-          BitseryEngine::deserialize(serializedPlan, deployment->plan);
+          if (!BitseryEngine::deserializeSafe(serializedPlan, deployment->plan)) {
+            basics_log("measureApplication rejected malformed deployment plan\n");
+            Message::construct(mothership->wBuffer, MothershipTopic::measureApplication, uint32_t(0), uint32_t(0), uint32_t(0));
+            delete deployment;
+            break;
+          }
 
           if (auto it = deploymentsByApp.find(deployment->plan.config.applicationID); it != deploymentsByApp.end())
           {
@@ -54128,7 +54151,13 @@ public:
 
           ApplicationDeployment *deployment = new ApplicationDeployment();
 
-          BitseryEngine::deserialize(serializedPlan, deployment->plan);
+          if (!BitseryEngine::deserializeSafe(serializedPlan, deployment->plan)) {
+            basics_log("spinApplication rejected malformed deployment plan\n");
+            Message::construct(mothership->wBuffer, MothershipTopic::spinApplication,
+                uint8_t(SpinApplicationResponseCode::invalidPlan), String("invalid plan: unsupported or malformed deployment plan"_ctv));
+            delete deployment;
+            break;
+          }
           const ProdigyDeploymentPlacementPolicy *placementPolicy = nullptr;
           for (const auto& candidate : masterAuthorityRuntimeState.deploymentPlacementPolicies)
           {
@@ -54250,6 +54279,15 @@ public:
           if (validateDeploymentApplicationIdentity(deployment->plan, identityFailure) == false)
           {
             rejectInvalidPlan(identityFailure);
+            return;
+          }
+          GlobalSingleWriterMembershipProjection globalGroup;
+          const bool hasGlobalGroup = desiredGlobalSingleWriterMembership(deployment->plan.config.deploymentID(), globalGroup);
+          if (deployment->plan.stateful.globalSingleWriter
+              ? (!prodigyGlobalSingleWriterPlanValid(deployment->plan) || !hasGlobalGroup ||
+                 !prodigyGlobalSingleWriterMembershipProjectionValid(globalGroup))
+              : hasGlobalGroup) {
+            rejectInvalidPlan("invalid plan: global single-writer mode requires its matching admitted membership"_ctv);
             return;
           }
           String taskPlanFailure = {};
@@ -55323,69 +55361,81 @@ public:
           });
           break;
         }
-      case MothershipTopic::truthPlacement:
+      case MothershipTopic::globalSingleWriterPlacement:
         {
-          String bytes; Message::extractToStringView(args,bytes); ProdigyTruthPlacementExchange r{};
-          r.success = args == message->terminal() && BitseryEngine::deserializeSafe(bytes,r) && applyTruthPlacement(r);
-          if (!r.success && r.failure.empty()) r.failure.assign("Truth placement unavailable or stale"_ctv);
+          String bytes; Message::extractToStringView(args,bytes); ProdigyGlobalSingleWriterPlacementExchange r{};
+          r.success = args == message->terminal() && BitseryEngine::deserializeSafe(bytes,r) && applyGlobalSingleWriterPlacement(r);
+          if (!r.success && r.failure.empty()) r.failure.assign("global single-writer placement unavailable or stale"_ctv);
           String payload;
           if (BitseryEngine::serialize(payload,r))
-            Message::construct(mothership->wBuffer,MothershipTopic::truthPlacement,payload);
+            Message::construct(mothership->wBuffer,MothershipTopic::globalSingleWriterPlacement,payload);
           break;
         }
-      case MothershipTopic::truthGlobalControl:
+      case MothershipTopic::globalSingleWriterControl:
         {
           String bytes; Message::extractToStringView(args,bytes);
-          ProdigyTruthGlobalControl control{};
-          if (args == message->terminal() && BitseryEngine::deserializeSafe(bytes,control)) beginTruthControl(mothership,std::move(control));
-          else replyTruthControl(mothership,control,"invalid Truth control frame");
+          ProdigyGlobalSingleWriterControl control{};
+          if (args == message->terminal() && BitseryEngine::deserializeSafe(bytes,control)) beginGlobalSingleWriterControl(mothership,std::move(control));
+          else replyGlobalSingleWriterControl(mothership,control,"invalid global single-writer control frame");
           break;
         }
-      case MothershipTopic::commitTruthGlobalMembership:
+      case MothershipTopic::commitGlobalSingleWriterMembership:
         {
           String serializedRequest = {}; Message::extractToStringView(args, serializedRequest);
-          TruthGlobalMembershipProjection request = {}; CommitTruthGlobalMembershipResponse response = {};
+          GlobalSingleWriterMembershipProjection request = {}; CommitGlobalSingleWriterMembershipResponse response = {};
           auto reply = [&]() { String payload = {}; BitseryEngine::serialize(payload, response);
-            Message::construct(mothership->wBuffer, MothershipTopic::commitTruthGlobalMembership, payload); };
+            Message::construct(mothership->wBuffer, MothershipTopic::commitGlobalSingleWriterMembership, payload); };
           if (args != message->terminal() || !BitseryEngine::deserializeSafe(serializedRequest, request) ||
-              !prodigyTruthGlobalMembershipProjectionValid(request))
-          { response.failure.assign("invalid Truth global membership projection"_ctv); reply(); break; }
+              !prodigyGlobalSingleWriterMembershipProjectionValid(request))
+          { response.failure.assign("invalid global single-writer membership projection"_ctv); reply(); break; }
           response.projection = request;
           if (!weAreMaster || !ignited || request.localClusterUUID != brainConfig.clusterUUID || masterAuthorityPersistencePending ||
               !masterAuthorityRuntimeStateDurable || durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation)
-          { response.failure.assign("Truth membership authority is not ready for this cluster"_ctv); reply(); break; }
-          // A single durable group owns Truth in this cluster. An update is a
-          // request to reconcile placement; only Truth can commit voting rights.
-          auto& groups = masterAuthorityRuntimeState.truthGlobalMembershipProjections;
-          auto existing = groups.begin();
+          { response.failure.assign("global single-writer membership authority is not ready for this cluster"_ctv); reply(); break; }
+          // Each deployment owns an independent group. This projection requests
+          // placement; only the application can commit voting rights.
+          auto deployed = deployments.find(request.deploymentID);
+          auto retained = deploymentPlans.find(request.deploymentID);
+          if ((deployed != deployments.end() && (!deployed->second ||
+               !prodigyGlobalSingleWriterPlanValid(deployed->second->plan))) ||
+              (retained != deploymentPlans.end() && !prodigyGlobalSingleWriterPlanValid(retained->second))) {
+            response.failure.assign("deployment has not opted into global single-writer mode"_ctv); reply(); break;
+          }
+          auto& groups = masterAuthorityRuntimeState.globalSingleWriterMembershipProjections;
+          auto existing = std::find_if(groups.begin(), groups.end(), [&](const auto& group) {
+            return group.deploymentID == request.deploymentID || group.membershipUUID == request.membershipUUID;
+          });
+          if (existing == groups.end() && groups.size() >= 64) {
+            response.failure.assign("global single-writer group limit reached"_ctv); reply(); break;
+          }
           if (existing != groups.end()) {
-            if (!prodigyTruthMembershipSuccessor(*existing, request)) {
-              response.failure.assign("conflicting Truth group or stale revision"_ctv); reply(); break;
+            if (!prodigyGlobalSingleWriterMembershipSuccessor(*existing, request)) {
+              response.failure.assign("conflicting global single-writer group or stale revision"_ctv); reply(); break;
             }
             if (existing->generation == request.generation) {
               String admitted; BitseryEngine::serialize(admitted, *existing);
               response.success = admitted.equals(serializedRequest);
               if (response.success) response.durableGeneration = durableMasterAuthorityRuntimeStateGeneration;
-              else response.failure.assign("conflicting Truth membership at this revision"_ctv);
+              else response.failure.assign("conflicting global single-writer membership at this revision"_ctv);
               reply(); break;
             }
           }
           if (masterAuthorityRuntimeState.generation == UINT64_MAX) {
-            response.failure.assign("Truth authority generation exhausted"_ctv); reply(); break;
+            response.failure.assign("global single-writer authority generation exhausted"_ctv); reply(); break;
           }
           const auto before = masterAuthorityRuntimeState; const uint64_t generation = before.generation + 1;
-          if (existing == masterAuthorityRuntimeState.truthGlobalMembershipProjections.end()) masterAuthorityRuntimeState.truthGlobalMembershipProjections.push_back(request);
+          if (existing == masterAuthorityRuntimeState.globalSingleWriterMembershipProjections.end()) masterAuthorityRuntimeState.globalSingleWriterMembershipProjections.push_back(request);
           else *existing = request;
           const uint64_t epoch = masterAuthorityEpoch, incarnation = mothership->connectionIncarnation;
           commitMasterAuthorityStateChangeAsync([this, mothership, epoch, incarnation, before, generation, request](bool durable) mutable {
             if (masterAuthorityEpoch != epoch) return;
             if (!durable && masterAuthorityRuntimeState.generation == generation) masterAuthorityRuntimeState = before;
             if (!activeMotherships.contains(mothership) || mothership->connectionIncarnation != incarnation) return;
-            CommitTruthGlobalMembershipResponse response = {}; response.projection = request; response.success = durable;
+            CommitGlobalSingleWriterMembershipResponse response = {}; response.projection = request; response.success = durable;
             response.durableGeneration = durable ? generation : 0;
-            if (!durable) response.failure.assign("Truth membership durable acceptance failed"_ctv);
+            if (!durable) response.failure.assign("global single-writer membership durable acceptance failed"_ctv);
             String payload = {}; BitseryEngine::serialize(payload, response);
-            Message::construct(mothership->wBuffer, MothershipTopic::commitTruthGlobalMembership, payload);
+            Message::construct(mothership->wBuffer, MothershipTopic::commitGlobalSingleWriterMembership, payload);
             (void)flushActiveMothershipSendBuffer(mothership, "truth-membership-durable");
           });
           break;
@@ -56936,11 +56986,11 @@ public:
             receiveApp6TruthMeshReceipt(neuron, receipt);
           break;
         }
-      case NeuronTopic::truthGlobalControl:
+      case NeuronTopic::globalSingleWriterControl:
         {
           String bytes; Message::extractToStringView(args,bytes);
-          ProdigyTruthGlobalControl response{};
-          if (args == message->terminal() && BitseryEngine::deserializeSafe(bytes,response)) acceptTruthControl(neuron,response);
+          ProdigyGlobalSingleWriterControl response{};
+          if (args == message->terminal() && BitseryEngine::deserializeSafe(bytes,response)) acceptGlobalSingleWriterControl(neuron,response);
           break;
         }
       case NeuronTopic::statefulStoreProofRecovery:

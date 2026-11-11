@@ -3972,7 +3972,7 @@ static void testBoundedFailureReport(TestSuite& suite)
                "failure_summary_display_preserves_human_report");
 }
 
-static void testTruthPlacementShardInvariant(TestSuite& suite)
+static void testGlobalSingleWriterPlacementShardInvariant(TestSuite& suite, uint16_t applicationID)
 {
   // Reconciliation may have to return through incomplete() before a local
   // machine is eligible. That path must still initialize the launch-plan
@@ -3984,9 +3984,17 @@ static void testTruthPlacementShardInvariant(TestSuite& suite)
   brain.brainConfig.clusterUUID = 17;
   ApplicationDeployment deployment = {};
   seedCommonPlan(deployment, true);
-  deployment.plan.config.applicationID = MeshRegistry::Truth::applicationID;
+  deployment.plan.config.applicationID = applicationID;
+  deployment.plan.config.type = ApplicationType::stateful;
+  deployment.plan.stateful.globalSingleWriter = true;
+  deployment.plan.stateful.neverShard = true;
+  deployment.plan.stateful.clientPrefix = prodigyRuntimeStatefulServicePrefix(applicationID, 1);
+  deployment.plan.stateful.siblingPrefix = prodigyRuntimeStatefulServicePrefix(applicationID, 11);
+  deployment.plan.stateful.cousinPrefix = prodigyRuntimeStatefulServicePrefix(applicationID, 3);
+  deployment.plan.stateful.seedingPrefix = prodigyRuntimeStatefulServicePrefix(applicationID, 4);
+  deployment.plan.stateful.shardingPrefix = prodigyRuntimeStatefulServicePrefix(applicationID, 5);
   deployment.nShardGroups = 0;
-  TruthGlobalMembershipProjection group = {};
+  GlobalSingleWriterMembershipProjection group = {};
   group.protocolVersion = 1; group.membershipUUID = 15; group.operationUUID = 16;
   group.localClusterUUID = brain.brainConfig.clusterUUID;
   group.deploymentID = deployment.plan.config.deploymentID(); group.generation = 1;
@@ -3995,35 +4003,43 @@ static void testTruthPlacementShardInvariant(TestSuite& suite)
   group.genesisMemberIDs = {1, 2, 3}; group.highestAllocatedMemberID = 3;
   for (int memberID = 1; memberID <= 3; ++memberID)
   {
-    TruthGlobalMember member = {};
+    GlobalSingleWriterMember member = {};
     member.memberID = memberID; member.clusterUUID = group.localClusterUUID;
     member.containerUUID = 100 + memberID; member.privateIPv6 = IPAddress(uint128_t(memberID));
     group.members.push_back(member);
   }
-  suite.expect(prodigyTruthGlobalMembershipProjectionValid(group) &&
-                   deployment.reconcileTruthPlacement(group) == false && deployment.nShardGroups == 1,
-               "truth_reconcile_incomplete_path_initializes_one_shard_before_scheduler_launch");
+  suite.expect(prodigyGlobalSingleWriterMembershipProjectionValid(group) &&
+                   deployment.reconcileGlobalSingleWriterPlacement(group) == false && deployment.nShardGroups == 1,
+               "global_single_writer_reconcile_incomplete_path_initializes_one_shard_before_scheduler_launch");
   suite.expect(deployment.nTarget() == 3,
-               "truth_reconcile_reports_all_three_local_voters_before_launch");
+               "global_single_writer_reconcile_reports_all_three_local_voters_before_launch");
   group.members[1].clusterUUID = 18;
   group.members[2].clusterUUID = 19;
-  suite.expect(!deployment.reconcileTruthPlacement(group) && deployment.nTarget() == 1,
-               "truth_reconcile_reports_only_local_projected_members");
-  TruthGlobalMember learner = {};
+  suite.expect(!deployment.reconcileGlobalSingleWriterPlacement(group) && deployment.nTarget() == 1,
+               "global_single_writer_reconcile_reports_only_local_projected_members");
+  GlobalSingleWriterMember learner = {};
   learner.memberID = 4; learner.clusterUUID = group.localClusterUUID;
   learner.containerUUID = 104; learner.privateIPv6 = IPAddress(uint128_t(4));
-  learner.role = TruthGlobalMemberRole::learner;
+  learner.role = GlobalSingleWriterMemberRole::learner;
   group.members.push_back(learner);
   group.highestAllocatedMemberID = 4; group.replacementPending = true;
-  suite.expect(!deployment.reconcileTruthPlacement(group) && deployment.nTarget() == 2,
-               "truth_reconcile_counts_learner_before_its_session_admission");
+  suite.expect(!deployment.reconcileGlobalSingleWriterPlacement(group) && deployment.nTarget() == 2,
+               "global_single_writer_reconcile_counts_learner_before_its_session_admission");
   group.members.erase(group.members.begin());
   group.retiredMemberIDs.push_back(1);
-  suite.expect(!deployment.reconcileTruthPlacement(group) && deployment.nTarget() == 1,
-               "truth_reconcile_excludes_retired_local_member_from_target");
+  suite.expect(!deployment.reconcileGlobalSingleWriterPlacement(group) && deployment.nTarget() == 1,
+               "global_single_writer_reconcile_excludes_retired_local_member_from_target");
   group.members.back().clusterUUID = 18;
-  suite.expect(deployment.reconcileTruthPlacement(group) && deployment.nTarget() == 0,
-               "truth_reconcile_retired_only_site_has_no_local_target");
+  suite.expect(deployment.reconcileGlobalSingleWriterPlacement(group) && deployment.nTarget() == 0,
+               "global_single_writer_reconcile_retired_only_site_has_no_local_target");
+  ContainerView replay = {};
+  replay.uuid = 101;
+  const auto missingMembershipPlan = replay.generatePlan(deployment.plan, 1);
+  suite.expect(missingMembershipPlan.globalSingleWriterMembership.protocolVersion != 0 &&
+      !prodigyGlobalSingleWriterContainerPlanValid(missingMembershipPlan),
+      "global_replay_without_membership_cannot_fall_back_to_local_writer");
+  deployment.plan.stateful.globalSingleWriter = false;
+  suite.expect(!deployment.reconcileGlobalSingleWriterPlacement(group), "global_reconcile_requires_explicit_plan_opt_in");
   thisBrain = savedBrain;
 }
 
@@ -4033,11 +4049,11 @@ int main(void)
   const char *selector = std::getenv("PRODIGY_TEST_ONLY");
   if (selector != nullptr && std::strcmp(selector, "truth-placement") == 0)
   {
-    testTruthPlacementShardInvariant(suite);
+    for (uint16_t app : {uint16_t(10), uint16_t(42)}) testGlobalSingleWriterPlacementShardInvariant(suite, app);
     dprintf(STDOUT_FILENO, "truth_placement passed=%d failed=%d\n", suite.passed, suite.failed);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
-  if (selector == nullptr) testTruthPlacementShardInvariant(suite);
+  if (selector == nullptr) for (uint16_t app : {uint16_t(10), uint16_t(42)}) testGlobalSingleWriterPlacementShardInvariant(suite, app);
   if (selector != nullptr && std::strcmp(selector, "storage-parent-traversal") == 0)
   {
     testStorageParentTraversal(suite);
