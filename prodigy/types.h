@@ -13978,6 +13978,32 @@ static inline bool prodigyCousinAutomaticWhiteholePlanValid(const Vector<Whiteho
       whiteholes[0].family == ExternalAddressFamily::ipv6 && whiteholes[0].transport == ExternalAddressTransport::tcp;
 }
 
+// A global Truth group has at most three remote members while a replacement
+// learner overlaps the three committed voters.  Its owner-driven sibling
+// sessions therefore need a bounded pool of independently leased public
+// source tuples.  This is deliberately narrower than the legacy automatic
+// COUSIN declaration: the runtime additionally requires the durable Truth
+// projection before it can use a pool.
+constexpr static uint32_t prodigyTruthGlobalSiblingMaximumWhiteholes = 3;
+
+static inline bool prodigyTruthGlobalSiblingWhiteholePlanValid(
+    const ProdigyLocalCousinServicePermission& permission, const DeploymentPlan& plan)
+{
+  return permission.protocolVersion == ProdigyLocalCousinServicePermission::purposeVersion &&
+      permission.localHalf == CousinRouteHalf::source &&
+      permission.purpose == ProdigyCousinServicePurpose::sibling &&
+      permission.localApplicationID == MeshRegistry::Truth::applicationID &&
+      permission.peerApplicationID == MeshRegistry::Truth::applicationID &&
+      permission.localCousinServicePrefix == MeshRegistry::Truth::siblings &&
+      permission.peerCousinServicePrefix == MeshRegistry::Truth::siblings &&
+      plan.config.applicationID == MeshRegistry::Truth::applicationID &&
+      !plan.whiteholes.empty() && plan.whiteholes.size() <= prodigyTruthGlobalSiblingMaximumWhiteholes &&
+      std::all_of(plan.whiteholes.begin(), plan.whiteholes.end(), [](const Whitehole& whitehole) {
+        return whiteholeDeclarationValid(whitehole) &&
+            whitehole.family == ExternalAddressFamily::ipv6 && whitehole.transport == ExternalAddressTransport::tcp;
+      });
+}
+
 static inline bool prodigyCousinProtectedWormholePlanValid(const DeploymentPlan& plan)
 {
   if (!plan.isStateful || plan.useHostNetworkNamespace || plan.wormholes.size() != 1 ||
@@ -14065,7 +14091,8 @@ static inline bool prodigyCousinPermissionPlanServiceMatches(
                   : prodigyCousinProtectedWormholePlanValid(plan);
   }
   if (plan.useHostNetworkNamespace) return false;
-  if (source && !plan.whiteholes.empty() && !prodigyCousinAutomaticWhiteholePlanValid(plan.whiteholes)) {
+  if (source && !plan.whiteholes.empty() && !prodigyCousinAutomaticWhiteholePlanValid(plan.whiteholes) &&
+      !prodigyTruthGlobalSiblingWhiteholePlanValid(permission, plan)) {
     if (permission.purpose != ProdigyCousinServicePurpose::clientAuthority ||
         !std::all_of(plan.whiteholes.begin(), plan.whiteholes.end(), [](const Whitehole& whitehole) {
           return whiteholeDeclarationValid(whitehole) && whitehole.transport == ExternalAddressTransport::quic;

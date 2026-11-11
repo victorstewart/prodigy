@@ -4,8 +4,10 @@
 import argparse
 from collections import Counter
 import json
+import os
 from pathlib import Path
 import re
+import select
 import subprocess
 import time
 
@@ -164,8 +166,25 @@ def main():
         raise RuntimeError("the singleton site must report every test machine healthy before isolation")
     machine_indices = ",".join(str(i) for i in range(1, len(machines) + 1))
     fault = subprocess.Popen([binary, "faultTestCluster", options.singleton, "link", machine_indices,
-                              str(options.outage_ms), "0", "0", "0"])
+                              str(options.outage_ms), "0", "0", "0"],
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
     try:
+        # Admission reads the same exclusive registry as our observations.
+        # Wait for its explicit release before making another CLI request.
+        startup = bytearray()
+        admission_deadline = min(deadline, time.monotonic() + 30)
+        while b"faultTestCluster admitted=1 " not in startup:
+            remaining = admission_deadline - time.monotonic()
+            if remaining <= 0 or not select.select([fault.stdout], [], [], remaining)[0]:
+                raise RuntimeError("timed out waiting for Mothership fault admission")
+            chunk = os.read(fault.stdout.fileno(), 4096)
+            if not chunk:
+                raise RuntimeError("Mothership fault admission failed: " + startup.decode(errors="replace"))
+            startup.extend(chunk)
+            if len(startup) > 65536:
+                raise RuntimeError("Mothership fault admission output exceeded its bound")
+        print(startup.decode(errors="replace"), end="", flush=True)
+
         def fault_active():
             # Do not let reconciliation turn an unobserved/failed fault into a
             # successful replacement.  The surviving side must first elect a
@@ -207,7 +226,8 @@ def main():
         wait_for("majority committed a replacement voter during the outage", repaired)
     finally:
         # Mothership owns restoration of the bounded fault even on failure.
-        fault.wait(timeout=options.outage_ms / 1000 + 60)
+        output, _ = fault.communicate(timeout=options.outage_ms / 1000 + 60)
+        print(output.decode(errors="replace"), end="", flush=True)
     if fault.returncode:
         raise RuntimeError("Mothership rejected or failed the bounded link fault")
 

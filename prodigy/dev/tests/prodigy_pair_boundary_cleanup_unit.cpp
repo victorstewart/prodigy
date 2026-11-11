@@ -158,18 +158,19 @@ static void testPairControlServiceDescriptorStatusIsolation(TestSuite& suite)
     const size_t begin = text.find(first), end = text.find(after, begin);
     return begin == std::string::npos || end == std::string::npos ? std::string{} : text.substr(begin, end - begin);
   };
-  const std::string descriptors = extract("pair_control_service_suffix()\n{\n", "\npair_control_service_side()\n");
+  const std::string descriptors = extract("pair_control_service_slots()\n{\n", "\npair_control_service_side()\n");
+  const std::string installRoute = extract("pair_control_install_service_route()\n{\n", "\npair_control_install_service_inside()\n");
   const std::string validation = extract("pair_control_validate_service_one_inside()\n{\n", "\npair_control_remove_service_route()\n");
   const std::string cleanup = extract("pair_control_cleanup_inside()\n{\n", "\npair_control_bind_parents()\n");
-  suite.expect(!descriptors.empty() && !validation.empty() && !cleanup.empty(),
+  suite.expect(!descriptors.empty() && !validation.empty() && !cleanup.empty() && !installRoute.empty(),
                "pair_service_status_fixture_extracts_real_provider_helpers");
-  if (descriptors.empty() || validation.empty() || cleanup.empty()) return;
+  if (descriptors.empty() || validation.empty() || cleanup.empty() || installRoute.empty()) return;
 
   // The external route and namespace operations are mocked.  The status
   // plumbing itself is real extracted provider code: absence is optional only
   // for a missing descriptor, never for malformed state or a failed owned
   // route removal.
-  const std::string script = "set -euo pipefail\n" + descriptors + validation + cleanup + R"TEST(
+  const std::string script = "set -euo pipefail\n" + descriptors + validation + cleanup + installRoute + R"TEST(
 pair_control_dir="$PWD/pair"
 pair_control_router_ns=""
 pair_control_first_link=""
@@ -186,6 +187,7 @@ pair_control_parse_service_args() {
   pair_control_service_source_router=fd42:1::1; pair_control_service_destination_router=fd42:2::1
   return 0
 }
+pair_control_service_descriptor() { printf '%s\n' "${pair_control_service_args[@]}"; }
 pair_control_service_side() { return 0; }
 pair_control_service_route_journal_valid() { [[ "$mode" != validation_fail ]]; }
 pair_control_service_route_exact() { [[ "$mode" != validation_fail ]]; }
@@ -203,9 +205,36 @@ write_descriptor
 printf prepared > "$pair_control_dir/service-phase"
 mode=validation_fail
 [[ "$(status_of pair_control_validate_service_inside)" == 1 ]]
+# Independent same-direction tuples retain the first descriptor and choose
+# distinct durable slots. Retrying either tuple must reuse its original slot.
+mode=valid
+pair_control_service_args=(); for _ in $(seq 1 13); do pair_control_service_args+=(y); done
+pair_control_select_service_slot
+[[ "$pair_control_service_transit_slot" == opposite ]]
+pair_write "$(pair_control_service_path service-descriptor opposite)" "$(pair_control_service_descriptor)"
+pair_control_service_args=(); for _ in $(seq 1 13); do pair_control_service_args+=(z); done
+pair_control_select_service_slot
+[[ "$pair_control_service_transit_slot" == flow-2 ]]
+pair_write "$(pair_control_service_path service-descriptor flow-2)" "$(pair_control_service_descriptor)"
+pair_control_service_args=(); for _ in $(seq 1 13); do pair_control_service_args+=(y); done
+pair_control_select_service_slot
+[[ "$pair_control_service_transit_slot" == opposite ]]
+[[ "$(head -1 "$pair_control_dir/service-descriptor")" == x ]]
 mode=cleanup_fail
 if pair_control_cleanup_inside; then exit 1; fi
 [[ ! -e "$pair_control_dir/phase" ]]
+# Multiple ports can share a route only after this operation journaled ownership.
+pair_control_service_route_expected() { printf '%s via %s dev %s\n' "$1" "$2" "$3"; }
+pair_control_service_route_exact() { [[ -f "$PWD/kernel-route" ]]; }
+ip() { printf added >> "$PWD/adds"; touch "$PWD/kernel-route"; }
+pair_control_install_service_route pc-first service-source-route ::1/128 ::2 vdcbr0
+[[ "$(cat adds)" == added ]]
+pair_control_install_service_route pc-first service-source-route-flow-2 ::1/128 ::2 vdcbr0
+[[ "$(cat adds)" == added ]]
+[[ "$(cat "$pair_control_dir/service-source-route-flow-2-intent")" == '::1/128 via ::2 dev vdcbr0' ]]
+# The identical bytes in another namespace or without journaled intent are foreign.
+if pair_control_install_service_route pc-second service-foreign-route ::1/128 ::2 vdcbr0; then exit 1; fi
+if pair_control_install_service_route pc-first service-foreign-route ::3/128 ::2 vdcbr0; then exit 1; fi
 )TEST";
   char temporary[] = "./pair-service-status-unit.XXXXXX";
   if (::mkdtemp(temporary) == nullptr) { suite.expect(false, "pair_service_status_fixture_creates_directory"); return; }
@@ -938,6 +967,7 @@ pair_control_netem_forget_removed_links
 [[ ! -e "$pair_control_dir/netem-active" && ! -e "$pair_control_dir/netem-first-intent" && "$(<"$pair_control_dir/netem-restored")" == *'ownedPeersRemoved=1' ]]
 # Exercise the actual supervisor/dead-owner cleanup integration as well as
 # the helpers. Namespace inventories below are only empty fixture files.
+pair_control_service_slots() { printf '%s\n' base opposite; }
 pair_control_load_service_descriptor() { return 3; }
 pair_control_load_masque_descriptor() { return 3; }
 pair_control_service_path() { printf '%s/%s-%s' "$pair_control_dir" "$1" "$2"; }

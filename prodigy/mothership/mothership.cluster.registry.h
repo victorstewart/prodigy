@@ -5857,6 +5857,30 @@ public:
     return true;
   }
 
+  bool findClusterPairTestControlBoundary(uint128_t pairUUID,
+                                         MothershipClusterPairEnrollmentIntent& intent,
+                                         bool& found, String *failure = nullptr)
+  {
+    intent = {}; found = false;
+    Vector<String> values;
+    struct ClearValues {
+      Vector<String>& values;
+      ~ClearValues() { for (auto& value : values) Vault::secureClearString(value); }
+    } clear {values};
+    if (!db.listValues(clusterPairEnrollmentsColumnFamily, values, failure)) return false;
+    for (const auto& encoded : values) {
+      MothershipClusterPairEnrollmentIntent candidate;
+      if (!BitseryEngine::deserializeSafe(encoded, candidate) || !mothershipClusterPairEnrollmentIntentValid(candidate)) {
+        if (failure) failure->assign("cluster pair enrollment intent is corrupt or unsupported"_ctv);
+        return false;
+      }
+      if (candidate.pairUUID != pairUUID || !candidate.testControlBoundaryAdmitted || candidate.testControlBoundaryClosed) continue;
+      if (found) { if (failure) failure->assign("duplicate test pair boundary"_ctv); return false; }
+      intent = std::move(candidate); found = true;
+    }
+    return true;
+  }
+
   bool recordClusterPairTestControlServiceTransit(uint128_t operationUUID,
                                                   const MothershipPairControlServiceTransit& transit,
                                                   MothershipClusterPairEnrollmentIntent& recorded,
@@ -5880,10 +5904,10 @@ public:
     bool alreadyAdmitted = false;
     for (const auto& existing : current.testControlServiceTransits)
     {
-      if (existing.sourceClusterUUID != transit.sourceClusterUUID) continue;
+      if (!mothershipPairControlServiceTransitSameFlow(existing, transit)) continue;
       if (!mothershipPairControlServiceTransitEqual(existing, transit))
       {
-        if (failure) failure->assign("pair-control service transit conflicts with its immutable direction tuple"_ctv);
+        if (failure) failure->assign("pair-control service transit conflicts with its immutable authenticated flow"_ctv);
         return false;
       }
       alreadyAdmitted = true;
@@ -5893,13 +5917,10 @@ public:
     {
       if (current.testControlServiceTransits.size() >= MothershipPairControlMaximumServiceTransits)
       {
-        if (failure) failure->assign("pair-control service transit direction capacity exceeded"_ctv);
+        if (failure) failure->assign("pair-control service transit capacity exceeded"_ctv);
         return false;
       }
       current.testControlServiceTransits.push_back(transit);
-      if (current.testControlServiceTransits.size() == 2 &&
-          current.testControlServiceTransits[0].sourceClusterUUID > current.testControlServiceTransits[1].sourceClusterUUID)
-        std::swap(current.testControlServiceTransits[0], current.testControlServiceTransits[1]);
     }
     if (!mothershipClusterPairEnrollmentIntentValid(current))
     {

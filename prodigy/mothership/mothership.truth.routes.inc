@@ -32,6 +32,68 @@ static bool truthSiblingPermissionMatches(const ProdigyLocalCousinServicePermiss
       permission.localDeploymentID == deploymentID && permission.peerDeploymentID == deploymentID;
 }
 
+// A test carrier starts with an explicitly admitted exact service tuple.
+// Replacement can allocate further declared Whiteholes in the same deployment.
+// Extend only that admitted service through the normal typed authorization and
+// provider owner, keeping all existing tuples available during the transition.
+bool reconcileTruthTestServiceTransits(const MothershipTruthGroup& state,
+                                      const CousinRouteRecord& route,
+                                      const MothershipProdigyCluster& source,
+                                      String& failure)
+{
+  MothershipClusterPairEnrollmentIntent intent; bool found = false;
+  {
+    auto registry = openClusterRegistry();
+    if (!registry.findClusterPairTestControlBoundary(route.pairUUID, intent, found, &failure)) return false;
+  }
+  if (!found) return true;
+  auto seed = std::find_if(intent.testControlServiceTransits.begin(), intent.testControlServiceTransits.end(), [&](const auto& transit) {
+    return transit.sourceClusterUUID == route.sourceClusterUUID && transit.destinationClusterUUID == route.destinationClusterUUID &&
+        transit.sourcePermissionUUID == route.sourcePermissionUUID && transit.destinationPermissionUUID == route.destinationPermissionUUID &&
+        transit.sourceDeploymentID == state.group.deploymentID && transit.destinationDeploymentID == state.group.deploymentID && transit.sourceSlot == 0;
+  });
+  if (seed == intent.testControlServiceTransits.end()) return true;
+  const auto admittedService = *seed;
+  RoutableResourceLeaseReport leases;
+  if (!readRoutableResourceLeases(source, leases, failure)) return false;
+  Vector<MothershipPairControlServiceTransit> missing, active;
+  for (const auto& lease : leases.leases) {
+    if (lease.kind != RoutableResourceLeaseKind::whiteholeAddressPort || lease.owner.deploymentID != state.group.deploymentID) continue;
+    auto transit = admittedService;
+    transit.sourceWhiteholeAddress = lease.address; transit.sourceTCPPort = lease.sourcePort;
+    active.push_back(transit);
+    if (std::any_of(intent.testControlServiceTransits.begin(), intent.testControlServiceTransits.end(), [&](const auto& existing) {
+      return mothershipPairControlServiceTransitSameFlow(existing, transit);
+    })) continue;
+    missing.push_back(transit);
+  }
+  if (missing.empty()) {
+    Vector<String> arguments; String receipt;
+    if (mothershipPairControlBoundaryArguments(intent.testControlBoundary, "query"_ctv, arguments, &failure) &&
+        mothershipRunVirtualDatacenterProvider(std::move(arguments), &receipt, &failure) &&
+        mothershipPairControlBoundaryPreparedReceiptValid(intent.testControlBoundary, receipt, intent.testControlServiceTransits)) return true;
+    // Admission is durable before the provider runs. Replay active tuples if
+    // an earlier invocation stopped between intent persistence and preparation.
+    missing = std::move(active); failure.clear();
+  }
+  TestPairLifecycleLock lock;
+  if (!lockTestPairLifecycle(lock, failure)) return false;
+  for (auto& transit : missing) {
+    if (!validatePairControlServiceTransit(intent, transit, failure)) return false;
+    {
+      auto registry = openClusterRegistry();
+      if (!registry.recordClusterPairTestControlServiceTransit(intent.operationUUID, transit, intent, &failure)) return false;
+    }
+    Vector<String> arguments;
+    if (!mothershipPairControlServiceTransitArguments(intent.testControlBoundary, transit, arguments, &failure) ||
+        !mothershipRunVirtualDatacenterProvider(std::move(arguments), &failure)) return false;
+  }
+  Vector<String> arguments; String receipt;
+  return mothershipPairControlBoundaryArguments(intent.testControlBoundary, "query"_ctv, arguments, &failure) &&
+      mothershipRunVirtualDatacenterProvider(std::move(arguments), &receipt, &failure) &&
+      mothershipPairControlBoundaryPreparedReceiptValid(intent.testControlBoundary, receipt, intent.testControlServiceTransits);
+}
+
 // Permissions bind deployments on a cluster pair. The resulting authenticated
 // sibling session binds both individual containers and the current Raft group.
 // Included in Mothership. Route and permission UUIDs, ingress endpoints, and
@@ -120,6 +182,7 @@ bool reconcileTruthSiblingRoutes(const MothershipTruthGroup& state,
         if (failure.empty()) failure.assign("Truth sibling route permission, authority, or durable receipt changed during recovery; retry reconciliation"_ctv);
         return false;
       }
+      if (!reconcileTruthTestServiceTransits(state, candidate, source, failure)) return false;
       ++exact;
     }
     if (exact != 1) {

@@ -460,12 +460,16 @@ static inline bool prodigyCousinSessionTransportSourceValid(const ProdigyCousinS
 // This never authorizes a caller-supplied endpoint or a legacy automatic flow.
 static inline bool prodigyCousinAutomaticSessionDesired(
     const ProdigyLocalCousinServicePermission& permission, const CousinRouteRecord& route,
-    bool exactLivePlanService, uint32_t usableWhiteholes, int64_t nowMs)
+    bool exactLivePlanService, uint32_t usableWhiteholes, int64_t nowMs,
+    bool truthGlobalSiblingPool = false)
 {
   return prodigyLocalCousinServicePermissionValid(permission) &&
       permission.protocolVersion == ProdigyLocalCousinServicePermission::purposeVersion &&
       permission.state == ProdigyLocalCousinServicePermissionState::active && permission.localHalf == CousinRouteHalf::source &&
-      exactLivePlanService && usableWhiteholes == 1 && cousinRouteCurrentContract(route) &&
+      exactLivePlanService &&
+      (truthGlobalSiblingPool ? (usableWhiteholes != 0 && usableWhiteholes <= 3) :
+                                usableWhiteholes == 1) &&
+      cousinRouteCurrentContract(route) &&
       cousinRouteAllowsNewAdmissionAt(route, nowMs) && route.sourcePermissionUUID == permission.permissionUUID &&
       route.pairUUID == permission.pairUUID && route.logicalWorkloadUUID == permission.logicalWorkloadUUID &&
       route.logicalServiceUUID == permission.logicalServiceUUID && route.sourceClusterUUID == permission.localClusterUUID &&

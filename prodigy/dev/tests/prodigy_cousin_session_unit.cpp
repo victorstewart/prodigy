@@ -218,6 +218,39 @@ int main()
     expect(!owner.applyCommand(renew), "nonlegacy_renew_authenticates_final_psk_byte");
   }
   {
+    auto source = purposeFixture(CousinRouteHalf::source, ProdigyCousinServicePurpose::sibling, false, 10, 0, 1, 0xa100);
+    auto route = buildRouteForSession(source.session);
+    expect(!prodigyCousinAutomaticSessionDesired(source.session.sourcePermission, route, true, 2, 2000) &&
+        prodigyCousinAutomaticSessionDesired(source.session.sourcePermission, route, true, 2, 2000, true) &&
+        prodigyCousinAutomaticSessionDesired(source.session.sourcePermission, route, true, 3, 2000, true) &&
+        !prodigyCousinAutomaticSessionDesired(source.session.sourcePermission, route, true, 4, 2000, true),
+        "truth_global_sibling_pool_is_explicitly_bounded_without_relaxing_legacy_automatic_sessions");
+
+    auto first = purposeFixture(CousinRouteHalf::source, ProdigyCousinServicePurpose::sibling, false, 10, 0, 1, 0xa110);
+    auto second = purposeFixture(CousinRouteHalf::source, ProdigyCousinServicePurpose::sibling, false, 10, 0, 1, 0xa120);
+    // Model C -> A1 and C -> A4: same protected public portal, but each
+    // session owns a different declared Whitehole source tuple and target.
+    second.session.sourceBindingNonce = 2;
+    second.session.sourceTCPPort++;
+    second.session.destination.containerUUID++;
+    second.session.destination.containerID++;
+    auto rekey = [](ProdigyCousinSessionLocalCommand& command) {
+      auto route = buildRouteForSession(command.session);
+      ClusterPairRoot root = {}; root.pairUUID = command.session.sourcePermission.pairUUID;
+      root.firstClusterUUID = command.session.sourcePermission.localClusterUUID;
+      root.secondClusterUUID = command.session.destination.permission.localClusterUUID;
+      root.rootGeneration = command.session.rootGeneration;
+      for (unsigned i = 0; i < root.root.size(); ++i) root.root[i] = uint8_t(i + 1);
+      ClusterPairKeyContext context = {}; ClusterPairDerivedKey key = {};
+      return prodigyCousinSessionRouteBindingForRoute(route, command.session.route) &&
+          prodigyCousinSessionKeyContext(command.session, context) && clusterPairDeriveKey(root, context, key) && key.size == 32 &&
+          (std::memcpy(command.psk.data(), key.bytes.data(), 32), prodigyCousinSessionDigest(command.session, command.canonicalContext));
+    };
+    ProdigyCousinSessionClient owner(first.session.sourceContainerUUID);
+    expect(rekey(first) && rekey(second) && owner.applyCommand(first) && owner.applyCommand(second),
+        "truth_global_source_keeps_old_same_portal_session_while_admitting_distinct_whitehole_target");
+  }
+  {
     auto source = purposeFixture(CousinRouteHalf::source, ProdigyCousinServicePurpose::clientAuthority, true);
     auto destination = purposeFixture(CousinRouteHalf::destination, ProdigyCousinServicePurpose::clientAuthority, true);
     String immutableBefore = {}, immutableAfter = {}, encoded = {}; prodigyCousinSessionDigest(source.session, immutableBefore);
@@ -416,6 +449,10 @@ int main()
   client.rBuffer.reserve(8192); server.rBuffer.reserve(8192);
   client.wBuffer.reserve(8192); server.wBuffer.reserve(8192);
   ok = ok && clientOwner.prepareOutbound(source.session.sessionUUID, client);
+  linger clientLinger = {}; socklen_t clientLingerLength = sizeof(clientLinger);
+  expect(ok && getsockopt(client.fd, SOL_SOCKET, SO_LINGER, &clientLinger, &clientLingerLength) == 0 &&
+         clientLingerLength == sizeof(clientLinger) && clientLinger.l_onoff == 1 && clientLinger.l_linger == 0,
+         "outbound_socket_is_abortive_before_ring_fixed_file_handoff");
   if (ok) {
     const int connected = connect(client.fd, client.daddr<sockaddr>(), client.daddrLen);
     ok = connected == 0 || errno == EINPROGRESS;
@@ -428,6 +465,10 @@ int main()
          std::memcmp(&reinterpret_cast<sockaddr_in6&>(observed).sin6_addr, source.session.sourceAddress.v6, 16) == 0,
          "native_connect_binds_allocated_whitehole_tuple");
   ok = ok && serverOwner.prepareInbound(server, observed, observedLength);
+  linger serverLinger = {}; socklen_t serverLingerLength = sizeof(serverLinger);
+  expect(ok && getsockopt(server.fd, SOL_SOCKET, SO_LINGER, &serverLinger, &serverLingerLength) == 0 &&
+         serverLingerLength == sizeof(serverLinger) && serverLinger.l_onoff == 1 && serverLinger.l_linger == 0,
+         "inbound_socket_is_abortive_before_ring_fixed_file_handoff");
   for (unsigned i = 0; ok && i < 10000 && (!client.isTransportNegotiated() || !server.isTransportNegotiated()); ++i)
     ok = pump(client, server) && pump(server, client);
   expect(ok && client.isTransportNegotiated() && server.isTransportNegotiated() &&
@@ -467,28 +508,30 @@ int main()
   expect(!unowned.abortOwnedSocket() && !fixed.abortOwnedSocket() && fixed.fd == 42,
          "abortive_close_rejects_unowned_and_ring_fixed_descriptors");
   fixed.fd = -1;
-  bool inboundClosed = false;
-  serverOwner.onSessionClosed = [&](uint128_t sessionUUID) {
-    if (server.sessionUUID() == sessionUUID)
-      inboundClosed = server.abortOwnedSocket();
-  };
-  auto revokeDestination = destination;
-  revokeDestination.kind = ProdigyCousinSessionLocalKind::revoke;
-  revokeDestination.psk.fill(0); revokeDestination.canonicalContext.clear();
-  expect(serverOwner.applyCommand(revokeDestination) &&
-         server.sessionUUID() == destination.session.sessionUUID && inboundClosed && server.fd == -1,
-         "destination_revocation_identifies_and_aborts_the_exact_accepted_stream");
-  bool peerReset = false;
-  for (unsigned attempt = 0; client.fd >= 0 && attempt < 500; ++attempt) {
+  // This models Ring's later direct close at the kernel socket layer. The
+  // source stays live, so a FIN here would retain its exact tuple.
+  bool destinationDirectClosed = server.fd >= 0;
+  const int destinationFD = server.fd;
+  if (destinationDirectClosed) {
+    server.fd = -1;
+    destinationDirectClosed = close(destinationFD) == 0;
+  }
+  bool destinationResetSource = false;
+  for (unsigned attempt = 0; destinationDirectClosed && client.fd >= 0 && attempt < 500; ++attempt) {
     char byte = 0;
     const ssize_t received = recv(client.fd, &byte, sizeof(byte), MSG_DONTWAIT);
-    if (received < 0 && errno == ECONNRESET) { peerReset = true; break; }
+    if (received < 0 && errno == ECONNRESET) { destinationResetSource = true; break; }
     if (received == 0 || (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) break;
     usleep(100);
   }
-  expect(peerReset, "retired_inbound_socket_resets_peer_instead_of_leaving_a_fin_wait_tuple");
-  expect(client.abortOwnedSocket() && client.fd == -1,
-         "revoked_fixed_whitehole_outbound_uses_abortive_owner_close");
+  expect(destinationDirectClosed && destinationResetSource,
+         "preinstalled_abortive_destination_close_resets_live_source_before_tuple_reuse");
+  if (client.fd >= 0) { close(client.fd); client.fd = -1; }
+  auto revokeDestination = destination;
+  revokeDestination.kind = ProdigyCousinSessionLocalKind::revoke;
+  revokeDestination.psk.fill(0); revokeDestination.canonicalContext.clear();
+  expect(serverOwner.applyCommand(revokeDestination) && server.sessionUUID() == destination.session.sessionUUID,
+         "destination_revocation_identifies_the_exact_accepted_stream_after_direct_close");
   if (server.fd >= 0) (void)server.abortOwnedSocket();
   auto reconnectSource = fixture(CousinRouteHalf::source, 0x7f11, 0x7f12);
   auto reconnectDestination = fixture(CousinRouteHalf::destination, 0x7f11, 0x7f12);

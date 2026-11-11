@@ -4003,6 +4003,27 @@ static void testTruthPlacementShardInvariant(TestSuite& suite)
   suite.expect(prodigyTruthGlobalMembershipProjectionValid(group) &&
                    deployment.reconcileTruthPlacement(group) == false && deployment.nShardGroups == 1,
                "truth_reconcile_incomplete_path_initializes_one_shard_before_scheduler_launch");
+  suite.expect(deployment.nTarget() == 3,
+               "truth_reconcile_reports_all_three_local_voters_before_launch");
+  group.members[1].clusterUUID = 18;
+  group.members[2].clusterUUID = 19;
+  suite.expect(!deployment.reconcileTruthPlacement(group) && deployment.nTarget() == 1,
+               "truth_reconcile_reports_only_local_projected_members");
+  TruthGlobalMember learner = {};
+  learner.memberID = 4; learner.clusterUUID = group.localClusterUUID;
+  learner.containerUUID = 104; learner.privateIPv6 = IPAddress(uint128_t(4));
+  learner.role = TruthGlobalMemberRole::learner;
+  group.members.push_back(learner);
+  group.highestAllocatedMemberID = 4; group.replacementPending = true;
+  suite.expect(!deployment.reconcileTruthPlacement(group) && deployment.nTarget() == 2,
+               "truth_reconcile_counts_learner_before_its_session_admission");
+  group.members.erase(group.members.begin());
+  group.retiredMemberIDs.push_back(1);
+  suite.expect(!deployment.reconcileTruthPlacement(group) && deployment.nTarget() == 1,
+               "truth_reconcile_excludes_retired_local_member_from_target");
+  group.members.back().clusterUUID = 18;
+  suite.expect(deployment.reconcileTruthPlacement(group) && deployment.nTarget() == 0,
+               "truth_reconcile_retired_only_site_has_no_local_target");
   thisBrain = savedBrain;
 }
 

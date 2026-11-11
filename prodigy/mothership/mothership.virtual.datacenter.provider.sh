@@ -2296,12 +2296,11 @@ pair_control_cleanup_inside()
       pair_control_remove_service_route "$pair_control_router_ns" "$name" \
          "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" "${pair_control_service_destination_side}0"
    }
-   local service_cleanup
-   if pair_control_cleanup_service_one_inside base; then service_cleanup=0; else service_cleanup=$?; fi
-   [[ "$service_cleanup" == 0 || "$service_cleanup" == 3 ]] || status=1
-   if [[ "$service_cleanup" == 3 ]] && { [[ -e "$(pair_control_service_path service-descriptor opposite)" || -L "$(pair_control_service_path service-descriptor opposite)" ]]; }; then status=1; fi
-   if pair_control_cleanup_service_one_inside opposite; then service_cleanup=0; else service_cleanup=$?; fi
-   [[ "$service_cleanup" == 0 || "$service_cleanup" == 3 ]] || status=1
+   local service_cleanup service_slot
+   for service_slot in $(pair_control_service_slots); do
+      if pair_control_cleanup_service_one_inside "$service_slot"; then service_cleanup=0; else service_cleanup=$?; fi
+      [[ "$service_cleanup" == 0 || "$service_cleanup" == 3 ]] || status=1
+   done
    local masque_cleanup
    if pair_control_load_masque_descriptor; then
       # Do not dismantle the carrier if the selected machine namespace can no
@@ -2423,22 +2422,37 @@ print(rows[0]["mtu"])
 '
 }
 
+# Keep the two legacy filenames usable; additional immutable tuples have
+# bounded numbered slots. Every slot is independently authorized by Mothership.
+pair_control_service_slots()
+{
+   printf '%s\n' base opposite
+   local i
+   for ((i=2;i<64;i++)); do printf 'flow-%s\n' "$i"; done
+}
+
 pair_control_service_suffix()
 {
-   [[ "$1" == base || "$1" == opposite ]] || return 2
-   [[ "$1" == base ]] || printf '%s' '-opposite'
+   case "$1" in
+      base) ;;
+      opposite) printf '%s' '-opposite' ;;
+      flow-*) [[ "${1#flow-}" =~ ^([2-9]|[1-5][0-9]|6[0-3])$ ]] || return 2; printf -- '-%s' "$1" ;;
+      *) return 2 ;;
+   esac
 }
 
 pair_control_service_path()
 {
-   local name="$1" slot="$2"
-   printf '%s/%s%s\n' "$pair_control_dir" "$name" "$(pair_control_service_suffix "$slot")"
+   local name="$1" slot="$2" suffix
+   suffix="$(pair_control_service_suffix "$slot")" || return 2
+   printf '%s/%s%s\n' "$pair_control_dir" "$name" "$suffix"
 }
 
 pair_control_service_name()
 {
-   local name="$1" slot="$2"
-   printf '%s%s\n' "$name" "$(pair_control_service_suffix "$slot")"
+   local name="$1" slot="$2" suffix
+   suffix="$(pair_control_service_suffix "$slot")" || return 2
+   printf '%s%s\n' "$name" "$suffix"
 }
 
 pair_control_load_service_descriptor()
@@ -2446,8 +2460,7 @@ pair_control_load_service_descriptor()
    local slot="${1:-base}" path
    path="$(pair_control_service_path service-descriptor "$slot")" || return 2
    pair_control_service_args=()
-   # Status 3 is reserved for a genuinely absent optional slot. Every
-   # malformed, unsafe, or unparsable descriptor is a hard failure.
+   # Only a genuinely absent slot is optional. Malformed state fails closed.
    [[ -e "$path" || -L "$path" ]] || return 3
    [[ -f "$path" && ! -L "$path" ]] || return 2
    mapfile -t pair_control_service_args < "$path" || return 2
@@ -2455,47 +2468,27 @@ pair_control_load_service_descriptor()
    pair_control_parse_service_args "${pair_control_service_args[@]}" || return 2
 }
 
-# Keep the legacy root descriptor as the first service.  A second, opposite
-# direction is stored in an explicitly named sibling, never folded into a
-# mutable aggregate.  This leaves old one-service journals byte-for-byte
-# usable during query and recovery cleanup.
 pair_control_select_service_slot()
 {
-   local requested existing=() base_source opposite_path
+   local requested slot free_slot="" loaded
    requested="$(pair_control_service_descriptor)" || return 1
-   if pair_control_load_service_descriptor base; then
-      existing=("${pair_control_service_args[@]}")
-   else
-      local loaded=$?
-      [[ "$loaded" == 3 ]] || return 1
-      pair_control_service_transit_slot=base
-      pair_control_service_args=()
-      mapfile -t pair_control_service_args <<< "$requested"
-      pair_control_parse_service_args "${pair_control_service_args[@]}" || return 1
-      return 0
-   fi
-   if [[ "$(printf '%s\n' "${existing[@]}")" == "$requested" ]]; then
-      pair_control_service_transit_slot=base
-      pair_control_service_args=("${existing[@]}")
-      return 0
-   fi
-   base_source="$pair_control_service_source_uuid"
+   for slot in $(pair_control_service_slots); do
+      if pair_control_load_service_descriptor "$slot"; then
+         if [[ "$(pair_control_service_descriptor)" == "$requested" ]]; then
+            pair_control_service_transit_slot="$slot"
+            return 0
+         fi
+      else
+         loaded=$?
+         [[ "$loaded" == 3 ]] || return 1
+         [[ -n "$free_slot" ]] || free_slot="$slot"
+      fi
+   done
+   [[ -n "$free_slot" ]] || return 1
+   pair_control_service_transit_slot="$free_slot"
    pair_control_service_args=()
    mapfile -t pair_control_service_args <<< "$requested"
-   pair_control_parse_service_args "${pair_control_service_args[@]}" || return 1
-   # There are exactly two cluster identities. A second tuple may only be the
-   # reverse direction of the legacy/root tuple.
-   [[ "$pair_control_service_source_uuid" != "$base_source" ]] || return 1
-   opposite_path="$(pair_control_service_path service-descriptor opposite)" || return 1
-   if [[ -e "$opposite_path" || -L "$opposite_path" ]]; then
-      pair_control_load_service_descriptor opposite || return 1
-      [[ "$(pair_control_service_descriptor)" == "$requested" ]] || return 1
-   else
-      pair_control_service_args=()
-      mapfile -t pair_control_service_args <<< "$requested"
-      pair_control_parse_service_args "${pair_control_service_args[@]}" || return 1
-   fi
-   pair_control_service_transit_slot=opposite
+   pair_control_parse_service_args "${pair_control_service_args[@]}"
 }
 
 pair_control_service_side()
@@ -2748,8 +2741,15 @@ pair_control_remove_masque_machine_route()
 
 pair_control_install_service_route()
 {
-   local namespace="$1" name="$2" prefix="$3" gateway="$4" device="$5" expected state owned=0
+   local namespace="$1" name="$2" prefix="$3" gateway="$4" device="$5" expected state owned=0 shared digest
    expected="$(pair_control_service_route_expected "$prefix" "$gateway" "$device")" || return 1
+   digest="$(printf '%s\n%s\n' "$namespace" "$expected" | sha256sum | awk '{print $1}')" || return 1
+   [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+   shared="$pair_control_dir/service-route-owner-$digest"
+   if [[ -e "$shared" || -L "$shared" ]]; then
+      [[ -f "$shared" && ! -L "$shared" && "$(<"$shared")" == "$namespace $expected" ]] || return 1
+      owned=1
+   fi
    if [[ -e "$pair_control_dir/$name-intent" || -L "$pair_control_dir/$name-intent" ]]; then
       [[ -f "$pair_control_dir/$name-intent" && ! -L "$pair_control_dir/$name-intent" && "$(<"$pair_control_dir/$name-intent")" == "$expected" ]] || return 1
       owned=1
@@ -2757,15 +2757,17 @@ pair_control_install_service_route()
       return 1
    fi
    if pair_control_service_route_exact "$namespace" "$prefix" "$gateway" "$device"; then
-      # An identical pre-existing route is not ours unless intent preceded it.
       [[ "$owned" == 1 ]] || return 1
    else
       state=$?
       [[ "$state" == 1 ]] || return 1
-      [[ "$owned" == 1 ]] || pair_write "$pair_control_dir/$name-intent" "$expected" || return 1
+      pair_write "$shared" "$namespace $expected" || return 1
+      pair_write "$pair_control_dir/$name-intent" "$expected" || return 1
       ip -n "$namespace" -6 route add "$prefix" via "$gateway" dev "$device" || return 1
       pair_control_service_route_exact "$namespace" "$prefix" "$gateway" "$device" || return 1
    fi
+   pair_write "$shared" "$namespace $expected" || return 1
+   pair_write "$pair_control_dir/$name-intent" "$expected" || return 1
    pair_write "$pair_control_dir/$name" "$expected"
 }
 
@@ -2788,6 +2790,10 @@ pair_control_install_service_inside()
    # Rebuild the restrictive policy with every descriptor persisted before
    # either of this direction's external /128 routes becomes live.
    pair_control_firewall || return 1
+   pair_control_service_args=()
+   mapfile -t pair_control_service_args <<< "$requested"
+   pair_control_parse_service_args "${pair_control_service_args[@]}" || return 1
+   pair_control_service_side || return 1
    name="$(pair_control_service_name service-source-route "$pair_control_service_transit_slot")" || return 1
    pair_control_install_service_route "pc-$pair_control_service_source_side" "$name" \
       "${pair_control_service_destination_address}/128" "$pair_control_service_source_router" vdcbr0 || return 1
@@ -2843,16 +2849,11 @@ pair_control_validate_service_one_inside()
 
 pair_control_validate_service_inside()
 {
-   local loaded opposite_descriptor
-   if pair_control_validate_service_one_inside base; then loaded=0; else loaded=$?; fi
-   if [[ "$loaded" == 3 ]]; then
-      opposite_descriptor="$(pair_control_service_path service-descriptor opposite)" || return 1
-      [[ ! -e "$opposite_descriptor" && ! -L "$opposite_descriptor" ]] || return 1
-      return 0
-   fi
-   [[ "$loaded" == 0 ]] || return 1
-   if pair_control_validate_service_one_inside opposite; then loaded=0; else loaded=$?; fi
-   [[ "$loaded" == 0 || "$loaded" == 3 ]] || return 1
+   local loaded slot
+   for slot in $(pair_control_service_slots); do
+      if pair_control_validate_service_one_inside "$slot"; then loaded=0; else loaded=$?; fi
+      [[ "$loaded" == 0 || "$loaded" == 3 ]] || return 1
+   done
 }
 
 pair_control_install_masque_inside()
@@ -2972,7 +2973,7 @@ pair_control_firewall()
    ip netns exec "$pair_control_router_ns" ip6tables -A FORWARD -i first0 -o second0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
    ip netns exec "$pair_control_router_ns" ip6tables -A FORWARD -i second0 -o first0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
    local service_slot service_load
-   for service_slot in base opposite; do
+   for service_slot in $(pair_control_service_slots); do
       if pair_control_load_service_descriptor "$service_slot"; then
          pair_control_service_side || return 1
          ip netns exec "$pair_control_router_ns" ip6tables -A FORWARD \
@@ -3230,30 +3231,17 @@ pair_control_query_inside()
          "$pair_control_service_source_address" "$pair_control_service_source_port" "$pair_control_service_destination_address" "$pair_control_service_destination_port" \
          "$pair_control_service_source_ingress_private6" "$pair_control_service_destination_ingress_private6"
    }
-   local load_status base_source opposite_source base_args=() opposite_args=()
-   if pair_control_load_service_descriptor base; then
-      base_args=("${pair_control_service_args[@]}"); base_source="$pair_control_service_source_uuid"
-      if pair_control_load_service_descriptor opposite; then
-         opposite_args=("${pair_control_service_args[@]}"); opposite_source="$pair_control_service_source_uuid"
-         [[ "$base_source" != "$opposite_source" ]] || return 1
-         # The receipt order is the boundary's first cluster then second
-         # cluster, independent of which direction was admitted first.
-         if [[ "$base_source" == "$pair_control_first_uuid" ]]; then
-            pair_control_service_args=("${base_args[@]}"); pair_control_parse_service_args "${pair_control_service_args[@]}" || return 1; pair_control_emit_service_receipt
-            pair_control_service_args=("${opposite_args[@]}"); pair_control_parse_service_args "${pair_control_service_args[@]}" || return 1; pair_control_emit_service_receipt
-         else
-            [[ "$opposite_source" == "$pair_control_first_uuid" ]] || return 1
-            pair_control_service_args=("${opposite_args[@]}"); pair_control_parse_service_args "${pair_control_service_args[@]}" || return 1; pair_control_emit_service_receipt
-            pair_control_service_args=("${base_args[@]}"); pair_control_parse_service_args "${pair_control_service_args[@]}" || return 1; pair_control_emit_service_receipt
-         fi
+   local load_status slot count=0
+   for slot in $(pair_control_service_slots); do
+      if pair_control_load_service_descriptor "$slot"; then
+         pair_control_emit_service_receipt
+         count=$((count+1))
       else
          load_status=$?
          [[ "$load_status" == 3 ]] || return 1
-         pair_control_service_args=("${base_args[@]}"); pair_control_parse_service_args "${pair_control_service_args[@]}" || return 1; pair_control_emit_service_receipt
       fi
-   else
-      load_status=$?
-      [[ "$load_status" == 3 && ! -e "$(pair_control_service_path service-descriptor opposite)" && ! -L "$(pair_control_service_path service-descriptor opposite)" ]] || return 1
+   done
+   if [[ "$count" == 0 ]]; then
       printf 'PAIR_CONTROL operationID=%s firstClusterUUID=%s secondClusterUUID=%s firstRuntimeIdentity=%s secondRuntimeIdentity=%s firstPrivate6Subnet=%s secondPrivate6Subnet=%s port=%s phase=prepared\n' \
          "$pair_control_id" "$pair_control_first_uuid" "$pair_control_second_uuid" "$pair_control_first_runtime" "$pair_control_second_runtime" "$pair_control_first_subnet" "$pair_control_second_subnet" "$pair_control_port"
    fi

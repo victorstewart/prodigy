@@ -72,6 +72,12 @@ class ProdigyCousinSessionStream : public ProdigyTransportTLSStream {
     ProdigyTransportTLSStream::clearQueuedSendBytes();
     return false;
   }
+  static bool configureAbortiveClose(int socket)
+  {
+    struct linger terminal = {};
+    terminal.l_onoff = 1;
+    return ::setsockopt(socket, SOL_SOCKET, SO_LINGER, &terminal, sizeof(terminal)) == 0;
+  }
 public:
   // These entry points must remain on the concrete stream in the receive owner.
   // Ring's virtual send interface is guarded as well, including queued ciphertext.
@@ -104,9 +110,7 @@ public:
     if (isFixedFile || fd < 0) return false;
     const int ownedFD = fd;
     fd = -1;
-    struct linger terminal = {};
-    terminal.l_onoff = 1;
-    const bool configured = ::setsockopt(ownedFD, SOL_SOCKET, SO_LINGER, &terminal, sizeof(terminal)) == 0;
+    const bool configured = configureAbortiveClose(ownedFD);
     const bool closed = ::close(ownedFD) == 0;
     return configured && closed;
   }
@@ -239,7 +243,10 @@ public:
     stream.setIPVersion(AF_INET6); stream.setNonBlocking();
     stream.setSaddr(session.sourceAddress, session.sourceTCPPort);
     stream.setDaddr(session.destination.publicAddress, session.destination.publicTCPPort);
-    if (stream.fd < 0 || !Ring::bindSourceAddressBeforeFixedFileInstall(&stream)) return false;
+    // Ring's later direct fixed-file close has no ordinary descriptor through
+    // which to configure this. Set the socket-wide abortive-close policy first.
+    if (stream.fd < 0 || !stream.configureAbortiveClose(stream.fd) ||
+        !Ring::bindSourceAddressBeforeFixedFileInstall(&stream)) return false;
     lease->claimed = true; stream.lease = lease; stream.resolving = false;
     std::weak_ptr<ProdigyCousinSessionLease> weak = lease;
     const bool prepared = stream.beginTransportAEGISWithPrelude(false, state->containerUUID,
@@ -336,6 +343,9 @@ public:
     expire();
     if (state->containerUUID == 0 || stream.transportEncryptionEnabled() ||
         length < sizeof(sockaddr_in6) || observedPeer.ss_family != AF_INET6) return false;
+    // Direct accepted-descriptor owners retain this fd until their Ring
+    // handoff. Configure the socket before that handoff as on the source path.
+    if (!stream.isFixedFile && stream.fd >= 0 && !stream.configureAbortiveClose(stream.fd)) return false;
     stream.resolving = true; stream.pendingDeadline = Time::msSinceBoot() + ProdigyCousinSessionPendingMs;
     std::weak_ptr<State> weak = state;
     return stream.beginTransportAEGISWithDeferredServerPrelude(state->containerUUID,

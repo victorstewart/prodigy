@@ -15492,6 +15492,12 @@ REMOTE_RUNTIME
       exit(EXIT_FAILURE);
     }
 
+    // The scoped registry read is closed before provider execution. Test
+    // observers may now open the registry without racing fault admission;
+    // they must still independently observe the requested outage.
+    std::printf("faultTestCluster admitted=1 identity=%s mode=%s machineIndices=%s\n",
+                identity.c_str(), mode.c_str(), machineIndices.c_str());
+    std::fflush(stdout);
     if (mothershipFaultVirtualDatacenterProvider(cluster, mode, machineIndices, uint32_t(durationMs), uint32_t(cycles), uint32_t(downMs), uint32_t(upMs), &failure) == false)
     {
       basics_log("faultTestCluster success=0 identity=%s failure=%s\n", identity.c_str(), failure.c_str());

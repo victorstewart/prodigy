@@ -2176,6 +2176,10 @@ static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
 
   switchboard_wormhole_egress_binding binding = installPortal(external, 443, 8443, 41);
   switchboard_wormhole_egress_binding binding2 = installPortal(external2, 4443, 9443, 42);
+  // TCP is deliberately a separate exposure: the production failure is a
+  // SYN-ACK on a public TCP listener, while the historical 9443 fixture is
+  // UDP-only.
+  switchboard_wormhole_egress_binding tcp9443Binding = installPortal(external2, 4443, 9443, 43, IPPROTO_TCP);
   std::vector<uint8_t> publicInner = makeIPv6L4EthernetFrame(client, external, IPPROTO_UDP, 49'152, 443);
   std::vector<uint8_t> publicOverlay = makeWormholeIPv6OverlayFrame(publicInner, selected);
   std::vector<uint8_t> privateIngress = makeIPv6L4EthernetFrame(client, server, IPPROTO_UDP, 49'152, 8443);
@@ -2236,6 +2240,75 @@ static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
 
   std::vector<uint8_t> hostOutput = {};
   std::vector<uint8_t> packetOutput = {};
+
+  // A protected public listener can simultaneously serve a private mesh peer.
+  // The private three-way handshake has no pair-route identity and therefore
+  // must retain a private owner rather than inherit the public grant profile.
+  tcp9443Binding.admission_profile = SWITCHBOARD_WORMHOLE_ADMISSION_PAIR_GRANT;
+  switchboard_wormhole_egress_key protectedPrivateExposure = {};
+  std::memcpy(protectedPrivateExposure.container, selected, sizeof(protectedPrivateExposure.container));
+  protectedPrivateExposure.port = htons(9443);
+  protectedPrivateExposure.proto = IPPROTO_TCP;
+  expectNamed(updateProgramMapElement(host, "wh_egress"_ctv, protectedPrivateExposure, tcp9443Binding) &&
+                  updateProgramMapElement(ingress, "wh_egress"_ctv, protectedPrivateExposure, tcp9443Binding) &&
+                  updateProgramMapElement(egress, "wh_egress"_ctv, protectedPrivateExposure, tcp9443Binding),
+              "protects_public_tcp_listener_profile");
+  clearWormholeFlows();
+  auto tcp = [](std::vector<uint8_t>& frame) -> tcphdr * {
+    return reinterpret_cast<tcphdr *>(frame.data() + sizeof(ethhdr) + sizeof(ipv6hdr));
+  };
+  auto checksumTCP = [&](std::vector<uint8_t>& frame) -> void {
+    ipv6hdr *ip6h = reinterpret_cast<ipv6hdr *>(frame.data() + sizeof(ethhdr));
+    tcphdr *header = tcp(frame);
+    header->check = 0;
+    header->check = checksumIPv6Transport(ip6h->saddr.s6_addr, ip6h->daddr.s6_addr, IPPROTO_TCP, header, sizeof(*header));
+  };
+  std::vector<uint8_t> privateSyn = makeIPv6L4EthernetFrame(peer, server, IPPROTO_TCP, 49'157, 9443);
+  tcp(privateSyn)->syn = 1;
+  tcp(privateSyn)->seq = htonl(17);
+  checksumTCP(privateSyn);
+  flow_key privateReplyKey = {};
+  std::memcpy(privateReplyKey.srcv6, server, sizeof(privateReplyKey.srcv6));
+  std::memcpy(privateReplyKey.dstv6, peer, sizeof(privateReplyKey.dstv6));
+  privateReplyKey.port16[0] = htons(9443);
+  privateReplyKey.port16[1] = htons(49'157);
+  privateReplyKey.proto = IPPROTO_TCP;
+  switchboard_wormhole_flow_key privateOwnerKey =
+      switchboardWormholeFlowMapKey(&privateReplyKey, tcp9443Binding.owner_generation);
+  expectNamed(runNetkit(ingress, privateSyn, 0, packetOutput) == NETKIT_PASS,
+              "private_tcp_syn_on_protected_listener_claims_owner");
+  switchboard_wormhole_flow privatePending = {};
+  expectNamed(lookupProgramMapElement(host, "wh_pending"_ctv, privateOwnerKey, privatePending) &&
+                  privatePending.disposition == SWITCHBOARD_WORMHOLE_FLOW_PRIVATE &&
+                  privatePending.admission_profile == SWITCHBOARD_WORMHOLE_ADMISSION_NONE,
+              "private_tcp_pending_owner_does_not_inherit_public_pair_grant");
+  std::vector<uint8_t> privateSynAck = makeIPv6L4EthernetFrame(server, peer, IPPROTO_TCP, 9443, 49'157);
+  tcp(privateSynAck)->syn = 1;
+  tcp(privateSynAck)->ack = 1;
+  tcp(privateSynAck)->seq = htonl(29);
+  tcp(privateSynAck)->ack_seq = htonl(18);
+  checksumTCP(privateSynAck);
+  expectNamed(runNetkit(egress, privateSynAck, 0, packetOutput) == NETKIT_PASS && packetOutput == privateSynAck,
+              "private_tcp_syn_ack_on_protected_listener_keeps_owner");
+  std::vector<uint8_t> privateAck = privateSyn;
+  tcp(privateAck)->syn = 0;
+  tcp(privateAck)->ack = 1;
+  tcp(privateAck)->seq = htonl(18);
+  tcp(privateAck)->ack_seq = htonl(30);
+  checksumTCP(privateAck);
+  expectNamed(runNetkit(ingress, privateAck, 0, packetOutput) == NETKIT_PASS,
+              "private_tcp_final_ack_on_protected_listener_promotes_owner");
+  switchboard_wormhole_flow privateEstablished = {};
+  expectNamed(lookupProgramMapElement(host, "wh_flows"_ctv, privateOwnerKey, privateEstablished) &&
+                  privateEstablished.phase == SWITCHBOARD_WORMHOLE_FLOW_ESTABLISHED &&
+                  privateEstablished.admission_profile == SWITCHBOARD_WORMHOLE_ADMISSION_NONE,
+              "private_tcp_protected_listener_establishes_without_pair_route");
+  tcp9443Binding.admission_profile = SWITCHBOARD_WORMHOLE_ADMISSION_NONE;
+  expectNamed(updateProgramMapElement(host, "wh_egress"_ctv, protectedPrivateExposure, tcp9443Binding) &&
+                  updateProgramMapElement(ingress, "wh_egress"_ctv, protectedPrivateExposure, tcp9443Binding) &&
+                  updateProgramMapElement(egress, "wh_egress"_ctv, protectedPrivateExposure, tcp9443Binding),
+              "restores_private_tcp_listener_profile");
+
   clearWormholeFlows();
   expectNamed(runHost(publicOverlay, hostOutput) == TC_ACT_SHOT,
               "rejects_forged_provenance_from_unauthorized_overlay_peer");

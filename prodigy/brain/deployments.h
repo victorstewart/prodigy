@@ -4478,6 +4478,15 @@ public:
     // peer admission rejects an uninitialized (zero) shard count.
     nShardGroups = 1;
 
+    // The same durable projection owns both exact launches and their reported
+    // target. A learner changes the local target before it becomes a voter;
+    // keeping the genesis count here prevents its leased sessions from being
+    // admitted once the second local instance is healthy.
+    nTargetBase = uint32_t(std::count_if(current.members.begin(), current.members.end(), [&](const auto& member) {
+      return member.clusterUUID == current.localClusterUUID;
+    }));
+    nTargetSurge = nTargetCanary = 0;
+
     bool changed = false;
     auto incomplete = [&]() -> bool {
       // Earlier exact constructions remain owned by the ordinary scheduler.
