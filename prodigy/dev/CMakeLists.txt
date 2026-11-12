@@ -1819,6 +1819,13 @@ if (PROJECT_ENABLE_TESTS)
    set_tests_properties(prodigy_g6_physical_observe_unit PROPERTIES TIMEOUT 30)
 
    add_test(
+      NAME prodigy_g6_physical_probe_container_unit
+      COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_g6_physical_probe_container_unit.py
+              $<TARGET_FILE:prodigy_g6_physical_probe_container>
+   )
+   set_tests_properties(prodigy_g6_physical_probe_container_unit PROPERTIES TIMEOUT 30)
+
+   add_test(
       NAME prodigy_mothership_local_vm_boundary_contract
       COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_local_vm_boundary_contract.py
    )

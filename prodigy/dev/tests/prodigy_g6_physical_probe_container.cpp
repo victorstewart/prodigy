@@ -1,7 +1,7 @@
 // G6 physical-boundary probe.  This binary never changes routes, DNS, BPF, or
-// host networking; it only opens application sockets and writes JSONL results.
+// host networking; it only opens application sockets to numeric endpoints and
+// writes JSONL results. DNS evidence belongs to the Prodigy resolver service.
 #include <arpa/inet.h>
-#include <netdb.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -83,16 +83,23 @@ void emit(const char *method, const char *status, const std::string& detail) {
   std::fflush(stdout);
 }
 int connectTcp(const char *host, const char *port, int family) {
-  addrinfo hints = {}; hints.ai_family = family; hints.ai_socktype = SOCK_STREAM;
-  addrinfo *answers = nullptr;
-  if (getaddrinfo(host, port, &hints, &answers) != 0) return -1;
-  int fd = -1;
-  for (addrinfo *answer = answers; answer; answer = answer->ai_next) {
-    fd = socket(answer->ai_family, answer->ai_socktype | SOCK_CLOEXEC, answer->ai_protocol);
-    if (fd >= 0 && connectTimed(fd, answer->ai_addr, answer->ai_addrlen)) break;
-    if (fd >= 0) close(fd); fd = -1;
-  }
-  freeaddrinfo(answers); return fd;
+  // This external observer has no resolver-service session. Never resolve names
+  // through the host's DNS configuration; TLS receives its SNI name separately.
+  if (!host || !port || !*port || std::strspn(port, "0123456789") != std::strlen(port)) return -1;
+  errno = 0; char *end = nullptr; const unsigned long number = std::strtoul(port, &end, 10);
+  if (errno || !end || *end || number == 0 || number > 65535) return -1;
+  sockaddr_storage address = {}; socklen_t length = 0;
+  auto *ipv4 = reinterpret_cast<sockaddr_in*>(&address);
+  auto *ipv6 = reinterpret_cast<sockaddr_in6*>(&address);
+  if ((family == AF_INET || family == AF_UNSPEC) && inet_pton(AF_INET, host, &ipv4->sin_addr) == 1) {
+    ipv4->sin_family = AF_INET; ipv4->sin_port = htons(number); length = sizeof(*ipv4);
+  } else if ((family == AF_INET6 || family == AF_UNSPEC) && inet_pton(AF_INET6, host, &ipv6->sin6_addr) == 1) {
+    ipv6->sin6_family = AF_INET6; ipv6->sin6_port = htons(number); length = sizeof(*ipv6);
+  } else return -1;
+  const int fd = socket(address.ss_family, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
+  if (fd >= 0 && connectTimed(fd, reinterpret_cast<const sockaddr*>(&address), length)) return fd;
+  if (fd >= 0) close(fd);
+  return -1;
 }
 std::string tcpDetail(const char *host, const char *port, int family, size_t bytes, bool reverse,
                       bool& passed) {
@@ -100,12 +107,12 @@ std::string tcpDetail(const char *host, const char *port, int family, size_t byt
   int fd = connectTcp(host, port, family);
   if (fd < 0) return "{\"connectSucceeded\":false,\"family\":" + std::to_string(family) + "}";
   std::vector<char> payload(bytes, 'p'); const std::string request(payload.begin(), payload.end());
-  const bool written = sendAll(fd, request); std::string response(bytes, '\0'); const bool received = written && receiveExact(fd, response);
+  const bool written = sendAll(fd, request); const bool received = written && receiveExact(fd, request);
   sockaddr_storage local = {}, peer = {}; socklen_t localLength = sizeof(local), peerLength = sizeof(peer);
   (void)getsockname(fd, reinterpret_cast<sockaddr*>(&local), &localLength);
   (void)getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &peerLength);
   close(fd);
-  passed = written && received && response == request;
+  passed = written && received;
   return "{\"connectSucceeded\":true,\"family\":" + std::to_string(family) +
       ",\"payloadBytes\":" + std::to_string(bytes) + ",\"payloadMatched\":" + (passed ? "true" : "false") +
       ",\"receivedBytes\":" + std::to_string(received ? bytes : 0) +
@@ -225,13 +232,9 @@ int server(int argc, char **argv) {
 }
 int dns(int argc, char **argv) {
   if (argc != 2) return 2;
-  addrinfo hints = {}; hints.ai_socktype = SOCK_STREAM; addrinfo *answers = nullptr;
-  const int result = getaddrinfo(argv[1], nullptr, &hints, &answers);
-  int addresses = 0; for (addrinfo *p = answers; p; p = p->ai_next) ++addresses;
-  if (answers) freeaddrinfo(answers);
-  // libc does not expose TTL or whether an answer was cache-served.  Do not claim it.
-  emit("dns-ttl-cache-expiry", "unproven", "{\"addresses\":" + std::to_string(addresses) +
-      ",\"getaddrinfoStatus\":" + std::to_string(result) + ",\"reason\":\"libc-does-not-expose-dns-ttl-or-cache-state\"}");
+  // A host lookup cannot prove the deployed resolver's TTL or cache behavior.
+  emit("dns-ttl-cache-expiry", "unproven", "{\"hostname\":" + json(argv[1]) +
+      ",\"reason\":\"prodigy-resolver-service-evidence-required\"}");
   return 1;
 }
 int tls(int argc, char **argv) {
