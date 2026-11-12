@@ -519,6 +519,8 @@ file(GLOB DISCOMBOBULATOR_SOURCE_FILES CONFIGURE_DEPENDS
 set(PRODIGY_DNS_RESOLVER_DISCOMBOBUFILE "${CMAKE_BINARY_DIR}/prodigy-dns-resolver.DiscombobuFile")
 set(PRODIGY_DNS_RESOLVER_CONTAINER_ARTIFACT "${CMAKE_BINARY_DIR}/prodigy-dns-resolver.${PRODIGY_RESOLVED_TARGET_ARCH}.container.zst")
 set(PRODIGY_DNS_RESOLVER_DEPLOYMENT_PLAN "${CMAKE_BINARY_DIR}/prodigy-dns-resolver.deployment.plan.v1.json")
+set(PRODIGY_DNS_RESOLVER_CONTEXT_DIR "${CMAKE_BINARY_DIR}/prodigy-dns-resolver-context")
+set(PRODIGY_DNS_RESOLVER_CONTEXT_STAMP "${PRODIGY_DNS_RESOLVER_CONTEXT_DIR}/.prepared")
 set(PRODIGY_PINGPONG_DISCOMBOBUFILE "${CMAKE_BINARY_DIR}/prodigy-pingpong.DiscombobuFile")
 set(PRODIGY_PINGPONG_CONTAINER_ARTIFACT "${CMAKE_BINARY_DIR}/prodigy-pingpong.${PRODIGY_RESOLVED_TARGET_ARCH}.container.zst")
 set(PRODIGY_PINGPONG_ISOLATION_DISCOMBOBUFILE "${CMAKE_BINARY_DIR}/prodigy-pingpong-isolation.DiscombobuFile")
@@ -1430,21 +1432,32 @@ add_dependencies(prodigy
    container_egress_declared_router
    fake_ipv4_boundary_nat)
 
+# Prepare native ELF inputs only; Discombobulator remains the app artifact owner.
+add_custom_command(
+   OUTPUT "${PRODIGY_DNS_RESOLVER_CONTEXT_STAMP}"
+   COMMAND "${Python3_EXECUTABLE}"
+           "${CMAKE_CURRENT_SOURCE_DIR}/tests/prepare_native_elf_context.py"
+           --binary "$<TARGET_FILE:prodigy_dns_resolver>"
+           --output "${PRODIGY_DNS_RESOLVER_CONTEXT_DIR}"
+           --architecture "${PRODIGY_RESOLVED_TARGET_ARCH}"
+           --destination /app/prodigy-dns-resolver
+   DEPENDS prodigy_dns_resolver
+           "${CMAKE_CURRENT_SOURCE_DIR}/tests/prepare_native_elf_context.py"
+   COMMENT "Preparing the native DNS resolver runtime closure"
+   VERBATIM
+)
+
 add_custom_command(
    OUTPUT "${PRODIGY_DNS_RESOLVER_CONTAINER_ARTIFACT}"
    COMMAND "${CMAKE_COMMAND}" -E env
            CARGO_TARGET_DIR=${DISCOMBOBULATOR_CARGO_TARGET_DIR}
            cargo run --quiet --manifest-path "${DISCOMBOBULATOR_MANIFEST}" --
-           remote add dockerhub docker.io
-   COMMAND "${CMAKE_COMMAND}" -E env
-           CARGO_TARGET_DIR=${DISCOMBOBULATOR_CARGO_TARGET_DIR}
-           cargo run --quiet --manifest-path "${DISCOMBOBULATOR_MANIFEST}" --
            build
            --file "${PRODIGY_DNS_RESOLVER_DISCOMBOBUFILE}"
-           --context "resolver=$<TARGET_FILE_DIR:prodigy_dns_resolver>"
+           --context "resolver=${PRODIGY_DNS_RESOLVER_CONTEXT_DIR}"
            --output "${PRODIGY_DNS_RESOLVER_CONTAINER_ARTIFACT}"
            --kind app
-   DEPENDS prodigy_dns_resolver
+   DEPENDS "${PRODIGY_DNS_RESOLVER_CONTEXT_STAMP}"
            "${PRODIGY_ROOT}/prodigy/dns/DiscombobuFile.in"
            "${PRODIGY_DNS_RESOLVER_DISCOMBOBUFILE}"
            "${DISCOMBOBULATOR_MANIFEST}"
@@ -1474,6 +1487,7 @@ add_custom_command(
    DEPENDS prodigy_g6_byo_probe_container
            "${PRODIGY_G6_BYO_PROBE_BINDING_FILE}"
            "${CMAKE_CURRENT_SOURCE_DIR}/tests/prepare_g6_byo_probe_context.py"
+           "${CMAKE_CURRENT_SOURCE_DIR}/tests/prepare_native_elf_context.py"
    COMMENT "Preparing the rollout-bound G6 BYO probe app context"
    VERBATIM
 )
