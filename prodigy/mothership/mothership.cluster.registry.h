@@ -358,6 +358,31 @@ public:
   bool providerManagedBGP = false;
 };
 
+class MothershipProdigyClusterRecordV9 {
+public:
+  MothershipProdigyCluster cluster;
+  Vector<uint32_t> adoptedMachineRackUUIDs;
+  Vector<uint128_t> adoptedMachineUUIDs;
+  MothershipInternalTransportProfile internalTransportProfile = MothershipInternalTransportProfile::tls;
+  uint32_t spareMachineCount = 0;
+  Vector<IPPrefix> bgpAuthorizedOriginPrefixes;
+  bool providerManagedBGP = false;
+  String fakePublicIngressSourcePreservingIPv4;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipProdigyClusterRecordV9& record)
+{
+  serializer.object(record.cluster);
+  serializer.container4b(record.adoptedMachineRackUUIDs, UINT32_MAX);
+  serializer.object(record.adoptedMachineUUIDs);
+  serializer.value1b(record.internalTransportProfile);
+  serializer.value4b(record.spareMachineCount);
+  serializer.container(record.bgpAuthorizedOriginPrefixes, 256);
+  serializer.value1b(record.providerManagedBGP);
+  serializer.text1b(record.fakePublicIngressSourcePreservingIPv4, 15);
+}
+
 template <typename S>
 static void serialize(S&& serializer, MothershipProdigyClusterRecordV8& record)
 {
@@ -1103,6 +1128,7 @@ private:
   constexpr static auto clusterRecordV6Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=6\n\n"_ctv;
   constexpr static auto clusterRecordV7Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=7\n\n"_ctv;
   constexpr static auto clusterRecordV8Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=8\n\n"_ctv;
+  constexpr static auto clusterRecordV9Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=9\n\n"_ctv;
 
   static void resolveDefaultDBPath(String& path)
   {
@@ -1383,6 +1409,29 @@ private:
     String serialized;
     serialized.append(value, valueSize);
 
+    if (recordHasHeader(serialized, clusterRecordV9Header))
+    {
+      String payload = {};
+      payload.assign(serialized.substr(clusterRecordV9Header.size(), serialized.size() - clusterRecordV9Header.size(), Copy::yes));
+      MothershipProdigyClusterRecordV9 record = {};
+      if (!BitseryEngine::deserializeSafe(payload, record) ||
+          record.adoptedMachineRackUUIDs.size() != record.cluster.machines.size() || record.adoptedMachineUUIDs.size() != record.cluster.machines.size() ||
+          !mothershipTestClusterPublicIngressSourcePreservingIPv4Valid(record.fakePublicIngressSourcePreservingIPv4) ||
+          (record.cluster.deploymentMode != MothershipClusterDeploymentMode::test || !record.cluster.test.enableFakeIpv4Boundary)) return false;
+      for (uint32_t index = 0; index < record.cluster.machines.size(); ++index)
+      {
+        record.cluster.machines[index].rackUUID = record.adoptedMachineRackUUIDs[index];
+        record.cluster.machines[index].uuid = record.adoptedMachineUUIDs[index];
+      }
+      record.cluster.internalTransportProfile = record.internalTransportProfile;
+      record.cluster.test.spareMachineCount = record.spareMachineCount;
+      record.cluster.test.fakePublicIngressSourcePreservingIPv4 = std::move(record.fakePublicIngressSourcePreservingIPv4);
+      record.cluster.providerManagedBGP = record.providerManagedBGP;
+      record.cluster.bgpAuthorizedOriginPrefixes = std::move(record.bgpAuthorizedOriginPrefixes);
+      cluster = std::move(record.cluster);
+      return validateClusterEnvironmentBGP(cluster, nullptr);
+    }
+
     if (recordHasHeader(serialized, clusterRecordV8Header))
     {
       String payload = {};
@@ -1599,7 +1648,21 @@ private:
     }
 
     String payload = {};
-    if (cluster.providerManagedBGP)
+    if (!cluster.test.fakePublicIngressSourcePreservingIPv4.empty())
+    {
+      MothershipProdigyClusterRecordV9 recordV9 = {};
+      recordV9.cluster = std::move(record.cluster);
+      recordV9.adoptedMachineRackUUIDs = std::move(record.adoptedMachineRackUUIDs);
+      recordV9.adoptedMachineUUIDs = std::move(record.adoptedMachineUUIDs);
+      recordV9.internalTransportProfile = record.internalTransportProfile;
+      recordV9.spareMachineCount = cluster.test.spareMachineCount;
+      recordV9.bgpAuthorizedOriginPrefixes = cluster.bgpAuthorizedOriginPrefixes;
+      recordV9.providerManagedBGP = cluster.providerManagedBGP;
+      recordV9.fakePublicIngressSourcePreservingIPv4 = cluster.test.fakePublicIngressSourcePreservingIPv4;
+      BitseryEngine::serialize(payload, recordV9);
+      serialized.assign(clusterRecordV9Header);
+    }
+    else if (cluster.providerManagedBGP)
     {
       MothershipProdigyClusterRecordV8 recordV8 = {};
       recordV8.cluster = std::move(record.cluster);
@@ -2955,6 +3018,13 @@ private:
         return false;
       }
 
+      if (!mothershipTestClusterPublicIngressSourcePreservingIPv4Valid(cluster.test.fakePublicIngressSourcePreservingIPv4) ||
+          (!cluster.test.fakePublicIngressSourcePreservingIPv4.empty() && !cluster.test.enableFakeIpv4Boundary))
+      {
+        if (failure) failure->assign("test fake public ingress source requires fake IPv4 boundary and one canonical 198.18/16 host IPv4"_ctv);
+        return false;
+      }
+
       if (cluster.test.spareMachineCount > 1)
       {
         if (failure)
@@ -3029,6 +3099,14 @@ private:
         cluster.bootstrapSshPrivateKeyPath.clear();
       }
       mothershipResolveTestClusterControlRecord(cluster.controls, cluster);
+    }
+    else if (!cluster.test.fakePublicIngressSourcePreservingIPv4.empty())
+    {
+      if (failure)
+      {
+        failure->assign("non-test clusters must not include test fake public ingress source"_ctv);
+      }
+      return false;
     }
     else if (cluster.test.specified)
     {

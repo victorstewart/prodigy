@@ -505,7 +505,7 @@ provider_process()
    [[ "${arguments[0]:-}" == bash || "${arguments[0]:-}" == /bin/bash ]] || return 1
    [[ "${arguments[1]:-}" =~ ^/proc/self/fd/[0-9]+$ ]] || return 1
    case "${arguments[2]:-}" in
-      --serve) [[ ( "${#arguments[@]}" -eq 15 || "${#arguments[@]}" -eq 16 ) && "${arguments[3]}" == "${workspace}" ]] ;;
+      --serve) [[ ( "${#arguments[@]}" -eq 15 || "${#arguments[@]}" -eq 16 || "${#arguments[@]}" -eq 18 ) && "${arguments[3]}" == "${workspace}" ]] ;;
       --serve-adopt) [[ "${#arguments[@]}" -eq 17 && "${arguments[3]}" =~ ^[0-9]+$ && "${arguments[5]}" == "${workspace}" && "${arguments[4]}" == "${workspace}/virtual-datacenter.recovery/"* ]] ;;
       *) return 1 ;;
    esac
@@ -686,6 +686,122 @@ fault_datacenter()
       sleep 0.1
    done
    return 1
+}
+
+# One selected fake-public listener keeps its peer address in both directions.
+# This runs in the retained provider's mount namespace, including its netns handles.
+public_ingress_policy()
+{
+   [[ "$#" -eq 4 ]] || return 2
+   local workspace="$1" runtime="$2" previous="$3" selected="$4"
+   python3 - "${workspace}" "${runtime}" "${previous}" "${selected}" "vdh${runtime: -8}" "vdp${runtime: -8}" <<'PUBLIC_INGRESS_POLICY'
+import ipaddress, json, os, pathlib, shlex, subprocess, sys
+workspace, runtime, previous, selected, edge, parent_edge = sys.argv[1:]
+parent = 'pvd-p-' + runtime
+prefix = ['ip', 'netns', 'exec', parent]
+tag = 'prodigy-public-ingress-' + runtime
+receipt = pathlib.Path(workspace) / 'virtual-datacenter.public-ingress-source'
+def require(condition, message):
+    if not condition: raise RuntimeError(message)
+def run(*args, data=None):
+    result = subprocess.run(args, input=data, text=True, capture_output=True)
+    if result.returncode: raise RuntimeError(f'{shlex.join(args)} failed: {result.stderr.strip()}')
+    return result.stdout
+def load(*args): return json.loads(run(*args))
+for address in (previous, selected):
+    require(not address or (str(ipaddress.IPv4Address(address)) == address and address.startswith('198.18.') and 0 < int(address.split('.')[-1]) < 255), 'invalid selected listener')
+require(runtime.isdigit() and int(runtime) > 1, 'invalid runtime identity')
+require(not receipt.is_symlink(), 'policy receipt is a symlink')
+require((receipt.read_text().strip() if receipt.exists() else '') == previous, 'persisted provider policy differs')
+# Prove that the selected interfaces are the retained VDC's veth pair.
+host = load('ip', '-d', '-j', 'link', 'show', 'dev', edge)[0]
+peer = load(*prefix, 'ip', '-d', '-j', 'link', 'show', 'dev', parent_edge)[0]
+require(host['linkinfo']['info_kind'] == peer['linkinfo']['info_kind'] == 'veth' and host['ifindex'] == peer['link_index'] and host['link_index'] == peer['ifindex'], 'boundary veth ownership differs')
+require(os.stat('/proc/self/ns/net').st_ino != os.stat('/run/netns/' + parent).st_ino, 'parent namespace is not isolated')
+pinned = load('bpftool', '-j', 'prog', 'show', 'pinned', str(pathlib.Path(workspace)/'boundary-bpffs/programs/fake_nat_eg'))
+if isinstance(pinned, list): pinned = pinned[0]
+filters = load(*prefix, 'tc', '-j', 'filter', 'show', 'dev', parent_edge, 'egress')
+require(any(f.get('kind') == 'bpf' and int(f.get('pref', 0)) > 100 and f.get('options', {}).get('prog', {}).get('id', f.get('options', {}).get('id')) == pinned['id'] and f.get('options', {}).get('direct-action') is True for f in filters), f'owned boundary NAT filter differs: expected id={pinned["id"]}, observed={filters}')
+base = ['iptables', '-w', '5', '-t', 'nat']
+generic = ['!', '-s', '172.31.0.0/30', '-d', '198.18.0.0/16', '-o', edge, '-j', 'SNAT', '--to-source', '172.31.0.1']
+run(*base, '-C', 'POSTROUTING', *generic)
+def rule(address, protocol):
+    return ['!', '-s', '172.31.0.0/30', '-d', address+'/32', '-o', edge, '-p', protocol, '-m', protocol, '--dport', '443', '-m', 'comment', '--comment', tag, '-j', 'ACCEPT']
+def audit(address):
+    nat = [shlex.split(line) for line in run(*base, '-S', 'POSTROUTING').splitlines()]
+    owned = [line for line in nat if tag in line]
+    expected = [['-A', 'POSTROUTING', *rule(address, p)] for p in ('tcp', 'udp')] if address else []
+    require(sorted(owned) == sorted(expected), 'owned ingress NAT rules differ')
+    if address:
+        generic_index = next(i for i, line in enumerate(nat) if line == ['-A', 'POSTROUTING', *generic])
+        require(all(nat.index(line) < generic_index for line in owned), 'ingress exemption follows generic SNAT')
+    all_rows = load(*prefix, 'tc', '-j', 'filter', 'show', 'dev', parent_edge, 'egress', 'pref', '100')
+    require(all(f.get('kind') == 'flower' for f in all_rows) and (bool(address) or not all_rows), 'reply filter preference is occupied')
+    rows = [f for f in all_rows if f.get('options', {}).get('handle') is not None]
+    require(len(rows) == (2 if address else 0), 'owned reply filter count differs')
+    for f in rows:
+        opt = f.get('options', {}); keys = opt.get('keys', {}); handle = int(str(opt.get('handle')), 0)
+        require(f.get('kind') == 'flower' and f.get('protocol') == 'ip' and handle in (1, 2), 'reply filter owner differs')
+        require(str(ipaddress.ip_interface(keys.get('src_ip', '0.0.0.0')).ip) == address and keys.get('ip_proto') == ('tcp' if handle == 1 else 'udp') and int(keys.get('src_port', 0)) == 443, 'reply filter selector differs')
+        require(set(keys) <= {'eth_type', 'ip_proto', 'src_ip', 'src_port'}, 'reply filter has unexpected selectors')
+        require(len(opt.get('actions', [])) == 1 and opt['actions'][0].get('kind') == 'gact' and opt['actions'][0].get('control_action', {}).get('type') == 'pass', 'reply filter action differs')
+def tc_set(address):
+    if not address:
+        # Preflight has proved that this preference belongs exclusively to us.
+        if load(*prefix, 'tc', '-j', 'filter', 'show', 'dev', parent_edge, 'egress', 'pref', '100'):
+            run(*prefix, 'tc', 'filter', 'del', 'dev', parent_edge, 'egress', 'pref', '100')
+    else:
+        for handle, protocol in ((1, 'tcp'), (2, 'udp')):
+            run(*prefix, 'tc', 'filter', 'replace', 'dev', parent_edge, 'egress', 'protocol', 'ip', 'pref', '100', 'handle', str(handle), 'flower', 'skip_hw', 'src_ip', address+'/32', 'ip_proto', protocol, 'src_port', '443', 'action', 'pass')
+def nat_set(old, new):
+    lines = ['*nat']
+    if old: lines += [' '.join(['-D', 'POSTROUTING', *rule(old, p)]) for p in ('tcp', 'udp')]
+    if new: lines += [' '.join(['-I', 'POSTROUTING', '1', *rule(new, p)]) for p in ('udp', 'tcp')]
+    run('iptables-restore', '--wait', '5', '--noflush', data='\n'.join(lines + ['COMMIT', '']))
+audit(previous)
+nat_changed = False
+try:
+    # Prepare replies before admitting preserved ingress; restore SNAT before
+    # removing reply exceptions. Each NAT pair commits as one table transaction.
+    if selected: tc_set(selected)
+    nat_set(previous, selected); nat_changed = True
+    if not selected: tc_set('')
+    audit(selected)
+    temporary = receipt.with_name(receipt.name + '.' + str(os.getpid()) + '.tmp')
+    with temporary.open('x') as out: out.write(selected + '\n')
+    os.replace(temporary, receipt)
+except BaseException:
+    if previous: tc_set(previous)
+    if nat_changed: nat_set(selected, previous)
+    if not previous: tc_set('')
+    audit(previous)
+    raise
+print(f'PUBLIC_INGRESS_SOURCE runtimeIdentity={runtime} ipv4={selected} tcp443={int(bool(selected))} udp443={int(bool(selected))}')
+PUBLIC_INGRESS_POLICY
+}
+
+# C++ supplies only one validated listener; the provider binds the operation to
+# the retained supervisor, its mount namespace, and its fake-boundary veth pair.
+configure_public_ingress_source()
+{
+   [[ "$#" -eq 3 && "${EUID}" -eq 0 ]] || return 2
+   local workspace="$1" previous="$2" selected="$3" provider_pid="" runtime="" lock_fd=""
+   valid_workspace "${workspace}" || return 2
+   [[ -f "${workspace}/virtual-datacenter.pid" && ! -L "${workspace}/virtual-datacenter.pid" ]] || return 1
+   provider_pid="$(<"${workspace}/virtual-datacenter.pid")"
+   provider_process "${provider_pid}" "${workspace}" || return 1
+   runtime="$(runtime_identity_for_workspace "${workspace}" "${provider_pid}")" || return 1
+   local -a arguments=()
+   mapfile -d '' -t arguments < "/proc/${provider_pid}/cmdline"
+   local offset=3
+   [[ "${arguments[2]}" != --serve-adopt ]] || offset=5
+   [[ "${arguments[$((offset + 4))]}" == 1 && "$(stat -Lc %i /proc/self/ns/net)" == "$(stat -Lc %i "/proc/${provider_pid}/ns/net")" ]] || return 1
+   # Serialize just this policy. The lifecycle owner already holds its own lock
+   # during stop, so this is deliberately separate from the workspace stop lock.
+   exec {lock_fd}>"${workspace}/virtual-datacenter.public-ingress-source.lock"
+   flock -n "${lock_fd}" || return 1
+   { declare -f public_ingress_policy; printf '\npublic_ingress_policy "$@"\n'; } |
+      timeout --foreground 25s nsenter -t "${provider_pid}" -m -- bash -s -- "${workspace}" "${runtime}" "${previous}" "${selected}"
 }
 
 repair_transport()
@@ -3319,6 +3435,10 @@ stop_datacenter_locked()
    fi
    if provider_process "${provider_pid}" "${workspace}"
    then
+      if [[ -s "${workspace}/virtual-datacenter.public-ingress-source" ]]; then
+         local selected="$(<"${workspace}/virtual-datacenter.public-ingress-source")"
+         [[ -z "${selected}" ]] || configure_public_ingress_source "${workspace}" "${selected}" "" || return 1
+      fi
       kill -TERM -- "-${provider_pid}"
       for _ in $(seq 1 150)
       do
@@ -3381,7 +3501,7 @@ stop_datacenter()
 
 launch_datacenter()
 {
-   [[ ( "$#" -eq 12 || "$#" -eq 13 ) && "${EUID}" -eq 0 ]] || return 2
+   [[ ( "$#" -eq 12 || "$#" -eq 13 || "$#" -eq 15 ) && "${EUID}" -eq 0 ]] || return 2
    local workspace="$1"
    local control_socket_path="${12}"
    valid_workspace "${workspace}" && valid_control_socket_path "${control_socket_path}" || return 2
@@ -3464,6 +3584,11 @@ case "${1:-}" in
       fault_datacenter "$@"
       exit
       ;;
+   --configure-public-ingress-source)
+      shift
+      configure_public_ingress_source "$@"
+      exit
+      ;;
    --repair-transport)
       shift
       repair_transport "$@"
@@ -3501,7 +3626,7 @@ then
    exec unshare --mount --propagation private -- bash "$0" --serve "$@"
 fi
 
-if [[ ( "$#" -ne 12 && "$#" -ne 13 ) || "${EUID}" -ne 0 ]]
+if [[ ( "$#" -ne 12 && "$#" -ne 13 && "$#" -ne 15 ) || "${EUID}" -ne 0 ]]
 then
    echo "virtual datacenter provider requires workspace, machine count, brain count, MTU, fake-boundary flag, host netns inode, machine resources, storage devices, and control socket as root" >&2
    exit 2
@@ -3520,6 +3645,7 @@ storage_device_count="${10}"
 storage_device_mb="${11}"
 control_socket_path="${12}"
 spare_machine_count="${13:-0}"
+public_ingress_source="${15:-}"
 [[ "$spare_machine_count" == 0 || "$spare_machine_count" == 1 ]]
 datacenter_fragment="$(network_fragment_from_control_socket_path "${control_socket_path}")"
 private_network_domain="$((datacenter_fragment - 1))"
@@ -3543,6 +3669,7 @@ if ! valid_workspace "${workspace}" ||
    ! [[ "${machine_storage_mb}" =~ ^[0-9]+$ ]] || [[ "${machine_storage_mb}" -lt 1 || "${machine_storage_mb}" -gt 1048576 ]] ||
    ! [[ "${storage_device_count}" =~ ^[0-9]+$ ]] || [[ "${storage_device_count}" -gt 16 ]] ||
    ! [[ "${storage_device_mb}" =~ ^[0-9]+$ ]] || [[ "${storage_device_mb}" -lt 1 || "${storage_device_mb}" -gt 1048576 ]] ||
+   ! [[ -z "${public_ingress_source}" || "${public_ingress_source}" =~ ^198\.18\.([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.([1-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-4])$ ]] ||
    ! valid_control_socket_path "${control_socket_path}"
 then
    echo "invalid virtual datacenter provider arguments" >&2
@@ -3700,6 +3827,7 @@ vdc_owned_resources_absent()
       iptables -C FORWARD -i "${host_edge}" ! -o "${host_edge}" -j ACCEPT >/dev/null 2>&1 && return 1
       iptables -C FORWARD ! -i "${host_edge}" -o "${host_edge}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 && return 1
       iptables -t nat -C POSTROUTING ! -s 172.31.0.0/30 -d 198.18.0.0/16 -o "${host_edge}" -j SNAT --to-source 172.31.0.1 >/dev/null 2>&1 && return 1
+      iptables -t nat -S POSTROUTING | grep -F -- "prodigy-public-ingress-${runtime_identity}" >/dev/null && return 1
       iptables -t nat -C POSTROUTING -s 172.31.0.2/32 ! -o "${host_edge}" -j MASQUERADE >/dev/null 2>&1 && return 1
       ip6tables -C FORWARD -i "${host_edge}" ! -o "${host_edge}" -j ACCEPT >/dev/null 2>&1 && return 1
       ip6tables -C FORWARD ! -i "${host_edge}" -o "${host_edge}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 && return 1
@@ -3753,6 +3881,10 @@ cleanup()
 
    if [[ "${fake_boundary}" == 1 ]]
    then
+      if [[ -s "${workspace}/virtual-datacenter.public-ingress-source" ]]; then
+         public_ingress_source="$(<"${workspace}/virtual-datacenter.public-ingress-source")"
+         [[ -z "${public_ingress_source}" ]] || public_ingress_policy "${workspace}" "${runtime_identity}" "${public_ingress_source}" ""
+      fi
       iptables -D FORWARD -i "${host_edge}" ! -o "${host_edge}" -j ACCEPT >/dev/null 2>&1 || true
       iptables -D FORWARD ! -i "${host_edge}" -o "${host_edge}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || true
       iptables -t nat -D POSTROUTING ! -s 172.31.0.0/30 -d 198.18.0.0/16 -o "${host_edge}" -j SNAT --to-source 172.31.0.1 >/dev/null 2>&1 || true
@@ -4009,6 +4141,7 @@ then
    sysctl -q -w net.ipv4.ip_forward=1
    sysctl -q -w net.ipv6.conf.all.forwarding=1
    iptables -t nat -A POSTROUTING ! -s 172.31.0.0/30 -d 198.18.0.0/16 -o "${host_edge}" -j SNAT --to-source 172.31.0.1
+
    iptables -t nat -A POSTROUTING -s 172.31.0.2/32 ! -o "${host_edge}" -j MASQUERADE
    iptables -A FORWARD -i "${host_edge}" ! -o "${host_edge}" -j ACCEPT
    iptables -A FORWARD ! -i "${host_edge}" -o "${host_edge}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
@@ -4019,6 +4152,7 @@ then
    ip netns exec "${parent_ns}" tc qdisc replace dev "${parent_edge}" clsact
    ip netns exec "${parent_ns}" tc filter replace dev "${parent_edge}" egress bpf da pinned "${boundary_bpffs}/programs/fake_nat_eg"
    ip netns exec "${parent_ns}" tc filter replace dev "${parent_edge}" ingress bpf da pinned "${boundary_bpffs}/programs/fake_nat_in"
+   [[ -z "${public_ingress_source}" ]] || public_ingress_policy "${workspace}" "${runtime_identity}" "" "${public_ingress_source}"
 fi
 fi
 

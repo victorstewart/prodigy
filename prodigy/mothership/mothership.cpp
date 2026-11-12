@@ -4907,10 +4907,15 @@ static bool mothershipStartVirtualDatacenterProvider(const MothershipProdigyClus
   arguments.push_back(std::move(storageDeviceCount));
   arguments.push_back(std::move(storageDeviceMB));
   arguments.push_back(std::move(controlSocketPath));
-  if (cluster.test.spareMachineCount != 0)
+  if (cluster.test.spareMachineCount != 0 || !cluster.test.fakePublicIngressSourcePreservingIPv4.empty())
   {
     arguments.emplace_back();
     arguments.back().assignItoa(cluster.test.spareMachineCount);
+  }
+  if (!cluster.test.fakePublicIngressSourcePreservingIPv4.empty())
+  {
+    arguments.emplace_back("0"_ctv); // Reserved BGP-underlay slot in newer providers.
+    arguments.push_back(cluster.test.fakePublicIngressSourcePreservingIPv4);
   }
   // Launch first clears the previous disposable workspace. Publish new OS
   // material only afterward; the provider waits for the final ready receipt.
@@ -4952,6 +4957,17 @@ static bool mothershipFaultVirtualDatacenterProvider(
   arguments.emplace_back();
   arguments.back().assignItoa(upMs);
   return mothershipRunVirtualDatacenterProvider(std::move(arguments), failure);
+}
+
+static bool mothershipConfigureVirtualDatacenterPublicIngressSource(
+    const MothershipProdigyCluster& cluster, const String& previous, const String& source, String& receipt, String *failure = nullptr)
+{
+  Vector<String> arguments = {};
+  arguments.emplace_back("--configure-public-ingress-source"_ctv);
+  arguments.push_back(cluster.test.workspaceRoot);
+  arguments.push_back(previous);
+  arguments.push_back(source);
+  return mothershipRunVirtualDatacenterProvider(std::move(arguments), &receipt, failure, 1024, 30'000, true);
 }
 
 static bool mothershipRepairVirtualDatacenterTransport(const MothershipProdigyCluster& cluster,
@@ -12612,6 +12628,33 @@ private:
                (unsigned long long)desiredCluster.topology.version,
                unsigned(desiredCluster.topology.machines.size()));
     printManagedCluster(desiredCluster);
+  }
+
+  void runConfigureTestClusterPublicIngressSource(int argc, char *argv[])
+  {
+    String identity = argc > 0 ? String(argv[0]) : String();
+    String requested = argc > 1 ? String(argv[1]) : String();
+    String failure = {}, receipt = {};
+    MothershipProdigyCluster cluster = {};
+    const bool valid = argc == 2 && (requested == "--disable"_ctv || (!requested.empty() && mothershipTestClusterPublicIngressSourcePreservingIPv4Valid(requested))) &&
+        loadClusterForScopedMutation("configureTestClusterPublicIngressSource", identity, cluster, failure) &&
+        cluster.deploymentMode == MothershipClusterDeploymentMode::test && cluster.test.enableFakeIpv4Boundary;
+    if (!valid) {
+      if (failure.empty()) failure.assign("usage: configureTestClusterPublicIngressSource [name|clusterUUID] [198.18.x.y|--disable]; requires test fake IPv4 boundary"_ctv);
+      basics_log("configureTestClusterPublicIngressSource success=0 identity=%s failure=%s\n", identity.c_str(), failure.c_str()); exit(EXIT_FAILURE);
+    }
+    if (requested == "--disable"_ctv) requested.clear();
+    if (!mothershipConfigureVirtualDatacenterPublicIngressSource(cluster, cluster.test.fakePublicIngressSourcePreservingIPv4, requested, receipt, &failure)) {
+      basics_log("configureTestClusterPublicIngressSource success=0 identity=%s failure=%s\n", identity.c_str(), failure.c_str()); exit(EXIT_FAILURE);
+    }
+    MothershipProdigyCluster desired = cluster; desired.test.fakePublicIngressSourcePreservingIPv4 = requested; desired.controls.clear();
+    MothershipClusterRegistry registry = openClusterRegistry(); MothershipProdigyCluster persisted = {};
+    if (!registry.upsertCluster(desired, &persisted, &failure)) {
+      String rollback = {}; (void)mothershipConfigureVirtualDatacenterPublicIngressSource(cluster, requested, cluster.test.fakePublicIngressSourcePreservingIPv4, rollback, nullptr);
+      basics_log("configureTestClusterPublicIngressSource success=0 identity=%s failure=persistence failed; provider rollback attempted: %s\n", identity.c_str(), failure.c_str()); exit(EXIT_FAILURE);
+    }
+    basics_log("%s", receipt.c_str());
+    basics_log("configureTestClusterPublicIngressSource success=1 identity=%s ipv4=%s\n", identity.c_str(), requested.c_str());
   }
 
   void runAdoptTestClusterSpare(int argc, char *argv[])
@@ -36251,6 +36294,7 @@ public:
         {"checkClusterProviderPlan",        &Mothership::runCheckClusterProviderPlan       },
         {"clusterReport",                   &Mothership::runClusterReport                  },
         {"configureLocalVMClusterLANIPv6",  &Mothership::runConfigureLocalVMClusterLANIPv6 },
+        {"configureTestClusterPublicIngressSource", &Mothership::runConfigureTestClusterPublicIngressSource},
         {"containerLogs",                   &Mothership::runContainerLogs                  },
         {"cousinPermission",                &Mothership::runCousinPermission               },
         {"cousinRoute",                     &Mothership::runCousinRoute                    },

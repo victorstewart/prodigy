@@ -155,7 +155,7 @@ static bool equalOSUpdatePolicies(const Vector<OperatingSystemUpdatePolicy>& lhs
 
 static bool equalTestConfig(const MothershipProdigyClusterTestConfig& lhs, const MothershipProdigyClusterTestConfig& rhs)
 {
-  return lhs.specified == rhs.specified && lhs.workspaceRoot.equals(rhs.workspaceRoot) && lhs.machineCount == rhs.machineCount && lhs.spareMachineCount == rhs.spareMachineCount && lhs.machineLogicalCores == rhs.machineLogicalCores && lhs.machineMemoryMB == rhs.machineMemoryMB && lhs.machineStorageMB == rhs.machineStorageMB && lhs.storageDeviceCount == rhs.storageDeviceCount && lhs.storageDeviceMB == rhs.storageDeviceMB && lhs.brainBootstrapFamily == rhs.brainBootstrapFamily && lhs.enableFakeIpv4Boundary == rhs.enableFakeIpv4Boundary && lhs.interContainerMTU == rhs.interContainerMTU;
+  return lhs.specified == rhs.specified && lhs.workspaceRoot.equals(rhs.workspaceRoot) && lhs.machineCount == rhs.machineCount && lhs.spareMachineCount == rhs.spareMachineCount && lhs.machineLogicalCores == rhs.machineLogicalCores && lhs.machineMemoryMB == rhs.machineMemoryMB && lhs.machineStorageMB == rhs.machineStorageMB && lhs.storageDeviceCount == rhs.storageDeviceCount && lhs.storageDeviceMB == rhs.storageDeviceMB && lhs.brainBootstrapFamily == rhs.brainBootstrapFamily && lhs.enableFakeIpv4Boundary == rhs.enableFakeIpv4Boundary && lhs.fakePublicIngressSourcePreservingIPv4.equals(rhs.fakePublicIngressSourcePreservingIPv4) && lhs.interContainerMTU == rhs.interContainerMTU;
 }
 
 static bool equalGcpConfig(const MothershipProdigyClusterGcpConfig& lhs, const MothershipProdigyClusterGcpConfig& rhs)
@@ -342,6 +342,25 @@ static void assignFixtureBootstrapSSHKeyPackage(MothershipProdigyCluster& cluste
 int main(void)
 {
   TestSuite suite;
+
+  suite.expect(mothershipTestClusterPublicIngressSourcePreservingIPv4Valid("198.18.0.2"_ctv) &&
+                   mothershipTestClusterPublicIngressSourcePreservingIPv4Valid({}) &&
+                   !mothershipTestClusterPublicIngressSourcePreservingIPv4Valid("198.19.0.2"_ctv) &&
+                   !mothershipTestClusterPublicIngressSourcePreservingIPv4Valid("198.18.0.0"_ctv) &&
+                   !mothershipTestClusterPublicIngressSourcePreservingIPv4Valid("198.18.1.0"_ctv) &&
+                   !mothershipTestClusterPublicIngressSourcePreservingIPv4Valid("198.18.1.255"_ctv),
+               "test_public_ingress_source_accepts_only_canonical_test_host");
+  {
+    MothershipProdigyClusterRecordV9 written = {}, read = {};
+    written.fakePublicIngressSourcePreservingIPv4.assign("198.18.0.2"_ctv);
+    String bytes = {};
+    suite.expect(BitseryEngine::serialize(bytes, written) && BitseryEngine::deserializeSafe(bytes, read) &&
+                     read.fakePublicIngressSourcePreservingIPv4.equals("198.18.0.2"_ctv),
+                 "test_public_ingress_source_v9_tail_round_trip");
+    read.fakePublicIngressSourcePreservingIPv4.assign("198.19.0.2"_ctv);
+    suite.expect(!mothershipTestClusterPublicIngressSourcePreservingIPv4Valid(read.fakePublicIngressSourcePreservingIPv4),
+                 "test_public_ingress_source_rejects_invalid_v9_tail");
+  }
 
   char scratch[] = "/tmp/nametag-mothership-registry-XXXXXX";
   char *created = mkdtemp(scratch);
@@ -1664,7 +1683,8 @@ int main(void)
 
     MothershipProdigyCluster loaded = {};
     suite.expect(MothershipClusterRegistry(dbPath).getCluster(remoteVultrBGP.name, loaded, &failure) &&
-                     equalClusters(storedRemoteVultrBGP, loaded),
+                     equalClusters(storedRemoteVultrBGP, loaded) &&
+                     loaded.test.fakePublicIngressSourcePreservingIPv4.empty(),
                  "provider_managed_bgp_v8_roundtrip");
     suite.expect(mothershipClusterAuthorizesBGPOriginPrefix(
                      loaded, IPPrefix("2602:fac0::", true, 40)),
@@ -1760,6 +1780,46 @@ int main(void)
     invalidSpare.spareMachineCount = 1;
     suite.expect(writeAndRejectV8("invalid-spare-v8"_ctv, invalidSpare),
                  "provider_managed_bgp_v8_rejects_invalid_spare_sidecar");
+  }
+
+  {
+    constexpr auto v9Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=9\n\n"_ctv;
+    String v9Path = {}; v9Path.snprintf<"{}/public-ingress-v9"_ctv>(dbPath);
+    MothershipProdigyClusterRecordV9 record = {};
+    record.cluster = testLocal;
+    record.cluster.name = "test-public-ingress-v9"_ctv;
+    record.cluster.test.workspaceRoot = "/tmp/test-public-ingress-v9"_ctv;
+    record.cluster.test.enableFakeIpv4Boundary = true;
+    record.internalTransportProfile = record.cluster.internalTransportProfile;
+    record.fakePublicIngressSourcePreservingIPv4 = "198.18.0.2"_ctv;
+    String payload = {}, encoded = {}, failure = {};
+    BitseryEngine::serialize(payload, record); encoded.assign(v9Header); encoded.append(payload);
+    { TidesDB database(v9Path); suite.expect(database.write("clusters"_ctv, record.cluster.name, encoded, &failure), "public_ingress_v9_written"); }
+    MothershipProdigyCluster loaded = {};
+    suite.expect(MothershipClusterRegistry(v9Path).getCluster(record.cluster.name, loaded, &failure) &&
+                     loaded.test.fakePublicIngressSourcePreservingIPv4.equals("198.18.0.2"_ctv),
+                 "public_ingress_v9_roundtrip");
+    record.fakePublicIngressSourcePreservingIPv4 = "198.19.0.2"_ctv;
+    payload.clear(); encoded.assign(v9Header); BitseryEngine::serialize(payload, record); encoded.append(payload);
+    { TidesDB database(v9Path); suite.expect(database.write("clusters"_ctv, "invalid-public-ingress-v9"_ctv, encoded, &failure), "public_ingress_invalid_v9_written"); }
+    MothershipProdigyCluster rejected = {};
+    suite.expect(!MothershipClusterRegistry(v9Path).getCluster("invalid-public-ingress-v9"_ctv, rejected, &failure),
+                 "public_ingress_v9_rejects_invalid_address_tail");
+
+    String v9UpsertPath = {};
+    v9UpsertPath.snprintf<"{}/public-ingress-v9-upsert"_ctv>(dbPath);
+    MothershipProdigyCluster desired = testLocal;
+    desired.name = "test-public-ingress-v9-upsert"_ctv;
+    desired.test.workspaceRoot = "/tmp/test-public-ingress-v9-upsert"_ctv;
+    desired.test.enableFakeIpv4Boundary = true;
+    desired.test.fakePublicIngressSourcePreservingIPv4 = "198.18.0.2"_ctv;
+    desired.controls.clear();
+    MothershipProdigyCluster persisted = {}, reloaded = {};
+    MothershipClusterRegistry v9Registry(v9UpsertPath);
+    suite.expect(v9Registry.upsertCluster(desired, &persisted, &failure) &&
+                     v9Registry.getCluster(desired.name, reloaded, &failure) &&
+                     reloaded.test.fakePublicIngressSourcePreservingIPv4.equals("198.18.0.2"_ctv),
+                 "public_ingress_v9_upsert_encodes_and_reloads");
   }
 
   {
