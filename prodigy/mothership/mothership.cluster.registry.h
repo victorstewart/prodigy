@@ -3856,8 +3856,7 @@ public:
       })) groups.push_back(std::move(legacy));
     } else if (reason != "record not found"_ctv) { if (failure) *failure=reason; return false; }
     for (size_t i=0;i<groups.size();++i) for (size_t j=i+1;j<groups.size();++j)
-      if (groups[i].group.membershipUUID == groups[j].group.membershipUUID ||
-          groups[i].group.deploymentID == groups[j].group.deploymentID) {
+      if (!prodigyGlobalSingleWriterMembershipsDisjoint(groups[i].group,groups[j].group)) {
         if (failure) failure->assign("conflicting durable global single-writer groups"_ctv); return false;
       }
     if (failure) failure->clear();
@@ -3907,8 +3906,9 @@ public:
     Vector<MothershipGlobalSingleWriterGroup> groups;
     if (!listGlobalSingleWriterGroups(groups,failure)) return false;
     for (const auto& existing : groups)
-      if (existing.group.deploymentID == state.group.deploymentID && existing.group.membershipUUID != state.group.membershipUUID) {
-        if (failure) failure->assign("deployment already belongs to another global single-writer group"_ctv);
+      if (existing.group.membershipUUID != state.group.membershipUUID &&
+          !prodigyGlobalSingleWriterMembershipsDisjoint(existing.group,state.group)) {
+        if (failure) failure->assign("deployment, incarnation, or endpoint already belongs to another global single-writer group"_ctv);
         return false;
       }
     auto next = state;
@@ -6350,7 +6350,7 @@ public:
     // Every current Radar/Pulse member is a local writer.  It has no durable
     // retained-source owner, so never create or consult the singleton placement
     // record that only protects Truth and the legacy graph recovery profile.
-    if (graph && plan.stateful.allMasters) { placement = {}; resumed = false; return true; }
+    if (graph && (plan.stateful.writerMode == StatefulWriterMode::allMasters)) { placement = {}; resumed = false; return true; }
     return admitApplicationPlacement(plan.config.applicationID, clusterUUID, receipt, placement, resumed, failure);
   }
 

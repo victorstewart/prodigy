@@ -4017,7 +4017,7 @@ public:
     // A global single-writer deployment is a set of exact local incarnations, not a
     // three-replica autoscaling group.  A site with no current voter/learner
     // owns no local target (a retired-only projection is intentionally zero).
-    if (plan.stateful.globalSingleWriter) {
+    if (plan.stateful.writerMode == StatefulWriterMode::globalSingleWriter) {
       if (!thisBrain || !prodigyGlobalSingleWriterPlanValid(plan)) return 0;
       GlobalSingleWriterMembershipProjection group;
       if (thisBrain->desiredGlobalSingleWriterMembership(plan.config.deploymentID(), group) &&
@@ -4522,7 +4522,8 @@ public:
         selected = machine;
         break;
       }
-      if (selected == nullptr || selected->claimContainerFragment(endpoint[15]) == false) return incomplete();
+      if (selected == nullptr || !selected->claimContainerFragment(endpoint[15],thisBrain->globalSingleWriterMemberships(),
+          thisBrain->brainConfig.clusterUUID,plan.config.deploymentID(),member.containerUUID)) return incomplete();
 
       Vector<uint32_t> gpuMemory = {};
       Vector<AssignedGPUDevice> gpuDevices = {};
@@ -4649,7 +4650,7 @@ public:
       for (const auto& [service, advertisement] : detached.advertisements)
         detached.advertisingOnPorts.insert(advertisement.port);
       const bool client = prodigyStatefulTopologyServesClients(candidate.statefulTopology) &&
-                          (plan.stateful.allMasters || clients[candidate.shardGroup] == candidate.uuid);
+                          ((plan.stateful.writerMode == StatefulWriterMode::allMasters) || clients[candidate.shardGroup] == candidate.uuid);
       reconcileLiveStatefulTopologyServices(&detached, false, client ? 1 : 0);
       candidate.advertisements = std::move(detached.advertisements);
       candidate.subscriptions = std::move(detached.subscriptions);
@@ -4662,7 +4663,7 @@ public:
   {
     if (thisBrain == nullptr || thisBrain->mesh == nullptr ||
         authority.deploymentID != plan.config.deploymentID() ||
-        authority.applicationID != plan.config.applicationID || authority.allMasters != plan.stateful.allMasters)
+        authority.applicationID != plan.config.applicationID || authority.allMasters != (plan.stateful.writerMode == StatefulWriterMode::allMasters))
       return false;
     // A retained steady record cannot cancel a newer admitted topology change.
     if (statefulWorkerTopologyUpgradePending && statefulWorkerTopologyUpgradeOperationID != authority.operationID)
@@ -4719,7 +4720,7 @@ public:
       for (const auto& [service, advertisement] : container->advertisements)
         container->advertisingOnPorts.insert(advertisement.port);
       const bool client = candidate.advertisements.contains(candidate.statefulMeshRoles.client);
-      if (client && !plan.stateful.allMasters) masterForShardGroup[container->shardGroup] = container;
+      if (client && plan.stateful.writerMode != StatefulWriterMode::allMasters) masterForShardGroup[container->shardGroup] = container;
       reconcileLiveStatefulTopologyServices(container, true, client ? 1 : 0);
       if (phaseChanged) clearStatefulWorkerTopologyCutoverBarrier(container);
     }
@@ -5605,7 +5606,7 @@ private:
     if (prodigyStatefulTopologyServesClients(topology) == false)
     {
       eraseAdvertisement(roles.client);
-      if (publish && clientSelection < 0 && plan.stateful.allMasters == false)
+      if (publish && clientSelection < 0 && plan.stateful.writerMode != StatefulWriterMode::allMasters)
       {
         auto masterIt = masterForShardGroup.find(container->shardGroup);
         if (masterIt != masterForShardGroup.end() && masterIt->second == container)
@@ -5616,8 +5617,8 @@ private:
     }
     else if (roles.client != 0)
     {
-      bool shouldAdvertiseClient = clientSelection >= 0 ? clientSelection != 0 : plan.stateful.allMasters;
-      if (clientSelection < 0 && plan.stateful.allMasters == false)
+      bool shouldAdvertiseClient = clientSelection >= 0 ? clientSelection != 0 : (plan.stateful.writerMode == StatefulWriterMode::allMasters);
+      if (clientSelection < 0 && plan.stateful.writerMode != StatefulWriterMode::allMasters)
       {
         auto masterIt = masterForShardGroup.find(container->shardGroup);
         if (masterIt == masterForShardGroup.end() || masterIt->second == nullptr || masterIt->second->state == ContainerState::destroyed)
@@ -7125,7 +7126,7 @@ public:
   // second client service.
   bool rebuildRecoveredStatefulShardMasters(void)
   {
-    if (plan.isStateful == false || plan.stateful.allMasters)
+    if (plan.isStateful == false || (plan.stateful.writerMode == StatefulWriterMode::allMasters))
     {
       return true;
     }
@@ -9764,7 +9765,7 @@ public:
       {
       }
 
-      if (!plan.stateful.allMasters && masterForShardGroup[container->shardGroup] == container)
+      if (plan.stateful.writerMode != StatefulWriterMode::allMasters && masterForShardGroup[container->shardGroup] == container)
       {
         changeShardGroupMaster(container->shardGroup);
       }
@@ -9962,7 +9963,7 @@ public:
       }
 
       auto master = masterForShardGroup.find(shardGroup);
-      if (!plan.stateful.allMasters &&
+      if (plan.stateful.writerMode != StatefulWriterMode::allMasters &&
           master != masterForShardGroup.end() && master->second == container)
       {
         // This is the same client-owner transition as ordinary destruction,
@@ -10353,7 +10354,7 @@ public:
           definitionContext.roles = container->effectiveStatefulMeshRoles(plan);
           definitionContext.topology = container->effectiveStatefulTopology(plan);
           definitionContext.advertiseClient = definitionContext.roles.client != 0 &&
-              (plan.stateful.allMasters || !masterForShardGroup.contains(container->shardGroup));
+              ((plan.stateful.writerMode == StatefulWriterMode::allMasters) || !masterForShardGroup.contains(container->shardGroup));
           definitionContext.seedingAlways = plan.stateful.seedingAlways;
           definitionContext.dataStrategy = work.data;
           definitionContext.nShardGroups = nShardGroups;
@@ -10364,7 +10365,7 @@ public:
               definitionContext.priorShardRoles.push_back(statefulMeshRolesForShardGroup(shardGroup));
             }
           }
-          if (definitionContext.advertiseClient && prodigyStatefulTopologyServesClients(definitionContext.topology) && !plan.stateful.allMasters)
+          if (definitionContext.advertiseClient && prodigyStatefulTopologyServesClients(definitionContext.topology) && plan.stateful.writerMode != StatefulWriterMode::allMasters)
           {
             masterForShardGroup.insert_or_assign(container->shardGroup, container);
           }
@@ -10490,7 +10491,7 @@ public:
                 return;
               }
             }
-            else container->fragment = machine->getContainerFragment();
+            else container->fragment = machine->getContainerFragment(thisBrain->globalSingleWriterMemberships(),thisBrain->brainConfig.clusterUUID);
             if (container->fragment == 0)
             {
               basics_log("container fragment allocation returned reserved fragment zero\n");
@@ -10891,7 +10892,7 @@ public:
     // autoscaling target. Brain invokes reconcileGlobalSingleWriterPlacement() after the
     // projection commit; ordinary architecting must never create an unbound
     // voter or learner in the meantime.
-    if (plan.stateful.globalSingleWriter) {
+    if (plan.stateful.writerMode == StatefulWriterMode::globalSingleWriter) {
       if (!thisBrain || !prodigyGlobalSingleWriterPlanValid(plan)) co_return;
       GlobalSingleWriterMembershipProjection group;
       if (thisBrain->desiredGlobalSingleWriterMembership(plan.config.deploymentID(),group) && group.protocolVersion != 0) {
@@ -10926,7 +10927,8 @@ public:
           }
           Machine* selected = nullptr;
           for (Machine* machine : thisBrain->machines) {
-            if (!prodigyMachineReadyForScheduling(machine) || !machine->containerFragmentAvailable(endpoint[15]) ||
+            if (!prodigyMachineReadyForScheduling(machine) || !machine->containerFragmentAvailable(endpoint[15],
+                thisBrain->globalSingleWriterMemberships(),thisBrain->brainConfig.clusterUUID,plan.config.deploymentID(),member.containerUUID) ||
                 endpoint[11] != thisBrain->brainConfig.datacenterFragment ||
                 endpoint[12] != uint8_t(machine->fragment >> 16) || endpoint[13] != uint8_t(machine->fragment >> 8) ||
                 endpoint[14] != uint8_t(machine->fragment) || nFitOnMachine(this, machine, 1, deltas[machine]) == 0) continue;

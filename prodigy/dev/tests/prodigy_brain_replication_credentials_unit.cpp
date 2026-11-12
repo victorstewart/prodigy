@@ -3822,7 +3822,7 @@ static void seedStatefulDeployRequestPlan(DeploymentPlan& plan, uint16_t applica
   plan.stateful.allowUpdateInPlace = true;
   plan.stateful.seedingAlways = false;
   plan.stateful.neverShard = false;
-  plan.stateful.allMasters = false;
+  plan.stateful.writerMode = StatefulWriterMode::localSingleWriter;
 }
 
 static void configureStatefulTopologySourceContainer(ContainerView& container,
@@ -3934,6 +3934,169 @@ static void testSpinApplicationInvalidPlanUsesSingleTopicFrame(TestSuite& suite)
   suite.expect(invalidPlanReason == "invalid plan: applicationID not reserved"_ctv, "spin_application_invalid_plan_includes_reason");
 }
 
+static void testGlobalSingleWriterEndpointReservations(TestSuite& suite)
+{
+  ScopedRing ring;
+  TestBrain brain;
+  BrainBase* previousBrain = thisBrain; thisBrain = &brain;
+  brain.weAreMaster = brain.ignited = brain.masterAuthorityRuntimeStateDurable = true;
+  brain.masterAuthorityRuntimeState.generation = brain.durableMasterAuthorityRuntimeStateGeneration = 1;
+  brain.brainConfig.clusterUUID = 17; brain.brainConfig.datacenterFragment = 7;
+  Machine machine;
+  machine.uuid = 99; machine.fragment = 0x12345; machine.state = MachineState::healthy; machine.runtimeReady = true;
+  machine.neuron.machine = &machine; machine.neuron.connected = true;
+  machine.neuron.isFixedFile = true; machine.neuron.fslot = 9;
+  brain.machines.insert(&machine);
+  Mothership stream;
+  auto commit = [&](const GlobalSingleWriterMembershipProjection& group) {
+    String bytes, request; auto copy=group;
+    BitseryEngine::serialize(bytes,copy);
+    const auto before=brain.masterAuthorityRuntimeState.generation;
+    brain.mothershipHandler(&stream,buildMothershipMessage(request,MothershipTopic::commitGlobalSingleWriterMembership,bytes));
+    return brain.masterAuthorityRuntimeState.generation == before+1 && brain.masterAuthorityRuntimeStateDurable;
+  };
+  auto configure = [&](uint16_t applicationID,uint128_t groupUUID) {
+    GlobalSingleWriterMembershipProjection group;
+    group.membershipUUID=groupUUID; group.operationUUID=groupUUID+1; group.localClusterUUID=brain.brainConfig.clusterUUID;
+    group.deploymentID=(uint64_t(applicationID)<<48)|1; group.generation=group.expectedCommittedConfigIndex=1;
+    group.genesisMemberIDs={1,2,3}; group.highestAllocatedMemberID=3;
+    for (int32_t id=1;id<=3;++id) {
+      ProdigyGlobalSingleWriterPlacementExchange offer;
+      offer.membershipUUID=group.membershipUUID; offer.deploymentID=group.deploymentID;
+      offer.localClusterUUID=group.localClusterUUID; offer.reserved=group.members;
+      offer.member.memberID=id; offer.member.clusterUUID=group.localClusterUUID; offer.member.containerUUID=groupUUID+id+10;
+      suite.expect(brain.applyGlobalSingleWriterPlacement(offer),"global_reservations_offer_exact_prelaunch_endpoint");
+      group.members.push_back(offer.member);
+    }
+    suite.expect(prodigyGlobalSingleWriterCommittedConfigDigest(group.membershipUUID,group.deploymentID,1,
+        group.members,group.expectedCommittedConfigSHA256) && commit(group),"global_reservations_commit_before_deployment");
+    return group;
+  };
+  const auto first=configure(42,1000), second=configure(43,2000);
+  suite.expect(brain.containers.empty() && machine.usedContainerFragments.empty() &&
+      brain.globalSingleWriterMemberships().size()==2 && prodigyGlobalSingleWriterMembershipsDisjoint(first,second),
+      "two_global_groups_configured_before_deployment_have_distinct_durable_endpoints");
+  const auto& member=first.members.front(); const uint8_t fragment=member.privateIPv6.v6[15];
+  suite.expect(!machine.containerFragmentAvailable(fragment,brain.globalSingleWriterMemberships(),17) &&
+      !machine.claimContainerFragment(fragment,brain.globalSingleWriterMemberships(),17,second.deploymentID,second.members.front().containerUUID) &&
+      machine.claimContainerFragment(fragment,brain.globalSingleWriterMemberships(),17,first.deploymentID,member.containerUUID),
+      "global_reserved_fragment_can_only_be_claimed_by_its_exact_deployment_and_container");
+  machine.relinquishContainerFragment(fragment);
+  suite.expect(!machine.containerFragmentAvailable(fragment,brain.globalSingleWriterMemberships(),17) &&
+      machine.claimContainerFragment(fragment,brain.globalSingleWriterMemberships(),17,first.deploymentID,member.containerUUID),
+      "physical_release_preserves_reservation_and_allows_exact_recovery");
+  machine.usedContainerFragments.clear();
+  for (uint16_t value=1;value<=255;++value)
+    if (value!=200 && machine.containerFragmentAvailable(uint8_t(value),brain.globalSingleWriterMemberships(),17))
+      machine.usedContainerFragments.insert(value);
+  suite.expect(machine.getContainerFragment(brain.globalSingleWriterMemberships(),17)==200,
+      "ordinary_allocator_skips_all_unlaunched_global_reservations");
+  machine.usedContainerFragments.clear();
+
+  auto conflict=second; conflict.membershipUUID=3000; conflict.operationUUID=3001; conflict.deploymentID=(uint64_t(44)<<48)|1;
+  for (auto& binding:conflict.members) binding.containerUUID+=1000;
+  suite.expect(prodigyGlobalSingleWriterCommittedConfigDigest(conflict.membershipUUID,conflict.deploymentID,1,
+      conflict.members,conflict.expectedCommittedConfigSHA256) && !commit(conflict),
+      "brain_projection_admission_rejects_cross_group_reserved_address_collision");
+  for (auto& binding:conflict.members)
+    binding.privateIPv6=IPAddress(MeshNode::addressForFragment(container_network_subnet6,7,machine.fragment,uint8_t(210+binding.memberID)));
+  ContainerView live;
+  live.uuid=9000; live.deploymentID=(uint64_t(45)<<48)|1; live.machine=&machine; live.fragment=conflict.members.front().privateIPv6.v6[15];
+  std::memcpy(&live.meshAddress,conflict.members.front().privateIPv6.v6,sizeof(live.meshAddress));
+  brain.containers[live.uuid]=&live; machine.usedContainerFragments.insert(live.fragment);
+  suite.expect(prodigyGlobalSingleWriterCommittedConfigDigest(conflict.membershipUUID,conflict.deploymentID,1,
+      conflict.members,conflict.expectedCommittedConfigSHA256) && !commit(conflict),
+      "brain_projection_admission_rejects_endpoint_owned_by_live_ordinary_container");
+  brain.containers.erase(live.uuid); machine.usedContainerFragments.clear();
+
+  BrainReplicatedContainerRuntimeState recovered;
+  recovered.plan.uuid=member.containerUUID; recovered.plan.config.applicationID=42; recovered.plan.config.versionID=1;
+  IPPrefix recoveredAddress; recoveredAddress.network=member.privateIPv6; recoveredAddress.cidr=128;
+  recovered.plan.addresses.push_back(recoveredAddress);
+  suite.expect(Brain::globalSingleWriterBindingsMatchRuntimePlan(first,recovered.plan),
+      "recovered_runtime_retains_its_exact_global_identity");
+  recovered.plan.uuid=9001;
+  suite.expect(!Brain::globalSingleWriterBindingsMatchRuntimePlan(first,recovered.plan) &&
+      brain.applyReplicatedContainerRuntimeStateNow(recovered)==Brain::ReplicatedContainerRuntimeStateApplyResult::rejected,
+      "runtime_replay_cannot_take_a_reserved_global_endpoint");
+
+  {
+    // Exact reconciliation plans both local views before scheduling either.
+    // The first durable spin captures one scheduled view and its still-planned
+    // sibling; only the launched identity belongs in runtime inventory.
+    ApplicationDeployment deployment;
+    seedStatefulDeployRequestPlan(deployment.plan,42); deployment.plan.config.versionID=1;
+    deployment.plan.stateful.writerMode=StatefulWriterMode::globalSingleWriter;
+    deployment.plan.stateful.neverShard=true; deployment.nShardGroups=1;
+    deployment.plan.stateful.clientPrefix=prodigyRuntimeStatefulServicePrefix(42,1);
+    deployment.plan.stateful.siblingPrefix=prodigyRuntimeStatefulServicePrefix(42,2);
+    deployment.plan.stateful.cousinPrefix=prodigyRuntimeStatefulServicePrefix(42,3);
+    deployment.plan.stateful.seedingPrefix=prodigyRuntimeStatefulServicePrefix(42,4);
+    deployment.plan.stateful.shardingPrefix=prodigyRuntimeStatefulServicePrefix(42,5);
+    brain.deployments[first.deploymentID]=&deployment;
+    std::array<ContainerView,2> local{};
+    for (size_t index=0;index<local.size();++index) {
+      auto& view=local[index]; const auto& binding=first.members[index];
+      view.uuid=binding.containerUUID; view.deploymentID=first.deploymentID; view.applicationID=42;
+      view.machine=&machine; view.fragment=binding.privateIPv6.v6[15]; view.isStateful=true;
+      view.lifetime=ApplicationLifetime::base; view.state=index ? ContainerState::planned : ContainerState::scheduled;
+      view.globalSingleWriterMemberID=binding.memberID;
+      if (index) std::memcpy(&view.requiredGlobalSingleWriterMeshAddress,binding.privateIPv6.v6,sizeof(view.requiredGlobalSingleWriterMeshAddress));
+      else {
+        std::memcpy(&view.meshAddress,binding.privateIPv6.v6,sizeof(view.meshAddress));
+        IPPrefix address; address.network=binding.privateIPv6; address.cidr=128; view.addresses.push_back(address);
+      }
+      brain.containers[view.uuid]=&view; deployment.containers.insert(&view);
+    }
+    BrainReplicatedContainerRuntimeState planned;
+    suite.expect(brain.captureReplicatedContainerRuntimeState(&local[1],planned) && planned.plan.addresses.empty() &&
+        brain.isUnsentStatefulServingReservation(planned),
+        "planned_global_sibling_is_reconstructable_from_projection_before_first_spin_snapshot");
+    auto notUnsent=planned; notUnsent.plan.state=ContainerState::scheduled;
+    suite.expect(!brain.isUnsentStatefulServingReservation(notUnsent),
+        "scheduled_global_identity_is_not_discarded_by_unlaunched_capture_filter");
+    ProdigyPersistentMasterAuthorityPackage snapshot;
+    brain.capturePersistentMasterAuthorityPackage(snapshot);
+    suite.expect(snapshot.containerRuntimeStates.size()==1 && snapshot.containerRuntimeStates.front().plan.uuid==local[0].uuid &&
+        snapshot.runtimeState.globalSingleWriterMembershipProjections.front().members.size()==3,
+        "mixed_two_member_snapshot_retains_scheduled_identity_and_durable_unlaunched_membership");
+    TestBrain restored; restored.brainConfig.clusterUUID=17; restored.brainConfig.datacenterFragment=7;
+    thisBrain=&restored;
+    suite.expect(restored.applyPersistentMasterAuthorityPackage(snapshot),
+        "mixed_two_member_snapshot_restores_after_crash_during_first_durable_spin");
+    auto pending=restored.pendingReplicatedContainerRuntimeStates.find(first.deploymentID);
+    suite.expect(pending!=restored.pendingReplicatedContainerRuntimeStates.end() && pending->second.size()==1 &&
+        pending->second.front().plan.uuid==local[0].uuid,
+        "restore_keeps_only_launched_member_pending_for_runtime_replay");
+    Machine recoveredMachine; recoveredMachine.fragment=machine.fragment;
+    suite.expect(!recoveredMachine.containerFragmentAvailable(local[1].fragment,restored.globalSingleWriterMemberships(),17) &&
+        recoveredMachine.claimContainerFragment(local[1].fragment,restored.globalSingleWriterMemberships(),17,first.deploymentID,local[1].uuid),
+        "unlaunched_local_sibling_keeps_its_reservation_and_can_be_reconstructed_exactly");
+    auto malformed=snapshot; malformed.containerRuntimeStates.push_back(planned);
+    TestBrain rejected; rejected.brainConfig.clusterUUID=17; rejected.brainConfig.datacenterFragment=7;
+    suite.expect(!rejected.applyPersistentMasterAuthorityPackage(malformed),
+        "runtime_restore_still_rejects_addressless_member_misrepresented_as_inventory");
+    thisBrain=&brain;
+    for (auto& view:local) { brain.containers.erase(view.uuid); deployment.containers.erase(&view); }
+    brain.deployments.erase(first.deploymentID);
+  }
+
+  auto retired=first; auto replacement=retired.members.front();
+  replacement.memberID=4; replacement.containerUUID+=100;
+  replacement.privateIPv6=IPAddress(MeshNode::addressForFragment(container_network_subnet6,7,machine.fragment,201));
+  retired.members.erase(retired.members.begin()); retired.members.push_back(replacement);
+  retired.retiredMemberIDs={1}; retired.highestAllocatedMemberID=4; ++retired.generation; ++retired.expectedCommittedConfigIndex;
+  machine.usedContainerFragments.insert(fragment);
+  suite.expect(prodigyGlobalSingleWriterCommittedConfigDigest(retired.membershipUUID,retired.deploymentID,
+      retired.expectedCommittedConfigIndex,retired.members,retired.expectedCommittedConfigSHA256) && commit(retired) &&
+      !machine.containerFragmentAvailable(fragment,brain.globalSingleWriterMemberships(),17),
+      "committed_retirement_does_not_release_a_still_owned_physical_fragment");
+  machine.relinquishContainerFragment(fragment);
+  suite.expect(machine.containerFragmentAvailable(fragment,brain.globalSingleWriterMemberships(),17),
+      "retired_fragment_becomes_available_only_after_projection_and_physical_ownership_end");
+  brain.machines.erase(&machine); thisBrain=previousBrain;
+}
+
 static void testMalformedWriterModeRejectedBeforeAdmission(TestSuite& suite)
 {
   StreamingTestBrain brain = {};
@@ -3945,7 +4108,7 @@ static void testMalformedWriterModeRejectedBeforeAdmission(TestSuite& suite)
 
   DeploymentPlan plan = {};
   seedStatefulDeployRequestPlan(plan, 42);
-  plan.stateful.neverShard = true; plan.stateful.globalSingleWriter = true;
+  plan.stateful.neverShard = true; plan.stateful.writerMode = StatefulWriterMode::globalSingleWriter;
   plan.stateful.clientPrefix = prodigyRuntimeStatefulServicePrefix(42, 1);
   plan.stateful.siblingPrefix = prodigyRuntimeStatefulServicePrefix(42, 2);
   plan.stateful.cousinPrefix = prodigyRuntimeStatefulServicePrefix(42, 3);
@@ -14879,7 +15042,7 @@ static void testRecoveredStatelessWormholesReplayAndAwaitAcknowledgement(TestSui
   // The same recovery owner must replay protected stateful COUSIN portals.
   deployment.plan.isStateful = true;
   deployment.plan.config.type = ApplicationType::stateful;
-  deployment.plan.stateful.allMasters = false;
+  deployment.plan.stateful.writerMode = StatefulWriterMode::localSingleWriter;
   deployment.plan.stateful.cousinPrefix = MeshServices::generateStatefulService(62'551, 3);
   container.isStateful = true; container.shardGroup = 0;
   deployment.nShardGroups = 1;
@@ -15173,7 +15336,7 @@ static void testRetainedStatelessHealthRestoresRunning(TestSuite& suite)
   stateful.plan = makeDeploymentPlan(62'573, 265'325'899'677'729ULL);
   stateful.plan.isStateful = true;
   stateful.plan.config.type = ApplicationType::stateful;
-  stateful.plan.stateful.allMasters = false;
+  stateful.plan.stateful.writerMode = StatefulWriterMode::localSingleWriter;
   stateful.plan.stateful.clientPrefix = (uint64_t(62'573) << 48) | (uint64_t(1) << 40);
   stateful.plan.stateful.siblingPrefix = (uint64_t(62'573) << 48) | (uint64_t(2) << 40);
   stateful.plan.stateful.seedingPrefix = (uint64_t(62'573) << 48) | (uint64_t(3) << 40);
@@ -29910,7 +30073,7 @@ static void checkDeferredStatefulFailedMachineRecoveryKeepsExistingOwner(
 
   ApplicationDeployment deployment = {};
   seedStatefulDeployRequestPlan(deployment.plan, applicationID);
-  deployment.plan.stateful.allMasters = true;
+  deployment.plan.stateful.writerMode = StatefulWriterMode::allMasters;
   deployment.state = DeploymentState::running;
   deployment.nShardGroups = 1;
   deployment.nTargetBase = deployment.nDeployedBase = deployment.nHealthyBase = 3;
@@ -31335,7 +31498,7 @@ static void testLateStatefulHealthResumesRecoveredDeployment(TestSuite& suite)
   deployment.plan = makeDeploymentPlan(62'041, 1);
   deployment.plan.isStateful = true;
   deployment.plan.config.type = ApplicationType::stateful;
-  deployment.plan.stateful.allMasters = true;
+  deployment.plan.stateful.writerMode = StatefulWriterMode::allMasters;
   deployment.nTargetBase = 1;
   deployment.nDeployedBase = 1;
   brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
@@ -38740,7 +38903,7 @@ static void testOrphanedMaterializedStatefulHeadRecovery(TestSuite& suite)
   head->plan.config.architecture = nametagCurrentBuildMachineArchitecture();
   head->plan.config.containerBlobSHA256.assign("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"_ctv);
   head->plan.canaryCount = 0;
-  head->plan.stateful.allMasters = false;
+  head->plan.stateful.writerMode = StatefulWriterMode::localSingleWriter;
   head->plan.stateful.allowUpdateInPlace = true;
   head->plan.stateful.clientPrefix = (uint64_t(applicationID) << 48) | (uint64_t(1) << 40);
   head->plan.stateful.siblingPrefix = (uint64_t(applicationID) << 48) | (uint64_t(2) << 40);
@@ -40035,7 +40198,7 @@ static void testInitialSeedLaunchAcknowledgement(TestSuite& suite)
 
   ApplicationDeployment deployment = {};
   deployment.plan = makeDeploymentPlan(2, 112);
-  deployment.plan.isStateful = true; deployment.plan.stateful.allMasters = true;
+  deployment.plan.isStateful = true; deployment.plan.stateful.writerMode = StatefulWriterMode::allMasters;
   deployment.plan.config.type = ApplicationType::stateful;
   deployment.plan.canaryCount = 0; deployment.plan.canariesMustLiveForMinutes = 0;
   deployment.plan.stateful.neverShard = true;
@@ -44342,7 +44505,7 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite, bool handof
           ApplicationDeployment truth = {};
           truth.plan.config = live.plan.config; truth.plan.config.applicationID = globalApplication;
           truth.plan.config.type = ApplicationType::stateful; truth.plan.isStateful = true;
-          truth.plan.stateful.neverShard = true; truth.plan.stateful.globalSingleWriter = true; truth.nShardGroups = 1;
+          truth.plan.stateful.neverShard = true; truth.plan.stateful.writerMode = StatefulWriterMode::globalSingleWriter; truth.nShardGroups = 1;
           truth.plan.stateful.clientPrefix = prodigyRuntimeStatefulServicePrefix(globalApplication, 1);
           truth.plan.stateful.siblingPrefix = prodigyRuntimeStatefulServicePrefix(globalApplication, 11);
           truth.plan.stateful.cousinPrefix = prodigyRuntimeStatefulServicePrefix(globalApplication, 3);
@@ -45820,6 +45983,12 @@ static void testAuthorityElectionFrontierRefreshesDurablePeerRevision(TestSuite&
 
 int main(void)
 {
+  if (const char* only=getenv("PRODIGY_TEST_ONLY"); only && strcmp(only,"global-writer-reservations")==0) {
+    TestSuite suite; testGlobalSingleWriterEndpointReservations(suite);
+    std::printf("GLOBAL_WRITER_RESERVATIONS_RESULT passed=%d failed=%d\n",suite.passed,suite.failed);
+    return suite.failed ? EXIT_FAILURE : EXIT_SUCCESS;
+  }
+
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "credential-wide-metrics-snapshot") == 0)
   {
     TestSuite suite;
@@ -46856,6 +47025,7 @@ int main(void)
   testMothershipConfigureLowersSharedCPUOvercommitWithoutMovingClaims(suite);
   testReplicateMasterAuthorityRejectsClusterTakeover(suite);
   testSpinApplicationInvalidPlanUsesSingleTopicFrame(suite);
+  testGlobalSingleWriterEndpointReservations(suite);
   testMalformedWriterModeRejectedBeforeAdmission(suite);
   testSpinApplicationRejectsDuplicateNonTaskDeploymentIDWithoutMutation(suite);
   testSpinApplicationProgressAppendsAfterOkayFrame(suite);

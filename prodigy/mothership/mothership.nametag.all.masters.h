@@ -485,7 +485,7 @@ static inline bool mothershipNametagInitialSeedRecordValid(const MothershipNamet
         item.nShardGroups != (item.applicationID == 3 || item.applicationID == 4 ? 3u : 1u) || item.artifactPath.empty() || item.artifactPath[0] != '/' ||
         !prodigyIsSHA256HexDigest(item.planSHA256) || !prodigyIsSHA256HexDigest(item.artifactSHA256) || !item.artifactBytes ||
         !BitseryEngine::deserializeSafe(item.normalizedPlan, plan) || !prodigyComputeSHA256Hex(item.normalizedPlan, planDigest) || planDigest != item.planSHA256 ||
-        !plan.isStateful || plan.config.type != ApplicationType::stateful || !plan.stateful.allMasters || plan.useHostNetworkNamespace ||
+        !plan.isStateful || plan.config.type != ApplicationType::stateful || plan.stateful.writerMode != StatefulWriterMode::allMasters || plan.useHostNetworkNamespace ||
         !plan.horizontalScalers.empty() || !plan.verticalScalers.empty() || plan.canaryCount || plan.canariesMustLiveForMinutes ||
         !plan.wormholes.empty() || !plan.whiteholes.empty() || plan.config.applicationID != item.applicationID ||
         plan.config.deploymentID() != item.deploymentID || plan.config.containerBlobSHA256 != item.artifactSHA256 || plan.config.containerBlobBytes != item.artifactBytes) return false;
@@ -557,7 +557,7 @@ static inline bool mothershipNametagSourceRepairPlanValid(const MothershipNameta
       !prodigyComputeSHA256Hex(value.normalizedPlan, digest) || digest != value.planSHA256 ||
       previous.config.deploymentID() != value.previousDeploymentID || next.config.deploymentID() != value.successorDeploymentID ||
       previous.config.applicationID != value.applicationID || next.config.applicationID != value.applicationID ||
-      !previous.isStateful || !next.isStateful || !previous.stateful.allMasters || !next.stateful.allMasters ||
+      !previous.isStateful || !next.isStateful || previous.stateful.writerMode != StatefulWriterMode::allMasters || next.stateful.writerMode != StatefulWriterMode::allMasters ||
       !previous.stateful.allowUpdateInPlace || !next.stateful.allowUpdateInPlace ||
       previous.useHostNetworkNamespace || next.useHostNetworkNamespace ||
       previous.config.containerBlobSHA256 != observed.containerBlobSHA256 ||

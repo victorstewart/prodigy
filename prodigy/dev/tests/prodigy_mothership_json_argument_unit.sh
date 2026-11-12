@@ -179,19 +179,42 @@ global_plan['stateful'] = {
     role + 'Prefix': (42 << 48) | (service << 40) | 1023
     for role, service in [('client', 9), ('sibling', 11), ('cousin', 12), ('seeding', 13), ('sharding', 14)]
 }
-global_plan['stateful'].update(neverShard=True, allMasters=False, globalSingleWriter=True)
+global_plan['stateful'].update(neverShard=True, writerMode='globalSingleWriter')
 cases.append(('global-app42', global_plan,
               'deploy failed: global single-writer deployment requires an admitted group before dispatch'))
 local_plan = copy.deepcopy(global_plan)
-local_plan['stateful']['globalSingleWriter'] = False
+local_plan['stateful']['writerMode'] = 'localSingleWriter'
 cases.append(('global-opt-out', local_plan, 'no file exists at containerPath provided'))
+all_masters = copy.deepcopy(global_plan)
+all_masters['stateful']['writerMode'] = 'allMasters'
+cases.append(('all-masters-enum', all_masters, 'no file exists at containerPath provided'))
+legacy_plan = copy.deepcopy(global_plan)
+del legacy_plan['stateful']['writerMode']
+legacy_plan['stateful'].update(allMasters=False, globalSingleWriter=True)
+cases.append(('legacy-global-app42', legacy_plan,
+              'deploy failed: global single-writer deployment requires an admitted group before dispatch'))
+for name, flags in [('all-first', {'allMasters': True, 'globalSingleWriter': True}),
+                    ('global-first', {'globalSingleWriter': True, 'allMasters': True})]:
+    candidate = copy.deepcopy(global_plan)
+    del candidate['stateful']['writerMode']
+    candidate['stateful'].update(flags)
+    cases.append((name, candidate, 'deploy failed: stateful.allMasters and globalSingleWriter are mutually exclusive'))
+for field in ('allMasters', 'globalSingleWriter'):
+    candidate = copy.deepcopy(global_plan)
+    candidate['stateful'][field] = False
+    cases.append(('mixed-' + field, candidate, 'deploy failed: stateful.writerMode cannot be combined with legacy writer flags'))
+for value, message in [(True, 'stateful.writerMode requires a string'),
+                       ('unknown', 'stateful.writerMode must be localSingleWriter, allMasters, or globalSingleWriter')]:
+    candidate = copy.deepcopy(global_plan)
+    candidate['stateful']['writerMode'] = value
+    cases.append(('invalid-enum-' + str(value), candidate, 'deploy failed: ' + message))
 invalid_mode = 'deploy failed: globalSingleWriter requires a stateful unsharded single-writer plan with distinct mesh roles and no hostnet or horizontal scalers'
-for name, field, value in [('global-allmasters', 'allMasters', True), ('global-sharded', 'neverShard', False),
+for name, field, value in [('global-sharded', 'neverShard', False),
                             ('global-role-collision', 'siblingPrefix', global_plan['stateful']['clientPrefix'])]:
     candidate = copy.deepcopy(global_plan)
     candidate['stateful'][field] = value
     cases.append((name, candidate, invalid_mode))
-wrong_type = copy.deepcopy(global_plan)
+wrong_type = copy.deepcopy(legacy_plan)
 wrong_type['stateful']['globalSingleWriter'] = 'true'
 cases.append(('global-bool-required', wrong_type, 'deploy failed: stateful.globalSingleWriter requires a bool'))
 hostnet = copy.deepcopy(global_plan)

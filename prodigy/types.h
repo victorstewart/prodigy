@@ -4441,6 +4441,12 @@ static inline bool taskExecutionCommitAttempt(TaskExecutionRecord& record, const
 
 constexpr inline uint64_t ProdigyGlobalSingleWriterMinimumVersion = 67;
 
+enum class StatefulWriterMode : uint8_t {
+  localSingleWriter = 0,
+  allMasters = 1,
+  globalSingleWriter = 2
+};
+
 class StatefulDeploymentPlan {
 public:
 
@@ -4468,12 +4474,9 @@ public:
   // and then also when a new application version was submitted we'd have to choose the larger of the two
   bool neverShard;
 
-  // every instance accepts writes and reads
-  bool allMasters;
-
-  // One application-owned consensus group spans the admitted datacenters.
-  // This is placement intent; only the application's committed quorum grants writes.
-  bool globalSingleWriter = false;
+  // Global mode spans admitted datacenters; only the application's committed
+  // quorum grants writes. Sharding remains a separate placement constraint.
+  StatefulWriterMode writerMode = StatefulWriterMode::localSingleWriter;
 };
 
 template <typename S>
@@ -4490,15 +4493,10 @@ static void serialize(S&& serializer, StatefulDeploymentPlan& plan)
   serializer.value1b(plan.neverShard);
   // Preserve legacy local/all-masters bytes. Legacy value1b(bool) readers do
   // not reject 2, so global plans additionally require runtime version 67.
-  uint8_t writerMode = 0;
-  if constexpr (!requires { serializer.adapter().isCompletedSuccessfully(); })
-    writerMode = uint8_t(plan.allMasters) | (uint8_t(plan.globalSingleWriter) << 1);
-  serializer.value1b(writerMode);
-  if constexpr (requires { serializer.adapter().isCompletedSuccessfully(); }) {
-    plan.allMasters = writerMode == 1;
-    plan.globalSingleWriter = writerMode == 2;
-    if (writerMode > 2) serializer.adapter().error(bitsery::ReaderError::InvalidData);
-  }
+  serializer.value1b(plan.writerMode);
+  if constexpr (requires { serializer.adapter().isCompletedSuccessfully(); })
+    if (uint8_t(plan.writerMode) > uint8_t(StatefulWriterMode::globalSingleWriter))
+      serializer.adapter().error(bitsery::ReaderError::InvalidData);
 }
 
 static inline uint64_t prodigyRuntimeStatefulServicePrefix(uint16_t applicationID, uint8_t serviceID)
@@ -11897,12 +11895,21 @@ static inline bool prodigyGlobalSingleWriterMembershipProjectionValid(const Glob
   // promotion. Both remaining voters must participate in this transition.
   return v.replacementPending && voters == 2 && v.members.size() == 3;
 }
+// Distinct groups may share machines, but never an incarnation or endpoint.
+// These bindings reserve addresses before any container claims its fragment.
+static inline bool prodigyGlobalSingleWriterMembershipsDisjoint(const GlobalSingleWriterMembershipProjection& a,
+                                                               const GlobalSingleWriterMembershipProjection& b) {
+  if (a.membershipUUID == b.membershipUUID || a.deploymentID == b.deploymentID) return false;
+  for (const auto& first : a.members) for (const auto& second : b.members)
+    if (first.containerUUID == second.containerUUID || first.privateIPv6.equals(second.privateIPv6)) return false;
+  return true;
+}
 static inline bool prodigyGlobalSingleWriterMembershipProjectionsValid(const Vector<GlobalSingleWriterMembershipProjection>& groups) {
   if (groups.size() > 64) return false;
   for (size_t index = 0; index < groups.size(); ++index) {
     if (!prodigyGlobalSingleWriterMembershipProjectionValid(groups[index])) return false;
     for (size_t prior = 0; prior < index; ++prior)
-      if (groups[prior].membershipUUID == groups[index].membershipUUID || groups[prior].deploymentID == groups[index].deploymentID)
+      if (!prodigyGlobalSingleWriterMembershipsDisjoint(groups[prior],groups[index]))
         return false;
   }
   return true;
@@ -13952,9 +13959,9 @@ public:
 
 static inline bool prodigyGlobalSingleWriterPlanValid(const DeploymentPlan& plan)
 {
-  if (!plan.stateful.globalSingleWriter || !plan.isStateful || plan.config.type != ApplicationType::stateful ||
+  if (plan.stateful.writerMode != StatefulWriterMode::globalSingleWriter || !plan.isStateful || plan.config.type != ApplicationType::stateful ||
       plan.config.applicationID == 0 || plan.config.versionID == 0 || plan.config.versionID > 0x0000FFFFFFFFFFFFULL ||
-      !plan.stateful.neverShard || plan.stateful.allMasters || plan.useHostNetworkNamespace || !plan.horizontalScalers.empty() ||
+      !plan.stateful.neverShard || plan.useHostNetworkNamespace || !plan.horizontalScalers.empty() ||
       !MeshServices::isPrefix(plan.stateful.siblingPrefix) ||
       ApplicationConfig::extractApplicationID(plan.stateful.siblingPrefix) != plan.config.applicationID) return false;
   return StatefulMeshRoles::forShardGroup(plan.stateful, plan.config.applicationID, 0).hasDistinctServices();
@@ -13994,7 +14001,7 @@ static void serialize(S&& serializer, DeploymentPlan& plan)
   serializer.value1b(plan.hasApiCredentialPolicy);
   serializer.object(plan.apiCredentialPolicy);
   if constexpr (requires { serializer.adapter().isCompletedSuccessfully(); })
-    if (plan.stateful.globalSingleWriter && !prodigyGlobalSingleWriterPlanValid(plan))
+    if (plan.stateful.writerMode == StatefulWriterMode::globalSingleWriter && !prodigyGlobalSingleWriterPlanValid(plan))
       serializer.adapter().error(bitsery::ReaderError::InvalidData);
 }
 
@@ -14134,7 +14141,7 @@ static inline bool prodigyCousinPermissionPlanServiceMatches(
   if (permission.protocolVersion < ProdigyLocalCousinServicePermission::purposeVersion)
     return plan.isStateful && plan.stateful.cousinPrefix == permission.localCousinServicePrefix;
   if (permission.purpose == ProdigyCousinServicePurpose::sibling) {
-    if (plan.stateful.globalSingleWriter) {
+    if (plan.stateful.writerMode == StatefulWriterMode::globalSingleWriter) {
       if (!prodigyGlobalSingleWriterPlanValid(plan) || permission.peerDeploymentID != plan.config.deploymentID()) return false;
     } else {
       const uint64_t legacySibling = plan.config.applicationID == 2 ? MeshRegistry::Pulse::siblings :
@@ -14257,8 +14264,7 @@ static inline bool prodigyMaterializedStatefulRecoveryPlansAreCompatible(
          successor.stateful.seedingPrefix == active.stateful.seedingPrefix &&
          successor.stateful.shardingPrefix == active.stateful.shardingPrefix &&
          successor.stateful.seedingAlways == active.stateful.seedingAlways &&
-         successor.stateful.allMasters == active.stateful.allMasters &&
-         successor.stateful.globalSingleWriter == active.stateful.globalSingleWriter;
+         successor.stateful.writerMode == active.stateful.writerMode;
 }
 
 class FailedDeploymentRecordPayload {

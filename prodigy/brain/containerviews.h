@@ -542,7 +542,7 @@ public:
 
     plan.uuid = uuid;
     plan.config = (configOverride ? *configOverride : dplan.config);
-    if (dplan.stateful.globalSingleWriter) {
+    if (dplan.stateful.writerMode == StatefulWriterMode::globalSingleWriter) {
       // Preserve the opt-in on replay even if authority is unavailable. An
       // incomplete present projection is rejected by the launch decoder.
       plan.globalSingleWriterMembership.protocolVersion = GlobalSingleWriterMembershipProjection::version;

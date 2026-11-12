@@ -120,7 +120,7 @@ public:
     servingDecision.applicationID = deployment->plan.config.applicationID;
     servingDecision.operationID = deployment->statefulWorkerTopologyUpgradeOperationID;
     servingDecision.phase = phase;
-    servingDecision.allMasters = deployment->plan.stateful.allMasters;
+    servingDecision.allMasters = (deployment->plan.stateful.writerMode == StatefulWriterMode::allMasters);
     servingDecision.targetConfig = deployment->statefulWorkerTopologyUpgradeTargetConfig();
     servingFixtureMachine.uuid = 1;
     for (ContainerView *container : deployment->containers)
@@ -1149,7 +1149,7 @@ static void testInplacePairingOrder(TestSuite& suite)
   previous.plan.config.type = ApplicationType::stateful;
   previous.plan.config.architecture = nametagCurrentBuildMachineArchitecture();
   previous.plan.stateful.siblingPrefix = (uint64_t(19'208) << 48) | (uint64_t(2) << 40);
-  previous.plan.stateful.allMasters = false;
+  previous.plan.stateful.writerMode = StatefulWriterMode::localSingleWriter;
   previous.plan.stateful.neverShard = false;
   previous.plan.stateful.allowUpdateInPlace = true;
   previous.state = DeploymentState::running;
@@ -1444,7 +1444,7 @@ static __attribute__((noinline)) void testRecoveredStatefulSuccessorTarget(TestS
   predecessor->plan.stateful.cousinPrefix = (uint64_t(19'209) << 48) | (uint64_t(3) << 40);
   predecessor->plan.stateful.seedingPrefix = (uint64_t(19'209) << 48) | (uint64_t(4) << 40);
   predecessor->plan.stateful.shardingPrefix = (uint64_t(19'209) << 48) | (uint64_t(5) << 40);
-  predecessor->plan.stateful.allMasters = allMasters;
+  predecessor->plan.stateful.writerMode = allMasters ? StatefulWriterMode::allMasters : StatefulWriterMode::localSingleWriter;
   predecessor->plan.stateful.allowUpdateInPlace = true;
   predecessor->nShardGroups = 0;
 
@@ -1633,7 +1633,7 @@ static void testFreshStatefulFloor(TestSuite& suite)
     graph.plan.config.applicationID = app;
     graph.plan.config.type = ApplicationType::stateful;
     graph.plan.stateful.neverShard = true;
-    graph.plan.stateful.allMasters = true;
+    graph.plan.stateful.writerMode = StatefulWriterMode::allMasters;
     graph.plan.stateful.clientPrefix = prodigyRuntimeStatefulServicePrefix(app, 1);
     graph.plan.stateful.siblingPrefix = prodigyRuntimeStatefulServicePrefix(app, 2);
     graph.plan.stateful.cousinPrefix = prodigyRuntimeStatefulServicePrefix(app, 3);
@@ -1707,7 +1707,7 @@ static void testRecoveredStatefulHeadShardTarget(TestSuite& suite)
     ApplicationDeployment recovered = {};
     seedCommonPlan(recovered, true);
     recovered.plan.config.type = ApplicationType::stateful;
-    recovered.plan.stateful.allMasters = true;
+    recovered.plan.stateful.writerMode = StatefulWriterMode::allMasters;
     recovered.state = DeploymentState::running;
     brain.deployments.insert_or_assign(recovered.plan.config.deploymentID(), &recovered);
 
@@ -1768,7 +1768,7 @@ static void testRecoveredStatefulQuorumDataStrategy(TestSuite& suite)
   deployment.plan.config.applicationID = 19'210;
   deployment.plan.config.versionID = 1;
   deployment.plan.config.type = ApplicationType::stateful;
-  deployment.plan.stateful.allMasters = false;
+  deployment.plan.stateful.writerMode = StatefulWriterMode::localSingleWriter;
 
   ContainerView master = {};
   master.deploymentID = deployment.plan.config.deploymentID();
@@ -1921,7 +1921,7 @@ static void testRecoveredStatefulMasterAdvertisementFence(TestSuite& suite)
     deployment.plan.stateful.cousinPrefix = MeshServices::generateStatefulService(19'211, 3);
     deployment.plan.stateful.seedingPrefix = MeshServices::generateStatefulService(19'211, 4);
     deployment.plan.stateful.shardingPrefix = MeshServices::generateStatefulService(19'211, 5);
-    deployment.plan.stateful.allMasters = false;
+    deployment.plan.stateful.writerMode = StatefulWriterMode::localSingleWriter;
   };
   auto generatedClientAdvertisement = [](const DeploymentPlan& plan, Advertisement& clientAdvertisement) {
     const StatefulMeshRoles roles = StatefulMeshRoles::forShardGroup(
@@ -2111,7 +2111,7 @@ static void testMaterializedStatefulRecoveryInitialHealth(TestSuite& suite)
     deployment.plan.stateful.cousinPrefix = (uint64_t(991) << 48) | (uint64_t(3) << 40);
     deployment.plan.stateful.seedingPrefix = (uint64_t(991) << 48) | (uint64_t(4) << 40);
     deployment.plan.stateful.shardingPrefix = (uint64_t(991) << 48) | (uint64_t(5) << 40);
-    deployment.plan.stateful.allMasters = true;
+    deployment.plan.stateful.writerMode = StatefulWriterMode::allMasters;
     deployment.plan.stateful.neverShard = false;
     deployment.plan.stateful.seedingAlways = false;
     deployment.plan.stateful.allowUpdateInPlace = true;
@@ -2822,7 +2822,7 @@ static void testStatefulHorizontalAutoscaleDispatch(TestSuite& suite)
     deployment.plan.stateful.cousinPrefix = MeshServices::generateStatefulService(999, 3);
     deployment.plan.stateful.seedingPrefix = MeshServices::generateStatefulService(999, 4);
     deployment.plan.stateful.shardingPrefix = MeshServices::generateStatefulService(999, 5);
-    deployment.plan.stateful.allMasters = true;
+    deployment.plan.stateful.writerMode = StatefulWriterMode::allMasters;
     deployment.state = DeploymentState::running;
     deployment.nShardGroups = 1; deployment.recomputeStatefulBaseTargetFromShardGroups();
     brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
@@ -2908,7 +2908,7 @@ static void testStatefulHorizontalAutoscaleFloorDispatch(TestSuite& suite)
     deployment.plan.stateful.cousinPrefix = MeshServices::generateStatefulService(998, 3);
     deployment.plan.stateful.seedingPrefix = MeshServices::generateStatefulService(998, 4);
     deployment.plan.stateful.shardingPrefix = MeshServices::generateStatefulService(998, 5);
-    deployment.plan.stateful.allMasters = true;
+    deployment.plan.stateful.writerMode = StatefulWriterMode::allMasters;
     deployment.state = DeploymentState::running;
     deployment.nShardGroups = 1;
     deployment.recomputeStatefulBaseTargetFromShardGroups();
@@ -3735,7 +3735,7 @@ static void testAllMastersBootstrapSeedingSubscription(TestSuite& suite)
     plan.config.versionID = 1;
     plan.config.type = ApplicationType::stateful;
     plan.isStateful = true;
-    plan.stateful.allMasters = true;
+    plan.stateful.writerMode = StatefulWriterMode::allMasters;
     plan.stateful.clientPrefix = MeshServices::generateStatefulService(applicationID, 1);
     plan.stateful.siblingPrefix = MeshServices::generateStatefulService(applicationID, 2);
     plan.stateful.cousinPrefix = MeshServices::generateStatefulService(applicationID, 3);
@@ -3986,7 +3986,7 @@ static void testGlobalSingleWriterPlacementShardInvariant(TestSuite& suite, uint
   seedCommonPlan(deployment, true);
   deployment.plan.config.applicationID = applicationID;
   deployment.plan.config.type = ApplicationType::stateful;
-  deployment.plan.stateful.globalSingleWriter = true;
+  deployment.plan.stateful.writerMode = StatefulWriterMode::globalSingleWriter;
   deployment.plan.stateful.neverShard = true;
   deployment.plan.stateful.clientPrefix = prodigyRuntimeStatefulServicePrefix(applicationID, 1);
   deployment.plan.stateful.siblingPrefix = prodigyRuntimeStatefulServicePrefix(applicationID, 11);
@@ -4038,7 +4038,7 @@ static void testGlobalSingleWriterPlacementShardInvariant(TestSuite& suite, uint
   suite.expect(missingMembershipPlan.globalSingleWriterMembership.protocolVersion != 0 &&
       !prodigyGlobalSingleWriterContainerPlanValid(missingMembershipPlan),
       "global_replay_without_membership_cannot_fall_back_to_local_writer");
-  deployment.plan.stateful.globalSingleWriter = false;
+  deployment.plan.stateful.writerMode = StatefulWriterMode::localSingleWriter;
   suite.expect(!deployment.reconcileGlobalSingleWriterPlacement(group), "global_reconcile_requires_explicit_plan_opt_in");
   thisBrain = savedBrain;
 }
@@ -7745,7 +7745,7 @@ int main(void)
     plan.stateful.allowUpdateInPlace = true;
     plan.stateful.seedingAlways = false;
     plan.stateful.neverShard = false;
-    plan.stateful.allMasters = true;
+    plan.stateful.writerMode = StatefulWriterMode::allMasters;
     plan.useHostNetworkNamespace = true;
     plan.networkAccess = ContainerNetworkAccess::declaredOnly;
     plan.hasTlsIssuancePolicy = true;
@@ -7788,7 +7788,7 @@ int main(void)
                  "deployment_plan_roundtrip_preserves_isolated_child_memory");
     suite.expect(roundtrip.config.containerBlobSHA256.equals(plan.config.containerBlobSHA256), "deployment_plan_roundtrip_preserves_container_blob_sha256");
     suite.expect(roundtrip.config.containerBlobBytes == plan.config.containerBlobBytes, "deployment_plan_roundtrip_preserves_container_blob_bytes");
-    suite.expect(roundtrip.stateful.allMasters == true, "deployment_plan_roundtrip_preserves_all_masters");
+    suite.expect(roundtrip.stateful.writerMode == StatefulWriterMode::allMasters, "deployment_plan_roundtrip_preserves_all_masters");
     suite.expect(roundtrip.useHostNetworkNamespace == true, "deployment_plan_roundtrip_preserves_host_network_namespace");
     suite.expect(roundtrip.networkAccess == ContainerNetworkAccess::declaredOnly, "deployment_plan_roundtrip_preserves_network_access");
     suite.expect(roundtrip.hasTlsIssuancePolicy, "deployment_plan_roundtrip_preserves_tls_policy_flag");
@@ -14864,7 +14864,7 @@ int main(void)
 
     ApplicationDeployment deployment;
     seedCommonPlan(deployment, true);
-    deployment.plan.stateful.allMasters = true;
+    deployment.plan.stateful.writerMode = StatefulWriterMode::allMasters;
 
     Rack rack {};
     rack.uuid = 1902;
@@ -14985,7 +14985,7 @@ int main(void)
 
     ApplicationDeployment deployment;
     seedCommonPlan(deployment, true);
-    deployment.plan.stateful.allMasters = true;
+    deployment.plan.stateful.writerMode = StatefulWriterMode::allMasters;
 
     Rack rack {};
     rack.uuid = 1903;

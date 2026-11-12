@@ -162,7 +162,7 @@ static void assertEmptyMachineColdCanonicalRuntimeRecovery(void)
     plan.stateful.seedingPrefix = 0x1400000000000000ULL;
     plan.stateful.shardingPrefix = 0x1500000000000000ULL;
     plan.stateful.neverShard = neverShard;
-    plan.stateful.allMasters = false;
+    plan.stateful.writerMode = StatefulWriterMode::localSingleWriter;
     return plan;
   };
   auto statelessPlan = [](uint16_t applicationID) {
@@ -718,7 +718,7 @@ static void assertEmptyMachineColdCanonicalRuntimeRecovery(void)
   // A follower may retain the proof-only plan, but it must be byte-for-byte
   // the same deployment authority sealed in the request.
   auto mismatchedActivePlan = orphanSnapshot;
-  mismatchedActivePlan.masterAuthority.deploymentPlans[activeHotID].stateful.allMasters = true;
+  mismatchedActivePlan.masterAuthority.deploymentPlans[activeHotID].stateful.writerMode = StatefulWriterMode::allMasters;
   const auto mismatchedStatePath = (orphanRoot / "mismatched-active-plan" / "state.new10").string();
   std::filesystem::create_directories(std::filesystem::path(mismatchedStatePath).parent_path());
   {
@@ -1166,7 +1166,7 @@ static void assertSchema4ConflictingClientRetirement(void)
   plan.config.memoryMB=128; plan.config.storageMB=64; plan.config.nLogicalCores=1; plan.isStateful=true;
   plan.stateful.clientPrefix=0x1100000000000000ULL; plan.stateful.siblingPrefix=0x1200000000000000ULL;
   plan.stateful.cousinPrefix=0x1300000000000000ULL; plan.stateful.seedingPrefix=0x1400000000000000ULL;
-  plan.stateful.shardingPrefix=0x1500000000000000ULL; plan.stateful.neverShard=true; plan.stateful.allMasters=false;
+  plan.stateful.shardingPrefix=0x1500000000000000ULL; plan.stateful.neverShard=true; plan.stateful.writerMode = StatefulWriterMode::localSingleWriter;
   const uint64_t deploymentID=plan.config.deploymentID(); ProdigyPersistentBrainSnapshot snapshot={};
   snapshot.brainConfig.clusterUUID=0x71; snapshot.brainConfig.datacenterFragment=7; snapshot.masterAuthority.deploymentPlans[deploymentID]=plan;
   DeploymentPlan companion={}; companion.config.type=ApplicationType::stateless; companion.config.applicationID=92; companion.config.versionID=7;
@@ -1398,7 +1398,7 @@ static void assertInitialSeedRuntimeRepair()
   ProdigyPersistentBrainSnapshot snapshot={}; snapshot.brainConfig.clusterUUID=4;
   for(auto id:binding.machineUUIDs) { ClusterMachine machine={};machine.uuid=id;machine.isBrain=true;snapshot.topology.machines.push_back(machine); }
   auto& runtime=snapshot.masterAuthority.runtimeState; runtime.generation=38;runtime.hasCompletedInitialMasterElection=true;
-  DeploymentPlan plan={};plan.isStateful=true;plan.stateful.allMasters=true;
+  DeploymentPlan plan={};plan.isStateful=true;plan.stateful.writerMode = StatefulWriterMode::allMasters;
   plan.config.type=ApplicationType::stateful;plan.config.applicationID=2;plan.config.versionID=112;
   plan.config.containerBlobSHA256=text(std::string(64,'a'));plan.config.containerBlobBytes=42;
   snapshot.masterAuthority.deploymentPlans.insert_or_assign(binding.deploymentID,plan);

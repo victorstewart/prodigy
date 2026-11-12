@@ -82,7 +82,7 @@ static void testAllMastersSeedBootstrapSchema(TestSuite& suite)
     candidate.masterAuthorityRuntimeStateDurable = true; candidate.durableMasterAuthorityRuntimeStateGeneration = 1;
     candidate.hasAuthoritativeTopology = true; candidate.authoritativeTopology.machines.push_back(ClusterMachine {});
     candidate.authoritativeTopology.machines.back().uuid = self.uuid; candidate.authoritativeTopology.machines.back().isBrain = true;
-    auto initialPlan = plan; initialPlan.isStateful = true; initialPlan.stateful.allMasters = true;
+    auto initialPlan = plan; initialPlan.isStateful = true; initialPlan.stateful.writerMode = StatefulWriterMode::allMasters;
     initialPlan.canaryCount = 0; initialPlan.config = initial.targetConfig;
     String serializedPlan; BitseryEngine::serialize(serializedPlan, initialPlan);
     String planHash; prodigyComputeSHA256Hex(serializedPlan, planHash);

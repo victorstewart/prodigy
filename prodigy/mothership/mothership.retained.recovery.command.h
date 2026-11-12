@@ -1365,7 +1365,7 @@ inline bool prepareLocal(const char *requestPath,const char *statePath,bool veri
     Vector<MothershipRetainedRecoverySealedSuccessorBootstrap> sealedOrphanSuccessors = {};
     if (retiringOrphanedStatefulPredecessor) {
       auto successor=request.plans.find(orphanedPredecessor.operation.successorDeploymentID);
-      require(successor!=request.plans.end() && successor->second.isStateful && !successor->second.stateful.allMasters &&
+      require(successor!=request.plans.end() && successor->second.isStateful && successor->second.stateful.writerMode != StatefulWriterMode::allMasters &&
                   successor->second.config.containerBlobSHA256.equals(orphanedPredecessor.operation.successorBlobSHA256),
               "orphaned stateful predecessor request does not bind its approved successor");
       String orphanFailure = {};
@@ -2648,7 +2648,7 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
           auto& orphan = manifest.orphanedStatefulPredecessor;
           auto successor = manifest.request.plans.find(orphan.operation.successorDeploymentID);
           require(successor != manifest.request.plans.end() && successor->second.isStateful &&
-                      !successor->second.stateful.allMasters &&
+                      successor->second.stateful.writerMode != StatefulWriterMode::allMasters &&
                       successor->second.config.containerBlobSHA256.equals(orphan.operation.successorBlobSHA256),
                   "orphaned stateful predecessor does not bind a culled active deployment and approved successor");
 
@@ -2672,7 +2672,7 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
                   "orphaned stateful predecessor historical request does not bind its operation");
           auto historicalPlan = priorRequest.plans.find(orphan.operation.activeDeploymentID);
           require(historicalPlan != priorRequest.plans.end() && historicalPlan->second.isStateful &&
-                      !historicalPlan->second.stateful.allMasters,
+                      historicalPlan->second.stateful.writerMode != StatefulWriterMode::allMasters,
                   "orphaned stateful predecessor historical active plan is unavailable");
           orphanedPredecessorHistoricalPlan = historicalPlan->second;
           auto retainedActivePlan = manifest.request.plans.find(orphan.operation.activeDeploymentID);

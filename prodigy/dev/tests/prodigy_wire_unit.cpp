@@ -686,6 +686,7 @@ static void expectWireRoundTrip(TestSuite& suite, const T& expected, const char 
 // compatibility test detects changes to any existing stateful-plan byte.
 struct LegacyStatefulDeploymentPlan {
   StatefulDeploymentPlan plan = {};
+  bool allMasters = false;
 };
 template<class S> static void serialize(S&& serializer, LegacyStatefulDeploymentPlan& legacy)
 {
@@ -693,7 +694,7 @@ template<class S> static void serialize(S&& serializer, LegacyStatefulDeployment
   serializer.value8b(plan.clientPrefix); serializer.value8b(plan.siblingPrefix);
   serializer.value8b(plan.cousinPrefix); serializer.value8b(plan.seedingPrefix); serializer.value8b(plan.shardingPrefix);
   serializer.value1b(plan.allowUpdateInPlace); serializer.value1b(plan.seedingAlways);
-  serializer.value1b(plan.neverShard); serializer.value1b(plan.allMasters);
+  serializer.value1b(plan.neverShard); serializer.value1b(legacy.allMasters);
 }
 
 static DeploymentPlan makeGlobalSingleWriterPlan()
@@ -703,7 +704,7 @@ static DeploymentPlan makeGlobalSingleWriterPlan()
   plan.config.nLogicalCores = 1; plan.config.memoryMB = 64; plan.config.storageMB = 64;
   plan.config.containerBlobSHA256.assign("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
   plan.config.containerBlobBytes = 1;
-  plan.isStateful = true; plan.stateful.neverShard = true; plan.stateful.globalSingleWriter = true;
+  plan.isStateful = true; plan.stateful.neverShard = true; plan.stateful.writerMode = StatefulWriterMode::globalSingleWriter;
   // Deliberately use application-owned service IDs, not Truth's defaults.
   plan.stateful.clientPrefix = prodigyRuntimeStatefulServicePrefix(42, 9);
   plan.stateful.siblingPrefix = prodigyRuntimeStatefulServicePrefix(42, 11);
@@ -725,14 +726,14 @@ static void testGlobalSingleWriterPlan(TestSuite& suite)
   String bytes = {}; DeploymentPlan decoded = {};
   BitseryEngine::serialize(bytes, plan);
   suite.expect(BitseryEngine::deserializeSafe(bytes, decoded) && prodigyGlobalSingleWriterPlanValid(decoded) &&
-      decoded.stateful.siblingPrefix == plan.stateful.siblingPrefix && !decoded.stateful.allMasters,
+      decoded.stateful.siblingPrefix == plan.stateful.siblingPrefix && decoded.stateful.writerMode == StatefulWriterMode::globalSingleWriter,
       "global_single_writer_non_truth_plan_roundtrip");
 
   auto reject = [&](DeploymentPlan invalid, const char* name) {
     bytes.clear(); BitseryEngine::serialize(bytes, invalid); decoded = {};
     suite.expect(!prodigyGlobalSingleWriterPlanValid(invalid) && !BitseryEngine::deserializeSafe(bytes, decoded), name);
   };
-  auto invalid = plan; invalid.stateful.allMasters = true; reject(invalid, "global_single_writer_rejects_all_masters");
+  auto invalid = plan; invalid.stateful.writerMode = StatefulWriterMode(3); reject(invalid, "global_single_writer_rejects_unknown_mode");
   invalid = plan; invalid.isStateful = false; reject(invalid, "global_single_writer_rejects_stateless_plan");
   invalid = plan; invalid.config.type = ApplicationType::stateless; reject(invalid, "global_single_writer_rejects_stateless_application");
   invalid = plan; invalid.stateful.neverShard = false; reject(invalid, "global_single_writer_rejects_sharding");
@@ -769,7 +770,7 @@ static void testGlobalSingleWriterPlan(TestSuite& suite)
       "global_single_writer_app42_sibling_permission_structurally_valid");
   suite.expect(prodigyCousinPermissionPlanServiceMatches(permission,plan),
       "global_single_writer_app42_sibling_permission_matches_explicit_global_plan");
-  auto optedOut = plan; optedOut.stateful.globalSingleWriter = false;
+  auto optedOut = plan; optedOut.stateful.writerMode = StatefulWriterMode::localSingleWriter;
   suite.expect(!prodigyCousinPermissionPlanServiceMatches(permission,optedOut),
       "global_single_writer_app42_sibling_permission_rejects_plan_opt_out");
   ++permission.peerDeploymentID;
@@ -786,21 +787,20 @@ static void testGlobalSingleWriterPlan(TestSuite& suite)
       "global_single_writer_sibling_pool_remains_bounded");
 
   auto mode = plan.stateful;
-  mode.globalSingleWriter = false;
   for (bool allMasters : {false, true}) {
-    mode.allMasters = allMasters;
-    LegacyStatefulDeploymentPlan legacy{mode}; String oldBytes = {}, newBytes = {};
+    mode.writerMode = allMasters ? StatefulWriterMode::allMasters : StatefulWriterMode::localSingleWriter;
+    LegacyStatefulDeploymentPlan legacy{mode, allMasters}; String oldBytes = {}, newBytes = {};
     BitseryEngine::serialize(oldBytes, legacy); BitseryEngine::serialize(newBytes, mode);
-    StatefulDeploymentPlan restored = {}; restored.globalSingleWriter = true;
+    StatefulDeploymentPlan restored = {}; restored.writerMode = StatefulWriterMode::globalSingleWriter;
     suite.expect(oldBytes == newBytes && BitseryEngine::deserializeSafe(oldBytes, restored) &&
-        restored.allMasters == allMasters && !restored.globalSingleWriter,
+        restored.writerMode == mode.writerMode,
         allMasters ? "all_masters_plan_preserves_legacy_bytes" : "local_writer_plan_preserves_legacy_bytes");
   }
   mode = plan.stateful; bytes.clear(); BitseryEngine::serialize(bytes, mode);
   suite.expect(bytes.size() == 44 && bytes[43] == 2, "global_single_writer_uses_reserved_writer_byte");
   LegacyStatefulDeploymentPlan legacy = {};
   const bool legacyAccepted = BitseryEngine::deserializeSafe(bytes, legacy);
-  uint8_t legacyByte = 0; std::memcpy(&legacyByte, &legacy.plan.allMasters, 1);
+  uint8_t legacyByte = 0; std::memcpy(&legacyByte, &legacy.allMasters, 1);
   suite.expect(legacyAccepted && legacyByte == 2 && ProdigyGlobalSingleWriterMinimumVersion == 67,
       "global_single_writer_requires_version_fence_for_raw_legacy_bool_decoder");
   for (uint8_t unsupported : {uint8_t(3), uint8_t(255)}) {
@@ -808,7 +808,7 @@ static void testGlobalSingleWriterPlan(TestSuite& suite)
     StatefulDeploymentPlan restored = {};
     suite.expect(!BitseryEngine::deserializeSafe(malformed, restored), "global_single_writer_rejects_unknown_writer_mode");
   }
-  auto local = plan; local.stateful.globalSingleWriter = false;
+  auto local = plan; local.stateful.writerMode = StatefulWriterMode::localSingleWriter;
   suite.expect(!prodigyGlobalSingleWriterPlanValid(local), "global_single_writer_requires_explicit_opt_in");
   local.stateful.allowUpdateInPlace = true;
   suite.expect(!prodigyMaterializedStatefulRecoveryPlansAreCompatible(plan, local),
@@ -1167,6 +1167,10 @@ int main(void)
     suite.expect(BitseryEngine::deserializeSafe(bytes,restored) && restored.globalSingleWriterMembershipProjections.size()==1 &&
         restored.globalSingleWriterMembershipProjections[0].members.size()==3, "durable non-Truth global projection round trip");
     auto secondGroup = group; ++secondGroup.membershipUUID; ++secondGroup.deploymentID;
+    for (auto& member : secondGroup.members) {
+      member.containerUUID += 100;
+      member.privateIPv6 = IPAddress(uint128_t(member.memberID + 100));
+    }
     state.globalSingleWriterMembershipProjections.push_back(secondGroup); bytes.clear(); BitseryEngine::serialize(bytes,state);
     suite.expect(BitseryEngine::deserializeSafe(bytes,restored) && restored.globalSingleWriterMembershipProjections.size()==2,
                  "independent global groups share one durable authority");
@@ -1177,6 +1181,14 @@ int main(void)
     state.globalSingleWriterMembershipProjections.back().deploymentID = group.deploymentID;
     bytes.clear(); BitseryEngine::serialize(bytes,state);
     suite.expect(!BitseryEngine::deserializeSafe(bytes,restored), "duplicate global deployment binding is rejected");
+    state.globalSingleWriterMembershipProjections.back() = secondGroup;
+    state.globalSingleWriterMembershipProjections.back().members[0].containerUUID = group.members[0].containerUUID;
+    bytes.clear(); BitseryEngine::serialize(bytes,state);
+    suite.expect(!BitseryEngine::deserializeSafe(bytes,restored), "cross-group container identity collision is rejected");
+    state.globalSingleWriterMembershipProjections.back() = secondGroup;
+    state.globalSingleWriterMembershipProjections.back().members[0].privateIPv6 = group.members[0].privateIPv6;
+    bytes.clear(); BitseryEngine::serialize(bytes,state);
+    suite.expect(!BitseryEngine::deserializeSafe(bytes,restored), "cross-group endpoint collision is rejected");
     auto unbound = group; unbound.deploymentID = 7;
     suite.expect(!prodigyGlobalSingleWriterMembershipProjectionValid(unbound), "global membership requires application identity");
     unbound = group; unbound.deploymentID = uint64_t(42) << 48;

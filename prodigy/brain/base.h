@@ -826,6 +826,11 @@ public:
   virtual bool statefulServingRecoveryReady() const { return true; }
   virtual bool desiredStatefulDataAuthority(uint64_t, StatefulDataAuthority&, uint32_t = UINT32_MAX) const { return false; }
   virtual bool desiredGlobalSingleWriterMembership(uint64_t, GlobalSingleWriterMembershipProjection&) const { return false; }
+  virtual const Vector<GlobalSingleWriterMembershipProjection>& globalSingleWriterMemberships() const
+  {
+    static const Vector<GlobalSingleWriterMembershipProjection> empty;
+    return empty;
+  }
   virtual bool desiredAllMastersSeedBootstrap(uint64_t, uint32_t, ProdigyAllMastersSeedBootstrap&) const { return false; }
   virtual bool allMastersSeedBootstrapAwaitingCancellation(uint64_t) const { return false; }
   virtual bool statefulCatchupCompensationFenced(uint64_t, uint32_t, uint128_t) const { return false; }
@@ -1429,7 +1434,7 @@ public:
     DeploymentPlan deploymentPlan = {};
     if (brain == nullptr || BitseryEngine::deserializeSafe(serializedPlan, deploymentPlan) == false ||
         !deploymentReplicationAllowedForPeer(deploymentPlan.config.deploymentID(), brain) ||
-        (deploymentPlan.stateful.globalSingleWriter && brain->version < ProdigyGlobalSingleWriterMinimumVersion)) return false;
+        (deploymentPlan.stateful.writerMode == StatefulWriterMode::globalSingleWriter && brain->version < ProdigyGlobalSingleWriterMinimumVersion)) return false;
     const uint64_t appendBytes = (uint64_t(serializedPlan.size()) + uint64_t(containerBlob.size()) + brainPeerReplicationFrameHeadroomBytes);
     if (allowBrainPeerReplicationAppend(brain, appendBytes, "replicateDeployment-live"_ctv) == false)
     {
@@ -1463,7 +1468,7 @@ public:
     if (brain == nullptr || brain->canQueueSend() == false ||
         !BitseryEngine::deserializeSafe(serializedPlan, deploymentPlan) ||
         deploymentPlan.config.deploymentID() != deploymentID ||
-        (deploymentPlan.stateful.globalSingleWriter && brain->version < ProdigyGlobalSingleWriterMinimumVersion) ||
+        (deploymentPlan.stateful.writerMode == StatefulWriterMode::globalSingleWriter && brain->version < ProdigyGlobalSingleWriterMinimumVersion) ||
         !deploymentReplicationAllowedForPeer(deploymentID, brain)) return false;
     const uint32_t transportEpoch = brain->transportEpoch;
     auto queued = brain->queuedStoreArtifactTransportEpochs.find(deploymentID);

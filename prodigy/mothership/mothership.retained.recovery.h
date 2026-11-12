@@ -206,7 +206,7 @@ static inline bool mothershipInitialSeedRuntimeRepairSnapshotValid(
       r.crossClusterMasqueGatewayAuthorities.size()!=b.gateways.size()) return false;
   auto plan=a.deploymentPlans.find(b.deploymentID);
   DeploymentPlan journalPlan={};
-  if (plan==a.deploymentPlans.end() || !plan->second.isStateful || !plan->second.stateful.allMasters ||
+  if (plan==a.deploymentPlans.end() || !plan->second.isStateful || plan->second.stateful.writerMode != StatefulWriterMode::allMasters ||
       !BitseryEngine::deserializeSafe(b.normalizedDeploymentPlan,journalPlan) ||
       !mothershipRetainedRecoveryPlansEqual(plan->second,journalPlan)) return false;
   const auto& authority=r.statefulServingAuthorities[0];
@@ -1061,7 +1061,7 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
       }
       if (parameters.uuid == retiredConflictingClientUUID) {
         if (!retiringConflictingClient || !existing->second.isStateful ||
-            existing->second.stateful.allMasters || bootstrap.plan.statefulMeshRoles.client == 0 ||
+            existing->second.stateful.writerMode == StatefulWriterMode::allMasters || bootstrap.plan.statefulMeshRoles.client == 0 ||
             parameters.deploymentID != retiredDeploymentID ||
             parameters.statefulTopology.shardGroup != retiredShardGroup ||
             bootstrap.plan.statefulMeshRoles.client != retiredClientRole)
@@ -1154,7 +1154,7 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
       auto existing = snapshot.masterAuthority.deploymentPlans.find(deploymentID);
       if (approved == approvedPlans.end() || existing == snapshot.masterAuthority.deploymentPlans.end() ||
           mothershipRetainedRecoveryPlansEqual(existing->second, approved->second) == false ||
-          existing->second.isStateful == false || existing->second.stateful.allMasters)
+          existing->second.isStateful == false || existing->second.stateful.writerMode == StatefulWriterMode::allMasters)
       {
         if (failure) failure->assign("cold canonical runtime deployment is not an approved non-all-master stateful plan"_ctv);
         return false;
@@ -1228,7 +1228,7 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
         prodigyIsSHA256HexDigest(partialHandoff->successorBlobSHA256) == false ||
         partialHandoff->accepted == false || partialHandoff->started == false || partialHandoff->completed ||
         partialHandoff->updatedAtMs <= 0 || active == approvedPlans.end() || successor == approvedPlans.end() ||
-        active->second.stateful.allMasters || successor->second.stateful.allMasters ||
+        active->second.stateful.writerMode == StatefulWriterMode::allMasters || successor->second.stateful.writerMode == StatefulWriterMode::allMasters ||
         prodigyMaterializedStatefulRecoveryPlansAreCompatible(active->second, successor->second) == false ||
         successor->second.config.containerBlobSHA256.equals(partialHandoff->successorBlobSHA256) == false ||
         statefulReplicas[activeID] != 2 || statefulClientMasters[activeID] != 1 ||
@@ -1275,7 +1275,7 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
     if (retiringConflictingClient && retainRetiredConflictingClientForCoordinatorProof && id == retiredDeploymentID) continue;
     if (sealedPartialHandoff && id == partialHandoff->successorDeploymentID) continue;
     const uint32_t expected = prodigyGraphDeploymentPlanCanonical(deployment, true) ? 0 :
-        (deployment.stateful.allMasters ? count : 1);
+        (deployment.stateful.writerMode == StatefulWriterMode::allMasters ? count : 1);
     if (statefulClientMasters[id] != expected) {
       if (failure) failure->assign("retained stateful inventory has missing or conflicting client masters"_ctv);
       return false;

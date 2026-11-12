@@ -279,7 +279,7 @@ static DeploymentPlan graphPlan(uint16_t app, bool replica)
 static DeploymentPlan graphAllMastersPlan(uint16_t app)
 {
   DeploymentPlan plan = graphPlan(app, false);
-  plan.stateful.allMasters = true;
+  plan.stateful.writerMode = StatefulWriterMode::allMasters;
   plan.stateful.seedingAlways = false;
   plan.whiteholes.clear();
   return plan;
@@ -343,7 +343,7 @@ static void graphMembershipRegressions(const String& path)
         return registry.admitGraphReplicaPlacement(candidate, cluster, 0x201, generation, topology,
             topologyDigest, digest('c'), placed, resumed, &failure);
       };
-      auto bad = replica; bad.stateful.allMasters = true; assert(!admit(bad));
+      auto bad = replica; bad.stateful.writerMode = StatefulWriterMode::allMasters; assert(!admit(bad));
       bad = replica; bad.stateful.neverShard = false; assert(!admit(bad));
       bad = replica; bad.stateful.clientPrefix = prodigyRuntimeStatefulServicePrefix(app, 1); assert(!admit(bad));
       bad = replica; ++bad.stateful.siblingPrefix; assert(!admit(bad));

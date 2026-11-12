@@ -24,7 +24,7 @@ static DeploymentPlan deployment(bool stateful)
     plan.stateful.seedingPrefix = 0x1400000000000000ULL;
     plan.stateful.shardingPrefix = 0x1500000000000000ULL;
     plan.stateful.neverShard = true;
-    plan.stateful.allMasters = true;
+    plan.stateful.writerMode = StatefulWriterMode::allMasters;
   }
   return plan;
 }
@@ -99,7 +99,7 @@ static void expectValidStateful(void)
 
 static void expectReplicaAndShardableRecovery()
 {
-  DeploymentPlan plan=deployment(true);plan.stateful.allMasters=false;plan.stateful.neverShard=false;
+  DeploymentPlan plan=deployment(true);plan.stateful.writerMode = StatefulWriterMode::localSingleWriter;plan.stateful.neverShard=false;
   auto parameters=parametersFor(plan);
   const auto roles=StatefulMeshRoles::forShardGroup(plan.stateful,plan.config.applicationID,0);
   parameters.statefulMeshRoles=roles;parameters.statefulMeshRoles.client=0;parameters.statefulMeshRoles.topologyBridge=0;
@@ -128,7 +128,7 @@ static void expectGraphReplicaRecovery()
 {
   for (uint16_t app : {uint16_t(2), uint16_t(5)}) {
     DeploymentPlan plan = deployment(true);
-    plan.config.applicationID = app; plan.stateful.allMasters = false;
+    plan.config.applicationID = app; plan.stateful.writerMode = StatefulWriterMode::localSingleWriter;
     plan.stateful.seedingAlways = true;
     plan.stateful.clientPrefix = 0;
     plan.stateful.siblingPrefix = prodigyRuntimeStatefulServicePrefix(app, 2);
@@ -172,7 +172,7 @@ static void expectGraphAllMastersRecovery()
   for (uint16_t app : {uint16_t(2), uint16_t(5)}) {
     DeploymentPlan plan = deployment(true);
     plan.config.applicationID = app;
-    plan.stateful.allMasters = true;
+    plan.stateful.writerMode = StatefulWriterMode::allMasters;
     plan.stateful.seedingAlways = false;
     plan.stateful.clientPrefix = prodigyRuntimeStatefulServicePrefix(app, 1);
     plan.stateful.siblingPrefix = prodigyRuntimeStatefulServicePrefix(app, 2);
@@ -215,7 +215,7 @@ static void expectLegacyGraphWriterEgressRecovery()
 {
   for (uint16_t app : {uint16_t(2), uint16_t(5)}) {
     DeploymentPlan plan = deployment(true);
-    plan.config.applicationID = app; plan.stateful.allMasters = false; plan.stateful.seedingAlways = true;
+    plan.config.applicationID = app; plan.stateful.writerMode = StatefulWriterMode::localSingleWriter; plan.stateful.seedingAlways = true;
     plan.stateful.clientPrefix = prodigyRuntimeStatefulServicePrefix(app, 1);
     plan.stateful.siblingPrefix = prodigyRuntimeStatefulServicePrefix(app, 2);
     plan.stateful.cousinPrefix = prodigyRuntimeStatefulServicePrefix(app, 3);

@@ -9652,6 +9652,52 @@ public:
     }
   }
 
+  static bool globalSingleWriterBindingsMatchRuntimePlan(const GlobalSingleWriterMembershipProjection& group,
+                                                        const ContainerPlan& plan) {
+    for (const auto& member : group.members) {
+      const bool sameUUID = plan.uuid == member.containerUUID;
+      const bool sameAddress = std::any_of(plan.addresses.begin(),plan.addresses.end(),[&](const auto& address) {
+        return address.network.equals(member.privateIPv6);
+      });
+      if ((sameUUID || sameAddress) && (!sameUUID || !sameAddress ||
+          member.clusterUUID != group.localClusterUUID || plan.config.deploymentID() != group.deploymentID)) return false;
+    }
+    return true;
+  }
+
+  bool globalSingleWriterBindingsMatchLiveContainers(const GlobalSingleWriterMembershipProjection& group) const {
+    for (const auto& member : group.members) {
+      for (const auto& [uuid,container] : containers) {
+        if (!container) continue;
+        uint128_t endpoint = 0; std::memcpy(&endpoint,member.privateIPv6.v6,sizeof(endpoint));
+        const bool sameUUID = uuid == member.containerUUID;
+        const bool sameAddress = container->meshAddress == endpoint || container->requiredGlobalSingleWriterMeshAddress == endpoint;
+        if ((sameUUID || sameAddress) && (!sameUUID || !sameAddress ||
+            member.clusterUUID != brainConfig.clusterUUID || container->deploymentID != group.deploymentID ||
+            (container->globalSingleWriterMemberID && container->globalSingleWriterMemberID != member.memberID))) return false;
+      }
+      if (member.clusterUUID != brainConfig.clusterUUID) continue;
+      for (const auto* machine : machines) {
+        if (!machine || !machine->fragment) continue;
+        const IPAddress endpoint(MeshNode::addressForFragment(container_network_subnet6,brainConfig.datacenterFragment,
+                                                               machine->fragment,member.privateIPv6.v6[15]));
+        if (!endpoint.equals(member.privateIPv6) || !machine->usedContainerFragments.contains(member.privateIPv6.v6[15])) continue;
+        const auto owner = containers.find(member.containerUUID);
+        if (owner == containers.end() || !owner->second || owner->second->machine != machine ||
+            owner->second->fragment != member.privateIPv6.v6[15]) return false;
+      }
+    }
+    // Canonical recovered inventory can await its Machine/deployment view.
+    // It still owns the identity while ordinary recovery materializes it.
+    for (const auto& [deployment,states] : pendingReplicatedContainerRuntimeStates) for (const auto& state : states)
+      if (!globalSingleWriterBindingsMatchRuntimePlan(group,state.plan)) return false;
+    return true;
+  }
+
+  const Vector<GlobalSingleWriterMembershipProjection>& globalSingleWriterMemberships() const override {
+    return masterAuthorityRuntimeState.globalSingleWriterMembershipProjections;
+  }
+
   bool applyGlobalSingleWriterPlacement(ProdigyGlobalSingleWriterPlacementExchange& r) {
     if (!weAreMaster || !ignited || !masterAuthorityRuntimeStateDurable || masterAuthorityPersistencePending ||
         durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation || r.success ||
@@ -9681,7 +9727,7 @@ public:
         }));
         if (occupancy > bestOccupancy || (occupancy == bestOccupancy && machine->fragment >= bestMachine)) continue;
         for (uint16_t fragment = 1; fragment <= 255; ++fragment) {
-          if (!machine->containerFragmentAvailable(uint8_t(fragment))) continue;
+          if (!machine->containerFragmentAvailable(uint8_t(fragment),globalSingleWriterMemberships(),brainConfig.clusterUUID)) continue;
           IPAddress candidate(MeshNode::addressForFragment(container_network_subnet6, brainConfig.datacenterFragment,
                                                             machine->fragment, uint8_t(fragment)));
           auto used = [&](const auto& member) { return member.privateIPv6.equals(candidate); };
@@ -9840,7 +9886,7 @@ public:
         if (saved.deploymentID == id && saved.phase == StatefulWorkerTopologyUpgradePhase::initialAllMastersSeedBootstrap) { first = &saved; break; }
       if (!first) return true;
       if (!initialAllMastersSeedBootstrapPeersCapable() || !statefulServingRecoveryReady() || !containerRetirementAuthorityAcknowledged() ||
-          !plan.isStateful || !plan.stateful.allMasters) return false;
+          !plan.isStateful || plan.stateful.writerMode != StatefulWriterMode::allMasters) return false;
       const auto& scope = first->initialAllMastersSeedBootstrap;
       String bytes, digest; auto copy = plan;
       if (!BitseryEngine::serialize(bytes, copy) || !prodigyComputeSHA256Hex(bytes, digest) || digest != scope.planSHA256 ||
@@ -9857,7 +9903,7 @@ public:
       return true;
     }
     if (!allMastersSeedBootstrapPeersCapable() || !statefulServingRecoveryReady() || !containerRetirementAuthorityAcknowledged() ||
-        !plan.isStateful || !plan.stateful.allMasters || first->qualificationCancellation.members.size() % 3 != 0) return false;
+        !plan.isStateful || plan.stateful.writerMode != StatefulWriterMode::allMasters || first->qualificationCancellation.members.size() % 3 != 0) return false;
     const uint32_t groups = first->qualificationCancellation.members.size() / 3;
     if (!groups) return false;
     String bytes, digest; auto copy = plan;
@@ -9934,7 +9980,7 @@ public:
     auto *deployment = deployed->second;
     const auto& plan = deployment->plan;
     if ((plan.config.applicationID != 3 && plan.config.applicationID != 4) || !plan.isStateful ||
-        plan.stateful.allMasters || shardGroup >= deployment->nShardGroups)
+        (plan.stateful.writerMode == StatefulWriterMode::allMasters) || shardGroup >= deployment->nShardGroups)
       return reject("stateful preparation requires one selected Hot/Cold writer shard");
     report.selectedShardGroup = shardGroup; report.nShardGroups = deployment->nShardGroups;
     BitseryEngine::serialize(report.normalizedDeploymentPlan, plan);
@@ -9988,7 +10034,7 @@ public:
     ApplicationDeployment *deployment = deployed->second;
     const DeploymentPlan& plan = deployment->plan;
     if (!plan.isStateful || plan.config.type != ApplicationType::stateful ||
-        !plan.stateful.allMasters || plan.useHostNetworkNamespace ||
+        plan.stateful.writerMode != StatefulWriterMode::allMasters || plan.useHostNetworkNamespace ||
         deployment->nShardGroups != 1 || deployment->containers.size() != 3 ||
         deployment->nTarget() != 3 || deployment->nDeployed() != 3 || deployment->nHealthy() != 3)
       return reject("all-masters identity requires one complete three-member IPv6 shard");
@@ -10237,7 +10283,7 @@ public:
         scope.baselineOperationUUID == 0 || !scope.nShardGroups || scope.nShardGroups > UINT16_MAX || b.shardGroup >= scope.nShardGroups ||
         !BitseryEngine::deserializeSafe(request.deploymentPlan, plan) ||
         !prodigyComputeSHA256Hex(request.deploymentPlan, planDigest) || planDigest != scope.planSHA256 ||
-        !plan.isStateful || plan.config.type != ApplicationType::stateful || !plan.stateful.allMasters || plan.useHostNetworkNamespace ||
+        !plan.isStateful || plan.config.type != ApplicationType::stateful || plan.stateful.writerMode != StatefulWriterMode::allMasters || plan.useHostNetworkNamespace ||
         !plan.horizontalScalers.empty() || !plan.verticalScalers.empty() || plan.canaryCount != 0 ||
         plan.config.deploymentID() != b.targetDeploymentID || plan.config.applicationID < 2 || plan.config.applicationID > 5 ||
         ((plan.config.applicationID == 2 || plan.config.applicationID == 5) && scope.nShardGroups != 1) ||
@@ -10302,7 +10348,7 @@ public:
     DeploymentPlan plan; String planDigest;
     if (!BitseryEngine::deserializeSafe(request.deploymentPlan, plan) ||
         !prodigyComputeSHA256Hex(request.deploymentPlan, planDigest) || planDigest != scope.successorPlanSHA256 ||
-        !plan.isStateful || plan.config.type != ApplicationType::stateful || !plan.stateful.allMasters || plan.useHostNetworkNamespace ||
+        !plan.isStateful || plan.config.type != ApplicationType::stateful || plan.stateful.writerMode != StatefulWriterMode::allMasters || plan.useHostNetworkNamespace ||
         !plan.horizontalScalers.empty() || !plan.verticalScalers.empty() || plan.canaryCount != 0 ||
         plan.config.deploymentID() != b.targetDeploymentID || plan.config.applicationID != scope.request.applicationID ||
         plan.config.containerBlobSHA256 != scope.successorArtifactSHA256 || !plan.config.containerBlobBytes ||
@@ -10332,7 +10378,7 @@ public:
       return reject("bootstrap does not bind current master and unexpired qualification");
     const uint64_t oldID = (uint64_t(scope.request.applicationID) << 48) | scope.request.activeVersionID;
     auto old = deployments.find(oldID);
-    if (old == deployments.end() || !old->second || !old->second->plan.isStateful || !old->second->plan.stateful.allMasters ||
+    if (old == deployments.end() || !old->second || !old->second->plan.isStateful || old->second->plan.stateful.writerMode != StatefulWriterMode::allMasters ||
         old->second->next || b.shardGroup >= old->second->nShardGroups || !old->second->qualificationStatefulCancellationIsSafe(scope, false) ||
         deployments.contains(b.targetDeploymentID)) return reject("bootstrap requires exact current predecessor and unqueued successor");
     if (scope.members.size() != old->second->nShardGroups * 3u)
@@ -10441,7 +10487,7 @@ public:
     else if (!BitseryEngine::deserializeSafe(request.deploymentPlan, plan))
       return reject("initial target authority requires its exact deployment plan");
     if (!plan.isStateful || plan.config.type != ApplicationType::stateful || plan.config.deploymentID() != request.deploymentID ||
-        plan.useHostNetworkNamespace || plan.stateful.allMasters || !plan.horizontalScalers.empty() ||
+        plan.useHostNetworkNamespace || (plan.stateful.writerMode == StatefulWriterMode::allMasters) || !plan.horizontalScalers.empty() ||
         !plan.verticalScalers.empty() || plan.canaryCount != 0)
       return reject("stateful data profile forbids host networking, all-masters, autoscaling and canaries");
     for (const auto& existing : authorities)
@@ -11538,8 +11584,8 @@ public:
     const auto savedPlan = deploymentPlans.find(deploymentID);
     const auto livePlan = deployments.find(deploymentID);
     GlobalSingleWriterMembershipProjection group;
-    const bool global = (savedPlan != deploymentPlans.end() && savedPlan->second.stateful.globalSingleWriter) ||
-        (livePlan != deployments.end() && livePlan->second && livePlan->second->plan.stateful.globalSingleWriter) ||
+    const bool global = (savedPlan != deploymentPlans.end() && (savedPlan->second.stateful.writerMode == StatefulWriterMode::globalSingleWriter)) ||
+        (livePlan != deployments.end() && livePlan->second && (livePlan->second->plan.stateful.writerMode == StatefulWriterMode::globalSingleWriter)) ||
         desiredGlobalSingleWriterMembership(deploymentID, group);
     if (global && (!peer || peer->version < ProdigyGlobalSingleWriterMinimumVersion)) return false;
     const auto admission = std::find_if(masterAuthorityRuntimeState.statelessDeploymentAdmissions.begin(),
@@ -11745,7 +11791,7 @@ public:
     authority.phase = phase;
     authority.sourceEpoch = deployment->statefulWorkerTopologyUpgradeSourceEpoch;
     authority.targetEpoch = deployment->statefulWorkerTopologyUpgradeTargetEpoch;
-    authority.allMasters = deployment->plan.stateful.allMasters;
+    authority.allMasters = (deployment->plan.stateful.writerMode == StatefulWriterMode::allMasters);
     authority.targetConfig = deployment->statefulWorkerTopologyUpgradeTargetConfig();
     for (const auto& state : states)
     {
@@ -11999,7 +12045,7 @@ public:
   bool prepareStatefulClientChange(ApplicationDeployment *deployment, uint32_t shardGroup,
                                    uint128_t failedUUID) override
   {
-    if (deployment == nullptr || deployment->plan.stateful.allMasters || !statefulServingPeersCapable() ||
+    if (deployment == nullptr || (deployment->plan.stateful.writerMode == StatefulWriterMode::allMasters) || !statefulServingPeersCapable() ||
         !containerRetirementAuthorityAcknowledged() || masterAuthorityRuntimeState.generation >= UINT64_MAX - 1) return false;
     auto owner = deployments.find(deployment->plan.config.deploymentID());
     if (owner == deployments.end() || owner->second != deployment) return false;
@@ -13105,7 +13151,7 @@ public:
         findMachineForReplicatedContainerRuntimeState(state) != machine ||
         !machine->runtimeReady || !statefulServingResourceObservationSupported(machine) ||
         containers.contains(state.plan.uuid) || current == nullptr ||
-        !deployment->plan.isStateful || !deployment->plan.stateful.allMasters ||
+        !deployment->plan.isStateful || deployment->plan.stateful.writerMode != StatefulWriterMode::allMasters ||
         !prodigyStatefulServingApplicationConfigEqual(deployment->plan.config,
                                                        current->targetConfig) ||
         !masterAuthorityRuntimeStateDurable ||
@@ -13196,6 +13242,17 @@ public:
 
   bool isUnsentStatefulServingReservation(const BrainReplicatedContainerRuntimeState& state) const
   {
+    if (state.plan.state == ContainerState::planned && state.plan.isStateful &&
+        !state.plan.runtimeReady && state.plan.addresses.empty() && state.plan.shardGroup == 0) {
+      GlobalSingleWriterMembershipProjection group;
+      if (desiredGlobalSingleWriterMembership(state.plan.config.deploymentID(),group) &&
+          prodigyGlobalSingleWriterLocalMember(group,state.plan.config.deploymentID(),state.plan.uuid)) {
+        // Exact reconciliation can plan several local members before the
+        // first launch is persisted. An addressless planned view has never
+        // launched; its durable projection reconstructs it after restart.
+        return true;
+      }
+    }
     if (const auto *initial = unadmittedInitialSeedReservationAuthority(state))
     {
       // A planned nonmember has never entered the launch owner. Persisting it
@@ -13305,6 +13362,12 @@ public:
   bool applyPersistentMasterAuthorityPackage(const ProdigyPersistentMasterAuthorityPackage& package)
   {
     ProdigyMasterAuthorityRuntimeState restoredRuntimeState = package.runtimeState;
+    if (!prodigyGlobalSingleWriterMembershipProjectionsValid(restoredRuntimeState.globalSingleWriterMembershipProjections)) return false;
+    for (const auto& group : restoredRuntimeState.globalSingleWriterMembershipProjections) {
+      if (!globalSingleWriterBindingsMatchLiveContainers(group)) return false;
+      for (const auto* states : {&package.containerRuntimeStates,&package.servingRuntimeStates})
+        for (const auto& state : *states) if (!globalSingleWriterBindingsMatchRuntimePlan(group,state.plan)) return false;
+    }
     if (localBundleRecoveryWitnessRetiredByAuthority(
             restoredRuntimeState, restoredRuntimeState.updateSelf))
     {
@@ -15311,6 +15374,8 @@ public:
 
   ReplicatedContainerRuntimeStateApplyResult applyReplicatedContainerRuntimeStateNow(const BrainReplicatedContainerRuntimeState& state)
   {
+    for (const auto& group : globalSingleWriterMemberships())
+      if (!globalSingleWriterBindingsMatchRuntimePlan(group,state.plan)) return ReplicatedContainerRuntimeStateApplyResult::rejected;
     if (containerRuntimeStateRetired(masterAuthorityRuntimeState, state.plan.uuid) ||
         deploymentLaunchFenced(state.plan.config.deploymentID()))
     {
@@ -21023,7 +21088,7 @@ public:
         head->plan.config.containerBlobBytes != scope.artifactBytes)
       return reject("retained stateful re-arm artifact identity differs");
     if (!head->plan.isStateful || head->plan.config.type != ApplicationType::stateful ||
-        !head->plan.stateful.allMasters || head->plan.useHostNetworkNamespace ||
+        head->plan.stateful.writerMode != StatefulWriterMode::allMasters || head->plan.useHostNetworkNamespace ||
         !scope.expectedIPv6Only || head->nShardGroups != 1 ||
         head->desiredReplicaCountForShardGroup(0) != scope.desiredReplicas)
       return reject("retained stateful re-arm plan is not the exact IPv6 all-masters topology");
@@ -21481,7 +21546,7 @@ public:
               head->plan.config.containerBlobSHA256.equals(scope.artifactSHA256) &&
               head->plan.config.containerBlobBytes == scope.artifactBytes &&
               head->plan.isStateful && head->plan.config.type == ApplicationType::stateful &&
-              head->plan.stateful.allMasters && !head->plan.useHostNetworkNamespace &&
+              (head->plan.stateful.writerMode == StatefulWriterMode::allMasters) && !head->plan.useHostNetworkNamespace &&
               head->nShardGroups == 1 && head->desiredReplicaCountForShardGroup(0) == scope.desiredReplicas &&
               BitseryEngine::serialize(replayPlanBytes, replayPlan) &&
               prodigyComputeSHA256Hex(replayPlanBytes, replayPlanSHA256) &&
@@ -21514,7 +21579,7 @@ public:
         // head: those retain their existing materialized-recovery barriers.
         else if (head->previous == nullptr && head->next == nullptr && head->state == DeploymentState::none &&
                  head->plan.isStateful && head->plan.config.type == ApplicationType::stateful &&
-                 ((!head->plan.stateful.allMasters && ordinaryMissingPredecessor) || retainedRearmValid) &&
+                 ((head->plan.stateful.writerMode != StatefulWriterMode::allMasters && ordinaryMissingPredecessor) || retainedRearmValid) &&
                  head->materializedStatefulRecoveryOwnsTransition == false &&
                  head->materializedStatefulRecoveryHealthFailed == false &&
                  head->waitingOnCompactions == false && head->canaryStack == nullptr &&
@@ -21553,7 +21618,7 @@ public:
           });
           if (retainedRearmValid)
           {
-            canonicalCohort = canonicalCohort && head->plan.stateful.allMasters &&
+            canonicalCohort = canonicalCohort && (head->plan.stateful.writerMode == StatefulWriterMode::allMasters) &&
                 retainedMembers.size() == retainedRearm->scope.retainedMembers.size();
             for (uint32_t index = 0; canonicalCohort && index < retainedMembers.size(); ++index)
             {
@@ -40559,7 +40624,7 @@ public:
           (app->isStateful ? deployment->second->nShardGroups : 1) != state.record.sourceShardGroups ||
           (app->isStateful ? app->shardGroup : 0) != state.record.sourceShardGroup) return false;
       GlobalSingleWriterMembershipProjection globalSingleWriterMembership;
-      const bool globalSibling = deployment->second->plan.stateful.globalSingleWriter &&
+      const bool globalSibling = (deployment->second->plan.stateful.writerMode == StatefulWriterMode::globalSingleWriter) &&
           permission->purpose == ProdigyCousinServicePurpose::sibling;
       const bool globalSingleWriterSiblingPool = globalSingleWriterSiblingMembership(*app, *permission, globalSingleWriterMembership) &&
           std::any_of(globalSingleWriterMembership.members.begin(), globalSingleWriterMembership.members.end(), [&](const auto& member) {
@@ -51828,7 +51893,7 @@ public:
                 // projection as the existing stateful preparation owner, but
                 // every member is client-serving. Expose that complete cohort
                 // only after all three current Neuron identities converge.
-                if (observedPlan->isStateful && observedPlan->stateful.allMasters)
+                if (observedPlan->isStateful && (observedPlan->stateful.writerMode == StatefulWriterMode::allMasters))
                   (void)observeAllMastersDeploymentIdentityCohort(deploymentID, report);
 
                 // This is an observation of the existing live runtime and
@@ -51852,7 +51917,7 @@ public:
                   member.replicaUUID = member.containerUUID = container->uuid;
                   member.clusterUUID = brainConfig.clusterUUID;
                   member.machineUUID = container->machine->uuid;
-                  member.allMasters = observedPlan->stateful.allMasters;
+                  member.allMasters = (observedPlan->stateful.writerMode == StatefulWriterMode::allMasters);
                   // Serving role is part of the authenticated current runtime
                   // plan, unlike native seed/watermark evidence below.  The
                   // source-baseline admission needs this role before any
@@ -54298,7 +54363,7 @@ public:
           }
           GlobalSingleWriterMembershipProjection globalGroup;
           const bool hasGlobalGroup = desiredGlobalSingleWriterMembership(deployment->plan.config.deploymentID(), globalGroup);
-          if (deployment->plan.stateful.globalSingleWriter
+          if ((deployment->plan.stateful.writerMode == StatefulWriterMode::globalSingleWriter)
               ? (!prodigyGlobalSingleWriterPlanValid(deployment->plan) || !hasGlobalGroup ||
                  !prodigyGlobalSingleWriterMembershipProjectionValid(globalGroup))
               : hasGlobalGroup) {
@@ -55434,6 +55499,13 @@ public:
               else response.failure.assign("conflicting global single-writer membership at this revision"_ctv);
               reply(); break;
             }
+          }
+          auto proposed = groups;
+          if (existing == groups.end()) proposed.push_back(request);
+          else proposed[size_t(existing-groups.begin())] = request;
+          if (!prodigyGlobalSingleWriterMembershipProjectionsValid(proposed) ||
+              !globalSingleWriterBindingsMatchLiveContainers(request)) {
+            response.failure.assign("global single-writer incarnation or endpoint is already owned"_ctv); reply(); break;
           }
           if (masterAuthorityRuntimeState.generation == UINT64_MAX) {
             response.failure.assign("global single-writer authority generation exhausted"_ctv); reply(); break;

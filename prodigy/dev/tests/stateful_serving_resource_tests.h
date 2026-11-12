@@ -34,7 +34,7 @@ static void testStatefulServingResourceAdjustment(TestSuite& suite)
   deployment.plan.config.nLogicalCores = 1;
   deployment.plan.config.memoryMB = 512;
   deployment.plan.config.storageMB = 1024;
-  deployment.plan.stateful.allMasters = false;
+  deployment.plan.stateful.writerMode = StatefulWriterMode::localSingleWriter;
   deployment.plan.stateful.clientPrefix = MeshServices::generateStatefulService(0x7a51, 1);
   deployment.plan.stateful.siblingPrefix = MeshServices::generateStatefulService(0x7a51, 2);
   deployment.plan.stateful.cousinPrefix = MeshServices::generateStatefulService(0x7a51, 3);

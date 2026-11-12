@@ -31,7 +31,7 @@ static inline bool prodigyGraphDeploymentPlanCanonical(const DeploymentPlan& pla
       plan.canariesMustLiveForMinutes == 0 && !plan.useHostNetworkNamespace &&
       plan.advertisements.empty() && plan.subscriptions.empty() && plan.wormholes.empty() && plan.publicTLS.empty();
   if (!common) return false;
-  if (plan.stateful.allMasters) {
+  if (plan.stateful.writerMode == StatefulWriterMode::allMasters) {
     return !replica && !plan.stateful.seedingAlways && plan.whiteholes.empty() &&
         plan.stateful.clientPrefix == prodigyRuntimeStatefulServicePrefix(app, 1);
   }
@@ -191,7 +191,7 @@ static inline bool prodigyBuildRetainedContainerBootstrap(
   const bool graphReplica = prodigyGraphDeploymentPlanCanonical(deployment, true);
   if (graph && !prodigyGraphTopologyCanonical(deployment, parameters.statefulTopology, 1))
     return prodigyRetainedRecoveryFail(failure, "graph recovery requires canonical group-zero owner or non-client replica");
-  if (graph && !deployment.stateful.allMasters &&
+  if (graph && deployment.stateful.writerMode != StatefulWriterMode::allMasters &&
       (parameters.whiteholes.size() != 1 || !resolvedWhiteholesValid(parameters.whiteholes) ||
       parameters.whiteholes[0].source != deployment.whiteholes[0].source))
     return prodigyRetainedRecoveryFail(failure, "graph recovery requires its exact resolved IPv6 egress binding");
@@ -226,7 +226,7 @@ static inline bool prodigyBuildRetainedContainerBootstrap(
   ProdigyContainerServiceDefinitions definitions = {};
   StatefulMeshRoles expectedRetainedRoles = {};
   const bool advertiseClient = deployment.isStateful && parameters.statefulMeshRoles.client != 0 && parameters.advertisesOnPorts.contains(expectedRoles.client);
-  if (deployment.isStateful && deployment.stateful.allMasters && !advertiseClient)
+  if (deployment.isStateful && deployment.stateful.writerMode == StatefulWriterMode::allMasters && !advertiseClient)
     return prodigyRetainedRecoveryFail(failure, "retained all-master replica is missing its client service");
   if (prodigyRetainedRecoveryGeneratedStatefulRoles(
           deployment, parameters.statefulTopology, advertiseClient,

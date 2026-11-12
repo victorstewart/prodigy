@@ -379,6 +379,19 @@ static void testTruthRegistry(TestSuite& suite, const String& directory)
     independent.group.membershipUUID = 171; independent.group.operationUUID = 172;
     independent.group.deploymentID = (uint64_t(42) << 48) | 8;
     independent.revision = 0;
+    auto colliding = independent;
+    suite.expect(prodigyGlobalSingleWriterCommittedConfigDigest(colliding.group.membershipUUID,
+        colliding.group.deploymentID,1,colliding.group.members,colliding.group.expectedCommittedConfigSHA256) &&
+        !registry.saveGlobalSingleWriterGroup(0,colliding,&failure),
+        "global registry rejects cross-group incarnation and address reuse before either deployment launches");
+    for (auto& member : independent.group.members) {
+      member.containerUUID += 1000;
+      member.privateIPv6 = IPAddress(uint128_t(1000+member.memberID));
+    }
+    colliding = independent; colliding.group.members.front().privateIPv6 = state.group.members.front().privateIPv6;
+    suite.expect(prodigyGlobalSingleWriterCommittedConfigDigest(colliding.group.membershipUUID,
+        colliding.group.deploymentID,1,colliding.group.members,colliding.group.expectedCommittedConfigSHA256) &&
+        !registry.saveGlobalSingleWriterGroup(0,colliding,&failure), "global registry rejects distinct identities sharing a reserved endpoint");
     suite.expect(prodigyGlobalSingleWriterCommittedConfigDigest(independent.group.membershipUUID,
         independent.group.deploymentID,1,independent.group.members,independent.group.expectedCommittedConfigSHA256) &&
         registry.saveGlobalSingleWriterGroup(0,independent,&failure), "app42 admits an independent global group beside Truth");
@@ -394,7 +407,7 @@ static void testTruthRegistry(TestSuite& suite, const String& directory)
         !registry.saveGlobalSingleWriterGroup(0,duplicate,&failure), "global registry rejects two groups for one deployment");
     DeploymentPlan plan;
     plan.config.applicationID=42; plan.config.versionID=8; plan.config.type=ApplicationType::stateful;
-    plan.isStateful=true; plan.stateful.neverShard=true; plan.stateful.globalSingleWriter=true;
+    plan.isStateful=true; plan.stateful.neverShard=true; plan.stateful.writerMode = StatefulWriterMode::globalSingleWriter;
     plan.stateful.clientPrefix=prodigyRuntimeStatefulServicePrefix(42,9);
     plan.stateful.siblingPrefix=prodigyRuntimeStatefulServicePrefix(42,11);
     plan.stateful.cousinPrefix=prodigyRuntimeStatefulServicePrefix(42,12);
@@ -404,7 +417,7 @@ static void testTruthRegistry(TestSuite& suite, const String& directory)
         !mothershipGlobalSingleWriterDeploymentMatches(state,plan,73) &&
         !mothershipGlobalSingleWriterDeploymentMatches(independent,plan,99),
         "global plan admission binds the exact group deployment and selected site");
-    plan.stateful.globalSingleWriter=false;
+    plan.stateful.writerMode = StatefulWriterMode::localSingleWriter;
     suite.expect(!mothershipGlobalSingleWriterDeploymentMatches(independent,plan,73),
         "configured global group cannot reinterpret an opted-out local plan");
     auto v1 = state;

@@ -23705,7 +23705,7 @@ LOCAL_RUNTIME
       return false;
     }
     if (reason != "record not found"_ctv) { failure=reason; return false; }
-    if (plan.stateful.globalSingleWriter) {
+    if (plan.stateful.writerMode == StatefulWriterMode::globalSingleWriter) {
       failure.assign("global single-writer deployment requires an admitted group before dispatch"_ctv);
       return false;
     }
@@ -23718,7 +23718,7 @@ LOCAL_RUNTIME
     }
     const uint128_t requested = socket.configuredClusterUUID();
     if (requested == 0) { failure.assign("Truth admission requires an exact registered cluster identity"_ctv); return false; }
-    if (graph && plan.stateful.allMasters) {
+    if (graph && plan.stateful.writerMode == StatefulWriterMode::allMasters) {
       // Graph genesis deliberately precedes cross-site seed authorization.  It
       // still dispatches only to the configured, durably registered cluster;
       // cousin permissions and remote seed admission remain their own owners.
@@ -23930,7 +23930,7 @@ LOCAL_RUNTIME
       return false;
     }
 
-    if (plan.stateful.globalSingleWriter && !requireGlobalSingleWriterControlVersion(result.failure)) return false;
+    if (plan.stateful.writerMode == StatefulWriterMode::globalSingleWriter && !requireGlobalSingleWriterControlVersion(result.failure)) return false;
 
     debugLog("socket_connected");
     socket.wBuffer.reserve(socket.wBuffer.size() + 1024);
@@ -24172,6 +24172,8 @@ LOCAL_RUNTIME
 
     bool sawSubnet = false;
     bool statefulClientPrefixPresent = false;
+    bool writerModePresent = false, legacyWriterModePresent = false;
+    bool legacyAllMasters = false, legacyGlobalSingleWriter = false;
     debugLog("json_parsed");
 
     for (auto field : doc.get_object())
@@ -25493,6 +25495,23 @@ LOCAL_RUNTIME
             (void)subfield.value.get(b);
             plan.stateful.neverShard = b;
           }
+          else if (key.equal("writerMode"_ctv))
+          {
+            if (subfield.value.type() != simdjson::dom::element_type::STRING) {
+              deploymentFailure.assign("stateful.writerMode requires a string"_ctv);
+              return false;
+            }
+            std::string_view mode;
+            (void)subfield.value.get(mode);
+            if (mode == "localSingleWriter") plan.stateful.writerMode = StatefulWriterMode::localSingleWriter;
+            else if (mode == "allMasters") plan.stateful.writerMode = StatefulWriterMode::allMasters;
+            else if (mode == "globalSingleWriter") plan.stateful.writerMode = StatefulWriterMode::globalSingleWriter;
+            else {
+              deploymentFailure.assign("stateful.writerMode must be localSingleWriter, allMasters, or globalSingleWriter"_ctv);
+              return false;
+            }
+            writerModePresent = true;
+          }
           else if (key.equal("globalSingleWriter"_ctv))
           {
             if (subfield.value.type() != simdjson::dom::element_type::BOOL)
@@ -25500,7 +25519,8 @@ LOCAL_RUNTIME
               deploymentFailure.assign("stateful.globalSingleWriter requires a bool"_ctv);
               return false;
             }
-            (void)subfield.value.get(plan.stateful.globalSingleWriter);
+            (void)subfield.value.get(legacyGlobalSingleWriter);
+            legacyWriterModePresent = true;
           }
           else if (key.equal("allMasters"_ctv))
           {
@@ -25513,7 +25533,8 @@ LOCAL_RUNTIME
 
             bool b = false;
             (void)subfield.value.get(b);
-            plan.stateful.allMasters = b;
+            legacyAllMasters = b;
+            legacyWriterModePresent = true;
           }
           else
           {
@@ -26888,7 +26909,19 @@ LOCAL_RUNTIME
       }
     }
 
-    if (plan.stateful.globalSingleWriter && !prodigyGlobalSingleWriterPlanValid(plan)) {
+    if (writerModePresent && legacyWriterModePresent) {
+      deploymentFailure.assign("stateful.writerMode cannot be combined with legacy writer flags"_ctv);
+      return false;
+    }
+    if (!writerModePresent) {
+      if (legacyAllMasters && legacyGlobalSingleWriter) {
+        deploymentFailure.assign("stateful.allMasters and globalSingleWriter are mutually exclusive"_ctv);
+        return false;
+      }
+      plan.stateful.writerMode = legacyGlobalSingleWriter ? StatefulWriterMode::globalSingleWriter :
+          legacyAllMasters ? StatefulWriterMode::allMasters : StatefulWriterMode::localSingleWriter;
+    }
+    if (plan.stateful.writerMode == StatefulWriterMode::globalSingleWriter && !prodigyGlobalSingleWriterPlanValid(plan)) {
       deploymentFailure.assign("globalSingleWriter requires a stateful unsharded single-writer plan with distinct mesh roles and no hostnet or horizontal scalers"_ctv);
       return false;
     }
@@ -37276,7 +37309,7 @@ private:
       if (!prepareDeploymentPlan(cluster.name.c_str(), planArgument.c_str(), artifactPath.c_str(),
             one.plan, one.artifactPath, returnEarly, failure) ||
           !mothershipValidateDiscombobulatorContainerBlobContract(one.artifactPath, &failure)) return false;
-      if (!one.plan.isStateful || !one.plan.stateful.allMasters || one.plan.useHostNetworkNamespace ||
+      if (!one.plan.isStateful || one.plan.stateful.writerMode != StatefulWriterMode::allMasters || one.plan.useHostNetworkNamespace ||
           one.plan.config.applicationID != bound.applicationID ||
           one.plan.config.deploymentID() != bound.successorDeploymentID ||
           bound.successorDeploymentID <= bound.previousDeploymentID ||
