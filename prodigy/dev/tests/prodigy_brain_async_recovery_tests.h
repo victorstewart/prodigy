@@ -1337,7 +1337,7 @@ static void testAsyncRetainedStatefulRearmAcceptance(TestSuite& suite)
   deployment->plan.isStateful = true;
   deployment->plan.canaryCount = 0;
   deployment->plan.useHostNetworkNamespace = false;
-  deployment->plan.stateful.allMasters = true;
+  deployment->plan.stateful.writerMode = StatefulWriterMode::allMasters;
   deployment->plan.stateful.allowUpdateInPlace = true;
   deployment->plan.stateful.clientPrefix = (uint64_t(applicationID) << 48) | (uint64_t(1) << 40);
   deployment->plan.stateful.siblingPrefix = (uint64_t(applicationID) << 48) | (uint64_t(2) << 40);
@@ -1648,7 +1648,7 @@ static void testAsyncRetainedStatefulRearmAcceptance(TestSuite& suite)
                      deployment->plan.config.applicationID == applicationID &&
                      deployment->plan.config.versionID == versionID &&
                      deployment->plan.config.deploymentID() == deploymentID &&
-                     deployment->plan.stateful.allMasters && !deployment->plan.useHostNetworkNamespace,
+                     deployment->plan.stateful.writerMode == StatefulWriterMode::allMasters && !deployment->plan.useHostNetworkNamespace,
                  "retained_rearm_preserves_deployment_storage_vm_and_ipv6_identity");
     brain.recoverDeploymentsAfterNeuronState();
     suite.expect(deployment->containers.size() == 3 && deployment->waitingOnContainers.size() == 1,

@@ -8,6 +8,7 @@
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <unistd.h>
 
 class TestSuite {
 public:
@@ -776,6 +777,49 @@ int main(void)
     if (mothershipCanResumeVultrSeedCreation(cluster, 123)) return 1;
     cluster.deploymentMode = MothershipClusterDeploymentMode::test;
     if (mothershipCanResumeVultrSeedCreation(cluster, 123)) return 1;
+
+    cluster = {};
+    cluster.clusterUUID = 0x123;
+    cluster.deploymentMode = MothershipClusterDeploymentMode::test;
+    cluster.includeLocalMachine = false;
+    cluster.test.specified = true;
+    cluster.test.workspaceRoot = "/tmp/resume-empty-test-creation"_ctv;
+    cluster.test.machineCount = 3;
+    cluster.test.machineLogicalCores = 4;
+    cluster.test.machineMemoryMB = 4096;
+    cluster.test.machineStorageMB = 16384;
+    cluster.nBrains = 3;
+    cluster.lastRefreshFailure = "virtual datacenter provider failed"_ctv;
+    if (!mothershipCanResumeEmptyTestCreation(cluster, 0x123) ||
+        mothershipCanResumeEmptyTestCreation(cluster, 0x124)) return 1;
+    cluster.deploymentMode = MothershipClusterDeploymentMode::remote;
+    if (mothershipCanResumeEmptyTestCreation(cluster, 0x123)) return 1;
+    cluster.deploymentMode = MothershipClusterDeploymentMode::local;
+    if (mothershipCanResumeEmptyTestCreation(cluster, 0x123)) return 1;
+    cluster.deploymentMode = MothershipClusterDeploymentMode::test;
+    cluster.environmentConfigured = true;
+    if (mothershipCanResumeEmptyTestCreation(cluster, 0x123)) return 1;
+    cluster.environmentConfigured = false;
+    cluster.topology.machines.emplace_back();
+    if (mothershipCanResumeEmptyTestCreation(cluster, 0x123)) return 1;
+    cluster.topology.machines.clear();
+    cluster.machines.emplace_back();
+    if (mothershipCanResumeEmptyTestCreation(cluster, 0x123)) return 1;
+    cluster.machines.clear();
+    cluster.lastRefreshFailure.clear();
+    if (mothershipCanResumeEmptyTestCreation(cluster, 0x123)) return 1;
+    cluster.lastRefreshFailure = "creation is still active"_ctv;
+    cluster.includeLocalMachine = true;
+    if (mothershipCanResumeEmptyTestCreation(cluster, 0x123)) return 1;
+    cluster.includeLocalMachine = false;
+    cluster.mothershipConnectivity.kind = MothershipConnectivityKind::tunnelProvider;
+    if (mothershipCanResumeEmptyTestCreation(cluster, 0x123)) return 1;
+    cluster.mothershipConnectivity.kind = MothershipConnectivityKind::ssh;
+    cluster.test.specified = false;
+    if (mothershipCanResumeEmptyTestCreation(cluster, 0x123)) return 1;
+    cluster.test.specified = true;
+    cluster.test.workspaceRoot.clear();
+    if (mothershipCanResumeEmptyTestCreation(cluster, 0x123)) return 1;
   }
 
   TestSuite suite;
@@ -786,6 +830,98 @@ int main(void)
   if (created == nullptr)
   {
     return EXIT_FAILURE;
+  }
+
+  {
+    MothershipProdigyCluster cluster = {};
+    cluster.clusterUUID = uint128_t(0x72530000) + uint128_t(::getpid());
+    cluster.deploymentMode = MothershipClusterDeploymentMode::test;
+    cluster.includeLocalMachine = false;
+    cluster.test.specified = true;
+    std::filesystem::path root = std::filesystem::path(created) / "empty-test-resume";
+    cluster.test.workspaceRoot = root.string().c_str();
+    cluster.test.machineCount = 3;
+    cluster.test.machineLogicalCores = 4;
+    cluster.test.machineMemoryMB = 4096;
+    cluster.test.machineStorageMB = 16384;
+    cluster.nBrains = 3;
+    cluster.lastRefreshFailure = "failed before seed creation"_ctv;
+    String failure = {};
+    suite.expect(mothershipEmptyTestCreationPathsSafe(cluster, &failure),
+                 "empty_test_creation_paths_accept_absent_workspace_and_socket_parent");
+
+    std::error_code error = {};
+    std::filesystem::create_directories(root, error);
+    std::FILE *file = std::fopen((root / "residual").c_str(), "w");
+    if (file) std::fclose(file);
+    suite.expect(!error && !mothershipEmptyTestCreationPathsSafe(cluster, &failure),
+                 "empty_test_creation_paths_reject_nonempty_workspace");
+    std::filesystem::remove_all(root, error); error.clear();
+    std::filesystem::create_directory_symlink(created, root, error);
+    suite.expect(!error && !mothershipEmptyTestCreationPathsSafe(cluster, &failure),
+                 "empty_test_creation_paths_reject_workspace_symlink");
+    std::filesystem::remove(root, error); error.clear();
+
+    std::filesystem::create_directories(root, error);
+    std::filesystem::permissions(root, std::filesystem::perms::others_write,
+                                 std::filesystem::perm_options::add, error);
+    suite.expect(!error && !mothershipEmptyTestCreationPathsSafe(cluster, &failure),
+                 "empty_test_creation_paths_reject_group_or_other_writable_workspace");
+    std::filesystem::permissions(root, std::filesystem::perms::others_write,
+                                 std::filesystem::perm_options::remove, error);
+    std::filesystem::remove_all(root, error); error.clear();
+    String socket = {};
+    mothershipResolveTestClusterControlSocketPath(cluster, socket);
+    std::filesystem::path socketPath(socket.c_str());
+    const auto socketParentStatus = std::filesystem::symlink_status(socketPath.parent_path(), error);
+    const bool socketParentAbsent = socketParentStatus.type() == std::filesystem::file_type::not_found &&
+        (!error || error == std::errc::no_such_file_or_directory);
+    suite.expect(socketParentAbsent,
+                 "empty_test_creation_paths_socket_parent_is_unique_to_fixture");
+    error.clear();
+    if (socketParentAbsent)
+    {
+      std::filesystem::create_directories(socketPath.parent_path(), error);
+      if (::geteuid() == 0)
+      {
+        suite.expect(!error && mothershipEmptyTestCreationPathsSafe(cluster, &failure),
+                     "empty_test_creation_paths_accept_empty_root_owned_socket_parent");
+      }
+      file = std::fopen((socketPath.parent_path() / "residual").c_str(), "w");
+      if (file) std::fclose(file);
+      suite.expect(!error && !mothershipEmptyTestCreationPathsSafe(cluster, &failure),
+                   "empty_test_creation_paths_reject_nonempty_socket_parent");
+      std::filesystem::remove(socketPath.parent_path() / "residual", error); error.clear();
+      std::filesystem::remove_all(socketPath.parent_path(), error); error.clear();
+      std::filesystem::create_directory_symlink(created, socketPath.parent_path(), error);
+      suite.expect(!error && !mothershipEmptyTestCreationPathsSafe(cluster, &failure),
+                   "empty_test_creation_paths_reject_control_socket_ancestor_symlink");
+      std::filesystem::remove(socketPath.parent_path(), error); error.clear();
+      std::filesystem::create_directories(socketPath.parent_path(), error);
+      std::filesystem::permissions(socketPath.parent_path(), std::filesystem::perms::group_write,
+                                   std::filesystem::perm_options::add, error);
+      suite.expect(!error && !mothershipEmptyTestCreationPathsSafe(cluster, &failure),
+                   "empty_test_creation_paths_reject_group_writable_socket_parent");
+      std::filesystem::permissions(socketPath.parent_path(), std::filesystem::perms::group_write,
+                                   std::filesystem::perm_options::remove, error);
+      std::filesystem::remove_all(socketPath.parent_path(), error); error.clear();
+      std::filesystem::create_directories(socketPath.parent_path(), error);
+      file = std::fopen(socketPath.c_str(), "w");
+      if (file) std::fclose(file);
+      suite.expect(!error && !mothershipEmptyTestCreationPathsSafe(cluster, &failure),
+                   "empty_test_creation_paths_reject_control_socket_artifact");
+      std::filesystem::remove_all(socketPath.parent_path(), error); error.clear();
+    }
+    if (::geteuid() == 0)
+    {
+      std::filesystem::create_directories(root, error);
+      suite.expect(!error && mothershipEmptyTestCreationPathsSafe(cluster, &failure),
+                   "empty_test_creation_paths_accept_empty_root_owned_workspace");
+      std::filesystem::remove_all(root, error);
+    }
+    cluster.test.workspaceRoot = "relative/workspace"_ctv;
+    suite.expect(!mothershipEmptyTestCreationPathsSafe(cluster, &failure),
+                 "empty_test_creation_paths_reject_relative_workspace");
   }
 
   std::filesystem::path fakeBinDir = std::filesystem::path(created) / "fake-bin";

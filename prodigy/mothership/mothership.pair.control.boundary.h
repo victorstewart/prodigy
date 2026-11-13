@@ -8,6 +8,7 @@
 #include <arpa/inet.h>
 #include <cstring>
 #include <cstdio>
+#include <string>
 
 #include <prodigy/cluster.pair.authority.h>
 #include <prodigy/mothership/mothership.virtual.datacenter.h>
@@ -204,7 +205,7 @@ static inline const char *mothershipPairControlFaultQdiscWitness(
   return nullptr;
 }
 
-// One operation-scoped, direct TCP flow is optional after the pair-control
+// Exact operation-scoped TCP flows are optional after the pair-control
 // carrier is prepared.  It deliberately names both deployed workloads and the
 // two already-leased public tuples; it is not a general inter-VDC route.
 class MothershipPairControlServiceTransit {
@@ -295,19 +296,27 @@ static inline bool mothershipPairControlServiceTransitEqual(
       left.destinationIngressPrivate6.equals(right.destinationIngressPrivate6);
 }
 
-static constexpr uint32_t MothershipPairControlMaximumServiceTransits = 2;
+static constexpr uint32_t MothershipPairControlMaximumServiceTransits = 64;
+
+static inline bool mothershipPairControlServiceTransitSameFlow(
+    const MothershipPairControlServiceTransit& left, const MothershipPairControlServiceTransit& right)
+{
+  return left.sourceClusterUUID == right.sourceClusterUUID &&
+      left.destinationClusterUUID == right.destinationClusterUUID &&
+      left.sourceWhiteholeAddress.equals(right.sourceWhiteholeAddress) && left.sourceTCPPort == right.sourceTCPPort &&
+      left.destinationWormholeAddress.equals(right.destinationWormholeAddress) && left.destinationTCPPort == right.destinationTCPPort;
+}
 
 static inline bool mothershipPairControlServiceTransitsValid(
     const Vector<MothershipPairControlServiceTransit>& transits,
     uint128_t firstClusterUUID, uint128_t secondClusterUUID)
 {
   if (transits.size() > MothershipPairControlMaximumServiceTransits) return false;
-  uint128_t previousSource = 0;
-  for (const auto& transit : transits)
+  for (size_t i = 0; i < transits.size(); ++i)
   {
-    if (!mothershipPairControlServiceTransitValid(transit, firstClusterUUID, secondClusterUUID) ||
-        transit.sourceClusterUUID <= previousSource) return false;
-    previousSource = transit.sourceClusterUUID;
+    if (!mothershipPairControlServiceTransitValid(transits[i], firstClusterUUID, secondClusterUUID)) return false;
+    for (size_t j = 0; j < i; ++j)
+      if (mothershipPairControlServiceTransitSameFlow(transits[i], transits[j])) return false;
   }
   return true;
 }
@@ -757,12 +766,16 @@ static inline bool mothershipPairControlBoundaryPreparedReceiptValid(
 {
   if (!mothershipPairControlServiceTransitsValid(transits, descriptor.firstClusterUUID, descriptor.secondClusterUUID)) return false;
   if (transits.empty()) return mothershipPairControlBoundaryPreparedReceiptValid(descriptor, receipt);
-  String expected;
+  String receiptText = receipt;
+  std::string remaining(receiptText.c_str(), receiptText.size());
   for (const auto& transit : transits)
   {
     String line;
     if (!mothershipPairControlBoundaryPreparedReceipt(descriptor, line, &transit)) return false;
-    expected.append(line);
+    const std::string expected(line.c_str(), line.size());
+    const auto position = remaining.find(expected);
+    if (position == std::string::npos) return false;
+    remaining.erase(position, expected.size());
   }
-  return receipt == expected;
+  return remaining.empty();
 }

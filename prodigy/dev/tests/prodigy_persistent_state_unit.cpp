@@ -1115,6 +1115,30 @@ static void testMasterAuthorityRuntimeStateRecoveryCodec(TestSuite& suite)
                    retainedRearmDecoded == retainedRearmState &&
                    prodigyRetainedStatefulRearmProofsValid(retainedRearmDecoded),
                "master_authority_runtime_state_roundtrips_v22_retained_rearm_proof");
+
+  // Versions 23 and 24 were retired database-repair tails.  Their old
+  // framing remains readable only when each bounded tail is canonically empty.
+  auto retiredTail = [&](uint64_t version, uint8_t firstCount, uint8_t secondCount = 0) {
+    String bytes = retainedRearmBytes;
+    for (uint32_t index = 0; index < sizeof(version); ++index)
+      bytes[sizeof(uint64_t) + index] = char((version >> (8 * index)) & 0xff);
+    bytes.append(char(firstCount));
+    if (version == 24) bytes.append(char(secondCount));
+    ProdigyMasterAuthorityRuntimeState decoded = {};
+    return BitseryEngine::deserializeSafe(bytes, decoded);
+  };
+  suite.expect(retiredTail(23, 0) && retiredTail(24, 0, 0),
+      "master_authority_runtime_state_accepts_empty_retired_v23_v24_tails");
+  suite.expect(!retiredTail(23, 1) && !retiredTail(24, 1, 0) && !retiredTail(24, 0, 1),
+      "master_authority_runtime_state_rejects_nonempty_retired_v23_v24_tails");
+  {
+    String truncated = retainedRearmBytes;
+    for (uint32_t index = 0; index < sizeof(uint64_t); ++index)
+      truncated[sizeof(uint64_t) + index] = char((uint64_t(23) >> (8 * index)) & 0xff);
+    ProdigyMasterAuthorityRuntimeState decoded = {};
+    suite.expect(!BitseryEngine::deserializeSafe(truncated, decoded),
+        "master_authority_runtime_state_rejects_truncated_retired_v23_tail");
+  }
   auto changedProof = retainedProof;
   changedProof.scope.retainedMembers[0].machineUUID = uint128_t(0x103);
   suite.expect(!prodigyRetainedStatefulRearmProofValid(changedProof),

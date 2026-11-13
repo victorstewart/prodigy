@@ -246,14 +246,14 @@ if (NOT "${_prodigy_depos_namespace}" STREQUAL "")
       " NAMESPACE ${_prodigy_depos_namespace}")
 endif()
 file(STRINGS "${DEPOS_MANIFEST_FILE}" _prodigy_masque_tunnel_manifest_lines
-   REGEX "^depos_require\\(masque_tunnel VERSION [^ )]+${_prodigy_masque_tunnel_manifest_namespace_suffix}\\)$")
+   REGEX "^depos_require\\(masque_tunnel( VERSION [^ )]+${_prodigy_masque_tunnel_manifest_namespace_suffix}|${_prodigy_masque_tunnel_manifest_namespace_suffix} VERSION [^ )]+)\\)$")
 list(LENGTH _prodigy_masque_tunnel_manifest_lines _prodigy_masque_tunnel_manifest_count)
 if (NOT _prodigy_masque_tunnel_manifest_count EQUAL 1)
    message(FATAL_ERROR "${DEPOS_MANIFEST_FILE} must materialize exactly one masque_tunnel request for visible namespace '${_prodigy_depos_namespace}'.")
 endif()
 list(GET _prodigy_masque_tunnel_manifest_lines 0 _prodigy_masque_tunnel_manifest_line)
-string(REGEX REPLACE "^depos_require\\(masque_tunnel VERSION ([^ )]+)${_prodigy_masque_tunnel_manifest_namespace_suffix}\\)$" "\\1"
-   _prodigy_masque_tunnel_materialized_version "${_prodigy_masque_tunnel_manifest_line}")
+string(REGEX MATCH " VERSION ([^ )]+)" _prodigy_masque_tunnel_manifest_version_token "${_prodigy_masque_tunnel_manifest_line}")
+set(_prodigy_masque_tunnel_materialized_version "${CMAKE_MATCH_1}")
 if (NOT _prodigy_masque_tunnel_materialized_version STREQUAL _prodigy_masque_tunnel_version)
    message(FATAL_ERROR "${DEPOS_MANIFEST_FILE} materialized masque_tunnel ${_prodigy_masque_tunnel_materialized_version}, expected ${_prodigy_masque_tunnel_version} from ${_prodigy_masque_tunnel_depofile}.")
 endif()
@@ -519,6 +519,8 @@ file(GLOB DISCOMBOBULATOR_SOURCE_FILES CONFIGURE_DEPENDS
 set(PRODIGY_DNS_RESOLVER_DISCOMBOBUFILE "${CMAKE_BINARY_DIR}/prodigy-dns-resolver.DiscombobuFile")
 set(PRODIGY_DNS_RESOLVER_CONTAINER_ARTIFACT "${CMAKE_BINARY_DIR}/prodigy-dns-resolver.${PRODIGY_RESOLVED_TARGET_ARCH}.container.zst")
 set(PRODIGY_DNS_RESOLVER_DEPLOYMENT_PLAN "${CMAKE_BINARY_DIR}/prodigy-dns-resolver.deployment.plan.v1.json")
+set(PRODIGY_DNS_RESOLVER_CONTEXT_DIR "${CMAKE_BINARY_DIR}/prodigy-dns-resolver-context")
+set(PRODIGY_DNS_RESOLVER_CONTEXT_STAMP "${PRODIGY_DNS_RESOLVER_CONTEXT_DIR}/.prepared")
 set(PRODIGY_PINGPONG_DISCOMBOBUFILE "${CMAKE_BINARY_DIR}/prodigy-pingpong.DiscombobuFile")
 set(PRODIGY_PINGPONG_CONTAINER_ARTIFACT "${CMAKE_BINARY_DIR}/prodigy-pingpong.${PRODIGY_RESOLVED_TARGET_ARCH}.container.zst")
 set(PRODIGY_PINGPONG_ISOLATION_DISCOMBOBUFILE "${CMAKE_BINARY_DIR}/prodigy-pingpong-isolation.DiscombobuFile")
@@ -1430,21 +1432,32 @@ add_dependencies(prodigy
    container_egress_declared_router
    fake_ipv4_boundary_nat)
 
+# Prepare native ELF inputs only; Discombobulator remains the app artifact owner.
+add_custom_command(
+   OUTPUT "${PRODIGY_DNS_RESOLVER_CONTEXT_STAMP}"
+   COMMAND "${Python3_EXECUTABLE}"
+           "${CMAKE_CURRENT_SOURCE_DIR}/tests/prepare_native_elf_context.py"
+           --binary "$<TARGET_FILE:prodigy_dns_resolver>"
+           --output "${PRODIGY_DNS_RESOLVER_CONTEXT_DIR}"
+           --architecture "${PRODIGY_RESOLVED_TARGET_ARCH}"
+           --destination /app/prodigy-dns-resolver
+   DEPENDS prodigy_dns_resolver
+           "${CMAKE_CURRENT_SOURCE_DIR}/tests/prepare_native_elf_context.py"
+   COMMENT "Preparing the native DNS resolver runtime closure"
+   VERBATIM
+)
+
 add_custom_command(
    OUTPUT "${PRODIGY_DNS_RESOLVER_CONTAINER_ARTIFACT}"
    COMMAND "${CMAKE_COMMAND}" -E env
            CARGO_TARGET_DIR=${DISCOMBOBULATOR_CARGO_TARGET_DIR}
            cargo run --quiet --manifest-path "${DISCOMBOBULATOR_MANIFEST}" --
-           remote add dockerhub docker.io
-   COMMAND "${CMAKE_COMMAND}" -E env
-           CARGO_TARGET_DIR=${DISCOMBOBULATOR_CARGO_TARGET_DIR}
-           cargo run --quiet --manifest-path "${DISCOMBOBULATOR_MANIFEST}" --
            build
            --file "${PRODIGY_DNS_RESOLVER_DISCOMBOBUFILE}"
-           --context "resolver=$<TARGET_FILE_DIR:prodigy_dns_resolver>"
+           --context "resolver=${PRODIGY_DNS_RESOLVER_CONTEXT_DIR}"
            --output "${PRODIGY_DNS_RESOLVER_CONTAINER_ARTIFACT}"
            --kind app
-   DEPENDS prodigy_dns_resolver
+   DEPENDS "${PRODIGY_DNS_RESOLVER_CONTEXT_STAMP}"
            "${PRODIGY_ROOT}/prodigy/dns/DiscombobuFile.in"
            "${PRODIGY_DNS_RESOLVER_DISCOMBOBUFILE}"
            "${DISCOMBOBULATOR_MANIFEST}"
@@ -1474,6 +1487,7 @@ add_custom_command(
    DEPENDS prodigy_g6_byo_probe_container
            "${PRODIGY_G6_BYO_PROBE_BINDING_FILE}"
            "${CMAKE_CURRENT_SOURCE_DIR}/tests/prepare_g6_byo_probe_context.py"
+           "${CMAKE_CURRENT_SOURCE_DIR}/tests/prepare_native_elf_context.py"
    COMMENT "Preparing the rollout-bound G6 BYO probe app context"
    VERBATIM
 )
@@ -1803,6 +1817,13 @@ if (PROJECT_ENABLE_TESTS)
       COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_g6_physical_observe_unit.py
    )
    set_tests_properties(prodigy_g6_physical_observe_unit PROPERTIES TIMEOUT 30)
+
+   add_test(
+      NAME prodigy_g6_physical_probe_container_unit
+      COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_g6_physical_probe_container_unit.py
+              $<TARGET_FILE:prodigy_g6_physical_probe_container>
+   )
+   set_tests_properties(prodigy_g6_physical_probe_container_unit PROPERTIES TIMEOUT 30)
 
    add_test(
       NAME prodigy_mothership_local_vm_boundary_contract
@@ -2859,6 +2880,9 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=upgrade-admission-inventory
               $<TARGET_FILE:prodigy_brain_replication_credentials_unit>)
    set_tests_properties(prodigy_upgrade_admission_inventory_owner_unit PROPERTIES TIMEOUT 30)
+   add_executable(truth_placement_selector_unit tests/truth_placement_selector_unit.cpp)
+   target_include_directories(truth_placement_selector_unit PRIVATE "${PRODIGY_ROOT}")
+   add_test(NAME truth_placement_selector_unit COMMAND truth_placement_selector_unit)
    add_test(NAME prodigy_cousin_route_unit COMMAND $<TARGET_FILE:prodigy_cousin_route_unit>)
    add_test(NAME prodigy_cluster_pair_keys_unit COMMAND $<TARGET_FILE:prodigy_cluster_pair_keys_unit>)
    add_test(NAME prodigy_transport_credential_authority_unit

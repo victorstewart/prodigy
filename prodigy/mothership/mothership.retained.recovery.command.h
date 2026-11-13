@@ -12,16 +12,9 @@
 #include <set>
 #include <thread>
 
-// Existing retained-fleet frames embed these records inline. The seed field is
-// part of their fixed layout. Only a separately bounded native startup frame
-// can use bytes remaining after it to detect a generation selection.
+// Existing retained-fleet frames embed these records inline. Their seed field
+// is fixed-layout: the next embedded record is not an optional startup tail.
 template<typename S> void mothershipSerializeRetainedParameters(S& s, ContainerParameters& parameters) {
-  if constexpr (requires { s.adapter().isCompletedSuccessfully(); }) {
-    parameters.statefulStoreGenerationSelection = {.protocolVersion = 0};
-  } else {
-    MothershipTidesMigration::require(parameters.statefulStoreGenerationSelection.protocolVersion == 0,
-        "retained fleet request cannot encode a selected native store generation");
-  }
   prodigySerializeContainerParameterFields(s, parameters);
   s.object(parameters.statefulStoreSeedAuthority);
 }
@@ -35,6 +28,111 @@ template<typename S> void serialize(S&& s, MothershipRetainedRecoveryMachineInpu
 
 namespace MothershipRetainedRecovery {
 using namespace MothershipTidesMigration;
+// The persistent local-state codec has EOF-delimited optional tails.  Keep it
+// in a length-framed standalone byte string whenever it is carried beside
+// other recovery fields, rather than embedding it in an outer Bitsery object.
+struct RuntimeStartupCapturedSourceTail {
+  String snapshotBytes;
+  String privateStatePath;
+  MothershipRetainedRecoveryMachineInput census;
+  Vector<String> parameterSHA256;
+};
+template<typename S> void serialize(S&& s, RuntimeStartupCapturedSourceTail& source) {
+  s.text1b(source.snapshotBytes,256*1024*1024); s.text1b(source.privateStatePath,4096);
+  s.object(source.census); s.container(source.parameterSHA256,UINT16_MAX,[](auto& entry,auto& digest){entry.text1b(digest,64);});
+}
+struct RuntimeStartupCapturedSource {
+  ProdigyPersistentLocalBrainState local;
+  String snapshotBytes;
+  String privateStatePath;
+  MothershipRetainedRecoveryMachineInput census;
+  Vector<String> parameterSHA256;
+};
+struct RuntimeStartupCapturedSourceEnvelope {
+  uint64_t magic = 0x5254434150535632ULL;
+  uint32_t version = 2;
+  String localBytes;
+  RuntimeStartupCapturedSourceTail tail;
+};
+template<typename S> void serialize(S&& s, RuntimeStartupCapturedSourceEnvelope& source) {
+  s.value8b(source.magic); s.value4b(source.version); s.text1b(source.localBytes,16*1024*1024); s.object(source.tail);
+}
+inline bool encodeRuntimeStartupCapturedSource(const RuntimeStartupCapturedSource& captured, String& bytes, String *failure = nullptr) {
+  auto reject=[&](const char *why) { if(failure) failure->assign(why); return false; };
+  if(captured.local.uuid==0 || captured.local.ownerClusterUUID==0 || captured.snapshotBytes.size()>256*1024*1024 ||
+      captured.privateStatePath.size()>4096 || captured.census.parameters.size()>UINT16_MAX ||
+      captured.census.parameters.size()!=captured.census.observedCreatedAtMs.size() ||
+      captured.parameterSHA256.size()!=captured.census.parameters.size())
+    return reject("runtime startup captured source bounds are invalid");
+  for(const String& digest:captured.parameterSHA256) if(!prodigyIsSHA256HexDigest(digest))
+    return reject("runtime startup captured parameter digest is invalid");
+  RuntimeStartupCapturedSourceEnvelope envelope = {};
+  if(!BitseryEngine::serialize(envelope.localBytes,captured.local) || envelope.localBytes.empty() || envelope.localBytes.size()>16*1024*1024)
+    return reject("runtime startup captured local serialization failed");
+  envelope.tail.snapshotBytes=captured.snapshotBytes; envelope.tail.privateStatePath=captured.privateStatePath;
+  envelope.tail.census=captured.census; envelope.tail.parameterSHA256=captured.parameterSHA256;
+  bytes.clear();
+  if(!BitseryEngine::serialize(bytes,envelope)) return reject("runtime startup captured source serialization failed");
+  return true;
+}
+inline bool decodeRuntimeStartupCapturedSource(const String& bytes, RuntimeStartupCapturedSource& captured, String *failure = nullptr) {
+  auto reject=[&](const char *why) { if(failure) failure->assign(why); return false; };
+  uint64_t magic = 0; uint32_t version = 0;
+  if(bytes.size()<sizeof(magic)+sizeof(version)) return reject("runtime startup captured source envelope is invalid");
+  std::memcpy(&magic,bytes.data(),sizeof(magic)); std::memcpy(&version,bytes.data()+sizeof(magic),sizeof(version));
+  if(magic!=0x5254434150535632ULL || version!=2) return reject("runtime startup captured source envelope is invalid");
+  RuntimeStartupCapturedSourceEnvelope envelope = {};
+  if(!BitseryEngine::deserializeSafe(bytes,envelope) || envelope.magic!=magic || envelope.version!=version ||
+      envelope.localBytes.empty() || envelope.localBytes.size()>16*1024*1024) return reject("runtime startup captured source envelope is invalid");
+  RuntimeStartupCapturedSource result = {};
+  if(!BitseryEngine::deserializeSafe(envelope.localBytes,result.local) || result.local.uuid==0 || result.local.ownerClusterUUID==0)
+    return reject("runtime startup captured local bytes are invalid");
+  result.snapshotBytes=std::move(envelope.tail.snapshotBytes); result.privateStatePath=std::move(envelope.tail.privateStatePath);
+  result.census=std::move(envelope.tail.census); result.parameterSHA256=std::move(envelope.tail.parameterSHA256);
+  captured=std::move(result); return true;
+}
+inline bool decodeLegacyRuntimeStartupCapturedSource(const String& bytes, const ProdigyPersistentLocalBrainState& canonicalLocal,
+                                                     RuntimeStartupCapturedSource& captured, String *failure = nullptr) {
+  auto reject=[&](const char *why) { if(failure) failure->assign(why); return false; };
+  String localBytes = {};
+  if(canonicalLocal.uuid==0 || canonicalLocal.ownerClusterUUID==0 || !BitseryEngine::serialize(localBytes,canonicalLocal) ||
+      localBytes.empty() || bytes.size()<=localBytes.size() || std::memcmp(bytes.data(),localBytes.data(),localBytes.size())!=0)
+    return reject("legacy runtime startup captured local prefix differs");
+  ProdigyPersistentLocalBrainState decodedLocal = {};
+  if(!BitseryEngine::deserializeSafe(localBytes,decodedLocal)) return reject("legacy runtime startup captured local bytes are invalid");
+  String tailBytes = {}; tailBytes.assign(bytes.data()+localBytes.size(),bytes.size()-localBytes.size());
+  RuntimeStartupCapturedSourceTail tail = {};
+  if(!BitseryEngine::deserializeSafe(tailBytes,tail)) return reject("legacy runtime startup captured tail is invalid");
+  RuntimeStartupCapturedSource result = {};
+  result.local=std::move(decodedLocal); result.snapshotBytes=std::move(tail.snapshotBytes); result.privateStatePath=std::move(tail.privateStatePath);
+  result.census=std::move(tail.census); result.parameterSHA256=std::move(tail.parameterSHA256);
+  captured=std::move(result); return true;
+}
+// Persistent snapshot storage carries the transport-authority root in its
+// private paired sidecar. The ordinary snapshot wire intentionally omits that
+// root, so bind captured bytes to the canonical snapshot's public projection,
+// then retain the full canonical object for private preparation.
+inline bool restoreRuntimeStartupCapturedAuthority(RuntimeStartupCapturedSource& captured,
+                                                    const ProdigyPersistentLocalBrainState& canonicalLocal,
+                                                    const ProdigyPersistentBrainSnapshot& canonicalSnapshot,
+                                                    ProdigyPersistentBrainSnapshot& restoredSnapshot,
+                                                    String *failure = nullptr) {
+  auto reject=[&](const char *why) { if(failure) failure->assign(why); return false; };
+  String canonicalWire = {};
+  ProdigyPersistentBrainSnapshot canonicalCopy=canonicalSnapshot, canonicalPublic={}, capturedPublic={};
+  if(!BitseryEngine::serialize(canonicalWire,canonicalCopy) ||
+      !BitseryEngine::deserializeSafe(canonicalWire,canonicalPublic) ||
+      !BitseryEngine::deserializeSafe(captured.snapshotBytes,capturedPublic))
+    return reject("runtime startup captured snapshot public projection is invalid");
+  if(!prodigyPersistentBrainSnapshotsEqual(canonicalPublic,capturedPublic))
+    return reject("runtime startup captured snapshot public projection differs from canonical private authority");
+  if(!prodigyPersistentSerializedEqual(canonicalLocal,captured.local))
+    return reject("runtime startup captured local public projection differs from canonical private authority");
+  RuntimeStartupCapturedSource result=captured;
+  result.local=canonicalLocal;
+  captured=std::move(result); restoredSnapshot=canonicalSnapshot;
+  return true;
+}
 struct Request {
   uint128_t clusterUUID = 0;
   String bundleSHA;
@@ -354,6 +452,92 @@ inline bool witnessesEquivalent(const Vector<ProdigyPersistentUpdateSelfMachineR
   }
   return true;
 }
+inline bool witnessesExact(const Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness>& a,
+                           const Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness>& b) {
+  if (a.size()!=b.size()) return false;
+  for (uint32_t i=0;i<a.size();++i) {
+    if (a[i].machineUUID!=b[i].machineUUID || a[i].bundleRegistered!=b[i].bundleRegistered ||
+        a[i].containerBootstraps.size()!=b[i].containerBootstraps.size()) return false;
+    for (uint32_t j=0;j<a[i].containerBootstraps.size();++j)
+      if (a[i].containerBootstraps[j]!=b[i].containerBootstraps[j]) return false;
+  }
+  return true;
+}
+// Runtime-startup recovery keeps the operation's captured authority separate
+// from the private paired state copy on which it is prepared.  The controller
+// binds the raw captured snapshot bytes to stopped-process proof; this record
+// deliberately carries that byte digest rather than trying to reproduce it by
+// serializing decoded unordered persistent maps.
+struct RuntimeStartupSource {
+  uint128_t memberUUID = 0;
+  String stoppedProofSHA256;
+  String stateSHA256;
+  String secretsSHA256;
+  String snapshotSHA256;
+};
+template<typename S> void serialize(S&& s, RuntimeStartupSource& source) {
+  s.value16b(source.memberUUID); s.text1b(source.stoppedProofSHA256,64);
+  s.text1b(source.stateSHA256,64); s.text1b(source.secretsSHA256,64);
+  s.text1b(source.snapshotSHA256,64);
+}
+// The member census is private operation input.  Its ContainerParameters are
+// normalized by the capture owner; this header only checks its topology and
+// uses the existing retained-recovery validator to bind it to authority.
+struct RuntimeStartupRequest {
+  uint32_t version = 1;
+  String bindingSHA256;
+  uint128_t clusterUUID = 0;
+  String targetBundleSHA256;
+  String sourceBundleSHA256;
+  String rejectedCandidateSHA256;
+  ClusterTopology topology;
+  Vector<RuntimeStartupSource> sources;
+  Vector<MothershipRetainedRecoveryMachineInput> machines;
+};
+template<typename S> void serialize(S&& s, RuntimeStartupRequest& request) {
+  s.value4b(request.version); s.text1b(request.bindingSHA256,64);
+  s.value16b(request.clusterUUID); s.text1b(request.targetBundleSHA256,64); s.text1b(request.rejectedCandidateSHA256,64);
+  if (request.version >= 2) s.text1b(request.sourceBundleSHA256,64);
+  s.object(request.topology); s.object(request.sources); s.object(request.machines);
+}
+struct RuntimeStartupPrepared {
+  String requestSHA256;
+  String sourceSnapshotSHA256;
+  String preparedSnapshotSHA256;
+  WitnessSet candidateWitnesses;
+};
+template<typename S> void serialize(S&& s, RuntimeStartupPrepared& prepared) {
+  s.text1b(prepared.requestSHA256,64); s.text1b(prepared.sourceSnapshotSHA256,64);
+  s.text1b(prepared.preparedSnapshotSHA256,64); s.object(prepared.candidateWitnesses);
+}
+inline bool runtimeStartupRequestValid(const RuntimeStartupRequest& request, String *failure = nullptr) {
+  auto reject=[&](const char *why) { if (failure) failure->assign(why); return false; };
+  if ((request.version != 1 && request.version != 2) || request.clusterUUID == 0 ||
+      !prodigyIsSHA256HexDigest(request.bindingSHA256) ||
+      !prodigyIsSHA256HexDigest(request.targetBundleSHA256) ||
+      (request.version >= 2 && !prodigyIsSHA256HexDigest(request.sourceBundleSHA256)) ||
+      (!request.rejectedCandidateSHA256.empty() && !prodigyIsSHA256HexDigest(request.rejectedCandidateSHA256)) ||
+      request.topology.machines.size() != 3 || request.sources.size() != 3 || request.machines.size() != 3)
+    return reject("runtime startup request shape is invalid");
+  bytell_hash_set<uint128_t> topologyMembers, sourceMembers, censusMembers;
+  for (const ClusterMachine& machine : request.topology.machines) {
+    if (!machine.isBrain || machine.uuid == 0 || !topologyMembers.insert(machine.uuid).second)
+      return reject("runtime startup request topology is not an exact three-Brain set");
+  }
+  for (const RuntimeStartupSource& source : request.sources) {
+    if (source.memberUUID == 0 || !topologyMembers.contains(source.memberUUID) || !sourceMembers.insert(source.memberUUID).second ||
+        !prodigyIsSHA256HexDigest(source.stoppedProofSHA256) || !prodigyIsSHA256HexDigest(source.stateSHA256) ||
+        !prodigyIsSHA256HexDigest(source.secretsSHA256) || !prodigyIsSHA256HexDigest(source.snapshotSHA256))
+      return reject("runtime startup request source proof is invalid");
+  }
+  for (const MothershipRetainedRecoveryMachineInput& machine : request.machines) {
+    if (machine.machineUUID == 0 || !topologyMembers.contains(machine.machineUUID) ||
+        !censusMembers.insert(machine.machineUUID).second || machine.machineFragment == 0 ||
+        machine.parameters.empty() || machine.parameters.size() != machine.observedCreatedAtMs.size())
+      return reject("runtime startup request census shape is invalid");
+  }
+  return true;
+}
 struct Record {
   uint128_t machine=0, container=0;
   uint64_t pid=0, created=0;
@@ -469,6 +653,26 @@ inline String coldCanonicalRuntimeStatesDigest(const Vector<BrainReplicatedConta
 inline void privateFile(const std::string& path, uint64_t maximum=UINT32_MAX) {
   struct stat st{};
   require(::lstat(path.c_str(),&st)==0 && S_ISREG(st.st_mode) && !(st.st_mode&0077) && st.st_nlink==1 && st.st_uid==::geteuid() && st.st_size>0 && uint64_t(st.st_size)<=maximum,"recovery input must be a private owned regular file");
+}
+inline bool loadRuntimeStartupRequest(const std::string& path,RuntimeStartupRequest& request,String& exactRequestSHA256,String *failure=nullptr) {
+  try {
+    privateFile(path,16*1024*1024); const std::string bytes=read(path); String raw=text(bytes);
+    require(prodigyComputeSHA256Hex(raw,exactRequestSHA256,failure) &&
+                BitseryEngine::deserializeSafe(raw,request) && runtimeStartupRequestValid(request,failure),
+            failure && failure->size()?str(*failure).c_str():"runtime startup request is unreadable");
+    return true;
+  } catch(const std::exception& error) { if(failure) failure->assign(error.what()); return false; }
+}
+inline bool durableRuntimeStartupRequest(const std::string& path,const String& exactRequestBytes,String *failure=nullptr) {
+  try {
+    RuntimeStartupRequest request={}; String digest={};
+    require(!exactRequestBytes.empty() && BitseryEngine::deserializeSafe(exactRequestBytes,request) &&
+                runtimeStartupRequestValid(request,failure) && prodigyComputeSHA256Hex(exactRequestBytes,digest,failure),
+            failure && failure->size()?str(*failure).c_str():"runtime startup request bytes are invalid");
+    if (fs::exists(path)) { privateFile(path,16*1024*1024); require(read(path)==str(exactRequestBytes),"runtime startup request bytes changed"); }
+    else durable(path,exactRequestBytes);
+    return true;
+  } catch(const std::exception& error) { if(failure) failure->assign(error.what()); return false; }
 }
 inline uint64_t number(simdjson::dom::element e,const char *key) {
   uint64_t n=0; require(e[key].get_uint64().get(n)==simdjson::SUCCESS,"invalid recovery integer"); return n;
@@ -830,6 +1034,140 @@ inline void loadSnapshot(const std::string& path,ProdigyPersistentBrainSnapshot&
   ProdigyPersistentStateStore store(text(path)); String failure;
   require(store.loadBrainSnapshot(snapshot,&failure),"private recovery snapshot unreadable");
 }
+inline void runtimeStartupPrivateOperationRoot(const std::string& operationRoot,const std::string& statePath) {
+  require(!operationRoot.empty() && fs::path(statePath)==fs::path(operationRoot)/"state.new10" &&
+              fs::is_directory(operationRoot) && !fs::is_symlink(operationRoot),
+          "runtime startup preparation requires its operation-private state.new10 copy");
+  struct stat root={};
+  require(::lstat(operationRoot.c_str(),&root)==0 && S_ISDIR(root.st_mode) && !(root.st_mode&0077) && root.st_uid==::geteuid(),
+          "runtime startup operation root is not private and owned");
+  require(fs::is_directory(statePath) && fs::is_directory(statePath+".secrets") &&
+              !fs::is_symlink(statePath) && !fs::is_symlink(statePath+".secrets"),
+          "runtime startup paired private copy is absent");
+}
+inline bool runtimeStartupSnapshotDigest(const ProdigyPersistentBrainSnapshot& snapshot,String& digest,String *failure=nullptr) {
+  ProdigyPersistentBrainSnapshot copy=snapshot; String bytes={};
+  return BitseryEngine::serialize(bytes,copy) && prodigyComputeSHA256Hex(bytes,digest,failure);
+}
+inline const RuntimeStartupSource *runtimeStartupSourceForMember(const RuntimeStartupRequest& request,uint128_t memberUUID) {
+  for (const RuntimeStartupSource& source : request.sources) if (source.memberUUID==memberUUID) return &source;
+  return nullptr;
+}
+inline bool runtimeStartupSourceMatches(const RuntimeStartupRequest& request,uint128_t memberUUID,
+                                        const String& exactSnapshotSHA256) {
+  const RuntimeStartupSource *source=runtimeStartupSourceForMember(request,memberUUID);
+  return source!=nullptr && source->snapshotSHA256==exactSnapshotSHA256;
+}
+// This operation only writes a caller-created private paired copy.  In
+// particular, sourceSnapshotSHA256 is a digest of the captured raw bytes, not
+// a digest recomputed from decoded maps here.
+inline bool prepareRuntimeStartupPrivate(const RuntimeStartupRequest& request,
+                                         const ProdigyPersistentLocalBrainState& sourceLocal,
+                                         const ProdigyPersistentBrainSnapshot& sourceSnapshot,
+                                         uint128_t memberUUID,const String& exactRequestSHA256,const String& sourceSnapshotSHA256,
+                                         const std::string& operationRoot,const std::string& copiedPrivateStatePath,
+                                         RuntimeStartupPrepared& prepared,String *failure=nullptr) {
+  try {
+    require(prodigyIsSHA256HexDigest(exactRequestSHA256) && runtimeStartupRequestValid(request,failure),
+            failure && failure->size() ? str(*failure).c_str() : "runtime startup request is invalid");
+    require(runtimeStartupSourceMatches(request,memberUUID,sourceSnapshotSHA256) && sourceLocal.uuid==memberUUID &&
+                sourceLocal.ownerClusterUUID==request.clusterUUID && sourceSnapshot.brainConfig.clusterUUID==request.clusterUUID,
+            "runtime startup source identity or captured snapshot proof differs");
+    const String& recordedRejected=sourceSnapshot.masterAuthority.runtimeState.updateSelf.workerExpectedBundleSHA256;
+    require(recordedRejected.empty() ||
+                (prodigyIsSHA256HexDigest(recordedRejected) &&
+                 request.rejectedCandidateSHA256==recordedRejected),
+            "runtime startup rejected candidate is not the captured update-self value");
+    runtimeStartupPrivateOperationRoot(operationRoot,copiedPrivateStatePath);
+    String why={};
+    ProdigyPersistentLocalBrainState copiedLocal={}; ProdigyPersistentBrainSnapshot copiedSnapshot={};
+    {
+      ProdigyPersistentStateStore store(text(copiedPrivateStatePath));
+      require(store.loadLocalBrainState(copiedLocal,&why) && store.loadBrainSnapshot(copiedSnapshot,&why) &&
+                  prodigyPersistentSerializedEqual(copiedLocal,sourceLocal),
+              "runtime startup private copy local authority differs from captured source");
+    }
+    ProdigyPersistentBrainSnapshot expected={};
+    require(mothershipPrepareRuntimeRecoveryStartupAuthority(sourceLocal,sourceSnapshot,request.clusterUUID,memberUUID,
+                request.topology,sourceSnapshot.masterAuthority.deploymentPlans,request.machines,
+                request.targetBundleSHA256,request.sourceBundleSHA256,request.rejectedCandidateSHA256,expected,&why),
+            why.size()?str(why).c_str():"runtime startup authority preparation failed");
+    ProdigyPersistentBrainSnapshot comparable=expected;
+    if (witnessesEquivalent(copiedSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses,
+                            expected.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses))
+      comparable.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses=
+          copiedSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;
+    if (!prodigyPersistentBrainSnapshotsEqual(copiedSnapshot,comparable)) {
+      require(prodigyPersistentBrainSnapshotsEqual(copiedSnapshot,sourceSnapshot),
+              "runtime startup private copy is neither source nor idempotently prepared");
+      {
+        ProdigyPersistentStateStore store(text(copiedPrivateStatePath));
+        require(store.saveBrainSnapshot(expected,&why),why.size()?str(why).c_str():"runtime startup private snapshot save failed");
+      }
+      loadSnapshot(copiedPrivateStatePath,copiedSnapshot);
+    }
+    require(prodigyPersistentBrainSnapshotsEqual(copiedSnapshot,comparable) ||
+                prodigyPersistentBrainSnapshotsEqual(copiedSnapshot,expected),"runtime startup private snapshot readback differs");
+    RuntimeStartupPrepared result={}; result.requestSHA256=exactRequestSHA256; result.sourceSnapshotSHA256=sourceSnapshotSHA256;
+    require(runtimeStartupSnapshotDigest(copiedSnapshot,result.preparedSnapshotSHA256,&why),"runtime startup prepared digest failed");
+    result.candidateWitnesses.requestSHA=exactRequestSHA256;
+    result.candidateWitnesses.witnesses=copiedSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;
+    prepared=std::move(result); return true;
+  } catch(const std::exception& error) { if(failure) failure->assign(error.what()); return false; }
+}
+// The controller seals one witness byte sequence after semantic comparison of
+// all three candidates.  Finalization accepts only that same request and only
+// replaces the witness vector in an already prepared private copy.
+inline bool finalizeRuntimeStartupPrivate(const RuntimeStartupRequest& request,
+                                          const ProdigyPersistentLocalBrainState& sourceLocal,
+                                          const ProdigyPersistentBrainSnapshot& sourceSnapshot,
+                                          uint128_t memberUUID,const String& exactRequestSHA256,const String& sourceSnapshotSHA256,
+                                          const std::string& operationRoot,const std::string& copiedPrivateStatePath,
+                                          const WitnessSet& sealed,RuntimeStartupPrepared& prepared,String *failure=nullptr) {
+  try {
+    RuntimeStartupPrepared candidate={}; String why={};
+    require(prepareRuntimeStartupPrivate(request,sourceLocal,sourceSnapshot,memberUUID,exactRequestSHA256,sourceSnapshotSHA256,
+                operationRoot,copiedPrivateStatePath,candidate,&why),why.size()?str(why).c_str():"runtime startup preparation failed");
+    require(sealed.requestSHA==candidate.requestSHA256 &&
+                witnessesEquivalent(candidate.candidateWitnesses.witnesses,sealed.witnesses),
+            "runtime startup sealed witnesses differ from prepared candidate");
+    ProdigyPersistentBrainSnapshot snapshot={};
+    {
+      ProdigyPersistentStateStore store(text(copiedPrivateStatePath));
+      require(store.loadBrainSnapshot(snapshot,&why),"runtime startup prepared copy is unreadable");
+      if (!witnessesExact(snapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses,sealed.witnesses)) {
+        snapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses=sealed.witnesses;
+        require(store.saveBrainSnapshot(snapshot,&why),why.size()?str(why).c_str():"runtime startup sealed witness save failed");
+      }
+    }
+    ProdigyPersistentBrainSnapshot readback={}; loadSnapshot(copiedPrivateStatePath,readback);
+    require(prodigyPersistentBrainSnapshotsEqual(snapshot,readback),"runtime startup sealed witness readback differs");
+    prepared=candidate; prepared.candidateWitnesses=sealed;
+    require(runtimeStartupSnapshotDigest(readback,prepared.preparedSnapshotSHA256,&why),"runtime startup sealed digest failed");
+    return true;
+  } catch(const std::exception& error) { if(failure) failure->assign(error.what()); return false; }
+}
+// The paired publication is intentionally independent of any recovery
+// envelope.  A caller persists after each individual rename so an interrupted
+// operation can reconcile only the proven pair state on re-entry.
+template<typename Databases,typename Exists,typename Rename,typename Persist>
+inline void publishPreparedPairedRecoveryDatabases(Databases& databases,Exists&& exists,Rename&& rename,Persist&& persist) {
+  for (auto& database : databases) {
+    if (database.swapped) continue;
+    String why={};
+    const bool live=exists(database,database.livePath);
+    const bool retained=exists(database,database.retainedV9Path);
+    const bool prepared=exists(database,database.preparedV10Path);
+    require(!(live && retained && prepared),"ambiguous retained database swap");
+    if (live && !retained && prepared)
+      require(rename(database,database.livePath,database.retainedV9Path,&why),"retained original rename failed");
+    if (!exists(database,database.livePath) && prepared)
+      require(rename(database,database.preparedV10Path,database.livePath,&why),"prepared recovery rename failed");
+    require(exists(database,database.livePath) && exists(database,database.retainedV9Path) &&
+                !exists(database,database.preparedV10Path),"retained recovery swap incomplete");
+    database.swapped=true; persist();
+  }
+}
 inline ColdCanonicalSource deriveColdCanonicalSource(const Manifest& manifest, uint128_t emptyMachineUUID,
                                                       const ProdigyPersistentBrainSnapshot *approvedSnapshot = nullptr,
                                                       const std::string& extractionPath = {}) {
@@ -1027,7 +1365,7 @@ inline bool prepareLocal(const char *requestPath,const char *statePath,bool veri
     Vector<MothershipRetainedRecoverySealedSuccessorBootstrap> sealedOrphanSuccessors = {};
     if (retiringOrphanedStatefulPredecessor) {
       auto successor=request.plans.find(orphanedPredecessor.operation.successorDeploymentID);
-      require(successor!=request.plans.end() && successor->second.isStateful && !successor->second.stateful.allMasters &&
+      require(successor!=request.plans.end() && successor->second.isStateful && successor->second.stateful.writerMode != StatefulWriterMode::allMasters &&
                   successor->second.config.containerBlobSHA256.equals(orphanedPredecessor.operation.successorBlobSHA256),
               "orphaned stateful predecessor request does not bind its approved successor");
       String orphanFailure = {};
@@ -2310,7 +2648,7 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
           auto& orphan = manifest.orphanedStatefulPredecessor;
           auto successor = manifest.request.plans.find(orphan.operation.successorDeploymentID);
           require(successor != manifest.request.plans.end() && successor->second.isStateful &&
-                      !successor->second.stateful.allMasters &&
+                      successor->second.stateful.writerMode != StatefulWriterMode::allMasters &&
                       successor->second.config.containerBlobSHA256.equals(orphan.operation.successorBlobSHA256),
                   "orphaned stateful predecessor does not bind a culled active deployment and approved successor");
 
@@ -2334,7 +2672,7 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
                   "orphaned stateful predecessor historical request does not bind its operation");
           auto historicalPlan = priorRequest.plans.find(orphan.operation.activeDeploymentID);
           require(historicalPlan != priorRequest.plans.end() && historicalPlan->second.isStateful &&
-                      !historicalPlan->second.stateful.allMasters,
+                      historicalPlan->second.stateful.writerMode != StatefulWriterMode::allMasters,
                   "orphaned stateful predecessor historical active plan is unavailable");
           orphanedPredecessorHistoricalPlan = historicalPlan->second;
           auto retainedActivePlan = manifest.request.plans.find(orphan.operation.activeDeploymentID);
@@ -2561,14 +2899,10 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
     }
     if(std::strcmp(action,"prepare")==0) {require(!e.receipt.activationBoundaryCrossed,"recovery already activated");return true;}
     if(e.receipt.phase<MothershipTidesDBMigrationPhase::swapped) {
-      for(auto& db:e.receipt.databases) {
-        if(db.swapped)continue;String why;
-        bool live=e.exists(db,db.livePath),old=e.exists(db,db.retainedV9Path),prepared=e.exists(db,db.preparedV10Path);
-        require(!(live && old && prepared),"ambiguous retained database swap");
-        if(live && !old && prepared)require(e.rename(db,db.livePath,db.retainedV9Path,&why),"retained original rename failed");
-        if(!e.exists(db,db.livePath) && prepared)require(e.rename(db,db.preparedV10Path,db.livePath,&why),"prepared recovery rename failed");
-        require(e.exists(db,db.livePath) && e.exists(db,db.retainedV9Path) && !e.exists(db,db.preparedV10Path),"retained recovery swap incomplete");db.swapped=true;e.persist(e.receipt,nullptr);
-      }
+      publishPreparedPairedRecoveryDatabases(e.receipt.databases,
+          [&](const auto& db,const auto& path) { return e.exists(db,path); },
+          [&](auto& db,const auto& from,const auto& to,String *why) { return e.rename(db,from,to,why); },
+          [&] { e.persist(e.receipt,nullptr); });
       e.receipt.phase=MothershipTidesDBMigrationPhase::swapped;e.persist(e.receipt,nullptr);
     }
     if(!e.receipt.activationBoundaryCrossed) {

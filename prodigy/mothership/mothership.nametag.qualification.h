@@ -582,7 +582,7 @@ static inline bool mothershipNametagQualificationSecondTruthWriterCandidatePlan(
       !BitseryEngine::deserializeSafe(source.normalizedDeploymentPlan, candidate) ||
       !BitseryEngine::serialize(bytes, candidate) || !prodigyComputeSHA256Hex(bytes, digest, failure) ||
       digest != source.canonicalPlanSHA256 || candidate.config.applicationID != MeshRegistry::Truth::applicationID ||
-      candidate.config.deploymentID() != source.deploymentID || !candidate.isStateful || candidate.stateful.allMasters) {
+      candidate.config.deploymentID() != source.deploymentID || !candidate.isStateful || candidate.stateful.writerMode == StatefulWriterMode::allMasters) {
     candidate = {};
     if (failure && failure->empty()) failure->assign("second Truth-writer candidate does not match the retained EWR Truth plan"_ctv);
     return false;

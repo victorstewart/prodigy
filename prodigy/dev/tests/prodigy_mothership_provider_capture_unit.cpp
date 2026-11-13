@@ -76,6 +76,141 @@ int main()
     failed += condition ? 0 : 1;
   };
 
+  {
+    MothershipRuntimeRecoveryPreparedSeal seal={};
+    seal.requestSHA256.assign(std::string(64,'a').c_str());
+    seal.witnessesSHA256.assign(std::string(64,'b').c_str());
+    seal.preparedSnapshotSHA256.assign(std::string(64,'c').c_str());
+    seal.stateSHA256.assign(std::string(64,'d').c_str());
+    seal.secretsSHA256.assign(std::string(64,'e').c_str());
+    expect(mothershipRuntimeRecoveryPreparedSealMatches(seal,seal.requestSHA256,seal.witnessesSHA256),
+           "activation successor accepts exact prepared witness seal");
+    String alteredWitnesses={}; alteredWitnesses.assign(std::string(64,'f').c_str());
+    expect(!mothershipRuntimeRecoveryPreparedSealMatches(seal,seal.requestSHA256,alteredWitnesses),
+           "activation successor rejects altered bootstrap bytes through exact witness seal");
+    expect(!mothershipRuntimeRecoveryPreparedSealMatches(seal,alteredWitnesses,seal.witnessesSHA256),
+           "activation successor rejects foreign startup request seal");
+    seal.preparedSnapshotSHA256.clear();
+    expect(!mothershipRuntimeRecoveryPreparedSealMatches(seal,seal.requestSHA256,seal.witnessesSHA256),
+           "activation successor rejects incomplete prepared authority seal");
+  }
+
+  {
+    String diagnostic = "stage=setns-mount errno=1\n"_ctv, failure = {};
+    expect(mothershipVDCAdopterDiagnosticValid(diagnostic),
+           "provider adopter accepts bounded preexec stage diagnostic");
+    mothershipVDCAdopterReadinessFailure(false, true, 125 << 8, 0, diagnostic, failure);
+    expect(failure == "retained provider adopter did not become ready outcome=exit=125 preexec=stage=setns-mount errno=1\n"_ctv,
+           "provider adopter preserves preexec exit and errno diagnostic");
+    mothershipVDCAdopterReadinessFailure(false, true, SIGTERM, 0, {}, failure);
+    expect(failure == "retained provider adopter did not become ready outcome=signal=15"_ctv,
+           "provider adopter preserves signal outcome");
+    mothershipVDCAdopterReadinessFailure(true, false, SIGKILL, 0, {}, failure);
+    expect(failure == "retained provider adopter did not become ready outcome=timeout"_ctv,
+           "provider adopter preserves readiness timeout outcome");
+    expect(!mothershipVDCAdopterDiagnosticValid("stage=unsafe/path errno=1\n"_ctv),
+           "provider adopter rejects unbounded diagnostic text");
+  }
+
+  // Exercise the exact predicate used by both the bounded capture receipt and
+  // stopped-proof validation.  An absent pair remains interface-bound; a
+  // wholly zero wire record is never recovery authority.
+  {
+    struct WitnessPair { MothershipVDCRetainedTCX links[2] = {}; };
+    WitnessPair absent = {};
+    expect(!mothershipTCXWitnessLinksAdmissible(absent.links),
+           "TCX recovery rejects unbound zero witness");
+    absent.links[0].ifindex = absent.links[1].ifindex = 17;
+    absent.links[0].attachType = uint32_t(BPF_TCX_INGRESS);
+    absent.links[1].attachType = uint32_t(BPF_TCX_EGRESS);
+    expect(mothershipTCXWitnessLinksAdmissible(absent.links),
+           "TCX recovery capture accepts exact interface-bound absence witness");
+    expect(mothershipTCXWitnessLinksStageValid(absent.links,
+                                               MothershipTCXWitnessVerificationStage::frozenEvidence, true, false),
+           "TCX recovery frozen evidence preserves clean absence");
+    expect(!mothershipTCXWitnessLinksStageValid(absent.links,
+                                                MothershipTCXWitnessVerificationStage::frozenEvidence, false, true),
+           "TCX recovery frozen evidence rejects reappeared target TCX");
+    expect(!mothershipTCXWitnessLinksStageValid(absent.links,
+                                                MothershipTCXWitnessVerificationStage::activeTarget, true, false),
+           "TCX recovery active target rejects still-absent source witness");
+    expect(mothershipTCXWitnessLinksStageValid(absent.links,
+                                               MothershipTCXWitnessVerificationStage::activeTarget, false, true),
+           "TCX recovery active target accepts canonical replacement pair");
+    auto altered = absent;
+    altered.links[0].programID = 1;
+    expect(!mothershipTCXWitnessLinksAdmissible(altered.links),
+           "TCX recovery rejects absent witness program identity");
+    altered = absent;
+    altered.links[1].linkID = 1;
+    expect(!mothershipTCXWitnessLinksAdmissible(altered.links),
+           "TCX recovery rejects absent witness link identity");
+    altered = absent;
+    altered.links[0].wormholeFlowMapID = 1;
+    expect(!mothershipTCXWitnessLinksAdmissible(altered.links),
+           "TCX recovery rejects absent witness flow map identity");
+    altered = absent;
+    altered.links[1].wormholePendingFlowMapID = 1;
+    expect(!mothershipTCXWitnessLinksAdmissible(altered.links),
+           "TCX recovery rejects absent witness pending map identity");
+    altered = absent;
+    altered.links[0].programTag[0] = 1;
+    expect(!mothershipTCXWitnessLinksAdmissible(altered.links),
+           "TCX recovery rejects absent witness program tag");
+    altered = absent;
+    altered.links[1].ifindex = 18;
+    expect(!mothershipTCXWitnessLinksAdmissible(altered.links),
+           "TCX recovery rejects absent witness interface drift");
+    altered = absent;
+    altered.links[1].attachType = uint32_t(BPF_TCX_INGRESS);
+    expect(!mothershipTCXWitnessLinksAdmissible(altered.links),
+           "TCX recovery rejects absent witness direction drift");
+
+    WitnessPair complete = {};
+    for (uint32_t index = 0; index != 2; ++index)
+    {
+      complete.links[index].ifindex = 17;
+      complete.links[index].attachType = index == 0 ? uint32_t(BPF_TCX_INGRESS) : uint32_t(BPF_TCX_EGRESS);
+      complete.links[index].programID = 10 + index;
+      complete.links[index].linkID = 20 + index;
+      complete.links[index].wormholeFlowMapID = 30 + index;
+      complete.links[index].wormholePendingFlowMapID = 40 + index;
+      complete.links[index].programTag[0] = uint8_t(50 + index);
+    }
+    expect(mothershipTCXWitnessLinksAdmissible(complete.links),
+           "TCX recovery capture accepts complete retained witness");
+    expect(mothershipTCXWitnessLinksStageValid(complete.links,
+                                               MothershipTCXWitnessVerificationStage::activeTarget, false, false),
+           "TCX recovery active target preserves exact retained source pair");
+  }
+
+  // The low-level provider collector appends chunks. The recovery inspector
+  // owns a fresh observation even if its caller reuses an earlier SHA buffer.
+  {
+    String output = {}, failure = {};
+    output.assign("earlier observation"_ctv);
+    expect(mothershipRecoveryInspectLocal("printf fresh",output,&failure) && output=="fresh"_ctv,
+           "recovery inspection replaces prior output");
+    expect(!mothershipRecoveryInspectLocal("exit 7",output,&failure) && output.empty(),
+           "failed recovery inspection cannot retain an earlier observation");
+    char root[] = "./mothership-recovery-digest-unit.XXXXXX";
+    const char *created=::mkdtemp(root);
+    expect(created!=nullptr,"create private recovery digest fixture");
+    if(created) {
+      String path={}; path.assign(created);
+      String first={}; first.assign(std::string(64,'a').c_str());
+      expect(mothershipRecoveryTreeDigest(path,first,&failure),"first recovery digest replaces earlier SHA");
+      const String saved=first;
+      expect(mothershipRecoveryTreeDigest(path,first,&failure) && first==saved,
+             "repeated recovery digest is stable with a reused buffer");
+      const std::string file=std::string(created)+"/changed";
+      { std::ofstream stream(file); stream << "changed bytes"; }
+      expect(mothershipRecoveryTreeDigest(path,first,&failure) && first!=saved,
+             "recovery digest still detects changed store bytes");
+      ::unlink(file.c_str()); ::rmdir(created);
+    }
+  }
+
   MothershipProdigyClusterMachineSchemaPatch sourceSchema = {};
   sourceSchema.schema = "replacement-vm"_ctv;
   sourceSchema.hasKind = true;

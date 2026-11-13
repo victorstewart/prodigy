@@ -1,4 +1,5 @@
 #include <cassert>
+#include <array>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -161,7 +162,7 @@ static void assertEmptyMachineColdCanonicalRuntimeRecovery(void)
     plan.stateful.seedingPrefix = 0x1400000000000000ULL;
     plan.stateful.shardingPrefix = 0x1500000000000000ULL;
     plan.stateful.neverShard = neverShard;
-    plan.stateful.allMasters = false;
+    plan.stateful.writerMode = StatefulWriterMode::localSingleWriter;
     return plan;
   };
   auto statelessPlan = [](uint16_t applicationID) {
@@ -497,16 +498,6 @@ static void assertEmptyMachineColdCanonicalRuntimeRecovery(void)
           decodedCold.states[0].plan.subscriptions.end() &&
       decodedCold.states[0].plan.subscriptions.find(0x5100)->second.nature ==
           SubscriptionNature::any);
-  // The sealed recovery format cannot silently drop a selected startup home.
-  auto selectedRequest = request;
-  selectedRequest.machines[1].parameters[0].statefulStoreGenerationSelection.protocolVersion = 1;
-  bool rejectedSelection = false;
-  try {
-    (void)encodeColdCanonicalSourceRequest(selectedRequest, MothershipTidesMigration::Plan{}, 1, coldSource);
-  } catch (const std::runtime_error&) {
-    rejectedSelection = true;
-  }
-  assert(rejectedSelection);
   auto tamperedCold = coldSource;
   tamperedCold.serializedStates[tamperedCold.serializedStates.size() - 1] ^= 1;
   const String tampered = encodeColdCanonicalSourceRequest(request, MothershipTidesMigration::Plan{}, 1, tamperedCold);
@@ -727,7 +718,7 @@ static void assertEmptyMachineColdCanonicalRuntimeRecovery(void)
   // A follower may retain the proof-only plan, but it must be byte-for-byte
   // the same deployment authority sealed in the request.
   auto mismatchedActivePlan = orphanSnapshot;
-  mismatchedActivePlan.masterAuthority.deploymentPlans[activeHotID].stateful.allMasters = true;
+  mismatchedActivePlan.masterAuthority.deploymentPlans[activeHotID].stateful.writerMode = StatefulWriterMode::allMasters;
   const auto mismatchedStatePath = (orphanRoot / "mismatched-active-plan" / "state.new10").string();
   std::filesystem::create_directories(std::filesystem::path(mismatchedStatePath).parent_path());
   {
@@ -1175,7 +1166,7 @@ static void assertSchema4ConflictingClientRetirement(void)
   plan.config.memoryMB=128; plan.config.storageMB=64; plan.config.nLogicalCores=1; plan.isStateful=true;
   plan.stateful.clientPrefix=0x1100000000000000ULL; plan.stateful.siblingPrefix=0x1200000000000000ULL;
   plan.stateful.cousinPrefix=0x1300000000000000ULL; plan.stateful.seedingPrefix=0x1400000000000000ULL;
-  plan.stateful.shardingPrefix=0x1500000000000000ULL; plan.stateful.neverShard=true; plan.stateful.allMasters=false;
+  plan.stateful.shardingPrefix=0x1500000000000000ULL; plan.stateful.neverShard=true; plan.stateful.writerMode = StatefulWriterMode::localSingleWriter;
   const uint64_t deploymentID=plan.config.deploymentID(); ProdigyPersistentBrainSnapshot snapshot={};
   snapshot.brainConfig.clusterUUID=0x71; snapshot.brainConfig.datacenterFragment=7; snapshot.masterAuthority.deploymentPlans[deploymentID]=plan;
   DeploymentPlan companion={}; companion.config.type=ApplicationType::stateless; companion.config.applicationID=92; companion.config.versionID=7;
@@ -1407,7 +1398,7 @@ static void assertInitialSeedRuntimeRepair()
   ProdigyPersistentBrainSnapshot snapshot={}; snapshot.brainConfig.clusterUUID=4;
   for(auto id:binding.machineUUIDs) { ClusterMachine machine={};machine.uuid=id;machine.isBrain=true;snapshot.topology.machines.push_back(machine); }
   auto& runtime=snapshot.masterAuthority.runtimeState; runtime.generation=38;runtime.hasCompletedInitialMasterElection=true;
-  DeploymentPlan plan={};plan.isStateful=true;plan.stateful.allMasters=true;
+  DeploymentPlan plan={};plan.isStateful=true;plan.stateful.writerMode = StatefulWriterMode::allMasters;
   plan.config.type=ApplicationType::stateful;plan.config.applicationID=2;plan.config.versionID=112;
   plan.config.containerBlobSHA256=text(std::string(64,'a'));plan.config.containerBlobBytes=42;
   snapshot.masterAuthority.deploymentPlans.insert_or_assign(binding.deploymentID,plan);
@@ -1820,8 +1811,627 @@ static void assertInitialSeedRuntimeRepair()
   fs::remove_all(root);
 }
 
+struct LegacyInlineRuntimeStartupCapturedSource {
+  ProdigyPersistentLocalBrainState local;
+  String snapshotBytes, privateStatePath;
+  MothershipRetainedRecoveryMachineInput census;
+  Vector<String> parameterSHA256;
+};
+template<typename S> static void serialize(S&& s, LegacyInlineRuntimeStartupCapturedSource& source)
+{
+  s.object(source.local); s.text1b(source.snapshotBytes,256*1024*1024); s.text1b(source.privateStatePath,4096);
+  s.object(source.census); s.container(source.parameterSHA256,65536,[](auto& entry,auto& digest){entry.text1b(digest,64);});
+}
+
+static void assertRuntimeStartupCapturedSourceCodec()
+{
+  using namespace MothershipRetainedRecovery;
+  RuntimeStartupCapturedSource source = {};
+  source.local.uuid=0x91; source.local.ownerClusterUUID=0x92;
+  source.snapshotBytes.assign("opaque retained\0snapshot bytes"_ctv);
+  source.privateStatePath.assign("/operation/snapshot-private"_ctv);
+  source.census.machineUUID=source.local.uuid; source.census.machineFragment=1;
+  String expectedSnapshotSHA = {}, failure = {};
+  assert(prodigyComputeSHA256Hex(source.snapshotBytes,expectedSnapshotSHA));
+
+  // This is the former byte layout.  The local-state reader uses enclosing
+  // EOF to discover optional tails, so it consumes snapshot bytes as a marker.
+  LegacyInlineRuntimeStartupCapturedSource old = {};
+  old.local=source.local; old.snapshotBytes=source.snapshotBytes; old.privateStatePath=source.privateStatePath;
+  old.census=source.census;
+  String oldBytes = {};
+  assert(BitseryEngine::serialize(oldBytes,old));
+  LegacyInlineRuntimeStartupCapturedSource oldRead = {};
+  assert(!BitseryEngine::deserializeSafe(oldBytes,oldRead));
+
+  String framed = {};
+  assert(encodeRuntimeStartupCapturedSource(source,framed,&failure));
+  RuntimeStartupCapturedSource decoded = {};
+  assert(decodeRuntimeStartupCapturedSource(framed,decoded,&failure));
+  String decodedSnapshotSHA = {};
+  assert(decoded.local.uuid==source.local.uuid && decoded.local.ownerClusterUUID==source.local.ownerClusterUUID &&
+      decoded.privateStatePath==source.privateStatePath && prodigyComputeSHA256Hex(decoded.snapshotBytes,decodedSnapshotSHA) &&
+      decodedSnapshotSHA==expectedSnapshotSHA);
+  auto badMagic=framed; badMagic[0]^=1;
+  assert(!decodeRuntimeStartupCapturedSource(badMagic,decoded,&failure));
+  auto badVersion=framed; badVersion[8]^=1;
+  assert(!decodeRuntimeStartupCapturedSource(badVersion,decoded,&failure));
+  String framedTrailing=framed; framedTrailing.append("x"_ctv);
+  assert(!decodeRuntimeStartupCapturedSource(framedTrailing,decoded,&failure));
+  RuntimeStartupCapturedSourceEnvelope invalidLocal = {};
+  invalidLocal.localBytes.assign("x"_ctv); invalidLocal.tail.snapshotBytes=source.snapshotBytes;
+  assert(BitseryEngine::serialize(framed,invalidLocal));
+  assert(!decodeRuntimeStartupCapturedSource(framed,decoded,&failure));
+
+  // The normal snapshot wire deliberately omits the private transport root.
+  // Restoration compares that public projection but returns the canonical
+  // private snapshot, rather than weakening its full-authority comparison.
+  ProdigyPersistentBrainSnapshot canonicalSnapshot = {};
+  auto& canonicalRoot=canonicalSnapshot.masterAuthority.runtimeState.transportCredentialAuthorityRoot;
+  canonicalRoot.authorityEpoch=7; canonicalRoot.keyEpoch=8; canonicalRoot.authorityGeneration=9;
+  for(uint32_t index=0; index<ProdigyTransportCredentialAuthorityRootBytes; ++index) canonicalRoot.root[index]=uint8_t(index+1);
+  RuntimeStartupCapturedSource authorityCaptured = {};
+  authorityCaptured.local=source.local;
+  auto wireCopy=canonicalSnapshot;
+  assert(BitseryEngine::serialize(authorityCaptured.snapshotBytes,wireCopy));
+  ProdigyPersistentBrainSnapshot publicProjection = {};
+  assert(BitseryEngine::deserializeSafe(authorityCaptured.snapshotBytes,publicProjection));
+  const auto& publicRoot=publicProjection.masterAuthority.runtimeState.transportCredentialAuthorityRoot;
+  assert(publicRoot.authorityEpoch==0 && publicRoot.keyEpoch==0 && publicRoot.authorityGeneration==0 &&
+      CRYPTO_memcmp(publicRoot.root,canonicalRoot.root,ProdigyTransportCredentialAuthorityRootBytes)!=0);
+  ProdigyPersistentBrainSnapshot restored = {};
+  assert(restoreRuntimeStartupCapturedAuthority(authorityCaptured,source.local,canonicalSnapshot,restored,&failure));
+  const auto& restoredRoot=restored.masterAuthority.runtimeState.transportCredentialAuthorityRoot;
+  assert(restoredRoot.authorityEpoch==canonicalRoot.authorityEpoch && restoredRoot.keyEpoch==canonicalRoot.keyEpoch &&
+      restoredRoot.authorityGeneration==canonicalRoot.authorityGeneration &&
+      CRYPTO_memcmp(restoredRoot.root,canonicalRoot.root,ProdigyTransportCredentialAuthorityRootBytes)==0);
+  auto alteredCaptured=authorityCaptured;
+  ProdigyPersistentBrainSnapshot alteredPublic = {};
+  assert(BitseryEngine::deserializeSafe(alteredCaptured.snapshotBytes,alteredPublic));
+  alteredPublic.brainConfig.datacenterFragment=1;
+  assert(BitseryEngine::serialize(alteredCaptured.snapshotBytes,alteredPublic));
+  auto unchangedRestored=restored;
+  assert(!restoreRuntimeStartupCapturedAuthority(alteredCaptured,source.local,canonicalSnapshot,restored,&failure));
+  assert(prodigyPersistentBrainSnapshotsEqual(restored,unchangedRestored));
+  auto alteredLocal=source.local; ++alteredLocal.ownerClusterUUID;
+  assert(!restoreRuntimeStartupCapturedAuthority(authorityCaptured,alteredLocal,canonicalSnapshot,restored,&failure));
+  assert(prodigyPersistentBrainSnapshotsEqual(restored,unchangedRestored));
+
+  // The present optional local tail is exactly the form that made an inline
+  // encoder especially ambiguous; standalone localBytes has its own EOF.
+  auto withOptionalLocal=source;
+  withOptionalLocal.local.transportCredentials.enabled=true;
+  assert(encodeRuntimeStartupCapturedSource(withOptionalLocal,framed,&failure));
+  assert(decodeRuntimeStartupCapturedSource(framed,decoded,&failure));
+  assert(decoded.local.transportCredentials.enabled && decoded.local.uuid==withOptionalLocal.local.uuid);
+
+  String canonicalLocal = {}, tailBytes = {}, legacyBytes = {};
+  RuntimeStartupCapturedSourceTail tail = {};
+  tail.snapshotBytes=source.snapshotBytes; tail.privateStatePath=source.privateStatePath; tail.census=source.census;
+  assert(BitseryEngine::serialize(canonicalLocal,source.local) && BitseryEngine::serialize(tailBytes,tail));
+  legacyBytes=canonicalLocal; legacyBytes.append(tailBytes);
+  assert(decodeLegacyRuntimeStartupCapturedSource(legacyBytes,source.local,decoded,&failure));
+  assert(prodigyComputeSHA256Hex(decoded.snapshotBytes,decodedSnapshotSHA) && decodedSnapshotSHA==expectedSnapshotSHA);
+  auto legacyOptional=withOptionalLocal;
+  assert(BitseryEngine::serialize(canonicalLocal,legacyOptional.local));
+  legacyBytes=canonicalLocal; legacyBytes.append(tailBytes);
+  assert(decodeLegacyRuntimeStartupCapturedSource(legacyBytes,legacyOptional.local,decoded,&failure));
+  assert(decoded.local.transportCredentials.enabled);
+  assert(BitseryEngine::serialize(canonicalLocal,source.local));
+  legacyBytes=canonicalLocal; legacyBytes.append(tailBytes);
+  auto wrongLocal=source.local; ++wrongLocal.ownerClusterUUID;
+  assert(!decodeLegacyRuntimeStartupCapturedSource(legacyBytes,wrongLocal,decoded,&failure));
+  assert(!decodeLegacyRuntimeStartupCapturedSource(String(legacyBytes.substr(0,legacyBytes.size()-1)),source.local,decoded,&failure));
+  legacyBytes.append("x"_ctv);
+  assert(!decodeLegacyRuntimeStartupCapturedSource(legacyBytes,source.local,decoded,&failure));
+}
+
+static void assertRuntimeRecoveryStartupAuthorityPreparation()
+{
+  using namespace MothershipRetainedRecovery;
+  const uint128_t cluster = 0x7a01, member = 1;
+  const String targetBundle = MothershipTidesMigration::text(std::string(64, 'd'));
+  const String sourceBundle = MothershipTidesMigration::text(std::string(64, 'c'));
+  ProdigyPersistentLocalBrainState local = {};
+  local.uuid = member;
+  local.ownerClusterUUID = cluster;
+  ProdigyPersistentBrainSnapshot source = {};
+  source.brainConfig.clusterUUID = cluster;
+  source.brainConfig.datacenterFragment = 7;
+  source.masterAuthority.runtimeState.generation = 17;
+  source.masterAuthority.runtimeState.hasCompletedInitialMasterElection = true;
+
+  DeploymentPlan deployment = {};
+  deployment.config.type = ApplicationType::stateless;
+  deployment.config.applicationID = 77;
+  deployment.config.versionID = 9;
+  deployment.config.memoryMB = 256;
+  deployment.config.storageMB = 128;
+  deployment.config.nLogicalCores = 1;
+  const uint64_t deploymentID = deployment.config.deploymentID();
+  source.masterAuthority.deploymentPlans[deploymentID] = deployment;
+  bytell_hash_map<uint64_t, DeploymentPlan> approved = source.masterAuthority.deploymentPlans;
+
+  Vector<MothershipRetainedRecoveryMachineInput> machines = {};
+  for (uint32_t index = 1; index <= 3; ++index)
+  {
+    ClusterMachine topologyMachine = {};
+    topologyMachine.uuid = index;
+    topologyMachine.isBrain = true;
+    source.topology.machines.push_back(topologyMachine);
+    MothershipRetainedRecoveryMachineInput machine = {};
+    machine.machineUUID = index;
+    machine.machineFragment = index;
+    ContainerParameters parameters = {};
+    parameters.uuid = 0x8100 + index;
+    parameters.deploymentID = deploymentID;
+    parameters.memoryMB = deployment.config.memoryMB;
+    parameters.storageMB = deployment.config.storageMB;
+    parameters.nLogicalCores = applicationSharedCPUCoreHint(deployment.config);
+    parameters.cpuMode = deployment.config.cpuMode;
+    parameters.requestedCPUMillis = applicationRequestedCPUMillis(deployment.config);
+    parameters.private6.network.is6 = true;
+    parameters.private6.cidr = 128;
+    std::memcpy(parameters.private6.network.v6, container_network_subnet6.value, 11);
+    parameters.private6.network.v6[11] = source.brainConfig.datacenterFragment;
+    parameters.private6.network.v6[14] = index;
+    parameters.private6.network.v6[15] = 1;
+    machine.parameters.push_back(parameters);
+    machine.observedCreatedAtMs.push_back(1793647800000LL + index);
+    machines.push_back(std::move(machine));
+  }
+  for (const MothershipRetainedRecoveryMachineInput& machine : machines)
+  {
+    NeuronContainerBootstrap bootstrap = {};
+    String bootstrapFailure = {};
+    assert(prodigyBuildRetainedContainerBootstrap(
+        deployment, machine.parameters[0], machine.machineFragment,
+        source.brainConfig.datacenterFragment, machine.observedCreatedAtMs[0], bootstrap, &bootstrapFailure));
+    BrainReplicatedContainerRuntimeState runtime = {};
+    runtime.machineUUID = machine.machineUUID;
+    runtime.plan = bootstrap.plan;
+    runtime.plan.state = ContainerState::healthy;
+    runtime.plan.runtimeReady = true;
+    source.masterAuthority.containerRuntimeStates.push_back(std::move(runtime));
+  }
+
+  // A durable planned reservation is not a live census member and therefore
+  // cannot be turned into a recovery witness.
+  BrainReplicatedContainerRuntimeState planned = {};
+  planned.machineUUID = member;
+  planned.plan.uuid = 0xfeed;
+  planned.plan.config = deployment.config;
+  planned.plan.state = ContainerState::planned;
+  planned.plan.runtimeReady = false;
+  source.masterAuthority.containerRuntimeStates.push_back(planned);
+
+  auto& update = source.masterAuthority.runtimeState.updateSelf;
+  update.bundleBlob.assign("rejected before inventory checkpoint"_ctv);
+  assert(prodigyComputeSHA256Hex(update.bundleBlob, update.workerExpectedBundleSHA256));
+  update.workerFailure.assign("machine container ownership needs a fresh authenticated stateUpload for bundle exec"_ctv);
+  const String rejectedCandidateSHA256 = update.workerExpectedBundleSHA256;
+  String originalBytes = {};
+  auto original = source;
+  assert(BitseryEngine::serialize(originalBytes, original));
+
+  String failure = {};
+  ProdigyPersistentBrainSnapshot prepared = {};
+  assert(mothershipPrepareRuntimeRecoveryStartupAuthority(
+      local, source, cluster, member, source.topology, approved, machines, targetBundle,
+      sourceBundle, rejectedCandidateSHA256, prepared, &failure));
+  String sourceAfterBytes = {};
+  assert(BitseryEngine::serialize(sourceAfterBytes, source) && sourceAfterBytes == originalBytes);
+  const auto& witnesses = prepared.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;
+  assert(witnesses.size() == 3 && prepared.masterAuthority.runtimeState.updateSelf.workerExpectedBundleSHA256 == targetBundle);
+  bytell_hash_set<uint128_t> witnessed = {};
+  for (const auto& witness : witnesses)
+    for (const String& serialized : witness.containerBootstraps)
+    {
+      NeuronContainerBootstrap bootstrap = {};
+      assert(BitseryEngine::deserializeSafe(serialized, bootstrap));
+      assert(bootstrap.plan.state == ContainerState::scheduled && bootstrap.plan.runtimeReady == false);
+      witnessed.insert(bootstrap.plan.uuid);
+    }
+  assert(witnessed.size() == 3 && !witnessed.contains(planned.plan.uuid));
+  NeuronContainerBootstrap expected = {}, observed = {};
+  assert(prodigyBuildRetainedContainerBootstrap(
+      deployment, machines[0].parameters[0], machines[0].machineFragment,
+      source.brainConfig.datacenterFragment, machines[0].observedCreatedAtMs[0], expected, &failure));
+  assert(BitseryEngine::deserializeSafe(witnesses[0].containerBootstraps[0], observed) &&
+      mothershipRetainedRecoveryBootstrapMatchesObservedLifecycle(observed, expected));
+
+  auto rejectsWithoutChangingSource = [&](Vector<MothershipRetainedRecoveryMachineInput> badMachines) {
+    ProdigyPersistentBrainSnapshot untouched = prepared;
+    String before = {};
+    assert(BitseryEngine::serialize(before, untouched));
+    assert(!mothershipPrepareRuntimeRecoveryStartupAuthority(
+        local, source, cluster, member, source.topology, approved, badMachines, targetBundle,
+        sourceBundle, rejectedCandidateSHA256, untouched, &failure));
+    String after = {};
+    assert(BitseryEngine::serialize(after, source) && after == originalBytes);
+    assert(BitseryEngine::serialize(after, untouched) && after == before);
+  };
+  auto alteredUUID = machines;
+  ++alteredUUID[0].parameters[0].uuid;
+  rejectsWithoutChangingSource(std::move(alteredUUID));
+  auto alteredParameters = machines;
+  ++alteredParameters[0].parameters[0].memoryMB;
+  rejectsWithoutChangingSource(std::move(alteredParameters));
+  auto fakeExtra = machines;
+  fakeExtra[0].parameters.push_back(fakeExtra[0].parameters[0]);
+  fakeExtra[0].observedCreatedAtMs.push_back(1793647800999LL);
+  rejectsWithoutChangingSource(std::move(fakeExtra));
+  auto missingMaterialized = machines;
+  missingMaterialized[1].parameters.clear();
+  missingMaterialized[1].observedCreatedAtMs.clear();
+  rejectsWithoutChangingSource(std::move(missingMaterialized));
+  auto wrongDeployment = machines;
+  ++wrongDeployment[2].parameters[0].deploymentID;
+  rejectsWithoutChangingSource(std::move(wrongDeployment));
+  auto malformedCensus = machines;
+  malformedCensus[1].observedCreatedAtMs.clear();
+  rejectsWithoutChangingSource(std::move(malformedCensus));
+
+  // The activation-successor form is narrower than generic recovery: an
+  // existing sealed source envelope may be replaced only by its exact bound
+  // source/target pair, and it is still rejected by the generic gate.
+  auto resumableSource = source;
+  resumableSource.masterAuthority.runtimeState.updateSelf =
+      prepared.masterAuthority.runtimeState.updateSelf;
+  resumableSource.masterAuthority.runtimeState.updateSelf.workerExpectedBundleSHA256 = sourceBundle;
+  String resumableBytes = {};
+  assert(BitseryEngine::serialize(resumableBytes, resumableSource));
+  assert(!mothershipRuntimeRecoverySnapshotValid(
+      local,resumableSource,cluster,member,source.topology,&failure));
+  assert(mothershipRuntimeRecoveryStartupSnapshotValid(
+      local,resumableSource,cluster,member,source.topology,targetBundle,sourceBundle,{},&failure));
+  auto wrongSourceBundle = MothershipTidesMigration::text(std::string(64, 'e'));
+  assert(!mothershipRuntimeRecoveryStartupSnapshotValid(
+      local,resumableSource,cluster,member,source.topology,targetBundle,wrongSourceBundle,{},&failure));
+  auto progressedSource = resumableSource;
+  progressedSource.masterAuthority.runtimeState.updateSelf.state =
+      uint8_t(ProdigyPersistentUpdateSelfState::Phase::waitingForFollowerReboots);
+  assert(!mothershipRuntimeRecoveryStartupSnapshotValid(
+      local,progressedSource,cluster,member,source.topology,targetBundle,sourceBundle,{},&failure));
+  auto peerMismatch = resumableSource;
+  peerMismatch.masterAuthority.runtimeState.updateSelfFollowerReadyPeerKeys.push_back(1);
+  assert(!mothershipRuntimeRecoveryStartupSnapshotValid(
+      local,peerMismatch,cluster,member,source.topology,targetBundle,sourceBundle,{},&failure));
+  ProdigyPersistentBrainSnapshot resumablePrepared = {};
+  assert(mothershipPrepareRuntimeRecoveryStartupAuthority(
+      local,resumableSource,cluster,member,source.topology,approved,machines,targetBundle,
+      sourceBundle,{},resumablePrepared,&failure));
+  String resumableAfterBytes = {};
+  assert(BitseryEngine::serialize(resumableAfterBytes,resumableSource) && resumableAfterBytes==resumableBytes);
+
+  // Registered predecessor witnesses are only a route to the copy-built
+  // canonical comparison below; the saved witness bytes are never evidence by
+  // themselves.
+  auto registeredSource = resumableSource;
+  for (auto& witness : registeredSource.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses)
+    witness.bundleRegistered = true;
+  assert(mothershipRuntimeRecoveryStartupSnapshotValid(
+      local,registeredSource,cluster,member,source.topology,targetBundle,sourceBundle,{},&failure));
+  ProdigyPersistentBrainSnapshot registeredPrepared = {};
+  assert(mothershipPrepareRuntimeRecoveryStartupAuthority(
+      local,registeredSource,cluster,member,source.topology,approved,machines,targetBundle,
+      sourceBundle,{},registeredPrepared,&failure));
+  auto registeredWrongSource = registeredSource;
+  ProdigyPersistentBrainSnapshot unchangedRegistered = registeredPrepared;
+  auto rejectsRegisteredPreparationWithoutMutation = [&](ProdigyPersistentBrainSnapshot& candidate,
+                                                          const String& candidateSourceBundle) {
+    String sourceBefore = {}, preparedBefore = {}, sourceAfter = {}, preparedAfter = {};
+    assert(BitseryEngine::serialize(sourceBefore, candidate));
+    assert(BitseryEngine::serialize(preparedBefore, unchangedRegistered));
+    assert(!mothershipPrepareRuntimeRecoveryStartupAuthority(
+        local,candidate,cluster,member,source.topology,approved,machines,targetBundle,
+        candidateSourceBundle,{},unchangedRegistered,&failure));
+    assert(BitseryEngine::serialize(sourceAfter, candidate) && sourceAfter == sourceBefore);
+    assert(BitseryEngine::serialize(preparedAfter, unchangedRegistered) && preparedAfter == preparedBefore);
+  };
+  rejectsRegisteredPreparationWithoutMutation(registeredWrongSource, wrongSourceBundle);
+  auto registeredProgressed = registeredSource;
+  registeredProgressed.masterAuthority.runtimeState.updateSelf.state =
+      uint8_t(ProdigyPersistentUpdateSelfState::Phase::waitingForFollowerReboots);
+  String progressedBefore = {}, progressedAfter = {};
+  assert(BitseryEngine::serialize(progressedBefore, registeredProgressed));
+  assert(!mothershipRuntimeRecoveryStartupSnapshotValid(
+      local,registeredProgressed,cluster,member,source.topology,targetBundle,sourceBundle,{},&failure));
+  assert(BitseryEngine::serialize(progressedAfter, registeredProgressed) && progressedAfter == progressedBefore);
+  auto duplicateRegistered = registeredSource;
+  duplicateRegistered.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses.push_back(
+      duplicateRegistered.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[0]);
+  rejectsRegisteredPreparationWithoutMutation(duplicateRegistered, sourceBundle);
+  auto alteredRegistered = registeredSource;
+  alteredRegistered.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[0].containerBootstraps[0] = "altered"_ctv;
+  rejectsRegisteredPreparationWithoutMutation(alteredRegistered, sourceBundle);
+
+  // The operation request binds raw captured bytes supplied by the caller;
+  // its structural gate cannot silently substitute another member's source.
+  RuntimeStartupRequest request = {};
+  request.version = 2;
+  request.bindingSHA256.assign(std::string(64, 'a').c_str());
+  request.clusterUUID = cluster;
+  request.targetBundleSHA256 = targetBundle;
+  request.sourceBundleSHA256 = sourceBundle;
+  request.rejectedCandidateSHA256 = rejectedCandidateSHA256;
+  request.topology = source.topology;
+  request.machines = machines;
+  for (uint32_t index = 1; index <= 3; ++index) {
+    RuntimeStartupSource captured = {};
+    captured.memberUUID = index;
+    captured.stoppedProofSHA256.assign(std::string(64, char('0' + index)).c_str());
+    captured.stateSHA256.assign(std::string(64, char('3' + index)).c_str());
+    captured.secretsSHA256.assign(std::string(64, char('6' + index)).c_str());
+    captured.snapshotSHA256.assign(std::string(64, char('a' + index)).c_str());
+    request.sources.push_back(std::move(captured));
+  }
+  assert(runtimeStartupRequestValid(request, &failure));
+  // Version one is the original wire shape: sourceBundle was not encoded, so
+  // a sealed old request remains byte-identical and resumes via its legacy
+  // strict admission path.
+  auto v1WithIgnoredSource = request;
+  v1WithIgnoredSource.version = 1;
+  auto v1WithoutSource = v1WithIgnoredSource;
+  v1WithoutSource.sourceBundleSHA256.clear();
+  String v1WithIgnoredSourceBytes = {}, v1WithoutSourceBytes = {};
+  assert(BitseryEngine::serialize(v1WithIgnoredSourceBytes,v1WithIgnoredSource));
+  assert(BitseryEngine::serialize(v1WithoutSourceBytes,v1WithoutSource));
+  assert(v1WithIgnoredSourceBytes==v1WithoutSourceBytes);
+  RuntimeStartupRequest decodedV1 = {};
+  assert(BitseryEngine::deserializeSafe(v1WithoutSourceBytes,decodedV1) &&
+      runtimeStartupRequestValid(decodedV1,&failure) && decodedV1.version==1 &&
+      decodedV1.sourceBundleSHA256.empty());
+  String requestBytes = {}, requestSHA256 = {};
+  assert(BitseryEngine::serialize(requestBytes,request));
+  assert(prodigyComputeSHA256Hex(requestBytes,requestSHA256));
+  auto sourceTamperedRequest = request;
+  sourceTamperedRequest.sourceBundleSHA256 = MothershipTidesMigration::text(std::string(64, 'e'));
+  String sourceTamperedBytes = {}, sourceTamperedSHA256 = {};
+  assert(BitseryEngine::serialize(sourceTamperedBytes,sourceTamperedRequest));
+  assert(prodigyComputeSHA256Hex(sourceTamperedBytes,sourceTamperedSHA256));
+  assert(sourceTamperedSHA256!=requestSHA256);
+  auto targetTamperedRequest = request;
+  targetTamperedRequest.targetBundleSHA256 = MothershipTidesMigration::text(std::string(64, 'f'));
+  String targetTamperedBytes = {}, targetTamperedSHA256 = {};
+  assert(BitseryEngine::serialize(targetTamperedBytes,targetTamperedRequest));
+  assert(prodigyComputeSHA256Hex(targetTamperedBytes,targetTamperedSHA256));
+  assert(targetTamperedSHA256!=requestSHA256);
+  assert(runtimeStartupSourceMatches(request, member, request.sources[0].snapshotSHA256));
+  auto swappedSource = request;
+  std::swap(swappedSource.sources[0].snapshotSHA256, swappedSource.sources[1].snapshotSHA256);
+  assert(runtimeStartupRequestValid(swappedSource, &failure));
+  assert(!runtimeStartupSourceMatches(swappedSource, member, request.sources[0].snapshotSHA256));
+  auto malformedRequest = request;
+  malformedRequest.sources[1].memberUUID = malformedRequest.sources[0].memberUUID;
+  assert(!runtimeStartupRequestValid(malformedRequest, &failure));
+  WitnessSet sealed = {};
+  sealed.requestSHA.assign(std::string(64, 'f').c_str());
+  sealed.witnesses = witnesses;
+  assert(witnessesExact(sealed.witnesses, witnesses));
+  sealed.witnesses[0].containerBootstraps[0].append("x", 1);
+  assert(!witnessesExact(sealed.witnesses, witnesses));
+
+  // Exercise the command-owner's real private paired store path.  This is a
+  // unit-owned TidesDB copy only: it never opens a runtime service, socket,
+  // namespace, or BPF resource.
+  std::filesystem::create_directories(".run");
+  char temporaryRoot[] = ".run/mothership-runtime-startup-private-XXXXXX";
+  assert(::mkdtemp(temporaryRoot) != nullptr && ::chmod(temporaryRoot, 0700) == 0);
+  const std::string operationRoot(temporaryRoot);
+  const std::string privateState = operationRoot + "/state.new10";
+  std::filesystem::create_directories(privateState + ".secrets");
+  {
+    ProdigyPersistentStateStore store(MothershipTidesMigration::text(privateState));
+    assert(store.saveLocalBrainState(local, &failure));
+    assert(store.saveBrainSnapshot(source, &failure));
+  }
+  String sourceBytes = {};
+  auto sourceCopy = source;
+  assert(BitseryEngine::serialize(sourceBytes, sourceCopy));
+  String sourceSnapshotSHA = {};
+  assert(prodigyComputeSHA256Hex(sourceBytes, sourceSnapshotSHA));
+  request.sources[0].snapshotSHA256 = sourceSnapshotSHA;
+  const String exactRequestSHA = MothershipTidesMigration::text(std::string(64, 'e'));
+  RuntimeStartupPrepared privatePrepared = {};
+  assert(prepareRuntimeStartupPrivate(request, local, source, member, exactRequestSHA, sourceSnapshotSHA,
+                                      operationRoot, privateState, privatePrepared, &failure));
+  ProdigyPersistentBrainSnapshot privateReadback = {};
+  loadSnapshot(privateState, privateReadback);
+  assert(prodigyPersistentBrainSnapshotsEqual(privateReadback, prepared));
+  String beforeFinalize = {};
+  assert(runtimeStartupSnapshotDigest(privateReadback, beforeFinalize, &failure));
+  WitnessSet shared = privatePrepared.candidateWitnesses;
+  assert(finalizeRuntimeStartupPrivate(request, local, source, member, exactRequestSHA, sourceSnapshotSHA,
+                                       operationRoot, privateState, shared, privatePrepared, &failure));
+  ProdigyPersistentBrainSnapshot finalized = {};
+  loadSnapshot(privateState, finalized);
+  String finalizedDigest = {};
+  assert(runtimeStartupSnapshotDigest(finalized, finalizedDigest, &failure));
+  assert(finalizeRuntimeStartupPrivate(request, local, source, member, exactRequestSHA, sourceSnapshotSHA,
+                                       operationRoot, privateState, shared, privatePrepared, &failure));
+  ProdigyPersistentBrainSnapshot replayed = {};
+  loadSnapshot(privateState, replayed);
+  String replayedDigest = {};
+  assert(runtimeStartupSnapshotDigest(replayed, replayedDigest, &failure) && replayedDigest == finalizedDigest);
+  auto wrongShared = shared;
+  wrongShared.requestSHA.assign(std::string(64, 'c').c_str());
+  assert(!finalizeRuntimeStartupPrivate(request, local, source, member, exactRequestSHA, sourceSnapshotSHA,
+                                        operationRoot, privateState, wrongShared, privatePrepared, &failure));
+  ProdigyPersistentBrainSnapshot rejectedReadback = {};
+  loadSnapshot(privateState, rejectedReadback);
+  String rejectedDigest = {};
+  assert(runtimeStartupSnapshotDigest(rejectedReadback, rejectedDigest, &failure) && rejectedDigest == replayedDigest);
+  assert(beforeFinalize == finalizedDigest);
+
+  // The publication primitive must resume a crash between moving one original
+  // aside and promoting its prepared replacement, without touching the other
+  // paired database until that member can be reconciled.
+  const auto publicationRoot = std::filesystem::path(operationRoot) / "paired-publication";
+  auto makeDirectory = [](const std::filesystem::path& path,const char *marker) {
+    std::filesystem::create_directories(path);
+    std::ofstream file(path / "marker", std::ios::binary);
+    assert(file); file << marker;
+  };
+  auto database = [&](const char *live,const char *retained,const char *preparedPath) {
+    MothershipTidesDBMigrationDatabase value = {};
+    value.livePath = MothershipTidesMigration::text((publicationRoot / live).string());
+    value.retainedV9Path = MothershipTidesMigration::text((publicationRoot / retained).string());
+    value.preparedV10Path = MothershipTidesMigration::text((publicationRoot / preparedPath).string());
+    return value;
+  };
+  auto stateDatabase = database("state", "source.state", "state.new10");
+  auto secretsDatabase = database("state.secrets", "source.secrets", "state.new10.secrets");
+  for (const auto& entry : std::array<MothershipTidesDBMigrationDatabase, 2>{stateDatabase, secretsDatabase}) {
+    makeDirectory(MothershipTidesMigration::str(entry.livePath), "original");
+    makeDirectory(MothershipTidesMigration::str(entry.preparedV10Path), "prepared");
+  }
+  Vector<MothershipTidesDBMigrationDatabase> interrupted = {stateDatabase, secretsDatabase};
+  bool interruptedAtPromotion = false;
+  try {
+    publishPreparedPairedRecoveryDatabases(interrupted,
+        [](const auto&,const String& path) { return std::filesystem::exists(MothershipTidesMigration::str(path)); },
+        [&](const auto&,const String& from,const String& to,String *why) {
+          if (MothershipTidesMigration::str(from).ends_with("state.new10")) {
+            interruptedAtPromotion = true; if (why) why->assign("injected promotion interruption"_ctv); return false;
+          }
+          std::filesystem::rename(MothershipTidesMigration::str(from), MothershipTidesMigration::str(to)); return true;
+        }, [] {});
+    assert(false);
+  } catch (const std::exception&) {}
+  assert(interruptedAtPromotion && !std::filesystem::exists(MothershipTidesMigration::str(stateDatabase.livePath)) &&
+      std::filesystem::exists(MothershipTidesMigration::str(stateDatabase.retainedV9Path)) &&
+      std::filesystem::exists(MothershipTidesMigration::str(stateDatabase.preparedV10Path)) &&
+      std::filesystem::exists(MothershipTidesMigration::str(secretsDatabase.livePath)) &&
+      !std::filesystem::exists(MothershipTidesMigration::str(secretsDatabase.retainedV9Path)));
+  Vector<MothershipTidesDBMigrationDatabase> resumed = {stateDatabase, secretsDatabase};
+  publishPreparedPairedRecoveryDatabases(resumed,
+      [](const auto&,const String& path) { return std::filesystem::exists(MothershipTidesMigration::str(path)); },
+      [](const auto&,const String& from,const String& to,String *) { std::filesystem::rename(MothershipTidesMigration::str(from), MothershipTidesMigration::str(to)); return true; },
+      [] {});
+  for (const auto& entry : resumed) {
+    assert(entry.swapped && std::filesystem::exists(MothershipTidesMigration::str(entry.livePath)) &&
+        std::filesystem::exists(MothershipTidesMigration::str(entry.retainedV9Path)) &&
+        !std::filesystem::exists(MothershipTidesMigration::str(entry.preparedV10Path)));
+    std::ifstream current(std::filesystem::path(MothershipTidesMigration::str(entry.livePath)) / "marker", std::ios::binary);
+    std::ifstream original(std::filesystem::path(MothershipTidesMigration::str(entry.retainedV9Path)) / "marker", std::ios::binary);
+    std::string currentValue, originalValue; current >> currentValue; original >> originalValue;
+    assert(currentValue == "prepared" && originalValue == "original");
+  }
+  auto ambiguous = database("ambiguous-live", "ambiguous-retained", "ambiguous-prepared");
+  makeDirectory(MothershipTidesMigration::str(ambiguous.livePath), "live");
+  makeDirectory(MothershipTidesMigration::str(ambiguous.retainedV9Path), "retained");
+  makeDirectory(MothershipTidesMigration::str(ambiguous.preparedV10Path), "prepared");
+  bool ambiguousRejected = false;
+  try {
+    Vector<MothershipTidesDBMigrationDatabase> values = {ambiguous};
+    publishPreparedPairedRecoveryDatabases(values,
+        [](const auto&,const String& path) { return std::filesystem::exists(MothershipTidesMigration::str(path)); },
+        [](const auto&,const String&,const String&,String *) { return false; }, [] {});
+  } catch (const std::exception&) { ambiguousRejected = true; }
+  assert(ambiguousRejected);
+  std::filesystem::remove_all(operationRoot);
+}
+
 int main()
 {
+  assertRuntimeStartupCapturedSourceCodec();
+  assertRuntimeRecoveryStartupAuthorityPreparation();
+  // Generic runtime recovery may inspect only decoded private copies.  Its
+  // neutral admission must refuse any unfinished update coordinator rather
+  // than treating an interrupted rollout as disposable state.
+  {
+    const uint128_t cluster=0x9a01, member=0x9a02;
+    ClusterTopology topology = {};
+    ClusterMachine brain = {}; brain.uuid=member; brain.isBrain=true;
+    topology.machines.push_back(brain);
+    ProdigyPersistentLocalBrainState local = {}; local.uuid=member; local.ownerClusterUUID=cluster;
+    ProdigyPersistentBrainSnapshot snapshot = {};
+    snapshot.brainConfig.clusterUUID=cluster; snapshot.topology=topology;
+    snapshot.masterAuthority.runtimeState.generation=1;
+    snapshot.masterAuthority.runtimeState.hasCompletedInitialMasterElection=true;
+    String failure = {};
+    assert(mothershipRuntimeRecoverySnapshotValid(local,snapshot,cluster,member,topology,&failure));
+    auto wrongOwner=local; wrongOwner.ownerClusterUUID=cluster+1;
+    assert(!mothershipRuntimeRecoverySnapshotValid(wrongOwner,snapshot,cluster,member,topology,&failure));
+    assert(failure=="private local Brain owner differs from recovery member"_ctv);
+    auto wrongTopology=topology; wrongTopology.machines[0].uuid=member+1;
+    assert(!mothershipRuntimeRecoverySnapshotValid(local,snapshot,cluster,member,wrongTopology,&failure));
+    snapshot.masterAuthority.runtimeState.updateSelf.state=
+        uint8_t(ProdigyPersistentUpdateSelfState::Phase::waitingForBundleEchos);
+    assert(!mothershipRuntimeRecoverySnapshotValid(local,snapshot,cluster,member,topology,&failure));
+    assert(failure=="private Brain snapshot contains an in-flight update-self coordinator"_ctv);
+    snapshot.masterAuthority.runtimeState.updateSelf={};
+    snapshot.masterAuthority.runtimeState.updateSelfFollowerReadyPeerKeys.push_back(1);
+    assert(!mothershipRuntimeRecoverySnapshotValid(local,snapshot,cluster,member,topology,&failure));
+    snapshot.masterAuthority.runtimeState.updateSelfFollowerReadyPeerKeys.clear();
+
+    // A rejected inventory checkpoint leaves only the candidate payload,
+    // digest, failure and requested concurrency. Restart restores idle state;
+    // admission preserves this evidence and never executes that candidate.
+    auto& authority = snapshot.masterAuthority.runtimeState;
+    for (uint8_t concurrency = 0; concurrency <= ProdigyUpdateSelfMaximumConcurrency; ++concurrency) {
+      authority.updateSelfFollowerConcurrency = concurrency;
+      assert(mothershipRuntimeRecoverySnapshotValid(local,snapshot,cluster,member,topology,&failure));
+    }
+    authority.updateSelf.bundleBlob.assign("candidate rejected before inventory checkpoint"_ctv);
+    assert(prodigyComputeSHA256Hex(authority.updateSelf.bundleBlob,
+                                  authority.updateSelf.workerExpectedBundleSHA256));
+    authority.updateSelf.workerFailure.assign("machine container ownership needs a fresh authenticated stateUpload for bundle exec"_ctv);
+    const auto rejected = authority.updateSelf;
+    for (uint8_t concurrency = 0; concurrency <= ProdigyUpdateSelfMaximumConcurrency; ++concurrency) {
+      authority.updateSelfFollowerConcurrency = concurrency;
+      assert(mothershipRuntimeRecoverySnapshotValid(local,snapshot,cluster,member,topology,&failure));
+      assert(authority.updateSelf == rejected && authority.updateSelfFollowerConcurrency == concurrency);
+    }
+    assert(mothershipRetainedRecoveryCanReplaceUpdate(snapshot,rejected.workerExpectedBundleSHA256));
+    String otherDigest; otherDigest.assign(std::string(64,'e').c_str());
+    assert(!mothershipRetainedRecoveryCanReplaceUpdate(snapshot,otherDigest));
+    assert(mothershipRetainedRecoveryCanReplaceUpdate(snapshot,otherDigest,{}, {},rejected.workerExpectedBundleSHA256));
+    struct UnsafeRejectedMutation { void (*apply)(ProdigyPersistentUpdateSelfState&); };
+    const UnsafeRejectedMutation mutations[] = {
+      {[](auto& v) { v.state = uint8_t(ProdigyPersistentUpdateSelfState::Phase::waitingForBundleEchos); }},
+      {[](auto& v) { v.state = uint8_t(ProdigyPersistentUpdateSelfState::Phase::waitingForFollowerReboots); }},
+      {[](auto& v) { v.state = uint8_t(ProdigyPersistentUpdateSelfState::Phase::waitingForRelinquishEchos); }},
+      {[](auto& v) { v.expectedEchos = 1; }},
+      {[](auto& v) { v.bundleEchos = 1; }},
+      {[](auto& v) { v.relinquishEchos = 1; }},
+      {[](auto& v) { v.plannedMasterPeerKey = 1; }},
+      {[](auto& v) { v.pendingDesignatedMasterPeerKey = 1; }},
+      {[](auto& v) { v.useStagedBundleOnly = true; }},
+      {[](auto& v) { v.bundleBlob.clear(); }},
+      {[](auto& v) { v.bundleBlob.append('!'); }},
+      {[](auto& v) { v.workerExpectedBundleSHA256.clear(); }},
+      {[](auto& v) { v.workerFailure.clear(); }},
+      {[](auto& v) { v.bundleEchoPeerKeys.push_back(1); }},
+      {[](auto& v) { v.relinquishEchoPeerKeys.push_back(1); }},
+      {[](auto& v) { v.followerBootNsByPeerKey.push_back({.peerKey=1,.bootNs=1}); }},
+      {[](auto& v) { v.followerRebootedPeerKeys.push_back(1); }},
+      {[](auto& v) { v.workerMachineUUIDs.push_back(1); }},
+      {[](auto& v) { v.workerStagedMachineUUIDs.push_back(1); }},
+      {[](auto& v) { v.workerTransitionIssuedMachineUUIDs.push_back(1); }},
+      {[](auto& v) { v.workerRebootedMachineUUIDs.push_back(1); }},
+      {[](auto& v) { v.workerStateUploadedMachineUUIDs.push_back(1); }},
+      {[](auto& v) { v.localMachineUUID = 1; }},
+      {[](auto& v) { v.localBundleRegistered = true; }},
+      {[](auto& v) { v.localContainerBootstraps.push_back("retained"_ctv); }},
+      {[](auto& v) { v.machineRecoveryWitnesses.push_back({}); }}
+    };
+    for (const auto& mutation : mutations) {
+      authority.updateSelf = rejected;
+      mutation.apply(authority.updateSelf);
+      assert(!mothershipRuntimeRecoverySnapshotValid(local,snapshot,cluster,member,topology,&failure));
+    }
+    authority.updateSelf = rejected;
+    authority.updateSelfFollowerConcurrency = ProdigyUpdateSelfMaximumConcurrency + 1;
+    assert(!mothershipRuntimeRecoverySnapshotValid(local,snapshot,cluster,member,topology,&failure));
+    authority.updateSelfFollowerConcurrency = 1;
+    authority.updateSelfFollowerTransitionIssuedPeerKeys.push_back(1);
+    assert(!mothershipRuntimeRecoverySnapshotValid(local,snapshot,cluster,member,topology,&failure));
+    authority.updateSelfFollowerTransitionIssuedPeerKeys.clear();
+    authority.updateSelfFollowerReadyPeerKeys.push_back(1);
+    assert(!mothershipRuntimeRecoverySnapshotValid(local,snapshot,cluster,member,topology,&failure));
+  }
   if (const char *only=std::getenv("PRODIGY_TEST_ONLY");only &&
       (std::strcmp(only,"initial-seed-runtime-repair")==0 || std::strcmp(only,"populated-seed-runtime-repair")==0)) {
     assertInitialSeedRuntimeRepair();std::puts("INITIAL_SEED_RUNTIME_REPAIR_RESULT failed_assertions=0");return 0;
@@ -2786,7 +3396,9 @@ int main()
   for(auto iterator=subscriptionPairings.rbegin();iterator!=subscriptionPairings.rend();++iterator)
     for(const SubscriptionPairing& pairing:iterator->second) reorderedBootstrap.plan.subscriptionPairings.insert(iterator->first,pairing);
   String reorderedBytes = {};BitseryEngine::serialize(reorderedBytes,reorderedBootstrap);
-  assert(!originalBootstrap.equals(reorderedBytes));
+  // The persistent codec is permitted to canonicalize this unordered map.
+  // The regression is semantic: recovery must accept either insertion order,
+  // including the stronger case where both serializations are already equal.
   originalBootstrap=std::move(reorderedBytes);
   assert(prodigyPersistentRetainedBootstrapEqual(decodedBootstrap,reorderedBootstrap));
   // Save the interrupted normal update, rather than the recovery envelope.

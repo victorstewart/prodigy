@@ -4014,6 +4014,22 @@ public:
 
   uint32_t desiredReplicaCountForShardGroup(uint32_t shardGroup) const
   {
+    // A global single-writer deployment is a set of exact local incarnations, not a
+    // three-replica autoscaling group.  A site with no current voter/learner
+    // owns no local target (a retired-only projection is intentionally zero).
+    if (plan.stateful.writerMode == StatefulWriterMode::globalSingleWriter) {
+      if (!thisBrain || !prodigyGlobalSingleWriterPlanValid(plan)) return 0;
+      GlobalSingleWriterMembershipProjection group;
+      if (thisBrain->desiredGlobalSingleWriterMembership(plan.config.deploymentID(), group) &&
+          group.protocolVersion != 0 && prodigyGlobalSingleWriterMembershipProjectionValid(group)) {
+        if (shardGroup != 0) return 0;
+        uint32_t local = 0;
+        for (const auto& member : group.members)
+          if (member.clusterUUID == group.localClusterUUID) ++local;
+        return local;
+      }
+      return 0;
+    }
     uint32_t replicas = 0;
     if (thisBrain && thisBrain->desiredStatefulReplicaCount(plan.config.deploymentID(), shardGroup, replicas)) return replicas;
     bool keepBlueAndGreen = (statefulWorkerTopologyUpgradeLocksShardGroup(shardGroup) && statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::greenBootstrap);
@@ -4447,6 +4463,131 @@ private:
 
 public:
 
+  // Called by Brain only after the membership projection (and, for a
+  // retirement, its committed Raft-removal proof) is durable.  This is not an
+  // election path: it materializes exactly the control-plane binding and lets
+  // the ordinary construct/destruct owner reserve resources and launch it.
+  bool reconcileGlobalSingleWriterPlacement(const GlobalSingleWriterMembershipProjection& current,
+                               const GlobalSingleWriterMember* retired = nullptr)
+  {
+    if (thisBrain == nullptr || !prodigyGlobalSingleWriterPlanValid(plan) ||
+        current.deploymentID != plan.config.deploymentID() || current.localClusterUUID != thisBrain->brainConfig.clusterUUID ||
+        prodigyGlobalSingleWriterMembershipProjectionValid(current) == false) return false;
+
+    // The group is an exact global membership with one local stateful shard. This
+    // must precede every scheduling exit, including incomplete(), because the
+    // ordinary launch serializer carries nShardGroups into ContainerPlan and
+    // peer admission rejects an uninitialized (zero) shard count.
+    nShardGroups = 1;
+
+    // The same durable projection owns both exact launches and their reported
+    // target. A learner changes the local target before it becomes a voter;
+    // keeping the genesis count here prevents its leased sessions from being
+    // admitted once the second local instance is healthy.
+    nTargetBase = uint32_t(std::count_if(current.members.begin(), current.members.end(), [&](const auto& member) {
+      return member.clusterUUID == current.localClusterUUID;
+    }));
+    nTargetSurge = nTargetCanary = 0;
+
+    bool changed = false;
+    auto incomplete = [&]() -> bool {
+      // Earlier exact constructions remain owned by the ordinary scheduler.
+      // Start them before asking Brain to retry the still-missing binding.
+      if (changed) schedule();
+      return false;
+    };
+    for (const GlobalSingleWriterMember& member : current.members)
+    {
+      if (member.clusterUUID != current.localClusterUUID) continue;
+      uint128_t address = 0;
+      std::memcpy(&address, member.privateIPv6.v6, sizeof(address));
+      auto existing = thisBrain->containers.find(member.containerUUID);
+      if (existing != thisBrain->containers.end())
+      {
+        ContainerView* container = existing->second;
+        if (container == nullptr || container->deploymentID != plan.config.deploymentID() ||
+            container->shardGroup != 0 || (container->globalSingleWriterMemberID && container->globalSingleWriterMemberID != member.memberID) ||
+            (container->meshAddress != address && container->requiredGlobalSingleWriterMeshAddress != address)) return incomplete();
+        continue;
+      }
+
+      Machine* selected = nullptr;
+      const uint8_t* endpoint = reinterpret_cast<const uint8_t*>(&address);
+      for (Machine* machine : thisBrain->machines)
+      {
+        if (prodigyMachineReadyForScheduling(machine) == false ||
+            endpoint[11] != thisBrain->brainConfig.datacenterFragment ||
+            endpoint[12] != uint8_t(machine->fragment >> 16) || endpoint[13] != uint8_t(machine->fragment >> 8) ||
+            endpoint[14] != uint8_t(machine->fragment) || nFitOnMachine(this, machine, 1, {}) == 0) continue;
+        selected = machine;
+        break;
+      }
+      if (selected == nullptr || !selected->claimContainerFragment(endpoint[15],thisBrain->globalSingleWriterMemberships(),
+          thisBrain->brainConfig.clusterUUID,plan.config.deploymentID(),member.containerUUID)) return incomplete();
+
+      Vector<uint32_t> gpuMemory = {};
+      Vector<AssignedGPUDevice> gpuDevices = {};
+      if (prodigyTakeAssignedGPUsForScheduling(selected, nullptr, nullptr, plan.config, gpuMemory, gpuDevices) == false)
+      {
+        selected->relinquishContainerFragment(endpoint[15]);
+        return incomplete();
+      }
+      prodigyDebitMachineScalarResources(selected, plan.config, 1);
+      nDeployedBase += 1;
+      countPerMachine[selected] += 1;
+      countPerRack[selected->rack] += 1;
+      ContainerView* container = constructOnMachine(selected, ApplicationLifetime::base, std::move(gpuMemory), std::move(gpuDevices), member.containerUUID);
+      container->shardGroup = 0;
+      containersByShardGroup.insert(0, container);
+      container->explicitStatefulMeshRoles = statefulMeshRolesForShardGroup(0);
+      prodigyPopulateDefaultStatefulTopology(container->explicitStatefulTopology, 0, plan.config);
+      container->fragment = endpoint[15];
+      container->requiredGlobalSingleWriterMeshAddress = address;
+      container->globalSingleWriterMemberID = member.memberID;
+      toSchedule.push_back(planStatefulConstruction(selected, container, DataStrategy::genesis));
+      changed = true;
+    }
+
+    if (retired != nullptr && retired->clusterUUID == current.localClusterUUID &&
+        std::find(current.retiredMemberIDs.begin(), current.retiredMemberIDs.end(), retired->memberID) != current.retiredMemberIDs.end())
+    {
+      if (std::any_of(current.members.begin(), current.members.end(), [&](const auto& active) {
+        return active.containerUUID == retired->containerUUID || active.privateIPv6.equals(retired->privateIPv6);
+      })) return incomplete();
+      uint128_t retiredAddress = 0;
+      std::memcpy(&retiredAddress, retired->privateIPv6.v6, sizeof(retiredAddress));
+      auto found = thisBrain->containers.find(retired->containerUUID);
+      if (found != thisBrain->containers.end() && found->second != nullptr)
+      {
+        ContainerView* container = found->second;
+        if (container->deploymentID != plan.config.deploymentID() ||
+            (container->meshAddress != retiredAddress && container->requiredGlobalSingleWriterMeshAddress != retiredAddress) ||
+            (container->globalSingleWriterMemberID != 0 && container->globalSingleWriterMemberID != retired->memberID)) return false;
+        if (containers.contains(container) && container->plannedWork == nullptr &&
+            container->state != ContainerState::destroyed && container->state != ContainerState::destroying)
+        {
+          toSchedule.push_back(planStatefulDestruction(container));
+          changed = true;
+        }
+        else if (container->state == ContainerState::destroying && container->plannedWork == nullptr)
+        {
+          // The ordinary destruction owner keeps this exact view alive until
+          // Neuron has acknowledged the terminal kill.  A Mothership retry is
+          // therefore allowed to repeat that idempotent kill, but must neither
+          // create another destruction work item nor infer completion from the
+          // local state transition alone.
+          auto waiting = waitingOnContainers.find(container);
+          if (waiting == waitingOnContainers.end() || waiting->second != ContainerState::destroyed ||
+              container->machine == nullptr || BrainBase::neuronControlStreamActive(container->machine) == false)
+            return false;
+          queueSend(container->machine, NeuronTopic::killContainer, container->uuid);
+        }
+      }
+    }
+    if (changed) schedule();
+    return true;
+  }
+
   // Calculate declarations on detached views. Preparing authority must not
   // publish pairings, change the live master map, or mutate runtime state.
   bool projectStatefulServingPlans(StatefulWorkerTopologyUpgradePhase phase,
@@ -4509,7 +4650,7 @@ public:
       for (const auto& [service, advertisement] : detached.advertisements)
         detached.advertisingOnPorts.insert(advertisement.port);
       const bool client = prodigyStatefulTopologyServesClients(candidate.statefulTopology) &&
-                          (plan.stateful.allMasters || clients[candidate.shardGroup] == candidate.uuid);
+                          ((plan.stateful.writerMode == StatefulWriterMode::allMasters) || clients[candidate.shardGroup] == candidate.uuid);
       reconcileLiveStatefulTopologyServices(&detached, false, client ? 1 : 0);
       candidate.advertisements = std::move(detached.advertisements);
       candidate.subscriptions = std::move(detached.subscriptions);
@@ -4522,7 +4663,7 @@ public:
   {
     if (thisBrain == nullptr || thisBrain->mesh == nullptr ||
         authority.deploymentID != plan.config.deploymentID() ||
-        authority.applicationID != plan.config.applicationID || authority.allMasters != plan.stateful.allMasters)
+        authority.applicationID != plan.config.applicationID || authority.allMasters != (plan.stateful.writerMode == StatefulWriterMode::allMasters))
       return false;
     // A retained steady record cannot cancel a newer admitted topology change.
     if (statefulWorkerTopologyUpgradePending && statefulWorkerTopologyUpgradeOperationID != authority.operationID)
@@ -4579,7 +4720,7 @@ public:
       for (const auto& [service, advertisement] : container->advertisements)
         container->advertisingOnPorts.insert(advertisement.port);
       const bool client = candidate.advertisements.contains(candidate.statefulMeshRoles.client);
-      if (client && !plan.stateful.allMasters) masterForShardGroup[container->shardGroup] = container;
+      if (client && plan.stateful.writerMode != StatefulWriterMode::allMasters) masterForShardGroup[container->shardGroup] = container;
       reconcileLiveStatefulTopologyServices(container, true, client ? 1 : 0);
       if (phaseChanged) clearStatefulWorkerTopologyCutoverBarrier(container);
     }
@@ -5465,7 +5606,7 @@ private:
     if (prodigyStatefulTopologyServesClients(topology) == false)
     {
       eraseAdvertisement(roles.client);
-      if (publish && clientSelection < 0 && plan.stateful.allMasters == false)
+      if (publish && clientSelection < 0 && plan.stateful.writerMode != StatefulWriterMode::allMasters)
       {
         auto masterIt = masterForShardGroup.find(container->shardGroup);
         if (masterIt != masterForShardGroup.end() && masterIt->second == container)
@@ -5476,8 +5617,8 @@ private:
     }
     else if (roles.client != 0)
     {
-      bool shouldAdvertiseClient = clientSelection >= 0 ? clientSelection != 0 : plan.stateful.allMasters;
-      if (clientSelection < 0 && plan.stateful.allMasters == false)
+      bool shouldAdvertiseClient = clientSelection >= 0 ? clientSelection != 0 : (plan.stateful.writerMode == StatefulWriterMode::allMasters);
+      if (clientSelection < 0 && plan.stateful.writerMode != StatefulWriterMode::allMasters)
       {
         auto masterIt = masterForShardGroup.find(container->shardGroup);
         if (masterIt == masterForShardGroup.end() || masterIt->second == nullptr || masterIt->second->state == ContainerState::destroyed)
@@ -5657,20 +5798,6 @@ private:
       return;
     }
 
-    const auto generationAdmission = brain->prepareStatefulStoreGenerationLaunch(machine, deferred.bootstrap);
-    if (generationAdmission == BrainBase::StatefulServingLaunchAdmission::pending)
-    {
-      deferred.waitingForServingAuthority = true;
-      deferDurableContainerSpinForPersistence(std::move(deferred));
-      return;
-    }
-    if (generationAdmission == BrainBase::StatefulServingLaunchAdmission::rejected)
-    {
-      failDurableContainerSpinPersistence(brain, deferred, launchContainer,
-          "stateful store generation launch is not admitted by serving authority"_ctv);
-      return;
-    }
-
     // A capacity miss has no side effects.  Preserve the scheduled owner and
     // retry it from the deployment's existing Ring dispatcher after the
     // current ArtifactIO completion has released its lease.  A rejected
@@ -5715,22 +5842,6 @@ private:
             // is a failed durable receipt, even when another request happens
             // to fill the shared writer by the time it returns.
             failDurableContainerSpinPersistence(brain, deferred, container);
-            return;
-          }
-          // Persistence yields to the Ring. Re-project the current generation
-          // before retiring a predecessor or dispatching this delayed launch.
-          const auto generationAdmission = brain->prepareStatefulStoreGenerationLaunch(
-              deferred.machine, deferred.bootstrap);
-          if (generationAdmission == BrainBase::StatefulServingLaunchAdmission::pending)
-          {
-            deferred.waitingForServingAuthority = true;
-            deferDurableContainerSpinForPersistence(std::move(deferred));
-            return;
-          }
-          if (generationAdmission == BrainBase::StatefulServingLaunchAdmission::rejected)
-          {
-            failDurableContainerSpinPersistence(brain, deferred, container,
-                "stateful store generation changed before durable launch"_ctv);
             return;
           }
           if (deferred.replaceContainerUUID != 0)
@@ -7015,7 +7126,7 @@ public:
   // second client service.
   bool rebuildRecoveredStatefulShardMasters(void)
   {
-    if (plan.isStateful == false || plan.stateful.allMasters)
+    if (plan.isStateful == false || (plan.stateful.writerMode == StatefulWriterMode::allMasters))
     {
       return true;
     }
@@ -9654,7 +9765,7 @@ public:
       {
       }
 
-      if (!plan.stateful.allMasters && masterForShardGroup[container->shardGroup] == container)
+      if (plan.stateful.writerMode != StatefulWriterMode::allMasters && masterForShardGroup[container->shardGroup] == container)
       {
         changeShardGroupMaster(container->shardGroup);
       }
@@ -9852,7 +9963,7 @@ public:
       }
 
       auto master = masterForShardGroup.find(shardGroup);
-      if (!plan.stateful.allMasters &&
+      if (plan.stateful.writerMode != StatefulWriterMode::allMasters &&
           master != masterForShardGroup.end() && master->second == container)
       {
         // This is the same client-owner transition as ordinary destruction,
@@ -10036,7 +10147,7 @@ public:
       }
     }
 
-    uint64_t reportBytes = std::min<uint64_t>(report.size(), ProdigyStatefulStoreBootFailureReportMaximumBytes);
+    uint64_t reportBytes = std::min<uint64_t>(report.size(), 256);
 
     bool failedBeforeDeployHealthy = false;
     if (container->deploymentID == plan.config.deploymentID())
@@ -10195,7 +10306,9 @@ public:
         return;
       }
       if constexpr (std::is_same_v<T, StatefulWork>) {
-        if (!work.container) return; // cancelled exact target while this coroutine was suspended
+        // Destruction carries only oldContainer. A suspended work item is
+        // cancelled when its own lifecycle target has been cleared.
+        if (!(work.lifecycle == LifecycleOp::destruct ? work.oldContainer : work.container)) return;
         StatefulDataAuthority desired;
         if (work.container && thisBrain->desiredStatefulDataAuthority(plan.config.deploymentID(), desired, work.container->shardGroup) &&
             thisBrain->statefulCatchupCompensationFenced(plan.config.deploymentID(), work.container->shardGroup, desired.operationUUID)) {
@@ -10241,7 +10354,7 @@ public:
           definitionContext.roles = container->effectiveStatefulMeshRoles(plan);
           definitionContext.topology = container->effectiveStatefulTopology(plan);
           definitionContext.advertiseClient = definitionContext.roles.client != 0 &&
-              (plan.stateful.allMasters || !masterForShardGroup.contains(container->shardGroup));
+              ((plan.stateful.writerMode == StatefulWriterMode::allMasters) || !masterForShardGroup.contains(container->shardGroup));
           definitionContext.seedingAlways = plan.stateful.seedingAlways;
           definitionContext.dataStrategy = work.data;
           definitionContext.nShardGroups = nShardGroups;
@@ -10252,7 +10365,7 @@ public:
               definitionContext.priorShardRoles.push_back(statefulMeshRolesForShardGroup(shardGroup));
             }
           }
-          if (definitionContext.advertiseClient && prodigyStatefulTopologyServesClients(definitionContext.topology) && !plan.stateful.allMasters)
+          if (definitionContext.advertiseClient && prodigyStatefulTopologyServesClients(definitionContext.topology) && plan.stateful.writerMode != StatefulWriterMode::allMasters)
           {
             masterForShardGroup.insert_or_assign(container->shardGroup, container);
           }
@@ -10363,7 +10476,22 @@ public:
             container->state = ContainerState::scheduled;
             container->remainingSubscriberCapacity = plan.minimumSubscriberCapacity;
 
-            container->fragment = machine->getContainerFragment();
+            if (container->requiredGlobalSingleWriterMeshAddress)
+            {
+              const uint8_t *expected = reinterpret_cast<const uint8_t *>(&container->requiredGlobalSingleWriterMeshAddress);
+              const uint8_t *prefix = container_network_subnet6.value;
+              if (std::memcmp(expected, prefix, 11) != 0 ||
+                  expected[11] != thisBrain->brainConfig.datacenterFragment ||
+                  expected[12] != uint8_t(machine->fragment >> 16) ||
+                  expected[13] != uint8_t(machine->fragment >> 8) ||
+                  expected[14] != uint8_t(machine->fragment) ||
+                  container->fragment != expected[15])
+              {
+                basics_log("Truth placement endpoint no longer matches its allocated machine fragment\n");
+                return;
+              }
+            }
+            else container->fragment = machine->getContainerFragment(thisBrain->globalSingleWriterMemberships(),thisBrain->brainConfig.clusterUUID);
             if (container->fragment == 0)
             {
               basics_log("container fragment allocation returned reserved fragment zero\n");
@@ -10372,6 +10500,7 @@ public:
             container->setMeshAddress(container_network_subnet6, thisBrain->brainConfig.datacenterFragment, machine->fragment, container->fragment);
             container->addresses.clear();
             container->addresses.emplace_back(container->meshAddress, uint8_t(128));
+            container->requiredGlobalSingleWriterMeshAddress = 0;
             container->wormholes = plan.wormholes;
             container->networkAccess = plan.networkAccess;
 
@@ -10759,6 +10888,68 @@ public:
   // this calculates a deployment of an application over a cluster, including transitioning from the last version(s) to this most recent
   void architect(CoroutineStack *coro, bool onlyMeasure, bool allowCompactionForScheduling = true, bool allowNewMachinesForScheduling = true)
   {
+    // Global single-writer membership is an exact durable placement, not an
+    // autoscaling target. Brain invokes reconcileGlobalSingleWriterPlacement() after the
+    // projection commit; ordinary architecting must never create an unbound
+    // voter or learner in the meantime.
+    if (plan.stateful.writerMode == StatefulWriterMode::globalSingleWriter) {
+      if (!thisBrain || !prodigyGlobalSingleWriterPlanValid(plan)) co_return;
+      GlobalSingleWriterMembershipProjection group;
+      if (thisBrain->desiredGlobalSingleWriterMembership(plan.config.deploymentID(),group) && group.protocolVersion != 0) {
+        if (!prodigyGlobalSingleWriterMembershipProjectionValid(group)) co_return;
+        if (!onlyMeasure) {
+          // reconcileGlobalSingleWriterPlacement() owns exact UUID/address construction and
+          // schedules it itself. Do not fall into generic architecting, which
+          // would create unbound replicas or requeue this same dispatch.
+          (void)reconcileGlobalSingleWriterPlacement(group);
+          co_return;
+        }
+        // Capacity reporting must test the assigned member endpoint, not an
+        // arbitrary scheduler candidate. This mutates only temporary deltas;
+        // the surrounding measure transaction restores normal target state.
+        uint32_t localTarget = 0, fitted = 0;
+        bytell_hash_map<Machine *, MachineResourcesDelta> deltas;
+        for (const auto& member : group.members) {
+          if (member.clusterUUID != group.localClusterUUID) continue;
+          ++localTarget;
+          uint128_t address = 0;
+          std::memcpy(&address, member.privateIPv6.v6, sizeof(address));
+          const uint8_t* endpoint = reinterpret_cast<const uint8_t*>(&address);
+          auto existing = thisBrain->containers.find(member.containerUUID);
+          if (existing != thisBrain->containers.end()) {
+            ContainerView* container = existing->second;
+            if (!container || container->deploymentID != plan.config.deploymentID() || container->shardGroup != 0 ||
+                (container->globalSingleWriterMemberID && container->globalSingleWriterMemberID != member.memberID) || container->machine == nullptr ||
+                (container->meshAddress != address && container->requiredGlobalSingleWriterMeshAddress != address) ||
+                container->fragment != endpoint[15]) break;
+            ++fitted;
+            continue;
+          }
+          Machine* selected = nullptr;
+          for (Machine* machine : thisBrain->machines) {
+            if (!prodigyMachineReadyForScheduling(machine) || !machine->containerFragmentAvailable(endpoint[15],
+                thisBrain->globalSingleWriterMemberships(),thisBrain->brainConfig.clusterUUID,plan.config.deploymentID(),member.containerUUID) ||
+                endpoint[11] != thisBrain->brainConfig.datacenterFragment ||
+                endpoint[12] != uint8_t(machine->fragment >> 16) || endpoint[13] != uint8_t(machine->fragment >> 8) ||
+                endpoint[14] != uint8_t(machine->fragment) || nFitOnMachine(this, machine, 1, deltas[machine]) == 0) continue;
+            selected = machine;
+            break;
+          }
+          if (!selected) break;
+          Vector<uint32_t> gpuMemory = {};
+          Vector<AssignedGPUDevice> gpuDevices = {};
+          if (!prodigyTakeAssignedGPUsForScheduling(selected, nullptr, &deltas[selected], plan.config, gpuMemory, gpuDevices)) break;
+          prodigyApplyPlannedMachineScalarDelta(deltas[selected], plan.config, 1);
+          ++fitted;
+        }
+        nShardGroups = 1;
+        nTargetBase = localTarget;
+        nTargetSurge = nTargetCanary = 0;
+        nDeployedBase = fitted;
+        co_return;
+      }
+      co_return;
+    }
     if (plan.isStateful)
     {
       prodigyLogDeployHeapSnapshot(

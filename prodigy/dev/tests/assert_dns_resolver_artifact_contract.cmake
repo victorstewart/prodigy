@@ -11,6 +11,9 @@ foreach(REQUIRED IN ITEMS
    "list(REMOVE_ITEM PRODIGY_COMMON_LINK_TARGETS prodigy_dns_resolver prodigy_dns_resolver_unit)"
    "depos_link(prodigy_dns_resolver PRIVATE basics::basics)"
    "set(PRODIGY_CARES_TARGETS"
+   "tests/prepare_native_elf_context.py"
+   "--destination /app/prodigy-dns-resolver"
+   "DEPENDS \"\${PRODIGY_DNS_RESOLVER_CONTEXT_STAMP}\""
    "prodigy_mothership_host_runtime_unit"
    "\"\${PRODIGY_ROOT}/prodigy/dns/DiscombobuFile.in\""
    "\"\${PRODIGY_DNS_RESOLVER_DISCOMBOBUFILE}\""
@@ -29,7 +32,7 @@ if (DNS_BUILD_START EQUAL -1 OR DNS_BUILD_END LESS DNS_BUILD_START)
 endif()
 math(EXPR DNS_BUILD_LENGTH "${DNS_BUILD_END} - ${DNS_BUILD_START}")
 string(SUBSTRING "${BUILD}" ${DNS_BUILD_START} ${DNS_BUILD_LENGTH} DNS_BUILD)
-foreach(REQUIRED IN ITEMS "remote add dockerhub docker.io" "--file \"\${PRODIGY_DNS_RESOLVER_DISCOMBOBUFILE}\""
+foreach(REQUIRED IN ITEMS "--context \"resolver=\${PRODIGY_DNS_RESOLVER_CONTEXT_DIR}\"" "--file \"\${PRODIGY_DNS_RESOLVER_DISCOMBOBUFILE}\""
    "--kind app" "WORKING_DIRECTORY \"\${CMAKE_BINARY_DIR}\"")
    string(FIND "${DNS_BUILD}" "${REQUIRED}" OFFSET)
    if (OFFSET EQUAL -1)
@@ -42,8 +45,8 @@ if (NOT DEBUG_OFFSET EQUAL -1)
 endif()
 
 foreach(REQUIRED IN ITEMS
-   "FROM @PRODIGY_MASQUE_GATEWAY_RUNTIME_BASE@"
-   "COPY {resolver} ./prodigy-dns-resolver /app/prodigy-dns-resolver"
+   "FROM scratch for @PRODIGY_RESOLVED_TARGET_ARCH@"
+   "COPY {resolver} * /"
    "SURVIVE /app/prodigy-dns-resolver"
    "EXECUTE [\"/app/prodigy-dns-resolver\"]")
    string(FIND "${DISCOMBOBUFILE}" "${REQUIRED}" OFFSET)

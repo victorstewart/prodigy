@@ -25,7 +25,7 @@
 
 class ContainerManagerGatewayRecoveryTestAccess {
 public:
-  using RecoveryRecord = ContainerManager::GatewayRecoveryRecord;
+  using RecoveryRecord = ProdigyGatewayRecovery::GatewayRecoveryRecord;
 
   static bool socketPath(uint128_t uuid, String& path)
   {
@@ -34,7 +34,7 @@ public:
 
   static bool tokenValid(const String& token)
   {
-    return ContainerManager::gatewayRecoveryTokenValid(token);
+    return ProdigyGatewayRecovery::gatewayRecoveryTokenValid(token);
   }
 
   static void generateToken(String& token)
@@ -54,7 +54,7 @@ public:
 
   static bool readRecordAt(int rootFD, const ContainerPlan& plan, String& token)
   {
-    return ContainerManager::readGatewayRecoveryRecordAt(rootFD, plan, token);
+    return ProdigyGatewayRecovery::readGatewayRecoveryRecordAt(rootFD, plan, token);
   }
 };
 
@@ -66,21 +66,6 @@ public:
     return ContainerManager::prepareContainerStorage(container, failureReport, requireExistingBackend);
   }
 
-  static bool armEnvironmentRepair(Container *container, const siginfo_t& infop, bool restart,
-                                   const ProdigyStatefulStoreBootFailure& failure)
-  {
-    return ContainerManager::armStatefulStoreEnvironmentStorageRepair(container, infop, restart, failure);
-  }
-
-  static bool reconcileEnvironmentRepairAt(Container *container, int storageParentFD, String *failureReport = nullptr)
-  {
-    return ContainerManager::reconcilePendingStatefulStoreEnvironmentStorageAt(container, storageParentFD, failureReport);
-  }
-
-  static bool captureDirectStoragePayloadAt(Container *container, int storageParentFD, String *failureReport = nullptr)
-  {
-    return ContainerManager::captureRegisteredDirectStoragePayloadAt(container, storageParentFD, failureReport);
-  }
 };
 
 class TestBrain final : public BrainBase {
@@ -135,7 +120,7 @@ public:
     servingDecision.applicationID = deployment->plan.config.applicationID;
     servingDecision.operationID = deployment->statefulWorkerTopologyUpgradeOperationID;
     servingDecision.phase = phase;
-    servingDecision.allMasters = deployment->plan.stateful.allMasters;
+    servingDecision.allMasters = (deployment->plan.stateful.writerMode == StatefulWriterMode::allMasters);
     servingDecision.targetConfig = deployment->statefulWorkerTopologyUpgradeTargetConfig();
     servingFixtureMachine.uuid = 1;
     for (ContainerView *container : deployment->containers)
@@ -1025,8 +1010,39 @@ static void testStorageParentTraversal(TestSuite& suite)
   int root = open(fixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   suite.expect(root >= 0, "storage_parent_fixture_opened");
   if (root < 0) return;
-  suite.expect(fchmod(root, 0711) == 0, "storage_parent_fixture_models_traversable_containers_root");
+  suite.expect(fchmod(root, 0700) == 0, "storage_parent_fixture_models_private_containers_root");
+  String artifactPath = {};
+  artifactPath.assign(fixture.path);
+  artifactPath.append("/artifact"_ctv);
+  suite.expect(mkdirat(root, "artifact", 0700) == 0, "artifact_parent_private_child_created");
+  if (geteuid() == 0)
+  {
+    constexpr uid_t mappedUID = 15728400;
+    suite.expect(fchownat(root, "artifact", mappedUID, mappedUID, AT_SYMLINK_NOFOLLOW) == 0,
+                 "artifact_parent_private_child_owned_by_mapped_uid");
+    pid_t child = fork();
+    suite.expect(child >= 0, "artifact_parent_private_mode_child_forked");
+    if (child == 0)
+    {
+      if (setgroups(0, nullptr) != 0 || setresgid(mappedUID, mappedUID, mappedUID) != 0 ||
+          setresuid(mappedUID, mappedUID, mappedUID) != 0) _exit(2);
+      int artifact = open(artifactPath.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+      if (artifact >= 0) { close(artifact); _exit(3); }
+      _exit(errno == EACCES ? 0 : 4);
+    }
+    if (child > 0)
+    {
+      int status = 0;
+      suite.expect(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                   "artifact_parent_private_mode_reproduces_mapped_uid_eacces");
+    }
+  }
   String failure;
+  suite.expect(ContainerManager::prepareContainerArtifactParentAt(root, &failure), "artifact_parent_prepared");
+  struct stat artifactParent = {};
+  suite.expect(fstat(root, &artifactParent) == 0 && (artifactParent.st_mode & 0777) == 0711 &&
+               artifactParent.st_uid == geteuid(),
+               "artifact_parent_owner_only_listing_mapped_uid_traversal");
   suite.expect(ContainerManager::prepareContainerStorageParentAt(root, &failure), "storage_parent_prepared");
   struct stat parent = {};
   suite.expect(fstatat(root, "storage", &parent, AT_SYMLINK_NOFOLLOW) == 0 &&
@@ -1047,6 +1063,12 @@ static void testStorageParentTraversal(TestSuite& suite)
       int own = openat(root, "storage/123", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
       if (own < 0) _exit(3);
       close(own);
+      int artifact = open(artifactPath.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+      if (artifact < 0) _exit(6);
+      close(artifact);
+      int artifactListing = open(fixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+      if (artifactListing >= 0) { close(artifactListing); _exit(7); }
+      if (errno != EACCES) _exit(8);
       int listing = openat(root, "storage", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
       if (listing >= 0) { close(listing); _exit(4); }
       _exit(errno == EACCES ? 0 : 5);
@@ -1055,13 +1077,17 @@ static void testStorageParentTraversal(TestSuite& suite)
     {
       int status = 0;
       suite.expect(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
-                   "storage_parent_real_mapped_uid_can_traverse_but_not_list");
+                   "artifact_and_storage_parents_real_mapped_uid_can_traverse_but_not_list");
     }
   }
   suite.expect(fchmodat(root, "storage", 0700, 0) == 0 &&
                ContainerManager::prepareContainerStorageParentAt(root, &failure) &&
                fstatat(root, "storage", &parent, AT_SYMLINK_NOFOLLOW) == 0 && (parent.st_mode & 0777) == 0711,
                "storage_parent_existing_private_parent_is_repaired");
+  suite.expect(fchmod(root, 0700) == 0 &&
+               ContainerManager::prepareContainerArtifactParentAt(root, &failure) &&
+               fstat(root, &artifactParent) == 0 && (artifactParent.st_mode & 0777) == 0711,
+               "artifact_parent_existing_private_parent_is_repaired");
   struct stat childMetadata = {};
   suite.expect(fstatat(root, "storage/123", &childMetadata, AT_SYMLINK_NOFOLLOW) == 0 &&
                (childMetadata.st_mode & 0777) == 0700,
@@ -1123,7 +1149,7 @@ static void testInplacePairingOrder(TestSuite& suite)
   previous.plan.config.type = ApplicationType::stateful;
   previous.plan.config.architecture = nametagCurrentBuildMachineArchitecture();
   previous.plan.stateful.siblingPrefix = (uint64_t(19'208) << 48) | (uint64_t(2) << 40);
-  previous.plan.stateful.allMasters = false;
+  previous.plan.stateful.writerMode = StatefulWriterMode::localSingleWriter;
   previous.plan.stateful.neverShard = false;
   previous.plan.stateful.allowUpdateInPlace = true;
   previous.state = DeploymentState::running;
@@ -1418,7 +1444,7 @@ static __attribute__((noinline)) void testRecoveredStatefulSuccessorTarget(TestS
   predecessor->plan.stateful.cousinPrefix = (uint64_t(19'209) << 48) | (uint64_t(3) << 40);
   predecessor->plan.stateful.seedingPrefix = (uint64_t(19'209) << 48) | (uint64_t(4) << 40);
   predecessor->plan.stateful.shardingPrefix = (uint64_t(19'209) << 48) | (uint64_t(5) << 40);
-  predecessor->plan.stateful.allMasters = allMasters;
+  predecessor->plan.stateful.writerMode = allMasters ? StatefulWriterMode::allMasters : StatefulWriterMode::localSingleWriter;
   predecessor->plan.stateful.allowUpdateInPlace = true;
   predecessor->nShardGroups = 0;
 
@@ -1607,7 +1633,7 @@ static void testFreshStatefulFloor(TestSuite& suite)
     graph.plan.config.applicationID = app;
     graph.plan.config.type = ApplicationType::stateful;
     graph.plan.stateful.neverShard = true;
-    graph.plan.stateful.allMasters = true;
+    graph.plan.stateful.writerMode = StatefulWriterMode::allMasters;
     graph.plan.stateful.clientPrefix = prodigyRuntimeStatefulServicePrefix(app, 1);
     graph.plan.stateful.siblingPrefix = prodigyRuntimeStatefulServicePrefix(app, 2);
     graph.plan.stateful.cousinPrefix = prodigyRuntimeStatefulServicePrefix(app, 3);
@@ -1681,7 +1707,7 @@ static void testRecoveredStatefulHeadShardTarget(TestSuite& suite)
     ApplicationDeployment recovered = {};
     seedCommonPlan(recovered, true);
     recovered.plan.config.type = ApplicationType::stateful;
-    recovered.plan.stateful.allMasters = true;
+    recovered.plan.stateful.writerMode = StatefulWriterMode::allMasters;
     recovered.state = DeploymentState::running;
     brain.deployments.insert_or_assign(recovered.plan.config.deploymentID(), &recovered);
 
@@ -1742,7 +1768,7 @@ static void testRecoveredStatefulQuorumDataStrategy(TestSuite& suite)
   deployment.plan.config.applicationID = 19'210;
   deployment.plan.config.versionID = 1;
   deployment.plan.config.type = ApplicationType::stateful;
-  deployment.plan.stateful.allMasters = false;
+  deployment.plan.stateful.writerMode = StatefulWriterMode::localSingleWriter;
 
   ContainerView master = {};
   master.deploymentID = deployment.plan.config.deploymentID();
@@ -1895,7 +1921,7 @@ static void testRecoveredStatefulMasterAdvertisementFence(TestSuite& suite)
     deployment.plan.stateful.cousinPrefix = MeshServices::generateStatefulService(19'211, 3);
     deployment.plan.stateful.seedingPrefix = MeshServices::generateStatefulService(19'211, 4);
     deployment.plan.stateful.shardingPrefix = MeshServices::generateStatefulService(19'211, 5);
-    deployment.plan.stateful.allMasters = false;
+    deployment.plan.stateful.writerMode = StatefulWriterMode::localSingleWriter;
   };
   auto generatedClientAdvertisement = [](const DeploymentPlan& plan, Advertisement& clientAdvertisement) {
     const StatefulMeshRoles roles = StatefulMeshRoles::forShardGroup(
@@ -2085,7 +2111,7 @@ static void testMaterializedStatefulRecoveryInitialHealth(TestSuite& suite)
     deployment.plan.stateful.cousinPrefix = (uint64_t(991) << 48) | (uint64_t(3) << 40);
     deployment.plan.stateful.seedingPrefix = (uint64_t(991) << 48) | (uint64_t(4) << 40);
     deployment.plan.stateful.shardingPrefix = (uint64_t(991) << 48) | (uint64_t(5) << 40);
-    deployment.plan.stateful.allMasters = true;
+    deployment.plan.stateful.writerMode = StatefulWriterMode::allMasters;
     deployment.plan.stateful.neverShard = false;
     deployment.plan.stateful.seedingAlways = false;
     deployment.plan.stateful.allowUpdateInPlace = true;
@@ -2796,7 +2822,7 @@ static void testStatefulHorizontalAutoscaleDispatch(TestSuite& suite)
     deployment.plan.stateful.cousinPrefix = MeshServices::generateStatefulService(999, 3);
     deployment.plan.stateful.seedingPrefix = MeshServices::generateStatefulService(999, 4);
     deployment.plan.stateful.shardingPrefix = MeshServices::generateStatefulService(999, 5);
-    deployment.plan.stateful.allMasters = true;
+    deployment.plan.stateful.writerMode = StatefulWriterMode::allMasters;
     deployment.state = DeploymentState::running;
     deployment.nShardGroups = 1; deployment.recomputeStatefulBaseTargetFromShardGroups();
     brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
@@ -2882,7 +2908,7 @@ static void testStatefulHorizontalAutoscaleFloorDispatch(TestSuite& suite)
     deployment.plan.stateful.cousinPrefix = MeshServices::generateStatefulService(998, 3);
     deployment.plan.stateful.seedingPrefix = MeshServices::generateStatefulService(998, 4);
     deployment.plan.stateful.shardingPrefix = MeshServices::generateStatefulService(998, 5);
-    deployment.plan.stateful.allMasters = true;
+    deployment.plan.stateful.writerMode = StatefulWriterMode::allMasters;
     deployment.state = DeploymentState::running;
     deployment.nShardGroups = 1;
     deployment.recomputeStatefulBaseTargetFromShardGroups();
@@ -3244,6 +3270,22 @@ static void testGatewayRecoveryTokenRecord(TestSuite& suite)
   suite.expect(rootFD >= 0 && ContainerManagerGatewayRecoveryTestAccess::writeRecordAt(rootFD, plan, token) &&
                ContainerManagerGatewayRecoveryTestAccess::readRecordAt(rootFD, plan, observed) && observed == token,
                "gateway_recovery_record_exact_roundtrip");
+  plan.system.gatewayTunnelInterface = "mgw0"_ctv;
+  Vector<BrainReplicatedContainerRuntimeState> runtimes = {};
+  const auto matchesGateway = [&](const String& name) {
+    return ProdigyGatewayRecovery::matchesRetainedGatewayAt(rootFD, name, plan.system, runtimes);
+  };
+  suite.expect(matchesGateway("99123"_ctv) && !matchesGateway("099123"_ctv),
+               "recovery_census_identifies_exact_gateway_cgroup");
+  ++plan.system.gatewayAuthorityGeneration;
+  suite.expect(!matchesGateway("99123"_ctv), "recovery_census_rejects_stale_gateway_generation");
+  --plan.system.gatewayAuthorityGeneration;
+  BrainReplicatedContainerRuntimeState application = {};
+  application.plan.uuid = plan.uuid;
+  application.plan.config.applicationID = 1;
+  application.machineUUID = plan.system.gatewayLocalMachineUUID;
+  runtimes.push_back(application);
+  suite.expect(!matchesGateway("99123"_ctv), "recovery_census_preserves_application_with_colliding_uuid");
   struct stat record = {};
   suite.expect(stat((directory / "masque-gateway-recovery.v1").c_str(), &record) == 0 && record.st_uid == 0 &&
                (record.st_mode & 07777) == 0600, "gateway_recovery_record_root_0600");
@@ -3693,7 +3735,7 @@ static void testAllMastersBootstrapSeedingSubscription(TestSuite& suite)
     plan.config.versionID = 1;
     plan.config.type = ApplicationType::stateful;
     plan.isStateful = true;
-    plan.stateful.allMasters = true;
+    plan.stateful.writerMode = StatefulWriterMode::allMasters;
     plan.stateful.clientPrefix = MeshServices::generateStatefulService(applicationID, 1);
     plan.stateful.siblingPrefix = MeshServices::generateStatefulService(applicationID, 2);
     plan.stateful.cousinPrefix = MeshServices::generateStatefulService(applicationID, 3);
@@ -3727,6 +3769,20 @@ static void testAllMastersBootstrapSeedingSubscription(TestSuite& suite)
           subscriptions.emplace(subscription.service, subscription);
           if (subscription.service == context.roles.seeding) { ++count; seeding = &subscription; }
         }
+        ContainerPlan startup = {};
+        startup.config = plan.config;
+        startup.isStateful = true;
+        startup.shardGroup = group;
+        startup.nShardGroups = groups;
+        startup.statefulMeshRoles = context.roles;
+        startup.statefulTopology = context.topology;
+        for (const auto& subscription : definitions.subscriptions)
+          startup.subscriptions.emplace(subscription.service, subscription);
+        Vector<uint64_t> startupFlags = {};
+        prodigyBuildContainerStartupFlags(startup, startupFlags);
+        const auto expectedDisposition = (expected == 0 || expectedNature == SubscriptionNature::none)
+            ? StatefulInitialStoreDisposition::initialEmptyAuthorized
+            : StatefulInitialStoreDisposition::mustRecover;
         ProdigyLocalCousinServicePermission permission;
         permission.protocolVersion = ProdigyLocalCousinServicePermission::purposeVersion;
         permission.purpose = ProdigyCousinServicePurpose::seeding;
@@ -3736,6 +3792,33 @@ static void testAllMastersBootstrapSeedingSubscription(TestSuite& suite)
         suite.expect(expected == 0 || (seeding != nullptr && seeding->nature == expectedNature &&
                      seeding->startAt == ContainerState::scheduled && seeding->stopAt == ContainerState::destroying),
                      "bootstrap_seeding_preserves_exact_nature_and_lifecycle");
+        suite.expect(startup.subscriptionPairings.size() == 0 && startupFlags.size() == 3 &&
+                     prodigyStatefulInitialStoreDispositionFromStartupFlags(startupFlags) == expectedDisposition,
+                     "startup_flags_classify_declared_recovery_subscriptions_without_live_pairings");
+        if (expectedDisposition == StatefulInitialStoreDisposition::initialEmptyAuthorized) {
+          startup.statefulMeshRoles.seeding = 0;
+          prodigyBuildContainerStartupFlags(startup, startupFlags);
+          suite.expect(prodigyStatefulInitialStoreDispositionFromStartupFlags(startupFlags) ==
+                           StatefulInitialStoreDisposition::mustRecover,
+                       "startup_flags_partial_stateful_roles_fail_closed");
+          startup.statefulMeshRoles = context.roles;
+          startup.statefulTopology.servingMode = StatefulTopologyServingMode::applicationDataAuthority;
+          auto& authority = startup.statefulTopology.dataAuthority;
+          authority.operationUUID = 21; authority.datasetUUID = 22; authority.snapshotUUID = 23;
+          authority.sourceClusterUUID = 24; authority.targetClusterUUID = 25;
+          authority.localClusterUUID = authority.writeOwnerClusterUUID = authority.targetClusterUUID;
+          authority.authorityEpoch = 1; authority.shardGroup = group; authority.nShardGroups = groups;
+          authority.mode = StatefulDataAuthorityMode::writeOwner;
+          authority.contractSHA256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv;
+          authority.shardManifestSHA256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"_ctv;
+          authority.snapshotBoundarySHA256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"_ctv;
+          authority.requiredAppliedWatermarkSHA256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"_ctv;
+          prodigyBuildContainerStartupFlags(startup, startupFlags);
+          suite.expect(prodigyStatefulTopologyServesClients(startup.statefulTopology) &&
+                       prodigyStatefulInitialStoreDispositionFromStartupFlags(startupFlags) ==
+                           StatefulInitialStoreDisposition::mustRecover,
+                       "startup_flags_data_authority_write_owner_stays_recovery_fenced");
+        }
         suite.expect(prodigyCousinSourceSubscriptionMatches(permission, context.roles.seeding,
                          subscriptions, ContainerState::healthy) == (expected == 1),
                      "bootstrap_seeding_subscription_allows_owner_session_after_readiness");
@@ -3773,43 +3856,39 @@ static void testAllMastersBootstrapSeedingSubscription(TestSuite& suite)
       context.dataStrategy = DataStrategy::changelog;
       verify(1, SubscriptionNature::all);
     }
+    if (groups == 3) {
+      ProdigyContainerServiceDefinitionContext sharding = {};
+      sharding.isStateful = true;
+      sharding.roles = StatefulMeshRoles::forShardGroup(plan.stateful, applicationID, 2);
+      sharding.nShardGroups = groups;
+      sharding.dataStrategy = DataStrategy::sharding;
+      sharding.priorShardRoles.push_back(StatefulMeshRoles::forShardGroup(plan.stateful, applicationID, 0));
+      sharding.priorShardRoles.push_back(StatefulMeshRoles::forShardGroup(plan.stateful, applicationID, 1));
+      prodigyPopulateDefaultStatefulTopology(sharding.topology, 2, plan.config);
+      ProdigyContainerServiceDefinitions definitions = {};
+      const bool built = prodigyBuildContainerServiceDefinitions(plan, sharding, definitions);
+      ContainerPlan startup = {};
+      startup.config = plan.config;
+      startup.isStateful = true;
+      startup.shardGroup = 2;
+      startup.nShardGroups = groups;
+      startup.statefulMeshRoles = sharding.roles;
+      startup.statefulTopology = sharding.topology;
+      for (const auto& subscription : definitions.subscriptions)
+        startup.subscriptions.emplace(subscription.service, subscription);
+      Vector<uint64_t> startupFlags = {};
+      prodigyBuildContainerStartupFlags(startup, startupFlags);
+      suite.expect(built && startup.subscriptionPairings.size() == 0 &&
+                       sharding.roles.classify(sharding.priorShardRoles[0].sharding) == StatefulMeshRole::none &&
+                       prodigyStatefulInitialStoreDispositionFromStartupFlags(startupFlags) ==
+                           StatefulInitialStoreDisposition::mustRecover,
+                   "startup_flags_sharding_prior_group_subscriptions_stay_fenced_without_pairings");
+    }
   };
   verifyApplication.template operator()<2>();
   verifyApplication.template operator()<3>();
   verifyApplication.template operator()<4>();
   verifyApplication.template operator()<5>();
-}
-
-static void testStoreGenerationLaunchMetadata(TestSuite& suite)
-{
-  TemporaryDirectory artifactRoot;
-  suite.expect(artifactRoot.create(), "store_generation_metadata_fixture_created");
-  if (artifactRoot.path.empty()) return;
-  Container container {};
-  container.artifactRootPath = artifactRoot.path;
-  container.plan.config.architecture = nametagCurrentBuildMachineArchitecture();
-  String architecture;
-  architecture.assign(machineCpuArchitectureName(container.plan.config.architecture));
-  const auto verify = [&](const char *extension, bool expected, uint32_t protocol) {
-    String metadata;
-    metadata.assign("{\"execute_path\":\"/app/server\",\"execute_args\":[],\"execute_env\":[],\"execute_cwd\":\"/\",\"execute_arch\":\"");
-    metadata.append(architecture);
-    metadata.append("\"");
-    metadata.append(extension);
-    metadata.append("}");
-    suite.expect(writeLaunchMetadataFixture(artifactRoot.path, metadata.c_str()), "store_generation_metadata_written");
-    String failure;
-    const bool loaded = ContainerManager::debugLoadContainerLaunchMetadata(&container, &failure);
-    suite.expect(loaded == expected, "store_generation_metadata_accepts_only_known_single_integer");
-    if (loaded) suite.expect(container.statefulStoreGenerationProtocol == protocol, "store_generation_metadata_protocol_projected");
-  };
-  verify("", true, 0);
-  verify(",\"stateful_store_generation_protocol\":1", true, 1);
-  verify("", true, 0); // A prior artifact's capability cannot survive a reload.
-  verify(",\"stateful_store_generation_protocol\":0", false, 0);
-  verify(",\"stateful_store_generation_protocol\":2", false, 0);
-  verify(",\"stateful_store_generation_protocol\":\"1\"", false, 0);
-  verify(",\"stateful_store_generation_protocol\":1,\"stateful_store_generation_protocol\":1", false, 0);
 }
 
 static void testRetainedStatefulFilesAfterFailure(TestSuite& suite)
@@ -3823,12 +3902,12 @@ static void testRetainedStatefulFilesAfterFailure(TestSuite& suite)
   const auto storage = root / "storage" / "81";
   const auto database = storage / "kvdb" / "file-1";
   const auto legacyDatabase = artifact / "rootfs" / "storage" / "kvdb" / "file-2";
-  const auto selectedDatabase = storage / "kvdb.0x82" / "file-3";
+  const auto applicationBackup = storage / "app-backup" / "file-3";
   suite.expect(writeFileFixture(database, "original") && writeFileFixture(legacyDatabase, "legacy") &&
-                    writeFileFixture(selectedDatabase, "partially seeded"),
-                "failed_stateful_cleanup_fixture_has_previous_and_selected_homes");
+                    writeFileFixture(applicationBackup, "application-owned backup"),
+                "failed_stateful_cleanup_fixture_has_application_storage");
   struct stat before[3] = {};
-  const std::filesystem::path paths[] = {database, legacyDatabase, selectedDatabase};
+  const std::filesystem::path paths[] = {database, legacyDatabase, applicationBackup};
   for (size_t index = 0; index < 3; ++index)
     suite.expect(lstat(paths[index].c_str(), &before[index]) == 0, "failed_stateful_cleanup_fixture_records_inode");
 
@@ -3851,148 +3930,6 @@ static void testRetainedStatefulFilesAfterFailure(TestSuite& suite)
   suite.expect(!container.deleteStorageOnCleanUp, "failed_stateful_cleanup_preserves_backing_on_later_teardown");
 }
 
-static void testStatefulEnvironmentStorageRepair(TestSuite& suite)
-{
-  TemporaryDirectory fixture;
-  suite.expect(fixture.create(), "environment_storage_repair_fixture_created");
-  if (fixture.path.size() == 0) return;
-  const auto parent = filesystemPathFromString(fixture.path) / "storage";
-  const auto outside = filesystemPathFromString(fixture.path) / "outside";
-  const uint128_t uuid = 0xE110;
-  String name = {};
-  name.assignItoa(uuid);
-  const auto payload = parent / name.c_str();
-
-  auto makeContainer = [&](uint128_t value) {
-    Container container = {};
-    container.plan.uuid = value;
-    container.plan.isStateful = true;
-    container.plan.restartOnFailure = true;
-    container.plan.config.type = ApplicationType::stateful;
-    container.plan.config.applicationID = 3;
-    container.plan.config.storageMB = 64;
-    container.name.assignItoa(value);
-    prodigyContainerStorageRootPathForName(container.name, container.storageRootPath);
-    container.storagePayloadPath.assign(container.storageRootPath);
-    container.executionHostID = uint32_t(geteuid());
-    container.statefulStoreGenerationProtocol = 1;
-    return container;
-  };
-  siginfo_t normalHSEExit = {};
-  normalHSEExit.si_code = CLD_EXITED;
-  normalHSEExit.si_status = 1;
-  ProdigyStatefulStoreBootFailure environment = {};
-  environment.kind = ProdigyStatefulStoreBootFailureKind::environment;
-  environment.stage = ProdigyStatefulStoreBootFailureStage::environmentInspection;
-  environment.systemErrno = ENOENT;
-  ProdigyStatefulStoreBootFailure permission = environment;
-  permission.kind = ProdigyStatefulStoreBootFailureKind::permission;
-  permission.systemErrno = EACCES;
-
-  suite.expect(createDirectoryFixture(payload) && chmod(payload.c_str(), 0000) == 0,
-               "environment_storage_repair_private_payload_fixture_created");
-  int parentFD = open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-  Container container = makeContainer(uuid);
-  String failure = {};
-  const bool captured = parentFD >= 0 &&
-      ContainerManagerStorageTestAccess::captureDirectStoragePayloadAt(&container, parentFD, &failure);
-  const bool armed = ContainerManagerStorageTestAccess::armEnvironmentRepair(
-      &container, normalHSEExit, true, permission);
-  const bool repaired = parentFD >= 0 &&
-      ContainerManagerStorageTestAccess::reconcileEnvironmentRepairAt(&container, parentFD, &failure);
-  if (parentFD >= 0) close(parentFD);
-  struct stat repairedMetadata = {};
-  suite.expect(captured && armed && repaired && !container.pendingEnvironmentRepairGeneration.has_value() &&
-                   lstat(payload.c_str(), &repairedMetadata) == 0 &&
-                   repairedMetadata.st_uid == geteuid() && repairedMetadata.st_gid == getegid() &&
-                   (repairedMetadata.st_mode & 0777) == 0700,
-               "environment_storage_repair_restores_exact_payload_owner_and_mode");
-
-  ProdigyStatefulStoreBootFailure metadata = environment;
-  metadata.kind = ProdigyStatefulStoreBootFailureKind::missingMetadata;
-  metadata.systemErrno = EACCES;
-  Container metadataContainer = makeContainer(uuid);
-  suite.expect(!ContainerManagerStorageTestAccess::armEnvironmentRepair(
-                   &metadataContainer, normalHSEExit, true, metadata) &&
-                   !metadataContainer.pendingEnvironmentRepairGeneration.has_value(),
-               "environment_storage_repair_rejects_metadata_eacces");
-  Container permissionContainer = makeContainer(uuid);
-  suite.expect(ContainerManagerStorageTestAccess::armEnvironmentRepair(
-                   &permissionContainer, normalHSEExit, true, permission) &&
-                   permissionContainer.pendingEnvironmentRepairGeneration.has_value(),
-               "environment_storage_repair_accepts_permission_eacces");
-  ProdigyStatefulStoreBootFailure permissionEPERM = permission;
-  permissionEPERM.systemErrno = EPERM;
-  Container permissionEPERMContainer = makeContainer(uuid);
-  suite.expect(ContainerManagerStorageTestAccess::armEnvironmentRepair(
-                   &permissionEPERMContainer, normalHSEExit, true, permissionEPERM) &&
-                   permissionEPERMContainer.pendingEnvironmentRepairGeneration.has_value(),
-               "environment_storage_repair_accepts_permission_eperm");
-  ProdigyStatefulStoreBootFailure readonlyFilesystem = permission;
-  readonlyFilesystem.systemErrno = EROFS;
-  Container readonlyFilesystemContainer = makeContainer(uuid);
-  suite.expect(!ContainerManagerStorageTestAccess::armEnvironmentRepair(
-                   &readonlyFilesystemContainer, normalHSEExit, true, readonlyFilesystem) &&
-                   !readonlyFilesystemContainer.pendingEnvironmentRepairGeneration.has_value(),
-               "environment_storage_repair_defers_readonly_filesystem");
-
-  Container staleContainer = makeContainer(uuid);
-  suite.expect(ContainerManagerStorageTestAccess::armEnvironmentRepair(
-                   &staleContainer, normalHSEExit, true, environment),
-               "environment_storage_repair_arms_current_legacy_generation");
-  parentFD = open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-  suite.expect(parentFD >= 0 &&
-                   ContainerManagerStorageTestAccess::captureDirectStoragePayloadAt(&staleContainer, parentFD, &failure),
-               "environment_storage_repair_captures_legacy_payload_identity");
-  staleContainer.statefulStoreGenerationSelection.protocolVersion = 1;
-  staleContainer.statefulStoreGenerationSelection.generationUUID = 0xE111;
-  failure.clear();
-  const bool staleRepaired = parentFD >= 0 &&
-      ContainerManagerStorageTestAccess::reconcileEnvironmentRepairAt(&staleContainer, parentFD, &failure);
-  if (parentFD >= 0) close(parentFD);
-  suite.expect(!staleRepaired && !staleContainer.pendingEnvironmentRepairGeneration.has_value(),
-               "environment_storage_repair_rejects_stale_generation_before_action");
-
-  const uint128_t symlinkUUID = 0xE112;
-  String symlinkName = {};
-  symlinkName.assignItoa(symlinkUUID);
-  const auto symlinkPayload = parent / symlinkName.c_str();
-  Container symlinkContainer = makeContainer(symlinkUUID);
-  std::error_code symlinkError = {};
-  const bool symlinkFixtureParent = createDirectoryFixture(outside) && chmod(outside.c_str(), 0711) == 0 &&
-      createDirectoryFixture(symlinkPayload);
-  parentFD = open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-  const bool symlinkCaptured = parentFD >= 0 &&
-      ContainerManagerStorageTestAccess::captureDirectStoragePayloadAt(&symlinkContainer, parentFD, &failure);
-  if (parentFD >= 0) close(parentFD);
-  if (symlinkFixtureParent && symlinkCaptured)
-  {
-    std::filesystem::remove(symlinkPayload, symlinkError);
-    if (!symlinkError)
-      symlinkError.clear();
-  }
-  if (symlinkFixtureParent && symlinkCaptured && !symlinkError)
-    std::filesystem::create_directory_symlink(outside, symlinkPayload, symlinkError);
-  suite.expect(symlinkFixtureParent && symlinkCaptured && !symlinkError,
-               "environment_storage_repair_symlink_fixture_created");
-  struct stat outsideBefore = {};
-  (void)lstat(outside.c_str(), &outsideBefore);
-  suite.expect(ContainerManagerStorageTestAccess::armEnvironmentRepair(
-                   &symlinkContainer, normalHSEExit, true, permission),
-               "environment_storage_repair_arms_symlink_case_for_refusal");
-  parentFD = open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-  failure.clear();
-  const bool symlinkRepaired = parentFD >= 0 &&
-      ContainerManagerStorageTestAccess::reconcileEnvironmentRepairAt(&symlinkContainer, parentFD, &failure);
-  if (parentFD >= 0) close(parentFD);
-  struct stat outsideAfter = {};
-  suite.expect(!symlinkRepaired && !symlinkContainer.pendingEnvironmentRepairGeneration.has_value() &&
-                   lstat(outside.c_str(), &outsideAfter) == 0 && outsideAfter.st_uid == outsideBefore.st_uid &&
-                   outsideAfter.st_gid == outsideBefore.st_gid &&
-                   (outsideAfter.st_mode & 0777) == (outsideBefore.st_mode & 0777),
-               "environment_storage_repair_refuses_symlink_without_mutating_target");
-}
-
 static void testBoundedFailureReport(TestSuite& suite)
 {
   siginfo_t termination = {};
@@ -4002,7 +3939,7 @@ static void testBoundedFailureReport(TestSuite& suite)
       "crash-report-head-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv;
   String standardError =
       "stderr-prefix-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-PC=0xfeedface"_ctv;
-  String summary = ContainerManager::boundedFailureReport(termination, SIGSEGV, report, standardError, nullptr);
+  String summary = ContainerManager::boundedFailureReport(termination, SIGSEGV, report, standardError);
   std::string_view summaryView(reinterpret_cast<const char *>(summary.data()), summary.size());
   suite.expect(summary.size() <= 256, "failure_summary_stays_within_brain_wire_limit");
   suite.expect(summaryView.find("termination=si_code") != std::string_view::npos,
@@ -4012,33 +3949,9 @@ static void testBoundedFailureReport(TestSuite& suite)
   suite.expect(summaryView.find("PC=0xfeedface") != std::string_view::npos,
                "failure_summary_retains_stderr_tail");
 
-  ProdigyStatefulStoreBootFailure failure = {};
-  failure.kind = ProdigyStatefulStoreBootFailureKind::missingMetadata;
-  failure.stage = ProdigyStatefulStoreBootFailureStage::kvdbOpen;
-  failure.systemErrno = ENOENT;
-  failure.rawError = 18432952018894061570ULL;
-  failure.generationUUID = 0x71;
-  String typedReport = {};
-  suite.expect(prodigyStatefulStoreBootFailureEncodeReport(report, failure, typedReport),
-               "failure_summary_fixture_has_typed_boot_failure");
-  String typedSummary = ContainerManager::boundedFailureReport(termination, SIGSEGV, report, standardError, &failure);
-  ProdigyStatefulStoreBootFailure decoded = {};
-  String human = {};
-  suite.expect(typedSummary.size() <= ProdigyStatefulStoreBootFailureReportMaximumBytes &&
-                   prodigyStatefulStoreBootFailureDecodeReport(typedSummary, decoded, human) &&
-                   decoded.kind == failure.kind && decoded.stage == failure.stage &&
-                   decoded.systemErrno == ENOENT && decoded.rawError == failure.rawError &&
-                   decoded.generationUUID == failure.generationUUID,
-               "failure_summary_preserves_typed_cause_and_generation_through_truncation");
-  std::string_view humanView(reinterpret_cast<const char *>(human.data()), human.size());
-  suite.expect(humanView.find("termination=si_code") != std::string_view::npos &&
-                   humanView.find("crash-report-head") != std::string_view::npos &&
-                   humanView.find("PC=0xfeedface") != std::string_view::npos,
-               "failure_summary_typed_path_retains_termination_report_head_and_stderr_tail");
-
   FailureReport recorded = {};
   recorded.containerUUID = 0x81;
-  recorded.report = typedSummary;
+  recorded.report = summary;
   recorded.approxTimeMs = 1;
   recorded.nthCrash = 1;
   recorded.signal = SIGSEGV;
@@ -4050,32 +3963,103 @@ static void testBoundedFailureReport(TestSuite& suite)
   DeploymentStatusReport restored = {};
   suite.expect(BitseryEngine::serialize(statusBytes, status) &&
                    BitseryEngine::deserializeSafe(statusBytes, restored) && restored.failureReports.size() == 1 &&
-                   restored.failureReports[0].report == typedSummary &&
-                   prodigyStatefulStoreBootFailureDecodeReport(restored.failureReports[0].report, decoded, human) &&
-                   decoded.generationUUID == failure.generationUUID,
-               "failure_summary_typed_record_survives_existing_status_codec");
+                   restored.failureReports[0].report == summary,
+               "failure_summary_record_survives_existing_status_codec");
   String displayed = {};
   recorded.stringify(displayed, 0);
   const std::string_view displayedView(reinterpret_cast<const char *>(displayed.data()), displayed.size());
-  suite.expect(displayedView.find("crash-report-head") != std::string_view::npos &&
-                   displayedView.find("@NTBF1:") == std::string_view::npos,
-               "failure_summary_display_preserves_human_report_without_wire_trailer");
+  suite.expect(displayedView.find("crash-report-head") != std::string_view::npos,
+               "failure_summary_display_preserves_human_report");
+}
 
-  String malformed = typedReport.substr(0, typedReport.size() - 1, Copy::yes);
-  String malformedSummary = ContainerManager::boundedFailureReport(termination, SIGSEGV, malformed, standardError, nullptr);
-  suite.expect(!prodigyStatefulStoreBootFailureDecodeReport(malformedSummary, decoded, human),
-               "failure_summary_does_not_promote_malformed_trailer_to_typed_evidence");
-  const String copiedTrailer = typedReport.substr(typedReport.size() - ProdigyStatefulStoreBootFailureTrailerBytes,
-                                                  ProdigyStatefulStoreBootFailureTrailerBytes, Copy::yes);
-  const String stderrOnly = ContainerManager::boundedFailureReport(termination, SIGSEGV, report, copiedTrailer, nullptr);
-  suite.expect(!prodigyStatefulStoreBootFailureDecodeReport(stderrOnly, decoded, human),
-               "failure_summary_stderr_cannot_supply_a_typed_boot_failure");
+static void testGlobalSingleWriterPlacementShardInvariant(TestSuite& suite, uint16_t applicationID)
+{
+  // Reconciliation may have to return through incomplete() before a local
+  // machine is eligible. That path must still initialize the launch-plan
+  // shard invariant consumed by Truth peer admission.
+  ScopedFreshRing ring;
+  TestBrain brain = {};
+  BrainBase *savedBrain = thisBrain;
+  thisBrain = &brain;
+  brain.brainConfig.clusterUUID = 17;
+  ApplicationDeployment deployment = {};
+  seedCommonPlan(deployment, true);
+  deployment.plan.config.applicationID = applicationID;
+  deployment.plan.config.type = ApplicationType::stateful;
+  deployment.plan.stateful.writerMode = StatefulWriterMode::globalSingleWriter;
+  deployment.plan.stateful.neverShard = true;
+  deployment.plan.stateful.clientPrefix = prodigyRuntimeStatefulServicePrefix(applicationID, 1);
+  deployment.plan.stateful.siblingPrefix = prodigyRuntimeStatefulServicePrefix(applicationID, 11);
+  deployment.plan.stateful.cousinPrefix = prodigyRuntimeStatefulServicePrefix(applicationID, 3);
+  deployment.plan.stateful.seedingPrefix = prodigyRuntimeStatefulServicePrefix(applicationID, 4);
+  deployment.plan.stateful.shardingPrefix = prodigyRuntimeStatefulServicePrefix(applicationID, 5);
+  deployment.nShardGroups = 0;
+  GlobalSingleWriterMembershipProjection group = {};
+  group.protocolVersion = 1; group.membershipUUID = 15; group.operationUUID = 16;
+  group.localClusterUUID = brain.brainConfig.clusterUUID;
+  group.deploymentID = deployment.plan.config.deploymentID(); group.generation = 1;
+  group.expectedCommittedConfigIndex = 22;
+  group.expectedCommittedConfigSHA256.assign("1111111111111111111111111111111111111111111111111111111111111111"_ctv);
+  group.genesisMemberIDs = {1, 2, 3}; group.highestAllocatedMemberID = 3;
+  for (int memberID = 1; memberID <= 3; ++memberID)
+  {
+    GlobalSingleWriterMember member = {};
+    member.memberID = memberID; member.clusterUUID = group.localClusterUUID;
+    member.containerUUID = 100 + memberID; member.privateIPv6 = IPAddress(uint128_t(memberID));
+    group.members.push_back(member);
+  }
+  suite.expect(prodigyGlobalSingleWriterMembershipProjectionValid(group) &&
+                   deployment.reconcileGlobalSingleWriterPlacement(group) == false && deployment.nShardGroups == 1,
+               "global_single_writer_reconcile_incomplete_path_initializes_one_shard_before_scheduler_launch");
+  suite.expect(deployment.nTarget() == 3,
+               "global_single_writer_reconcile_reports_all_three_local_voters_before_launch");
+  group.members[1].clusterUUID = 18;
+  group.members[2].clusterUUID = 19;
+  suite.expect(!deployment.reconcileGlobalSingleWriterPlacement(group) && deployment.nTarget() == 1,
+               "global_single_writer_reconcile_reports_only_local_projected_members");
+  GlobalSingleWriterMember learner = {};
+  learner.memberID = 4; learner.clusterUUID = group.localClusterUUID;
+  learner.containerUUID = 104; learner.privateIPv6 = IPAddress(uint128_t(4));
+  learner.role = GlobalSingleWriterMemberRole::learner;
+  group.members.push_back(learner);
+  group.highestAllocatedMemberID = 4; group.replacementPending = true;
+  suite.expect(!deployment.reconcileGlobalSingleWriterPlacement(group) && deployment.nTarget() == 2,
+               "global_single_writer_reconcile_counts_learner_before_its_session_admission");
+  group.members.erase(group.members.begin());
+  group.retiredMemberIDs.push_back(1);
+  suite.expect(!deployment.reconcileGlobalSingleWriterPlacement(group) && deployment.nTarget() == 1,
+               "global_single_writer_reconcile_excludes_retired_local_member_from_target");
+  group.members.back().clusterUUID = 18;
+  suite.expect(deployment.reconcileGlobalSingleWriterPlacement(group) && deployment.nTarget() == 0,
+               "global_single_writer_reconcile_retired_only_site_has_no_local_target");
+  ContainerView replay = {};
+  replay.uuid = 101;
+  const auto missingMembershipPlan = replay.generatePlan(deployment.plan, 1);
+  suite.expect(missingMembershipPlan.globalSingleWriterMembership.protocolVersion != 0 &&
+      !prodigyGlobalSingleWriterContainerPlanValid(missingMembershipPlan),
+      "global_replay_without_membership_cannot_fall_back_to_local_writer");
+  deployment.plan.stateful.writerMode = StatefulWriterMode::localSingleWriter;
+  suite.expect(!deployment.reconcileGlobalSingleWriterPlacement(group), "global_reconcile_requires_explicit_plan_opt_in");
+  thisBrain = savedBrain;
 }
 
 int main(void)
 {
   TestSuite suite;
   const char *selector = std::getenv("PRODIGY_TEST_ONLY");
+  if (selector != nullptr && std::strcmp(selector, "truth-placement") == 0)
+  {
+    for (uint16_t app : {uint16_t(10), uint16_t(42)}) testGlobalSingleWriterPlacementShardInvariant(suite, app);
+    dprintf(STDOUT_FILENO, "truth_placement passed=%d failed=%d\n", suite.passed, suite.failed);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (selector == nullptr) for (uint16_t app : {uint16_t(10), uint16_t(42)}) testGlobalSingleWriterPlacementShardInvariant(suite, app);
+  if (selector != nullptr && std::strcmp(selector, "storage-parent-traversal") == 0)
+  {
+    testStorageParentTraversal(suite);
+    dprintf(STDOUT_FILENO, "storage_parent_traversal passed=%d failed=%d\n", suite.passed, suite.failed);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (selector == nullptr || std::strcmp(selector, "retained-store-failure") == 0)
   {
     testRetainedStatefulFilesAfterFailure(suite);
@@ -4084,27 +4068,11 @@ int main(void)
       return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
   }
-  if (selector == nullptr || std::strcmp(selector, "environment-storage-repair") == 0)
-  {
-    testStatefulEnvironmentStorageRepair(suite);
-    if (selector != nullptr) {
-      dprintf(STDOUT_FILENO, "environment_storage_repair passed=%d failed=%d\n", suite.passed, suite.failed);
-      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
-    }
-  }
-  if (selector == nullptr || std::strcmp(selector, "typed-boot-failure") == 0)
+  if (selector == nullptr || std::strcmp(selector, "bounded-failure-report") == 0)
   {
     testBoundedFailureReport(suite);
     if (selector != nullptr) {
-      dprintf(STDOUT_FILENO, "typed_boot_failure passed=%d failed=%d\n", suite.passed, suite.failed);
-      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
-    }
-  }
-  if (selector == nullptr || std::strcmp(selector, "store-generation-metadata") == 0)
-  {
-    testStoreGenerationLaunchMetadata(suite);
-    if (selector != nullptr) {
-      dprintf(STDOUT_FILENO, "store_generation_metadata passed=%d failed=%d\n", suite.passed, suite.failed);
+      dprintf(STDOUT_FILENO, "bounded_failure_report passed=%d failed=%d\n", suite.passed, suite.failed);
       return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
   }
@@ -7777,7 +7745,7 @@ int main(void)
     plan.stateful.allowUpdateInPlace = true;
     plan.stateful.seedingAlways = false;
     plan.stateful.neverShard = false;
-    plan.stateful.allMasters = true;
+    plan.stateful.writerMode = StatefulWriterMode::allMasters;
     plan.useHostNetworkNamespace = true;
     plan.networkAccess = ContainerNetworkAccess::declaredOnly;
     plan.hasTlsIssuancePolicy = true;
@@ -7820,7 +7788,7 @@ int main(void)
                  "deployment_plan_roundtrip_preserves_isolated_child_memory");
     suite.expect(roundtrip.config.containerBlobSHA256.equals(plan.config.containerBlobSHA256), "deployment_plan_roundtrip_preserves_container_blob_sha256");
     suite.expect(roundtrip.config.containerBlobBytes == plan.config.containerBlobBytes, "deployment_plan_roundtrip_preserves_container_blob_bytes");
-    suite.expect(roundtrip.stateful.allMasters == true, "deployment_plan_roundtrip_preserves_all_masters");
+    suite.expect(roundtrip.stateful.writerMode == StatefulWriterMode::allMasters, "deployment_plan_roundtrip_preserves_all_masters");
     suite.expect(roundtrip.useHostNetworkNamespace == true, "deployment_plan_roundtrip_preserves_host_network_namespace");
     suite.expect(roundtrip.networkAccess == ContainerNetworkAccess::declaredOnly, "deployment_plan_roundtrip_preserves_network_access");
     suite.expect(roundtrip.hasTlsIssuancePolicy, "deployment_plan_roundtrip_preserves_tls_policy_flag");
@@ -8327,9 +8295,20 @@ int main(void)
     Vector<uint64_t> flags = {};
     prodigyBuildContainerStartupFlags(plan, flags);
 
-    suite.expect(flags.size() == 2, "container_startup_flags_stateful_include_two_entries");
+    suite.expect(flags.size() == 3, "container_startup_flags_stateful_include_disposition_entry");
     suite.expect(flags[0] == 7, "container_startup_flags_stateful_preserve_shard_group");
     suite.expect(flags[1] == 13, "container_startup_flags_stateful_preserve_shard_group_count");
+    suite.expect(prodigyStatefulInitialStoreDispositionFromStartupFlags(flags) ==
+                     StatefulInitialStoreDisposition::mustRecover,
+                 "container_startup_flags_invalid_stateful_plan_fails_closed");
+    flags.pop_back();
+    suite.expect(prodigyStatefulInitialStoreDispositionFromStartupFlags(flags) ==
+                     StatefulInitialStoreDisposition::mustRecover,
+                 "container_startup_flags_legacy_two_entry_shape_fails_closed");
+    flags.push_back(99);
+    suite.expect(prodigyStatefulInitialStoreDispositionFromStartupFlags(flags) ==
+                     StatefulInitialStoreDisposition::mustRecover,
+                 "container_startup_flags_unknown_disposition_fails_closed");
   }
 
   {
@@ -14885,7 +14864,7 @@ int main(void)
 
     ApplicationDeployment deployment;
     seedCommonPlan(deployment, true);
-    deployment.plan.stateful.allMasters = true;
+    deployment.plan.stateful.writerMode = StatefulWriterMode::allMasters;
 
     Rack rack {};
     rack.uuid = 1902;
@@ -15006,7 +14985,7 @@ int main(void)
 
     ApplicationDeployment deployment;
     seedCommonPlan(deployment, true);
-    deployment.plan.stateful.allMasters = true;
+    deployment.plan.stateful.writerMode = StatefulWriterMode::allMasters;
 
     Rack rack {};
     rack.uuid = 1903;

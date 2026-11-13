@@ -1441,17 +1441,6 @@ public:
     ProdigyCousinSessionRecord record = {};
     uint128_t sourceMachineUUID = 0;
     uint128_t destinationMachineUUID = 0;
-    uint64_t destinationIOGeneration = 0;
-    uint32_t destinationCrashCount = 0;
-    // A native receipt is usable only after the target has acknowledged this
-    // exact two-half lease.  Keep the previous acknowledgement while a
-    // renewal is in flight so a transient renewal cannot manufacture a proof
-    // gap or extend an expired lease.
-    int64_t pendingNativeLeaseExpiresAtMilliseconds = 0;
-    uint64_t acknowledgedNativeLeaseGeneration = 0;
-    int64_t acknowledgedNativeLeaseExpiresAtMs = 0;
-    CousinRouteHalf pendingLocalHalf = CousinRouteHalf::source;
-    bool nativeRepairRenewing = false;
     uint64_t carrierIOGeneration = 0;
     uint64_t applicationIOGeneration = 0;
     uint32_t applicationCrashCount = 0;
@@ -1496,7 +1485,6 @@ public:
     uint128_t neuronMachineUUID = 0;
     uint64_t neuronIOGeneration = 0;
     uint64_t authorityEpoch = 0;
-    uint32_t crashCount = 0;
   };
   Vector<StatefulStoreReceiptCache> statefulStoreReceiptCaches = {};
   class StatefulStoreSeedAuthorityCache {
@@ -2278,6 +2266,14 @@ public:
     RoutableResourceLeaseReport *inlineResponse = nullptr;
     uint32_t outstanding = 0;
   };
+  struct PendingGlobalSingleWriterControl {
+    ProdigyGlobalSingleWriterControl command;
+    Mothership* stream;
+    uint64_t streamIncarnation, epoch, neuronGeneration, crashes;
+    int64_t deadlineMs;
+  };
+  bytell_hash_map<uint128_t, PendingGlobalSingleWriterControl> pendingGlobalSingleWriterControls;
+
   class PendingContainerLogs
   {
   public:
@@ -2512,7 +2508,6 @@ public:
     uint64_t authorityEpoch = 0;
     uint32_t crashCount = 0;
     bool releasing = false;
-    int64_t lastRepairSendMs = 0;
   };
   bytell_hash_map<uint128_t, StatefulSourceCutCache> statefulSourceCuts;
 
@@ -2538,7 +2533,6 @@ public:
     uint32_t requiredContainerRetirementJournalVersion = 0;
     uint32_t targetContainerRetirementJournalVersion = 0;
     bool statelessRetirementReaderRequired = false;
-    uint64_t requiredStoreRecoveryReaderVersion = 0;
     uint64_t targetBinaryVersion = 0;
     String admittedTargetContractSHA256 = {};
     bool hasExplicitFollowerConcurrency = false;
@@ -9609,153 +9603,6 @@ public:
     return true;
   }
 
-  bool statefulStoreGenerationPeersCapable(bool requireMemberRepair = false) const
-  {
-    if (!statefulServingPeersCapable()) return false;
-    ClusterTopology topology;
-    if (!loadAuthoritativeClusterTopology(topology)) return false;
-    for (const auto& member : topology.machines) {
-      if (!member.isBrain || clusterMachineMatchesThisBrain(member)) continue;
-      const auto *peer = brainPeerForTopologyMember(member);
-      if (!peer || peer->version < ProdigyStatefulStoreGenerationMinimumVersion ||
-          !peer->statefulStoreGenerationCapabilityAcknowledged ||
-          (requireMemberRepair && (peer->version < ProdigyNativeMemberRepairMinimumVersion ||
-                                   !peer->nativeMemberRepairCapabilityAcknowledged))) return false;
-    }
-    return true;
-  }
-
-  uint64_t requiredStoreRecoveryReaderVersion() const
-  {
-    if (!masterAuthorityRuntimeState.statefulServingMemberRepairs.empty() ||
-        std::any_of(masterAuthorityRuntimeState.statefulStoreGenerationSelections.begin(),
-                    masterAuthorityRuntimeState.statefulStoreGenerationSelections.end(), [](const auto& selected) {
-          return selected.authority.sourceClusterUUID == selected.authority.targetClusterUUID;
-        })) return ProdigyNativeMemberRepairMinimumVersion;
-    return masterAuthorityRuntimeState.statefulStoreGenerationSelections.empty() ? 0 :
-        ProdigyStatefulStoreGenerationMinimumVersion;
-  }
-
-  StatefulServingLaunchAdmission prepareStatefulStoreGenerationLaunch(
-      const Machine *machine, String& encodedBootstrap) const override
-  {
-    NeuronContainerBootstrap bootstrap = {};
-    if (!BitseryEngine::deserializeSafe(encodedBootstrap, bootstrap))
-    {
-      bootstrap = {};
-      if (!BitseryEngine::deserializeSafe(encodedBootstrap, bootstrap.plan))
-        return StatefulServingLaunchAdmission::rejected;
-    }
-
-    ProdigyStatefulStoreGenerationSelection selected = {.protocolVersion = 0};
-    if (!prodigyProjectStatefulStoreGeneration(masterAuthorityRuntimeState,
-          statefulServingRuntimeStates, bootstrap.plan, selected))
-      return StatefulServingLaunchAdmission::rejected;
-    if (selected.protocolVersion == 0)
-    {
-      // A captured selected home cannot become the legacy home because its
-      // authority record is missing during replay or recovery.
-      return bootstrap.statefulStoreGenerationSelection.protocolVersion == 0
-          ? StatefulServingLaunchAdmission::ready : StatefulServingLaunchAdmission::rejected;
-    }
-    if (!weAreMaster || machine == nullptr ||
-        selected.authority.targetClusterUUID != brainConfig.clusterUUID)
-      return StatefulServingLaunchAdmission::rejected;
-
-    const auto sealed = std::find_if(statefulServingRuntimeStates.begin(), statefulServingRuntimeStates.end(),
-        [&](const auto& state) { return state.plan.uuid == bootstrap.plan.uuid; });
-    if (sealed == statefulServingRuntimeStates.end() || sealed->machineUUID != machine->uuid)
-      return StatefulServingLaunchAdmission::rejected;
-    // Inventory recovery needs this exact durable projection to restore its
-    // processes. Waiting for that inventory here would prevent its own replay.
-    // New placement admission remains in prepareStatefulServingLaunch.
-    if (!masterAuthorityRuntimeStateDurable ||
-        durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation ||
-        !statefulStoreGenerationPeersCapable(selected.authority.sourceClusterUUID == selected.authority.targetClusterUUID) ||
-        !containerRetirementAuthorityAcknowledged() || !statefulServingResourceObservationSupported(machine))
-      return StatefulServingLaunchAdmission::pending;
-
-    bootstrap.statefulStoreGenerationSelection = std::move(selected);
-    String projected = {};
-    if (!BitseryEngine::serialize(projected, bootstrap))
-      return StatefulServingLaunchAdmission::rejected;
-    encodedBootstrap = std::move(projected);
-    return StatefulServingLaunchAdmission::ready;
-  }
-
-  bool nativeRepairLivePlanMatches(ContainerView *member, const BrainReplicatedContainerRuntimeState& sealed) const
-  {
-    BrainReplicatedContainerRuntimeState live = {};
-    return member && captureReplicatedContainerRuntimeState(member, live) && live.machineUUID == sealed.machineUUID &&
-        prodigyStatefulServingImmutablePlanMatches(sealed, live.plan);
-  }
-
-  // Accept a diagnostic only from the current owner of the failed home.
-  // Retries of that home share one durable request, even across master
-  // election. The selected generation acquires authority only after the
-  // native donor returns a verifiable cut.
-  void acceptNativeMemberRepair(NeuronView *neuron, ApplicationDeployment *deployment,
-                                ContainerView *target, const String& report)
-  {
-    if (!weAreMaster || !deployment || !target || !target->machine || !target->isStateful ||
-        target->lifetime != ApplicationLifetime::base || target->plannedWork ||
-        target->state != ContainerState::crashedRestarting || target->runtimeReady ||
-        !deployment->plan.isStateful || deployment->plan.config.deploymentID() != target->deploymentID ||
-        (deployment->plan.config.applicationID != 3 && deployment->plan.config.applicationID != 4) ||
-        !containerRetirementNeuronAuthorized(neuron, target->machine->uuid) ||
-        !statefulServingResourceObservationSupported(target->machine)) return;
-    ProdigyStatefulStoreBootFailure failure;
-    String human;
-    target->nativeBootFailure = {.protocolVersion = 0};
-    if (!prodigyStatefulStoreBootFailureDecodeReport(report, failure, human)) return;
-    target->nativeBootFailure = failure;
-    target->nativeFailureStreamGeneration = neuron->ioGeneration;
-    target->nativeFailureAuthorityEpoch = masterAuthorityEpoch;
-    target->nativeFailureCrashCount = target->nCrashes;
-    using Kind = ProdigyStatefulStoreBootFailureKind;
-    // An I/O or permission error cannot establish that a store needs seeding.
-    // Local restart and storage reconciliation own those errors.
-    if (failure.kind != Kind::missingMetadata && failure.kind != Kind::malformedMetadata &&
-        failure.kind != Kind::unverifiedStore && failure.kind != Kind::interruptedInitialization) return;
-    if (!masterAuthorityRuntimeStateDurable || masterAuthorityPersistencePending != 0 ||
-        durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation ||
-        !statefulServingRecoveryReady() || !statefulStoreGenerationPeersCapable(true) ||
-        !containerRetirementAuthorityAcknowledged() ||
-        containerRuntimeStateRetired(masterAuthorityRuntimeState, target->uuid)) return;
-    const auto selected = std::find_if(masterAuthorityRuntimeState.statefulStoreGenerationSelections.begin(),
-        masterAuthorityRuntimeState.statefulStoreGenerationSelections.end(),
-        [&](const auto& current) { return current.authority.targetContainerUUID == target->uuid; });
-    if (failure.generationUUID != (selected == masterAuthorityRuntimeState.statefulStoreGenerationSelections.end()
-            ? uint128_t(0) : selected->generationUUID)) return;
-    auto& requests = masterAuthorityRuntimeState.statefulServingMemberRepairs;
-    auto position = std::lower_bound(requests.begin(), requests.end(), target->uuid,
-        [](const auto& current, uint128_t uuid) { return current.targetContainerUUID < uuid; });
-    const bool replacingExpiredPartial = position != requests.end() && position->targetContainerUUID == target->uuid;
-    if (replacingExpiredPartial &&
-        (selected == masterAuthorityRuntimeState.statefulStoreGenerationSelections.end() ||
-         selected->authority.operationUUID != position->operationUUID || position->failure.generationUUID == failure.generationUUID ||
-         failure.kind != Kind::interruptedInitialization || failure.stage != ProdigyStatefulStoreBootFailureStage::checkpoint ||
-         failure.systemErrno != ESTALE || selected->authority.retainUntilMilliseconds > uint64_t(Time::now<TimeResolution::ms>()))) return;
-    if ((!replacingExpiredPartial && requests.size() >= 4096) || masterAuthorityRuntimeState.generation >= UINT64_MAX - 1) return;
-    const ProdigyStatefulServingAuthority *scope = nullptr;
-    ProdigyStatefulServingMemberRepair request = {};
-    const auto *sealed = prodigyStatefulServingRepairMember(masterAuthorityRuntimeState, statefulServingRuntimeStates,
-        target->deploymentID, target->shardGroup, target->uuid, target->machine->uuid, scope, request.targetPlanSHA256);
-    if (!sealed || !nativeRepairLivePlanMatches(target, *sealed)) return;
-    if (RAND_priv_bytes(reinterpret_cast<unsigned char *>(&request.operationUUID), sizeof(request.operationUUID)) != 1 ||
-        request.operationUUID == 0) return;
-    request.deploymentID = target->deploymentID;
-    request.shardGroup = target->shardGroup;
-    request.targetContainerUUID = target->uuid;
-    request.targetMachineUUID = target->machine->uuid;
-    request.servingRevision = scope->revision;
-    request.failure = failure;
-    if (!prodigyStatefulServingMemberRepairValid(request)) return;
-    if (replacingExpiredPartial) *position = std::move(request);
-    else requests.insert(position, std::move(request));
-    commitMasterAuthorityStateChangeAsync({});
-  }
-
   bool allMastersSeedBootstrapPeersCapable() const
   {
     if (!statefulServingPeersCapable()) return false;
@@ -9790,6 +9637,215 @@ public:
         authority = saved.dataAuthority;
         return true;
       }
+    return false;
+  }
+
+  void replyGlobalSingleWriterControl(Mothership* stream, const ProdigyGlobalSingleWriterControl& source, const char* error = nullptr) {
+    auto response = source;
+    response.bindings = {.protocolVersion = 0};
+    response.response = true;
+    if (error) { response.success = false; response.failure.assign(error); }
+    String encoded;
+    if (BitseryEngine::serialize(encoded,response)) {
+      Message::construct(stream->wBuffer,MothershipTopic::globalSingleWriterControl,encoded);
+      (void)flushActiveMothershipSendBuffer(stream,"truth-control");
+    }
+  }
+
+  static bool globalSingleWriterBindingsMatchRuntimePlan(const GlobalSingleWriterMembershipProjection& group,
+                                                        const ContainerPlan& plan) {
+    for (const auto& member : group.members) {
+      const bool sameUUID = plan.uuid == member.containerUUID;
+      const bool sameAddress = std::any_of(plan.addresses.begin(),plan.addresses.end(),[&](const auto& address) {
+        return address.network.equals(member.privateIPv6);
+      });
+      if ((sameUUID || sameAddress) && (!sameUUID || !sameAddress ||
+          member.clusterUUID != group.localClusterUUID || plan.config.deploymentID() != group.deploymentID)) return false;
+    }
+    return true;
+  }
+
+  bool globalSingleWriterBindingsMatchLiveContainers(const GlobalSingleWriterMembershipProjection& group) const {
+    for (const auto& member : group.members) {
+      for (const auto& [uuid,container] : containers) {
+        if (!container) continue;
+        uint128_t endpoint = 0; std::memcpy(&endpoint,member.privateIPv6.v6,sizeof(endpoint));
+        const bool sameUUID = uuid == member.containerUUID;
+        const bool sameAddress = container->meshAddress == endpoint || container->requiredGlobalSingleWriterMeshAddress == endpoint;
+        if ((sameUUID || sameAddress) && (!sameUUID || !sameAddress ||
+            member.clusterUUID != brainConfig.clusterUUID || container->deploymentID != group.deploymentID ||
+            (container->globalSingleWriterMemberID && container->globalSingleWriterMemberID != member.memberID))) return false;
+      }
+      if (member.clusterUUID != brainConfig.clusterUUID) continue;
+      for (const auto* machine : machines) {
+        if (!machine || !machine->fragment) continue;
+        const IPAddress endpoint(MeshNode::addressForFragment(container_network_subnet6,brainConfig.datacenterFragment,
+                                                               machine->fragment,member.privateIPv6.v6[15]));
+        if (!endpoint.equals(member.privateIPv6) || !machine->usedContainerFragments.contains(member.privateIPv6.v6[15])) continue;
+        const auto owner = containers.find(member.containerUUID);
+        if (owner == containers.end() || !owner->second || owner->second->machine != machine ||
+            owner->second->fragment != member.privateIPv6.v6[15]) return false;
+      }
+    }
+    // Canonical recovered inventory can await its Machine/deployment view.
+    // It still owns the identity while ordinary recovery materializes it.
+    for (const auto& [deployment,states] : pendingReplicatedContainerRuntimeStates) for (const auto& state : states)
+      if (!globalSingleWriterBindingsMatchRuntimePlan(group,state.plan)) return false;
+    return true;
+  }
+
+  const Vector<GlobalSingleWriterMembershipProjection>& globalSingleWriterMemberships() const override {
+    return masterAuthorityRuntimeState.globalSingleWriterMembershipProjections;
+  }
+
+  bool applyGlobalSingleWriterPlacement(ProdigyGlobalSingleWriterPlacementExchange& r) {
+    if (!weAreMaster || !ignited || !masterAuthorityRuntimeStateDurable || masterAuthorityPersistencePending ||
+        durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation || r.success ||
+        !r.membershipUUID || r.localClusterUUID != brainConfig.clusterUUID || !prodigyGlobalSingleWriterDeploymentIDValid(r.deploymentID))
+      return false;
+    GlobalSingleWriterMembershipProjection current;
+    const bool exists = desiredGlobalSingleWriterMembership(r.deploymentID,current);
+    if (exists && current.membershipUUID != r.membershipUUID) return false;
+    auto livePlan = deployments.find(r.deploymentID);
+    if (livePlan != deployments.end() && (!livePlan->second ||
+        !prodigyGlobalSingleWriterPlanValid(livePlan->second->plan))) return false;
+    if (r.action == GlobalSingleWriterPlacementAction::offerAddress) {
+      if (r.member.memberID <= 0 || !r.member.containerUUID || r.member.clusterUUID != r.localClusterUUID) return false;
+      // An offer is advisory. The scheduler rechecks and claims the fragment
+      // through Machine at launch. Never substitute another endpoint.
+      const auto deployment = deployments.find(r.deploymentID);
+      size_t bestOccupancy = SIZE_MAX;
+      uint32_t bestMachine = UINT32_MAX;
+      for (auto* machine : machines) {
+        if (!prodigyMachineReadyForScheduling(machine) || !neuronControlStreamActive(machine) ||
+            (deployment != deployments.end() && (!deployment->second ||
+                !ApplicationDeployment::nFitOnMachine(deployment->second, machine, 1)))) continue;
+        const auto prefix = MeshNode::addressForFragment(container_network_subnet6, brainConfig.datacenterFragment,
+                                                          machine->fragment, 0);
+        const auto occupancy = size_t(std::count_if(r.reserved.begin(), r.reserved.end(), [&](const auto& member) {
+          return member.clusterUUID == r.localClusterUUID && std::memcmp(member.privateIPv6.v6, &prefix, 15) == 0;
+        }));
+        if (occupancy > bestOccupancy || (occupancy == bestOccupancy && machine->fragment >= bestMachine)) continue;
+        for (uint16_t fragment = 1; fragment <= 255; ++fragment) {
+          if (!machine->containerFragmentAvailable(uint8_t(fragment),globalSingleWriterMemberships(),brainConfig.clusterUUID)) continue;
+          IPAddress candidate(MeshNode::addressForFragment(container_network_subnet6, brainConfig.datacenterFragment,
+                                                            machine->fragment, uint8_t(fragment)));
+          auto used = [&](const auto& member) { return member.privateIPv6.equals(candidate); };
+          if (std::any_of(r.reserved.begin(),r.reserved.end(),used) ||
+              (exists && std::any_of(current.members.begin(),current.members.end(),used))) continue;
+          r.member.privateIPv6 = candidate;
+          bestMachine = machine->fragment;
+          bestOccupancy = occupancy;
+          break;
+        }
+      }
+      return bestOccupancy != SIZE_MAX;
+    }
+    if (!exists || r.generation != current.generation || r.committedConfigIndex != current.expectedCommittedConfigIndex ||
+        r.committedConfigSHA256 != current.expectedCommittedConfigSHA256) return false;
+    auto deployed = deployments.find(r.deploymentID);
+    if (deployed == deployments.end() || !deployed->second || !prodigyGlobalSingleWriterPlanValid(deployed->second->plan)) return false;
+    if (r.action == GlobalSingleWriterPlacementAction::reconcile) return deployed->second->reconcileGlobalSingleWriterPlacement(current);
+    if (r.action != GlobalSingleWriterPlacementAction::retire || r.member.clusterUUID != brainConfig.clusterUUID ||
+        !std::binary_search(current.retiredMemberIDs.begin(),current.retiredMemberIDs.end(),r.member.memberID)) return false;
+    if (!deployed->second->reconcileGlobalSingleWriterPlacement(current,&r.member)) {
+      r.failure.assign("retired container does not match its placement or its Neuron is unavailable"_ctv);
+      return false;
+    }
+    auto retiring = containers.find(r.member.containerUUID);
+    if (retiring == containers.end()) return true;
+    const auto* pending = retiring->second;
+    char status[128];
+    std::snprintf(status, sizeof(status), "retired member %d awaits terminal destruction (state=%u work=%u)",
+        r.member.memberID, pending ? unsigned(pending->state) : 0, unsigned(pending && pending->plannedWork));
+    r.failure.assign(status);
+    return false;
+  }
+
+  void beginGlobalSingleWriterControl(Mothership* stream, ProdigyGlobalSingleWriterControl command) {
+    if (!prodigyGlobalSingleWriterControlRequestValid(command) || command.exchangeUUID || command.bindings.protocolVersion ||
+        !weAreMaster || !ignited || !masterAuthorityRuntimeStateDurable || masterAuthorityPersistencePending ||
+        durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation ||
+        command.localClusterUUID != brainConfig.clusterUUID ||
+        !desiredGlobalSingleWriterMembership(command.deploymentID,command.bindings)) {
+      replyGlobalSingleWriterControl(stream,command,"global single-writer control needs an admitted local group and durable master");
+      return;
+    }
+    if (!command.generation && (command.action == GlobalSingleWriterControlAction::inspect ||
+        command.action == GlobalSingleWriterControlAction::inspectReservation)) command.generation = command.bindings.generation;
+    auto deployment = deployments.find(command.deploymentID);
+    auto container = containers.find(command.containerUUID);
+    if (!prodigyGlobalSingleWriterControlForProjection(command,command.bindings) || container == containers.end() ||
+        !container->second || deployment == deployments.end() || !deployment->second ||
+        !prodigyGlobalSingleWriterPlanValid(deployment->second->plan) || container->second->deploymentID != command.deploymentID ||
+        !container->second->machine || !neuronControlStreamActive(container->second->machine) ||
+        pendingGlobalSingleWriterControls.size() >= 64) {
+      replyGlobalSingleWriterControl(stream,command,"global single-writer member or its authenticated Neuron is unavailable");
+      return;
+    }
+    // Each hop echoes a per-dispatch nonce even when a durable operation is retried.
+    command.exchangeUUID = Random::generateNumberWithNBits<128,uint128_t>();
+    if (!command.exchangeUUID || pendingGlobalSingleWriterControls.contains(command.exchangeUUID)) {
+      replyGlobalSingleWriterControl(stream,command,"unable to allocate global single-writer exchange");
+      return;
+    }
+    String encoded;
+    if (!BitseryEngine::serialize(encoded,command)) { replyGlobalSingleWriterControl(stream,command,"invalid global single-writer command"); return; }
+    auto* target = container->second;
+    auto& neuron = target->machine->neuron;
+    pendingGlobalSingleWriterControls[command.exchangeUUID] = {command,stream,stream->connectionIncarnation,masterAuthorityEpoch,
+        neuron.ioGeneration,uint64_t(target->nCrashes),Time::now<TimeResolution::ms>() + 5000};
+    Message::construct(neuron.wBuffer,NeuronTopic::globalSingleWriterControl,target->uuid,encoded);
+    Ring::queueSend(&neuron);
+  }
+
+  void acceptGlobalSingleWriterControl(NeuronView* neuron, const ProdigyGlobalSingleWriterControl& r) {
+    if (!neuron || !neuron->machine || !prodigyGlobalSingleWriterControlReportValid(r)) return;
+    auto it = pendingGlobalSingleWriterControls.find(r.exchangeUUID);
+    if (it == pendingGlobalSingleWriterControls.end()) return;
+    const auto& pending = it->second;
+    const auto& q = pending.command;
+    auto live = containers.find(q.containerUUID);
+    if (!weAreMaster || pending.epoch != masterAuthorityEpoch || pending.deadlineMs <= Time::now<TimeResolution::ms>() ||
+        live == containers.end() || !live->second || live->second->machine != neuron->machine ||
+        !neuronControlStreamActive(neuron->machine) || &neuron->machine->neuron != neuron ||
+        pending.neuronGeneration != neuron->ioGeneration || pending.crashes != uint64_t(live->second->nCrashes) ||
+        r.operationUUID != q.operationUUID || r.membershipUUID != q.membershipUUID || r.containerUUID != q.containerUUID ||
+        r.memberID != q.memberID || r.deploymentID != q.deploymentID || r.localClusterUUID != q.localClusterUUID ||
+        r.action != q.action || r.generation != q.generation || r.targetMemberID != q.targetMemberID ||
+        r.expectedCommittedConfigIndex != q.expectedCommittedConfigIndex || r.expectedCommittedConfigSHA256 != q.expectedCommittedConfigSHA256 ||
+        r.protocolVersion != q.protocolVersion || r.reservationTopic != q.reservationTopic ||
+        r.reservationRequestUUID != q.reservationRequestUUID || r.minimumAppliedIndex != q.minimumAppliedIndex ||
+        (q.bootNonce && r.bootNonce != q.bootNonce)) return;
+    auto* stream = pending.stream;
+    const auto incarnation = pending.streamIncarnation;
+    pendingGlobalSingleWriterControls.erase(it);
+    if (activeMotherships.contains(stream) && stream->connectionIncarnation == incarnation)
+      replyGlobalSingleWriterControl(stream,r);
+  }
+
+  void expireGlobalSingleWriterControls() {
+    const auto now = Time::now<TimeResolution::ms>();
+    for (auto it = pendingGlobalSingleWriterControls.begin(); it != pendingGlobalSingleWriterControls.end();) {
+      if (it->second.deadlineMs > now && weAreMaster && it->second.epoch == masterAuthorityEpoch) { ++it; continue; }
+      auto pending = std::move(it->second);
+      it = pendingGlobalSingleWriterControls.erase(it);
+      if (activeMotherships.contains(pending.stream) && pending.stream->connectionIncarnation == pending.streamIncarnation)
+        replyGlobalSingleWriterControl(pending.stream,pending.command,"global single-writer exchange expired; inspect before retry");
+    }
+  }
+
+  bool desiredGlobalSingleWriterMembership(uint64_t deploymentID,
+                                    GlobalSingleWriterMembershipProjection& out) const override
+  {
+    for (const auto& value : masterAuthorityRuntimeState.globalSingleWriterMembershipProjections) {
+      if (value.deploymentID == deploymentID && value.localClusterUUID == brainConfig.clusterUUID) {
+        // Neuron checks the exact local UUID. Projecting to an unlisted UUID
+        // therefore refuses the launch instead of falling back to a local writer.
+        out = value;
+        return true;
+      }
+    }
     return false;
   }
 
@@ -9833,7 +9889,7 @@ public:
         if (saved.deploymentID == id && saved.phase == StatefulWorkerTopologyUpgradePhase::initialAllMastersSeedBootstrap) { first = &saved; break; }
       if (!first) return true;
       if (!initialAllMastersSeedBootstrapPeersCapable() || !statefulServingRecoveryReady() || !containerRetirementAuthorityAcknowledged() ||
-          !plan.isStateful || !plan.stateful.allMasters) return false;
+          !plan.isStateful || plan.stateful.writerMode != StatefulWriterMode::allMasters) return false;
       const auto& scope = first->initialAllMastersSeedBootstrap;
       String bytes, digest; auto copy = plan;
       if (!BitseryEngine::serialize(bytes, copy) || !prodigyComputeSHA256Hex(bytes, digest) || digest != scope.planSHA256 ||
@@ -9850,7 +9906,7 @@ public:
       return true;
     }
     if (!allMastersSeedBootstrapPeersCapable() || !statefulServingRecoveryReady() || !containerRetirementAuthorityAcknowledged() ||
-        !plan.isStateful || !plan.stateful.allMasters || first->qualificationCancellation.members.size() % 3 != 0) return false;
+        !plan.isStateful || plan.stateful.writerMode != StatefulWriterMode::allMasters || first->qualificationCancellation.members.size() % 3 != 0) return false;
     const uint32_t groups = first->qualificationCancellation.members.size() / 3;
     if (!groups) return false;
     String bytes, digest; auto copy = plan;
@@ -9927,7 +9983,7 @@ public:
     auto *deployment = deployed->second;
     const auto& plan = deployment->plan;
     if ((plan.config.applicationID != 3 && plan.config.applicationID != 4) || !plan.isStateful ||
-        plan.stateful.allMasters || shardGroup >= deployment->nShardGroups)
+        (plan.stateful.writerMode == StatefulWriterMode::allMasters) || shardGroup >= deployment->nShardGroups)
       return reject("stateful preparation requires one selected Hot/Cold writer shard");
     report.selectedShardGroup = shardGroup; report.nShardGroups = deployment->nShardGroups;
     BitseryEngine::serialize(report.normalizedDeploymentPlan, plan);
@@ -9981,7 +10037,7 @@ public:
     ApplicationDeployment *deployment = deployed->second;
     const DeploymentPlan& plan = deployment->plan;
     if (!plan.isStateful || plan.config.type != ApplicationType::stateful ||
-        !plan.stateful.allMasters || plan.useHostNetworkNamespace ||
+        plan.stateful.writerMode != StatefulWriterMode::allMasters || plan.useHostNetworkNamespace ||
         deployment->nShardGroups != 1 || deployment->containers.size() != 3 ||
         deployment->nTarget() != 3 || deployment->nDeployed() != 3 || deployment->nHealthy() != 3)
       return reject("all-masters identity requires one complete three-member IPv6 shard");
@@ -10149,305 +10205,6 @@ public:
     return response;
   }
 
-  bool nativeRepairFailureStillCurrent(const ProdigyStatefulServingMemberRepair& request,
-                                     const ContainerView *target) const
-  {
-    return target && target->machine && target->machine->uuid == request.targetMachineUUID &&
-        !target->plannedWork && target->state == ContainerState::crashedRestarting && !target->runtimeReady &&
-        target->deploymentID == request.deploymentID && target->shardGroup == request.shardGroup &&
-        target->nativeFailureStreamGeneration == target->machine->neuron.ioGeneration &&
-        target->nativeFailureAuthorityEpoch == masterAuthorityEpoch && target->nativeFailureCrashCount == target->nCrashes &&
-        target->nativeBootFailure == request.failure && statefulServingResourceObservationSupported(target->machine) &&
-        !containerRuntimeStateRetired(masterAuthorityRuntimeState, target->uuid);
-  }
-
-  // Choose one healthy authoritative donor. Its verified native receipt
-  // supplies the fixture and baseline lineage. A plan digest is never a
-  // substitute for either. Waiting for a donor does not pin a snapshot.
-  bool prepareNativeRepairChallenge(ProdigyStatefulServingMemberRepair& request,
-                                    const ProdigyStatefulServingAuthority& scope,
-                                    const BrainReplicatedContainerRuntimeState& target, uint128_t excludeDonor = 0)
-  {
-    for (const auto& member : scope.members)
-    {
-      if (member.containerUUID == excludeDonor || member.containerUUID == request.targetContainerUUID || member.machineUUID == request.targetMachineUUID ||
-          member.shardGroup != request.shardGroup) continue;
-      auto live = containers.find(member.containerUUID);
-      if (live == containers.end() || !live->second || !live->second->machine ||
-          live->second->machine->uuid != member.machineUUID) continue;
-      auto& peer = live->second->machine->neuron;
-      if (!containerRetirementNeuronAuthorized(&peer, member.machineUUID)) continue;
-      auto proof = std::find_if(statefulStoreReceiptCaches.begin(), statefulStoreReceiptCaches.end(), [&](const auto& cached) {
-        const auto& value = cached.receipt;
-        return cached.authorityEpoch == masterAuthorityEpoch && cached.neuronIOGeneration == peer.ioGeneration &&
-            cached.neuronMachineUUID == member.machineUUID && cached.crashCount == live->second->nCrashes && value.localContainerUUID == member.containerUUID &&
-            value.localClusterUUID == brainConfig.clusterUUID && value.deploymentID == request.deploymentID &&
-            value.shardGroup == request.shardGroup && value.nShardGroups == target.plan.nShardGroups &&
-            value.protocolVersion == ProdigyStatefulStoreReceipt::sourceCutVersion &&
-            value.state == ProdigyStatefulStoreReceiptState::active && value.cutMaterialized &&
-            value.committedHeadsDominateCut && prodigyStatefulStoreReceiptValid(value);
-      });
-      if (proof == statefulStoreReceiptCaches.end()) continue;
-      const auto now = Time::now<TimeResolution::ms>();
-      const auto& repairs = masterAuthorityRuntimeState.statefulServingMemberRepairs;
-      if (std::any_of(repairs.begin(), repairs.end(), [&](const auto& other) {
-            return other.operationUUID != request.operationUUID && other.challenge.protocolVersion &&
-                other.challenge.sourceContainerUUID == member.containerUUID && other.challenge.retainUntilMilliseconds > now;
-          })) continue;
-      auto busy = statefulSourceCuts.find(member.containerUUID);
-      if (busy != statefulSourceCuts.end() && !busy->second.releaseReceipt.released &&
-          busy->second.challenge.retainUntilMilliseconds > now) continue;
-      ProdigyStatefulStoreSourceCut cut = {};
-      cut.applicationID = uint16_t(request.deploymentID >> 48);
-      cut.sourceClusterUUID = brainConfig.clusterUUID;
-      cut.sourceDeploymentID = request.deploymentID;
-      cut.sourceContainerUUID = member.containerUUID;
-      cut.storeKind = DeploymentIdentityStoreKind::kv;
-      cut.nShardGroups = target.plan.nShardGroups;
-      cut.shardGroup = request.shardGroup;
-      cut.operationUUID = request.operationUUID;
-      cut.retainUntilMilliseconds = now + 60 * 60 * 1000;
-      ContainerView *donor = nullptr;
-      String observedPlan;
-      if (!statefulSourceCutIncarnation(cut, donor, observedPlan) || donor != live->second) continue;
-      const ProdigyStatefulServingAuthority *donorScope = nullptr;
-      String donorDigest;
-      const auto *sealed = prodigyStatefulServingRepairMember(masterAuthorityRuntimeState, statefulServingRuntimeStates,
-          request.deploymentID, request.shardGroup, member.containerUUID, member.machineUUID, donorScope, donorDigest);
-      if (!sealed || donorScope != &scope || !nativeRepairLivePlanMatches(donor, *sealed)) continue;
-      if (RAND_priv_bytes(reinterpret_cast<unsigned char *>(&cut.requestUUID), sizeof(cut.requestUUID)) != 1 ||
-          RAND_priv_bytes(reinterpret_cast<unsigned char *>(&cut.memberRequestUUID), sizeof(cut.memberRequestUUID)) != 1 ||
-          !cut.requestUUID || !cut.memberRequestUUID) return false;
-      request.challenge = std::move(cut);
-      request.donorMachineUUID = member.machineUUID;
-      request.donorPlanSHA256 = std::move(donorDigest);
-      request.fixtureSHA256 = proof->receipt.seedFixtureSHA256;
-      request.sourceBaselineOperationUUID = proof->receipt.sourceBaselineOperationUUID;
-      commitMasterAuthorityStateChangeAsync({});
-      return true;
-    }
-    return false;
-  }
-
-  // The desired generation survives master failover. Ask the donor whether it
-  // still holds that exact snapshot; a query cannot create or repin a cut.
-  void recoverSelectedNativeRepairCut(const ProdigyStatefulServingMemberRepair& request,
-                                      const ProdigyStatefulStoreSeedAuthority& authority)
-  {
-    const auto& challenge = request.challenge;
-    const auto now = Time::now<TimeResolution::ms>();
-    if (!challenge.protocolVersion || challenge.retainUntilMilliseconds <= now ||
-        challenge.requestUUID != authority.sourceRequestUUID || challenge.memberRequestUUID != authority.sourceMemberRequestUUID ||
-        challenge.operationUUID != authority.operationUUID || challenge.sourceContainerUUID != authority.sourceContainerUUID) return;
-    ContainerView *donor = nullptr;
-    String incarnation;
-    if (!statefulSourceCutIncarnation(challenge, donor, incarnation) ||
-        !containerRetirementNeuronAuthorized(&donor->machine->neuron, request.donorMachineUUID)) return;
-    const ProdigyStatefulServingAuthority *scope = nullptr;
-    String digest;
-    const auto *sealed = prodigyStatefulServingRepairMember(masterAuthorityRuntimeState, statefulServingRuntimeStates,
-        request.deploymentID, request.shardGroup, challenge.sourceContainerUUID, request.donorMachineUUID, scope, digest);
-    if (!sealed || digest != request.donorPlanSHA256 || !nativeRepairLivePlanMatches(donor, *sealed)) return;
-
-    auto found = statefulSourceCuts.find(challenge.sourceContainerUUID);
-    if (found != statefulSourceCuts.end())
-    {
-      auto& prior = found->second;
-      if (prior.challenge != challenge && prior.challenge.retainUntilMilliseconds > now && !prior.releaseReceipt.released) return;
-      if (prior.challenge == challenge && prior.ioGeneration == donor->machine->neuron.ioGeneration &&
-          prior.authorityEpoch == masterAuthorityEpoch && prior.crashCount == donor->nCrashes && prior.planSHA256 == incarnation)
-      {
-        if (prior.receipt.ready || prior.releasing || prior.releaseReceipt.released ||
-            (prior.lastRepairSendMs && now - prior.lastRepairSendMs < 1000)) return;
-      }
-    }
-    StatefulSourceCutCache restored = {};
-    restored.challenge = restored.outstanding = challenge;
-    restored.outstanding.action = ProdigyStatefulStoreSourceCutAction::query;
-    restored.outstanding.cutUUID = authority.cutUUID;
-    restored.outstanding.cutGeneration = authority.cutGeneration;
-    restored.planSHA256 = std::move(incarnation);
-    restored.ioGeneration = donor->machine->neuron.ioGeneration;
-    restored.authorityEpoch = masterAuthorityEpoch;
-    restored.crashCount = donor->nCrashes;
-    restored.lastRepairSendMs = now;
-    String encoded;
-    if (!BitseryEngine::serialize(encoded, restored.outstanding)) return;
-    statefulSourceCuts.insert_or_assign(challenge.sourceContainerUUID, std::move(restored));
-    auto& peer = donor->machine->neuron;
-    Message::construct(peer.wBuffer, NeuronTopic::statefulStoreSourceCut, donor->uuid, encoded);
-    Ring::queueSend(&peer);
-  }
-
-  void driveNativeMemberRepairs()
-  {
-    auto& requests = masterAuthorityRuntimeState.statefulServingMemberRepairs;
-    // Losing a lease must withdraw health even when this master cannot
-    // currently issue replacement authority.
-    if (weAreMaster)
-      for (const auto& home : masterAuthorityRuntimeState.statefulStoreGenerationSelections)
-      {
-        if (home.authority.sourceClusterUUID != brainConfig.clusterUUID || home.authority.targetClusterUUID != brainConfig.clusterUUID) continue;
-        auto member = containers.find(home.authority.targetContainerUUID);
-        if (member != containers.end() && member->second && member->second->state == ContainerState::healthy &&
-            !nativeMemberProofCurrent(*member->second, home)) withdrawNativeMemberHealth(*member->second);
-      }
-    if ((requests.empty() && masterAuthorityRuntimeState.statefulStoreGenerationSelections.empty()) ||
-        !weAreMaster || !masterAuthorityRuntimeStateDurable || masterAuthorityPersistencePending ||
-        durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation ||
-        masterAuthorityRuntimeState.generation >= UINT64_MAX - 1 || !statefulServingRecoveryReady() ||
-        !statefulStoreGenerationPeersCapable(true) || !containerRetirementAuthorityAcknowledged()) return;
-    auto& selections = masterAuthorityRuntimeState.statefulStoreGenerationSelections;
-    for (const auto& home : selections)
-    {
-      if (home.authority.sourceClusterUUID == brainConfig.clusterUUID && home.authority.targetClusterUUID == brainConfig.clusterUUID &&
-          std::none_of(requests.begin(), requests.end(), [&](const auto& request) { return request.targetContainerUUID == home.authority.targetContainerUUID; }))
-        (void)ensureNativeMemberRepairSession(home, ProdigyCohortRepairPurpose::catchup);
-    }
-    for (auto& request : requests)
-    {
-      auto live = containers.find(request.targetContainerUUID);
-      if (live == containers.end() || !live->second) continue;
-      const ProdigyStatefulServingAuthority *scope = nullptr;
-      String digest;
-      const auto *target = prodigyStatefulServingRepairMember(masterAuthorityRuntimeState, statefulServingRuntimeStates,
-          request.deploymentID, request.shardGroup, request.targetContainerUUID, request.targetMachineUUID, scope, digest);
-      if (!target || digest != request.targetPlanSHA256 || scope->revision < request.servingRevision ||
-          !nativeRepairLivePlanMatches(live->second, *target)) continue;
-      auto chosen = std::lower_bound(selections.begin(), selections.end(), request.targetContainerUUID,
-          [](const auto& selection, uint128_t uuid) { return selection.authority.targetContainerUUID < uuid; });
-      const bool hasHome = chosen != selections.end() && chosen->authority.targetContainerUUID == request.targetContainerUUID;
-      if (hasHome && chosen->authority.operationUUID == request.operationUUID)
-      {
-        auto *member = live->second;
-        recoverSelectedNativeRepairCut(request, chosen->authority);
-        if (nativeMemberProofCurrent(*member, *chosen))
-        {
-          // Release the donor through its native owner. A cut that expired on
-          // the donor's own deadline no longer holds a snapshot to release.
-          if (chosen->authority.retainUntilMilliseconds > Time::now<TimeResolution::ms>())
-          {
-            ProdigyStatefulStoreSourceCut release = request.challenge;
-            release.action = ProdigyStatefulStoreSourceCutAction::release;
-            release.cutUUID = chosen->authority.cutUUID; release.cutGeneration = chosen->authority.cutGeneration;
-            const auto result = statefulSourceCutOperation(release);
-            if (!result.released) continue;
-          }
-          std::erase_if(requests, [uuid = request.targetContainerUUID](const auto& entry) { return entry.targetContainerUUID == uuid; });
-          commitMasterAuthorityStateChangeAsync({});
-          return;
-        }
-        if (nativeRepairFailureStillCurrent(request, member))
-        {
-          auto *machine = member->machine;
-          if (!machine->stateUploadRequestPending &&
-              (member->requestedRepairHome != chosen->generationUUID || member->requestedRepairCrash != member->nCrashes ||
-               member->requestedRepairStream != machine->neuron.ioGeneration))
-          {
-            queueNeuronStateUploadForMachine(machine);
-            if (machine->stateUploadRequestPending)
-            {
-              member->requestedRepairHome = chosen->generationUUID;
-              member->requestedRepairCrash = member->nCrashes;
-              member->requestedRepairStream = machine->neuron.ioGeneration;
-            }
-          }
-        }
-        else if (member->state != ContainerState::crashedRestarting)
-        {
-          // A healthy process may already have materialized the retained cut
-          // before this Brain restarted. Offer ordinary catch-up independently
-          // of the old copy lease. Only the native proof can complete repair.
-          (void)ensureNativeMemberRepairSession(*chosen, ProdigyCohortRepairPurpose::catchup);
-          if (chosen->authority.retainUntilMilliseconds > Time::now<TimeResolution::ms>())
-            (void)ensureNativeMemberRepairSession(*chosen, ProdigyCohortRepairPurpose::seed);
-        }
-        continue;
-      }
-      if ((hasHome ? chosen->generationUUID : uint128_t(0)) != request.failure.generationUUID ||
-          !nativeRepairFailureStillCurrent(request, live->second)) continue;
-      if (!request.challenge.protocolVersion)
-      {
-        if (prepareNativeRepairChallenge(request, *scope, *target)) return;
-        continue;
-      }
-      const auto& cut = request.challenge;
-      const auto now = Time::now<TimeResolution::ms>();
-      if (cut.retainUntilMilliseconds <= now)
-      {
-        request.challenge = {.protocolVersion = 0}; request.donorMachineUUID = 0;
-        request.donorPlanSHA256.clear(); request.fixtureSHA256.clear(); request.sourceBaselineOperationUUID = 0;
-        commitMasterAuthorityStateChangeAsync({});
-        return;
-      }
-      const ProdigyStatefulServingAuthority *donorScope = nullptr;
-      String donorDigest;
-      const auto *sealedDonor = prodigyStatefulServingRepairMember(masterAuthorityRuntimeState, statefulServingRuntimeStates,
-          request.deploymentID, request.shardGroup, cut.sourceContainerUUID, request.donorMachineUUID, donorScope, donorDigest);
-      if (!sealedDonor || donorScope != scope || donorDigest != request.donorPlanSHA256) continue;
-      ContainerView *donor = nullptr;
-      String incarnation;
-      if (!statefulSourceCutIncarnation(cut, donor, incarnation) ||
-          !containerRetirementNeuronAuthorized(&donor->machine->neuron, request.donorMachineUUID) ||
-          !nativeRepairLivePlanMatches(donor, *sealedDonor))
-      {
-        // No target bytes have been authorized yet. A different healthy
-        // donor can satisfy this request while the failed donor is offline.
-        if (prepareNativeRepairChallenge(request, *scope, *target, cut.sourceContainerUUID)) return;
-        continue;
-      }
-      auto cached = statefulSourceCuts.find(cut.sourceContainerUUID);
-      if (cached == statefulSourceCuts.end() || cached->second.challenge.retainUntilMilliseconds <= now || cached->second.releaseReceipt.released)
-      {
-        StatefulSourceCutCache prepare;
-        prepare.challenge = cut;
-        prepare.planSHA256 = incarnation; prepare.ioGeneration = donor->machine->neuron.ioGeneration;
-        prepare.authorityEpoch = masterAuthorityEpoch; prepare.crashCount = donor->nCrashes;
-        statefulSourceCuts.insert_or_assign(cut.sourceContainerUUID, std::move(prepare));
-        cached = statefulSourceCuts.find(cut.sourceContainerUUID);
-      }
-      if (cached->second.challenge != cut || cached->second.releasing || cached->second.planSHA256 != incarnation ||
-          cached->second.ioGeneration != donor->machine->neuron.ioGeneration || cached->second.authorityEpoch != masterAuthorityEpoch ||
-          cached->second.crashCount != donor->nCrashes) continue;
-      if (cached->second.lastRepairSendMs && now - cached->second.lastRepairSendMs < 1000 && !cached->second.receipt.ready) continue;
-      cached->second.lastRepairSendMs = now;
-      const auto receipt = statefulSourceCutOperation(cut);
-      if (!receipt.failure.empty())
-      {
-        if (prepareNativeRepairChallenge(request, *scope, *target, cut.sourceContainerUUID)) return;
-        continue;
-      }
-      if (!receipt.ready || !prodigyStatefulStoreSourceCutResponseMatches(cut, receipt)) continue;
-      ProdigyStatefulStoreGenerationSelection next = {};
-      if (RAND_priv_bytes(reinterpret_cast<unsigned char *>(&next.generationUUID), sizeof(next.generationUUID)) != 1 ||
-          next.generationUUID == 0 || next.generationUUID == request.failure.generationUUID) continue;
-      next.admittedPlanSHA256 = digest;
-      next.servingRevision = scope->revision;
-      auto& authority = next.authority;
-      authority.protocolVersion = ProdigyStatefulStoreSeedAuthority::sourceCutVersion;
-      const uint64_t prior = hasHome ? std::max(chosen->authority.authorityGeneration, chosen->authority.seedGeneration) : 0;
-      if (prior == UINT64_MAX) continue;
-      authority.seedGeneration = authority.authorityGeneration = std::max(prior, masterAuthorityRuntimeState.generation) + 1;
-      authority.operationUUID = cut.operationUUID; authority.applicationID = cut.applicationID; authority.storeKind = cut.storeKind;
-      authority.shardGroup = cut.shardGroup; authority.nShardGroups = cut.nShardGroups;
-      authority.targetClusterUUID = authority.sourceClusterUUID = brainConfig.clusterUUID;
-      authority.targetDeploymentID = authority.sourceDeploymentID = request.deploymentID;
-      authority.sourceContainerUUID = cut.sourceContainerUUID; authority.targetContainerUUID = request.targetContainerUUID;
-      authority.fixtureSHA256 = request.fixtureSHA256; authority.sourceBaselineOperationUUID = request.sourceBaselineOperationUUID;
-      authority.sourceRequestUUID = receipt.requestUUID; authority.sourceMemberRequestUUID = receipt.memberRequestUUID;
-      authority.sourceContentWatermarkSHA256 = receipt.contentSHA256; authority.sourceCatchupWatermarkSHA256 = receipt.headsSHA256;
-      authority.cutUUID = receipt.cutUUID; authority.cutGeneration = receipt.cutGeneration;
-      authority.sourceCutScope = receipt.scope; authority.retainUntilMilliseconds = receipt.retainUntilMilliseconds;
-      if (RAND_priv_bytes(reinterpret_cast<unsigned char *>(&authority.seedRouteUUID), sizeof(authority.seedRouteUUID)) != 1 ||
-          !prodigyStatefulStoreGenerationSelectionMatchesPlan(next, target->plan)) continue;
-      if (hasHome) *chosen = std::move(next);
-      else if (selections.size() < 4096) selections.insert(chosen, std::move(next));
-      else continue;
-      commitMasterAuthorityStateChangeAsync({});
-      return;
-    }
-  }
-
   StatefulDataAuthorityOperation statefulDataAuthorityPreparationOperation(const StatefulDataAuthorityOperation& request)
   {
     auto response = request;
@@ -10529,7 +10286,7 @@ public:
         scope.baselineOperationUUID == 0 || !scope.nShardGroups || scope.nShardGroups > UINT16_MAX || b.shardGroup >= scope.nShardGroups ||
         !BitseryEngine::deserializeSafe(request.deploymentPlan, plan) ||
         !prodigyComputeSHA256Hex(request.deploymentPlan, planDigest) || planDigest != scope.planSHA256 ||
-        !plan.isStateful || plan.config.type != ApplicationType::stateful || !plan.stateful.allMasters || plan.useHostNetworkNamespace ||
+        !plan.isStateful || plan.config.type != ApplicationType::stateful || plan.stateful.writerMode != StatefulWriterMode::allMasters || plan.useHostNetworkNamespace ||
         !plan.horizontalScalers.empty() || !plan.verticalScalers.empty() || plan.canaryCount != 0 ||
         plan.config.deploymentID() != b.targetDeploymentID || plan.config.applicationID < 2 || plan.config.applicationID > 5 ||
         ((plan.config.applicationID == 2 || plan.config.applicationID == 5) && scope.nShardGroups != 1) ||
@@ -10594,7 +10351,7 @@ public:
     DeploymentPlan plan; String planDigest;
     if (!BitseryEngine::deserializeSafe(request.deploymentPlan, plan) ||
         !prodigyComputeSHA256Hex(request.deploymentPlan, planDigest) || planDigest != scope.successorPlanSHA256 ||
-        !plan.isStateful || plan.config.type != ApplicationType::stateful || !plan.stateful.allMasters || plan.useHostNetworkNamespace ||
+        !plan.isStateful || plan.config.type != ApplicationType::stateful || plan.stateful.writerMode != StatefulWriterMode::allMasters || plan.useHostNetworkNamespace ||
         !plan.horizontalScalers.empty() || !plan.verticalScalers.empty() || plan.canaryCount != 0 ||
         plan.config.deploymentID() != b.targetDeploymentID || plan.config.applicationID != scope.request.applicationID ||
         plan.config.containerBlobSHA256 != scope.successorArtifactSHA256 || !plan.config.containerBlobBytes ||
@@ -10624,7 +10381,7 @@ public:
       return reject("bootstrap does not bind current master and unexpired qualification");
     const uint64_t oldID = (uint64_t(scope.request.applicationID) << 48) | scope.request.activeVersionID;
     auto old = deployments.find(oldID);
-    if (old == deployments.end() || !old->second || !old->second->plan.isStateful || !old->second->plan.stateful.allMasters ||
+    if (old == deployments.end() || !old->second || !old->second->plan.isStateful || old->second->plan.stateful.writerMode != StatefulWriterMode::allMasters ||
         old->second->next || b.shardGroup >= old->second->nShardGroups || !old->second->qualificationStatefulCancellationIsSafe(scope, false) ||
         deployments.contains(b.targetDeploymentID)) return reject("bootstrap requires exact current predecessor and unqueued successor");
     if (scope.members.size() != old->second->nShardGroups * 3u)
@@ -10733,7 +10490,7 @@ public:
     else if (!BitseryEngine::deserializeSafe(request.deploymentPlan, plan))
       return reject("initial target authority requires its exact deployment plan");
     if (!plan.isStateful || plan.config.type != ApplicationType::stateful || plan.config.deploymentID() != request.deploymentID ||
-        plan.useHostNetworkNamespace || plan.stateful.allMasters || !plan.horizontalScalers.empty() ||
+        plan.useHostNetworkNamespace || (plan.stateful.writerMode == StatefulWriterMode::allMasters) || !plan.horizontalScalers.empty() ||
         !plan.verticalScalers.empty() || plan.canaryCount != 0)
       return reject("stateful data profile forbids host networking, all-masters, autoscaling and canaries");
     for (const auto& existing : authorities)
@@ -11443,22 +11200,7 @@ public:
 
   bool crossClusterMasqueGatewayAuthorityPairCurrent(const CrossClusterMasqueGatewayAuthority& authority) const
   {
-    const auto enrollment = std::find_if(masterAuthorityRuntimeState.clusterPairEnrollments.begin(),
-        masterAuthorityRuntimeState.clusterPairEnrollments.end(), [&](const auto& value) {
-          return value.pairUUID == authority.pairUUID && value.operationUUID == authority.pairOperationUUID &&
-              value.localClusterUUID == authority.localClusterUUID && value.peerClusterUUID == authority.peerClusterUUID;
-        });
-    if (enrollment == masterAuthorityRuntimeState.clusterPairEnrollments.end() ||
-        enrollment->state != ProdigyClusterPairEnrollmentState::active ||
-        enrollment->localAuthorityGeneration != authority.pairAuthorityGeneration ||
-        enrollment->agreedKeyEpoch != authority.keyGeneration) return false;
-    const auto operation = std::find_if(masterAuthorityRuntimeState.clusterPairEnrollmentOperations.begin(),
-        masterAuthorityRuntimeState.clusterPairEnrollmentOperations.end(), [&](const auto& value) {
-          return value.pairUUID == authority.pairUUID && value.operationUUID == authority.pairOperationUUID;
-        });
-    return operation != masterAuthorityRuntimeState.clusterPairEnrollmentOperations.end() &&
-        operation->localAuthorityGeneration == authority.pairAuthorityGeneration &&
-        operation->initialProjectionDelivered && !operation->revocationRequested && !operation->projectionsWithdrawn;
+    return masterAuthorityRuntimeState.crossClusterMasqueGatewayAuthorityPairCurrent(authority);
   }
 
   ProdigyCrossClusterMasqueGatewayAuthorityResponse queryCrossClusterMasqueGatewayAuthority(
@@ -11842,6 +11584,13 @@ public:
   bool deploymentReplicationAllowedForPeer(uint64_t deploymentID, BrainView *peer) const override
   {
     if (statelessDeploymentRetired(deploymentID)) return false;
+    const auto savedPlan = deploymentPlans.find(deploymentID);
+    const auto livePlan = deployments.find(deploymentID);
+    GlobalSingleWriterMembershipProjection group;
+    const bool global = (savedPlan != deploymentPlans.end() && (savedPlan->second.stateful.writerMode == StatefulWriterMode::globalSingleWriter)) ||
+        (livePlan != deployments.end() && livePlan->second && (livePlan->second->plan.stateful.writerMode == StatefulWriterMode::globalSingleWriter)) ||
+        desiredGlobalSingleWriterMembership(deploymentID, group);
+    if (global && (!peer || peer->version < ProdigyGlobalSingleWriterMinimumVersion)) return false;
     const auto admission = std::find_if(masterAuthorityRuntimeState.statelessDeploymentAdmissions.begin(),
         masterAuthorityRuntimeState.statelessDeploymentAdmissions.end(), [&](const auto& candidate) {
           return candidate.deploymentID == deploymentID;
@@ -12045,7 +11794,7 @@ public:
     authority.phase = phase;
     authority.sourceEpoch = deployment->statefulWorkerTopologyUpgradeSourceEpoch;
     authority.targetEpoch = deployment->statefulWorkerTopologyUpgradeTargetEpoch;
-    authority.allMasters = deployment->plan.stateful.allMasters;
+    authority.allMasters = (deployment->plan.stateful.writerMode == StatefulWriterMode::allMasters);
     authority.targetConfig = deployment->statefulWorkerTopologyUpgradeTargetConfig();
     for (const auto& state : states)
     {
@@ -12299,7 +12048,7 @@ public:
   bool prepareStatefulClientChange(ApplicationDeployment *deployment, uint32_t shardGroup,
                                    uint128_t failedUUID) override
   {
-    if (deployment == nullptr || deployment->plan.stateful.allMasters || !statefulServingPeersCapable() ||
+    if (deployment == nullptr || (deployment->plan.stateful.writerMode == StatefulWriterMode::allMasters) || !statefulServingPeersCapable() ||
         !containerRetirementAuthorityAcknowledged() || masterAuthorityRuntimeState.generation >= UINT64_MAX - 1) return false;
     auto owner = deployments.find(deployment->plan.config.deploymentID());
     if (owner == deployments.end() || owner->second != deployment) return false;
@@ -13302,6 +13051,91 @@ public:
     return ownerPresent;
   }
 
+  static bool isVolatileStatelessPlannerReservation(
+      bool isStateful, ContainerState state, uint8_t fragment, bool runtimeReady)
+  {
+    return !isStateful && state == ContainerState::planned && fragment == 0 && !runtimeReady;
+  }
+
+  static bool isStatelessPlannerReservationShape(const BrainReplicatedContainerRuntimeState& state)
+  {
+    return isVolatileStatelessPlannerReservation(
+        state.plan.isStateful, state.plan.state, state.plan.fragment, state.plan.runtimeReady);
+  }
+
+  bool isVolatileStatelessPlannerReservation(const BrainReplicatedContainerRuntimeState& state) const
+  {
+    const uint64_t deploymentID = state.plan.config.deploymentID();
+    const auto authoritative = deploymentPlans.find(deploymentID);
+    return state.plan.uuid != 0 && state.machineUUID != 0 &&
+           isStatelessPlannerReservationShape(state) &&
+           state.plan.system.kind == SystemContainerKind::none &&
+           !state.plan.useHostNetworkNamespace &&
+           authoritative != deploymentPlans.end() && !authoritative->second.isStateful &&
+           authoritative->second.config.applicationID == state.plan.config.applicationID &&
+           authoritative->second.config.versionID == state.plan.config.versionID &&
+           authoritative->second.config.containerBlobSHA256.equals(state.plan.config.containerBlobSHA256) &&
+           authoritative->second.config.containerBlobBytes == state.plan.config.containerBlobBytes;
+  }
+
+  bool volatileStatelessPlannerReservationInventoryCurrent(
+      const BrainReplicatedContainerRuntimeState& state) const
+  {
+    if (!weAreMaster || !recoveringPersistedNeuronInventory || !persistedMachineInventoryEnumerated ||
+        !masterAuthorityRuntimeStateDurable ||
+        durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation ||
+        !isVolatileStatelessPlannerReservation(state)) return false;
+    bool sourceMachinePresent = false;
+    uint32_t observedOwners = 0;
+    for (const Machine *machine : machines)
+    {
+      if (machine == nullptr || machine->uuid == 0 || !machine->runtimeReady || !neuronControlStreamActive(machine) ||
+          !persistedMachineInventoryUploaded.contains(machine->uuid)) return false;
+      const auto inventory = containerRetirementInventoryByMachine.find(machine->uuid);
+      if (inventory == containerRetirementInventoryByMachine.end() ||
+          inventory->second.authorityEpoch != masterAuthorityEpoch ||
+          inventory->second.ioGeneration != machine->neuron.ioGeneration) return false;
+      sourceMachinePresent |= machine->uuid == state.machineUUID;
+      if (inventory->second.present.contains(state.plan.uuid))
+      {
+        // UUID equality alone is not an adoption proof: a stale or duplicate
+        // report from another Machine must retain the legacy record closed.
+        if (machine->uuid != state.machineUUID || ++observedOwners != 1) return false;
+      }
+    }
+    if (!sourceMachinePresent) return false;
+    if (observedOwners == 0) return !containers.contains(state.plan.uuid);
+    const auto actual = containers.find(state.plan.uuid);
+    const auto owner = deployments.find(state.plan.config.deploymentID());
+    const auto authoritative = deploymentPlans.find(state.plan.config.deploymentID());
+    return observedOwners == 1 && actual != containers.end() && actual->second != nullptr && actual->second->machine != nullptr &&
+           actual->second->uuid == state.plan.uuid && !actual->second->isStateful &&
+           actual->second->state != ContainerState::planned &&
+           actual->second->machine->uuid == state.machineUUID &&
+           actual->second->deploymentID == state.plan.config.deploymentID() && actual->second->fragment != 0 &&
+           owner != deployments.end() && owner->second != nullptr && !owner->second->plan.isStateful &&
+           authoritative != deploymentPlans.end() && !authoritative->second.isStateful &&
+           owner->second->plan.config.applicationID == authoritative->second.config.applicationID &&
+           owner->second->plan.config.versionID == authoritative->second.config.versionID &&
+           owner->second->plan.config.containerBlobSHA256.equals(authoritative->second.config.containerBlobSHA256) &&
+           owner->second->plan.config.containerBlobBytes == authoritative->second.config.containerBlobBytes &&
+           owner->second->containers.contains(actual->second) &&
+           actual->second->machine->containersByDeploymentID.contains(actual->second->deploymentID) &&
+           actual->second->machine->containersByDeploymentID.find(actual->second->deploymentID)->second.contains(actual->second);
+  }
+
+  bool pendingReplicatedContainerRuntimeStatesContainOnlyVolatileStatelessPlannerReservations() const
+  {
+    if (pendingReplicatedContainerRuntimeStates.empty()) return false;
+    for (const auto& [deploymentID, states] : pendingReplicatedContainerRuntimeStates)
+    {
+      (void)deploymentID;
+      for (const BrainReplicatedContainerRuntimeState& state : states)
+        if (!isVolatileStatelessPlannerReservation(state)) return false;
+    }
+    return true;
+  }
+
   bool preparePresentInitialSeedReservationRecovery(
       ApplicationDeployment *deployment,
       const BrainReplicatedContainerRuntimeState& state,
@@ -13320,7 +13154,7 @@ public:
         findMachineForReplicatedContainerRuntimeState(state) != machine ||
         !machine->runtimeReady || !statefulServingResourceObservationSupported(machine) ||
         containers.contains(state.plan.uuid) || current == nullptr ||
-        !deployment->plan.isStateful || !deployment->plan.stateful.allMasters ||
+        !deployment->plan.isStateful || deployment->plan.stateful.writerMode != StatefulWriterMode::allMasters ||
         !prodigyStatefulServingApplicationConfigEqual(deployment->plan.config,
                                                        current->targetConfig) ||
         !masterAuthorityRuntimeStateDurable ||
@@ -13411,6 +13245,17 @@ public:
 
   bool isUnsentStatefulServingReservation(const BrainReplicatedContainerRuntimeState& state) const
   {
+    if (state.plan.state == ContainerState::planned && state.plan.isStateful &&
+        !state.plan.runtimeReady && state.plan.addresses.empty() && state.plan.shardGroup == 0) {
+      GlobalSingleWriterMembershipProjection group;
+      if (desiredGlobalSingleWriterMembership(state.plan.config.deploymentID(),group) &&
+          prodigyGlobalSingleWriterLocalMember(group,state.plan.config.deploymentID(),state.plan.uuid)) {
+        // Exact reconciliation can plan several local members before the
+        // first launch is persisted. An addressless planned view has never
+        // launched; its durable projection reconstructs it after restart.
+        return true;
+      }
+    }
     if (const auto *initial = unadmittedInitialSeedReservationAuthority(state))
     {
       // A planned nonmember has never entered the launch owner. Persisting it
@@ -13520,6 +13365,12 @@ public:
   bool applyPersistentMasterAuthorityPackage(const ProdigyPersistentMasterAuthorityPackage& package)
   {
     ProdigyMasterAuthorityRuntimeState restoredRuntimeState = package.runtimeState;
+    if (!prodigyGlobalSingleWriterMembershipProjectionsValid(restoredRuntimeState.globalSingleWriterMembershipProjections)) return false;
+    for (const auto& group : restoredRuntimeState.globalSingleWriterMembershipProjections) {
+      if (!globalSingleWriterBindingsMatchLiveContainers(group)) return false;
+      for (const auto* states : {&package.containerRuntimeStates,&package.servingRuntimeStates})
+        for (const auto& state : *states) if (!globalSingleWriterBindingsMatchRuntimePlan(group,state.plan)) return false;
+    }
     if (localBundleRecoveryWitnessRetiredByAuthority(
             restoredRuntimeState, restoredRuntimeState.updateSelf))
     {
@@ -14994,6 +14845,8 @@ public:
   bool peerCanReceiveMasterAuthorityState(BrainView *peer) const
   {
     return weAreMaster && peerCanExchangeMasterAuthorityState(peer) && !peer->isMasterBrain &&
+           (masterAuthorityRuntimeState.globalSingleWriterMembershipProjections.empty() ||
+            peer->version >= ProdigyGlobalSingleWriterMinimumVersion) &&
            (!qualificationCancellationPresent() || (containerRetirementPeerCapabilityCurrent(peer) && peer->qualificationCancellationCapabilityAcknowledged)) &&
            (!transportCredentialLifecycleOperationsPresent() || transportCredentialLifecyclePeerCapabilityCurrent(peer, true)) &&
            (masterAuthorityRuntimeState.localCousinServicePermissions.empty() ||
@@ -15010,13 +14863,6 @@ public:
                     [](const auto& operation) { return operation.protocolVersion >= ProdigyClusterPairEnrollmentOperation::privateDiscoveryVersion; })))) &&
            (masterAuthorityRuntimeState.statefulServingAuthorities.empty() ||
             (containerRetirementPeerCapabilityCurrent(peer) && peer->statefulServingAuthorityCapabilityAcknowledged)) &&
-           (requiredStoreRecoveryReaderVersion() < ProdigyNativeMemberRepairMinimumVersion ||
-            (containerRetirementPeerCapabilityCurrent(peer) && peer->version >= ProdigyNativeMemberRepairMinimumVersion &&
-             peer->nativeMemberRepairCapabilityAcknowledged)) &&
-           (masterAuthorityRuntimeState.statefulStoreGenerationSelections.empty() ||
-            (containerRetirementPeerCapabilityCurrent(peer) &&
-             peer->version >= ProdigyStatefulStoreGenerationMinimumVersion &&
-             peer->statefulStoreGenerationCapabilityAcknowledged)) &&
            (std::none_of(masterAuthorityRuntimeState.statefulServingAuthorities.begin(), masterAuthorityRuntimeState.statefulServingAuthorities.end(),
               [](const auto& authority) { return authority.phase == StatefulWorkerTopologyUpgradePhase::allMastersSeedBootstrap; }) ||
             (containerRetirementPeerCapabilityCurrent(peer) && peer->allMastersSeedBootstrapCapabilityAcknowledged)) &&
@@ -15376,7 +15222,6 @@ public:
 
   void applyContainerRuntimePlanToView(ContainerView *container, Machine *machine, ApplicationDeployment *deployment, ContainerPlan& plan)
   {
-    const bool holdClient = nativeMemberInventoryHoldsClient(*container, plan, machine);
     container->subscriptions.clear();
     container->advertisements.clear();
     container->advertisingOnPorts.clear();
@@ -15385,7 +15230,7 @@ public:
     container->deploymentID = plan.config.deploymentID();
     container->applicationID = plan.config.applicationID;
     container->lifetime = plan.lifetime;
-    container->state = holdClient && plan.state == ContainerState::healthy ? ContainerState::scheduled : plan.state;
+    container->state = plan.state;
     container->runtimeReady = plan.runtimeReady;
     container->declaredStatefulClientService = plan.declaredStatefulClientService;
     container->declaredStatefulClientPort = plan.declaredStatefulClientPort;
@@ -15431,7 +15276,6 @@ public:
 
       for (const auto& [service, advertisement] : container->advertisements)
       {
-        if (holdClient && service == plan.statefulMeshRoles.client) continue;
         mesh->logAdvertisement(container,
                                advertisement.service,
                                recoveringPersistedNeuronInventory);
@@ -15442,7 +15286,6 @@ public:
       {
         for (const AdvertisementPairing& pairing : pairings)
         {
-          if (holdClient && pairing.service == plan.statefulMeshRoles.client) continue;
           mesh->logAdvertisementPairing(pairing.secret, container, pairing);
           container->remainingSubscriberCapacity -= 1;
         }
@@ -15534,6 +15377,8 @@ public:
 
   ReplicatedContainerRuntimeStateApplyResult applyReplicatedContainerRuntimeStateNow(const BrainReplicatedContainerRuntimeState& state)
   {
+    for (const auto& group : globalSingleWriterMemberships())
+      if (!globalSingleWriterBindingsMatchRuntimePlan(group,state.plan)) return ReplicatedContainerRuntimeStateApplyResult::rejected;
     if (containerRuntimeStateRetired(masterAuthorityRuntimeState, state.plan.uuid) ||
         deploymentLaunchFenced(state.plan.config.deploymentID()))
     {
@@ -15570,6 +15415,21 @@ public:
     }
 
     ApplicationDeployment *deployment = deploymentIt->second;
+    // A legacy zero-fragment stateless planned row has no process or
+    // restorable DeploymentWork. Keep it in the existing pending-runtime
+    // owner until current fleet inventory either proves it absent or has
+    // already adopted an exact real runtime with the same UUID.
+    if (isStatelessPlannerReservationShape(state))
+    {
+      // A malformed row with this legacy shape is not a runnable plan.  It
+      // must remain in the existing pending owner rather than taking the
+      // ordinary replication path and materializing a ghost ContainerView.
+      if (!isVolatileStatelessPlannerReservation(state))
+        return ReplicatedContainerRuntimeStateApplyResult::deferred;
+      return volatileStatelessPlannerReservationInventoryCurrent(state)
+          ? ReplicatedContainerRuntimeStateApplyResult::rejected
+          : ReplicatedContainerRuntimeStateApplyResult::deferred;
+    }
     ContainerView *container = nullptr;
     bool created = false;
     if (auto existing = containers.find(state.plan.uuid); existing != containers.end())
@@ -21231,7 +21091,7 @@ public:
         head->plan.config.containerBlobBytes != scope.artifactBytes)
       return reject("retained stateful re-arm artifact identity differs");
     if (!head->plan.isStateful || head->plan.config.type != ApplicationType::stateful ||
-        !head->plan.stateful.allMasters || head->plan.useHostNetworkNamespace ||
+        head->plan.stateful.writerMode != StatefulWriterMode::allMasters || head->plan.useHostNetworkNamespace ||
         !scope.expectedIPv6Only || head->nShardGroups != 1 ||
         head->desiredReplicaCountForShardGroup(0) != scope.desiredReplicas)
       return reject("retained stateful re-arm plan is not the exact IPv6 all-masters topology");
@@ -21380,6 +21240,117 @@ public:
       return;
     }
     recoverDeploymentsAfterNeuronState();
+  }
+
+  // Normal admission already collapses an empty queued middle version before
+  // persisting the new head. After a cold restore, durable plans are rebuilt
+  // first and runtime inventory is attached later, so that same harmless
+  // middle can survive between a materialized predecessor and the restored
+  // queued head. Reuse the admission predicate here, but do not infer a
+  // lifecycle state for either retained owner.
+  bool normalizeRecoveredUnmaterializedQueuedMiddle(ApplicationDeployment *head)
+  {
+    if (head == nullptr || head->state != DeploymentState::waitingToDeploy ||
+        head->lifecycleIsUnmaterialized() == false || head->previous == nullptr)
+    {
+      return false;
+    }
+    ApplicationDeployment *middle = head->previous;
+    ApplicationDeployment *predecessor = middle->previous;
+    if (middle->state != DeploymentState::none || middle->lifecycleIsUnmaterialized() == false ||
+        predecessor == nullptr || predecessor->lifecycleIsUnmaterialized() || predecessor->nHealthy() != 0 ||
+        predecessor->next != middle || middle->next != head ||
+        predecessor->plan.config.applicationID != head->plan.config.applicationID ||
+        middle->plan.config.applicationID != head->plan.config.applicationID)
+    {
+      return false;
+    }
+
+    const uint64_t middleID = middle->plan.config.deploymentID();
+    const uint64_t predecessorID = predecessor->plan.config.deploymentID();
+    const uint64_t headID = head->plan.config.deploymentID();
+    auto indexed = deployments.find(middleID);
+    if (indexed == deployments.end() || indexed->second != middle ||
+        deploymentHasRoutableResourceLease(middleID))
+    {
+      // A queued owner with a remaining routing lease is not the ordinary
+      // no-op admission shape. Leave it for the existing lease owner.
+      return true;
+    }
+    const UpdateSelfPersistenceAdmission admission = updateSelfPersistenceAdmission();
+    if (admission != UpdateSelfPersistenceAdmission::admitted)
+    {
+      recoveryPersistenceRetryPending = admission == UpdateSelfPersistenceAdmission::backpressured;
+      return true;
+    }
+
+    auto retainedPlan = deploymentPlans.find(middleID);
+    const bool hadRetainedPlan = retainedPlan != deploymentPlans.end();
+    DeploymentPlan retainedPlanCopy = {};
+    if (hadRetainedPlan)
+    {
+      retainedPlanCopy = retainedPlan->second;
+      deploymentPlans.erase(retainedPlan);
+    }
+    predecessor->next = head;
+    head->previous = predecessor;
+    deployments.erase(indexed);
+    const uint64_t epoch = masterAuthorityEpoch;
+    const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+    auto receipt = std::make_shared<PersistenceDispatchResult>();
+    recoveryPersistencePending = true;
+    persistLocalRuntimeStateAsync([this, lifetime, receipt, epoch, middle, predecessor, head,
+        middleID, predecessorID, headID, hadRetainedPlan, retainedPlanCopy = std::move(retainedPlanCopy)](bool durable) mutable {
+      if (lifetime.expired()) { delete middle; return; }
+      recoveryPersistencePending = false;
+      receipt->completed = true;
+      auto currentMiddle = deployments.find(middleID);
+      auto currentPredecessor = deployments.find(predecessorID);
+      auto currentHead = deployments.find(headID);
+      const bool exactDetachedChain = currentMiddle == deployments.end() &&
+          currentPredecessor != deployments.end() && currentPredecessor->second == predecessor &&
+          currentHead != deployments.end() && currentHead->second == head;
+      if (!exactDetachedChain)
+      {
+        if (currentMiddle == deployments.end() || currentMiddle->second != middle) delete middle;
+        return;
+      }
+      if (masterAuthorityEpoch != epoch)
+      {
+        if (predecessor->next == head && head->previous == predecessor)
+        {
+          deployments.insert_or_assign(middleID, middle);
+          predecessor->next = middle;
+          middle->previous = predecessor;
+          middle->next = head;
+          head->previous = middle;
+          if (hadRetainedPlan) deploymentPlans.insert_or_assign(middleID, std::move(retainedPlanCopy));
+        }
+        return;
+      }
+      if (predecessor->next != head || head->previous != predecessor)
+      {
+        delete middle;
+        return;
+      }
+      if (!durable)
+      {
+        deployments.insert_or_assign(middleID, middle);
+        predecessor->next = middle;
+        middle->previous = predecessor;
+        middle->next = head;
+        head->previous = middle;
+        if (hadRetainedPlan) deploymentPlans.insert_or_assign(middleID, std::move(retainedPlanCopy));
+        recoveryPersistenceRetryPending = true;
+        return;
+      }
+      receipt->durable = true;
+      recoveryPersistenceRetryPending = false;
+      delete middle;
+      if (receipt->returned) recoverDeploymentsAfterNeuronState();
+    });
+    receipt->returned = true;
+    return !receipt->completed || !receipt->durable;
   }
 
   void recoverDeploymentsAfterNeuronState(void)
@@ -21578,7 +21549,7 @@ public:
               head->plan.config.containerBlobSHA256.equals(scope.artifactSHA256) &&
               head->plan.config.containerBlobBytes == scope.artifactBytes &&
               head->plan.isStateful && head->plan.config.type == ApplicationType::stateful &&
-              head->plan.stateful.allMasters && !head->plan.useHostNetworkNamespace &&
+              (head->plan.stateful.writerMode == StatefulWriterMode::allMasters) && !head->plan.useHostNetworkNamespace &&
               head->nShardGroups == 1 && head->desiredReplicaCountForShardGroup(0) == scope.desiredReplicas &&
               BitseryEngine::serialize(replayPlanBytes, replayPlan) &&
               prodigyComputeSHA256Hex(replayPlanBytes, replayPlanSHA256) &&
@@ -21611,7 +21582,7 @@ public:
         // head: those retain their existing materialized-recovery barriers.
         else if (head->previous == nullptr && head->next == nullptr && head->state == DeploymentState::none &&
                  head->plan.isStateful && head->plan.config.type == ApplicationType::stateful &&
-                 ((!head->plan.stateful.allMasters && ordinaryMissingPredecessor) || retainedRearmValid) &&
+                 ((head->plan.stateful.writerMode != StatefulWriterMode::allMasters && ordinaryMissingPredecessor) || retainedRearmValid) &&
                  head->materializedStatefulRecoveryOwnsTransition == false &&
                  head->materializedStatefulRecoveryHealthFailed == false &&
                  head->waitingOnCompactions == false && head->canaryStack == nullptr &&
@@ -21650,7 +21621,7 @@ public:
           });
           if (retainedRearmValid)
           {
-            canonicalCohort = canonicalCohort && head->plan.stateful.allMasters &&
+            canonicalCohort = canonicalCohort && (head->plan.stateful.writerMode == StatefulWriterMode::allMasters) &&
                 retainedMembers.size() == retainedRearm->scope.retainedMembers.size();
             for (uint32_t index = 0; canonicalCohort && index < retainedMembers.size(); ++index)
             {
@@ -21824,6 +21795,11 @@ public:
         });
         receipt->returned = true;
         if (!receipt->completed || !receipt->durable) return;
+      }
+
+      if (normalizeRecoveredUnmaterializedQueuedMiddle(head))
+      {
+        return;
       }
 
       // A queued successor becomes the application index head before the
@@ -23549,7 +23525,6 @@ public:
     driveTransportCredentialEnrollmentOperations();
     driveClusterPairEnrollmentOperations();
     driveCousinDiscoverySnapshots();
-    driveNativeMemberRepairs();
     driveCousinSessions();
     resumeStatefulTopologyRetirements();
     for (BrainView *peer : brains)
@@ -24642,6 +24617,13 @@ public:
     for (const auto& runtime : crossClusterMasqueGatewayBrainRuntimes)
     {
       if (runtime.authority.localMachineUUID != machine->uuid) continue;
+      // A replacement that changes this pair's reserved fragment is terminally
+      // fenced by the old runtime's kill acknowledgement.  Its plan is no
+      // longer a current authority-bound bootstrap, so ordinary registration
+      // must not reject the whole replay while it waits to observe that ACK.
+      // If this Neuron still reports the old process, the inventory owner
+      // requeues its exact kill instead of re-adopting it here.
+      if (runtime.killPending) continue;
       const auto *authority = desiredCrossClusterMasqueGatewayAuthority(
           runtime.authority.pairUUID, machine->uuid);
       const auto effective =
@@ -24652,7 +24634,7 @@ public:
               authority->pairUUID, authority->localMachineUUID);
       if (!masterAuthorityRuntimeStateDurable ||
           durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation ||
-          runtime.killPending || authority == nullptr ||
+          authority == nullptr ||
           !crossClusterMasqueGatewayAuthoritiesExactlyEqual(runtime.authority, *authority) ||
           !crossClusterMasqueGatewayPlanMatchesAuthority(runtime.plan, *authority, fragment) ||
           !replayedUUIDs.insert(runtime.plan.uuid).second)
@@ -24700,18 +24682,50 @@ public:
   // stateUpload records, and only while their complete UUID set still equals
   // the canonical machine index. A membership change makes this return false;
   // the caller requests the established fresh stateUpload before retrying.
-  bool collectAuthenticatedNeuronStateUploadBootstraps(Machine *machine, Vector<String>& serializedBootstraps)
+  bool collectAuthenticatedNeuronStateUploadBootstraps(
+      Machine *machine, Vector<String>& serializedBootstraps, String *diagnostic = nullptr)
   {
     serializedBootstraps.clear();
-    if (machine == nullptr || machine->uuid == 0 || machine->runtimeReady == false ||
-        persistedMachineInventoryUploaded.contains(machine->uuid) == false)
+    if (diagnostic != nullptr)
     {
+      diagnostic->clear();
+    }
+    if (machine == nullptr)
+    {
+      if (diagnostic != nullptr) diagnostic->assign("stateUpload inventory machine=0 category=machine-null"_ctv);
       return false;
+    }
+
+    const auto reject = [&](const String& category, uint64_t deploymentID = 0, uint128_t containerUUID = 0,
+                            uint64_t canonicalCount = 0, uint64_t uploadedCount = 0) {
+      serializedBootstraps.clear();
+      if (diagnostic != nullptr)
+      {
+        String machineID = {}, deployment = {}, container = {};
+        machineID.assignItoh(machine->uuid);
+        deployment.assignItoh(deploymentID);
+        container.assignItoh(containerUUID);
+        diagnostic->snprintf_add<"stateUpload inventory machine={} category={} deployment={} container={} canonical={itoa} uploaded={itoa}"_ctv>(
+            machineID, category, deployment, container, canonicalCount, uploadedCount);
+      }
+      return false;
+    };
+    if (machine->uuid == 0)
+    {
+      return reject("machine-uuid-zero"_ctv);
+    }
+    if (machine->runtimeReady == false)
+    {
+      return reject("machine-runtime-not-ready"_ctv);
+    }
+    if (persistedMachineInventoryUploaded.contains(machine->uuid) == false)
+    {
+      return reject("machine-upload-marker-missing"_ctv);
     }
     const auto uploaded = persistedMachineStateUploadPlansByMachine.find(machine->uuid);
     if (uploaded == persistedMachineStateUploadPlansByMachine.end())
     {
-      return false;
+      return reject("authenticated-upload-missing"_ctv);
     }
 
     bytell_hash_set<uint128_t> canonical = {};
@@ -24719,10 +24733,29 @@ public:
     {
       for (const ContainerView *container : machineContainers)
       {
-        if (container == nullptr || container->uuid == 0 || container->machine != machine ||
-            container->deploymentID != deploymentID || canonical.insert(container->uuid).second == false)
+        if (container == nullptr)
         {
-          return false;
+          return reject("canonical-container-null"_ctv, deploymentID, 0, canonical.size(), uploaded->second.size());
+        }
+        if (container->uuid == 0)
+        {
+          return reject("canonical-container-uuid-zero"_ctv, deploymentID, 0,
+                        canonical.size(), uploaded->second.size());
+        }
+        if (container->machine != machine)
+        {
+          return reject("canonical-container-wrong-machine"_ctv, deploymentID, container->uuid,
+                        canonical.size(), uploaded->second.size());
+        }
+        if (container->deploymentID != deploymentID)
+        {
+          return reject("canonical-container-wrong-deployment"_ctv, deploymentID, container->uuid,
+                        canonical.size(), uploaded->second.size());
+        }
+        if (canonical.insert(container->uuid).second == false)
+        {
+          return reject("canonical-container-duplicate"_ctv, deploymentID, container->uuid,
+                        canonical.size(), uploaded->second.size());
         }
       }
     }
@@ -24731,22 +24764,39 @@ public:
     for (const String& serializedPlan : uploaded->second)
     {
       ContainerPlan plan = {};
-      if (BitseryEngine::deserializeSafe(serializedPlan, plan) == false || plan.uuid == 0 ||
-          canonical.contains(plan.uuid) == false || seen.insert(plan.uuid).second == false)
+      if (BitseryEngine::deserializeSafe(serializedPlan, plan) == false)
       {
-        return false;
+        return reject("authenticated-upload-deserialize-failed"_ctv, 0, 0,
+                      canonical.size(), uploaded->second.size());
+      }
+      if (plan.uuid == 0)
+      {
+        return reject("authenticated-upload-uuid-zero"_ctv, plan.config.deploymentID(), 0,
+                      canonical.size(), uploaded->second.size());
+      }
+      if (canonical.contains(plan.uuid) == false)
+      {
+        return reject("authenticated-upload-not-canonical"_ctv, plan.config.deploymentID(), plan.uuid,
+                      canonical.size(), uploaded->second.size());
+      }
+      if (seen.insert(plan.uuid).second == false)
+      {
+        return reject("authenticated-upload-duplicate"_ctv, plan.config.deploymentID(), plan.uuid,
+                      canonical.size(), uploaded->second.size());
       }
       auto deploymentIt = deployments.find(plan.config.deploymentID());
       if (deploymentIt == deployments.end() || deploymentIt->second == nullptr)
       {
-        return false;
+        return reject("deployment-index-missing"_ctv, plan.config.deploymentID(), plan.uuid,
+                      canonical.size(), uploaded->second.size());
       }
       ApplicationDeployment *deployment = deploymentIt->second;
       auto indexed = containers.find(plan.uuid);
       if (indexed == containers.end() || indexed->second == nullptr || indexed->second->machine != machine ||
           indexed->second->deploymentID != plan.config.deploymentID())
       {
-        return false;
+        return reject("global-container-index-mismatch"_ctv, plan.config.deploymentID(), plan.uuid,
+                      canonical.size(), uploaded->second.size());
       }
       String credentialFailure = {};
       if (deploymentApiCredentialsAvailableForLaunch(deployment->plan, &credentialFailure) == false)
@@ -24758,7 +24808,8 @@ public:
             deployment->plan.config.deploymentID(),
             credentialFailure.size() ? credentialFailure : String("credential policy unavailable for container replay"_ctv),
             deployment->generateReport());
-        return false;
+        return reject("deployment-credentials-unavailable"_ctv, plan.config.deploymentID(), plan.uuid,
+                      canonical.size(), uploaded->second.size());
       }
       NeuronContainerBootstrap bootstrap = {};
       bootstrap.plan = plan;
@@ -24769,7 +24820,20 @@ public:
     }
     if (seen.size() != canonical.size())
     {
-      return false;
+      uint128_t missingUUID = 0;
+      for (uint128_t uuid : canonical)
+        if (!seen.contains(uuid)) { missingUUID = uuid; break; }
+      auto missing = containers.find(missingUUID);
+      const bool unlaunchedReservation = missing != containers.end() && missing->second != nullptr &&
+          missing->second->state == ContainerState::planned && missing->second->fragment == 0 &&
+          !missing->second->runtimeReady;
+      // A normal inventory refresh cannot report an unsent planner reservation.
+      // Keep admission closed: excluding it would require a lifecycle fence
+      // that prevents scheduling and in-flight launch callbacks during exec.
+      return reject(unlaunchedReservation ? String("canonical-planner-reservation-unlaunched"_ctv) :
+                    String("authenticated-upload-set-mismatch"_ctv),
+                    missing == containers.end() || missing->second == nullptr ? 0 : missing->second->deploymentID,
+                    missingUUID, canonical.size(), seen.size());
     }
 
     // System gateways are deliberately outside the application deployment
@@ -24783,10 +24847,15 @@ public:
       {
         continue;
       }
-      if (!crossClusterMasqueGatewayAuthenticatedInventoryCurrent(runtime, machine) ||
-          seen.insert(runtime.authenticatedInventoryPlan.uuid).second == false)
+      if (!crossClusterMasqueGatewayAuthenticatedInventoryCurrent(runtime, machine))
       {
-        return false;
+        return reject("gateway-authenticated-inventory-missing-or-stale"_ctv, 0,
+                      runtime.authenticatedInventoryPlan.uuid, canonical.size(), seen.size());
+      }
+      if (seen.insert(runtime.authenticatedInventoryPlan.uuid).second == false)
+      {
+        return reject("gateway-authenticated-inventory-duplicate"_ctv, 0,
+                      runtime.authenticatedInventoryPlan.uuid, canonical.size(), seen.size());
       }
       NeuronContainerBootstrap bootstrap = {};
       bootstrap.plan = runtime.authenticatedInventoryPlan;
@@ -24800,9 +24869,11 @@ public:
   bool replayRestoredContainerInventory()
   {
     if (!weAreMaster || !recoveringPersistedNeuronInventory) return pendingRestoredContainerInventory.empty();
-    // Never emit a partial bootstrap while another deployment or machine is
-    // still awaiting materialization. Retain exact UUIDs across split batches.
-    if (!pendingReplicatedContainerRuntimeStates.empty()) return false;
+    // Retain exact runtime UUIDs across split batches. Volatile planner rows
+    // cannot bootstrap a process; replay the real runtimes so authenticated
+    // inventory can settle those rows before the final recovery barrier opens.
+    if (!pendingReplicatedContainerRuntimeStates.empty() &&
+        !pendingReplicatedContainerRuntimeStatesContainOnlyVolatileStatelessPlannerReservations()) return false;
     Vector<uint128_t> observed;
     bytell_hash_set<Machine *> progressed;
     bytell_hash_set<Machine *> missing;
@@ -25070,20 +25141,6 @@ public:
     {
       if (bootstraps != &liveBootstraps) liveBootstraps = *bootstraps;
       bootstraps = &liveBootstraps;
-      for (String& encoded : liveBootstraps)
-      {
-        const auto admission = prepareStatefulStoreGenerationLaunch(machine, encoded);
-        if (admission != StatefulServingLaunchAdmission::ready)
-        {
-          bootstraps = nullptr;
-          bootstrapSource = "generation-projection-withheld";
-          if (admission == StatefulServingLaunchAdmission::pending)
-            bootstrapFailure.assign("stateful store generation is awaiting current authority or machine capability"_ctv);
-          else
-            bootstrapFailure.assign("stateful store generation does not match the authoritative launch"_ctv);
-          break;
-        }
-      }
     }
 
     // Read the last accepted inventory before invalidating it for this new
@@ -28101,6 +28158,112 @@ public:
     return 1;
   }
 
+  // ClusterTopology is the authority for an adopted machine's logical rack.
+  // `Machine::rack` and the deployment placement maps intentionally use Rack*
+  // identity for their hot scheduling path, so changing only rackUUID makes a
+  // truthful cluster report while leaving scheduling on the old rack.
+  void rebindMachineRack(Machine *machine, uint32_t rackUUID)
+  {
+    if (machine == nullptr || rackUUID == 0)
+    {
+      return;
+    }
+
+    Rack *previousRack = machine->rack;
+    if (previousRack != nullptr && previousRack->uuid == rackUUID)
+    {
+      machine->rackUUID = rackUUID;
+      return;
+    }
+
+    Rack *rack = nullptr;
+    if (auto rackIt = racks.find(rackUUID); rackIt != racks.end())
+    {
+      rack = rackIt->second;
+    }
+    else
+    {
+      rack = new Rack();
+      rack->uuid = rackUUID;
+      racks.insert_or_assign(rackUUID, rack);
+    }
+
+    if (previousRack != nullptr)
+    {
+      previousRack->machines.erase(machine);
+    }
+    machine->rackUUID = rackUUID;
+    machine->rack = rack;
+    rack->machines.insert(machine);
+
+    // Existing deployment counters and shard fences are keyed by Rack*, not
+    // by the durable rack UUID. Re-key only the moved machine's contribution;
+    // the existing deployment predicate remains the single authority for
+    // whether an old or new rack is represented by a stateful shard.
+    if (previousRack != nullptr)
+    {
+      Vector<ApplicationDeployment *> graph;
+      collectDeploymentGraph(graph);
+      for (ApplicationDeployment *deployment : graph)
+      {
+        if (deployment == nullptr)
+        {
+          continue;
+        }
+
+        uint32_t movedCount = 0;
+        if (auto machineCount = deployment->countPerMachine.find(machine);
+            machineCount != deployment->countPerMachine.end())
+        {
+          movedCount = machineCount->second;
+        }
+        if (movedCount > 0)
+        {
+          if (auto previousCount = deployment->countPerRack.find(previousRack);
+              previousCount != deployment->countPerRack.end())
+          {
+            if (previousCount->second <= movedCount)
+            {
+              deployment->countPerRack.erase(previousCount);
+            }
+            else
+            {
+              previousCount->second -= movedCount;
+            }
+          }
+          deployment->countPerRack[rack] += movedCount;
+        }
+
+        for (auto& [shardGroup, placedRacks] : deployment->racksByShardGroup)
+        {
+          if (deploymentUsesRackForShardGroup(deployment, previousRack, shardGroup) == false)
+          {
+            placedRacks.erase(previousRack);
+          }
+          if (deploymentUsesRackForShardGroup(deployment, rack, shardGroup))
+          {
+            placedRacks.insert(rack);
+          }
+        }
+      }
+      bool referencedByRetiringMachine = false;
+      for (const auto& [neuron, retirement] : retiringMachinesByNeuron)
+      {
+        (void)neuron;
+        if (retirement.machine != nullptr && retirement.machine->rack == previousRack)
+        {
+          referencedByRetiringMachine = true;
+          break;
+        }
+      }
+      if (previousRack->machines.empty() && referencedByRetiringMachine == false)
+      {
+        eraseRetiredRackPlacement(previousRack, graph);
+      }
+      deleteRackIfUnused(previousRack);
+    }
+  }
+
   void applyClusterMachineRecord(Machine *machine, const ClusterMachine& clusterMachine, uint32_t resolvedPrivate4, const IPAddress& resolvedPeerAddress, const String& resolvedPeerAddressText)
   {
     if (machine == nullptr)
@@ -28183,7 +28346,7 @@ public:
     }
     machine->uuid = resolvedMachineUUID;
     uint32_t rackUUID = synthesizeTestClusterRackUUID(clusterMachine, resolvedPrivate4, resolvedPeerAddressText);
-    machine->rackUUID = rackUUID != 0 ? rackUUID : 1;
+    rebindMachineRack(machine, rackUUID != 0 ? rackUUID : 1);
     machine->private4 = resolvedPrivate4;
     machine->gatewayPrivate4 = 0;
     if (clusterMachine.resolvePrivate4Gateway(machine->gatewayPrivate4) == false && thisNeuron != nullptr)
@@ -29095,11 +29258,6 @@ public:
     if (auto it = containers.find(containerUUID); it != containers.end())
     {
       ContainerView *container = it->second;
-      if (const auto *home = nativeRepairSelection(containerUUID))
-      {
-        container->nativeRepairHealthyObserved = true;
-        if (!nativeMemberProofCurrent(*container, *home)) return;
-      }
       const bool restoredInventoryProgress =
           noteRestoredContainerInventoryReplayProgress(containerUUID, container->machine);
       ApplicationDeployment *deployment = nullptr;
@@ -29129,13 +29287,6 @@ public:
         const bool recoveringDeployment = deployment->plan.config.type != ApplicationType::task &&
                                           deployment->state == DeploymentState::none;
         deployment->containerIsHealthy(container);
-        if (mesh && container->verifiedRepairHome && container->state == ContainerState::healthy)
-        {
-          const auto client = container->explicitStatefulMeshRoles.client;
-          auto entry = container->advertisements.find(client);
-          if (client && entry != container->advertisements.end() && serviceBlueprintActiveAtContainerState(entry->second, container->state))
-            mesh->advertise(client, container, entry->second.port, true);
-        }
         (void)advanceTlsResumptionLifecycleForDeployment(deployment->plan, Time::now<TimeResolution::ms>(), false);
         replicateContainerRuntimeStateToFollowers(container);
         PRODIGY_DEBUG_LOG(
@@ -29330,42 +29481,6 @@ public:
         return;
       }
 
-      auto assignRack = [&](Machine *machine, uint32_t rackUUID) -> void {
-        if (machine == nullptr || rackUUID == 0)
-        {
-          return;
-        }
-
-        if (machine->rack != nullptr && machine->rack->uuid == rackUUID)
-        {
-          machine->rackUUID = rackUUID;
-          return;
-        }
-
-        if (machine->rack != nullptr)
-        {
-          Rack *previousRack = machine->rack;
-          previousRack->machines.erase(machine);
-          deleteRackIfUnused(previousRack);
-        }
-
-        Rack *rack = nullptr;
-        if (auto rackIt = racks.find(rackUUID); rackIt != racks.end())
-        {
-          rack = rackIt->second;
-        }
-        else
-        {
-          rack = new Rack();
-          rack->uuid = rackUUID;
-          racks.insert_or_assign(rackUUID, rack);
-        }
-
-        machine->rackUUID = rackUUID;
-        machine->rack = rack;
-        rack->machines.insert(machine);
-      };
-
       // The authoritative topology owns cluster roles. Provider inventory
       // snapshots describe backing-machine state and may omit both flags, so a
       // sparse refresh must not erase an already established Brain or local
@@ -29426,7 +29541,7 @@ public:
 
       if (candidate->rackUUID != 0)
       {
-        assignRack(canonical, candidate->rackUUID);
+        rebindMachineRack(canonical, candidate->rackUUID);
       }
     };
 
@@ -34741,6 +34856,7 @@ public:
         {
           runBrainPeerHeartbeatTick();
           expireContainerLogRequests();
+          expireGlobalSingleWriterControls();
           brainPeerHeartbeatTicker.setTimeoutMs(brainPeerHeartbeatIntervalMs);
           Ring::queueTimeout(&brainPeerHeartbeatTicker);
           break;
@@ -40166,8 +40282,30 @@ public:
     return true;
   }
 
+  bool globalSingleWriterSiblingMembership(const ContainerView& container,
+                                    const ProdigyLocalCousinServicePermission& permission,
+                                    GlobalSingleWriterMembershipProjection& membership) const
+  {
+    auto deployment = deployments.find(container.deploymentID);
+    if (deployment == deployments.end() || !deployment->second ||
+        !prodigyGlobalSingleWriterPlanValid(deployment->second->plan)) return false;
+    const auto& plan = deployment->second->plan;
+    return permission.localApplicationID == plan.config.applicationID &&
+        permission.peerApplicationID == plan.config.applicationID &&
+        permission.localDeploymentID == container.deploymentID && permission.peerDeploymentID == container.deploymentID &&
+        permission.purpose == ProdigyCousinServicePurpose::sibling &&
+        permission.localCousinServicePrefix == plan.stateful.siblingPrefix &&
+        permission.peerCousinServicePrefix == plan.stateful.siblingPrefix &&
+        permission.localHalf == CousinRouteHalf::source &&
+        desiredGlobalSingleWriterMembership(container.deploymentID, membership) &&
+        membership.localClusterUUID == brainConfig.clusterUUID &&
+        prodigyGlobalSingleWriterLocalMember(membership, container.deploymentID, container.uuid) &&
+        container.whiteholes.size() <= prodigyGlobalSingleWriterSiblingMaximumWhiteholes;
+  }
+
   bool cousinSessionSourceRequest(NeuronView *neuron, uint128_t containerUUID,
-                                 const ProdigyCousinSessionRequest& request, bool ownerDesired = false)
+                                 const ProdigyCousinSessionRequest& request, bool ownerDesired = false,
+                                 const GlobalSingleWriterMember *desiredGlobalSingleWriterCounterpart = nullptr)
   {
     if (!weAreMaster || !neuron || !neuron->machine || neuron != &neuron->machine->neuron ||
         !prodigyCousinSessionRequestValid(request) ||
@@ -40212,6 +40350,20 @@ public:
         permission->localHalf != CousinRouteHalf::source || !permission->slots.contains(request.slot) ||
         permission->localDeploymentID != container->deploymentID ||
         !localCousinServicePermissionMatchesCurrentLivePlan(*permission)) return reject();
+    // ContainerView deliberately carries runtime state, not the admitted
+    // launch plan.  The durable master projection is the only authority for
+    // this opt-in global single-writer path.
+    GlobalSingleWriterMembershipProjection globalSingleWriterMembership;
+    const bool globalSingleWriterSiblingPool = desiredGlobalSingleWriterCounterpart != nullptr &&
+        globalSingleWriterSiblingMembership(*container, *permission, globalSingleWriterMembership) &&
+        std::any_of(globalSingleWriterMembership.members.begin(), globalSingleWriterMembership.members.end(), [&](const auto& member) {
+          return member.memberID == desiredGlobalSingleWriterCounterpart->memberID &&
+              member.clusterUUID == desiredGlobalSingleWriterCounterpart->clusterUUID &&
+              member.containerUUID == desiredGlobalSingleWriterCounterpart->containerUUID &&
+              member.privateIPv6.equals(desiredGlobalSingleWriterCounterpart->privateIPv6) && member.role == desiredGlobalSingleWriterCounterpart->role;
+        }) && desiredGlobalSingleWriterCounterpart->containerUUID != container->uuid &&
+        desiredGlobalSingleWriterCounterpart->clusterUUID != globalSingleWriterMembership.localClusterUUID;
+    if (desiredGlobalSingleWriterCounterpart != nullptr && !globalSingleWriterSiblingPool) return reject();
     // All purpose-bound permissions are driven by this owner, including KV
     // cousins. Legacy permissions retain the explicit application request.
     const bool automatic =
@@ -40225,12 +40377,15 @@ public:
           container->subscriptions, container->state)) return reject();
     if (automatic != ownerDesired || (!automatic && !container->isStateful) ||
         (automatic && (neuron->cousinDiscoveryVersion < 2 || (!privateRequest &&
-            (usableWhiteholes != 1 || container->whiteholes.size() != 1))))) return reject();
+            (globalSingleWriterSiblingPool ? (usableWhiteholes == 0 || usableWhiteholes > prodigyGlobalSingleWriterSiblingMaximumWhiteholes ||
+                                        container->whiteholes.size() > prodigyGlobalSingleWriterSiblingMaximumWhiteholes) :
+                                      (usableWhiteholes != 1 || container->whiteholes.size() != 1)))))) return reject();
     if (std::any_of(cousinSessions.begin(), cousinSessions.end(), [&](const auto& session) {
           return session.record.sourceContainerUUID == containerUUID &&
               (session.record.sourceBindingNonce == request.bindingNonce ||
                (privateRequest && prodigyCousinSessionUsesPrivateContainerEndpoints(session.record) &&
-                session.record.sourcePermission.permissionUUID == request.permissionUUID && session.record.slot == request.slot)) &&
+                session.record.sourcePermission.permissionUUID == request.permissionUUID && session.record.slot == request.slot &&
+                (!globalSingleWriterSiblingPool || session.record.destination.containerUUID == desiredGlobalSingleWriterCounterpart->containerUUID))) &&
               prodigyCousinSourcePermissionsConflict(*permission, session.record.sourcePermission) &&
               session.expiresAtMs > Time::msSinceBoot(); })) return false;
     ProdigyCousinDiscoveryResponse counterparts = queryCousinCounterparts({1, request.permissionUUID, request.slot});
@@ -40262,10 +40417,24 @@ public:
       if (!localCousinServicePermissionAllowsRoute(request.permissionUUID, route, request.slot, routeNowMs)) continue;
       if (privateRequest != (route.endpointKind == CousinRouteEndpointKind::privateContainer)) continue;
       if (cutAuthority && route.routeUUID != cutAuthority->seedRouteUUID) continue;
-      if (automatic && !prodigyCousinAutomaticSessionDesired(*permission, route, true, privateRequest ? 1 : usableWhiteholes, routeNowMs)) continue;
-      const auto destination = std::find_if(counterparts.records.begin(), counterparts.records.end(),
-          [&](const auto& candidate) { return cousinRouteMatchesCounterpart(route, candidate) &&
-              (!cutAuthority || prodigySourceCutCounterpartMatches(*cutAuthority, route, candidate)); });
+      if (automatic && !prodigyCousinAutomaticSessionDesired(*permission, route, true,
+          privateRequest ? 1 : usableWhiteholes, routeNowMs, globalSingleWriterSiblingPool)) continue;
+      auto destination = counterparts.records.end();
+      for (auto candidate = counterparts.records.begin(); candidate != counterparts.records.end(); ++candidate) {
+        if (!cousinRouteMatchesCounterpart(route, *candidate) ||
+            (cutAuthority && !prodigySourceCutCounterpartMatches(*cutAuthority, route, *candidate))) continue;
+        if (globalSingleWriterSiblingPool && (candidate->containerUUID != desiredGlobalSingleWriterCounterpart->containerUUID ||
+            candidate->permission.localClusterUUID != desiredGlobalSingleWriterCounterpart->clusterUUID ||
+            (privateRequest && !candidate->publicAddress.equals(desiredGlobalSingleWriterCounterpart->privateIPv6)))) continue;
+        if (destination != counterparts.records.end()) {
+          // Legacy callers intentionally retain first-live-counterpart
+          // selection.  The Truth owner supplied an exact membership target,
+          // so ambiguity there is unsafe and must fail closed.
+          if (globalSingleWriterSiblingPool) return reject();
+          break;
+        }
+        destination = candidate;
+      }
       if (destination == counterparts.records.end()) continue;
       selectedRoute = &route; selectedDestination = &*destination; break;
     }
@@ -40373,24 +40542,6 @@ public:
                               String& context) const
   {
     OPENSSL_cleanse(key.data(), key.size()); context.clear();
-    if (prodigyCousinNativeRepairSession(record)) {
-      const auto& root = masterAuthorityRuntimeState.transportCredentialAuthorityRoot;
-      const auto target = std::find_if(masterAuthorityRuntimeState.transportCredentialEnrollments.begin(), masterAuthorityRuntimeState.transportCredentialEnrollments.end(), [&](const auto& value) {
-        return value.nodeUUID == record.repairTarget.nodeUUID && value.clusterUUID == record.repairAuthority.targetClusterUUID &&
-            value.role == ProdigyTransportCredentialNodeRole::neuron && value.state == ProdigyTransportCredentialEnrollmentState::active;
-      });
-      const auto donor = std::find_if(masterAuthorityRuntimeState.transportCredentialEnrollments.begin(), masterAuthorityRuntimeState.transportCredentialEnrollments.end(), [&](const auto& value) {
-        return value.nodeUUID == record.repairDonor.nodeUUID && value.clusterUUID == record.repairAuthority.sourceClusterUUID &&
-            value.role == ProdigyTransportCredentialNodeRole::neuron && value.state == ProdigyTransportCredentialEnrollmentState::active;
-      });
-      if (!root.valid() || target == masterAuthorityRuntimeState.transportCredentialEnrollments.end() ||
-          donor == masterAuthorityRuntimeState.transportCredentialEnrollments.end()) return false;
-      ProdigyTransportNodeCredential credential = {};
-      const bool ok = prodigyDeriveTransportNodeCredential(root, *target, credential) &&
-          prodigyCousinSessionDigest(record, context) && prodigyDeriveNativeStatefulRepairPSK(credential,
-              donor->operationUUID, donor->nodeUUID, donor->role, context, key.data());
-      OPENSSL_cleanse(credential.secret, sizeof(credential.secret)); return ok;
-    }
     const auto enrollment = std::find_if(masterAuthorityRuntimeState.clusterPairEnrollments.begin(),
         masterAuthorityRuntimeState.clusterPairEnrollments.end(), [&](const auto& value) {
           return value.pairUUID == record.sourcePermission.pairUUID && value.state == ProdigyClusterPairEnrollmentState::active &&
@@ -40410,196 +40561,8 @@ public:
     return ok;
   }
 
-  // Same-cohort repair remains one bounded cousinSessions lease.  Unlike an
-  // ordinary route, both local halves are commanded by this Brain: donor
-  // install first, then target activation after its exact ACK.
-  bool nativeSeedCutCurrent(const ProdigyStatefulStoreSeedAuthority& authority, ContainerView *expectedDonor)
-  {
-    const auto found = statefulSourceCuts.find(authority.sourceContainerUUID);
-    if (found == statefulSourceCuts.end()) return false;
-    const auto& cache = found->second;
-    const auto& challenge = cache.challenge;
-    const auto& receipt = cache.receipt;
-    auto expected = challenge;
-    if (receipt.action == ProdigyStatefulStoreSourceCutAction::query) {
-      expected.action = ProdigyStatefulStoreSourceCutAction::query;
-      expected.cutUUID = authority.cutUUID;
-      expected.cutGeneration = authority.cutGeneration;
-    }
-    ContainerView *incarnated = nullptr;
-    String incarnation = {};
-    return expectedDonor != nullptr && statefulSourceCutIncarnation(challenge, incarnated, incarnation) &&
-        incarnated == expectedDonor && cache.planSHA256 == incarnation &&
-        cache.ioGeneration == expectedDonor->machine->neuron.ioGeneration && cache.crashCount == expectedDonor->nCrashes &&
-        cache.authorityEpoch == masterAuthorityEpoch && !cache.releasing && !cache.releaseReceipt.released &&
-        authority.retainUntilMilliseconds > uint64_t(Time::now<TimeResolution::ms>()) &&
-        challenge.operationUUID == authority.operationUUID && challenge.sourceClusterUUID == authority.sourceClusterUUID &&
-        challenge.sourceDeploymentID == authority.sourceDeploymentID && challenge.sourceContainerUUID == authority.sourceContainerUUID &&
-        challenge.applicationID == authority.applicationID && challenge.storeKind == authority.storeKind &&
-        challenge.shardGroup == authority.shardGroup && challenge.nShardGroups == authority.nShardGroups &&
-        challenge.scope == authority.sourceCutScope && challenge.retainUntilMilliseconds == authority.retainUntilMilliseconds &&
-        receipt.response && receipt.ready && !receipt.released && prodigyStatefulStoreSourceCutResponseMatches(expected, receipt) &&
-        receipt.requestUUID == authority.sourceRequestUUID && receipt.memberRequestUUID == authority.sourceMemberRequestUUID &&
-        receipt.cutUUID == authority.cutUUID && receipt.cutGeneration == authority.cutGeneration &&
-        receipt.contentSHA256 == authority.sourceContentWatermarkSHA256 && receipt.headsSHA256 == authority.sourceCatchupWatermarkSHA256;
-  }
-
-  bool ensureNativeMemberRepairSession(const ProdigyStatefulStoreGenerationSelection& selection,
-                                       ProdigyCohortRepairPurpose purpose)
-  {
-    if (!weAreMaster || !masterAuthorityRuntimeStateDurable || masterAuthorityPersistencePending ||
-        durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation ||
-        !statefulServingRecoveryReady() || !statefulStoreGenerationPeersCapable(true) ||
-        !containerRetirementAuthorityAcknowledged() || !prodigyStatefulStoreGenerationSelectionValid(selection) ||
-        selection.authority.targetClusterUUID != brainConfig.clusterUUID) return false;
-    const auto& authority = selection.authority;
-    const auto *current = nativeRepairSelection(authority.targetContainerUUID);
-    if (!current || !prodigyStatefulStoreGenerationSelectionsEqual(*current, selection)) return false;
-    for (const auto& session : cousinSessions) {
-      if (prodigyCousinNativeRepairSession(session.record) && session.record.repairTarget.containerUUID == authority.targetContainerUUID &&
-          session.record.repairGenerationUUID == selection.generationUUID && session.record.repairPurpose == purpose &&
-          cousinSessionLocalCurrent(session)) return true;
-    }
-    if (cousinSessions.size() >= ProdigyCousinSessionMaximumRecords) return false;
-    auto target = containers.find(authority.targetContainerUUID);
-    if (target == containers.end() || !target->second || !target->second->machine) return false;
-    const ProdigyStatefulServingAuthority *scope = nullptr;
-    String targetDigest = {};
-    const auto *targetSealed = prodigyStatefulServingRepairMember(masterAuthorityRuntimeState, statefulServingRuntimeStates,
-            authority.targetDeploymentID, authority.shardGroup, target->second->uuid, target->second->machine->uuid,
-            scope, targetDigest);
-    if (!targetSealed || !scope || targetDigest != selection.admittedPlanSHA256 ||
-        !nativeRepairLivePlanMatches(target->second, *targetSealed)) return false;
-    auto targetDeployment = deployments.find(target->second->deploymentID);
-    if (targetDeployment == deployments.end() || !targetDeployment->second ||
-        target->second->shardGroup != authority.shardGroup || targetDeployment->second->nShardGroups != authority.nShardGroups) return false;
-    const uint64_t targetService = purpose == ProdigyCohortRepairPurpose::seed ?
-        target->second->effectiveStatefulMeshRoles(targetDeployment->second->plan).seeding :
-        target->second->effectiveStatefulMeshRoles(targetDeployment->second->plan).sibling;
-    if (targetService == 0 || !target->second->subscriptions.contains(targetService)) return false;
-    ContainerView *donorView = nullptr;
-    uint16_t donorPort = 0;
-    for (const auto& member : scope->members) {
-      if (member.containerUUID == target->second->uuid || member.shardGroup != authority.shardGroup ||
-          (purpose == ProdigyCohortRepairPurpose::seed && member.containerUUID != authority.sourceContainerUUID)) continue;
-      auto donor = containers.find(member.containerUUID);
-      if (donor == containers.end() || !donor->second || !donor->second->machine ||
-          donor->second->machine == target->second->machine || donor->second->machine->uuid != member.machineUUID ||
-          donor->second->state != ContainerState::healthy || !donor->second->runtimeReady) continue;
-      const ProdigyStatefulServingAuthority *donorScope = nullptr;
-      String donorDigest = {};
-      const auto *donorSealed = prodigyStatefulServingRepairMember(masterAuthorityRuntimeState, statefulServingRuntimeStates,
-              authority.targetDeploymentID, authority.shardGroup, donor->second->uuid, donor->second->machine->uuid,
-              donorScope, donorDigest);
-      if (!donorSealed || donorScope != scope || donorDigest != member.planSHA256 ||
-          !nativeRepairLivePlanMatches(donor->second, *donorSealed)) continue;
-      auto donorDeployment = deployments.find(donor->second->deploymentID);
-      if (donorDeployment == deployments.end() || !donorDeployment->second || donor->second->shardGroup != authority.shardGroup ||
-          donorDeployment->second->nShardGroups != authority.nShardGroups) continue;
-      const uint64_t donorService = purpose == ProdigyCohortRepairPurpose::seed ?
-          donor->second->effectiveStatefulMeshRoles(donorDeployment->second->plan).seeding :
-          donor->second->effectiveStatefulMeshRoles(donorDeployment->second->plan).sibling;
-      auto advertisement = donor->second->advertisements.find(donorService);
-      if (donorService != targetService || advertisement == donor->second->advertisements.end() || advertisement->second.port == 0 ||
-          !serviceBlueprintActiveAtContainerState(advertisement->second, donor->second->state)) continue;
-      donorView = donor->second; donorPort = advertisement->second.port; break;
-    }
-    if (!donorView) return false;
-    if (purpose == ProdigyCohortRepairPurpose::seed && !nativeSeedCutCurrent(authority, donorView)) return false;
-    CousinSessionState state = {}; auto& record = state.record;
-    record.protocolVersion = ProdigyCousinSessionNativeRepairProtocolVersion;
-    if (RAND_priv_bytes(reinterpret_cast<unsigned char *>(&record.sessionUUID), sizeof(record.sessionUUID)) != 1 ||
-        RAND_priv_bytes(reinterpret_cast<unsigned char *>(&record.requestUUID), sizeof(record.requestUUID)) != 1 ||
-        record.sessionUUID == 0 || record.requestUUID == 0) return false;
-    record.repairGenerationUUID = selection.generationUUID; record.repairAuthority = authority;
-    record.repairPurpose = purpose; record.repairService = targetService;
-    if (purpose == ProdigyCohortRepairPurpose::seed && authority.retainUntilMilliseconds > uint64_t(INT64_MAX)) return false;
-    // Catch-up can keep one authenticated change stream across renewals.
-    // Each endpoint still gets an absolute, short-lived command grant.
-    record.repairExpiresAtMilliseconds = purpose == ProdigyCohortRepairPurpose::seed ?
-        int64_t(authority.retainUntilMilliseconds) : INT64_MAX;
-    record.repairTarget = {.containerUUID = target->second->uuid, .nodeUUID = target->second->machine->uuid, .tcpPort = 0};
-    record.repairDonor = {.containerUUID = donorView->uuid, .nodeUUID = donorView->machine->uuid, .tcpPort = donorPort};
-    record.repairTarget.address.is6 = record.repairDonor.address.is6 = true;
-    std::memcpy(record.repairTarget.address.v6, &target->second->meshAddress, 16);
-    std::memcpy(record.repairDonor.address.v6, &donorView->meshAddress, 16);
-    for (uint32_t attempt = 0; attempt < 32 && record.repairTarget.tcpPort == 0; ++attempt) {
-      uint16_t random = 0; if (RAND_priv_bytes(reinterpret_cast<unsigned char *>(&random), sizeof(random)) != 1) return false;
-      const uint16_t port = uint16_t(49152u + random % 16384u);
-      if (std::none_of(cousinSessions.begin(), cousinSessions.end(), [&](const auto& existing) {
-            return existing.expiresAtMs > Time::msSinceBoot() && prodigyCousinNativeRepairSession(existing.record) &&
-                existing.record.repairTarget.containerUUID == record.repairTarget.containerUUID && existing.record.repairTarget.tcpPort == port;
-          })) record.repairTarget.tcpPort = port;
-    }
-    if (!prodigyCousinSessionRecordValid(record)) return false;
-    state.sourceMachineUUID = target->second->machine->uuid; state.destinationMachineUUID = donorView->machine->uuid;
-    state.applicationIOGeneration = target->second->machine->neuron.ioGeneration; state.destinationIOGeneration = donorView->machine->neuron.ioGeneration;
-    state.applicationCrashCount = target->second->nCrashes; state.destinationCrashCount = donorView->nCrashes;
-    state.authorityEpoch = masterAuthorityEpoch; state.createdAtMs = Time::msSinceBoot(); state.expiresAtMs = state.createdAtMs + ProdigyCousinSessionPendingMs;
-    state.pendingLocalHalf = CousinRouteHalf::destination;
-    if (!cousinSessionLocalCurrent(state) || !sendCousinSessionLocalCommand(state, ProdigyCousinSessionLocalKind::install)) return false;
-    cousinSessions.push_back(std::move(state)); return true;
-  }
-
   bool cousinSessionLocalCurrent(const CousinSessionState& state)
   {
-    if (prodigyCousinNativeRepairSession(state.record)) {
-      if (!weAreMaster || state.authorityEpoch != masterAuthorityEpoch || state.expiresAtMs <= Time::msSinceBoot() ||
-          !prodigyCousinNativeRepairSessionCurrent(state.record, Time::now<TimeResolution::ms>())) return false;
-      auto target = containers.find(state.record.repairTarget.containerUUID);
-      auto donor = containers.find(state.record.repairDonor.containerUUID);
-      if (target == containers.end() || donor == containers.end() || !target->second || !donor->second ||
-          !target->second->machine || !donor->second->machine || target->second->machine->uuid != state.sourceMachineUUID ||
-          donor->second->machine->uuid != state.destinationMachineUUID ||
-          target->second->machine->neuron.ioGeneration != state.applicationIOGeneration ||
-          donor->second->machine->neuron.ioGeneration != state.destinationIOGeneration ||
-          !containerRetirementNeuronAuthorized(&target->second->machine->neuron, target->second->machine->uuid) ||
-          !containerRetirementNeuronAuthorized(&donor->second->machine->neuron, donor->second->machine->uuid) ||
-          donor->second->nCrashes != state.destinationCrashCount || target->second->nCrashes != state.applicationCrashCount ||
-          donor->second->state != ContainerState::healthy || !donor->second->runtimeReady) return false;
-      const auto *selection = nativeRepairSelection(target->second->uuid);
-      if (!selection || selection->generationUUID != state.record.repairGenerationUUID) return false;
-      auto recordSelection = *selection;
-      recordSelection.authority = state.record.repairAuthority;
-      if (!prodigyStatefulStoreGenerationSelectionsEqual(*selection, recordSelection)) return false;
-      const ProdigyStatefulServingAuthority *scope = nullptr;
-      String targetDigest = {}, donorDigest = {};
-      const auto *targetSealed = prodigyStatefulServingRepairMember(masterAuthorityRuntimeState, statefulServingRuntimeStates,
-              state.record.repairAuthority.targetDeploymentID, state.record.repairAuthority.shardGroup,
-              target->second->uuid, target->second->machine->uuid, scope, targetDigest);
-      if (!targetSealed || !scope || targetDigest != selection->admittedPlanSHA256 ||
-          !nativeRepairLivePlanMatches(target->second, *targetSealed)) return false;
-      const ProdigyStatefulServingAuthority *donorScope = nullptr;
-      const auto *donorSealed = prodigyStatefulServingRepairMember(masterAuthorityRuntimeState, statefulServingRuntimeStates,
-              state.record.repairAuthority.targetDeploymentID, state.record.repairAuthority.shardGroup,
-              donor->second->uuid, donor->second->machine->uuid, donorScope, donorDigest);
-      if (!donorSealed || donorScope != scope || !nativeRepairLivePlanMatches(donor->second, *donorSealed)) return false;
-      auto targetDeployment = deployments.find(target->second->deploymentID);
-      auto donorDeployment = deployments.find(donor->second->deploymentID);
-      if (targetDeployment == deployments.end() || donorDeployment == deployments.end() || !targetDeployment->second || !donorDeployment->second ||
-          target->second->shardGroup != state.record.repairAuthority.shardGroup || donor->second->shardGroup != state.record.repairAuthority.shardGroup ||
-          targetDeployment->second->nShardGroups != state.record.repairAuthority.nShardGroups ||
-          donorDeployment->second->nShardGroups != state.record.repairAuthority.nShardGroups) return false;
-      const uint64_t service = state.record.repairPurpose == ProdigyCohortRepairPurpose::seed ?
-          target->second->effectiveStatefulMeshRoles(targetDeployment->second->plan).seeding :
-          target->second->effectiveStatefulMeshRoles(targetDeployment->second->plan).sibling;
-      const uint64_t donorService = state.record.repairPurpose == ProdigyCohortRepairPurpose::seed ?
-          donor->second->effectiveStatefulMeshRoles(donorDeployment->second->plan).seeding :
-          donor->second->effectiveStatefulMeshRoles(donorDeployment->second->plan).sibling;
-      const auto advertisement = donor->second->advertisements.find(donorService);
-      if (service == 0 || !target->second->subscriptions.contains(service) || donorService != service || service != state.record.repairService ||
-          advertisement == donor->second->advertisements.end() || advertisement->second.port != state.record.repairDonor.tcpPort) return false;
-      IPAddress targetAddress = {}, donorAddress = {};
-      targetAddress.is6 = donorAddress.is6 = true;
-      std::memcpy(targetAddress.v6, &target->second->meshAddress, 16);
-      std::memcpy(donorAddress.v6, &donor->second->meshAddress, 16);
-      if (!targetAddress.equals(state.record.repairTarget.address) || !donorAddress.equals(state.record.repairDonor.address)) return false;
-      if (state.record.repairPurpose == ProdigyCohortRepairPurpose::seed) {
-        if (state.record.repairDonor.containerUUID != state.record.repairAuthority.sourceContainerUUID ||
-            !nativeSeedCutCurrent(state.record.repairAuthority, donor->second)) return false;
-      }
-      return true;
-    }
     if (!weAreMaster || state.authorityEpoch != masterAuthorityEpoch || state.expiresAtMs <= Time::msSinceBoot() ||
         !clusterPairAuthorityQualified() || !localCousinServicePermissionAuthorityAcknowledged() ||
         !cousinRouteAuthorityAcknowledged()) return false;
@@ -40663,13 +40626,25 @@ public:
           prodigyCousinPermissionServiceForRoles(*permission, app->effectiveStatefulMeshRoles(deployment->second->plan)) != state.record.sourceService ||
           (app->isStateful ? deployment->second->nShardGroups : 1) != state.record.sourceShardGroups ||
           (app->isStateful ? app->shardGroup : 0) != state.record.sourceShardGroup) return false;
+      GlobalSingleWriterMembershipProjection globalSingleWriterMembership;
+      const bool globalSibling = (deployment->second->plan.stateful.writerMode == StatefulWriterMode::globalSingleWriter) &&
+          permission->purpose == ProdigyCousinServicePurpose::sibling;
+      const bool globalSingleWriterSiblingPool = globalSingleWriterSiblingMembership(*app, *permission, globalSingleWriterMembership) &&
+          std::any_of(globalSingleWriterMembership.members.begin(), globalSingleWriterMembership.members.end(), [&](const auto& member) {
+            return member.containerUUID == state.record.destination.containerUUID &&
+                member.clusterUUID == state.record.destination.permission.localClusterUUID &&
+                (!prodigyCousinSessionUsesPrivateContainerEndpoints(state.record) ||
+                 member.privateIPv6.equals(state.record.destination.publicAddress));
+          });
+      if (globalSibling && !globalSingleWriterSiblingPool) return false;
       if (prodigyCousinSessionUsesPrivateContainerEndpoints(state.record)) {
         IPAddress mesh = {}; mesh.is6 = true; std::memcpy(mesh.v6, &app->meshAddress, 16);
         if (machine->neuron.cousinDiscoveryVersion < 3 || !mesh.equals(state.record.sourceAddress) ||
             state.record.sourceBindingNonce == 0 || state.record.sourceTCPPort < 49152) return false;
       } else {
         if (permission->purpose != ProdigyCousinServicePurpose::statefulCousin &&
-            (machine->neuron.cousinDiscoveryVersion < 2 || app->whiteholes.size() != 1)) return false;
+            (machine->neuron.cousinDiscoveryVersion < 2 ||
+             (globalSingleWriterSiblingPool ? app->whiteholes.empty() : app->whiteholes.size() != 1))) return false;
         uint32_t bindings = 0;
         for (const auto& whitehole : app->whiteholes)
           if (whitehole.bindingNonce == state.record.sourceBindingNonce && whitehole.hasAddress &&
@@ -40715,36 +40690,23 @@ public:
 
   bool sendCousinSessionLocalCommand(CousinSessionState& state, ProdigyCousinSessionLocalKind kind)
   {
-    const bool nativeRepair = prodigyCousinNativeRepairSession(state.record);
-    const CousinRouteHalf half = nativeRepair ? state.pendingLocalHalf :
-        (state.record.sourcePermission.localClusterUUID == brainConfig.clusterUUID ? CousinRouteHalf::source : CousinRouteHalf::destination);
-    const bool source = half == CousinRouteHalf::source;
-    const uint128_t localUUID = nativeRepair ? prodigyCousinSessionContainerForLocalHalf(state.record, half) :
-        (source ? state.record.sourceContainerUUID : state.record.destination.containerUUID);
-    Machine *machine = findMachineByUUID(nativeRepair ? (source ? state.sourceMachineUUID : state.destinationMachineUUID) :
-        (source ? state.record.sourceNodeUUID : state.record.destination.nodeUUID));
+    const bool source = state.record.sourcePermission.localClusterUUID == brainConfig.clusterUUID;
+    const uint128_t localUUID = source ? state.record.sourceContainerUUID : state.record.destination.containerUUID;
+    Machine *machine = findMachineByUUID(source ? state.record.sourceNodeUUID : state.record.destination.nodeUUID);
     if (!machine || !containerRetirementNeuronAuthorized(&machine->neuron, machine->uuid) ||
-        machine->neuron.ioGeneration != (nativeRepair && !source ? state.destinationIOGeneration : state.applicationIOGeneration)) return false;
+        machine->neuron.ioGeneration != state.applicationIOGeneration) return false;
     ProdigyCousinSessionLocalCommand command = {};
     command.kind = kind; command.localHalf = source ? CousinRouteHalf::source : CousinRouteHalf::destination;
     command.requestUUID = state.record.requestUUID; command.session = state.record; command.leaseGeneration = state.leaseGeneration;
-    if (nativeRepair) command.protocolVersion = 4;
     if (state.record.transport == ProdigyCousinSessionTransport::reverseCarrier) {
       command.protocolVersion = 3; command.carrierConnectionID = state.connectionID;
       command.carrierGeneration = state.carrierGeneration;
     }
-    if (!nativeRepair && !source && state.record.sourcePermission.transportSourcePolicy == ProdigyCousinTransportSourcePolicy::authenticatedNAT) {
+    if (!source && state.record.sourcePermission.transportSourcePolicy == ProdigyCousinTransportSourcePolicy::authenticatedNAT) {
       command.protocolVersion = 2; command.authenticatedSourceAddress = state.authenticatedSourceAddress;
     }
     if (kind != ProdigyCousinSessionLocalKind::revoke) {
       command.validForMs = ProdigyCousinSessionLeaseMs;
-      if (nativeRepair) {
-        const auto now = Time::now<TimeResolution::ms>();
-        if (!source) state.pendingNativeLeaseExpiresAtMilliseconds = std::min<int64_t>(
-            state.record.repairExpiresAtMilliseconds, now + ProdigyCousinSessionLeaseMs);
-        command.nativeLeaseExpiresAtMilliseconds = state.pendingNativeLeaseExpiresAtMilliseconds;
-        if (!prodigyNativeRepairLeaseRemainingMs(command, now)) return false;
-      }
       if (!cousinSessionDeriveKey(state.record, command.psk, command.canonicalContext)) return false;
     }
     String encoded = {};
@@ -40761,21 +40723,9 @@ public:
     // removes this terminal record. They must not start another revoke exchange.
     if (state.expiresAtMs == 0) return;
     state.expiresAtMs = 0;
-    state.acknowledgedNativeLeaseGeneration = 0;
-    state.acknowledgedNativeLeaseExpiresAtMs = 0;
     // A deposed leader cannot keep issuing commands. Independent kernel/app
     // deadlines close anything whose current owner can no longer be reached.
     if (weAreMaster && state.authorityEpoch == masterAuthorityEpoch) {
-      if (prodigyCousinNativeRepairSession(state.record)) {
-        state.pendingLocalHalf = CousinRouteHalf::destination;
-        (void)sendCousinSessionLocalCommand(state, ProdigyCousinSessionLocalKind::revoke);
-        state.pendingLocalHalf = CousinRouteHalf::source;
-        (void)sendCousinSessionLocalCommand(state, ProdigyCousinSessionLocalKind::revoke);
-        auto target = containers.find(state.record.repairTarget.containerUUID);
-        if (target != containers.end() && target->second && target->second->verifiedRepairSession == state.record.sessionUUID)
-          withdrawNativeMemberHealth(*target->second);
-        return;
-      }
       (void)sendCousinSessionLocalCommand(state, ProdigyCousinSessionLocalKind::revoke);
       ProdigyCousinAdmissionCommand command = {}; command.session = state.record;
       command.revoke = true; command.leaseGeneration = state.leaseGeneration;
@@ -40966,104 +40916,6 @@ public:
     });
   }
 
-  const ProdigyStatefulStoreGenerationSelection *nativeRepairSelection(uint128_t uuid) const
-  {
-    const auto& homes = masterAuthorityRuntimeState.statefulStoreGenerationSelections;
-    auto home = std::lower_bound(homes.begin(), homes.end(), uuid,
-        [](const auto& value, uint128_t target) { return value.authority.targetContainerUUID < target; });
-    return home != homes.end() && home->authority.targetContainerUUID == uuid &&
-        home->authority.targetClusterUUID == brainConfig.clusterUUID && home->authority.sourceClusterUUID == brainConfig.clusterUUID
-        ? &*home : nullptr;
-  }
-
-  bool nativeMemberProofCurrent(const ContainerView& member, const ProdigyStatefulStoreGenerationSelection& home)
-  {
-    if (!member.machine || member.verifiedRepairHome != home.generationUUID ||
-        member.verifiedRepairEpoch != masterAuthorityEpoch || member.verifiedRepairCrash != member.nCrashes ||
-        member.verifiedRepairStream != member.machine->neuron.ioGeneration ||
-        member.verifiedRepairLeaseExpiresAtMs <= Time::msSinceBoot()) return false;
-    return std::any_of(cousinSessions.begin(), cousinSessions.end(), [&](const auto& session) {
-      return session.record.sessionUUID == member.verifiedRepairSession &&
-          prodigyCousinNativeRepairSession(session.record) && session.record.repairPurpose == ProdigyCohortRepairPurpose::catchup &&
-          session.record.repairGenerationUUID == home.generationUUID && session.record.repairTarget.containerUUID == member.uuid &&
-          session.destinationInstalled && session.sourceActivated && cousinSessionLocalCurrent(session);
-    });
-  }
-
-  void withdrawNativeMemberHealth(ContainerView& member)
-  {
-    member.verifiedRepairHome = 0;
-    member.verifiedRepairSession = 0;
-    if (member.state != ContainerState::healthy) return;
-    auto owner = deployments.find(member.deploymentID);
-    if (owner == deployments.end() || !owner->second) return;
-    const auto client = member.explicitStatefulMeshRoles.client;
-    if (mesh && client) mesh->stopAdvertisement(client, &member, true);
-    member.state = ContainerState::scheduled;
-    owner->second->rebuildRecoveredContainerCounts();
-    replicateContainerRuntimeStateToFollowers(&member);
-  }
-
-  // Inventory establishes the running process. Only its authenticated native
-  // receipt establishes whether the selected database can serve.
-  bool nativeMemberInventoryHoldsClient(ContainerView& member, const ContainerPlan& plan, Machine *machine)
-  {
-    if (!weAreMaster) return false;
-    const auto *home = nativeRepairSelection(plan.uuid);
-    if (!home) return false;
-    if (plan.state == ContainerState::healthy) member.nativeRepairHealthyObserved = true;
-    return member.machine != machine || !nativeMemberProofCurrent(member, *home);
-  }
-
-  // The native worker checked its committed frontier on an authenticated
-  // ordinary change stream. A seed-session receipt can never promote the
-  // member or clear its outstanding recovery request.
-  void receiveNativeMemberRepairReceipt(NeuronView *neuron, ContainerView *target,
-      const ProdigyStatefulStoreGenerationSelection& home, const ProdigyStatefulStoreReceipt& receipt)
-  {
-    if (!target || !target->machine || !containerRetirementNeuronAuthorized(neuron, target->machine->uuid) ||
-        !masterAuthorityRuntimeStateDurable || masterAuthorityPersistencePending ||
-        durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation ||
-        !containerRetirementAuthorityAcknowledged() ||
-        !prodigyStatefulStoreReceiptMatchesSourceCutAuthority(receipt, home.authority)) return;
-    auto cached = std::find_if(statefulStoreReceiptCaches.begin(), statefulStoreReceiptCaches.end(), [&](const auto& value) {
-      return value.receipt.localContainerUUID == target->uuid;
-    });
-    if (receipt.state == ProdigyStatefulStoreReceiptState::withdrawn)
-    {
-      if (cached != statefulStoreReceiptCaches.end() && cached->authorityEpoch == masterAuthorityEpoch &&
-          cached->neuronIOGeneration == neuron->ioGeneration && cached->receipt.siblingSessionUUID == receipt.siblingSessionUUID &&
-          cached->receipt.siblingSessionGeneration == receipt.siblingSessionGeneration)
-      {
-        cached->receipt = receipt;
-        withdrawNativeMemberHealth(*target);
-      }
-      return;
-    }
-    auto active = std::find_if(cousinSessions.begin(), cousinSessions.end(), [&](const auto& state) {
-      const auto& record = state.record;
-      return prodigyCousinNativeRepairSession(record) && record.repairPurpose == ProdigyCohortRepairPurpose::catchup &&
-          record.repairGenerationUUID == home.generationUUID && record.repairTarget.containerUUID == target->uuid &&
-          record.repairTarget.nodeUUID == target->machine->uuid && record.sessionUUID == receipt.siblingSessionUUID &&
-          state.acknowledgedNativeLeaseGeneration == receipt.siblingSessionGeneration &&
-          state.acknowledgedNativeLeaseExpiresAtMs > Time::msSinceBoot() && state.destinationInstalled &&
-          state.sourceActivated && cousinSessionLocalCurrent(state);
-    });
-    if (active == cousinSessions.end()) return;
-    StatefulStoreReceiptCache latest = {};
-    latest.crashCount = target->nCrashes;
-    latest.receipt = receipt; latest.neuronMachineUUID = target->machine->uuid;
-    latest.neuronIOGeneration = neuron->ioGeneration; latest.authorityEpoch = masterAuthorityEpoch;
-    if (cached == statefulStoreReceiptCaches.end()) statefulStoreReceiptCaches.push_back(std::move(latest));
-    else *cached = std::move(latest);
-    target->verifiedRepairHome = home.generationUUID; target->verifiedRepairStream = neuron->ioGeneration;
-    target->verifiedRepairEpoch = masterAuthorityEpoch; target->verifiedRepairCrash = target->nCrashes;
-    target->verifiedRepairSession = receipt.siblingSessionUUID;
-    target->verifiedRepairLeaseExpiresAtMs = active->acknowledgedNativeLeaseExpiresAtMs;
-    if (target->nativeRepairHealthyObserved && target->state != ContainerState::healthy) noteLocalContainerHealthy(target->uuid);
-    driveNativeMemberRepairs();
-  }
-
   void receiveStatefulStoreReceipt(NeuronView *neuron, const ProdigyStatefulStoreReceipt& receipt)
   {
     if (!weAreMaster || !neuron || !neuron->machine || !prodigyStatefulStoreReceiptValid(receipt) ||
@@ -41082,11 +40934,6 @@ public:
         receipt.shardGroup != container->second->shardGroup || receipt.nShardGroups == 0 ||
         deployment == deployments.end() || deployment->second == nullptr ||
         receipt.nShardGroups != deployment->second->nShardGroups) return;
-    if (const auto *home = nativeRepairSelection(receipt.localContainerUUID))
-    {
-      receiveNativeMemberRepairReceipt(neuron, container->second, *home, receipt);
-      return;
-    }
     auto found = std::find_if(statefulStoreReceiptCaches.begin(), statefulStoreReceiptCaches.end(), [&](const auto& value) {
       return value.receipt.localContainerUUID == receipt.localContainerUUID;
     });
@@ -41150,7 +40997,6 @@ public:
           receipt.siblingSessionUUID == found->receipt.siblingSessionUUID &&
           receipt.siblingSessionGeneration < found->receipt.siblingSessionGeneration))) return;
     StatefulStoreReceiptCache next = {};
-    next.crashCount = container->second->nCrashes;
     next.receipt = receipt; next.neuronMachineUUID = neuron->machine->uuid;
     next.neuronIOGeneration = neuron->ioGeneration; next.authorityEpoch = masterAuthorityEpoch;
     if (found == statefulStoreReceiptCaches.end()) statefulStoreReceiptCaches.push_back(std::move(next));
@@ -41988,31 +41834,6 @@ public:
     auto found = std::find_if(cousinSessions.begin(), cousinSessions.end(), [&](const auto& state) { return state.record.sessionUUID == ack.sessionUUID; });
     if (found == cousinSessions.end()) return;
     auto& state = *found;
-    if (prodigyCousinNativeRepairSession(state.record)) {
-      const CousinRouteHalf half = state.pendingLocalHalf;
-      if (state.authorityEpoch != masterAuthorityEpoch || !state.awaitingLocalAck || ack.leaseGeneration != state.leaseGeneration ||
-          ack.kind != state.expectedLocalKind || containerUUID != prodigyCousinSessionContainerForLocalHalf(state.record, half) ||
-          neuron->machine->uuid != (half == CousinRouteHalf::source ? state.sourceMachineUUID : state.destinationMachineUUID) ||
-          neuron->ioGeneration != (half == CousinRouteHalf::source ? state.applicationIOGeneration : state.destinationIOGeneration)) return;
-      state.awaitingLocalAck = false;
-      if (!ack.success || !cousinSessionLocalCurrent(state)) { revokeCousinSession(state); return; }
-      if (half == CousinRouteHalf::destination) {
-        state.destinationInstalled = true; state.pendingLocalHalf = CousinRouteHalf::source;
-        if (!sendCousinSessionLocalCommand(state, state.nativeRepairRenewing ? ProdigyCousinSessionLocalKind::renew : ProdigyCousinSessionLocalKind::activate)) revokeCousinSession(state);
-      } else {
-        const auto remaining = state.pendingNativeLeaseExpiresAtMilliseconds - Time::now<TimeResolution::ms>();
-        if (remaining <= 0 || remaining > ProdigyCousinSessionLeaseMs) { revokeCousinSession(state); return; }
-        state.sourceActivated = true; state.nativeRepairRenewing = false;
-        state.expiresAtMs = Time::msSinceBoot() + remaining;
-        state.nextRenewalMs = Time::msSinceBoot() + ProdigyCousinSessionRenewMs;
-        // Only a successful target acknowledgement makes this generation
-        // eligible for a native receipt.  The application sends that receipt
-        // through its existing retrying owner after this activation command.
-        state.acknowledgedNativeLeaseGeneration = state.leaseGeneration;
-        state.acknowledgedNativeLeaseExpiresAtMs = state.expiresAtMs;
-      }
-      return;
-    }
     const bool source = state.record.sourcePermission.localClusterUUID == brainConfig.clusterUUID;
     if (state.authorityEpoch != masterAuthorityEpoch || state.applicationIOGeneration != neuron->ioGeneration ||
         (source ? state.record.sourceNodeUUID : state.record.destination.nodeUUID) != neuron->machine->uuid ||
@@ -42057,15 +41878,6 @@ public:
     for (auto it = cousinSessions.begin(); it != cousinSessions.end();) {
       auto& state = *it;
       if (!cousinSessionLocalCurrent(state)) { revokeCousinSession(state); it = cousinSessions.erase(it); continue; }
-      if (prodigyCousinNativeRepairSession(state.record)) {
-        if (state.sourceActivated && state.destinationInstalled && !state.awaitingLocalAck && now >= state.nextRenewalMs) {
-          if (state.leaseGeneration == UINT64_MAX) { revokeCousinSession(state); it = cousinSessions.erase(it); continue; }
-          ++state.leaseGeneration; state.nativeRepairRenewing = true; state.pendingLocalHalf = CousinRouteHalf::destination;
-          state.expiresAtMs = now + ProdigyCousinSessionPendingMs;
-          if (!sendCousinSessionLocalCommand(state, ProdigyCousinSessionLocalKind::renew)) { revokeCousinSession(state); it = cousinSessions.erase(it); continue; }
-        }
-        ++it; continue;
-      }
       if (state.sourceActivated && !state.awaitingPeerReady && !state.awaitingLocalAck && now >= state.nextRenewalMs) {
         Machine *carrier = findMachineByUUID(state.localEndpoint.nodeUUID);
         if (state.leaseGeneration == UINT64_MAX) { revokeCousinSession(state); it = cousinSessions.erase(it); continue; }
@@ -42100,6 +41912,63 @@ public:
                   localCousinServicePermissionAllowsRoute(permission.permissionUUID, route, request.slot,
                       Time::now<TimeResolution::ms>());
             });
+        GlobalSingleWriterMembershipProjection globalSingleWriterMembership;
+        const bool globalSingleWriterSiblingPool = globalSingleWriterSiblingMembership(*container, permission, globalSingleWriterMembership) &&
+            (privateRoute || !container->whiteholes.empty());
+        if (globalSingleWriterSiblingPool) {
+          const auto counterparts = queryCousinCounterparts({1, permission.permissionUUID, request.slot});
+          if (!counterparts.success) continue;
+          for (const GlobalSingleWriterMember& member : globalSingleWriterMembership.members) {
+            // Same-site voters use the local mesh. Every remote voter or
+            // learner needs its own exact authenticated session on either transport.
+            if (member.clusterUUID == globalSingleWriterMembership.localClusterUUID || member.containerUUID == container->uuid) continue;
+            const ProdigyCousinCounterpart *target = nullptr;
+            for (const auto& counterpart : counterparts.records)
+              if (counterpart.containerUUID == member.containerUUID &&
+                  counterpart.permission.localClusterUUID == member.clusterUUID &&
+                  (privateRoute ? (counterpart.routablePrefixUUID == 0 && counterpart.publicAddress.equals(member.privateIPv6)) :
+                                  counterpart.routablePrefixUUID != 0)) {
+                if (target != nullptr) { target = nullptr; break; }
+                target = &counterpart;
+              }
+            if (target == nullptr) continue;
+            const bool current = std::any_of(cousinSessions.begin(), cousinSessions.end(), [&](const auto& session) {
+              return session.record.sourceContainerUUID == container->uuid &&
+                  session.record.sourcePermission.permissionUUID == permission.permissionUUID &&
+                  session.record.destination.containerUUID == member.containerUUID && session.expiresAtMs > now;
+            });
+            if (current) continue;
+            if (privateRoute) {
+              if (RAND_priv_bytes(reinterpret_cast<unsigned char *>(&request.bindingNonce), sizeof(request.bindingNonce)) != 1 ||
+                  !request.bindingNonce) continue;
+            } else {
+              const Whitehole *selected = nullptr;
+              for (const Whitehole& candidate : container->whiteholes) {
+                if (!whiteholeDeclarationValid(candidate) || !candidate.hasAddress || candidate.address.isNull() ||
+                    !prodigyCousinDirectIPv6AddressValid(candidate.address) || candidate.family != ExternalAddressFamily::ipv6 ||
+                    candidate.transport != ExternalAddressTransport::tcp || candidate.sourcePort == 0 || candidate.bindingNonce == 0) continue;
+                const bool leased = std::any_of(cousinSessions.begin(), cousinSessions.end(), [&](const auto& session) {
+                  const bool sameSocketTuple = session.record.sourceAddress.equals(candidate.address) &&
+                      session.record.sourceTCPPort == candidate.sourcePort &&
+                      session.record.destination.publicAddress.equals(target->publicAddress) &&
+                      session.record.destination.publicTCPPort == target->publicTCPPort;
+                  return session.record.sourceContainerUUID == container->uuid &&
+                      session.expiresAtMs > now && (sameSocketTuple ||
+                        (session.record.sourceBindingNonce == candidate.bindingNonce &&
+                         prodigyCousinSourcePermissionsConflict(permission, session.record.sourcePermission)));
+                });
+                if (!leased) { selected = &candidate; break; }
+              }
+              // Capacity exhaustion is a safe deferral.  In particular, do not
+              // revoke an established voter session merely to admit a learner.
+              if (!selected) continue;
+              request.bindingNonce = selected->bindingNonce;
+            }
+            if (RAND_priv_bytes(reinterpret_cast<unsigned char *>(&request.requestUUID), sizeof(request.requestUUID)) != 1 || request.requestUUID == 0) continue;
+            (void)cousinSessionSourceRequest(&container->machine->neuron, container->uuid, request, true, &member);
+          }
+          continue;
+        }
         if (privateRoute || container->whiteholes.empty()) {
           if (RAND_priv_bytes(reinterpret_cast<unsigned char *>(&request.bindingNonce), sizeof(request.bindingNonce)) != 1 ||
               request.bindingNonce == 0) continue;
@@ -44386,7 +44255,8 @@ public:
       }
       ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
       witness.machineUUID = machine->uuid;
-      if (collectAuthenticatedNeuronStateUploadBootstraps(machine, witness.containerBootstraps) == false)
+      String inventoryDiagnostic = {};
+      if (collectAuthenticatedNeuronStateUploadBootstraps(machine, witness.containerBootstraps, &inventoryDiagnostic) == false)
       {
         // A normal stateUpload remains the single owner of inventory refresh.
         // Do not checkpoint a stale or scheduler-derived view; ask Neuron for
@@ -44394,6 +44264,10 @@ public:
         // attempt this operation again after the reply.
         queueNeuronStateUploadForMachine(machine);
         updateSelfWorkerFailure.assign("machine container ownership needs a fresh authenticated stateUpload for bundle exec"_ctv);
+        if (inventoryDiagnostic.empty() == false)
+        {
+          updateSelfWorkerFailure.snprintf_add<": {}"_ctv>(inventoryDiagnostic);
+        }
         completion(false); return;
       }
       witnesses.push_back(std::move(witness));
@@ -45408,10 +45282,10 @@ public:
           String serialized;
           Message::extractToStringView(args, serialized);
 
-          Vector<ProdigyMetricSample> samples;
-          if (BitseryEngine::deserializeSafe(serialized, samples))
+          ProdigyMetricSamplesSnapshot snapshot;
+          if (BitseryEngine::deserializeSafe(serialized, snapshot))
           {
-            metrics.importSamples(samples);
+            metrics.importSamples(snapshot.samples);
             persistLocalRuntimeStateAsync();
           }
           break;
@@ -45798,12 +45672,12 @@ public:
             Message::construct(bv->wBuffer, BrainTopic::replicateMasterAuthorityState, serializedRuntimeState);
           }
           {
-            Vector<ProdigyMetricSample> metricSamples;
-            metrics.exportSamples(metricSamples);
-            if (metricSamples.empty() == false)
+            ProdigyMetricSamplesSnapshot snapshot;
+            metrics.exportSamples(snapshot.samples);
+            if (snapshot.samples.empty() == false)
             {
               String serializedMetricSamples;
-              BitseryEngine::serialize(serializedMetricSamples, metricSamples);
+              BitseryEngine::serialize(serializedMetricSamples, snapshot);
               Message::construct(bv->wBuffer, BrainTopic::replicateMetricsSnapshot, serializedMetricSamples);
             }
           }
@@ -45845,8 +45719,6 @@ public:
           bv->placementPolicyCapabilityAcknowledged = false;
           bv->containerRetirementCapabilityAcknowledged = false;
           bv->statefulServingAuthorityCapabilityAcknowledged = false;
-          bv->statefulStoreGenerationCapabilityAcknowledged = false;
-          bv->nativeMemberRepairCapabilityAcknowledged = false;
           bv->statefulDataAuthorityCapabilityAcknowledged = false;
           bv->statelessDeploymentAdmissionCapabilityAcknowledged = false;
           bv->statelessDeploymentRetirementCapabilityAcknowledged = false;
@@ -45874,9 +45746,7 @@ public:
                                       (bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion ? 31 :
                                       (bv->version >= ProdigyStatelessDeploymentAdmissionCapabilityMinimumVersion ? 15 : 7)) |
                                       (bv->transportAEGISEnabled() ? uint64_t(32 | 64 | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 32768 | 65536 | 131072 | 262144 | ProdigyInitialAllMastersSeedBootstrapCapability |
-                                      ProdigyStatelessDeploymentRetirementCapability |
-                                      (bv->version >= ProdigyStatefulStoreGenerationMinimumVersion ? ProdigyStatefulStoreGenerationCapability : 0) |
-                                      (bv->version >= ProdigyNativeMemberRepairMinimumVersion ? ProdigyNativeMemberRepairCapability : 0)) : 0);
+                                      ProdigyStatelessDeploymentRetirementCapability) : 0);
             Message::construct(bv->wBuffer, BrainTopic::advertiseCapabilities, advertised);
             Ring::queueSend(bv);
           }
@@ -46588,9 +46458,7 @@ public:
                                      (bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion ? 31 :
                                      (bv->version >= ProdigyStatelessDeploymentAdmissionCapabilityMinimumVersion ? 15 : 7)) |
                                      (bv->transportAEGISEnabled() ? uint64_t(32 | 64 | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 32768 | 65536 | 131072 | 262144 | ProdigyInitialAllMastersSeedBootstrapCapability |
-                                      ProdigyStatelessDeploymentRetirementCapability |
-                                      (bv->version >= ProdigyStatefulStoreGenerationMinimumVersion ? ProdigyStatefulStoreGenerationCapability : 0) |
-                                      (bv->version >= ProdigyNativeMemberRepairMinimumVersion ? ProdigyNativeMemberRepairCapability : 0)) : 0);
+                                     ProdigyStatelessDeploymentRetirementCapability) : 0);
           Message::construct(bv->wBuffer, BrainTopic::acknowledgeCapabilities, capabilities & supported);
           Ring::queueSend(bv);
           break;
@@ -46602,8 +46470,6 @@ public:
           uint64_t capabilities = 0;
           Message::extractArg<ArgumentNature::fixed>(args, capabilities);
           bv->statelessDeploymentRetirementCapabilityAcknowledged = false;
-          bv->statefulStoreGenerationCapabilityAcknowledged = false;
-          bv->nativeMemberRepairCapabilityAcknowledged = false;
           bv->qualificationCancellationCapabilityAcknowledged = false;
           bv->allMastersSeedBootstrapCapabilityAcknowledged = false;
           bv->initialAllMastersSeedBootstrapCapabilityAcknowledged = false;
@@ -46626,12 +46492,6 @@ public:
           {
             bv->containerRetirementCapabilityAcknowledged = true;
             bv->statefulServingAuthorityCapabilityAcknowledged = (capabilities & uint64_t(4)) != 0;
-            bv->statefulStoreGenerationCapabilityAcknowledged =
-                bv->transportAEGISEnabled() && bv->version >= ProdigyStatefulStoreGenerationMinimumVersion &&
-                (capabilities & ProdigyStatefulStoreGenerationCapability) != 0;
-            bv->nativeMemberRepairCapabilityAcknowledged = bv->transportAEGISEnabled() &&
-                bv->version >= ProdigyNativeMemberRepairMinimumVersion &&
-                (capabilities & ProdigyNativeMemberRepairCapability) != 0;
             bv->statefulDataAuthorityCapabilityAcknowledged =
                 bv->version >= ProdigyStatefulDataAuthorityMinimumVersion && (capabilities & uint64_t(16384)) != 0;
             bv->statelessDeploymentAdmissionCapabilityAcknowledged =
@@ -47174,6 +47034,7 @@ public:
 
             deployment->previous = previous->previous;
             previous->previous->next = deployment;
+            deployment->state = DeploymentState::waitingToDeploy;
 
             if (auto it = deployments.find(previous->plan.config.deploymentID()); it != deployments.end() && it->second == previous)
             {
@@ -52035,7 +51896,7 @@ public:
                 // projection as the existing stateful preparation owner, but
                 // every member is client-serving. Expose that complete cohort
                 // only after all three current Neuron identities converge.
-                if (observedPlan->isStateful && observedPlan->stateful.allMasters)
+                if (observedPlan->isStateful && (observedPlan->stateful.writerMode == StatefulWriterMode::allMasters))
                   (void)observeAllMastersDeploymentIdentityCohort(deploymentID, report);
 
                 // This is an observation of the existing live runtime and
@@ -52059,7 +51920,7 @@ public:
                   member.replicaUUID = member.containerUUID = container->uuid;
                   member.clusterUUID = brainConfig.clusterUUID;
                   member.machineUUID = container->machine->uuid;
-                  member.allMasters = observedPlan->stateful.allMasters;
+                  member.allMasters = (observedPlan->stateful.writerMode == StatefulWriterMode::allMasters);
                   // Serving role is part of the authenticated current runtime
                   // plan, unlike native seed/watermark evidence below.  The
                   // source-baseline admission needs this role before any
@@ -52376,7 +52237,6 @@ public:
             pending->requiredContainerRetirementJournalVersion = requiredContainerRetirementJournalReaderVersion();
             pending->statelessRetirementReaderRequired =
                 !masterAuthorityRuntimeState.statelessDeploymentRetirements.empty();
-            pending->requiredStoreRecoveryReaderVersion = requiredStoreRecoveryReaderVersion();
             pending->responseTopic = admittedUpdateDispatch ? MothershipTopic::updateProdigyAdmitted : MothershipTopic::updateProdigy;
             pending->admittedRequest = admittedUpdateRequestForDispatch;
             pending->admittedClusterUUID = brainConfig.clusterUUID;
@@ -52405,7 +52265,7 @@ public:
                         pending->failure.assign("bundle artifact preparation failed"_ctv);
                       }
                       if (pending->failure.empty() && (pending->admitted || pending->requiredContainerRetirementJournalVersion ||
-                                                       pending->statelessRetirementReaderRequired || pending->requiredStoreRecoveryReaderVersion != 0))
+                                                       pending->statelessRetirementReaderRequired))
                       {
                         ProdigyApprovedUpgradeBundle approved = {};
                         if (!prodigyApproveBundleUpgradeContract(pending->prepared.stageBundlePath, approved, &pending->failure) ||
@@ -52423,11 +52283,6 @@ public:
                             pending->targetBinaryVersion < ProdigyStatelessDeploymentRetirementCapabilityMinimumVersion)
                         {
                           pending->failure.assign("target binary cannot read durable stateless retirement authority"_ctv);
-                          return;
-                        }
-                        if (pending->targetBinaryVersion < pending->requiredStoreRecoveryReaderVersion)
-                        {
-                          pending->failure.assign("target binary cannot read durable stateful store generation authority"_ctv);
                           return;
                         }
                         pending->targetContainerRetirementJournalVersion = approved.contract.containerRetirementJournalVersion;
@@ -52600,11 +52455,6 @@ public:
               pending->targetBinaryVersion < ProdigyStatelessDeploymentRetirementCapabilityMinimumVersion)
           {
             rejectPendingMothershipUpdateArtifact(pending, "target binary lacks the stateless retirement authority reader"_ctv);
-            break;
-          }
-          if (pending->targetBinaryVersion < requiredStoreRecoveryReaderVersion())
-          {
-            rejectPendingMothershipUpdateArtifact(pending, "target binary lacks the stateful store generation authority reader"_ctv);
             break;
           }
           if (pending->targetContainerRetirementJournalVersion < requiredContainerRetirementJournalReaderVersion())
@@ -53665,7 +53515,12 @@ public:
 
           ApplicationDeployment *deployment = new ApplicationDeployment();
 
-          BitseryEngine::deserialize(serializedPlan, deployment->plan);
+          if (!BitseryEngine::deserializeSafe(serializedPlan, deployment->plan)) {
+            basics_log("measureApplication rejected malformed deployment plan\n");
+            Message::construct(mothership->wBuffer, MothershipTopic::measureApplication, uint32_t(0), uint32_t(0), uint32_t(0));
+            delete deployment;
+            break;
+          }
 
           if (auto it = deploymentsByApp.find(deployment->plan.config.applicationID); it != deploymentsByApp.end())
           {
@@ -54015,7 +53870,22 @@ public:
           if (args == message->terminal() && BitseryEngine::deserializeSafe(encoded, response) && prodigyPairPrivateBGPSecretScopeValid(response.scope))
           {
             Machine *machine = nullptr; for (Machine *candidate : machines) if (candidate->uuid == response.scope.machineUUID) { machine = candidate; break; }
-            response.success = machine != nullptr && neuronControlStreamActive(machine);
+            const auto authority = std::find_if(
+                masterAuthorityRuntimeState.crossClusterMasqueGatewayAuthorities.begin(),
+                masterAuthorityRuntimeState.crossClusterMasqueGatewayAuthorities.end(), [&](const auto& value) {
+                  return value.state == CrossClusterMasqueGatewayState::active &&
+                      value.pairUUID == response.scope.pairUUID &&
+                      value.pairOperationUUID == response.scope.operationUUID &&
+                      value.localClusterUUID == response.scope.clusterUUID &&
+                      value.localMachineUUID == response.scope.machineUUID &&
+                      value.keyGeneration == response.scope.keyEpoch &&
+                      value.tunnelSlot == response.scope.tunnelSlot &&
+                      value.pairAuthorityGeneration == response.scope.authorityGeneration &&
+                      value.generation == response.scope.gatewayGeneration;
+                });
+            response.success = machine != nullptr && masterAuthorityRuntimeStateDurable &&
+                authority != masterAuthorityRuntimeState.crossClusterMasqueGatewayAuthorities.end() &&
+                neuronControlStreamActive(machine);
             if (response.success) { Message::construct(machine->neuron.wBuffer, NeuronTopic::withdrawCrossClusterPrivateBGPSecret,
                 response.scope.pairUUID, response.scope.operationUUID, response.scope.keyEpoch, response.scope.tunnelSlot, response.scope.clusterUUID,
                 response.scope.machineUUID, response.scope.authorityGeneration, response.scope.gatewayGeneration); Ring::queueSend(&machine->neuron); response.acknowledged = true; }
@@ -54364,7 +54234,13 @@ public:
 
           ApplicationDeployment *deployment = new ApplicationDeployment();
 
-          BitseryEngine::deserialize(serializedPlan, deployment->plan);
+          if (!BitseryEngine::deserializeSafe(serializedPlan, deployment->plan)) {
+            basics_log("spinApplication rejected malformed deployment plan\n");
+            Message::construct(mothership->wBuffer, MothershipTopic::spinApplication,
+                uint8_t(SpinApplicationResponseCode::invalidPlan), String("invalid plan: unsupported or malformed deployment plan"_ctv));
+            delete deployment;
+            break;
+          }
           const ProdigyDeploymentPlacementPolicy *placementPolicy = nullptr;
           for (const auto& candidate : masterAuthorityRuntimeState.deploymentPlacementPolicies)
           {
@@ -54486,6 +54362,15 @@ public:
           if (validateDeploymentApplicationIdentity(deployment->plan, identityFailure) == false)
           {
             rejectInvalidPlan(identityFailure);
+            return;
+          }
+          GlobalSingleWriterMembershipProjection globalGroup;
+          const bool hasGlobalGroup = desiredGlobalSingleWriterMembership(deployment->plan.config.deploymentID(), globalGroup);
+          if ((deployment->plan.stateful.writerMode == StatefulWriterMode::globalSingleWriter)
+              ? (!prodigyGlobalSingleWriterPlanValid(deployment->plan) || !hasGlobalGroup ||
+                 !prodigyGlobalSingleWriterMembershipProjectionValid(globalGroup))
+              : hasGlobalGroup) {
+            rejectInvalidPlan("invalid plan: global single-writer mode requires its matching admitted membership"_ctv);
             return;
           }
           String taskPlanFailure = {};
@@ -55556,6 +55441,92 @@ public:
             String payload = {}; BitseryEngine::serialize(payload, response);
             Message::construct(mothership->wBuffer, MothershipTopic::commitDeploymentPlacementPolicy, payload);
             (void)flushActiveMothershipSendBuffer(mothership, "placement-policy-durable");
+          });
+          break;
+        }
+      case MothershipTopic::globalSingleWriterPlacement:
+        {
+          String bytes; Message::extractToStringView(args,bytes); ProdigyGlobalSingleWriterPlacementExchange r{};
+          r.success = args == message->terminal() && BitseryEngine::deserializeSafe(bytes,r) && applyGlobalSingleWriterPlacement(r);
+          if (!r.success && r.failure.empty()) r.failure.assign("global single-writer placement unavailable or stale"_ctv);
+          String payload;
+          if (BitseryEngine::serialize(payload,r))
+            Message::construct(mothership->wBuffer,MothershipTopic::globalSingleWriterPlacement,payload);
+          break;
+        }
+      case MothershipTopic::globalSingleWriterControl:
+        {
+          String bytes; Message::extractToStringView(args,bytes);
+          ProdigyGlobalSingleWriterControl control{};
+          if (args == message->terminal() && BitseryEngine::deserializeSafe(bytes,control)) beginGlobalSingleWriterControl(mothership,std::move(control));
+          else replyGlobalSingleWriterControl(mothership,control,"invalid global single-writer control frame");
+          break;
+        }
+      case MothershipTopic::commitGlobalSingleWriterMembership:
+        {
+          String serializedRequest = {}; Message::extractToStringView(args, serializedRequest);
+          GlobalSingleWriterMembershipProjection request = {}; CommitGlobalSingleWriterMembershipResponse response = {};
+          auto reply = [&]() { String payload = {}; BitseryEngine::serialize(payload, response);
+            Message::construct(mothership->wBuffer, MothershipTopic::commitGlobalSingleWriterMembership, payload); };
+          if (args != message->terminal() || !BitseryEngine::deserializeSafe(serializedRequest, request) ||
+              !prodigyGlobalSingleWriterMembershipProjectionValid(request))
+          { response.failure.assign("invalid global single-writer membership projection"_ctv); reply(); break; }
+          response.projection = request;
+          if (!weAreMaster || !ignited || request.localClusterUUID != brainConfig.clusterUUID || masterAuthorityPersistencePending ||
+              !masterAuthorityRuntimeStateDurable || durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation)
+          { response.failure.assign("global single-writer membership authority is not ready for this cluster"_ctv); reply(); break; }
+          // Each deployment owns an independent group. This projection requests
+          // placement; only the application can commit voting rights.
+          auto deployed = deployments.find(request.deploymentID);
+          auto retained = deploymentPlans.find(request.deploymentID);
+          if ((deployed != deployments.end() && (!deployed->second ||
+               !prodigyGlobalSingleWriterPlanValid(deployed->second->plan))) ||
+              (retained != deploymentPlans.end() && !prodigyGlobalSingleWriterPlanValid(retained->second))) {
+            response.failure.assign("deployment has not opted into global single-writer mode"_ctv); reply(); break;
+          }
+          auto& groups = masterAuthorityRuntimeState.globalSingleWriterMembershipProjections;
+          auto existing = std::find_if(groups.begin(), groups.end(), [&](const auto& group) {
+            return group.deploymentID == request.deploymentID || group.membershipUUID == request.membershipUUID;
+          });
+          if (existing == groups.end() && groups.size() >= 64) {
+            response.failure.assign("global single-writer group limit reached"_ctv); reply(); break;
+          }
+          if (existing != groups.end()) {
+            if (!prodigyGlobalSingleWriterMembershipSuccessor(*existing, request)) {
+              response.failure.assign("conflicting global single-writer group or stale revision"_ctv); reply(); break;
+            }
+            if (existing->generation == request.generation) {
+              String admitted; BitseryEngine::serialize(admitted, *existing);
+              response.success = admitted.equals(serializedRequest);
+              if (response.success) response.durableGeneration = durableMasterAuthorityRuntimeStateGeneration;
+              else response.failure.assign("conflicting global single-writer membership at this revision"_ctv);
+              reply(); break;
+            }
+          }
+          auto proposed = groups;
+          if (existing == groups.end()) proposed.push_back(request);
+          else proposed[size_t(existing-groups.begin())] = request;
+          if (!prodigyGlobalSingleWriterMembershipProjectionsValid(proposed) ||
+              !globalSingleWriterBindingsMatchLiveContainers(request)) {
+            response.failure.assign("global single-writer incarnation or endpoint is already owned"_ctv); reply(); break;
+          }
+          if (masterAuthorityRuntimeState.generation == UINT64_MAX) {
+            response.failure.assign("global single-writer authority generation exhausted"_ctv); reply(); break;
+          }
+          const auto before = masterAuthorityRuntimeState; const uint64_t generation = before.generation + 1;
+          if (existing == masterAuthorityRuntimeState.globalSingleWriterMembershipProjections.end()) masterAuthorityRuntimeState.globalSingleWriterMembershipProjections.push_back(request);
+          else *existing = request;
+          const uint64_t epoch = masterAuthorityEpoch, incarnation = mothership->connectionIncarnation;
+          commitMasterAuthorityStateChangeAsync([this, mothership, epoch, incarnation, before, generation, request](bool durable) mutable {
+            if (masterAuthorityEpoch != epoch) return;
+            if (!durable && masterAuthorityRuntimeState.generation == generation) masterAuthorityRuntimeState = before;
+            if (!activeMotherships.contains(mothership) || mothership->connectionIncarnation != incarnation) return;
+            CommitGlobalSingleWriterMembershipResponse response = {}; response.projection = request; response.success = durable;
+            response.durableGeneration = durable ? generation : 0;
+            if (!durable) response.failure.assign("global single-writer membership durable acceptance failed"_ctv);
+            String payload = {}; BitseryEngine::serialize(payload, response);
+            Message::construct(mothership->wBuffer, MothershipTopic::commitGlobalSingleWriterMembership, payload);
+            (void)flushActiveMothershipSendBuffer(mothership, "truth-membership-durable");
           });
           break;
         }
@@ -57105,6 +57076,13 @@ public:
             receiveApp6TruthMeshReceipt(neuron, receipt);
           break;
         }
+      case NeuronTopic::globalSingleWriterControl:
+        {
+          String bytes; Message::extractToStringView(args,bytes);
+          ProdigyGlobalSingleWriterControl response{};
+          if (args == message->terminal() && BitseryEngine::deserializeSafe(bytes,response)) acceptGlobalSingleWriterControl(neuron,response);
+          break;
+        }
       case NeuronTopic::statefulStoreProofRecovery:
         {
           String encoded = {}; Message::extractToStringView(args, encoded);
@@ -57745,10 +57723,7 @@ public:
             Machine *previousMachine = container->machine;
             ContainerState previousState = container->state;
             bool previousRuntimeReady = container->runtimeReady;
-            const bool holdClient = nativeMemberInventoryHoldsClient(*container, plan, neuron->machine);
-            ContainerState uploadedState = holdClient && plan.state == ContainerState::healthy ? ContainerState::scheduled : plan.state;
-            if (holdClient && previousState == ContainerState::healthy && mesh && container->explicitStatefulMeshRoles.client)
-              mesh->stopAdvertisement(container->explicitStatefulMeshRoles.client, container, true);
+            ContainerState uploadedState = plan.state;
             uint128_t previousPairingAddress = container->pairingAddress();
             bool replayActivePeerPairings = false;
 
@@ -57865,7 +57840,7 @@ public:
 
             for (const auto& [service, advertisement] : container->advertisements)
             {
-              if ((!holdClient || service != plan.statefulMeshRoles.client) && serviceBlueprintActiveAtContainerState(advertisement, uploadedState))
+              if (serviceBlueprintActiveAtContainerState(advertisement, uploadedState))
               {
                 mesh->logAdvertisement(container,
                                        advertisement.service,
@@ -57878,7 +57853,6 @@ public:
             {
               for (const AdvertisementPairing& pairing : pairings)
               {
-                if (holdClient && pairing.service == plan.statefulMeshRoles.client) continue;
                 mesh->logAdvertisementPairing(pairing.secret, container, pairing);
 
                 // we could also just pull the stress right now.... and then calculate capacity exactly...
@@ -58413,22 +58387,9 @@ public:
             // ready cut whose identity has already been returned upstream.
             if (cache.receipt.ready) break;
             cache.receipt = std::move(reply);
-            if (cache.receipt.ready && !masterAuthorityRuntimeState.statefulServingMemberRepairs.empty())
-              driveNativeMemberRepairs();
-          }
-          else if (reply.action == ProdigyStatefulStoreSourceCutAction::query && reply.ready)
-          {
-            // Only this query path reaches the donor. Keep its actual reply
-            // and require the selected content and head digests at grant time.
-            cache.receipt = std::move(reply);
-            driveNativeMemberRepairs();
           }
           else if (reply.action == ProdigyStatefulStoreSourceCutAction::release &&
-                   (reply.released || !reply.failure.empty()))
-          {
-            cache.releaseReceipt = std::move(reply);
-            if (cache.releaseReceipt.released) driveNativeMemberRepairs();
-          }
+                   (reply.released || !reply.failure.empty())) cache.releaseReceipt = std::move(reply);
           break;
         }
       case NeuronTopic::statefulDataAuthority:
@@ -58660,10 +58621,7 @@ public:
               break;
             }
 
-            container->nativeRepairHealthyObserved = false;
-            container->verifiedRepairHome = 0;
             deployment->containerFailed(container, approxTimeMs, signal, report, restarted);
-            if (restarted && signal == 0) acceptNativeMemberRepair(neuron, deployment, container, report);
 
             if (restoredInventoryProgress)
             {

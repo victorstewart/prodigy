@@ -2629,7 +2629,7 @@ int main()
   retainedTruthPlan.config.versionID = 0x42;
   retainedTruthPlan.config.type = ApplicationType::stateful;
   retainedTruthPlan.isStateful = true;
-  retainedTruthPlan.stateful.allMasters = false;
+  retainedTruthPlan.stateful.writerMode = StatefulWriterMode::localSingleWriter;
   DeploymentIdentityReport retainedTruthIdentity = {};
   retainedTruthIdentity.version = 4; retainedTruthIdentity.found = retainedTruthIdentity.live = true;
   retainedTruthIdentity.applicationID = MeshRegistry::Truth::applicationID;
@@ -3068,7 +3068,7 @@ int main()
       item.artifactPath.assign("/task/initial-seed.blob"_ctv);
       item.artifactSHA256 = digest('a'); item.artifactBytes = 8192;
       DeploymentPlan plan = {};
-      plan.isStateful = true; plan.stateful.allMasters = true;
+      plan.isStateful = true; plan.stateful.writerMode = StatefulWriterMode::allMasters;
       plan.config.type = ApplicationType::stateful; plan.config.applicationID = app;
       plan.config.versionID = item.deploymentID & UINT64_C(0x0000ffffffffffff);
       plan.config.containerBlobSHA256 = item.artifactSHA256; plan.config.containerBlobBytes = item.artifactBytes;
@@ -3134,7 +3134,7 @@ int main()
       observed.clusterUUID = rootIntent.sites[0].clusterUUID; observed.applicationID = app;
       observed.deploymentID = plan.previousDeploymentID; observed.nShardGroups = 3;
       observed.nTarget = observed.nDeployed = observed.nHealthy = 9;
-      DeploymentPlan before; before.isStateful = before.stateful.allMasters = before.stateful.allowUpdateInPlace = true;
+      DeploymentPlan before; before.isStateful = before.stateful.allowUpdateInPlace = true; before.stateful.writerMode = StatefulWriterMode::allMasters;
       before.config.type = ApplicationType::stateful; before.config.applicationID = app;
       before.config.versionID = plan.previousDeploymentID & UINT64_C(0x0000ffffffffffff);
       before.config.containerBlobSHA256 = digest('a'); before.config.containerBlobBytes = 8192;
@@ -3183,7 +3183,7 @@ int main()
     radarObserved.applicationID = MeshRegistry::Radar::applicationID;
     radarObserved.deploymentID = radarPlan.previousDeploymentID; radarObserved.nShardGroups = 1;
     radarObserved.nTarget = radarObserved.nDeployed = radarObserved.nHealthy = 3;
-    DeploymentPlan radarBefore = {}; radarBefore.isStateful = radarBefore.stateful.allMasters = radarBefore.stateful.allowUpdateInPlace = true;
+    DeploymentPlan radarBefore = {}; radarBefore.isStateful = radarBefore.stateful.allowUpdateInPlace = true; radarBefore.stateful.writerMode = StatefulWriterMode::allMasters;
     radarBefore.config.type = ApplicationType::stateful; radarBefore.config.applicationID = MeshRegistry::Radar::applicationID;
     radarBefore.config.versionID = radarPlan.previousDeploymentID & UINT64_C(0x0000ffffffffffff);
     radarBefore.config.containerBlobSHA256 = digest('a'); radarBefore.config.containerBlobBytes = 8192;

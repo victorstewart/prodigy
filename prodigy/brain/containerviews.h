@@ -22,25 +22,13 @@ public:
   Vector<uint32_t> assignedGPUMemoryMBs;
   Vector<AssignedGPUDevice> assignedGPUDevices;
   uint8_t fragment;
+  // Ephemeral launch fence for a durable Truth placement.  The resulting
+  // meshAddress is persisted in the ordinary ContainerPlan; this only stops
+  // the scheduler from replacing an assigned endpoint with a random fragment.
+  uint128_t requiredGlobalSingleWriterMeshAddress = 0;
+  int32_t globalSingleWriterMemberID = 0;
 
   uint32_t nCrashes;
-  // An observed failed process is current only on its reporting control
-  // connection. The durable serving request retains the failure separately.
-  ProdigyStatefulStoreBootFailure nativeBootFailure = {.protocolVersion = 0};
-  uint64_t nativeFailureStreamGeneration = 0;
-  uint64_t nativeFailureAuthorityEpoch = 0;
-  uint32_t nativeFailureCrashCount = 0;
-  uint128_t requestedRepairHome = 0;
-  uint64_t requestedRepairStream = 0;
-  uint32_t requestedRepairCrash = 0;
-  bool nativeRepairHealthyObserved = false;
-  uint128_t verifiedRepairHome = 0;
-  uint128_t verifiedRepairSession = 0;
-  int64_t verifiedRepairLeaseExpiresAtMs = 0;
-  uint64_t verifiedRepairStream = 0;
-  uint64_t verifiedRepairEpoch = 0;
-  uint32_t verifiedRepairCrash = 0;
-
 
   DeploymentWork *plannedWork = nullptr;
   uint64_t destructionWaiterDeploymentID = 0;
@@ -554,6 +542,12 @@ public:
 
     plan.uuid = uuid;
     plan.config = (configOverride ? *configOverride : dplan.config);
+    if (dplan.stateful.writerMode == StatefulWriterMode::globalSingleWriter) {
+      // Preserve the opt-in on replay even if authority is unavailable. An
+      // incomplete present projection is rejected by the launch decoder.
+      plan.globalSingleWriterMembership.protocolVersion = GlobalSingleWriterMembershipProjection::version;
+      if (thisBrain) thisBrain->desiredGlobalSingleWriterMembership(plan.config.deploymentID(), plan.globalSingleWriterMembership);
+    }
     plan.subscriptions = subscriptions;
     plan.advertisements = advertisements;
     plan.requiresDatacenterUniqueTag = dplan.requiresDatacenterUniqueTag;

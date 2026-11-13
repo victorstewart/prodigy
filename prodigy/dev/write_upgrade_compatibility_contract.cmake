@@ -139,11 +139,12 @@ _prodigy_upgrade_policy_safe_text("${_migration_protocol}" "migrationProtocolVer
 if (NOT _architecture STREQUAL "${ARCHITECTURE}")
    _prodigy_upgrade_policy_error("architecture must equal the built target architecture")
 endif()
-if (NOT _disposition MATCHES "^(same-cluster-rollout|new-cluster-required)$")
+if (NOT _disposition MATCHES "^(same-cluster-rollout|same-cluster-cohort-recovery|new-cluster-required)$")
    _prodigy_upgrade_policy_error("disposition must be a qualified release disposition")
 endif()
 if (NOT _transport_identity_mode MATCHES "^(preserveClusterIdentity|unsupported)$" OR
-    (_disposition STREQUAL "same-cluster-rollout" AND NOT _transport_identity_mode STREQUAL "preserveClusterIdentity"))
+    ((_disposition STREQUAL "same-cluster-rollout" OR _disposition STREQUAL "same-cluster-cohort-recovery") AND
+     NOT _transport_identity_mode STREQUAL "preserveClusterIdentity"))
    _prodigy_upgrade_policy_error("same-cluster releases must preserve cluster transport identity")
 endif()
 _prodigy_upgrade_policy_get_uint("${_prodigy_upgrade_policy}" _minimum_healthy minimumHealthyBrains)
@@ -165,6 +166,18 @@ foreach (_axis IN ITEMS wire persistentState authorityState transportTrust conta
    endif()
    set(_compatibility_${_axis} "${_axis_value}")
 endforeach()
+if (_disposition STREQUAL "same-cluster-cohort-recovery")
+   if (_minimum_healthy LESS 3 OR _required_free_bytes EQUAL 0 OR
+       _compatibility_wire STREQUAL "unknown" OR
+       NOT _compatibility_persistentState STREQUAL "compatible" OR
+       NOT _compatibility_authorityState STREQUAL "compatible" OR
+       NOT _compatibility_transportTrust STREQUAL "compatible" OR
+       NOT _compatibility_containerProtocol STREQUAL "compatible" OR
+       NOT _compatibility_dataPlane STREQUAL "compatible" OR
+       NOT _compatibility_appState STREQUAL "compatible")
+      _prodigy_upgrade_policy_error("same-cluster cohort recovery requires three brains, nonzero staging, and compatible retained-state axes")
+   endif()
+endif()
 
 string(JSON _source_id_count ERROR_VARIABLE _source_id_error LENGTH "${_prodigy_upgrade_policy}" supportedSourceReleaseIDs)
 string(JSON _source_contract_count ERROR_VARIABLE _source_contract_error LENGTH "${_prodigy_upgrade_policy}" sourceContracts)
@@ -212,6 +225,7 @@ file(WRITE "${OUTPUT}"
 "  \"manifestVersion\": 1,\n"
 "  \"releaseID\": \"${_release_id}\",\n"
 "  \"prodigySHA256\": \"${PRODIGY_SHA256}\",\n"
+"  \"containerRetirementJournalVersion\": 4,\n"
 "  \"mothershipSHA256\": \"${MOTHERSHIP_SHA256}\",\n"
 "  \"architecture\": \"${ARCHITECTURE}\",\n"
 "  \"binaryVersion\": \"${_binary_version}\",\n"

@@ -31,7 +31,7 @@ public:
 
   static bool readRecordAt(int rootFD, const ContainerPlan& plan, String& token)
   {
-    return ContainerManager::readGatewayRecoveryRecordAt(rootFD, plan, token);
+    return ProdigyGatewayRecovery::readGatewayRecoveryRecordAt(rootFD, plan, token);
   }
 };
 
@@ -305,6 +305,55 @@ public:
     crossClusterMasqueGatewayRuntimes.clear();
     crossClusterMasqueGatewayRuntimes.emplace_back();
     crossClusterMasqueGatewayRuntimes.back().authority = authority;
+    return true;
+  }
+
+  bool prepareGatewayPrivateBGPWithdrawalForTest(const CrossClusterMasqueGatewayAuthority& authority)
+  {
+    replaceBrainWithoutClosing();
+    controlTransportCredentials.self.clusterUUID = authority.localClusterUUID;
+    return installGatewayAuthorityForStateUploadTest(authority);
+  }
+
+  void forgetGatewayPrivateBGPRuntimeForTest()
+  {
+    crossClusterMasqueGatewayRuntimes.clear();
+  }
+
+  bool withdrawGatewayPrivateBGPForTest(const ProdigyPairPrivateBGPSecretScope& scope,
+                                        bool& acknowledged)
+  {
+    acknowledged = false;
+    if (brain == nullptr) return false;
+    brain->wBuffer.clear();
+    String frame = {};
+    Message::construct(frame, NeuronTopic::withdrawCrossClusterPrivateBGPSecret,
+        scope.pairUUID, scope.operationUUID, scope.keyEpoch, scope.tunnelSlot,
+        scope.clusterUUID, scope.machineUUID, scope.authorityGeneration,
+        scope.gatewayGeneration);
+    neuronHandler(reinterpret_cast<Message *>(frame.data()));
+    if (brain->wBuffer.size() < Message::headerBytes) return false;
+    auto *reply = reinterpret_cast<Message *>(brain->wBuffer.data());
+    if (reply->size != brain->wBuffer.size() ||
+        NeuronTopic(reply->topic) != NeuronTopic::crossClusterPrivateBGPSecretRevocationAck)
+      return false;
+    uint8_t *args = reply->args;
+    uint128_t pair = 0, operation = 0, cluster = 0, machine = 0;
+    uint64_t epoch = 0, authorityGeneration = 0, gatewayGeneration = 0;
+    uint8_t slot = 0, accepted = 0;
+    Message::extractArg<ArgumentNature::fixed>(args, pair);
+    Message::extractArg<ArgumentNature::fixed>(args, operation);
+    Message::extractArg<ArgumentNature::fixed>(args, epoch);
+    Message::extractArg<ArgumentNature::fixed>(args, slot);
+    Message::extractArg<ArgumentNature::fixed>(args, cluster);
+    Message::extractArg<ArgumentNature::fixed>(args, machine);
+    Message::extractArg<ArgumentNature::fixed>(args, authorityGeneration);
+    Message::extractArg<ArgumentNature::fixed>(args, gatewayGeneration);
+    Message::extractArg<ArgumentNature::fixed>(args, accepted);
+    acknowledged = args == reply->terminal() && accepted == 1 &&
+        pair == scope.pairUUID && operation == scope.operationUUID && epoch == scope.keyEpoch &&
+        slot == scope.tunnelSlot && cluster == scope.clusterUUID && machine == scope.machineUUID &&
+        authorityGeneration == scope.authorityGeneration && gatewayGeneration == scope.gatewayGeneration;
     return true;
   }
 
@@ -1119,8 +1168,81 @@ static void testRetainedGatewayRecoveryAdmission(TestSuite& suite)
   ring.shutdownRing();
 }
 
+static void testGatewayPrivateBGPWithdrawalIdempotence(TestSuite& suite)
+{
+  ArtifactRing ring = {};
+  CrossClusterMasqueGatewayAuthority authority = {};
+  authority.pairUUID = 0x9101; authority.pairOperationUUID = 0x9102;
+  authority.localClusterUUID = 0x9103; authority.peerClusterUUID = 0x9104;
+  authority.localMachineUUID = 0x9105; authority.peerMachineUUID = 0x9106;
+  authority.localDatacenterFragment = 1; authority.peerDatacenterFragment = 2;
+  authority.localSitePrefix = prodigyContainerDatacenterSitePrefix(1);
+  authority.peerSitePrefix = prodigyContainerDatacenterSitePrefix(2);
+  authority.artifactSHA256.assign("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
+  authority.artifactBytes = 1;
+  authority.listenerPublicUDPEndpoint = IPAddress("2001:db8::10", true);
+  authority.listenerPublicUDPPort = 4433;
+  authority.tunnelSlot = 0; authority.gatewaySlot = 0;
+  authority.privateTunnelInterface.assign("mtbgpwithdraw0"_ctv);
+  authority.privateTunnelLocalIPv6 = IPAddress("fd5a:4d53::1", true);
+  authority.privateTunnelPeerIPv6 = IPAddress("fd5a:4d53::2", true);
+  authority.privateLocalASN = 42001; authority.privatePeerASN = 42002;
+  authority.privateLocalBGPID = 1; authority.privatePeerBGPID = 2;
+  authority.privateSessionCredentialSHA256.assign("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"_ctv);
+  authority.localIdentitySHA256.assign("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"_ctv);
+  authority.peerIdentitySHA256.assign("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"_ctv);
+  authority.peerTrustSHA256.assign("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"_ctv);
+  authority.generation = 6; authority.pairAuthorityGeneration = 5; authority.keyGeneration = 4;
+  authority.localRole = CrossClusterMasqueGatewayRole::listener;
+  authority.state = CrossClusterMasqueGatewayState::active;
+  const ProdigyPairPrivateBGPSecretScope scope = {
+      authority.pairUUID, authority.pairOperationUUID, authority.keyGeneration,
+      authority.tunnelSlot, authority.localClusterUUID, authority.localMachineUUID,
+      authority.pairAuthorityGeneration, authority.generation};
+  TestNeuron neuron = {};
+  bool firstAcknowledged = false, repeatedAcknowledged = false, newerRejected = false;
+  const bool prepared = neuron.prepareGatewayPrivateBGPWithdrawalForTest(authority);
+  const bool firstParsed = prepared && neuron.withdrawGatewayPrivateBGPForTest(scope, firstAcknowledged);
+  const bool repeatedParsed = firstParsed && neuron.withdrawGatewayPrivateBGPForTest(scope, repeatedAcknowledged);
+  auto newer = scope; ++newer.authorityGeneration;
+  const bool newerParsed = repeatedParsed && neuron.withdrawGatewayPrivateBGPForTest(newer, newerRejected);
+  suite.expect(firstParsed && repeatedParsed && newerParsed && firstAcknowledged && repeatedAcknowledged && !newerRejected,
+               "neuron_gateway_private_bgp_withdrawal_acknowledges_exact_empty_owner_idempotently_and_rejects_newer_authority");
+
+  TestNeuron absent = {};
+  bool absentAcknowledged = false;
+  suite.expect(absent.prepareGatewayPrivateBGPWithdrawalForTest(authority),
+               "neuron_gateway_private_bgp_withdrawal_absent_scope_fixture_is_authenticated");
+  absent.forgetGatewayPrivateBGPRuntimeForTest();
+  Container anchored = {};
+  anchored.plan.uuid = 0x9107;
+  anchored.plan.system.kind = SystemContainerKind::crossClusterMasqueGateway;
+  anchored.plan.system.gatewayPairUUID = scope.pairUUID;
+  anchored.plan.system.gatewayLocalClusterUUID = scope.clusterUUID;
+  anchored.plan.system.gatewayLocalMachineUUID = scope.machineUUID;
+  anchored.plan.system.gatewayKeyEpoch = scope.keyEpoch;
+  anchored.plan.system.gatewayAuthorityGeneration = scope.authorityGeneration;
+  anchored.plan.system.gatewayGeneration = scope.gatewayGeneration;
+  absent.trackContainerForReplyTest(&anchored);
+  bool anchoredAcknowledged = true;
+  const bool anchoredParsed = absent.withdrawGatewayPrivateBGPForTest(scope, anchoredAcknowledged);
+  absent.untrackContainerForReplyTest(anchored.plan.uuid);
+  const bool absentParsed = absent.withdrawGatewayPrivateBGPForTest(scope, absentAcknowledged);
+  suite.expect(anchoredParsed && !anchoredAcknowledged && absentParsed && absentAcknowledged,
+               "neuron_gateway_private_bgp_withdrawal_requires_exactly_absent_gateway_scope");
+  ring.shutdownRing();
+}
+
 int main()
 {
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "gateway-private-bgp-withdrawal-idempotence") == 0)
+  {
+    TestSuite suite = {};
+    testGatewayPrivateBGPWithdrawalIdempotence(suite);
+    std::printf("GATEWAY_PRIVATE_BGP_WITHDRAWAL_IDEMPOTENCE_RESULT failed_assertions=%d\n", suite.failed);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (const char *only = std::getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "gateway-retained-recovery-admission") == 0)
   {

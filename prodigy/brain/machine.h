@@ -420,20 +420,29 @@ public:
   uint64_t switchboardStateSyncIOGeneration = 0;
   bytell_hash_set<uint32_t> usedContainerFragments;
 
-  bool containerFragmentAvailable(uint8_t fragment) const
+  bool containerFragmentAvailable(uint8_t fragment,
+      const Vector<GlobalSingleWriterMembershipProjection>& memberships = {}, uint128_t localClusterUUID = 0,
+      uint64_t deploymentID = 0, uint128_t containerUUID = 0) const
   {
-    return fragment != 0 &&
-           !prodigyCrossClusterMasqueGatewayRuntimeFragmentValid(fragment) &&
-           fragment != prodigyMothershipTunnelProviderRuntimeFragment &&
-           usedContainerFragments.contains(fragment) == false;
+    if (fragment == 0 || prodigyCrossClusterMasqueGatewayRuntimeFragmentValid(fragment) ||
+        fragment == prodigyMothershipTunnelProviderRuntimeFragment || usedContainerFragments.contains(fragment)) return false;
+    // Consult the current authority directly. Physical inventory release must
+    // not erase an unlaunched or recovering member's durable reservation.
+    for (const auto& group : memberships) for (const auto& member : group.members) {
+      const auto* address = member.privateIPv6.v6;
+      if (member.clusterUUID == localClusterUUID && address[12] == uint8_t(this->fragment >> 16) &&
+          address[13] == uint8_t(this->fragment >> 8) && address[14] == uint8_t(this->fragment) && address[15] == fragment &&
+          (group.deploymentID != deploymentID || member.containerUUID != containerUUID)) return false;
+    }
+    return true;
   }
 
-  uint8_t getContainerFragment(void)
+  uint8_t getContainerFragment(const Vector<GlobalSingleWriterMembershipProjection>& memberships = {}, uint128_t localClusterUUID = 0)
   {
     uint8_t fragment = Random::generateNumberWithNBits<8, uint8_t>();
     for (uint32_t checked = 0; checked < 256; ++checked, ++fragment)
     {
-      if (containerFragmentAvailable(fragment) == false)
+      if (containerFragmentAvailable(fragment,memberships,localClusterUUID) == false)
       {
         continue;
       }
@@ -443,6 +452,21 @@ public:
     }
 
     return 0;
+  }
+
+  // A durable placement may carry an already allocated mesh endpoint.  Claim
+  // its final fragment through the same allocator used by ordinary launches;
+  // never manufacture a parallel address allocation path.
+  bool claimContainerFragment(uint8_t fragment,
+      const Vector<GlobalSingleWriterMembershipProjection>& memberships = {}, uint128_t localClusterUUID = 0,
+      uint64_t deploymentID = 0, uint128_t containerUUID = 0)
+  {
+    if (containerFragmentAvailable(fragment,memberships,localClusterUUID,deploymentID,containerUUID) == false)
+    {
+      return false;
+    }
+    usedContainerFragments.insert(fragment);
+    return true;
   }
 
   void relinquishContainerFragment(uint8_t fragment)

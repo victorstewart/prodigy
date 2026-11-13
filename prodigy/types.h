@@ -10,7 +10,6 @@
 #include <prodigy/enums/datacenter.h>
 #include <networking/private4.h>
 #include <services/prodigy.h>
-#include <services/base64.h>
 #include <services/vault.h>
 #include <prodigy/container.contract.h>
 #include <prodigy/cluster.pair.enrollment.h>
@@ -4440,6 +4439,14 @@ static inline bool taskExecutionCommitAttempt(TaskExecutionRecord& record, const
   return true;
 }
 
+constexpr inline uint64_t ProdigyGlobalSingleWriterMinimumVersion = 67;
+
+enum class StatefulWriterMode : uint8_t {
+  localSingleWriter = 0,
+  allMasters = 1,
+  globalSingleWriter = 2
+};
+
 class StatefulDeploymentPlan {
 public:
 
@@ -4467,8 +4474,9 @@ public:
   // and then also when a new application version was submitted we'd have to choose the larger of the two
   bool neverShard;
 
-  // every instance accepts writes and reads
-  bool allMasters;
+  // Global mode spans admitted datacenters; only the application's committed
+  // quorum grants writes. Sharding remains a separate placement constraint.
+  StatefulWriterMode writerMode = StatefulWriterMode::localSingleWriter;
 };
 
 template <typename S>
@@ -4483,7 +4491,12 @@ static void serialize(S&& serializer, StatefulDeploymentPlan& plan)
   serializer.value1b(plan.allowUpdateInPlace);
   serializer.value1b(plan.seedingAlways);
   serializer.value1b(plan.neverShard);
-  serializer.value1b(plan.allMasters);
+  // Preserve legacy local/all-masters bytes. Legacy value1b(bool) readers do
+  // not reject 2, so global plans additionally require runtime version 67.
+  serializer.value1b(plan.writerMode);
+  if constexpr (requires { serializer.adapter().isCompletedSuccessfully(); })
+    if (uint8_t(plan.writerMode) > uint8_t(StatefulWriterMode::globalSingleWriter))
+      serializer.adapter().error(bitsery::ReaderError::InvalidData);
 }
 
 static inline uint64_t prodigyRuntimeStatefulServicePrefix(uint16_t applicationID, uint8_t serviceID)
@@ -5587,125 +5600,6 @@ static void serialize(S&& serializer, StatelessDeploymentPlan& plan)
   serializer.value1b(plan.moveableDuringCompaction);
 }
 
-enum class ProdigyStatefulStoreBootFailureKind : uint8_t {
-  none = 0, missingMetadata = 1, malformedMetadata = 2, permission = 3,
-  io = 4, capacity = 5, incompatible = 6, unsafePath = 7,
-  unverifiedStore = 8, interruptedInitialization = 9, other = 10,
-  environment = 11, configuration = 12, needsDiagnosis = 13
-};
-
-enum class ProdigyStatefulStoreBootFailureStage : uint8_t {
-  none = 0, environmentInspection = 1, configurationInitialization = 2,
-  kvdbOpen = 3, kvsOperation = 4, checkpoint = 5, publication = 6, other = 7
-};
-
-class ProdigyStatefulStoreBootFailure {
-public:
-  static constexpr uint32_t version = 1;
-  uint32_t protocolVersion = version;
-  ProdigyStatefulStoreBootFailureKind kind = ProdigyStatefulStoreBootFailureKind::none;
-  ProdigyStatefulStoreBootFailureStage stage = ProdigyStatefulStoreBootFailureStage::none;
-  uint8_t publicationStage = 0;
-  uint8_t reserved = 0;
-  int32_t systemErrno = 0;
-  uint64_t rawError = 0;
-  uint128_t generationUUID = 0;
-  bool operator==(const ProdigyStatefulStoreBootFailure&) const = default;
-};
-
-template <typename S>
-static void serialize(S&& serializer, ProdigyStatefulStoreBootFailure& failure)
-{
-  serializer.value4b(failure.protocolVersion);
-  serializer.value1b(failure.kind);
-  serializer.value1b(failure.stage);
-  serializer.value1b(failure.publicationStage);
-  serializer.value1b(failure.reserved);
-  serializer.value4b(failure.systemErrno);
-  serializer.value8b(failure.rawError);
-  serializer.value16b(failure.generationUUID);
-}
-
-constexpr inline uint32_t ProdigyStatefulStoreBootFailureReportMaximumBytes = 256;
-constexpr inline uint32_t ProdigyStatefulStoreBootFailureBinaryBytes = 36;
-constexpr inline uint32_t ProdigyStatefulStoreBootFailureBase64Bytes = 48;
-constexpr inline auto ProdigyStatefulStoreBootFailureTrailerMarker = "\n@NTBF1:"_ctv;
-constexpr inline uint32_t ProdigyStatefulStoreBootFailureTrailerBytes =
-    ProdigyStatefulStoreBootFailureTrailerMarker.size() + ProdigyStatefulStoreBootFailureBase64Bytes + 1;
-constexpr inline uint32_t ProdigyStatefulStoreBootFailureHumanMaximumBytes =
-    ProdigyStatefulStoreBootFailureReportMaximumBytes - ProdigyStatefulStoreBootFailureTrailerBytes;
-static_assert(ProdigyStatefulStoreBootFailureTrailerBytes == 57);
-
-static inline bool prodigyStatefulStoreBootFailureValid(const ProdigyStatefulStoreBootFailure& failure)
-{
-  return failure.protocolVersion == ProdigyStatefulStoreBootFailure::version &&
-      uint8_t(failure.kind) >= uint8_t(ProdigyStatefulStoreBootFailureKind::missingMetadata) &&
-      uint8_t(failure.kind) <= uint8_t(ProdigyStatefulStoreBootFailureKind::needsDiagnosis) &&
-      uint8_t(failure.stage) >= uint8_t(ProdigyStatefulStoreBootFailureStage::environmentInspection) &&
-      uint8_t(failure.stage) <= uint8_t(ProdigyStatefulStoreBootFailureStage::other) &&
-      failure.reserved == 0 && failure.systemErrno >= 0;
-}
-
-static inline bool prodigyStatefulStoreBootFailureEncodeReport(
-    const String& human, const ProdigyStatefulStoreBootFailure& failure, String& report)
-{
-  report.clear();
-  if (!prodigyStatefulStoreBootFailureValid(failure)) return false;
-  auto copy = failure;
-  String binary = {};
-  if (!BitseryEngine::serialize(binary, copy) || binary.size() != ProdigyStatefulStoreBootFailureBinaryBytes) return false;
-  String encoded = {};
-  Base64::encode(reinterpret_cast<const uint8_t *>(binary.data()), binary.size(), encoded);
-  if (encoded.size() != ProdigyStatefulStoreBootFailureBase64Bytes) return false;
-  const uint64_t humanBytes = std::min<uint64_t>(human.size(), ProdigyStatefulStoreBootFailureHumanMaximumBytes);
-  report.append(human.substr(0, humanBytes, Copy::no));
-  report.append(ProdigyStatefulStoreBootFailureTrailerMarker);
-  report.append(encoded);
-  report.append('\n');
-  return report.size() <= ProdigyStatefulStoreBootFailureReportMaximumBytes;
-}
-
-static inline bool prodigyStatefulStoreBootFailureBase64Character(char character)
-{
-  return (character >= 'A' && character <= 'Z') || (character >= 'a' && character <= 'z') ||
-      (character >= '0' && character <= '9') || character == '+' || character == '/';
-}
-
-static inline bool prodigyStatefulStoreBootFailureDecodeReport(
-    const String& report, ProdigyStatefulStoreBootFailure& failure, String& human)
-{
-  failure = {.protocolVersion = 0};
-  human.assign(report);
-  if (report.size() > ProdigyStatefulStoreBootFailureReportMaximumBytes ||
-      report.size() < ProdigyStatefulStoreBootFailureTrailerBytes) return false;
-  const uint64_t trailerOffset = report.size() - ProdigyStatefulStoreBootFailureTrailerBytes;
-  if (std::memcmp(report.data() + trailerOffset, ProdigyStatefulStoreBootFailureTrailerMarker.data(),
-                  ProdigyStatefulStoreBootFailureTrailerMarker.size()) != 0 || report[report.size() - 1] != '\n') return false;
-  String encoded = report.substr(trailerOffset + ProdigyStatefulStoreBootFailureTrailerMarker.size(),
-                                 ProdigyStatefulStoreBootFailureBase64Bytes, Copy::yes);
-  for (char character : encoded)
-    if (!prodigyStatefulStoreBootFailureBase64Character(character)) return false;
-  String binary = {};
-  Base64::decode(encoded, binary);
-  if (binary.size() != ProdigyStatefulStoreBootFailureBinaryBytes) return false;
-  String canonical = {};
-  Base64::encode(reinterpret_cast<const uint8_t *>(binary.data()), binary.size(), canonical);
-  ProdigyStatefulStoreBootFailure decoded = {.protocolVersion = 0};
-  if (canonical != encoded || !BitseryEngine::deserializeSafe(binary, decoded) ||
-      !prodigyStatefulStoreBootFailureValid(decoded)) return false;
-  failure = decoded;
-  human.assign(report.substr(0, trailerOffset, Copy::no));
-  return true;
-}
-
-static inline String prodigyStatefulStoreBootFailureHumanReport(const String& report)
-{
-  ProdigyStatefulStoreBootFailure ignored = {.protocolVersion = 0};
-  String human = {};
-  (void)prodigyStatefulStoreBootFailureDecodeReport(report, ignored, human);
-  return human;
-}
-
 class FailureReport {
 public:
 
@@ -5722,8 +5616,7 @@ public:
     string.appendTabs(nTabs);
     string.append("Failure Report:\n"_ctv);
 
-    String humanReport = prodigyStatefulStoreBootFailureHumanReport(report);
-    string.snprintf_tab_add<"\tnreport: {}\n"_ctv>(nTabs, humanReport);
+    string.snprintf_tab_add<"\tnreport: {}\n"_ctv>(nTabs, report);
     string.snprintf_tab_add<"\tnapproxTime: {}\n"_ctv>(nTabs, String::epochMsToDateTime(approxTimeMs));
     string.snprintf_tab_add<"\tnnthCrash: {itoa}\n"_ctv>(nTabs, nthCrash);
     string.snprintf_tab_add<"\tnsignal: {itoa}\n"_ctv>(nTabs, signal);
@@ -6240,7 +6133,8 @@ static inline bool prodigyStatefulStoreSeedAuthorityValid(const ProdigyStatefulS
   return (value.protocolVersion == ProdigyStatefulStoreSeedAuthority::version || prodigyStatefulStoreSeedAuthorityHasSourceCut(value.protocolVersion)) && value.authorityGeneration != 0 &&
       value.operationUUID != 0 && value.applicationID != 0 && value.storeKind != DeploymentIdentityStoreKind::unknown &&
       value.shardGroup < value.nShardGroups && value.targetClusterUUID != 0 && value.targetDeploymentID != 0 &&
-      value.targetContainerUUID != 0 && value.sourceClusterUUID != 0 && value.sourceDeploymentID != 0 &&
+      value.targetContainerUUID != 0 && value.sourceClusterUUID != 0 &&
+      value.sourceClusterUUID != value.targetClusterUUID && value.sourceDeploymentID != 0 &&
       value.sourceContainerUUID != 0 && value.seedGeneration != 0 && prodigyIsSHA256HexDigest(value.fixtureSHA256) &&
       (prodigyStatefulStoreSeedAuthorityHasSourceCut(value.protocolVersion) ? value.expectedCatchupWatermarkSHA256.empty() :
        prodigyIsSHA256HexDigest(value.expectedCatchupWatermarkSHA256)) &&
@@ -6254,126 +6148,6 @@ static inline bool prodigyStatefulStoreSeedAuthorityValid(const ProdigyStatefulS
         value.qualificationDeadlineAtMilliseconds > 0 && uint64_t(value.qualificationDeadlineAtMilliseconds) <= value.retainUntilMilliseconds) :
        (value.qualificationRunUUID == 0 && value.qualificationChallengeUUID == 0 && value.qualificationExecutionGeneration == 0 &&
         value.qualificationDeadlineAtMilliseconds == 0));
-}
-
-// This is an immutable launch selection, not a materialization-progress state.
-// The HSE checkpoint owns progress; this record only binds a particular target
-// to the unpublished/selected native generation it is authorized to open.
-class ProdigyStatefulStoreGenerationSelection {
-public:
-  static constexpr uint32_t version = 1;
-  uint32_t protocolVersion = version;
-  uint128_t generationUUID = 0;
-  uint64_t servingRevision = 0;
-  String admittedPlanSHA256;
-  ProdigyStatefulStoreSeedAuthority authority = {.protocolVersion = 0};
-};
-
-template <typename S>
-static void serialize(S&& serializer, ProdigyStatefulStoreGenerationSelection& selection)
-{
-  serializer.value4b(selection.protocolVersion);
-  serializer.value16b(selection.generationUUID);
-  serializer.value8b(selection.servingRevision);
-  serializer.text1b(selection.admittedPlanSHA256, 64);
-  serializer.object(selection.authority);
-}
-
-static inline bool prodigyStatefulStoreGenerationSelectionValid(
-    const ProdigyStatefulStoreGenerationSelection& selection)
-{
-  return selection.protocolVersion == ProdigyStatefulStoreGenerationSelection::version &&
-      selection.generationUUID != 0 && selection.servingRevision != 0 &&
-      prodigyIsSHA256HexDigest(selection.admittedPlanSHA256) &&
-      prodigyStatefulStoreSeedAuthorityHasSourceCut(selection.authority.protocolVersion) &&
-      prodigyStatefulStoreSeedAuthorityValid(selection.authority);
-}
-
-// A zero protocol is the canonical absence of a selection.  Retained launch
-// state uses SameHome to decide whether an in-flight selected store may be
-// replayed; the full equality helper additionally binds the admitted plan.
-static inline bool prodigyStatefulStoreGenerationSelectionsEqual(
-    const ProdigyStatefulStoreGenerationSelection& a,
-    const ProdigyStatefulStoreGenerationSelection& b)
-{
-  if (a.protocolVersion == 0 || b.protocolVersion == 0)
-    return a.protocolVersion == 0 && b.protocolVersion == 0;
-  if (!prodigyStatefulStoreGenerationSelectionValid(a) ||
-      !prodigyStatefulStoreGenerationSelectionValid(b)) return false;
-  String aBytes = {}, bBytes = {};
-  auto aCopy = a, bCopy = b;
-  return BitseryEngine::serialize(aBytes, aCopy) && BitseryEngine::serialize(bBytes, bCopy) && aBytes == bBytes;
-}
-
-static inline bool prodigyStatefulStoreGenerationSameHome(
-    const ProdigyStatefulStoreGenerationSelection& a,
-    const ProdigyStatefulStoreGenerationSelection& b)
-{
-  if (a.protocolVersion == 0 || b.protocolVersion == 0)
-    return a.protocolVersion == 0 && b.protocolVersion == 0;
-  if (!prodigyStatefulStoreGenerationSelectionValid(a) ||
-      !prodigyStatefulStoreGenerationSelectionValid(b) || a.generationUUID != b.generationUUID) return false;
-  String aBytes = {}, bBytes = {};
-  auto aAuthority = a.authority, bAuthority = b.authority;
-  return BitseryEngine::serialize(aBytes, aAuthority) && BitseryEngine::serialize(bBytes, bAuthority) && aBytes == bBytes;
-}
-
-// Intent to repair one existing serving member. The serving package owns the
-// target identity. A source cut has its own challenge and the native store
-// owns progress. Waiting for an input does not change the authority revision.
-struct ProdigyStatefulServingMemberRepair {
-  uint128_t operationUUID = 0;
-  uint64_t deploymentID = 0;
-  uint32_t shardGroup = 0;
-  uint128_t targetContainerUUID = 0;
-  uint128_t targetMachineUUID = 0;
-  uint64_t servingRevision = 0;
-  String targetPlanSHA256;
-  ProdigyStatefulStoreBootFailure failure;
-  ProdigyStatefulStoreSourceCut challenge = {.protocolVersion = 0};
-  uint128_t donorMachineUUID = 0;
-  String donorPlanSHA256;
-  uint128_t sourceBaselineOperationUUID = 0;
-  String fixtureSHA256;
-
-  bool operator==(const ProdigyStatefulServingMemberRepair&) const = default;
-};
-
-template <typename S>
-static void serialize(S&& serializer, ProdigyStatefulServingMemberRepair& request)
-{
-  serializer.value16b(request.operationUUID);
-  serializer.value8b(request.deploymentID);
-  serializer.value4b(request.shardGroup);
-  serializer.value16b(request.targetContainerUUID);
-  serializer.value16b(request.targetMachineUUID);
-  serializer.value8b(request.servingRevision);
-  serializer.text1b(request.targetPlanSHA256, 64);
-  serializer.object(request.failure);
-  serializer.object(request.challenge);
-  serializer.value16b(request.donorMachineUUID);
-  serializer.text1b(request.donorPlanSHA256, 64);
-  serializer.value16b(request.sourceBaselineOperationUUID);
-  serializer.text1b(request.fixtureSHA256, 64);
-}
-
-static inline bool prodigyStatefulServingMemberRepairValid(const ProdigyStatefulServingMemberRepair& request)
-{
-  const auto app = uint16_t(request.deploymentID >> 48);
-  if (!request.operationUUID || (app != 3 && app != 4) || !request.targetContainerUUID ||
-      !request.targetMachineUUID || !request.servingRevision || !prodigyIsSHA256HexDigest(request.targetPlanSHA256) ||
-      !prodigyStatefulStoreBootFailureValid(request.failure)) return false;
-  const auto& cut = request.challenge;
-  if (cut.protocolVersion == 0)
-    return cut == ProdigyStatefulStoreSourceCut{.protocolVersion = 0} && request.donorMachineUUID == 0 &&
-        request.donorPlanSHA256.empty() && !request.sourceBaselineOperationUUID && request.fixtureSHA256.empty();
-  return prodigyStatefulStoreSourceCutValid(cut) && !cut.response && cut.action == ProdigyStatefulStoreSourceCutAction::prepare &&
-      cut.operationUUID == request.operationUUID && cut.memberRequestUUID != 0 && cut.sourceDeploymentID == request.deploymentID &&
-      cut.sourceContainerUUID != request.targetContainerUUID && cut.shardGroup == request.shardGroup &&
-      cut.applicationID == app && cut.storeKind == DeploymentIdentityStoreKind::kv &&
-      request.donorMachineUUID != 0 && request.donorMachineUUID != request.targetMachineUUID &&
-      prodigyIsSHA256HexDigest(request.donorPlanSHA256) && request.sourceBaselineOperationUUID != 0 &&
-      prodigyIsSHA256HexDigest(request.fixtureSHA256);
 }
 
 // Native store observation relayed through the existing container -> Neuron
@@ -12050,6 +11824,290 @@ public:
 };
 template <typename S> static void serialize(S&& s, ProdigyCrossClusterMasqueGatewayAuthorityResponse& r) { s.value1b(r.success); s.text1b(r.failure, 4096); s.value16b(r.localClusterUUID); s.value8b(r.currentAuthorityGeneration); s.value1b(r.found); s.value1b(r.qualified); s.object(r.authority); }
 
+// An opt-in desired membership.  This is deliberately not a writer grant:
+// only the application's committed consensus configuration grants writes.
+#define PRODIGY_GLOBAL_SINGLE_WRITER_MEMBERSHIP_VERSION 1
+enum class GlobalSingleWriterMemberRole : uint8_t { voter = 1, learner = 2 };
+class GlobalSingleWriterMember {
+public:
+  int32_t memberID = 0;
+  uint128_t clusterUUID = 0, containerUUID = 0;
+  IPAddress privateIPv6 = {};
+  GlobalSingleWriterMemberRole role = GlobalSingleWriterMemberRole::voter;
+};
+template <typename S> static void serialize(S&& s, GlobalSingleWriterMember& v) {
+  s.value4b(v.memberID); s.value16b(v.clusterUUID); s.value16b(v.containerUUID); s.object(v.privateIPv6); s.value1b(v.role);
+}
+class GlobalSingleWriterMembershipProjection {
+public:
+  static constexpr uint32_t version = PRODIGY_GLOBAL_SINGLE_WRITER_MEMBERSHIP_VERSION;
+  uint32_t protocolVersion = version;
+  uint128_t membershipUUID = 0, operationUUID = 0, localClusterUUID = 0;
+  uint64_t deploymentID = 0, generation = 0, expectedCommittedConfigIndex = 0;
+  String expectedCommittedConfigSHA256;
+  // Stable for the lifetime of this group, including after voter replacement.
+  std::array<int32_t, 3> genesisMemberIDs{};
+  int32_t highestAllocatedMemberID = 0;
+  Vector<GlobalSingleWriterMember> members;
+  Vector<int32_t> retiredMemberIDs;
+  bool replacementPending = false;
+};
+template <typename S> static void serialize(S&& s, GlobalSingleWriterMembershipProjection& v) {
+  s.value4b(v.protocolVersion); s.value16b(v.membershipUUID); s.value16b(v.operationUUID); s.value16b(v.localClusterUUID);
+  s.value8b(v.deploymentID); s.value8b(v.generation); s.value8b(v.expectedCommittedConfigIndex);
+  s.text1b(v.expectedCommittedConfigSHA256, 64);
+  for (auto& id : v.genesisMemberIDs) s.value4b(id);
+  s.value4b(v.highestAllocatedMemberID);
+  s.container(v.members, 4); s.container4b(v.retiredMemberIDs, 256);
+  s.value1b(v.replacementPending);
+}
+static inline bool prodigyGlobalSingleWriterDeploymentIDValid(uint64_t deployment) {
+  return ApplicationConfig::extractApplicationID(deployment) != 0 && (deployment & 0x0000FFFFFFFFFFFFULL) != 0;
+}
+static inline bool prodigyGlobalSingleWriterMembershipProjectionValid(const GlobalSingleWriterMembershipProjection& v) {
+  if (v.protocolVersion != GlobalSingleWriterMembershipProjection::version || v.membershipUUID == 0 || v.localClusterUUID == 0 ||
+      !v.operationUUID || !prodigyGlobalSingleWriterDeploymentIDValid(v.deploymentID) || v.generation == 0 || v.expectedCommittedConfigIndex == 0 ||
+      !prodigyIsSHA256HexDigest(v.expectedCommittedConfigSHA256) || v.members.empty() || v.members.size() > 4 || v.retiredMemberIDs.size() > 256) return false;
+  if (v.genesisMemberIDs[0] <= 0 || v.genesisMemberIDs[0] >= v.genesisMemberIDs[1] ||
+      v.genesisMemberIDs[1] >= v.genesisMemberIDs[2] || v.highestAllocatedMemberID < v.genesisMemberIDs[2]) return false;
+  int32_t prior = 0; uint32_t voters = 0; bool local = false;
+  for (const auto& member : v.members) {
+    if (member.memberID <= 0 || member.memberID <= prior || member.memberID > v.highestAllocatedMemberID || member.clusterUUID == 0 ||
+        member.containerUUID == 0 || !member.privateIPv6.is6 || member.privateIPv6.isNull() ||
+        (member.role != GlobalSingleWriterMemberRole::voter && member.role != GlobalSingleWriterMemberRole::learner)) return false;
+    if (member.role == GlobalSingleWriterMemberRole::voter) ++voters;
+    if (member.clusterUUID == v.localClusterUUID) local = true;
+    for (const auto& earlier : v.members) {
+      if (earlier.memberID >= member.memberID) break;
+      if (earlier.containerUUID == member.containerUUID || earlier.privateIPv6.equals(member.privateIPv6)) return false;
+    }
+    prior = member.memberID;
+  }
+  prior = 0;
+  for (int32_t retired : v.retiredMemberIDs) {
+    if (retired <= 0 || retired <= prior || retired > v.highestAllocatedMemberID ||
+        std::any_of(v.members.begin(), v.members.end(), [retired](const auto& m) { return m.memberID == retired; })) return false;
+    prior = retired;
+  }
+  if (!local && v.retiredMemberIDs.empty()) return false;
+  if (voters == 3) return v.members.size() == 3 || v.replacementPending;
+  // The old voter has been removed and the caught-up learner is awaiting
+  // promotion. Both remaining voters must participate in this transition.
+  return v.replacementPending && voters == 2 && v.members.size() == 3;
+}
+// Distinct groups may share machines, but never an incarnation or endpoint.
+// These bindings reserve addresses before any container claims its fragment.
+static inline bool prodigyGlobalSingleWriterMembershipsDisjoint(const GlobalSingleWriterMembershipProjection& a,
+                                                               const GlobalSingleWriterMembershipProjection& b) {
+  if (a.membershipUUID == b.membershipUUID || a.deploymentID == b.deploymentID) return false;
+  for (const auto& first : a.members) for (const auto& second : b.members)
+    if (first.containerUUID == second.containerUUID || first.privateIPv6.equals(second.privateIPv6)) return false;
+  return true;
+}
+static inline bool prodigyGlobalSingleWriterMembershipProjectionsValid(const Vector<GlobalSingleWriterMembershipProjection>& groups) {
+  if (groups.size() > 64) return false;
+  for (size_t index = 0; index < groups.size(); ++index) {
+    if (!prodigyGlobalSingleWriterMembershipProjectionValid(groups[index])) return false;
+    for (size_t prior = 0; prior < index; ++prior)
+      if (!prodigyGlobalSingleWriterMembershipsDisjoint(groups[prior],groups[index]))
+        return false;
+  }
+  return true;
+}
+// Member IDs are storage incarnations. An endpoint cannot acquire an old
+// vote by changing the binding in a newer launch plan.
+static inline bool prodigyGlobalSingleWriterMembershipSuccessor(const GlobalSingleWriterMembershipProjection& old,
+                                                   const GlobalSingleWriterMembershipProjection& next) {
+  if (old.membershipUUID != next.membershipUUID || old.operationUUID != next.operationUUID || old.localClusterUUID != next.localClusterUUID ||
+      old.deploymentID != next.deploymentID || old.genesisMemberIDs != next.genesisMemberIDs ||
+      next.highestAllocatedMemberID < old.highestAllocatedMemberID ||
+      next.generation < old.generation || next.expectedCommittedConfigIndex < old.expectedCommittedConfigIndex ||
+      (next.expectedCommittedConfigIndex == old.expectedCommittedConfigIndex &&
+       !next.expectedCommittedConfigSHA256.equals(old.expectedCommittedConfigSHA256))) return false;
+  // The durable high-water mark keeps retired IDs fenced even after their
+  // individual cleanup receipts have aged out of the bounded projection.
+  for (const auto& member : next.members)
+    if (member.memberID <= old.highestAllocatedMemberID &&
+        std::none_of(old.members.begin(), old.members.end(), [&](const auto& m) { return m.memberID == member.memberID; }))
+      return false;
+  for (const auto& before : old.members) {
+    auto after = std::find_if(next.members.begin(), next.members.end(),
+                              [&](const auto& member) { return member.memberID == before.memberID; });
+    if (after == next.members.end()) {
+      if (!std::binary_search(next.retiredMemberIDs.begin(), next.retiredMemberIDs.end(), before.memberID)) return false;
+    } else if (after->containerUUID != before.containerUUID || after->clusterUUID != before.clusterUUID ||
+               !after->privateIPv6.equals(before.privateIPv6)) return false;
+  }
+  return true;
+}
+static inline bool prodigyGlobalSingleWriterLocalMember(const GlobalSingleWriterMembershipProjection& group, uint64_t deployment,
+    uint128_t container) {
+  if (group.deploymentID != deployment || !prodigyGlobalSingleWriterMembershipProjectionValid(group)) return false;
+  return std::any_of(group.members.begin(), group.members.end(), [&](const auto& m) {
+    return m.clusterUUID == group.localClusterUUID && m.containerUUID == container;
+  });
+}
+class CommitGlobalSingleWriterMembershipResponse : public MothershipResponse {
+public:
+  uint64_t durableGeneration = 0;
+  GlobalSingleWriterMembershipProjection projection;
+};
+template <typename S> static void serialize(S&& s, CommitGlobalSingleWriterMembershipResponse& v) {
+  s.value1b(v.success); s.text1b(v.failure, 4096); s.value8b(v.durableGeneration); s.object(v.projection);
+}
+
+// The application owns the Raft state. Brain and Neuron attest the transport
+// endpoints; a desired placement cannot supply a committed report.
+#define PRODIGY_GLOBAL_SINGLE_WRITER_CONTROL_VERSION 2
+enum class GlobalSingleWriterControlAction : uint8_t { inspect = 1, provisionOnce, addLearner, removeVoter, promoteLearner, inspectReservation };
+
+class ProdigyGlobalSingleWriterControl : public MothershipResponse {
+public:
+  // Version two preserves the complete version-one prefix.  It adds only the
+  // member-addressed, read-only receipt proof after the old payload, so a v1
+  // inspect/provision exchange remains byte-for-byte unchanged.
+  uint32_t protocolVersion = 1;
+  GlobalSingleWriterControlAction action = GlobalSingleWriterControlAction::inspect;
+  bool response = false, provisioned = false;
+  uint128_t membershipUUID = 0, operationUUID = 0, localClusterUUID = 0, containerUUID = 0, bootNonce = 0, exchangeUUID = 0;
+  uint64_t deploymentID = 0, generation = 0, expectedCommittedConfigIndex = 0, committedConfigIndex = 0, term = 0, appliedIndex = 0;
+  int32_t memberID = 0, targetMemberID = 0, leaderMemberID = 0;
+  String expectedCommittedConfigSHA256, committedConfigSHA256;
+  Vector<GlobalSingleWriterMember> members;
+  Vector<int32_t> reachableMemberIDs, caughtUpMemberIDs;
+  GlobalSingleWriterMembershipProjection bindings = {.protocolVersion = 0};
+  uint16_t reservationTopic = 0;
+  uint128_t reservationRequestUUID = 0;
+  uint64_t minimumAppliedIndex = 0;
+  bool reservationFound = false;
+  String reservationDigest;
+};
+template<typename S> static void serialize(S&& s, ProdigyGlobalSingleWriterControl& v) {
+  s.value4b(v.protocolVersion); s.value1b(v.action); s.value1b(v.response); s.value1b(v.success);
+  s.text1b(v.failure, 4096); s.value1b(v.provisioned);
+  s.value16b(v.membershipUUID); s.value16b(v.operationUUID); s.value16b(v.localClusterUUID); s.value16b(v.containerUUID);
+  s.value16b(v.bootNonce); s.value16b(v.exchangeUUID); s.value8b(v.deploymentID); s.value8b(v.generation); s.value8b(v.expectedCommittedConfigIndex);
+  s.value8b(v.committedConfigIndex); s.value8b(v.term); s.value8b(v.appliedIndex); s.value4b(v.memberID);
+  s.value4b(v.targetMemberID); s.value4b(v.leaderMemberID); s.text1b(v.expectedCommittedConfigSHA256,64);
+  s.text1b(v.committedConfigSHA256,64); s.container(v.members,4); s.container4b(v.reachableMemberIDs,4); s.container4b(v.caughtUpMemberIDs,4); s.object(v.bindings);
+  if (v.protocolVersion >= 2) {
+    s.value2b(v.reservationTopic); s.value16b(v.reservationRequestUUID); s.value8b(v.minimumAppliedIndex);
+    s.value1b(v.reservationFound); s.text1b(v.reservationDigest,64);
+  }
+}
+
+static inline bool prodigyGlobalSingleWriterCommittedConfigDigest(uint128_t group, uint64_t deployment, uint64_t index,
+    const Vector<GlobalSingleWriterMember>& members, String& digest) {
+  if (!group || !prodigyGlobalSingleWriterDeploymentIDValid(deployment) || !index || members.size() < 2 || members.size() > 4) return false;
+  // Retain the original domain tag so already committed configuration digests
+  // remain stable when the application-independent contract is upgraded.
+  String bytes; bytes.assign("Truth configuration v1"_ctv);
+  // All fields have fixed widths; integers are in network byte order.
+  auto append = [&](uint128_t value, size_t width) {
+    while (width) { --width; bytes.append(uint8_t(value >> (width * 8))); }
+  };
+  append(group,16); append(deployment,8); append(index,8); append(members.size(),1);
+  int32_t previous = 0;
+  size_t voters = 0;
+  for (const auto& m : members) {
+    if (m.memberID <= previous || !m.clusterUUID || !m.containerUUID || !m.privateIPv6.is6 || m.privateIPv6.isNull() ||
+        (m.role != GlobalSingleWriterMemberRole::voter && m.role != GlobalSingleWriterMemberRole::learner)) return false;
+    for (const auto& other : members) {
+      if (other.memberID == m.memberID) break;
+      if (other.containerUUID == m.containerUUID || other.privateIPv6.equals(m.privateIPv6)) return false;
+    }
+    previous = m.memberID;
+    voters += m.role == GlobalSingleWriterMemberRole::voter;
+    append(uint32_t(m.memberID),4); append(m.clusterUUID,16); append(m.containerUUID,16);
+    bytes.append(reinterpret_cast<const uint8_t *>(m.privateIPv6.v6),16); append(uint8_t(m.role),1);
+  }
+  return voters >= 2 && voters <= 3 && members.size()-voters <= 1 && prodigyComputeSHA256Hex(bytes,digest);
+}
+static inline bool prodigyGlobalSingleWriterControlAddressValid(const ProdigyGlobalSingleWriterControl& v) {
+  return (v.protocolVersion == 1 || v.protocolVersion == 2) && v.membershipUUID && v.operationUUID && v.localClusterUUID && v.containerUUID &&
+      prodigyGlobalSingleWriterDeploymentIDValid(v.deploymentID) && v.memberID > 0 &&
+      v.action >= GlobalSingleWriterControlAction::inspect && v.action <= GlobalSingleWriterControlAction::inspectReservation &&
+      (v.protocolVersion != 1 || v.action != GlobalSingleWriterControlAction::inspectReservation);
+}
+
+static inline bool prodigyGlobalSingleWriterControlRequestValid(const ProdigyGlobalSingleWriterControl& v) {
+  if (!prodigyGlobalSingleWriterControlAddressValid(v) || v.response || v.success || !v.failure.empty() ||
+      v.provisioned || v.committedConfigIndex || v.term || v.appliedIndex || v.leaderMemberID ||
+      !v.committedConfigSHA256.empty() || !v.members.empty() || !v.reachableMemberIDs.empty() || !v.caughtUpMemberIDs.empty() ||
+      v.reservationFound || !v.reservationDigest.empty())
+    return false;
+  if (v.action == GlobalSingleWriterControlAction::inspect)
+    return v.targetMemberID == 0 && !v.reservationTopic && !v.reservationRequestUUID && !v.minimumAppliedIndex;
+  if (v.action == GlobalSingleWriterControlAction::inspectReservation)
+    return v.protocolVersion == 2 && v.targetMemberID == 0 && v.reservationTopic != 0 && v.reservationRequestUUID != 0 &&
+        v.minimumAppliedIndex != 0 && !v.expectedCommittedConfigIndex && v.expectedCommittedConfigSHA256.empty() && !v.bootNonce;
+  if (v.reservationTopic || v.reservationRequestUUID || v.minimumAppliedIndex) return false;
+  if (!v.bootNonce || !v.generation) return false;
+  if (v.action == GlobalSingleWriterControlAction::provisionOnce) return v.targetMemberID == 0;
+  return v.targetMemberID > 0 && v.expectedCommittedConfigIndex && prodigyIsSHA256HexDigest(v.expectedCommittedConfigSHA256);
+}
+
+static inline bool prodigyGlobalSingleWriterControlReportValid(const ProdigyGlobalSingleWriterControl& v) {
+  if (!prodigyGlobalSingleWriterControlAddressValid(v) || !v.response || !v.exchangeUUID || v.bindings.protocolVersion) return false;
+  if (!v.success) return !v.failure.empty();
+  if (!v.failure.empty() || !v.generation || !v.bootNonce) return false;
+  const bool reservationInspection = v.action == GlobalSingleWriterControlAction::inspectReservation;
+  if (reservationInspection) {
+    if (v.protocolVersion != 2 || !v.reservationTopic || !v.reservationRequestUUID || !v.minimumAppliedIndex ||
+        v.appliedIndex < v.minimumAppliedIndex ||
+        (v.reservationFound ? !prodigyIsSHA256HexDigest(v.reservationDigest) : !v.reservationDigest.empty())) return false;
+  } else if (v.reservationTopic || v.reservationRequestUUID || v.minimumAppliedIndex || v.reservationFound || !v.reservationDigest.empty()) {
+    return false;
+  }
+  // A bound journal can be inspected before genesis or the first election.
+  if (!v.committedConfigIndex)
+    return v.leaderMemberID == 0 && v.members.empty() && v.committedConfigSHA256.empty() &&
+           v.reachableMemberIDs.empty() && v.caughtUpMemberIDs.empty();
+  String digest;
+  if (!v.provisioned || !v.term || v.appliedIndex < v.committedConfigIndex ||
+      !prodigyGlobalSingleWriterCommittedConfigDigest(v.membershipUUID,v.deploymentID,v.committedConfigIndex,v.members,digest) ||
+      !digest.equals(v.committedConfigSHA256)) return false;
+  auto present = [&](int32_t id, bool voter) {
+    return std::any_of(v.members.begin(),v.members.end(),[&](const auto& m) {
+      return m.memberID == id && (!voter || m.role == GlobalSingleWriterMemberRole::voter);
+    });
+  };
+  if (v.leaderMemberID && !present(v.leaderMemberID,true)) return false;
+  for (const auto* ids : {&v.reachableMemberIDs,&v.caughtUpMemberIDs}) {
+    int32_t previous = 0;
+    for (int32_t id : *ids) {
+      if (id <= previous || !present(id,false)) return false;
+      previous = id;
+    }
+  }
+  return true;
+}
+
+static inline bool prodigyGlobalSingleWriterControlForProjection(const ProdigyGlobalSingleWriterControl& v, const GlobalSingleWriterMembershipProjection& group) {
+  if (!prodigyGlobalSingleWriterLocalMember(group, v.deploymentID, v.containerUUID) || group.membershipUUID != v.membershipUUID ||
+      group.localClusterUUID != v.localClusterUUID || group.generation != v.generation) return false;
+  return std::any_of(group.members.begin(),group.members.end(),[&](const auto& m) {
+    return m.memberID == v.memberID && m.containerUUID == v.containerUUID && m.clusterUUID == v.localClusterUUID;
+  });
+}
+
+enum class GlobalSingleWriterPlacementAction : uint8_t { offerAddress = 1, reconcile, retire };
+class ProdigyGlobalSingleWriterPlacementExchange : public MothershipResponse {
+public:
+  GlobalSingleWriterPlacementAction action = GlobalSingleWriterPlacementAction::offerAddress;
+  uint128_t membershipUUID = 0, localClusterUUID = 0;
+  uint64_t deploymentID = 0, generation = 0, committedConfigIndex = 0;
+  String committedConfigSHA256;
+  GlobalSingleWriterMember member;
+  Vector<GlobalSingleWriterMember> reserved;
+};
+template<class S> static void serialize(S&& s, ProdigyGlobalSingleWriterPlacementExchange& r) {
+  s.value1b(r.action); s.value1b(r.success); s.text1b(r.failure,4096);
+  s.value16b(r.membershipUUID); s.value16b(r.localClusterUUID); s.value8b(r.deploymentID);
+  s.value8b(r.generation); s.value8b(r.committedConfigIndex); s.text1b(r.committedConfigSHA256,64);
+  s.object(r.member); s.container(r.reserved,4);
+}
+
 class ProdigyMasterAuthorityRuntimeState {
 public:
 
@@ -12077,11 +12135,6 @@ public:
   // materializedStatefulRecoveryOperations; this vector is not another state
   // machine.
   Vector<ProdigyRetainedStatefulRearmProof> retainedStatefulRearmProofs;
-  // Version-twenty-three desired generation projections.  These bind launch
-  // identity only; native checkpoint progress and serving promotion remain in
-  // their existing owners.
-  Vector<ProdigyStatefulStoreGenerationSelection> statefulStoreGenerationSelections;
-  Vector<ProdigyStatefulServingMemberRepair> statefulServingMemberRepairs;
   Vector<ApiCredentialExpiryNotice> apiCredentialExpiryNotices;
   Vector<ProdigyManagedMachineSchema> machineSchemas;
   Vector<RoutableResourceLease> routableResourceLeases;
@@ -12093,6 +12146,9 @@ public:
   // Version-six master-authority tail.  This registry is deliberately separate
   // from positional DeploymentPlan bytes.
   Vector<ProdigyDeploymentPlacementPolicy> deploymentPlacementPolicies;
+  // Version-twenty-five desired global membership projections. Pending means
+  // exactly that: Brain must not turn this admin input into a voting config.
+  Vector<GlobalSingleWriterMembershipProjection> globalSingleWriterMembershipProjections;
   Vector<ProdigyStatelessDeploymentAdmission> statelessDeploymentAdmissions;
   Vector<ProdigyStatelessDeploymentRetirement> statelessDeploymentRetirements;
   // Zero is the pre-v21 unlimited follower behavior. Explicit requests use
@@ -12122,10 +12178,29 @@ public:
   // ProdigyPersistentBrainSnapshotSecrets before writing the snapshot.
   ProdigyTransportCredentialAuthorityRoot transportCredentialAuthorityRoot;
 
+  bool crossClusterMasqueGatewayAuthorityPairCurrent(const CrossClusterMasqueGatewayAuthority& authority) const
+  {
+    const auto enrollment = std::find_if(clusterPairEnrollments.begin(),
+        clusterPairEnrollments.end(), [&](const auto& value) {
+          return value.pairUUID == authority.pairUUID && value.operationUUID == authority.pairOperationUUID &&
+              value.localClusterUUID == authority.localClusterUUID && value.peerClusterUUID == authority.peerClusterUUID;
+        });
+    if (enrollment == clusterPairEnrollments.end() ||
+        enrollment->state != ProdigyClusterPairEnrollmentState::active ||
+        enrollment->localAuthorityGeneration != authority.pairAuthorityGeneration ||
+        enrollment->agreedKeyEpoch != authority.keyGeneration) return false;
+    const auto operation = std::find_if(clusterPairEnrollmentOperations.begin(),
+        clusterPairEnrollmentOperations.end(), [&](const auto& value) {
+          return value.pairUUID == authority.pairUUID && value.operationUUID == authority.pairOperationUUID;
+        });
+    return operation != clusterPairEnrollmentOperations.end() &&
+        operation->localAuthorityGeneration == authority.pairAuthorityGeneration &&
+        operation->initialProjectionDelivered && !operation->revocationRequested && !operation->projectionsWithdrawn;
+  }
+
   bool operator==(const ProdigyMasterAuthorityRuntimeState& other) const
   {
-    if (statefulServingMemberRepairs != other.statefulServingMemberRepairs) return false;
-    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || nextPendingElasticAddressOperationID != other.nextPendingElasticAddressOperationID || nextDNSIntentRevision != other.nextDNSIntentRevision || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || pendingAddMachinesProvisioningIntents.size() != other.pendingAddMachinesProvisioningIntents.size() || pendingAutonomousProvisioningOperations.size() != other.pendingAutonomousProvisioningOperations.size() || pendingElasticAddressAssignments.size() != other.pendingElasticAddressAssignments.size() || pendingElasticAddressReleases.size() != other.pendingElasticAddressReleases.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || statefulServingAuthorities.size() != other.statefulServingAuthorities.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || materializedStatefulRecoveryOperations.size() != other.materializedStatefulRecoveryOperations.size() || materializedStatefulRecoveryRetries.size() != other.materializedStatefulRecoveryRetries.size() || retainedStatefulRearmProofs.size() != other.retainedStatefulRearmProofs.size() || statefulStoreGenerationSelections.size() != other.statefulStoreGenerationSelections.size() || apiCredentialExpiryNotices.size() != other.apiCredentialExpiryNotices.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || taskExecutions.size() != other.taskExecutions.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf || updateSelfFollowerConcurrency != other.updateSelfFollowerConcurrency || updateSelfFollowerTransitionIssuedPeerKeys != other.updateSelfFollowerTransitionIssuedPeerKeys || updateSelfFollowerReadyPeerKeys != other.updateSelfFollowerReadyPeerKeys ||
+    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || nextPendingElasticAddressOperationID != other.nextPendingElasticAddressOperationID || nextDNSIntentRevision != other.nextDNSIntentRevision || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || pendingAddMachinesProvisioningIntents.size() != other.pendingAddMachinesProvisioningIntents.size() || pendingAutonomousProvisioningOperations.size() != other.pendingAutonomousProvisioningOperations.size() || pendingElasticAddressAssignments.size() != other.pendingElasticAddressAssignments.size() || pendingElasticAddressReleases.size() != other.pendingElasticAddressReleases.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || statefulServingAuthorities.size() != other.statefulServingAuthorities.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || materializedStatefulRecoveryOperations.size() != other.materializedStatefulRecoveryOperations.size() || materializedStatefulRecoveryRetries.size() != other.materializedStatefulRecoveryRetries.size() || retainedStatefulRearmProofs.size() != other.retainedStatefulRearmProofs.size() || apiCredentialExpiryNotices.size() != other.apiCredentialExpiryNotices.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || taskExecutions.size() != other.taskExecutions.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf || updateSelfFollowerConcurrency != other.updateSelfFollowerConcurrency || updateSelfFollowerTransitionIssuedPeerKeys != other.updateSelfFollowerTransitionIssuedPeerKeys || updateSelfFollowerReadyPeerKeys != other.updateSelfFollowerReadyPeerKeys ||
         prodigyDeploymentPlacementPoliciesEqual(deploymentPlacementPolicies, other.deploymentPlacementPolicies) == false ||
         prodigyStatelessDeploymentAdmissionsEqual(statelessDeploymentAdmissions, other.statelessDeploymentAdmissions) == false ||
         prodigyStatelessDeploymentRetirementsEqual(statelessDeploymentRetirements, other.statelessDeploymentRetirements) == false ||
@@ -12137,6 +12212,7 @@ public:
         transportCredentialEnrollmentOperations.size() != other.transportCredentialEnrollmentOperations.size() ||
         prodigyCousinRoutesEqual(cousinRoutes, other.cousinRoutes) == false ||
         prodigyCrossClusterMasqueGatewayAuthoritiesEqual(crossClusterMasqueGatewayAuthorities, other.crossClusterMasqueGatewayAuthorities) == false ||
+        globalSingleWriterMembershipProjections.size() != other.globalSingleWriterMembershipProjections.size() ||
         transportCredentialAuthorityRoot.authorityEpoch != other.transportCredentialAuthorityRoot.authorityEpoch ||
         transportCredentialAuthorityRoot.keyEpoch != other.transportCredentialAuthorityRoot.keyEpoch ||
         transportCredentialAuthorityRoot.authorityGeneration != other.transportCredentialAuthorityRoot.authorityGeneration ||
@@ -12157,6 +12233,13 @@ public:
     {
       const auto& left = transportCredentialEnrollmentOperations[index]; const auto& right = other.transportCredentialEnrollmentOperations[index];
       if (!(left == right)) return false;
+    }
+    for (uint32_t index = 0; index < globalSingleWriterMembershipProjections.size(); ++index)
+    {
+      String left = {}, right = {};
+      auto a = globalSingleWriterMembershipProjections[index], b = other.globalSingleWriterMembershipProjections[index];
+      BitseryEngine::serialize(left, a); BitseryEngine::serialize(right, b);
+      if (left != right) return false;
     }
 
     for (const auto& [key, snapshot] : tlsResumptionSnapshotsByWormhole)
@@ -12219,11 +12302,6 @@ public:
     for (uint32_t index = 0; index < statefulServingAuthorities.size(); ++index)
     {
       if (statefulServingAuthorities[index] != other.statefulServingAuthorities[index]) return false;
-    }
-    for (uint32_t index = 0; index < statefulStoreGenerationSelections.size(); ++index)
-    {
-      if (!prodigyStatefulStoreGenerationSelectionsEqual(
-              statefulStoreGenerationSelections[index], other.statefulStoreGenerationSelections[index])) return false;
     }
 
     for (uint32_t index = 0; index < deferredStatefulScaleIntents.size(); ++index)
@@ -12952,6 +13030,9 @@ public:
   // Append-only seed authority. A zero protocolVersion is the explicit
   // absence until a remote seed is scheduled, including initial all-master boot.
   ProdigyStatefulStoreSeedAuthority statefulStoreSeedAuthority = {.protocolVersion = 0};
+  // Desired-only global membership. The application independently verifies
+  // its committed consensus configuration before making this active.
+  GlobalSingleWriterMembershipProjection globalSingleWriterMembership = {.protocolVersion = 0};
   uint64_t declaredStatefulClientService = 0;
   uint16_t declaredStatefulClientPort = 0;
 
@@ -13254,53 +13335,38 @@ static void serialize(S&& serializer, NeuronContainerMetricPolicy& policy)
   serializer.value4b(policy.metricsCadenceMs);
 }
 
-// This deliberately validates only the immutable plan scope.  Local cluster
-// and sealed-runtime admission are checked by the serving-authority owner.
-static inline bool prodigyStatefulStoreGenerationSelectionMatchesPlan(
-    const ProdigyStatefulStoreGenerationSelection& selection, const ContainerPlan& plan)
-{
-  if (selection.protocolVersion == 0) return true;
-  const auto& authority = selection.authority;
-  return prodigyStatefulStoreGenerationSelectionValid(selection) &&
-      !plan.isSystemContainer() && plan.isStateful && plan.config.type == ApplicationType::stateful &&
-      authority.applicationID == plan.config.applicationID &&
-      authority.targetContainerUUID == plan.uuid &&
-      authority.targetDeploymentID == plan.config.deploymentID() &&
-      authority.shardGroup == plan.shardGroup && authority.nShardGroups == plan.nShardGroups;
-}
-
 class NeuronContainerBootstrap {
 public:
 
   ContainerPlan plan;
   NeuronContainerMetricPolicy metricPolicy;
-  // Each bootstrap is serialized as its own bounded String on every current
-  // transport/persistence path. This terminal field is therefore safe to
-  // append; ContainerPlan itself remains byte-for-byte legacy.
-  ProdigyStatefulStoreGenerationSelection statefulStoreGenerationSelection = {.protocolVersion = 0};
 };
+
+static inline bool prodigyGlobalSingleWriterContainerPlanValid(const ContainerPlan& plan)
+{
+  return plan.isStateful && plan.config.type == ApplicationType::stateful && !plan.useHostNetworkNamespace &&
+      plan.config.applicationID != 0 && plan.config.versionID != 0 && plan.config.versionID <= 0x0000FFFFFFFFFFFFULL &&
+      plan.shardGroup == 0 && plan.nShardGroups == 1 && plan.statefulMeshRoles.sibling != 0 &&
+      ApplicationConfig::extractApplicationID(plan.statefulMeshRoles.sibling) == plan.config.applicationID &&
+      plan.statefulMeshRoles.hasDistinctServices() &&
+      prodigyGlobalSingleWriterLocalMember(plan.globalSingleWriterMembership,plan.config.deploymentID(),plan.uuid);
+}
 
 template <typename S>
 static void serialize(S&& serializer, NeuronContainerBootstrap& bootstrap)
 {
   serializer.object(bootstrap.plan);
   serializer.object(bootstrap.metricPolicy);
-  if constexpr (requires { serializer.adapter().isCompletedSuccessfully(); })
-  {
-    if (!serializer.adapter().isCompletedSuccessfully())
-    {
-      serializer.object(bootstrap.statefulStoreGenerationSelection);
-      if (!serializer.adapter().isCompletedSuccessfully() ||
-          !prodigyStatefulStoreGenerationSelectionValid(bootstrap.statefulStoreGenerationSelection) ||
-          !prodigyStatefulStoreGenerationSelectionMatchesPlan(
-              bootstrap.statefulStoreGenerationSelection, bootstrap.plan))
+  if constexpr (requires { serializer.adapter().isCompletedSuccessfully(); }) {
+    bootstrap.plan.globalSingleWriterMembership = {.protocolVersion = 0};
+    if (!serializer.adapter().isCompletedSuccessfully()) {
+      serializer.object(bootstrap.plan.globalSingleWriterMembership);
+      if (!prodigyGlobalSingleWriterContainerPlanValid(bootstrap.plan) ||
+          !serializer.adapter().isCompletedSuccessfully())
         serializer.adapter().error(bitsery::ReaderError::InvalidData);
     }
-    else bootstrap.statefulStoreGenerationSelection = {.protocolVersion = 0};
-  }
-  else if (bootstrap.statefulStoreGenerationSelection.protocolVersion != 0)
-  {
-    serializer.object(bootstrap.statefulStoreGenerationSelection);
+  } else if (bootstrap.plan.globalSingleWriterMembership.protocolVersion) {
+    serializer.object(bootstrap.plan.globalSingleWriterMembership);
   }
 }
 
@@ -13365,10 +13431,9 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   // add-machines record. Version 20 appends the Mothership-created local
   // MASQUE gateway authority ledger. Version 21 appends durable stateless
   // retirement receipts; version 22 appends immutable retained-deployment
-  // re-arm proofs beside the existing recovery-operation ledger; version 23
-  // appends exact stateful native-generation launch selections.
-  // Older readers reject before consuming either newer operation layout.
-  constexpr uint64_t explicitVersion = 24;
+  // re-arm proofs beside the existing recovery-operation ledger. Versions
+  // 23/24 are decode-only: their retired database-repair tails must be empty.
+  constexpr uint64_t explicitVersion = 25;
   using Serializer = std::remove_cv_t<std::remove_reference_t<S>>;
   if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
     state.transportCredentialAuthorityRoot = {};
@@ -13394,8 +13459,9 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   bool hasCrossClusterMasqueGatewayAuthorities = false;
   bool hasStatelessDeploymentRetirements = false;
   bool hasRetainedStatefulRearmProofs = false;
-  bool hasStatefulStoreGenerationSelections = false;
-  bool hasStatefulServingMemberRepairs = false;
+  bool hasRetiredStoreSelections = false;
+  bool hasRetiredMemberRepairs = false;
+  bool hasGlobalSingleWriterMembershipProjections = false;
 
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
@@ -13433,20 +13499,13 @@ static void prodigySerializeMasterAuthorityRuntimeState(
     hasCousinRoutes = state.cousinRoutes.empty() == false;
     hasPendingAddMachinesProvisioningIntents = state.pendingAddMachinesProvisioningIntents.empty() == false;
     hasStatelessDeploymentRetirements = !state.statelessDeploymentRetirements.empty();
-    hasRetainedStatefulRearmProofs = !state.retainedStatefulRearmProofs.empty();
-    hasStatefulServingMemberRepairs = !state.statefulServingMemberRepairs.empty();
-    hasStatefulStoreGenerationSelections = hasStatefulServingMemberRepairs || !state.statefulStoreGenerationSelections.empty();
+    hasGlobalSingleWriterMembershipProjections = !state.globalSingleWriterMembershipProjections.empty();
+    hasRetainedStatefulRearmProofs = !state.retainedStatefulRearmProofs.empty() || hasGlobalSingleWriterMembershipProjections;
     hasCrossClusterMasqueGatewayAuthorities = !state.crossClusterMasqueGatewayAuthorities.empty() || hasStatelessDeploymentRetirements;
     // Version 22 is cumulative through the v21 retirement container. Emit
     // every earlier tail, even when empty, before the re-arm proof sidecar.
     if (hasRetainedStatefulRearmProofs)
     {
-      hasStatelessDeploymentRetirements = true;
-      hasCrossClusterMasqueGatewayAuthorities = true;
-    }
-    if (hasStatefulStoreGenerationSelections)
-    {
-      hasRetainedStatefulRearmProofs = true;
       hasStatelessDeploymentRetirements = true;
       hasCrossClusterMasqueGatewayAuthorities = true;
     }
@@ -13490,7 +13549,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
       hasAllMachineRecoveryWitnesses = true;
       hasMaterializedStatefulRecoveryRetries = true;
     }
-    if (hasMaterializedStatefulRecoveryOperations || hasApiCredentialExpiryNotices || hasAllMachineRecoveryWitnesses || hasMaterializedStatefulRecoveryRetries || hasContainerRuntimeStates || hasDeploymentPlacementPolicies || hasStatefulServingAuthorities || hasStatelessDeploymentAdmissions || hasExplicitUpdateSelfFollowerConcurrency || hasPendingAddMachinesProvisioningIntents || hasStatefulStoreGenerationSelections)
+    if (hasMaterializedStatefulRecoveryOperations || hasApiCredentialExpiryNotices || hasAllMachineRecoveryWitnesses || hasMaterializedStatefulRecoveryRetries || hasContainerRuntimeStates || hasDeploymentPlacementPolicies || hasStatefulServingAuthorities || hasStatelessDeploymentAdmissions || hasExplicitUpdateSelfFollowerConcurrency || hasPendingAddMachinesProvisioningIntents)
     {
       uint64_t marker = versionMarker;
       serializer.value8b(marker);
@@ -13520,8 +13579,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
       if (hasCrossClusterMasqueGatewayAuthorities) version = 20;
       if (hasStatelessDeploymentRetirements) version = 21;
       if (hasRetainedStatefulRearmProofs) version = 22;
-      if (hasStatefulStoreGenerationSelections) version = 23;
-      if (hasStatefulServingMemberRepairs) version = 24;
+      if (hasGlobalSingleWriterMembershipProjections) version = 25;
       serializer.value8b(version);
     }
     serializer.value8b(state.generation);
@@ -13572,8 +13630,9 @@ static void prodigySerializeMasterAuthorityRuntimeState(
       hasCrossClusterMasqueGatewayAuthorities = version >= 20;
       hasStatelessDeploymentRetirements = version >= 21;
       hasRetainedStatefulRearmProofs = version >= 22;
-      hasStatefulStoreGenerationSelections = version >= 23;
-      hasStatefulServingMemberRepairs = version >= 24;
+      hasRetiredStoreSelections = version == 23 || version == 24;
+      hasRetiredMemberRepairs = version == 24;
+      hasGlobalSingleWriterMembershipProjections = version >= 25;
     }
   }
 
@@ -13843,45 +13902,35 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   {
     state.retainedStatefulRearmProofs.clear();
   }
-  if (hasStatefulStoreGenerationSelections)
+  if (hasGlobalSingleWriterMembershipProjections)
   {
-    serializer.container(state.statefulStoreGenerationSelections, 4096,
-        [](auto& nested, ProdigyStatefulStoreGenerationSelection& selection) { nested.object(selection); });
+    serializer.container(state.globalSingleWriterMembershipProjections, 64);
     if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
-    {
-      uint128_t previousTarget = 0;
-      for (const auto& selection : state.statefulStoreGenerationSelections)
-        if (!prodigyStatefulStoreGenerationSelectionValid(selection) ||
-            (previousTarget != 0 && selection.authority.targetContainerUUID <= previousTarget)) {
-          serializer.adapter().error(bitsery::ReaderError::InvalidData); return;
-        }
-        else previousTarget = selection.authority.targetContainerUUID;
-    }
+      if (!prodigyGlobalSingleWriterMembershipProjectionsValid(state.globalSingleWriterMembershipProjections))
+        serializer.adapter().error(bitsery::ReaderError::InvalidData);
   }
   else if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
-    state.statefulStoreGenerationSelections.clear();
+    state.globalSingleWriterMembershipProjections.clear();
   }
-  if (hasStatefulServingMemberRepairs)
+  if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
-    serializer.container(state.statefulServingMemberRepairs, 4096);
-    if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
+    // v23/v24 appended application-database repair containers. Their writer
+    // encodes an empty container as one zero byte. Accept only that canonical
+    // empty form; reject active retired state before allocating or discarding
+    // any payload. New writers never emit these tails.
+    for (bool present : {hasRetiredStoreSelections, hasRetiredMemberRepairs})
     {
-      uint128_t previous = 0;
-      for (const auto& request : state.statefulServingMemberRepairs)
+      if (!present) continue;
+      uint8_t countPrefix = 0;
+      serializer.value1b(countPrefix);
+      if (countPrefix != 0)
       {
-        if (!prodigyStatefulServingMemberRepairValid(request) || request.targetContainerUUID <= previous ||
-            request.servingRevision > state.generation)
-        {
-          serializer.adapter().error(bitsery::ReaderError::InvalidData);
-          return;
-        }
-        previous = request.targetContainerUUID;
+        serializer.adapter().error(bitsery::ReaderError::InvalidData);
+        return;
       }
     }
   }
-  else if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
-    state.statefulServingMemberRepairs.clear();
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
   {
     if (!prodigyPendingAddMachinesProvisioningIntentsValid(
@@ -13935,6 +13984,16 @@ public:
   DeploymentApiCredentialPolicy apiCredentialPolicy;
 };
 
+static inline bool prodigyGlobalSingleWriterPlanValid(const DeploymentPlan& plan)
+{
+  if (plan.stateful.writerMode != StatefulWriterMode::globalSingleWriter || !plan.isStateful || plan.config.type != ApplicationType::stateful ||
+      plan.config.applicationID == 0 || plan.config.versionID == 0 || plan.config.versionID > 0x0000FFFFFFFFFFFFULL ||
+      !plan.stateful.neverShard || plan.useHostNetworkNamespace || !plan.horizontalScalers.empty() ||
+      !MeshServices::isPrefix(plan.stateful.siblingPrefix) ||
+      ApplicationConfig::extractApplicationID(plan.stateful.siblingPrefix) != plan.config.applicationID) return false;
+  return StatefulMeshRoles::forShardGroup(plan.stateful, plan.config.applicationID, 0).hasDistinctServices();
+}
+
 template <typename S>
 static void serialize(S&& serializer, DeploymentPlan& plan)
 {
@@ -13968,6 +14027,9 @@ static void serialize(S&& serializer, DeploymentPlan& plan)
   serializer.object(plan.tlsIssuancePolicy);
   serializer.value1b(plan.hasApiCredentialPolicy);
   serializer.object(plan.apiCredentialPolicy);
+  if constexpr (requires { serializer.adapter().isCompletedSuccessfully(); })
+    if (plan.stateful.writerMode == StatefulWriterMode::globalSingleWriter && !prodigyGlobalSingleWriterPlanValid(plan))
+      serializer.adapter().error(bitsery::ReaderError::InvalidData);
 }
 
 // Validate both exact declarations against the authority's retained plan map.
@@ -14002,6 +14064,33 @@ static inline bool prodigyCousinAutomaticWhiteholePlanValid(const Vector<Whiteho
 {
   return whiteholes.size() == 1 && whiteholeDeclarationValid(whiteholes[0]) &&
       whiteholes[0].family == ExternalAddressFamily::ipv6 && whiteholes[0].transport == ExternalAddressTransport::tcp;
+}
+
+// A global single-writer group has at most three remote members while a replacement
+// learner overlaps the three committed voters.  Its owner-driven sibling
+// sessions therefore need a bounded pool of independently leased public
+// source tuples.  This is deliberately narrower than the legacy automatic
+// COUSIN declaration: the runtime additionally requires the durable membership
+// projection before it can use a pool.
+constexpr static uint32_t prodigyGlobalSingleWriterSiblingMaximumWhiteholes = 3;
+
+static inline bool prodigyGlobalSingleWriterSiblingWhiteholePlanValid(
+    const ProdigyLocalCousinServicePermission& permission, const DeploymentPlan& plan)
+{
+  return permission.protocolVersion == ProdigyLocalCousinServicePermission::purposeVersion &&
+      permission.localHalf == CousinRouteHalf::source &&
+      permission.purpose == ProdigyCousinServicePurpose::sibling &&
+      prodigyGlobalSingleWriterPlanValid(plan) &&
+      permission.localApplicationID == plan.config.applicationID &&
+      permission.peerApplicationID == plan.config.applicationID &&
+      permission.localDeploymentID == plan.config.deploymentID() && permission.peerDeploymentID == plan.config.deploymentID() &&
+      permission.localCousinServicePrefix == plan.stateful.siblingPrefix &&
+      permission.peerCousinServicePrefix == plan.stateful.siblingPrefix &&
+      !plan.whiteholes.empty() && plan.whiteholes.size() <= prodigyGlobalSingleWriterSiblingMaximumWhiteholes &&
+      std::all_of(plan.whiteholes.begin(), plan.whiteholes.end(), [](const Whitehole& whitehole) {
+        return whiteholeDeclarationValid(whitehole) &&
+            whitehole.family == ExternalAddressFamily::ipv6 && whitehole.transport == ExternalAddressTransport::tcp;
+      });
 }
 
 static inline bool prodigyCousinProtectedWormholePlanValid(const DeploymentPlan& plan)
@@ -14078,6 +14167,16 @@ static inline bool prodigyCousinPermissionPlanServiceMatches(
   // permissions opt into the service and endpoint topology checks below.
   if (permission.protocolVersion < ProdigyLocalCousinServicePermission::purposeVersion)
     return plan.isStateful && plan.stateful.cousinPrefix == permission.localCousinServicePrefix;
+  if (permission.purpose == ProdigyCousinServicePurpose::sibling) {
+    if (plan.stateful.writerMode == StatefulWriterMode::globalSingleWriter) {
+      if (!prodigyGlobalSingleWriterPlanValid(plan) || permission.peerDeploymentID != plan.config.deploymentID()) return false;
+    } else {
+      const uint64_t legacySibling = plan.config.applicationID == 2 ? MeshRegistry::Pulse::siblings :
+          (plan.config.applicationID == 5 ? MeshRegistry::Radar::siblings :
+           (plan.config.applicationID == 10 ? MeshRegistry::Truth::siblings : 0));
+      if (!legacySibling || permission.localCousinServicePrefix != legacySibling) return false;
+    }
+  }
   const bool automatic = permission.purpose != ProdigyCousinServicePurpose::statefulCousin;
   const bool source = permission.localHalf == CousinRouteHalf::source;
   if (!automatic) {
@@ -14091,7 +14190,8 @@ static inline bool prodigyCousinPermissionPlanServiceMatches(
                   : prodigyCousinProtectedWormholePlanValid(plan);
   }
   if (plan.useHostNetworkNamespace) return false;
-  if (source && !plan.whiteholes.empty() && !prodigyCousinAutomaticWhiteholePlanValid(plan.whiteholes)) {
+  if (source && !plan.whiteholes.empty() && !prodigyCousinAutomaticWhiteholePlanValid(plan.whiteholes) &&
+      !prodigyGlobalSingleWriterSiblingWhiteholePlanValid(permission, plan)) {
     if (permission.purpose != ProdigyCousinServicePurpose::clientAuthority ||
         !std::all_of(plan.whiteholes.begin(), plan.whiteholes.end(), [](const Whitehole& whitehole) {
           return whiteholeDeclarationValid(whitehole) && whitehole.transport == ExternalAddressTransport::quic;
@@ -14191,7 +14291,7 @@ static inline bool prodigyMaterializedStatefulRecoveryPlansAreCompatible(
          successor.stateful.seedingPrefix == active.stateful.seedingPrefix &&
          successor.stateful.shardingPrefix == active.stateful.shardingPrefix &&
          successor.stateful.seedingAlways == active.stateful.seedingAlways &&
-         successor.stateful.allMasters == active.stateful.allMasters;
+         successor.stateful.writerMode == active.stateful.writerMode;
 }
 
 class FailedDeploymentRecordPayload {
@@ -14654,10 +14754,72 @@ public:
   // startup authority was supplied, including initial all-master boot and
   // legacy producers without the appended tail.
   ProdigyStatefulStoreSeedAuthority statefulStoreSeedAuthority = {.protocolVersion = 0};
-  // Terminal native-startup extension.  A zero protocolVersion explicitly
-  // means legacy home selection; it is never inferred for a selected repair.
-  ProdigyStatefulStoreGenerationSelection statefulStoreGenerationSelection = {.protocolVersion = 0};
+  GlobalSingleWriterMembershipProjection globalSingleWriterMembership = {.protocolVersion = 0};
 };
+
+enum class StatefulInitialStoreDisposition : uint64_t {
+  mustRecover = 0,
+  initialEmptyAuthorized = 1
+};
+
+constexpr static uint32_t prodigyContainerStartupFlagShardGroupIndex = 0;
+constexpr static uint32_t prodigyContainerStartupFlagShardGroupCountIndex = 1;
+constexpr static uint32_t prodigyContainerStartupFlagInitialStoreDispositionIndex = 2;
+
+static inline StatefulInitialStoreDisposition prodigyStatefulInitialStoreDispositionFromStartupFlags(
+    const Vector<uint64_t>& flags)
+{
+  if (flags.size() <= prodigyContainerStartupFlagInitialStoreDispositionIndex ||
+      flags[prodigyContainerStartupFlagInitialStoreDispositionIndex] !=
+          uint64_t(StatefulInitialStoreDisposition::initialEmptyAuthorized))
+  {
+    return StatefulInitialStoreDisposition::mustRecover;
+  }
+  return StatefulInitialStoreDisposition::initialEmptyAuthorized;
+}
+
+static inline StatefulInitialStoreDisposition prodigyStatefulInitialStoreDispositionForPlan(
+    const ContainerPlan& plan)
+{
+  if (!plan.isStateful || plan.config.type != ApplicationType::stateful || plan.nShardGroups == 0 ||
+      plan.shardGroup >= plan.nShardGroups || plan.statefulTopology.shardGroup != plan.shardGroup ||
+      plan.statefulMeshRoles.sibling == 0 || plan.statefulMeshRoles.seeding == 0 ||
+      !prodigyStatefulMeshRolesConfigured(plan.statefulMeshRoles) ||
+      !plan.statefulMeshRoles.hasDistinctServices() ||
+      !prodigyStatefulTopologyServesClients(plan.statefulTopology) ||
+      (plan.statefulTopology.servingMode != StatefulTopologyServingMode::serve &&
+       !prodigyStatefulTopologyIsAllMastersSeedBootstrap(plan.statefulTopology)))
+  {
+    return StatefulInitialStoreDisposition::mustRecover;
+  }
+
+  bool siblingDeclared = false;
+  for (const auto& [service, subscription] : plan.subscriptions)
+  {
+    const StatefulMeshRole role = plan.statefulMeshRoles.classify(service);
+    if (role == StatefulMeshRole::sibling && service == plan.statefulMeshRoles.sibling &&
+        subscription.startAt == ContainerState::scheduled &&
+        subscription.stopAt == ContainerState::destroying && subscription.nature == SubscriptionNature::all)
+    {
+      siblingDeclared = true;
+    }
+    else if (role == StatefulMeshRole::seeding)
+    {
+      if (subscription.nature != SubscriptionNature::none ||
+          !prodigyStatefulTopologyIsAllMastersSeedBootstrap(plan.statefulTopology))
+      {
+        return StatefulInitialStoreDisposition::mustRecover;
+      }
+    }
+    else
+    {
+      return StatefulInitialStoreDisposition::mustRecover;
+    }
+  }
+
+  return siblingDeclared ? StatefulInitialStoreDisposition::initialEmptyAuthorized :
+      StatefulInitialStoreDisposition::mustRecover;
+}
 
 // A private listener declaration is carried to the process without publishing
 // a mesh advertisement. The application still needs authenticated writeOwner
@@ -14733,27 +14895,23 @@ static void serialize(S&& serializer, ContainerParameters& params)
     if (!serializer.adapter().isCompletedSuccessfully())
     {
       serializer.object(params.statefulStoreSeedAuthority);
-      if (!serializer.adapter().isCompletedSuccessfully())
-      {
-        serializer.object(params.statefulStoreGenerationSelection);
-        if (!serializer.adapter().isCompletedSuccessfully() ||
-            !prodigyStatefulStoreGenerationSelectionValid(params.statefulStoreGenerationSelection))
+      // A retired selected-home extension requires explicit migration; it
+      // must never be ignored while launching against the canonical app home.
+      if (!serializer.adapter().isCompletedSuccessfully()) {
+        serializer.object(params.globalSingleWriterMembership);
+        if (!prodigyGlobalSingleWriterLocalMember(params.globalSingleWriterMembership,params.deploymentID,params.uuid) || !serializer.adapter().isCompletedSuccessfully())
           serializer.adapter().error(bitsery::ReaderError::InvalidData);
-      }
-      else params.statefulStoreGenerationSelection = {.protocolVersion = 0};
+      } else params.globalSingleWriterMembership = {.protocolVersion = 0};
     }
     else
     {
       params.statefulStoreSeedAuthority = {.protocolVersion = 0};
-      params.statefulStoreGenerationSelection = {.protocolVersion = 0};
+      params.globalSingleWriterMembership = {.protocolVersion = 0};
     }
   }
   else
   {
     serializer.object(params.statefulStoreSeedAuthority);
-    // Do not alter legacy native startup bytes merely because the producer
-    // understands generation launch. A selected generation is explicit.
-    if (params.statefulStoreGenerationSelection.protocolVersion != 0)
-      serializer.object(params.statefulStoreGenerationSelection);
+    if (params.globalSingleWriterMembership.protocolVersion) serializer.object(params.globalSingleWriterMembership);
   }
 }

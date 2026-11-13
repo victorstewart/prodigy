@@ -66,10 +66,10 @@ endif()
 
 file(READ "${_prodigy_source_dependency_packager}" _prodigy_source_dependency_script)
 string(FIND "${_prodigy_source_dependency_script}"
-   [[version="${PRODIGY_SOURCE_DEPENDENCY_VERSION:-0.4.5-rc.4}"]]
+   [[version="${PRODIGY_SOURCE_DEPENDENCY_VERSION:-0.4.5-rc.5}"]]
    _prodigy_source_release_identity_index)
 if (_prodigy_source_release_identity_index EQUAL -1)
-   message(FATAL_ERROR "The source-dependency release producer must own Prodigy 0.4.5-rc.4.")
+   message(FATAL_ERROR "The source-dependency release producer must own Prodigy 0.4.5-rc.5.")
 endif()
 if (NOT _prodigy_source_dependency_script MATCHES
    "for public_root in prodigy switchboard macros enums services; do")
@@ -88,38 +88,6 @@ foreach(_prodigy_required_public_header IN ITEMS
 endforeach()
 
 file(READ "${PRODIGY_ROOT}/prodigy/version.h" _prodigy_version_header)
-foreach(_prodigy_v61_contract IN ITEMS
-   [[ProdigyBinaryVersion = 61]]
-   [[ProdigyNativeMemberRepairMinimumVersion = 61]]
-   [[ProdigyNativeMemberRepairCapability = 4194304]]
-)
-   string(FIND "${_prodigy_version_header}" "${_prodigy_v61_contract}"
-      _prodigy_v61_contract_index)
-   if (_prodigy_v61_contract_index EQUAL -1)
-      message(FATAL_ERROR "The source-dependency release is missing its v61 native-repair public contract: ${_prodigy_v61_contract}")
-   endif()
-endforeach()
-file(READ "${PRODIGY_ROOT}/prodigy/cousin.session.h" _prodigy_cousin_session_header)
-file(READ "${PRODIGY_ROOT}/prodigy/types.h" _prodigy_types_header)
-string(FIND "${_prodigy_types_header}" [[statefulStoreGenerationSelection]]
-   _prodigy_stateful_selection_index)
-if (_prodigy_stateful_selection_index EQUAL -1)
-   message(FATAL_ERROR "The source-dependency release is missing its native-repair stateful-generation contract.")
-endif()
-foreach(_prodigy_native_repair_contract IN ITEMS
-   [[prodigyCousinNativeRepairSession]]
-   [[nativeLeaseExpiresAtMilliseconds]]
-   [[repairExpiresAtMilliseconds]]
-   [[repairAuthority]]
-   [[repairGenerationUUID]]
-   [[repairService]]
-)
-   string(FIND "${_prodigy_cousin_session_header}" "${_prodigy_native_repair_contract}"
-      _prodigy_native_repair_contract_index)
-   if (_prodigy_native_repair_contract_index EQUAL -1)
-      message(FATAL_ERROR "The source-dependency release is missing its native-repair session contract: ${_prodigy_native_repair_contract}")
-   endif()
-endforeach()
 
 if (NOT _prodigy_source_dependency_script MATCHES
    "DEPENDS \\$\\{basics_package\\} VERSION \\$\\{basics_version\\}")

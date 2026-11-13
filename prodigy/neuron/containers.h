@@ -32,9 +32,7 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
-#include <optional>
 #include <string>
-#include <utility>
 
 #include <ebpf/common/structs.h>
 #include <services/memfd.h>
@@ -42,6 +40,7 @@
 #include <prodigy/build.identity.h>
 #include <prodigy/bundle.artifact.h>
 #include <prodigy/container.contract.h>
+#include <prodigy/gateway.recovery.record.h>
 #include <prodigy/container.mesh.identity.h>
 #include <prodigy/cousin.session.h>
 #include <prodigy/declared.network.policy.h>
@@ -411,6 +410,7 @@ static inline void prodigyBuildContainerStartupFlags(const ContainerPlan& plan, 
   if (plan.isStateful && plan.nShardGroups > 0)
   {
     flags.push_back(plan.nShardGroups);
+    flags.push_back(uint64_t(prodigyStatefulInitialStoreDispositionForPlan(plan)));
   }
 }
 
@@ -1331,16 +1331,6 @@ public:
   };
 
   ContainerPlan plan;
-  // This is a validated projection of the authoritative v23 record.  It is
-  // intentionally not part of ContainerPlan's legacy nested codec.
-  ProdigyStatefulStoreGenerationSelection statefulStoreGenerationSelection = {.protocolVersion = 0};
-  uint32_t statefulStoreGenerationProtocol = 0;
-  bool statefulStoreGenerationLaunchReady() const
-  {
-    return statefulStoreGenerationSelection.protocolVersion == 0 ||
-        (statefulStoreGenerationProtocol == 1 &&
-         prodigyStatefulStoreGenerationSelectionMatchesPlan(statefulStoreGenerationSelection, plan));
-  }
   StatefulDataAuthorityPreparation statefulPreparationRequest;
   ProdigyNametagQualificationWriterIsolation qualificationIsolationArm = {};
   uint64_t qualificationIsolationDeadlineNs = 0;
@@ -1398,13 +1388,6 @@ public:
   MachineCpuArchitecture executeArchitecture = MachineCpuArchitecture::unknown;
   String storageRootPath;
   String storagePayloadPath;
-  uint64_t registeredStoragePayloadDevice = 0;
-  uint64_t registeredStoragePayloadInode = 0;
-  // A typed HSE environment failure can authorize exactly one local storage
-  // ownership reconciliation before its ordinary warm restart.  The value is
-  // the exact selected generation (zero is the canonical legacy selection),
-  // never a durable recovery decision.
-  std::optional<uint128_t> pendingEnvironmentRepairGeneration;
   String runtimePath;
   String neuronListenerPath;
   bool gatewayReadinessListenerReady = false;
@@ -2115,27 +2098,14 @@ public:
                                     CousinRouteHalf half, flow_key& flow)
   {
     flow = {};
-    const bool nativeRepair = prodigyCousinNativeRepairSession(session);
     if (!prodigyCousinSessionRecordValid(session) ||
-        (!nativeRepair && !prodigyCousinSessionUsesPrivateContainerEndpoints(session)) ||
+        !prodigyCousinSessionUsesPrivateContainerEndpoints(session) ||
         !cousinRouteHalfValid(half)) return false;
     const bool source = half == CousinRouteHalf::source;
-    const IPAddress& localAddress = nativeRepair ?
-        (source ? session.repairTarget.address : session.repairDonor.address) :
-        (source ? session.sourceAddress : session.destination.publicAddress);
-    const IPAddress& peerAddress = nativeRepair ?
-        (source ? session.repairDonor.address : session.repairTarget.address) :
-        (source ? session.destination.publicAddress : session.sourceAddress);
-    const uint16_t localPort = nativeRepair ?
-        (source ? session.repairTarget.tcpPort : session.repairDonor.tcpPort) :
-        (source ? session.sourceTCPPort : session.destination.publicTCPPort);
-    const uint16_t peerPort = nativeRepair ?
-        (source ? session.repairDonor.tcpPort : session.repairTarget.tcpPort) :
-        (source ? session.destination.publicTCPPort : session.sourceTCPPort);
-    std::memcpy(flow.srcv6, localAddress.v6, 16);
-    std::memcpy(flow.dstv6, peerAddress.v6, 16);
-    flow.port16[0] = htons(localPort);
-    flow.port16[1] = htons(peerPort);
+    std::memcpy(flow.srcv6, source ? session.sourceAddress.v6 : session.destination.publicAddress.v6, 16);
+    std::memcpy(flow.dstv6, source ? session.destination.publicAddress.v6 : session.sourceAddress.v6, 16);
+    flow.port16[0] = htons(source ? session.sourceTCPPort : session.destination.publicTCPPort);
+    flow.port16[1] = htons(source ? session.destination.publicTCPPort : session.sourceTCPPort);
     flow.proto = IPPROTO_TCP;
     return true;
   }
@@ -4293,7 +4263,6 @@ private:
     container->executeEnv.clear();
     container->executeCwd.clear();
     container->executeArchitecture = MachineCpuArchitecture::unknown;
-    container->statefulStoreGenerationProtocol = 0;
 
     int artifactRootFD = -1;
     if (openVerifiedContainerArtifactRoot(container, artifactRootFD, failureReport) == false)
@@ -4369,7 +4338,6 @@ private:
     bool sawExecuteEnv = false;
     bool sawExecuteCwd = false;
     bool sawExecuteArch = false;
-    bool sawStoreGenerationProtocol = false;
 
     for (auto field : doc.get_object())
     {
@@ -4474,17 +4442,6 @@ private:
         }
 
         sawExecuteArch = true;
-      }
-      else if (key == "stateful_store_generation_protocol"_ctv)
-      {
-        uint64_t protocol = 0;
-        if (sawStoreGenerationProtocol || field.value.get_uint64().get(protocol) != simdjson::SUCCESS || protocol != 1)
-        {
-          if (failureReport) failureReport->assign("launch metadata stateful_store_generation_protocol must appear once with value 1"_ctv);
-          return false;
-        }
-        sawStoreGenerationProtocol = true;
-        container->statefulStoreGenerationProtocol = uint32_t(protocol);
       }
       else
       {
@@ -4625,18 +4582,15 @@ private:
 
 public:
 
-  static String boundedFailureReport(const siginfo_t& infop, int terminalSignal, const String& reportHead,
-                                     const String& standardError, const ProdigyStatefulStoreBootFailure *observed)
+  static String boundedFailureReport(const siginfo_t& infop, int terminalSignal, const String& report, const String& standardError)
   {
     // The Brain stores at most 256 report bytes. Keep the termination identity,
     // beginning of the report, and the end of stderr (where crash PCs land).
-    const bool typed = observed != nullptr;
-    const uint64_t maximumWireReportBytes = typed ? ProdigyStatefulStoreBootFailureHumanMaximumBytes :
-        ProdigyStatefulStoreBootFailureReportMaximumBytes;
     String bounded = {};
     bounded.snprintf<"termination=si_code {itoa} si_status {itoa} signal {itoa}\nreport-head:\n"_ctv>(
         int(infop.si_code), int(infop.si_status), terminalSignal);
-    const uint64_t stderrTailBytes = typed ? 64 : 112;
+    constexpr uint64_t maximumWireReportBytes = 256;
+    constexpr uint64_t stderrTailBytes = 112;
     constexpr uint64_t stderrLabelBytes = 14;
     uint64_t remainingAfterHeader = maximumWireReportBytes > bounded.size()
                                         ? maximumWireReportBytes - bounded.size()
@@ -4644,8 +4598,8 @@ public:
     uint64_t headBudget = remainingAfterHeader > stderrLabelBytes + stderrTailBytes
                               ? remainingAfterHeader - stderrLabelBytes - stderrTailBytes
                               : 0;
-    uint64_t headBytes = std::min<uint64_t>(reportHead.size(), headBudget);
-    bounded.append(reportHead.substr(0, headBytes, Copy::no));
+    uint64_t headBytes = std::min<uint64_t>(report.size(), headBudget);
+    bounded.append(report.substr(0, headBytes, Copy::no));
     bounded.append("\nstderr-tail:\n"_ctv);
     uint64_t tailBudget = maximumWireReportBytes > bounded.size()
                               ? maximumWireReportBytes - bounded.size()
@@ -4660,20 +4614,6 @@ public:
     {
       bounded.assign(bounded.substr(0, maximumWireReportBytes, Copy::yes));
     }
-    if (typed)
-    {
-      String encoded = {};
-      if (prodigyStatefulStoreBootFailureEncodeReport(bounded, *observed, encoded))
-        return encoded;
-    }
-    // A normal stderr tail can contain arbitrary bytes, including a second
-    // program's encoded crash report. Only the original crash file may
-    // supply the typed record that the controller will act on.
-    ProdigyStatefulStoreBootFailure ignored = {};
-    String ignoredHuman;
-    if (!bounded.empty() && bounded[bounded.size() - 1] == '\n' &&
-        prodigyStatefulStoreBootFailureDecodeReport(bounded, ignored, ignoredHuman))
-      bounded[bounded.size() - 1] = ' ';
     return bounded;
   }
 
@@ -6192,30 +6132,6 @@ private:
     int64_t failureTimeMs = 0;
   };
 
-  static bool parseDecimal128(const char *text, uint128_t& value)
-  {
-    value = 0;
-    if (text == nullptr || *text == '\0')
-    {
-      return false;
-    }
-    constexpr uint128_t maximum = ~uint128_t(0);
-    for (const char *cursor = text; *cursor != '\0'; ++cursor)
-    {
-      if (*cursor < '0' || *cursor > '9')
-      {
-        return false;
-      }
-      uint8_t digit = uint8_t(*cursor - '0');
-      if (value > (maximum - digit) / 10)
-      {
-        return false;
-      }
-      value = value * 10 + digit;
-    }
-    return true;
-  }
-
   static bool readContainerLogAt(
       int rootFD,
       const String& relativePath,
@@ -6409,7 +6325,7 @@ private:
     const int64_t oldestFailureTimeMs = nowMs - failedContainerArtifactRetentionMs;
     ok &= forEachDirectoryName(applicationFD, [&](const char *containerName) {
       uint128_t containerUUID = 0;
-      if (parseDecimal128(containerName, containerUUID) == false ||
+      if (prodigyParseDecimal128(containerName, containerUUID) == false ||
           (operation.containerUUID != 0 && operation.containerUUID != containerUUID))
       {
         return;
@@ -6424,7 +6340,7 @@ private:
       }
       ok &= forEachDirectoryName(containerFD, [&](const char *failureTimeName) {
         uint128_t failureTime = 0;
-        if (parseDecimal128(failureTimeName, failureTime) && failureTime <= uint128_t(INT64_MAX) &&
+        if (prodigyParseDecimal128(failureTimeName, failureTime) && failureTime <= uint128_t(INT64_MAX) &&
             int64_t(failureTime) >= oldestFailureTimeMs && int64_t(failureTime) <= nowMs &&
             failedContainerArtifactBundleIsCompleteAt(containerFD, failureTimeName))
         {
@@ -7529,7 +7445,7 @@ private:
   }
 
   constexpr static uint64_t secureContainerResolveFlags =
-      RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS;
+      prodigySecureContainerResolveFlags;
 
   static bool validateContainerRelativePathComponent(const String& component, const String& fullPath, String *failureReport = nullptr)
   {
@@ -7715,59 +7631,7 @@ private:
     return true;
   }
 
-  // This root-owned record is consumed by a replacement binary, so its bytes
-  // cannot depend on compiler padding or host integer layout. All integers are
-  // big-endian and the reserved bytes must remain zero.
-  struct GatewayRecoveryRecord {
-    uint8_t version = 1;
-    uint8_t reserved[7] = {};
-    uint8_t containerUUID[16] = {}, pairUUID[16] = {};
-    uint8_t localClusterUUID[16] = {}, localMachineUUID[16] = {};
-    uint8_t keyEpoch[8] = {}, authorityGeneration[8] = {}, gatewayGeneration[8] = {};
-    char token[32] = {};
-  };
-  static_assert(sizeof(GatewayRecoveryRecord) == 128);
-
-  template <typename Integer, size_t N>
-  static void encodeGatewayRecoveryInteger(Integer value, uint8_t (&encoded)[N])
-  {
-    for (size_t i = N; i > 0; --i)
-    {
-      encoded[i - 1] = uint8_t(value & Integer(0xff));
-      value >>= 8;
-    }
-  }
-
-  static GatewayRecoveryRecord makeGatewayRecoveryRecord(const ContainerPlan& plan, const String& token)
-  {
-    GatewayRecoveryRecord record = {};
-    encodeGatewayRecoveryInteger(plan.uuid, record.containerUUID);
-    encodeGatewayRecoveryInteger(plan.system.gatewayPairUUID, record.pairUUID);
-    encodeGatewayRecoveryInteger(plan.system.gatewayLocalClusterUUID, record.localClusterUUID);
-    encodeGatewayRecoveryInteger(plan.system.gatewayLocalMachineUUID, record.localMachineUUID);
-    encodeGatewayRecoveryInteger(plan.system.gatewayKeyEpoch, record.keyEpoch);
-    encodeGatewayRecoveryInteger(plan.system.gatewayAuthorityGeneration, record.authorityGeneration);
-    encodeGatewayRecoveryInteger(plan.system.gatewayGeneration, record.gatewayGeneration);
-    memcpy(record.token, token.data(), sizeof(record.token));
-    return record;
-  }
-
-  static bool readGatewayRecoveryRecordFD(int fd, GatewayRecoveryRecord& record)
-  {
-    uint8_t *bytes = reinterpret_cast<uint8_t *>(&record);
-    size_t offset = 0;
-    while (offset < sizeof(record))
-    {
-      const ssize_t result = pread(fd, bytes + offset, sizeof(record) - offset, off_t(offset));
-      if (result > 0) { offset += size_t(result); continue; }
-      if (result < 0 && errno == EINTR) continue;
-      return false;
-    }
-    uint8_t trailing = 0;
-    return pread(fd, &trailing, 1, off_t(sizeof(record))) == 0;
-  }
-
-  static bool writeGatewayRecoveryRecordFD(int fd, const GatewayRecoveryRecord& record)
+  static bool writeGatewayRecoveryRecordFD(int fd, const ProdigyGatewayRecovery::GatewayRecoveryRecord& record)
   {
     const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&record);
     size_t offset = 0;
@@ -7789,10 +7653,7 @@ private:
 
   static bool gatewayRecoveryTokenValid(const String& token)
   {
-    if (token.size() != 32) return false;
-    for (uint64_t i = 0; i < token.size(); ++i)
-      if (!((token[i] >= '0' && token[i] <= '9') || (token[i] >= 'a' && token[i] <= 'f'))) return false;
-    return true;
+    return ProdigyGatewayRecovery::gatewayRecoveryTokenValid(token);
   }
 
   static void generateGatewayRecoveryToken(String& token)
@@ -7823,24 +7684,14 @@ private:
     return true;
   }
 
-  static bool gatewayRecoveryRecordMatches(const GatewayRecoveryRecord& record, const ContainerPlan& plan)
-  {
-    String storedToken = {};
-    storedToken.assign(record.token, sizeof(record.token));
-    if (record.version != 1 || !gatewayRecoveryTokenValid(storedToken)) return false;
-    for (uint8_t value : record.reserved) if (value != 0) return false;
-    const GatewayRecoveryRecord expected = makeGatewayRecoveryRecord(plan, storedToken);
-    return memcmp(&record, &expected, sizeof(record)) == 0;
-  }
-
   static bool gatewayRecoveryRecordFDMatches(int fd, const ContainerPlan& plan,
-                                             const GatewayRecoveryRecord& intended)
+                                             const ProdigyGatewayRecovery::GatewayRecoveryRecord& intended)
   {
     struct stat info = {};
-    GatewayRecoveryRecord existing = {};
+    ProdigyGatewayRecovery::GatewayRecoveryRecord existing = {};
     return fd >= 0 && fstat(fd, &info) == 0 && S_ISREG(info.st_mode) && info.st_uid == 0 &&
         (info.st_mode & 07777) == 0600 && info.st_size == off_t(sizeof(existing)) &&
-        readGatewayRecoveryRecordFD(fd, existing) && gatewayRecoveryRecordMatches(existing, plan) &&
+        ProdigyGatewayRecovery::readGatewayRecoveryRecordFD(fd, existing) && ProdigyGatewayRecovery::gatewayRecoveryRecordMatches(existing, plan) &&
         memcmp(existing.token, intended.token, sizeof(existing.token)) == 0;
   }
 
@@ -7850,7 +7701,7 @@ private:
     String name = {}; name.assignItoa(plan.uuid);
     int directoryFD = Filesystem::openDirectoryAt(rootFD, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC, secureContainerResolveFlags);
     if (directoryFD < 0) return false;
-    const GatewayRecoveryRecord record = makeGatewayRecoveryRecord(plan, token);
+    const ProdigyGatewayRecovery::GatewayRecoveryRecord record = ProdigyGatewayRecovery::makeGatewayRecoveryRecord(plan, token);
     struct stat prior = {}; if (fstatat(directoryFD, "masque-gateway-recovery.v1", &prior, AT_SYMLINK_NOFOLLOW) == 0) {
       int existingFD = openat(directoryFD, "masque-gateway-recovery.v1", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
       const bool identical = gatewayRecoveryRecordFDMatches(existingFD, plan, record);
@@ -7895,24 +7746,10 @@ private:
     const bool written = writeGatewayRecoveryRecordAt(rootFD, plan, token, failureReport); close(rootFD); return written;
   }
 
-  static bool readGatewayRecoveryRecordAt(int rootFD, const ContainerPlan& plan, String& token, String *failureReport = nullptr)
-  {
-    token.clear();
-    String name = {}; name.assignItoa(plan.uuid);
-    int directoryFD = Filesystem::openDirectoryAt(rootFD, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC, secureContainerResolveFlags);
-    if (directoryFD < 0) return false;
-    int fd = openat(directoryFD, "masque-gateway-recovery.v1", O_RDONLY | O_CLOEXEC | O_NOFOLLOW); close(directoryFD);
-    struct stat info = {}; GatewayRecoveryRecord record = {};
-    const bool ok = fd >= 0 && fstat(fd, &info) == 0 && S_ISREG(info.st_mode) && info.st_uid == 0 &&
-        (info.st_mode & 07777) == 0600 && info.st_size == off_t(sizeof(record)) &&
-        readGatewayRecoveryRecordFD(fd, record) && gatewayRecoveryRecordMatches(record, plan);
-    if (fd >= 0) close(fd); if (!ok) return false; token.assign(record.token, 32); return true;
-  }
-
   static bool readGatewayRecoveryRecord(const ContainerPlan& plan, String& token, String *failureReport = nullptr)
   {
     int rootFD = -1; if (!openContainerRuntimeRoot(rootFD, failureReport)) return false;
-    const bool read = readGatewayRecoveryRecordAt(rootFD, plan, token, failureReport); close(rootFD); return read;
+    const bool read = ProdigyGatewayRecovery::readGatewayRecoveryRecordAt(rootFD, plan, token); close(rootFD); return read;
   }
 
   static bool prepareContainerNeuronListener(Container *container, int& listenerFD, String *failureReport = nullptr)
@@ -9661,12 +9498,61 @@ public:
     return true;
   }
 
+  static bool prepareContainerArtifactParentAt(int containersFD, String *failureReport = nullptr)
+  {
+    // The child enters its user namespace before opening and mounting its
+    // artifact root. The mapped UID needs traversal through the shared
+    // /containers parent, but must not be able to list other container homes.
+    // The production Neuron runs as root, so this also rejects a non-root
+    // owner there; tests deliberately use their effective owner.
+    struct stat metadata = {};
+    const bool ready = fstat(containersFD, &metadata) == 0 && S_ISDIR(metadata.st_mode) &&
+                       metadata.st_uid == geteuid() && fchmod(containersFD, 0711) == 0;
+    if (ready == false && failureReport)
+    {
+      failureReport->assign("container artifact parent is not owned or cannot be made traversable"_ctv);
+    }
+    else if (ready && failureReport)
+    {
+      failureReport->clear();
+    }
+    return ready;
+  }
+
+  static bool prepareContainerArtifactParent(String *failureReport = nullptr)
+  {
+    if (geteuid() != 0)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("container artifact parent repair requires root owner"_ctv);
+      }
+      return false;
+    }
+    int containersFD = open("/containers", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (containersFD < 0)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("failed to open container artifact parent without symlinks"_ctv);
+      }
+      return false;
+    }
+    const bool ready = prepareContainerArtifactParentAt(containersFD, failureReport);
+    close(containersFD);
+    return ready;
+  }
+
   static bool prepareContainerStorageParentAt(int containersFD, String *failureReport = nullptr)
   {
     // The child enters its user namespace before mounting /storage. Its mapped
     // UID needs traversal through this shared parent, but must not list another
     // container's storage. Each container directory remains private and owned
     // by its own execution UID.
+    if (prepareContainerArtifactParentAt(containersFD, failureReport) == false)
+    {
+      return false;
+    }
     if (mkdirat(containersFD, "storage", 0711) != 0 && errno != EEXIST)
     {
       if (failureReport)
@@ -9697,100 +9583,6 @@ public:
       failureReport->clear();
     }
     return ready;
-  }
-
-  static bool captureRegisteredDirectStoragePayloadAt(
-      Container *container, int storageParentFD, String *failureReport = nullptr)
-  {
-    auto fail = [&](const char *reason) {
-      if (failureReport) failureReport->assign(reason);
-      return false;
-    };
-    if (container == nullptr || storageParentFD < 0) return fail("registered direct storage payload is unavailable");
-    container->registeredStoragePayloadDevice = 0;
-    container->registeredStoragePayloadInode = 0;
-    if (container->storageUsesLoopFilesystem)
-      return fail("registered direct storage payload is unavailable");
-    String expectedName = {};
-    expectedName.assignItoa(container->plan.uuid);
-    String expectedRoot = {};
-    prodigyContainerStorageRootPathForName(expectedName, expectedRoot);
-    if (container->name.equals(expectedName) == false || container->storageRootPath.equals(expectedRoot) == false ||
-        container->storagePayloadPath.equals(expectedRoot) == false)
-      return fail("registered direct storage payload is not canonical");
-    struct stat parent = {};
-    if (fstat(storageParentFD, &parent) != 0 || !S_ISDIR(parent.st_mode) || parent.st_uid != geteuid() ||
-        (parent.st_mode & 0022) != 0)
-      return fail("registered storage parent ownership is unsafe");
-    int payloadFD = openat(storageParentFD, expectedName.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (payloadFD < 0) return fail("registered direct storage payload cannot be opened without symlinks");
-    struct stat payload = {};
-    const bool captured = fstat(payloadFD, &payload) == 0 && S_ISDIR(payload.st_mode) && payload.st_dev != 0 && payload.st_ino != 0;
-    close(payloadFD);
-    if (!captured) return fail("registered direct storage payload identity is unavailable");
-    container->registeredStoragePayloadDevice = uint64_t(payload.st_dev);
-    container->registeredStoragePayloadInode = uint64_t(payload.st_ino);
-    if (failureReport) failureReport->clear();
-    return true;
-  }
-
-  static bool statefulStoreEnvironmentStorageRepairCandidate(const Container *container)
-  {
-    return container != nullptr && container->plan.isStateful &&
-        container->plan.config.type == ApplicationType::stateful && container->plan.config.storageMB > 0 &&
-        (container->plan.config.applicationID == 3 || container->plan.config.applicationID == 4);
-  }
-
-  static int openVerifiedContainerStorageParent(String *failureReport = nullptr)
-  {
-    int containersFD = open("/containers", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (containersFD < 0)
-    {
-      if (failureReport) failureReport->assign("registered storage containers owner cannot be opened without symlinks");
-      return -1;
-    }
-    struct stat containers = {};
-    const bool containersSafe = fstat(containersFD, &containers) == 0 && S_ISDIR(containers.st_mode) &&
-        containers.st_uid == geteuid() && (containers.st_mode & 0022) == 0;
-    if (!containersSafe)
-    {
-      close(containersFD);
-      if (failureReport) failureReport->assign("registered storage containers owner is unsafe");
-      return -1;
-    }
-    int storageParentFD = openat(containersFD, "storage", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    close(containersFD);
-    if (storageParentFD < 0 && failureReport)
-      failureReport->assign("registered storage parent cannot be opened without symlinks");
-    return storageParentFD;
-  }
-
-  static bool captureRegisteredDirectStoragePayload(Container *container, String *failureReport = nullptr)
-  {
-    int storageParentFD = openVerifiedContainerStorageParent(failureReport);
-    if (storageParentFD < 0)
-    {
-      return false;
-    }
-    const bool captured = captureRegisteredDirectStoragePayloadAt(container, storageParentFD, failureReport);
-    close(storageParentFD);
-    return captured;
-  }
-
-  // Capturing this extra witness must never turn an otherwise successful
-  // prepare/hydrate into a failed create.  A missing witness simply leaves
-  // the privileged restart-only reconciliation unavailable until a later
-  // successful lifecycle pass records one.
-  static void recordStatefulStoreEnvironmentStorageWitness(Container *container)
-  {
-    if (!statefulStoreEnvironmentStorageRepairCandidate(container)) return;
-    String witnessFailure = {};
-    if (captureRegisteredDirectStoragePayload(container, &witnessFailure) == false)
-    {
-      std::fprintf(stderr, "container storage repair witness unavailable uuid=%llu reason=%s\n",
-                   (unsigned long long)container->plan.uuid,
-                   witnessFailure.c_str());
-    }
   }
 
   // A process-present state upload re-adopts the existing container rather
@@ -9829,9 +9621,6 @@ public:
       container->storagePayloadPath = root;
       container->storageUsesLoopFilesystem = false;
       container->storageLoopDevices.clear();
-      container->registeredStoragePayloadDevice = 0;
-      container->registeredStoragePayloadInode = 0;
-      recordStatefulStoreEnvironmentStorageWitness(container);
       return true;
     }
 
@@ -9864,8 +9653,6 @@ public:
     container->storagePayloadPath = std::move(payload);
     container->storageUsesLoopFilesystem = true;
     container->storageLoopDevices = std::move(loopDevices);
-    container->registeredStoragePayloadDevice = 0;
-    container->registeredStoragePayloadInode = 0;
     return true;
   }
 
@@ -9881,8 +9668,6 @@ public:
     container->storagePayloadPath.assign(container->storageRootPath);
     container->storageUsesLoopFilesystem = false;
     container->storageLoopDevices.clear();
-    container->registeredStoragePayloadDevice = 0;
-    container->registeredStoragePayloadInode = 0;
 
     int containersFD = open("/containers", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (containersFD < 0)
@@ -9949,7 +9734,6 @@ public:
                          errno,
                          strerror(errno));
             }
-            recordStatefulStoreEnvironmentStorageWitness(container);
             return true;
           }
         }
@@ -9982,7 +9766,6 @@ public:
                    strerror(errno));
       }
 
-      recordStatefulStoreEnvironmentStorageWitness(container);
       return true;
     }
 
@@ -10037,115 +9820,6 @@ public:
                  strerror(errno));
     }
 
-    return true;
-  }
-
-  // This repair is deliberately narrower than storage preparation: the
-  // existing backend is already registered on this live Container, and only
-  // its exact payload directory may be made accessible to its mapped owner.
-  // It never creates, removes, traverses, or changes descendants/backing
-  // files.  `storageParentFD` lets the focused unit test prove the same
-  // descriptor-pinned operation without touching /containers.
-  static bool reconcilePendingStatefulStoreEnvironmentStorageAt(
-      Container *container, int storageParentFD, String *failureReport = nullptr)
-  {
-    if (container == nullptr || storageParentFD < 0)
-    {
-      if (failureReport) failureReport->assign("stateful environment storage repair owner is unavailable"_ctv);
-      return false;
-    }
-    const std::optional<uint128_t> pending = std::exchange(container->pendingEnvironmentRepairGeneration, std::nullopt);
-    if (!pending.has_value()) return false;
-
-    String expectedName = {};
-    expectedName.assignItoa(container->plan.uuid);
-    const auto reject = [&](const char *reason) {
-      if (failureReport) failureReport->assign(reason);
-      return false;
-    };
-    if (container->pendingDestroy || container->killedOnPurpose || !container->plan.restartOnFailure ||
-        !statefulStoreEnvironmentStorageRepairCandidate(container) ||
-        container->name.equals(expectedName) == false || container->statefulStoreGenerationProtocol != 1)
-      return reject("stateful environment storage repair is no longer authorized");
-
-    const auto& selection = container->statefulStoreGenerationSelection;
-    if ((selection.protocolVersion == 0 && *pending != 0) ||
-        (selection.protocolVersion != 0 && *pending != selection.generationUUID) ||
-        !container->statefulStoreGenerationLaunchReady())
-      return reject("stateful environment storage repair generation is stale");
-
-    // Loop-backed payloads also need a current mounted-device proof.  The
-    // existing loop owner does not retain that proof yet, so defer rather than
-    // infer it from a pathname or a nonempty device vector.
-    if (container->storageUsesLoopFilesystem) return reject("stateful environment storage repair loop backend is unverified");
-    String expectedRoot = {};
-    prodigyContainerStorageRootPathForName(expectedName, expectedRoot);
-    if (container->storageRootPath.equals(expectedRoot) == false ||
-        container->storagePayloadPath.equals(expectedRoot) == false ||
-        container->registeredStoragePayloadDevice == 0 || container->registeredStoragePayloadInode == 0)
-      return reject("stateful environment storage repair backend is not registered");
-
-    struct stat parent = {};
-    if (fstat(storageParentFD, &parent) != 0 || !S_ISDIR(parent.st_mode) || parent.st_uid != geteuid() ||
-        (parent.st_mode & 0022) != 0)
-      return reject("stateful environment storage repair parent is unsafe");
-    int payloadFD = openat(storageParentFD, expectedName.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (payloadFD < 0) return reject("stateful environment storage repair cannot open registered payload");
-    struct stat payload = {};
-    bool repaired = fstat(payloadFD, &payload) == 0 && S_ISDIR(payload.st_mode) &&
-        uint64_t(payload.st_dev) == container->registeredStoragePayloadDevice &&
-        uint64_t(payload.st_ino) == container->registeredStoragePayloadInode;
-    const uid_t expectedOwner = uid_t(container->executionHostID);
-    if (repaired && (payload.st_uid != expectedOwner || payload.st_gid != gid_t(expectedOwner)))
-      repaired = fchown(payloadFD, expectedOwner, gid_t(expectedOwner)) == 0;
-    if (repaired && (payload.st_mode & 0777) != 0700)
-      repaired = fchmod(payloadFD, 0700) == 0;
-    close(payloadFD);
-    if (!repaired) return reject("stateful environment storage repair could not restore registered payload access");
-    if (failureReport) failureReport->clear();
-    return true;
-  }
-
-  static bool reconcilePendingStatefulStoreEnvironmentStorage(Container *container, String *failureReport = nullptr)
-  {
-    int storageParentFD = openVerifiedContainerStorageParent(failureReport);
-    if (storageParentFD < 0)
-    {
-      if (container) container->pendingEnvironmentRepairGeneration.reset();
-      return false;
-    }
-    const bool repaired = reconcilePendingStatefulStoreEnvironmentStorageAt(container, storageParentFD, failureReport);
-    close(storageParentFD);
-    return repaired;
-  }
-
-  static bool nativeStoreBootFailureCurrent(
-      const Container *container, const siginfo_t& infop, bool restart,
-      const ProdigyStatefulStoreBootFailure& failure)
-  {
-    if (!container || !prodigyStatefulStoreBootFailureValid(failure)) return false;
-    const bool selectedGeneration =
-        (container->statefulStoreGenerationSelection.protocolVersion == 0 && failure.generationUUID == 0) ||
-        (container->statefulStoreGenerationSelection.protocolVersion != 0 &&
-         failure.generationUUID == container->statefulStoreGenerationSelection.generationUUID);
-    return infop.si_code == CLD_EXITED && infop.si_status == 1 && restart && !container->killedOnPurpose &&
-        !container->pendingDestroy && container->plan.restartOnFailure &&
-        statefulStoreEnvironmentStorageRepairCandidate(container) &&
-        container->statefulStoreGenerationProtocol == 1 && selectedGeneration && container->statefulStoreGenerationLaunchReady();
-  }
-
-  static bool armStatefulStoreEnvironmentStorageRepair(
-      Container *container, const siginfo_t& infop, bool restart,
-      const ProdigyStatefulStoreBootFailure& failure)
-  {
-    if (!container) return false;
-    container->pendingEnvironmentRepairGeneration.reset();
-    if (!nativeStoreBootFailureCurrent(container, infop, restart, failure) ||
-        failure.stage != ProdigyStatefulStoreBootFailureStage::environmentInspection ||
-        !((failure.kind == ProdigyStatefulStoreBootFailureKind::environment && failure.systemErrno == ENOENT) ||
-          (failure.kind == ProdigyStatefulStoreBootFailureKind::permission &&
-           (failure.systemErrno == EACCES || failure.systemErrno == EPERM)))) return false;
-    container->pendingEnvironmentRepairGeneration = failure.generationUUID;
     return true;
   }
 
@@ -11407,28 +11081,6 @@ public:
     return true;
   }
 
-  // A generation handoff keeps the canonical container UUID and its storage
-  // allocation.  It is therefore deliberately narrower than a replacement:
-  // only an already-observed crash whose ordinary restart timer still owns
-  // backoff may be rebound.  The Neuron validates immutable plan identity and
-  // the selected generation before calling this lifecycle-only guard.
-  static bool stateUploadGenerationRestartPredecessorReady(
-      const Container *predecessor, const ContainerPlan& uploaded,
-      String *failureReport = nullptr)
-  {
-    if (predecessor == nullptr || predecessor->plan.uuid != uploaded.uuid || predecessor->pid <= 0 ||
-        predecessor->waitidPending || predecessor->infop.si_pid != predecessor->pid ||
-        predecessor->infop.si_pid <= 0 || predecessor->cgroup < 0 || predecessor->restartTimer == nullptr ||
-        predecessor->killedOnPurpose || predecessor->pendingDestroy || predecessor->resumeAfterShutdown != nullptr ||
-        predecessor->plan.config.applicationID != uploaded.config.applicationID ||
-        predecessor->plan.config.type == ApplicationType::task)
-    {
-      if (failureReport) failureReport->assign("generation restart requires the same observed crash-backoff container"_ctv);
-      return false;
-    }
-    return true;
-  }
-
   // A replacement continuation finishes its wait while co_consume is still
   // inspecting this stack. Retire it after the outermost consumer returns,
   // using the same ownership rule as the deployment drain continuation.
@@ -11549,23 +11201,6 @@ public:
     }
     TimeoutPacket *restartTimer = predecessor->restartTimer;
     predecessor->killedOnPurpose = true;
-    predecessor->restartAfterClose = false;
-    predecessor->restartTimer = nullptr;
-    Ring::queueCancelTimeout(restartTimer);
-    return true;
-  }
-
-  static bool claimStateUploadGenerationRestartPredecessor(
-      Container *predecessor, const ContainerPlan& uploaded,
-      String *failureReport = nullptr)
-  {
-    if (!stateUploadGenerationRestartPredecessorReady(predecessor, uploaded, failureReport) ||
-        !observedCrashBackoffPredecessorCgroupIsEmpty(predecessor, failureReport)) return false;
-    TimeoutPacket *restartTimer = predecessor->restartTimer;
-    // Clearing the timer before queuing its cancellation fences any delayed
-    // timeout CQE. Unlike a replacement claim this retains the same owner,
-    // so it must not borrow `killedOnPurpose`: the normal close/restart owner
-    // remains responsible for resuming this exact container.
     predecessor->restartAfterClose = false;
     predecessor->restartTimer = nullptr;
     Ring::queueCancelTimeout(restartTimer);
@@ -12580,18 +12215,12 @@ public:
                                                const String& compressedContainerPath,
                                                Container *& container,
                                                String *failure = nullptr,
-                                               uint64_t admissionGeneration = 0,
-                                               ProdigyStatefulStoreGenerationSelection selection = {.protocolVersion = 0})
+                                               uint64_t admissionGeneration = 0)
   {
     container = nullptr;
     if (failure)
     {
       failure->clear();
-    }
-    if (!prodigyStatefulStoreGenerationSelectionMatchesPlan(selection, plan))
-    {
-      if (failure) failure->assign("stateful store generation does not match the container launch"_ctv);
-      co_return false;
     }
     if (approveCapabilities(plan) == false)
     {
@@ -12631,7 +12260,6 @@ public:
 
     container = new Container();
     container->plan = plan;
-    container->statefulStoreGenerationSelection = selection;
     container->name.assignItoa(plan.uuid);
     container->userID = userID;
     container->executionHostID = executionHostID;
@@ -13739,6 +13367,11 @@ public:
     }
     ensureSigchldIsWaitable();
 
+    if (prepareContainerArtifactParent(failureReport) == false)
+    {
+      return false;
+    }
+
     if (container->artifactRootPath.size() == 0)
     {
       container->artifactRootPath.assign("/containers/"_ctv);
@@ -13765,12 +13398,6 @@ public:
 
         return false;
       }
-    }
-
-    if (!container->statefulStoreGenerationLaunchReady())
-    {
-      if (failureReport) failureReport->assign("stateful store generation is not supported by the sealed artifact"_ctv);
-      return false;
     }
 
     int parentSupplementaryGroupCount = getgroups(0, nullptr);
@@ -14224,10 +13851,7 @@ public:
         parameters.whiteholes = container->plan.whiteholes;
         parameters.statefulMeshRoles = container->plan.statefulMeshRoles;
         parameters.statefulTopology = container->plan.statefulTopology;
-        if (container->statefulStoreGenerationSelection.protocolVersion != 0)
-        {
-          parameters.statefulStoreGenerationSelection = container->statefulStoreGenerationSelection;
-        }
+        parameters.globalSingleWriterMembership = container->plan.globalSingleWriterMembership;
         // This is a private startup port declaration, not a mesh advertisement.
         // Catchup starts with client role zero; only authenticated writeOwner
         // may install this already-bound IPv6 listener at the application.
@@ -14274,8 +13898,7 @@ public:
                                          parameters.statefulMeshRoles.seeding != 0 ||
                                          parameters.statefulMeshRoles.sharding != 0 ||
                                          parameters.statefulMeshRoles.topologyBridge != 0 ||
-                                         parameters.statefulTopology.configured() ||
-                                         parameters.statefulStoreGenerationSelection.protocolVersion != 0);
+                                         parameters.statefulTopology.configured());
 
         // ProdigyWire covers the compact stateless startup path. Wormhole and
         // whitehole startup data plus stateful mesh and topology metadata use
@@ -14768,8 +14391,7 @@ public:
   // Coroutine arguments must own every value used after suspension. Callers
   // commonly supply a handler-local or temporary metric policy.
   static void spinContainer(ContainerPlan plan, uint128_t replaceContainerUUID, NeuronContainerMetricPolicy metricPolicy,
-                            RetainedContainerStorageSource retainedSource = {},
-                            ProdigyStatefulStoreGenerationSelection selection = {.protocolVersion = 0})
+                            RetainedContainerStorageSource retainedSource = {})
   {
 #if PRODIGY_DEBUG
     PRODIGY_DEBUG_LOG("executeWork spinContainer deploymentID=%llu containerUUID=%llu replaceUUID=%llu lifecycle=construct-or-updateInPlace\n",
@@ -14778,7 +14400,7 @@ public:
                       (unsigned long long)replaceContainerUUID);
 #endif
     const uint64_t launchAdmissionGeneration =
-        thisNeuron != nullptr ? thisNeuron->beginPendingContainerLaunch(plan, selection) : 0;
+        thisNeuron != nullptr ? thisNeuron->beginPendingContainerLaunch(plan) : 0;
     if (thisNeuron != nullptr && launchAdmissionGeneration == 0)
     {
       // Duplicate transport/recovery frames converge on the original launch.
@@ -15120,7 +14742,7 @@ public:
 
     Container *container = nullptr;
     String createFailure = {};
-    co_await createContainer(plan, compressedContainerPath, container, &createFailure, launchAdmissionGeneration, selection);
+    co_await createContainer(plan, compressedContainerPath, container, &createFailure, launchAdmissionGeneration);
     if (container == nullptr)
     {
       if (thisNeuron != nullptr &&
@@ -15407,20 +15029,6 @@ public:
     if (thisNeuron != nullptr && container->plan.whiteholes.empty() == false)
     {
       thisNeuron->openWhiteholesForLocalContainer(container->plan.fragment, container->plan.whiteholes);
-    }
-
-    if (!coldRestart && container->pendingEnvironmentRepairGeneration.has_value())
-    {
-      String repairFailure = {};
-      if (reconcilePendingStatefulStoreEnvironmentStorage(container, &repairFailure) == false)
-      {
-        // A malformed, moved, or unavailable retained backend remains owned
-        // by the ordinary failure path.  Do not delete it merely because this
-        // optional local reconciliation could not prove its target.
-        std::fprintf(stderr, "restartContainer environment storage repair skipped uuid=%llu reason=%s\n",
-                     (unsigned long long)container->plan.uuid,
-                     repairFailure.c_str());
-      }
     }
 
     if (startContainer(container, true, &failureReport) == false)

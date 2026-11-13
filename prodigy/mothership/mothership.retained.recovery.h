@@ -13,6 +13,85 @@
 
 static inline bool mothershipRetainedRecoveryPlansEqual(const DeploymentPlan&,const DeploymentPlan&);
 
+// Ordinary update admission may retain a rejected candidate and its failure
+// before the inventory checkpoint starts. It is dormant only when every
+// coordinator, handoff, worker and recovery field is still default. Preserve
+// these bytes as evidence; they do not authorize executing the candidate.
+static inline bool mothershipRetainedRecoveryRejectedUpdatePayloadValid(
+    const ProdigyPersistentUpdateSelfState& update)
+{
+  if (update.bundleBlob.empty() || update.workerFailure.empty() ||
+      !prodigyIsSHA256HexDigest(update.workerExpectedBundleSHA256)) return false;
+  ProdigyPersistentUpdateSelfState rejected = {};
+  rejected.bundleBlob = update.bundleBlob;
+  rejected.workerExpectedBundleSHA256 = update.workerExpectedBundleSHA256;
+  rejected.workerFailure = update.workerFailure;
+  String digest = {};
+  return update == rejected && prodigyComputeSHA256Hex(update.bundleBlob, digest) &&
+      digest == update.workerExpectedBundleSHA256;
+}
+
+// Read-only admission for a generic stopped-runtime replacement.  The caller
+// supplies objects decoded by Prodigy's persistent store from private copies;
+// this validator never opens, rewrites, or normalizes a store. An actionable
+// update-self coordinator remains meaningful authority and blocks recovery.
+// An exact rejected-before-checkpoint payload and a concurrency preference
+// carry no transition intent; both remain unchanged in the retained store.
+static inline bool mothershipRuntimeRecoverySnapshotStructureValid(
+    const ProdigyPersistentLocalBrainState& local,
+    const ProdigyPersistentBrainSnapshot& snapshot,
+    uint128_t expectedClusterUUID, uint128_t expectedMemberUUID,
+    const ClusterTopology& expectedTopology, String *failure = nullptr)
+{
+  const auto reject = [&](const char *reason) { if (failure) failure->assign(reason); return false; };
+  if (failure) failure->clear();
+  if (!expectedClusterUUID || !expectedMemberUUID) return reject("runtime recovery identity is empty");
+  if (local.uuid != expectedMemberUUID || local.ownerClusterUUID != expectedClusterUUID)
+    return reject("private local Brain owner differs from recovery member");
+  if (snapshot.brainConfig.clusterUUID != expectedClusterUUID)
+    return reject("private Brain snapshot cluster differs from recovery cohort");
+  String observedBytes = {}, expectedBytes = {};
+  auto observedTopology=snapshot.topology, expectedTopologyCopy=expectedTopology;
+  if (!BitseryEngine::serialize(observedBytes,observedTopology) ||
+      !BitseryEngine::serialize(expectedBytes,expectedTopologyCopy) || observedBytes != expectedBytes)
+    return reject("private Brain snapshot topology differs from recovery cohort");
+  uint32_t memberMatches=0;
+  for (const ClusterMachine& machine : snapshot.topology.machines)
+    if (machine.uuid==expectedMemberUUID && machine.isBrain) ++memberMatches;
+  if (memberMatches!=1) return reject("recovery member is not one exact Brain in private topology");
+  const auto& authority=snapshot.masterAuthority.runtimeState;
+  if (!authority.hasCompletedInitialMasterElection || authority.generation==0)
+    return reject("private Brain snapshot lacks completed durable initial election");
+  if (!authority.pendingAddMachinesOperations.empty() || !authority.pendingAddMachinesProvisioningIntents.empty() ||
+      !authority.pendingAutonomousProvisioningOperations.empty() || !authority.pendingElasticAddressAssignments.empty() ||
+      !authority.pendingElasticAddressReleases.empty() || !authority.statefulWorkerTopologyUpgradeOperations.empty() ||
+      !authority.deferredStatefulScaleIntents.empty() || !authority.materializedStatefulRecoveryOperations.empty() ||
+      !authority.materializedStatefulRecoveryRetries.empty() || !authority.retainedStatefulRearmProofs.empty() ||
+      !authority.taskExecutions.empty())
+    return reject("private Brain snapshot contains an unsupported in-flight authority operation");
+  return true;
+}
+
+static inline bool mothershipRuntimeRecoverySnapshotValid(
+    const ProdigyPersistentLocalBrainState& local,
+    const ProdigyPersistentBrainSnapshot& snapshot,
+    uint128_t expectedClusterUUID, uint128_t expectedMemberUUID,
+    const ClusterTopology& expectedTopology, String *failure = nullptr)
+{
+  if (!mothershipRuntimeRecoverySnapshotStructureValid(
+          local,snapshot,expectedClusterUUID,expectedMemberUUID,expectedTopology,failure)) return false;
+  const auto& authority=snapshot.masterAuthority.runtimeState;
+  const ProdigyPersistentUpdateSelfState idle = {};
+  if ((authority.updateSelf != idle &&
+       !mothershipRetainedRecoveryRejectedUpdatePayloadValid(authority.updateSelf)) ||
+      authority.updateSelfFollowerConcurrency > ProdigyUpdateSelfMaximumConcurrency ||
+      !authority.updateSelfFollowerTransitionIssuedPeerKeys.empty() ||
+      !authority.updateSelfFollowerReadyPeerKeys.empty())
+  { if (failure) failure->assign("private Brain snapshot contains an in-flight update-self coordinator"); return false; }
+  if (failure) failure->clear();
+  return true;
+}
+
 // The original same-format repair admits only the unmaterialized first seed. It never
 // edits this snapshot: the command owner checks private copies and retains the
 // original state and paired secrets directories byte-for-byte.
@@ -127,7 +206,7 @@ static inline bool mothershipInitialSeedRuntimeRepairSnapshotValid(
       r.crossClusterMasqueGatewayAuthorities.size()!=b.gateways.size()) return false;
   auto plan=a.deploymentPlans.find(b.deploymentID);
   DeploymentPlan journalPlan={};
-  if (plan==a.deploymentPlans.end() || !plan->second.isStateful || !plan->second.stateful.allMasters ||
+  if (plan==a.deploymentPlans.end() || !plan->second.isStateful || plan->second.stateful.writerMode != StatefulWriterMode::allMasters ||
       !BitseryEngine::deserializeSafe(b.normalizedDeploymentPlan,journalPlan) ||
       !mothershipRetainedRecoveryPlansEqual(plan->second,journalPlan)) return false;
   const auto& authority=r.statefulServingAuthorities[0];
@@ -593,20 +672,11 @@ static inline bool mothershipRetainedRecoveryCanReplaceUpdate(
   // Admission may reject after retaining the candidate payload, before the
   // coordinator issues any work. Fenced recovery may consume that exact
   // candidate only when every progress, handoff and recovery field is empty.
-  ProdigyPersistentUpdateSelfState unstarted;
-  unstarted.bundleBlob = update.bundleBlob;
-  unstarted.workerExpectedBundleSHA256 = update.workerExpectedBundleSHA256;
-  unstarted.workerFailure = update.workerFailure;
-  if (update == unstarted && !update.bundleBlob.empty() && !update.workerFailure.empty() &&
-      (update.workerExpectedBundleSHA256 == expectedBundleSHA256 ||
+  if ((update.workerExpectedBundleSHA256 == expectedBundleSHA256 ||
        (prodigyIsSHA256HexDigest(rejectedCandidateSHA256) &&
         rejectedCandidateSHA256 != expectedBundleSHA256 &&
-        update.workerExpectedBundleSHA256 == rejectedCandidateSHA256)))
-  {
-    String digest;
-    return prodigyComputeSHA256Hex(update.bundleBlob, digest) &&
-        digest == update.workerExpectedBundleSHA256;
-  }
+        update.workerExpectedBundleSHA256 == rejectedCandidateSHA256)) &&
+      mothershipRetainedRecoveryRejectedUpdatePayloadValid(update)) return true;
   // Followers can still hold the previous recovery envelope when the master's
   // next update is contained. Only the sealed installed predecessor is allowed.
   const bool previousEnvelope = mothershipRetainedRecoveryEnvelopeMatches(update, previousBundleSHA256);
@@ -664,6 +734,43 @@ static inline bool mothershipRetainedRecoveryCanReplaceUpdate(
   if (previousEnvelope) return true;
   String digest;
   return prodigyComputeSHA256Hex(update.bundleBlob, digest) && digest == update.workerExpectedBundleSHA256;
+}
+
+// The activation-successor recovery path may consume only the coordinator
+// bound to its immutable installed source and replacement target.  Generic
+// stopped-runtime recovery remains stricter and continues to call the gate
+// above; this form is not a blanket exemption for active update state.
+static inline bool mothershipRuntimeRecoveryStartupSnapshotValid(
+    const ProdigyPersistentLocalBrainState& local,
+    const ProdigyPersistentBrainSnapshot& snapshot,
+    uint128_t expectedClusterUUID, uint128_t expectedMemberUUID,
+    const ClusterTopology& expectedTopology, const String& targetBundleSHA256,
+    const String& sourceBundleSHA256, const String& rejectedCandidateSHA256 = {},
+    String *failure = nullptr)
+{
+  if (!mothershipRuntimeRecoverySnapshotStructureValid(
+          local,snapshot,expectedClusterUUID,expectedMemberUUID,expectedTopology,failure)) return false;
+  const auto& authority=snapshot.masterAuthority.runtimeState;
+  const bool unboundRejectedCapture=rejectedCandidateSHA256.empty() &&
+      mothershipRetainedRecoveryRejectedUpdatePayloadValid(authority.updateSelf);
+  // A registered source envelope cannot validate itself: only the later
+  // copy-built canonical witness set may authenticate its registrations.
+  // Admit it to that existing preparation owner, never directly to runtime.
+  const bool registeredSourceEnvelope =
+      mothershipRetainedRecoveryEnvelopeMatches(authority.updateSelf,sourceBundleSHA256) &&
+      std::any_of(authority.updateSelf.machineRecoveryWitnesses.begin(),
+                  authority.updateSelf.machineRecoveryWitnesses.end(),
+                  [](const ProdigyPersistentUpdateSelfMachineRecoveryWitness& witness) { return witness.bundleRegistered; });
+  if (!prodigyIsSHA256HexDigest(targetBundleSHA256) || !prodigyIsSHA256HexDigest(sourceBundleSHA256) ||
+      (!rejectedCandidateSHA256.empty() && !prodigyIsSHA256HexDigest(rejectedCandidateSHA256)) ||
+      authority.updateSelfFollowerConcurrency > ProdigyUpdateSelfMaximumConcurrency ||
+      !authority.updateSelfFollowerTransitionIssuedPeerKeys.empty() ||
+      !authority.updateSelfFollowerReadyPeerKeys.empty() ||
+      (!unboundRejectedCapture && !registeredSourceEnvelope && !mothershipRetainedRecoveryCanReplaceUpdate(
+          snapshot,targetBundleSHA256,sourceBundleSHA256,{},rejectedCandidateSHA256)))
+  { if (failure) failure->assign("private Brain snapshot contains an unresumable update-self coordinator"); return false; }
+  if (failure) failure->clear();
+  return true;
 }
 
 // A successor can retain either the exact interrupted recovery envelope, or
@@ -954,7 +1061,7 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
       }
       if (parameters.uuid == retiredConflictingClientUUID) {
         if (!retiringConflictingClient || !existing->second.isStateful ||
-            existing->second.stateful.allMasters || bootstrap.plan.statefulMeshRoles.client == 0 ||
+            existing->second.stateful.writerMode == StatefulWriterMode::allMasters || bootstrap.plan.statefulMeshRoles.client == 0 ||
             parameters.deploymentID != retiredDeploymentID ||
             parameters.statefulTopology.shardGroup != retiredShardGroup ||
             bootstrap.plan.statefulMeshRoles.client != retiredClientRole)
@@ -1047,7 +1154,7 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
       auto existing = snapshot.masterAuthority.deploymentPlans.find(deploymentID);
       if (approved == approvedPlans.end() || existing == snapshot.masterAuthority.deploymentPlans.end() ||
           mothershipRetainedRecoveryPlansEqual(existing->second, approved->second) == false ||
-          existing->second.isStateful == false || existing->second.stateful.allMasters)
+          existing->second.isStateful == false || existing->second.stateful.writerMode == StatefulWriterMode::allMasters)
       {
         if (failure) failure->assign("cold canonical runtime deployment is not an approved non-all-master stateful plan"_ctv);
         return false;
@@ -1121,7 +1228,7 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
         prodigyIsSHA256HexDigest(partialHandoff->successorBlobSHA256) == false ||
         partialHandoff->accepted == false || partialHandoff->started == false || partialHandoff->completed ||
         partialHandoff->updatedAtMs <= 0 || active == approvedPlans.end() || successor == approvedPlans.end() ||
-        active->second.stateful.allMasters || successor->second.stateful.allMasters ||
+        active->second.stateful.writerMode == StatefulWriterMode::allMasters || successor->second.stateful.writerMode == StatefulWriterMode::allMasters ||
         prodigyMaterializedStatefulRecoveryPlansAreCompatible(active->second, successor->second) == false ||
         successor->second.config.containerBlobSHA256.equals(partialHandoff->successorBlobSHA256) == false ||
         statefulReplicas[activeID] != 2 || statefulClientMasters[activeID] != 1 ||
@@ -1168,7 +1275,7 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
     if (retiringConflictingClient && retainRetiredConflictingClientForCoordinatorProof && id == retiredDeploymentID) continue;
     if (sealedPartialHandoff && id == partialHandoff->successorDeploymentID) continue;
     const uint32_t expected = prodigyGraphDeploymentPlanCanonical(deployment, true) ? 0 :
-        (deployment.stateful.allMasters ? count : 1);
+        (deployment.stateful.writerMode == StatefulWriterMode::allMasters ? count : 1);
     if (statefulClientMasters[id] != expected) {
       if (failure) failure->assign("retained stateful inventory has missing or conflicting client masters"_ctv);
       return false;
@@ -1311,6 +1418,111 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
   runtime.updateSelf = {};
   runtime.updateSelf.workerExpectedBundleSHA256 = expectedBundleSHA256;
   runtime.updateSelf.machineRecoveryWitnesses = std::move(witnesses);
+  return true;
+}
+
+// Prepare the one startup-authority projection used by a replacement runtime
+// after Mothership has independently captured a complete live cohort.  This
+// does not admit a second recovery policy: version-two startup binds the
+// installed source and replacement target through the retained coordinator
+// owner, then delegates all bootstrap construction and canonical inventory
+// checks there.  Leave both the source snapshot and caller output untouched
+// on every rejection.
+static inline bool mothershipPrepareRuntimeRecoveryStartupAuthority(
+    const ProdigyPersistentLocalBrainState& local,
+    const ProdigyPersistentBrainSnapshot& source,
+    uint128_t expectedClusterUUID, uint128_t expectedMemberUUID,
+    const ClusterTopology& expectedTopology,
+    const bytell_hash_map<uint64_t, DeploymentPlan>& approvedPlans,
+    const Vector<MothershipRetainedRecoveryMachineInput>& machines,
+    const String& targetBundleSHA256,
+    const String& sourceBundleSHA256,
+    const String& rejectedCandidateSHA256,
+    ProdigyPersistentBrainSnapshot& prepared,
+    String *failure = nullptr)
+{
+  const auto reject = [&](const char *reason) {
+    if (failure) failure->assign(reason);
+    return false;
+  };
+  if (failure) failure->clear();
+  if (expectedTopology.machines.size() != 3 || machines.size() != 3)
+    return reject("runtime recovery requires a complete three-Brain live cohort");
+  bytell_hash_set<uint128_t> topologyMachines = {};
+  for (const ClusterMachine& machine : expectedTopology.machines)
+    if (machine.uuid == 0 || machine.isBrain == false || !topologyMachines.insert(machine.uuid).second)
+      return reject("runtime recovery topology is not an exact three-Brain cohort");
+  bytell_hash_set<uint128_t> cohortMachines = {};
+  bytell_hash_set<uint32_t> cohortFragments = {};
+  for (const MothershipRetainedRecoveryMachineInput& machine : machines)
+    if (machine.machineUUID == 0 || machine.machineFragment == 0 || machine.machineFragment > 0xffffff ||
+        machine.parameters.empty() || machine.parameters.size() != machine.observedCreatedAtMs.size() ||
+        !cohortMachines.insert(machine.machineUUID).second || !cohortFragments.insert(machine.machineFragment).second ||
+        !topologyMachines.contains(machine.machineUUID))
+      return reject("runtime recovery live cohort shape differs from frozen topology");
+  const bool legacyStartupRequest=sourceBundleSHA256.empty();
+  if ((legacyStartupRequest && !mothershipRuntimeRecoverySnapshotValid(
+          local,source,expectedClusterUUID,expectedMemberUUID,expectedTopology,failure)) ||
+      (!legacyStartupRequest && !mothershipRuntimeRecoveryStartupSnapshotValid(
+          local,source,expectedClusterUUID,expectedMemberUUID,expectedTopology,
+          targetBundleSHA256,sourceBundleSHA256,rejectedCandidateSHA256,failure)))
+    return false;
+
+  // The census is evidence, not new scheduler authority. Every observed live
+  // process must bind once to a pre-existing canonical runtime record, with
+  // its credentials and immutable deployment projection preserved by the
+  // persistent bootstrap comparator. Planned reservations are intentionally
+  // outside that bijection: they have no live process and must never acquire a
+  // witness merely because they remain in durable scheduler state.
+  bytell_hash_set<uint128_t> observedRuntimeUUIDs = {};
+  for (const MothershipRetainedRecoveryMachineInput& machine : machines)
+  {
+    for (uint32_t index = 0; index < machine.parameters.size(); ++index)
+    {
+      const ContainerParameters& parameters = machine.parameters[index];
+      const BrainReplicatedContainerRuntimeState *runtime = nullptr;
+      for (const BrainReplicatedContainerRuntimeState& candidate : source.masterAuthority.containerRuntimeStates)
+      {
+        if (candidate.plan.uuid != parameters.uuid) continue;
+        if (runtime != nullptr || candidate.machineUUID != machine.machineUUID)
+          return reject("live retained container does not map to one canonical runtime owner");
+        runtime = &candidate;
+      }
+      auto plan = approvedPlans.find(parameters.deploymentID);
+      NeuronContainerBootstrap reconstructed = {}, observed = {};
+      String bootstrapFailure = {};
+      if (runtime == nullptr || plan == approvedPlans.end() ||
+          !observedRuntimeUUIDs.insert(parameters.uuid).second ||
+          !prodigyBuildRetainedContainerBootstrap(
+              plan->second, parameters, machine.machineFragment,
+              source.brainConfig.datacenterFragment, machine.observedCreatedAtMs[index],
+              reconstructed, &bootstrapFailure) ||
+          runtime->plan.config.deploymentID() != parameters.deploymentID)
+        return reject("live retained container differs from canonical deployment authority");
+      observed = reconstructed;
+      observed.plan = runtime->plan;
+      if (!mothershipRetainedRecoveryBootstrapMatchesObservedLifecycle(observed, reconstructed))
+        return reject("live retained container lifecycle or credentials differ from canonical authority");
+    }
+  }
+  for (const BrainReplicatedContainerRuntimeState& runtime : source.masterAuthority.containerRuntimeStates)
+  {
+    if (runtime.plan.state == ContainerState::planned) continue;
+    if ((runtime.plan.state != ContainerState::scheduled && runtime.plan.state != ContainerState::healthy) ||
+        !observedRuntimeUUIDs.contains(runtime.plan.uuid))
+      return reject("canonical live runtime is absent from the retained census");
+  }
+
+  ProdigyPersistentBrainSnapshot candidate = source;
+  String preparationFailure = {};
+  if (!mothershipPrepareRetainedRecoverySnapshot(
+          candidate, approvedPlans, machines, targetBundleSHA256, &preparationFailure,
+          sourceBundleSHA256, {}, 0, nullptr, false, true, 0, {}, nullptr,rejectedCandidateSHA256))
+  {
+    if (failure) failure->assign(preparationFailure);
+    return false;
+  }
+  prepared = std::move(candidate);
   return true;
 }
 

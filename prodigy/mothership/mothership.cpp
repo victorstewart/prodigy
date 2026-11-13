@@ -32,6 +32,8 @@
 #include <services/prodigy.h>
 
 #include <prodigy/bootstrap.config.h>
+#include <prodigy/additional.ingress.h>
+#include <prodigy/netdev.detect.h>
 #include <prodigy/bundle.upgrade.h>
 #include <prodigy/container.contract.h>
 #include <prodigy/containerstore.h>
@@ -79,6 +81,7 @@
 #include <prodigy/mothership/mothership.tidesdb.migration.command.h>
 #include <prodigy/mothership/mothership.retained.recovery.command.h>
 #include <prodigy/mothership/mothership.nametag.qualification.h>
+#include <prodigy/gateway.recovery.record.h>
 
 // for now every time we create a new application or service we're going to have to recompile the mothership so that
 // it can read the enum values from enums.datacenter.h, but in the future we can do something else more flexible
@@ -4192,6 +4195,8 @@ static bool mothershipVDCResumeBrainStateCaptureLocal(
 // The lifecycle owner asks Switchboard to retain its existing resources. It
 // neither attaches a program nor writes a routing map. Namespace entry stays in
 // this bounded child, and the durable recovery record owns the exact identities.
+static void mothershipTCXImport(const MothershipVDCRetainedTCX& source, SwitchboardHostTCXRetentionIdentity& target);
+static void mothershipTCXExport(const SwitchboardHostTCXRetentionIdentity& source, MothershipVDCRetainedTCX& target);
 static bool mothershipVDCRetainFollowerNetworking(MothershipVDCBundleRecovery& operation,
                                                  bool capture, String *failure)
 {
@@ -4230,34 +4235,20 @@ static bool mothershipVDCRetainFollowerNetworking(MothershipVDCBundleRecovery& o
     if (capture) bpffsRoot.assign("/sys/fs/bpf"_ctv);
     else bpffsRoot.snprintf<"/mnt/prodigy-vdc-{itoa}/machine-bpffs/machine{itoa}"_ctv>(operation.runtimeIdentity, uint64_t(operation.machineIndex));
     SwitchboardHostTCXRetentionPair pair = {};
-    auto importIdentity = [](const MothershipVDCRetainedTCX& source, SwitchboardHostTCXRetentionIdentity& target) {
-      target.interfaceIndex = source.ifindex;
-      target.direction = source.attachType == uint32_t(BPF_TCX_INGRESS) ? SwitchboardHostTCXDirection::ingress : SwitchboardHostTCXDirection::egress;
-      target.programID = source.programID; target.linkID = source.linkID;
-      target.wormholeFlowMapID = source.wormholeFlowMapID; target.wormholePendingFlowMapID = source.wormholePendingFlowMapID;
-      std::memcpy(target.programTag, source.programTag, sizeof(target.programTag));
-    };
-    auto exportIdentity = [](const SwitchboardHostTCXRetentionIdentity& source, MothershipVDCRetainedTCX& target) {
-      target.ifindex = source.interfaceIndex;
-      target.attachType = uint32_t(switchboardHostTCXAttachType(source.direction));
-      target.programID = source.programID; target.linkID = source.linkID;
-      target.wormholeFlowMapID = source.wormholeFlowMapID; target.wormholePendingFlowMapID = source.wormholePendingFlowMapID;
-      std::memcpy(target.programTag, source.programTag, sizeof(target.programTag));
-    };
     bool okay = false;
     if (capture)
       okay = switchboardHostTCXRetainCurrentPair(ifindex, bpffsRoot, pair);
     else if (operation.version == 4 && operation.retainedTCX[0].attachType == uint32_t(BPF_TCX_INGRESS) &&
              operation.retainedTCX[1].attachType == uint32_t(BPF_TCX_EGRESS))
     {
-      importIdentity(operation.retainedTCX[0], pair.ingress);
-      importIdentity(operation.retainedTCX[1], pair.egress);
+      mothershipTCXImport(operation.retainedTCX[0], pair.ingress);
+      mothershipTCXImport(operation.retainedTCX[1], pair.egress);
       okay = switchboardHostTCXVerifyRetainedPair(ifindex, bpffsRoot, pair);
     }
     if (okay)
     {
-      exportIdentity(pair.ingress, receipt.links[0]);
-      exportIdentity(pair.egress, receipt.links[1]);
+      mothershipTCXExport(pair.ingress, receipt.links[0]);
+      mothershipTCXExport(pair.egress, receipt.links[1]);
       receipt.result = 0;
     }
     ssize_t bytes;
@@ -4290,6 +4281,220 @@ static bool mothershipVDCRetainFollowerNetworking(MothershipVDCBundleRecovery& o
   return true;
 }
 
+// A same-boot service replacement keeps the kernel references outside the
+// service cgroup.  The caller owns durable serialization of this witness; this
+// local primitive only retains/verifies the exact already-attached pair.
+class MothershipFrozenServiceTCXWitness {
+public:
+  MothershipVDCProcessIdentity process = {};
+  String bootID = {};
+  String primaryInterface = {};
+  uint64_t bpffsDevice = 0;
+  uint64_t bpffsInode = 0;
+  MothershipVDCRetainedTCX links[2] = {};
+};
+
+static bool mothershipReadLocalBootID(String& bootID)
+{
+  if (!mothershipVDCRead("/proc/sys/kernel/random/boot_id"_ctv, bootID, 64)) return false;
+  if (!bootID.empty() && bootID[bootID.size() - 1] == '\n') bootID.resize(bootID.size()-1);
+  if (bootID.size() != 36) return false;
+  for (uint64_t index = 0; index < bootID.size(); ++index)
+  {
+    if (index == 8 || index == 13 || index == 18 || index == 23) { if (bootID[index] != '-') return false; }
+    else if (!((bootID[index] >= '0' && bootID[index] <= '9') || (bootID[index] >= 'a' && bootID[index] <= 'f'))) return false;
+  }
+  return true;
+}
+
+static void mothershipTCXImport(const MothershipVDCRetainedTCX& source, SwitchboardHostTCXRetentionIdentity& target)
+{
+  target.interfaceIndex = source.ifindex;
+  target.direction = source.attachType == uint32_t(BPF_TCX_INGRESS) ? SwitchboardHostTCXDirection::ingress : SwitchboardHostTCXDirection::egress;
+  target.programID = source.programID; target.linkID = source.linkID;
+  target.wormholeFlowMapID = source.wormholeFlowMapID; target.wormholePendingFlowMapID = source.wormholePendingFlowMapID;
+  std::memcpy(target.programTag, source.programTag, sizeof(target.programTag));
+}
+
+static void mothershipTCXExport(const SwitchboardHostTCXRetentionIdentity& source, MothershipVDCRetainedTCX& target)
+{
+  target.ifindex = source.interfaceIndex; target.attachType = uint32_t(switchboardHostTCXAttachType(source.direction));
+  target.programID = source.programID; target.linkID = source.linkID;
+  target.wormholeFlowMapID = source.wormholeFlowMapID; target.wormholePendingFlowMapID = source.wormholePendingFlowMapID;
+  std::memcpy(target.programTag, source.programTag, sizeof(target.programTag));
+}
+
+static bool mothershipLocalNamespacesMatch(const MothershipVDCProcessIdentity& expected)
+{
+  MothershipVDCProcessIdentity local = {};
+  return mothershipVDCReadProcess(uint64_t(::getpid()), local) &&
+      local.mountNamespace == expected.mountNamespace && local.networkNamespace == expected.networkNamespace &&
+      local.cgroupNamespace == expected.cgroupNamespace;
+}
+
+static bool mothershipTCXWitnessLinksValid(const MothershipVDCRetainedTCX (&links)[2])
+{
+  return links[0].ifindex != 0 && links[0].linkID != 0 && links[0].programID != 0 &&
+      links[0].wormholeFlowMapID != 0 && links[0].wormholePendingFlowMapID != 0 &&
+      links[0].attachType == uint32_t(BPF_TCX_INGRESS) && links[1].ifindex == links[0].ifindex &&
+      links[1].linkID != 0 && links[1].programID != 0 && links[1].wormholeFlowMapID != 0 &&
+      links[1].wormholePendingFlowMapID != 0 && links[1].attachType == uint32_t(BPF_TCX_EGRESS);
+}
+
+static bool mothershipTCXWitnessLinksAbsent(const MothershipVDCRetainedTCX (&links)[2])
+{
+  if (links[0].ifindex == 0 || links[1].ifindex != links[0].ifindex ||
+      links[0].attachType != uint32_t(BPF_TCX_INGRESS) || links[1].attachType != uint32_t(BPF_TCX_EGRESS))
+    return false;
+  for (const MothershipVDCRetainedTCX& link : links)
+  {
+    if (link.programID != 0 || link.linkID != 0 || link.wormholeFlowMapID != 0 || link.wormholePendingFlowMapID != 0)
+      return false;
+    for (uint8_t byte : link.programTag) if (byte != 0) return false;
+  }
+  return true;
+}
+
+// The only two serializable TCX states accepted by recovery are an exact
+// retained pair and the interface-bound, otherwise-zero clean-absence
+// sentinel.  Keep this predicate shared by receipt acceptance and stopped
+// proof validation so a capture cannot publish a proof its consumer rejects.
+static bool mothershipTCXWitnessLinksAdmissible(const MothershipVDCRetainedTCX (&links)[2])
+{
+  return mothershipTCXWitnessLinksValid(links) || mothershipTCXWitnessLinksAbsent(links);
+}
+
+enum class MothershipTCXWitnessVerificationStage : uint8_t { frozenEvidence, activeTarget };
+
+// A source absence witness is valid evidence only while the frozen source
+// remains absent.  Once the target is active, its packaged canonical routers
+// are required instead; a partial or still-absent target is never accepted.
+static bool mothershipTCXWitnessLinksStageValid(const MothershipVDCRetainedTCX (&links)[2],
+                                                MothershipTCXWitnessVerificationStage stage,
+                                                bool cleanlyAbsent,
+                                                bool currentCanonicalPair)
+{
+  if (mothershipTCXWitnessLinksValid(links)) return true;
+  return mothershipTCXWitnessLinksAbsent(links) &&
+      (stage == MothershipTCXWitnessVerificationStage::frozenEvidence ? cleanlyAbsent : currentCanonicalPair);
+}
+
+static bool mothershipTCXCurrentCanonicalPairValid(uint32_t ifindex)
+{
+  SwitchboardHostTCXRetentionIdentity ingress = {}, egress = {};
+  return switchboardHostTCXOpenCurrent(ifindex, "/sys/fs/bpf"_ctv, SwitchboardHostTCXDirection::ingress, 0, ingress) &&
+      switchboardHostTCXOpenCurrent(ifindex, "/sys/fs/bpf"_ctv, SwitchboardHostTCXDirection::egress, 0, egress) &&
+      ingress.interfaceIndex == ifindex && egress.interfaceIndex == ifindex &&
+      ingress.direction == SwitchboardHostTCXDirection::ingress && egress.direction == SwitchboardHostTCXDirection::egress &&
+      ingress.wormholeFlowMapID == egress.wormholeFlowMapID &&
+      ingress.wormholePendingFlowMapID == egress.wormholePendingFlowMapID;
+}
+
+static bool mothershipCaptureFrozenServicePrimaryTCX(const MothershipVDCProcessIdentity& process,
+                                                     MothershipFrozenServiceTCXWitness& witness, String *failure)
+{
+  auto reject = [&](const char *message) { if (failure) failure->assign(message); return false; };
+  if (!mothershipVDCProcessMatches(process) || !mothershipLocalNamespacesMatch(process) || !mothershipFrozenServiceCgroup(process))
+    return reject("service process is not the exact frozen cgroup owner");
+  String optional = {};
+  if (!prodigyResolveOptionalAdditionalIngressDevice(optional, failure) || !optional.empty())
+    return reject("same-boot TCX recovery requires additional ingress policy absent");
+  if (!prodigyResolveOptionalPrivateOverlayDevice(optional, failure) || !optional.empty())
+    return reject("same-boot TCX recovery requires private overlay policy absent");
+  String primary = {};
+  if (!prodigyResolvePrimaryNetworkDevice(primary) || primary.empty()) return reject("primary network interface is unavailable");
+  struct CloseFD { int fd = -1; ~CloseFD() { if (fd >= 0) ::close(fd); } } mount, network, input, output;
+  String path = {}; path.snprintf<"/proc/{itoa}/ns/mnt"_ctv>(process.pid); mount.fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  path.snprintf<"/proc/{itoa}/ns/net"_ctv>(process.pid); network.fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  struct stat mountInfo = {}, networkInfo = {};
+  if (mount.fd < 0 || network.fd < 0 || ::fstat(mount.fd, &mountInfo) != 0 || ::fstat(network.fd, &networkInfo) != 0 ||
+      uint64_t(mountInfo.st_ino) != process.mountNamespace || uint64_t(networkInfo.st_ino) != process.networkNamespace)
+    return reject("frozen service namespace identity changed");
+  int descriptors[2] = {};
+  if (::pipe2(descriptors, O_CLOEXEC) != 0) return reject("cannot open TCX retention receipt channel");
+  input.fd = descriptors[0]; output.fd = descriptors[1];
+  struct Receipt { MothershipVDCRetainedTCX links[2]; uint64_t device, inode; int result = 1; } receipt = {};
+  pid_t child = ::fork();
+  if (child == 0)
+  {
+    ::close(input.fd); ::signal(SIGALRM, SIG_DFL); ::alarm(10);
+    if (::setns(mount.fd, CLONE_NEWNS) != 0 || ::setns(network.fd, CLONE_NEWNET) != 0) _exit(125);
+    const uint32_t ifindex = ::if_nametoindex(primary.c_str()); struct stat bpffs = {};
+    SwitchboardHostTCXRetentionPair pair = {};
+    if (ifindex != 0 && ::stat("/sys/fs/bpf", &bpffs) == 0 && switchboardHostTCXValidBPFFSRoot("/sys/fs/bpf"_ctv))
+    {
+      receipt.device = bpffs.st_dev; receipt.inode = bpffs.st_ino;
+      if (switchboardHostTCXPairCleanlyAbsent(ifindex, "/sys/fs/bpf"_ctv))
+      {
+        receipt.links[0].ifindex = receipt.links[1].ifindex = ifindex;
+        receipt.links[0].attachType = uint32_t(BPF_TCX_INGRESS);
+        receipt.links[1].attachType = uint32_t(BPF_TCX_EGRESS);
+        receipt.result = 0;
+      }
+      else if (switchboardHostTCXRetainCurrentPair(ifindex, "/sys/fs/bpf"_ctv, pair))
+      { mothershipTCXExport(pair.ingress, receipt.links[0]); mothershipTCXExport(pair.egress, receipt.links[1]); receipt.result = mothershipTCXWitnessLinksValid(receipt.links) ? 0 : 1; }
+    }
+    size_t sent = 0; while (sent < sizeof(receipt)) { const ssize_t bytes = ::write(output.fd, reinterpret_cast<const char *>(&receipt) + sent, sizeof(receipt) - sent); if (bytes < 0 && errno == EINTR) continue; if (bytes <= 0) _exit(1); sent += size_t(bytes); }
+    _exit(receipt.result == 0 ? 0 : 1);
+  }
+  if (child < 0) return reject("cannot launch bounded TCX retention request");
+  ::close(output.fd); output.fd = -1; size_t received = 0;
+  while (received < sizeof(receipt)) { const ssize_t bytes = ::read(input.fd, reinterpret_cast<char *>(&receipt) + received, sizeof(receipt) - received); if (bytes < 0 && errno == EINTR) continue; if (bytes <= 0) break; received += size_t(bytes); }
+  int status = 0; pid_t waited = -1; do { waited = ::waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+  // A receipt is usable only when it is either an exact retained pair or the
+  // interface-bound clean-absence sentinel.  The latter is deliberately not a
+  // zeroed record: it still binds this frozen proof to the original ifindex.
+  if (waited != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0 || received != sizeof(receipt) || receipt.result != 0 ||
+      !mothershipTCXWitnessLinksAdmissible(receipt.links))
+    return reject("exact primary TCX retention failed");
+  if (!mothershipVDCProcessMatches(process) || !mothershipLocalNamespacesMatch(process) || !mothershipFrozenServiceCgroup(process))
+    return reject("frozen service identity changed during TCX retention");
+  if (!mothershipReadLocalBootID(witness.bootID)) return reject("local boot identity is unavailable");
+  witness.process = process; witness.primaryInterface = primary; witness.bpffsDevice = receipt.device; witness.bpffsInode = receipt.inode;
+  witness.links[0] = receipt.links[0]; witness.links[1] = receipt.links[1]; if (failure) failure->clear(); return true;
+}
+
+static bool mothershipVerifyReplacementServicePrimaryTCX(const MothershipFrozenServiceTCXWitness& witness,
+                                                         const MothershipVDCProcessIdentity& replacement,
+                                                         MothershipTCXWitnessVerificationStage stage,
+                                                         String *failure)
+{
+  auto reject = [&](const char *message) { if (failure) failure->assign(message); return false; };
+  if (!mothershipVDCProcessMatches(replacement) || !mothershipLocalNamespacesMatch(witness.process) ||
+      replacement.mountNamespace != witness.process.mountNamespace || replacement.networkNamespace != witness.process.networkNamespace ||
+      replacement.cgroupNamespace != witness.process.cgroupNamespace)
+    return reject("replacement service namespace identity differs from frozen witness");
+  String bootID = {};
+  if (!mothershipReadLocalBootID(bootID) || bootID != witness.bootID) return reject("replacement service boot identity differs from frozen witness");
+  struct stat bpffs = {};
+  if (::stat("/sys/fs/bpf", &bpffs) != 0 || uint64_t(bpffs.st_dev) != witness.bpffsDevice ||
+      uint64_t(bpffs.st_ino) != witness.bpffsInode || !switchboardHostTCXValidBPFFSRoot("/sys/fs/bpf"_ctv))
+    return reject("replacement service bpffs identity differs from frozen witness");
+  const uint32_t ifindex = ::if_nametoindex(MothershipTidesMigration::str(witness.primaryInterface).c_str());
+  if (ifindex == 0) return reject("replacement service primary interface differs from frozen witness");
+  if (mothershipTCXWitnessLinksAbsent(witness.links))
+  {
+    const bool frozenAbsence = stage == MothershipTCXWitnessVerificationStage::frozenEvidence &&
+        switchboardHostTCXPairCleanlyAbsent(ifindex, "/sys/fs/bpf"_ctv);
+    const bool currentCanonicalPair = stage == MothershipTCXWitnessVerificationStage::activeTarget &&
+        mothershipTCXCurrentCanonicalPairValid(ifindex);
+    if (witness.links[0].ifindex != ifindex || witness.links[1].ifindex != ifindex ||
+        !mothershipTCXWitnessLinksStageValid(witness.links, stage, frozenAbsence, currentCanonicalPair))
+      return reject(stage == MothershipTCXWitnessVerificationStage::activeTarget ?
+          "replacement service primary TCX target pair differs from frozen absence witness" :
+          "replacement service primary TCX absence differs from frozen witness");
+    if (failure) failure->clear(); return true;
+  }
+  if (!mothershipTCXWitnessLinksValid(witness.links) || witness.links[0].ifindex != ifindex || witness.links[1].ifindex != ifindex ||
+      witness.links[0].attachType != uint32_t(BPF_TCX_INGRESS) || witness.links[1].attachType != uint32_t(BPF_TCX_EGRESS))
+    return reject("replacement service primary interface differs from frozen witness");
+  SwitchboardHostTCXRetentionPair pair = {};
+  mothershipTCXImport(witness.links[0], pair.ingress); mothershipTCXImport(witness.links[1], pair.egress);
+  if (!switchboardHostTCXVerifyRetainedPair(ifindex, "/sys/fs/bpf"_ctv, pair))
+    return reject("replacement service retained primary TCX identity differs");
+  if (failure) failure->clear(); return true;
+}
+
 static void mothershipVDCTestFaultAfterRecoveryTransition(MothershipVDCTestRecoveryFaultPhase requested,
     MothershipVDCTestRecoveryFaultPhase transition, const MothershipVDCBundleRecovery& operation)
 {
@@ -4302,6 +4507,40 @@ static void mothershipVDCTestFaultAfterRecoveryTransition(MothershipVDCTestRecov
   std::fflush(stdout);
   std::fflush(stderr);
   _exit(86);
+}
+
+static bool mothershipVDCAdopterDiagnosticValid(const String& value)
+{
+  if (value.size() < 6 || value.size() > 192 || std::memcmp(value.data(), "stage=", 6) != 0) return false;
+  for (char byte : value)
+    if (!((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+          (byte >= '0' && byte <= '9') || byte == '=' || byte == '-' || byte == '_' || byte == ' ' || byte == '\n'))
+      return false;
+  return true;
+}
+
+static void mothershipVDCAdopterReadinessFailure(bool timedOut, bool exited, int status,
+                                                 int waitError, const String& diagnostic, String& failure)
+{
+  failure.assign("retained provider adopter did not become ready outcome="_ctv);
+  if (timedOut) failure.append("timeout"_ctv);
+  else if (exited && WIFEXITED(status))
+  {
+    String outcome = {}; outcome.snprintf<"exit={itoa}"_ctv>(uint64_t(WEXITSTATUS(status)));
+    failure.append(outcome);
+  }
+  else if (exited && WIFSIGNALED(status))
+  {
+    String outcome = {}; outcome.snprintf<"signal={itoa}"_ctv>(uint64_t(WTERMSIG(status)));
+    failure.append(outcome);
+  }
+  else if (waitError != 0)
+  {
+    String outcome = {}; outcome.snprintf<"wait-error={itoa}"_ctv>(uint64_t(waitError));
+    failure.append(outcome);
+  }
+  else failure.append("unobserved"_ctv);
+  if (!diagnostic.empty()) { failure.append(" preexec="_ctv); failure.append(diagnostic); }
 }
 
 static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyCluster& cluster,
@@ -4625,7 +4864,7 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
       Vector<String> args = {};
       if (mothershipVDCReadProcess(pid, observed) == false || observed.startTime != start || observed.mountNamespace != mount ||
           observed.networkNamespace != operation.supervisor.networkNamespace || mothershipVDCReadArguments(pid, args) == false ||
-          args.size() != 17 || args[2].equals("--serve-adopt"_ctv) == false || args[4].equals(directory) == false) return false;
+          args.size() < 17 || args.size() > 19 || args[2].equals("--serve-adopt"_ctv) == false || args[4].equals(directory) == false) return false;
       operation.adopter = observed;
       return true;
     };
@@ -4652,32 +4891,82 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
       providerPath.snprintf<"/proc/self/fd/{itoa}"_ctv>(uint64_t(providerFD));
       runtime.assignItoa(operation.runtimeIdentity);
       mothershipVirtualDatacenterPath(directory, "provider.log", logPath);
+      String preexecPath = {}, scriptFailurePath = {};
+      mothershipVirtualDatacenterPath(directory, "adopter-preexec-failure", preexecPath);
+      mothershipVirtualDatacenterPath(directory, "adopter-pre-ready-failure", scriptFailurePath);
+      (void)::unlink(preexecPath.c_str()); (void)::unlink(scriptFailurePath.c_str());
       Vector<char *> argv = {};
       argv.push_back(const_cast<char *>("/bin/bash")); argv.push_back(const_cast<char *>(providerPath.c_str()));
       argv.push_back(const_cast<char *>("--serve-adopt")); argv.push_back(const_cast<char *>(runtime.c_str())); argv.push_back(const_cast<char *>(directory.c_str()));
       for (String& argument : operation.providerArguments) argv.push_back(const_cast<char *>(argument.c_str()));
+      // Recovery records the stable twelve-argument provider identity. Rebuild
+      // the optional launch tail from the still-bound cluster policy so a
+      // private BGP/MASQUE fixture cannot lose its required 1500-byte underlay
+      // during an otherwise compatible provider handoff.
+      const bool requirePublicIngressMTU = !cluster.test.enableFakeIpv4Boundary && mothershipClusterBGPEnabled(cluster);
+      String recoverySpare = {}, recoveryBGPUnderlay = {};
+      if (cluster.test.spareMachineCount != 0 || requirePublicIngressMTU) {
+        recoverySpare.assignItoa(cluster.test.spareMachineCount);
+        argv.push_back(const_cast<char *>(recoverySpare.c_str()));
+      }
+      if (requirePublicIngressMTU) {
+        recoveryBGPUnderlay.assign("1"_ctv);
+        argv.push_back(const_cast<char *>(recoveryBGPUnderlay.c_str()));
+      }
       argv.push_back(nullptr);
       pid_t child = ::fork();
       if (child == 0)
       {
-        if (::setsid() < 0 || ::setns(mount.fd, CLONE_NEWNS) != 0 ||
-            ::setenv("PRODIGY_VDC_RECOVERY_CGROUP_FD", retainedCgroupFD.c_str(), 1) != 0) _exit(125);
-        int log = ::open(logPath.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
-        int input = ::open("/dev/null", O_RDONLY);
-        if (log < 0 || input < 0 || ::dup2(log, STDOUT_FILENO) < 0 || ::dup2(log, STDERR_FILENO) < 0 || ::dup2(input, STDIN_FILENO) < 0) _exit(125);
-        ::execv("/bin/bash", argv.data()); _exit(127);
+        const auto preexecFailure = [&](const char *stage, int exitCode = 125) {
+          const int savedErrno = errno;
+          const int fd = ::open(preexecPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+          if (fd >= 0) {
+            char message[128] = {};
+            const int bytes = std::snprintf(message, sizeof(message), "stage=%s errno=%d\n", stage, savedErrno);
+            if (bytes > 0) (void)::write(fd, message, size_t(std::min<int>(bytes, sizeof(message) - 1)));
+            ::close(fd);
+          }
+          _exit(exitCode);
+        };
+        if (::setsid() < 0) preexecFailure("setsid");
+        if (::setns(mount.fd, CLONE_NEWNS) != 0) preexecFailure("setns-mount");
+        if (::setenv("PRODIGY_VDC_RECOVERY_CGROUP_FD", retainedCgroupFD.c_str(), 1) != 0) preexecFailure("setenv-cgroup-fd");
+        const int log = ::open(logPath.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
+        if (log < 0) preexecFailure("open-provider-log");
+        const int input = ::open("/dev/null", O_RDONLY);
+        if (input < 0) preexecFailure("open-dev-null");
+        if (::dup2(log, STDOUT_FILENO) < 0) preexecFailure("dup2-stdout");
+        if (::dup2(log, STDERR_FILENO) < 0) preexecFailure("dup2-stderr");
+        if (::dup2(input, STDIN_FILENO) < 0) preexecFailure("dup2-stdin");
+        ::execv("/bin/bash", argv.data()); preexecFailure("execv-bash", 127);
       }
       if (child < 0) return reject("cannot launch retained provider adopter");
-      bool ready = false;
+      bool ready = false, exited = false, timedOut = false;
+      int status = 0, waitError = 0;
       for (unsigned attempt = 0; attempt < 200; ++attempt) {
         if (readReady()) { ready = true; break; }
-        int status = 0; if (::waitpid(child, &status, WNOHANG) == child) break;
+        const pid_t waited = ::waitpid(child, &status, WNOHANG);
+        if (waited == child) { exited = true; break; }
+        if (waited < 0 && errno != EINTR) { waitError = errno; break; }
         ::usleep(50000);
       }
       if (ready == false) {
+        timedOut = !exited && waitError == 0;
         MothershipVDCProcessIdentity pending = {};
-        if (mothershipVDCReadProcess(child, pending)) (void)mothershipVDCSignal(pending, SIGKILL);
-        return reject("retained provider adopter did not become ready");
+        if (mothershipVDCReadProcess(child, pending)) {
+          (void)mothershipVDCSignal(pending, SIGKILL);
+          const pid_t waited = ::waitpid(child, &status, WNOHANG);
+          if (waited == child) exited = true;
+          else if (waited < 0 && errno != EINTR) waitError = errno;
+        }
+        String diagnostic = {};
+        if (mothershipVDCRead(preexecPath, diagnostic, 256) == false || !mothershipVDCAdopterDiagnosticValid(diagnostic)) {
+          diagnostic.clear(); String scriptDiagnostic = {};
+          if (mothershipVDCRead(scriptFailurePath, scriptDiagnostic, 256) && mothershipVDCAdopterDiagnosticValid(scriptDiagnostic))
+            diagnostic = std::move(scriptDiagnostic);
+        }
+        if (failure) mothershipVDCAdopterReadinessFailure(timedOut, exited, status, waitError, diagnostic, *failure);
+        return false;
       }
     }
     operation.phase = MothershipVDCRecoveryPhase::ready;
@@ -4881,6 +5170,7 @@ static bool mothershipStartVirtualDatacenterProvider(const MothershipProdigyClus
   String machineStorageMB = {};
   String storageDeviceCount = {};
   String storageDeviceMB = {};
+  String bgpUnderlay = {};
   machineCount.assignItoa(cluster.test.machineCount);
   brainCount.assignItoa(cluster.nBrains);
   mtuText.assignItoa(mtu);
@@ -4891,6 +5181,11 @@ static bool mothershipStartVirtualDatacenterProvider(const MothershipProdigyClus
   machineStorageMB.assignItoa(cluster.test.machineStorageMB);
   storageDeviceCount.assignItoa(cluster.test.storageDeviceCount);
   storageDeviceMB.assignItoa(cluster.test.storageDeviceMB);
+  // A private cross-site BGP/MASQUE carrier still has to carry the listener's
+  // standard 1500-byte wormhole underlay.  This is deliberately separate from
+  // the test's container overlay budget and never turns on a public boundary.
+  const bool requirePublicIngressMTU = !cluster.test.enableFakeIpv4Boundary && mothershipClusterBGPEnabled(cluster);
+  bgpUnderlay.assignItoa(requirePublicIngressMTU ? 1 : 0);
   String controlSocketPath = {};
   mothershipResolveTestClusterControlSocketPath(cluster, controlSocketPath);
   Vector<String> arguments = {};
@@ -4907,14 +5202,18 @@ static bool mothershipStartVirtualDatacenterProvider(const MothershipProdigyClus
   arguments.push_back(std::move(storageDeviceCount));
   arguments.push_back(std::move(storageDeviceMB));
   arguments.push_back(std::move(controlSocketPath));
-  if (cluster.test.spareMachineCount != 0 || !cluster.test.fakePublicIngressSourcePreservingIPv4.empty())
+  if (cluster.test.spareMachineCount != 0 || requirePublicIngressMTU ||
+      !cluster.test.fakePublicIngressSourcePreservingIPv4.empty())
   {
     arguments.emplace_back();
     arguments.back().assignItoa(cluster.test.spareMachineCount);
   }
+  if (requirePublicIngressMTU || !cluster.test.fakePublicIngressSourcePreservingIPv4.empty())
+  {
+    arguments.push_back(std::move(bgpUnderlay));
+  }
   if (!cluster.test.fakePublicIngressSourcePreservingIPv4.empty())
   {
-    arguments.emplace_back("0"_ctv); // Reserved BGP-underlay slot in newer providers.
     arguments.push_back(cluster.test.fakePublicIngressSourcePreservingIPv4);
   }
   // Launch first clears the previous disposable workspace. Publish new OS
@@ -5571,6 +5870,632 @@ static bool bootstrapLocalProdigy(
   }
 
   return true;
+}
+
+// The same immutable request is staged on every member.  The local command is
+// part of the approved Mothership bundle; only the controller owns sequencing.
+struct MothershipRemoteRuntimeRecoveryExecutionLock {
+  int fd=-1;
+  ~MothershipRemoteRuntimeRecoveryExecutionLock(){if(fd>=0)::close(fd);}
+  bool acquire(const String& registryPath) {
+    String path=registryPath; path.append(".remote-runtime-recovery-execution.lock"_ctv);
+    fd=::open(path.c_str(),O_CREAT|O_RDWR|O_CLOEXEC|O_NOFOLLOW,0600);
+    struct stat st={};
+    return fd>=0 && ::fstat(fd,&st)==0 && S_ISREG(st.st_mode) && st.st_uid==::geteuid() &&
+        st.st_nlink==1 && (st.st_mode&0077)==0 && ::flock(fd,LOCK_EX|LOCK_NB)==0;
+  }
+};
+struct MothershipRemoteRuntimeRecoveryRequest {
+  uint32_t version = 2;
+  MothershipRemoteRuntimeRecoveryCohortRecord cohort;
+  ClusterTopology topology;
+};
+template <typename S> static void serialize(S&& s, MothershipRemoteRuntimeRecoveryRequest& r) {
+  s.value4b(r.version); s.object(r.cohort); s.object(r.topology);
+}
+struct MothershipRemoteRuntimeRecoveryAbortRequest {
+  uint32_t version=1;
+  String requestSHA256, frozenCohortSHA256;
+  Vector<MothershipRemoteRuntimeRecoveryMember> sources;
+  Vector<uint8_t> restartInhibited;
+  Vector<String> proofFileSHA256;
+};
+template <typename S> static void serialize(S&& s, MothershipRemoteRuntimeRecoveryAbortRequest& r) {
+  s.value4b(r.version); s.text1b(r.requestSHA256,64); s.text1b(r.frozenCohortSHA256,64);
+  s.container(r.sources,3); s.container1b(r.restartInhibited,3);
+  s.container(r.proofFileSHA256,3,[](auto& nested,auto& digest){nested.text1b(digest,64);});
+}
+template <typename S> static void serialize(S&& s, MothershipFrozenServiceTCXWitness& w) {
+  s.object(w.process); s.text1b(w.bootID,36); s.text1b(w.primaryInterface,IF_NAMESIZE);
+  s.value8b(w.bpffsDevice); s.value8b(w.bpffsInode); s.object(w.links[0]); s.object(w.links[1]);
+}
+template <typename S> static void serialize(S&& s, MothershipVDCApplicationIdentity& a) {
+  s.text1b(a.name,128); s.object(a.process); s.value8b(a.storageDevice); s.value8b(a.storageInode);
+}
+struct MothershipRemoteRuntimeRecoveryProof {
+  uint32_t version = 1;
+  String bindingSHA256;
+  uint128_t memberUUID = 0;
+  MothershipFrozenServiceTCXWitness network;
+  Vector<MothershipVDCApplicationIdentity> applications;
+  String stateSHA256, secretsSHA256, snapshotSHA256;
+  uint64_t authorityGeneration = 0;
+};
+template <typename S> static void serialize(S&& s, MothershipRemoteRuntimeRecoveryProof& p) {
+  s.value4b(p.version); s.text1b(p.bindingSHA256,64); s.value16b(p.memberUUID);
+  s.object(p.network); s.container(p.applications,65536);
+  s.text1b(p.stateSHA256,64); s.text1b(p.secretsSHA256,64); s.text1b(p.snapshotSHA256,64);
+  s.value8b(p.authorityGeneration);
+}
+using MothershipRuntimeRecoveryCapturedSource = MothershipRetainedRecovery::RuntimeStartupCapturedSource;
+struct MothershipRuntimeRecoveryCensus {
+  MothershipRetainedRecovery::RuntimeStartupSource source;
+  MothershipRetainedRecoveryMachineInput machine;
+  String rejectedCandidateSHA256;
+};
+template <typename S> static void serialize(S&& s,MothershipRuntimeRecoveryCensus& census) {
+  s.object(census.source);s.object(census.machine);s.text1b(census.rejectedCandidateSHA256,64);
+}
+struct MothershipRuntimeRecoveryPreparedSeal {
+  String requestSHA256,witnessesSHA256,stateSHA256,secretsSHA256,preparedSnapshotSHA256;
+};
+template <typename S> static void serialize(S&& s,MothershipRuntimeRecoveryPreparedSeal& seal) {
+  s.text1b(seal.requestSHA256,64);s.text1b(seal.witnessesSHA256,64);
+  s.text1b(seal.stateSHA256,64);s.text1b(seal.secretsSHA256,64);s.text1b(seal.preparedSnapshotSHA256,64);
+}
+
+static bool mothershipRecoveryInspectLocal(const std::string& command, String& output, String *failure)
+{
+  // The bounded provider capture appends chunks. Each inspection is a fresh
+  // observation, including when its caller reuses a prior digest buffer.
+  output.clear();
+  if (failure) failure->clear();
+  int fds[2] = {-1,-1};
+  if (::pipe2(fds,O_CLOEXEC) != 0) return false;
+  const pid_t child=::fork();
+  if (child==0) {
+    if (::dup2(fds[1],STDOUT_FILENO)<0 || ::dup2(fds[1],STDERR_FILENO)<0) _exit(127);
+    ::close(fds[0]); ::close(fds[1]);
+    ::unsetenv("BASH_ENV");
+    ::execl("/bin/bash","bash","--noprofile","--norc","-euo","pipefail","-c",command.c_str(),nullptr); _exit(127);
+  }
+  ::close(fds[1]);
+  if (child<0) { ::close(fds[0]); return false; }
+  int status=0;
+  return mothershipCaptureVirtualDatacenterProviderOutput(fds[0],child,output,failure,1024*1024,120'000,false,status) &&
+      WIFEXITED(status) && WEXITSTATUS(status)==0;
+}
+
+static bool mothershipRecoveryTreeDigest(const String& path, String& digest, String *failure)
+{
+  using namespace MothershipTidesMigration;
+  if (!mothershipRecoveryInspectLocal(MothershipRetainedRecovery::initialSeedRepairTreeProgram(str(path)),digest,failure)) return false;
+  if (!digest.empty() && digest[digest.size()-1]=='\n') digest.resize(digest.size()-1);
+  return prodigyIsSHA256HexDigest(digest);
+}
+
+// Read the live startup descriptor through its existing memfd owner.  A
+// container's persisted plan supplies only the compact wire's omitted CPU
+// fields; credentials and all transmitted fields come from the live process.
+static bool mothershipRuntimeRecoveryPreparedSealMatches(
+    const MothershipRuntimeRecoveryPreparedSeal& seal,const String& requestSHA256,const String& witnessesSHA256)
+{
+  return prodigyIsSHA256HexDigest(requestSHA256) && prodigyIsSHA256HexDigest(witnessesSHA256) &&
+      seal.requestSHA256==requestSHA256 && seal.witnessesSHA256==witnessesSHA256 &&
+      prodigyIsSHA256HexDigest(seal.preparedSnapshotSHA256) &&
+      prodigyIsSHA256HexDigest(seal.stateSHA256) && prodigyIsSHA256HexDigest(seal.secretsSHA256);
+}
+
+// A cross-cluster MASQUE gateway is a system runtime, so it deliberately has
+// no application startup memfd. Its root-owned recovery record carries the
+// non-secret tuple that binds the retained cgroup to a current durable
+// authority. The record owner validates its fixed layout, mode, and private
+// action token without exposing that token here.
+static bool mothershipRuntimeRecoveryGatewayRecordMatches(
+    const MothershipVDCApplicationIdentity& application,
+    const MothershipVDCProcessIdentity& inspector,
+    const ProdigyPersistentBrainSnapshot& snapshot, uint128_t machineUUID)
+{
+  if (!mothershipVDCProcessMatches(application.process) || !mothershipVDCProcessMatches(inspector) ||
+      snapshot.brainConfig.clusterUUID == 0 || machineUUID == 0)
+    return false;
+  String root = {};
+  root.snprintf<"/proc/{itoa}/root/run/prodigy/containers"_ctv>(inspector.pid);
+  const int rootFD = ::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (rootFD < 0) return false;
+  struct stat metadata = {};
+  const bool rootValid = ::fstat(rootFD, &metadata) == 0 && S_ISDIR(metadata.st_mode) &&
+      metadata.st_uid == 0 && (metadata.st_mode & (S_IWGRP | S_IWOTH)) == 0;
+  if (!rootValid) { ::close(rootFD); return false; }
+
+  const auto& state = snapshot.masterAuthority.runtimeState;
+  uint32_t matches = 0;
+  for (const auto& authority : state.crossClusterMasqueGatewayAuthorities)
+  {
+    if (authority.state != CrossClusterMasqueGatewayState::active ||
+        authority.localClusterUUID != snapshot.brainConfig.clusterUUID ||
+        authority.localMachineUUID != machineUUID ||
+        !prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(authority))
+      continue;
+    if (!state.crossClusterMasqueGatewayAuthorityPairCurrent(authority)) continue;
+    SystemContainerRuntimePlan gateway = {};
+    gateway.kind = SystemContainerKind::crossClusterMasqueGateway;
+    if (!prodigyBindCrossClusterMasqueGatewayRuntimePlanAuthority(gateway, authority) ||
+        !ProdigyGatewayRecovery::matchesRetainedGatewayAt(
+            rootFD, application.name, gateway, snapshot.masterAuthority.containerRuntimeStates))
+      continue;
+    ++matches;
+  }
+  ::close(rootFD);
+  return matches == 1 && mothershipVDCProcessMatches(application.process) &&
+      mothershipVDCProcessMatches(inspector);
+}
+
+static bool mothershipRuntimeRecoveryReadCensus(
+    const Vector<MothershipVDCApplicationIdentity>& applications,
+    const MothershipVDCProcessIdentity& inspector,
+    const ProdigyPersistentBrainSnapshot& snapshot, uint128_t machineUUID,
+    MothershipRetainedRecoveryMachineInput& census, Vector<String>& parameterDigests,
+    String *failure)
+{
+  using namespace MothershipTidesMigration;
+  try {
+    census={}; parameterDigests.clear(); census.machineUUID=machineUUID;
+    for(const auto& assignment:snapshot.masterAuthority.runtimeState.machineFragmentAssignments)
+      if(assignment.machineUUID==machineUUID) {
+        require(census.machineFragment==0,"retained census machine fragment is ambiguous");
+        census.machineFragment=assignment.fragment;
+      }
+    require(census.machineFragment!=0,"retained census machine has no canonical fragment");
+    for (const auto& app:applications) {
+      require(mothershipVDCProcessMatches(app.process),"retained census process changed before parameters read");
+      const auto proc=fs::path("/proc")/std::to_string(app.process.pid);
+      fs::path descriptor;
+      for (const auto& entry:fs::directory_iterator(proc/"fd")) {
+        std::error_code error; const auto link=fs::read_symlink(entry.path(),error);
+        if (!error && link=="/memfd:container.params (deleted)") {
+          require(descriptor.empty(),"retained census has ambiguous startup parameters"); descriptor=entry.path();
+        }
+      }
+      if (descriptor.empty() &&
+          mothershipRuntimeRecoveryGatewayRecordMatches(app, inspector, snapshot, machineUUID))
+      {
+        // System gateway identity is verified above through its root-owned
+        // recovery record and current authority; it has no app startup
+        // parameters and must not enter the application bootstrap census.
+        continue;
+      }
+      String bytes={},digest={}; ContainerParameters parameters={};
+      require(!descriptor.empty() && mothershipVDCRead(text(descriptor.string()),bytes,16*1024*1024) &&
+              prodigyComputeSHA256Hex(bytes,digest,failure) &&
+              ProdigyWire::deserializeStartupContainerParameters(bytes,parameters),
+              "retained census live startup parameters unavailable");
+      String decimal={};decimal.assignItoa(parameters.uuid);
+      require(decimal==app.name,"retained census parameters name another cgroup");
+      auto plan=snapshot.masterAuthority.deploymentPlans.find(parameters.deploymentID);
+      require(plan!=snapshot.masterAuthority.deploymentPlans.end(),"retained census deployment authority absent");
+      prodigyRestoreRetainedStartupCPUFields(bytes,plan->second,parameters);
+      require(mothershipVDCProcessMatches(app.process),"retained census process changed during parameters read");
+      int64_t created=0;
+      for(const auto& runtime:snapshot.masterAuthority.containerRuntimeStates)
+        if(runtime.machineUUID==machineUUID && runtime.plan.uuid==parameters.uuid) {
+          require(created==0,"retained census canonical runtime is ambiguous");created=runtime.plan.createdAtMs;
+        }
+      require(created>0,"retained census canonical creation time absent");
+      census.parameters.push_back(std::move(parameters));census.observedCreatedAtMs.push_back(created);
+      parameterDigests.push_back(std::move(digest));
+    }
+    return true;
+  } catch(const std::exception& error) {if(failure) failure->assign(error.what());return false;}
+}
+
+// Decode legacy captures only with the exact standalone local-state prefix
+// obtained from a canonical sealed source. New captures frame that prefix.
+static bool mothershipRuntimeRecoveryLoadCapturedSource(
+    const String& bytes, const ProdigyPersistentLocalBrainState& canonicalLocal,
+    MothershipRuntimeRecoveryCapturedSource& captured, String *failure)
+{
+  using namespace MothershipRetainedRecovery;
+  String why={};
+  if(decodeRuntimeStartupCapturedSource(bytes,captured,&why) ||
+      decodeLegacyRuntimeStartupCapturedSource(bytes,canonicalLocal,captured,&why)) return true;
+  if(failure)failure->assign("runtime recovery captured startup envelope decode failed"_ctv);
+  return false;
+}
+
+// Public snapshot serialization intentionally omits private authority roots.
+// Recover the full state through the existing paired-store loader on a fresh
+// private copy of the byte-sealed originals. Opening a TidesDB copy may compact
+// it, so an earlier opened copy cannot prove the original file-tree digest.
+static bool mothershipRuntimeRecoveryReadSealedSource(
+    const String& root, const String& originalState, const String& originalSecrets,
+    const MothershipRemoteRuntimeRecoveryProof& proof,
+    ProdigyPersistentLocalBrainState& local, ProdigyPersistentBrainSnapshot& snapshot,
+    String *failure)
+{
+  using namespace MothershipTidesMigration;
+  std::string temporary=str(root)+"/source-read-XXXXXX";bool created=false;
+  const auto cleanup=[&]() {
+    if(!created)return true;
+    std::error_code error={};fs::remove_all(temporary,error);return !error;
+  };
+  try {
+    String sha={},why={};
+    const auto sourceUnchanged=[&]() {
+      return mothershipRecoveryTreeDigest(originalState,sha,&why) && sha==proof.stateSHA256 &&
+          mothershipRecoveryTreeDigest(originalSecrets,sha,&why) && sha==proof.secretsSHA256;
+    };
+    require(sourceUnchanged(),"runtime recovery sealed source changed before private read");
+    require(::mkdtemp(temporary.data())!=nullptr,"runtime recovery temporary source directory unavailable");created=true;
+    const auto statePath=text(temporary+"/state");
+    require(mothershipVDCCopyPrivateStateTree(originalState,statePath,&why) &&
+            mothershipVDCCopyPrivateStateTree(originalSecrets,text(temporary+"/state.secrets"),&why),
+            "runtime recovery sealed private source copy failed");
+    ProdigyPersistentLocalBrainState canonicalLocal={};ProdigyPersistentBrainSnapshot canonicalSnapshot={};
+    {
+      ProdigyPersistentStateStore state(statePath);
+      require(state.loadLocalBrainState(canonicalLocal,&why) && state.loadBrainSnapshot(canonicalSnapshot,&why),
+              "runtime recovery sealed private source load failed");
+      state.close();
+    }
+    require(sourceUnchanged(),"runtime recovery sealed source changed during private read");
+    require(cleanup(),"runtime recovery temporary source cleanup failed");created=false;
+    local=std::move(canonicalLocal);snapshot=std::move(canonicalSnapshot);
+    if(failure)failure->clear();return true;
+  } catch(const std::exception& error) {
+    if(failure)failure->assign(error.what());
+    if(!cleanup() && failure)failure->append("; temporary source cleanup failed"_ctv);
+    return false;
+  }
+}
+
+// Local stopped-state attestation.  This command never opens the live DB and
+// never stops, installs or starts a service.  It may retain existing kernel
+// references only after the controller's exact source cgroup is frozen.
+static bool mothershipRemoteRuntimeRecoveryLocal(const String& root, const String& binding,
+    uint128_t memberUUID, const String& mode, const String& driverBundle, String& output, String *failure)
+{
+  using namespace MothershipTidesMigration;
+  try {
+    require(::geteuid()==0 && prodigyIsSHA256HexDigest(binding),"runtime recovery local authority is invalid");
+    require(std::getenv("PRODIGY_STATE_DB")==nullptr && std::getenv("PRODIGY_STATE_SECRETS_DB")==nullptr,
+            "runtime recovery cannot use live-store environment overrides");
+    pathCheck(str(root));
+    require(fs::canonical(str(root))==fs::path(str(root)),"runtime recovery root is not canonical");
+    struct stat st = {};
+    require(::lstat(str(root).c_str(),&st)==0 && S_ISDIR(st.st_mode) && st.st_uid==0 && (st.st_mode&0777)==0700,
+            "runtime recovery root must be private and root-owned");
+    String requestPath=root; requestPath.append("/request.bin"_ctv);
+    require(::lstat(requestPath.c_str(),&st)==0 && S_ISREG(st.st_mode) && st.st_uid==0 && st.st_nlink==1 && (st.st_mode&0777)==0600,
+            "runtime recovery request ownership is invalid");
+    String bytes={},sha={};
+    require(mothershipVDCRead(requestPath,bytes,16*1024*1024) && prodigyComputeSHA256Hex(bytes,sha,failure) && sha==binding,
+            "runtime recovery request digest differs");
+    MothershipRemoteRuntimeRecoveryRequest request;
+    require(BitseryEngine::deserializeSafe(bytes,request) && (request.version==1 || request.version==2) &&
+            request.cohort.phase==MothershipRemoteRuntimeRecoveryPhase::admitted &&
+            MothershipClusterRegistry::remoteRuntimeRecoveryCohortValid(request.cohort),"runtime recovery request shape is invalid");
+    auto topology=request.topology; BitseryEngine::serialize(bytes,topology);
+    require(prodigyComputeSHA256Hex(bytes,sha,failure) && sha==request.cohort.topologySHA256,"runtime recovery topology binding differs");
+    String operation={}; operation.assignItoh(request.cohort.operationID);
+    require(str(root)=="/var/lib/prodigy/runtime-recovery/"+str(operation),"runtime recovery root does not belong to operation");
+    const MothershipRemoteRuntimeRecoveryMember *member=nullptr;
+    for (const auto& value:request.cohort.members) if(value.machineUUID==memberUUID) member=&value;
+    require(member!=nullptr,"runtime recovery member is absent");
+    String boot={},machineID={};
+    require(mothershipReadLocalBootID(boot) && boot==member->bootID && mothershipVDCRead("/etc/machine-id"_ctv,machineID,64),
+            "runtime recovery boot identity differs");
+    if (!machineID.empty() && machineID[machineID.size()-1]=='\n') machineID.resize(machineID.size()-1);
+    require(machineID==member->linuxMachineID,"runtime recovery machine identity differs");
+    require(prodigyComputeFileSHA256Hex("/proc/self/exe"_ctv,sha,failure),"runtime recovery helper identity unavailable");
+    if(driverBundle.empty()) require(sha==request.cohort.targetMothershipSHA256,
+                                    "runtime recovery helper is not the approved Mothership");
+    else {
+      ProdigyApprovedUpgradeBundle target={},driver={};
+      const auto targetBundle=text(str(root)+"/target-runtime/prodigy.bundle.tar.zst");
+      require(prodigyApproveBundleUpgradeContract(targetBundle,target,failure) && target.verifyRetainedSnapshot(failure) &&
+              target.bundleSHA256==request.cohort.targetBundleSHA256 &&
+              target.contract.contractSHA256==request.cohort.targetContractSHA256 &&
+              target.contract.prodigySHA256==request.cohort.targetProdigySHA256 &&
+              target.contract.mothershipSHA256==request.cohort.targetMothershipSHA256,
+              "runtime recovery helper target differs from immutable request");
+      MothershipUpgradeIdentity identity={}; identity.releaseID=target.contract.releaseID;
+      identity.contractSHA256=target.contract.contractSHA256; identity.prodigySHA256=target.contract.prodigySHA256;
+      identity.mothershipSHA256=target.contract.mothershipSHA256;
+      require(prodigyApproveBundleUpgradeContract(driverBundle,driver,failure) && driver.verifyRetainedSnapshot(failure) &&
+              prodigyValidateRuntimeRecoveryDriver(driver,sha,identity,target.contract.architecture,request.cohort.clusterUUID,failure),
+              "runtime recovery helper is not a separately approved compatible controller");
+      require(str(driverBundle)==str(root)+"/driver-"+str(driver.bundleSHA256).substr(0,16)+"/prodigy.bundle.tar.zst",
+              "runtime recovery helper bundle is outside its operation-bound driver root");
+    }
+    MothershipVDCProcessIdentity inspector={};
+    require(mothershipVDCReadProcess(::getpid(),inspector),"runtime recovery inspector identity is unavailable");
+    const bool capture=mode=="capture"_ctv, active=mode=="active"_ctv;
+    const bool startup=mode=="census"_ctv || mode=="prepare-startup"_ctv || mode=="finalize-startup"_ctv || mode=="publish-startup"_ctv || mode=="verify-startup"_ctv || mode=="verify-prepared"_ctv;
+    require(capture || active || startup || mode=="stopped"_ctv,"runtime recovery inspection mode is invalid");
+    require(!startup || request.version==2,"runtime recovery startup authority requires a fresh version-two operation");
+    String proofPath=root; proofPath.append("/stopped-proof.bin"_ctv);
+    MothershipRemoteRuntimeRecoveryProof proof;
+    if (::lstat(proofPath.c_str(),&st)==0) {
+      require(S_ISREG(st.st_mode) && st.st_uid==0 && st.st_nlink==1 && (st.st_mode&0777)==0600 &&
+              mothershipVDCRead(proofPath,bytes,16*1024*1024) && BitseryEngine::deserializeSafe(bytes,proof) &&
+              proof.version==1 && proof.bindingSHA256==binding && proof.memberUUID==memberUUID,
+              "runtime recovery stopped proof is invalid");
+    } else {
+      require(errno==ENOENT && capture,"runtime recovery stopped proof is absent");
+      proof.bindingSHA256=binding; proof.memberUUID=memberUUID;
+      MothershipVDCProcessIdentity source={};
+      require(mothershipVDCReadProcess(member->sourceProcessPID,source),"runtime recovery source process identity unavailable");
+      require(source.startTime==member->sourceProcessStartTicks,"runtime recovery source process start time changed");
+      require(source.mountNamespace==inspector.mountNamespace,"runtime recovery source mount namespace differs");
+      require(source.networkNamespace==inspector.networkNamespace,"runtime recovery source network namespace differs");
+      require(source.cgroupNamespace==inspector.cgroupNamespace,"runtime recovery source cgroup namespace differs");
+      require(mothershipFrozenServiceCgroup(source),"runtime recovery source service cgroup is not frozen");
+      String cgroup={};
+      require(mothershipVDCReadProcessFile(source.pid,"cgroup",cgroup) && cgroup=="0::/system.slice/prodigy.service\n"_ctv,
+              "runtime recovery source is outside its admitted service cgroup");
+      String exe={}; exe.snprintf<"/proc/{itoa}/exe"_ctv>(source.pid);
+      require(prodigyComputeFileSHA256Hex(exe,sha,failure) && sha==request.cohort.sourceProdigySHA256,
+              "runtime recovery source executable differs");
+      require(mothershipRecoveryTreeDigest("/var/lib/prodigy/state"_ctv,proof.stateSHA256,failure) &&
+              mothershipRecoveryTreeDigest("/var/lib/prodigy/state.secrets"_ctv,proof.secretsSHA256,failure),
+              "runtime recovery original store digest unavailable");
+      // A fresh private directory avoids trusting a partial copy left by a
+      // terminated prior inspector. Original and completed evidence is retained.
+      String copy={}; copy.snprintf<"{}/snapshot-{itoa}-{itoa}"_ctv>(root,uint64_t(::getpid()),Time::msSinceBoot());
+      String secrets=copy; secrets.append(".secrets"_ctv);
+      require(mothershipVDCCopyPrivateStateTree("/var/lib/prodigy/state"_ctv,copy,failure) &&
+              mothershipVDCCopyPrivateStateTree("/var/lib/prodigy/state.secrets"_ctv,secrets,failure),
+              "runtime recovery private store copy failed");
+      ProdigyPersistentStateStore state(copy);
+      ProdigyPersistentLocalBrainState local={}; ProdigyPersistentBrainSnapshot snapshot={};
+      require(state.loadLocalBrainState(local,failure) && state.loadBrainSnapshot(snapshot,failure),
+              "runtime recovery canonical private store loader rejected snapshot");
+      state.close();
+      require(request.version < 2 ?
+          mothershipRuntimeRecoverySnapshotValid(local,snapshot,request.cohort.clusterUUID,memberUUID,request.topology,failure) :
+          mothershipRuntimeRecoveryStartupSnapshotValid(local,snapshot,request.cohort.clusterUUID,memberUUID,request.topology,
+              request.cohort.targetBundleSHA256,request.cohort.sourceBundleSHA256,{},failure),
+              "runtime recovery private snapshot admission failed");
+      proof.authorityGeneration=snapshot.masterAuthority.runtimeState.generation;
+      require(proof.authorityGeneration>=request.cohort.authorityGeneration,"runtime recovery private authority regressed");
+      require(BitseryEngine::serialize(bytes,snapshot) && prodigyComputeSHA256Hex(bytes,proof.snapshotSHA256,failure),
+              "runtime recovery snapshot proof digest failed");
+      require(mothershipVDCReadApplicationIdentities(source,proof.applications,failure),"runtime recovery application inventory unavailable");
+      std::sort(proof.applications.begin(),proof.applications.end(),[](const auto& a,const auto& b){return str(a.name)<str(b.name);});
+      require(mothershipCaptureFrozenServicePrimaryTCX(source,proof.network,failure),"runtime recovery kernel retention failed");
+      require(mothershipRecoveryTreeDigest("/var/lib/prodigy/state"_ctv,sha,failure),
+              "runtime recovery original state digest unavailable after capture");
+      require(sha==proof.stateSHA256,"runtime recovery original state bytes changed during capture");
+      require(mothershipRecoveryTreeDigest("/var/lib/prodigy/state.secrets"_ctv,sha,failure),
+              "runtime recovery original secrets digest unavailable after capture");
+      require(sha==proof.secretsSHA256,"runtime recovery original secrets bytes changed during capture");
+      require(mothershipFrozenServiceCgroup(source),"runtime recovery source cgroup thawed during capture");
+      require(mothershipVDCProcessMatches(source),"runtime recovery source process changed during capture");
+      if(request.version==2) {
+        MothershipRuntimeRecoveryCapturedSource captured={};captured.local=local;
+        captured.snapshotBytes=bytes;captured.privateStatePath=copy;
+        require(mothershipRuntimeRecoveryReadCensus(proof.applications,inspector,snapshot,memberUUID,captured.census,captured.parameterSHA256,failure),
+                "runtime recovery live startup census failed");
+        const auto capturedPath=fs::path(str(root))/"startup-source.bin";
+        if(fs::exists(capturedPath)) {
+          MothershipRetainedRecovery::privateFile(capturedPath.string());
+          MothershipRuntimeRecoveryCapturedSource prior={};String priorBytes=text(read(capturedPath));
+          ProdigyPersistentBrainSnapshot priorSnapshot={};
+          require(mothershipRuntimeRecoveryLoadCapturedSource(priorBytes,local,prior,failure) &&
+                  MothershipRetainedRecovery::restoreRuntimeStartupCapturedAuthority(prior,local,snapshot,priorSnapshot,failure) &&
+                  prodigyPersistentSerializedEqual(prior.local,local) && prior.parameterSHA256==captured.parameterSHA256 &&
+                  prior.census.machineUUID==captured.census.machineUUID && prior.census.machineFragment==captured.census.machineFragment &&
+                  prior.census.observedCreatedAtMs==captured.census.observedCreatedAtMs &&
+                  prior.census.parameters.size()==captured.census.parameters.size(),"runtime recovery partial capture source changed");
+          captured.privateStatePath=prior.privateStatePath;captured.snapshotBytes=prior.snapshotBytes;
+          for(uint32_t index=0;index<captured.census.parameters.size();++index) {
+            const auto& parameters=captured.census.parameters[index];auto plan=snapshot.masterAuthority.deploymentPlans.find(parameters.deploymentID);
+            NeuronContainerBootstrap left={},right={};
+            require(plan!=snapshot.masterAuthority.deploymentPlans.end() &&
+                    prodigyBuildRetainedContainerBootstrap(plan->second,parameters,captured.census.machineFragment,
+                        snapshot.brainConfig.datacenterFragment,captured.census.observedCreatedAtMs[index],left,failure) &&
+                    prodigyBuildRetainedContainerBootstrap(plan->second,prior.census.parameters[index],captured.census.machineFragment,
+                        snapshot.brainConfig.datacenterFragment,captured.census.observedCreatedAtMs[index],right,failure) &&
+                    prodigyPersistentRetainedBootstrapEqual(left,right),"runtime recovery partial capture parameters changed");
+          }
+          require(prodigyComputeSHA256Hex(captured.snapshotBytes,proof.snapshotSHA256,failure),"runtime recovery retained source digest failed");
+        } else {
+          String capturedBytes={};
+          require(MothershipRetainedRecovery::encodeRuntimeStartupCapturedSource(captured,capturedBytes,failure),"runtime recovery startup source encoding failed");
+          require(mothershipVDCDurableWrite(root,"startup-source.bin",capturedBytes,failure),"runtime recovery startup source publication failed");
+        }
+      }
+      BitseryEngine::serialize(bytes,proof);
+      require(mothershipVDCDurableWrite(root,"stopped-proof.bin",bytes,failure),"runtime recovery stopped proof publication failed");
+    }
+    require(prodigyIsSHA256HexDigest(proof.stateSHA256) && prodigyIsSHA256HexDigest(proof.secretsSHA256) &&
+            prodigyIsSHA256HexDigest(proof.snapshotSHA256) && proof.authorityGeneration>=request.cohort.authorityGeneration &&
+            proof.network.bootID==member->bootID && proof.network.process.pid==member->sourceProcessPID &&
+            proof.network.process.startTime==member->sourceProcessStartTicks &&
+            mothershipTCXWitnessLinksAdmissible(proof.network.links),
+            "runtime recovery stopped proof identity differs");
+    require(mothershipVerifyReplacementServicePrimaryTCX(proof.network,inspector,
+            active ? MothershipTCXWitnessVerificationStage::activeTarget : MothershipTCXWitnessVerificationStage::frozenEvidence,
+            failure),"runtime recovery retained kernel identity differs");
+    if (capture) require(mothershipVDCProcessMatches(proof.network.process) && mothershipFrozenServiceCgroup(proof.network.process),
+                        "runtime recovery source thawed or changed");
+    const auto originalState=fs::exists(fs::path(str(root))/"source.state")?text(str(root)+"/source.state"):String("/var/lib/prodigy/state"_ctv);
+    const auto originalSecrets=fs::exists(fs::path(str(root))/"source.secrets")?text(str(root)+"/source.secrets"):String("/var/lib/prodigy/state.secrets"_ctv);
+    if (!active) require(mothershipRecoveryTreeDigest(originalState,sha,failure) && sha==proof.stateSHA256 &&
+                         mothershipRecoveryTreeDigest(originalSecrets,sha,failure) && sha==proof.secretsSHA256,
+                         "runtime recovery original store bytes changed");
+    Vector<MothershipVDCApplicationIdentity> observed;
+    require(mothershipVDCReadApplicationIdentities(inspector,observed,failure),"runtime recovery application inventory changed");
+    std::sort(observed.begin(),observed.end(),[](const auto& a,const auto& b){return str(a.name)<str(b.name);});
+    if (!active) require(observed.size()==proof.applications.size(),"runtime recovery application inventory count changed");
+    for (auto saved:proof.applications) {
+      bool found=false;
+      for(auto current:observed) if(saved.name==current.name) {
+        String left={},right={}; BitseryEngine::serialize(left,saved); BitseryEngine::serialize(right,current);
+        found=left==right; break;
+      }
+      require(found,"runtime recovery retained application identity differs");
+    }
+    if(startup) {
+      using namespace MothershipRetainedRecovery;
+      const auto operationRoot=str(root),privateState=operationRoot+"/state.new10";
+      const auto sourcePath=fs::path(operationRoot)/"startup-source.bin";
+      privateFile(sourcePath.string(),256*1024*1024);
+      MothershipRuntimeRecoveryCapturedSource captured={};ProdigyPersistentBrainSnapshot snapshot={},canonicalSnapshot={};
+      ProdigyPersistentLocalBrainState canonicalLocal={};
+      require(mothershipRuntimeRecoveryReadSealedSource(root,originalState,originalSecrets,proof,canonicalLocal,canonicalSnapshot,failure),
+              "runtime recovery sealed private authority unavailable");
+      require(mothershipRuntimeRecoveryLoadCapturedSource(text(read(sourcePath)),canonicalLocal,captured,failure),
+              "runtime recovery captured startup envelope decode failed");
+      require(prodigyComputeSHA256Hex(captured.snapshotBytes,sha,failure) && sha==proof.snapshotSHA256,
+              "runtime recovery captured startup snapshot digest differs");
+      require(restoreRuntimeStartupCapturedAuthority(captured,canonicalLocal,canonicalSnapshot,snapshot,failure),
+              "runtime recovery captured public authority differs from sealed source");
+      require(captured.local.uuid==memberUUID && captured.local.ownerClusterUUID==request.cohort.clusterUUID,
+              "runtime recovery captured startup local identity differs");
+      require(fs::path(str(captured.privateStatePath)).parent_path()==fs::path(operationRoot) &&
+              fs::path(str(captured.privateStatePath)).filename().string().starts_with("snapshot-"),
+              "runtime recovery captured startup private path differs");
+      MothershipRetainedRecoveryMachineInput current={};Vector<String> currentDigests={};
+      require(mothershipRuntimeRecoveryReadCensus(proof.applications,inspector,snapshot,memberUUID,current,currentDigests,failure) &&
+              currentDigests==captured.parameterSHA256 && current.machineUUID==captured.census.machineUUID &&
+              current.machineFragment==captured.census.machineFragment && current.observedCreatedAtMs==captured.census.observedCreatedAtMs,
+              "runtime recovery live startup parameters changed");
+      MothershipRuntimeRecoveryCensus census={};census.machine=std::move(current);
+      census.source.memberUUID=memberUUID;census.source.stateSHA256=proof.stateSHA256;
+      census.source.secretsSHA256=proof.secretsSHA256;census.source.snapshotSHA256=proof.snapshotSHA256;
+      census.rejectedCandidateSHA256=snapshot.masterAuthority.runtimeState.updateSelf.workerExpectedBundleSHA256;
+      require(prodigyComputeFileSHA256Hex(proofPath,census.source.stoppedProofSHA256,failure),"runtime recovery source proof digest failed");
+      if(mode=="census"_ctv) {
+        require(mothershipVDCProcessMatches(proof.network.process) && mothershipFrozenServiceCgroup(proof.network.process),
+                "runtime recovery census requires its frozen original source");
+        String encoded={};BitseryEngine::serialize(encoded,census);Base64::encode(encoded.data(),encoded.size(),output);return true;
+      }
+      const auto startupPath=fs::path(operationRoot)/"startup-request.bin";
+      String startupSHA={};
+      RuntimeStartupRequest startupRequest={};
+      require(loadRuntimeStartupRequest(startupPath.string(),startupRequest,startupSHA,failure) && startupRequest.bindingSHA256==binding &&
+              startupRequest.clusterUUID==request.cohort.clusterUUID && startupRequest.targetBundleSHA256==request.cohort.targetBundleSHA256 &&
+              (request.version < 2 || startupRequest.version==1 ||
+               startupRequest.sourceBundleSHA256==request.cohort.sourceBundleSHA256) &&
+              startupRequest.topology==request.topology,"runtime recovery startup request binding differs");
+      const auto* localSource=runtimeStartupSourceForMember(startupRequest,memberUUID);
+      require(localSource && localSource->stoppedProofSHA256==census.source.stoppedProofSHA256 &&
+              localSource->stateSHA256==proof.stateSHA256 && localSource->secretsSHA256==proof.secretsSHA256 &&
+              localSource->snapshotSHA256==proof.snapshotSHA256,"runtime recovery startup request source proof differs");
+      const MothershipRetainedRecoveryMachineInput *requestedCensus=nullptr;
+      for(const auto& machine:startupRequest.machines) if(machine.machineUUID==memberUUID) requestedCensus=&machine;
+      require(requestedCensus && requestedCensus->machineFragment==census.machine.machineFragment &&
+              requestedCensus->observedCreatedAtMs==census.machine.observedCreatedAtMs &&
+              requestedCensus->parameters.size()==census.machine.parameters.size(),"runtime recovery requested local census differs");
+      for(uint32_t index=0;index<census.machine.parameters.size();++index) {
+        const auto& parameters=census.machine.parameters[index];const auto& requested=requestedCensus->parameters[index];
+        auto plan=snapshot.masterAuthority.deploymentPlans.find(parameters.deploymentID);
+        NeuronContainerBootstrap left={},right={};
+        require(plan!=snapshot.masterAuthority.deploymentPlans.end() &&
+                prodigyBuildRetainedContainerBootstrap(plan->second,parameters,census.machine.machineFragment,
+                    snapshot.brainConfig.datacenterFragment,census.machine.observedCreatedAtMs[index],left,failure) &&
+                prodigyBuildRetainedContainerBootstrap(plan->second,requested,census.machine.machineFragment,
+                    snapshot.brainConfig.datacenterFragment,census.machine.observedCreatedAtMs[index],right,failure) &&
+                prodigyPersistentRetainedBootstrapEqual(left,right),"runtime recovery requested local parameters differ from live memfd");
+      }
+      if(mode=="prepare-startup"_ctv || mode=="finalize-startup"_ctv || mode=="verify-prepared"_ctv) {
+        require(mode=="verify-prepared"_ctv || (mothershipVDCProcessMatches(proof.network.process) && mothershipFrozenServiceCgroup(proof.network.process)),
+                "runtime recovery preparation requires its frozen original source");
+        const auto existingSeal=fs::path(operationRoot)/"startup-prepared.bin";
+        if(fs::exists(existingSeal)) {
+          privateFile(existingSeal.string());MothershipRuntimeRecoveryPreparedSeal seal={};String sealBytes=text(read(existingSeal));
+          const auto witnessesPath=fs::path(operationRoot)/"startup-witnesses.bin";privateFile(witnessesPath.string());
+          String witnessBytes=text(read(witnessesPath));WitnessSet witnesses={};
+          require(BitseryEngine::deserializeSafe(sealBytes,seal) && seal.requestSHA256==startupSHA &&
+                  prodigyComputeSHA256Hex(witnessBytes,sha,failure) && sha==seal.witnessesSHA256 &&
+                  BitseryEngine::deserializeSafe(witnessBytes,witnesses) && witnesses.requestSHA==startupSHA &&
+                  mothershipRecoveryTreeDigest(text(privateState),sha,failure) && sha==seal.stateSHA256 &&
+                  mothershipRecoveryTreeDigest(text(privateState+".secrets"),sha,failure) && sha==seal.secretsSHA256,
+                  "runtime recovery sealed preparation changed");
+          if(mode=="prepare-startup"_ctv) {
+            RuntimeStartupPrepared prepared={};prepared.requestSHA256=startupSHA;prepared.sourceSnapshotSHA256=proof.snapshotSHA256;
+            prepared.preparedSnapshotSHA256=seal.preparedSnapshotSHA256;prepared.candidateWitnesses=std::move(witnesses);
+            String encoded={};BitseryEngine::serialize(encoded,prepared);Base64::encode(encoded.data(),encoded.size(),output);
+          } else require(prodigyComputeSHA256Hex(sealBytes,output,failure),"runtime recovery prepared seal digest unavailable");
+          return true;
+        }
+        require(mode!="verify-prepared"_ctv,"runtime recovery prepared seal is absent");
+        for(const auto& suffix:{std::string(),std::string(".secrets")}) {
+          const auto destination=privateState+suffix;
+          if(!fs::exists(destination)) require(mothershipVDCCopyPrivateStateTree(text(str(captured.privateStatePath)+suffix),text(destination),failure),
+                                             "runtime recovery private preparation copy failed");
+        }
+        RuntimeStartupPrepared prepared={};
+        if(mode=="prepare-startup"_ctv) {
+          require(prepareRuntimeStartupPrivate(startupRequest,captured.local,snapshot,memberUUID,startupSHA,proof.snapshotSHA256,
+                      operationRoot,privateState,prepared,failure),"runtime recovery startup authority preparation rejected");
+          String encoded={};BitseryEngine::serialize(encoded,prepared);Base64::encode(encoded.data(),encoded.size(),output);return true;
+        }
+        const auto witnessesPath=fs::path(operationRoot)/"startup-witnesses.bin";
+        privateFile(witnessesPath.string(),16*1024*1024);String witnessBytes=text(read(witnessesPath));WitnessSet witnesses={};
+        require(BitseryEngine::deserializeSafe(witnessBytes,witnesses) && witnesses.requestSHA==startupSHA &&
+                finalizeRuntimeStartupPrivate(startupRequest,captured.local,snapshot,memberUUID,startupSHA,proof.snapshotSHA256,
+                    operationRoot,privateState,witnesses,prepared,failure),"runtime recovery shared startup witnesses rejected");
+        MothershipRuntimeRecoveryPreparedSeal seal={};seal.requestSHA256=startupSHA;seal.preparedSnapshotSHA256=prepared.preparedSnapshotSHA256;
+        require(prodigyComputeSHA256Hex(witnessBytes,seal.witnessesSHA256,failure) &&
+                mothershipRecoveryTreeDigest(text(privateState),seal.stateSHA256,failure) &&
+                mothershipRecoveryTreeDigest(text(privateState+".secrets"),seal.secretsSHA256,failure),"runtime recovery prepared store digest failed");
+        String sealBytes={};BitseryEngine::serialize(sealBytes,seal);
+        const auto sealPath=fs::path(operationRoot)/"startup-prepared.bin";
+        if(fs::exists(sealPath)) {privateFile(sealPath.string());require(text(read(sealPath))==sealBytes,"runtime recovery prepared store seal changed");}
+        else require(mothershipVDCDurableWrite(root,"startup-prepared.bin",sealBytes,failure),"runtime recovery prepared store seal publication failed");
+        require(prodigyComputeSHA256Hex(sealBytes,output,failure),"runtime recovery prepared seal digest failed");return true;
+      }
+      // Publication is a separate stopped-state effect; no live database is
+      // opened while Prodigy runs. Original stores remain at sealed backups.
+      String stopped={};require(mothershipRecoveryInspectLocal("test \"$(systemctl show -p MainPID --value prodigy)\" = 0; ! pgrep -x prodigy",stopped,failure),
+                                "runtime recovery startup publication requires all local writers stopped");
+      const auto sealPath=fs::path(operationRoot)/"startup-prepared.bin";privateFile(sealPath.string());
+      MothershipRuntimeRecoveryPreparedSeal seal={};String sealBytes=text(read(sealPath));
+      require(BitseryEngine::deserializeSafe(sealBytes,seal) && seal.requestSHA256==startupSHA &&
+              prodigyComputeFileSHA256Hex(text(operationRoot+"/startup-witnesses.bin"),sha,failure) && sha==seal.witnessesSHA256,
+              "runtime recovery prepared publication binding differs");
+      Vector<MothershipTidesDBMigrationDatabase> databases={};
+      for(unsigned index=0;index<2;++index) {
+        const auto prepared=privateState+(index?".secrets":""),live=std::string("/var/lib/prodigy/state")+(index?".secrets":"");
+        const auto retained=operationRoot+(index?"/source.secrets":"/source.state");
+        const auto selected=fs::exists(prepared)?prepared:live;
+        require(mothershipRecoveryTreeDigest(text(selected),sha,failure) && sha==(index?seal.secretsSHA256:seal.stateSHA256),
+                "runtime recovery prepared store changed before publication");
+        MothershipTidesDBMigrationDatabase db={};db.livePath=text(live);db.retainedV9Path=text(retained);db.preparedV10Path=text(prepared);
+        databases.push_back(std::move(db));
+        if(mode!="publish-startup"_ctv) require(fs::exists(retained) && fs::exists(live) && !fs::exists(prepared),"runtime recovery startup publication is incomplete");
+      }
+      if(mode=="publish-startup"_ctv) publishPreparedPairedRecoveryDatabases(databases,
+          [](const auto&,const String& path) {
+            struct stat metadata={};const auto name=str(path);
+            if(::lstat(name.c_str(),&metadata)!=0) {require(errno==ENOENT,"runtime recovery store metadata unavailable");return false;}
+            require(S_ISDIR(metadata.st_mode) && metadata.st_uid==0,"runtime recovery store path is not an owned directory");return true;
+          },
+          [](const auto&,const String& from,const String& to,String *why) {
+            const auto source=str(from),destination=str(to);struct stat sourceInfo={},parentInfo={},exists={};
+            if(::lstat(destination.c_str(),&exists)==0 || errno!=ENOENT || ::lstat(source.c_str(),&sourceInfo)!=0 ||
+                !S_ISDIR(sourceInfo.st_mode) || ::stat(fs::path(destination).parent_path().c_str(),&parentInfo)!=0 ||
+                sourceInfo.st_dev!=parentInfo.st_dev || ::rename(source.c_str(),destination.c_str())!=0) {
+              if(why) why->assign("runtime recovery same-filesystem rename refused");return false;
+            }
+            for(const auto& parent:{fs::path(source).parent_path(),fs::path(destination).parent_path()}) {
+              const int fd=::open(parent.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
+              if(fd<0) return false;const bool synced=::fsync(fd)==0;::close(fd);if(!synced)return false;
+            }
+            return true;
+          },[]{});
+      output=seal.requestSHA256;return true;
+    }
+    String inventorySHA={},networkSHA={};
+    BitseryEngine::serialize(bytes,proof.applications); require(prodigyComputeSHA256Hex(bytes,inventorySHA,failure),"inventory digest failed");
+    BitseryEngine::serialize(bytes,proof.network); require(prodigyComputeSHA256Hex(bytes,networkSHA,failure),"network digest failed");
+    output.clear(); output.append(proof.stateSHA256); output.append(' '); output.append(proof.secretsSHA256); output.append(' ');
+    output.append(inventorySHA); output.append(' '); output.append(proof.snapshotSHA256); output.append(' '); output.append(networkSHA);
+    return true;
+  } catch (const std::exception& e) { if(failure && failure->empty()) failure->assign(e.what()); return false; }
 }
 
 class MothershipSocket {
@@ -7983,6 +8908,23 @@ private:
     return true;
   }
 
+  bool validateClusterNativeExactDNSCredentialReference(const MothershipProdigyCluster& cluster, String& failure, MothershipProviderCredential *credentialOut = nullptr)
+  {
+    MothershipProviderCredential credential = {};
+    if (validateClusterDNSProviderCredentialReference(cluster, failure, &credential) == false) return false;
+    auto scope = credential.metadata.find("dnsScope"_ctv);
+    auto records = credential.metadata.find("dnsRecords"_ctv);
+    if (scope == credential.metadata.end() || records == credential.metadata.end() ||
+        scope->second.equal("native-exact"_ctv) == false || records->second.empty())
+    {
+      failure.assign("cluster DNS credential requires native-exact dnsScope with declared dnsRecords"_ctv);
+      return false;
+    }
+    if (credentialOut) *credentialOut = std::move(credential);
+    failure.clear();
+    return true;
+  }
+
   static void inferClusterMachineSchemaCpuCapabilities(BrainIaaS& provider,
                                                        CoroutineStack *coro,
                                                        const MothershipProdigyCluster& cluster,
@@ -9243,7 +10185,8 @@ private:
     if (expected.truthRetirementStartedGeneration == 0) return true;
     // This receipt identifies the verified cleanup; it does not itself prove
     // absence. The caller reaches here only after the lifecycle owner has
-    // verified exact provider IDs absent and membership/graph cleanup passed.
+    // verified destruction of created machines or cleanup of the exact adopted
+    // or test runtimes, and membership/graph cleanup passed.
     String bytes;
     bytes.assign("PRODIGY-TRUTH-OWNER-CLUSTER-REMOVAL-v1\n"_ctv);
     auto binding = expected;
@@ -9572,8 +10515,25 @@ private:
     return true;
   }
 
+  bool requireGlobalSingleWriterControlVersion(String& failure)
+  {
+    Message::construct(socket.wBuffer,MothershipTopic::pullClusterReport);
+    if (!socket.send()) { failure=socket.ioFailureDetail(); socket.close(); return false; }
+    auto* response=socket.recvExpectedTopic(MothershipTopic::pullClusterReport,1024);
+    String bytes; ClusterStatusReport report;
+    if (response) {
+      auto* args=response->args;
+      Message::extractToStringView(args,bytes);
+      if (args==response->terminal() && BitseryEngine::deserializeSafe(bytes,report) &&
+          mothershipGlobalSingleWriterControlVersionSupported(report)) return true;
+    }
+    failure.assign("global single-writer requires an authenticated current master running Prodigy 67 or newer"_ctv);
+    socket.close(); return false;
+  }
+
   template <typename Request, typename Response>
-  bool requestTopicRoundTrip(MothershipTopic topic, const Request& request, Response& response, String& failure)
+  bool requestTopicRoundTrip(MothershipTopic topic, const Request& request, Response& response, String& failure,
+                            bool requireGlobalSingleWriter = false)
   {
     response = {};
     String topicName = {};
@@ -9591,6 +10551,8 @@ private:
       }
       return false;
     }
+
+    if (requireGlobalSingleWriter && !requireGlobalSingleWriterControlVersion(failure)) return false;
 
     String serializedRequest = {};
     Request requestCopy = request;
@@ -11723,10 +12685,11 @@ private:
         operatorAcceptedActiveWorkloadInterruption && registeredCluster != nullptr &&
         registeredCluster->clusterUUID == report.clusterUUID &&
         (registeredCluster->deploymentMode == MothershipClusterDeploymentMode::remote ||
-         registeredCluster->deploymentMode == MothershipClusterDeploymentMode::local) &&
+         registeredCluster->deploymentMode == MothershipClusterDeploymentMode::local ||
+         (registeredCluster->deploymentMode == MothershipClusterDeploymentMode::test && registeredCluster->test.specified)) &&
         report.activeDeploymentCount != 0;
     if (operatorAcceptedActiveWorkloadInterruption && !input.operatorAcceptedActiveWorkloadInterruption)
-      failure.assign("active-workload interruption acceptance requires an exact registered local or remote cluster with active deployments"_ctv);
+      failure.assign("active-workload interruption acceptance requires an exact registered cluster with active deployments"_ctv);
     input.overlapCapacityAvailable =
         (report.activeDeploymentCount == 0 || input.operatorAcceptedActiveWorkloadInterruption) &&
         report.stagingCapacityComplete && report.requiredStagingBytes == targetBundle.contract.requiredFreeBytes &&
@@ -12541,6 +13504,100 @@ private:
     printManagedCluster(desiredCluster);
   }
 
+  // Correct logical placement labels on already-adopted remote members. The
+  // reconciliation owner reads current Brain topology and admits only exact
+  // unchanged adopted identities before emitting a rack-only AddMachines update.
+  void runUpdateAdoptedMachineRacks(int argc, char *argv[])
+  {
+    if (argc != 2)
+    {
+      basics_log("usage: updateAdoptedMachineRacks [remote cluster name|UUID] [json|-|@path]\n");
+      exit(EXIT_FAILURE);
+    }
+    String failure = {};
+    MothershipProdigyCluster controlCluster = {};
+    if (loadRemoteClusterMutationTarget("updateAdoptedMachineRacks", argv[0], controlCluster, failure) == false)
+    {
+      basics_log("updateAdoptedMachineRacks success=0 identity=%s failure=%s\n", argv[0], failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    String json = {};
+    if (resolveJSONArgument("updateAdoptedMachineRacks", argv[1], json) == false) exit(EXIT_FAILURE);
+    json.need(simdjson::SIMDJSON_PADDING);
+    simdjson::dom::parser parser;
+    simdjson::dom::element doc;
+    if (parser.parse(json.data(), json.size()).get(doc) || doc.type() != simdjson::dom::element_type::ARRAY)
+    {
+      basics_log("updateAdoptedMachineRacks requires a JSON array\n");
+      exit(EXIT_FAILURE);
+    }
+    struct RackUpdate { uint128_t machineUUID = 0; uint32_t rackUUID = 0; };
+    Vector<RackUpdate> updates = {};
+    for (auto item : doc.get_array())
+    {
+      if (item.type() != simdjson::dom::element_type::OBJECT)
+      { basics_log("updateAdoptedMachineRacks[] requires object\n"); exit(EXIT_FAILURE); }
+      RackUpdate update = {};
+      bool sawMachineUUID = false, sawRackUUID = false;
+      for (auto field : item.get_object())
+      {
+        String key = {}; key.setInvariant(field.key.data(), field.key.size());
+        if (key.equal("machineUUID"_ctv))
+        {
+          String identity = {};
+          if (sawMachineUUID || field.value.type() != simdjson::dom::element_type::STRING)
+          { basics_log("updateAdoptedMachineRacks[].machineUUID requires one canonical UUID string\n"); exit(EXIT_FAILURE); }
+          identity.setInvariant(field.value.get_c_str());
+          if (prodigyParseCanonicalHex128(identity, update.machineUUID) == false || update.machineUUID == 0)
+          { basics_log("updateAdoptedMachineRacks[].machineUUID invalid\n"); exit(EXIT_FAILURE); }
+          sawMachineUUID = true;
+        }
+        else if (key.equal("rackUUID"_ctv))
+        {
+          uint64_t rackUUID = 0;
+          if (sawRackUUID || (field.value.type() != simdjson::dom::element_type::INT64 && field.value.type() != simdjson::dom::element_type::UINT64) ||
+              field.value.get(rackUUID) != simdjson::SUCCESS || rackUUID == 0 || rackUUID > UINT32_MAX)
+          { basics_log("updateAdoptedMachineRacks[].rackUUID requires uint32 in 1..%u\n", UINT32_MAX); exit(EXIT_FAILURE); }
+          update.rackUUID = uint32_t(rackUUID); sawRackUUID = true;
+        }
+        else { basics_log("updateAdoptedMachineRacks[] invalid field\n"); exit(EXIT_FAILURE); }
+      }
+      if (sawMachineUUID == false || sawRackUUID == false)
+      { basics_log("updateAdoptedMachineRacks[] requires machineUUID and rackUUID\n"); exit(EXIT_FAILURE); }
+      for (const RackUpdate& prior : updates)
+        if (prior.machineUUID == update.machineUUID)
+        { basics_log("updateAdoptedMachineRacks duplicate machineUUID\n"); exit(EXIT_FAILURE); }
+      updates.push_back(update);
+    }
+    if (updates.empty()) { basics_log("updateAdoptedMachineRacks requires at least one update\n"); exit(EXIT_FAILURE); }
+
+    MothershipProdigyCluster desiredCluster = controlCluster;
+    for (const RackUpdate& update : updates)
+    {
+      MothershipProdigyClusterMachine *machine = nullptr;
+      for (MothershipProdigyClusterMachine& candidate : desiredCluster.machines)
+      {
+        if (candidate.uuid != update.machineUUID) continue;
+        if (machine != nullptr)
+        { basics_log("updateAdoptedMachineRacks success=0 name=%s failure=machine UUID is ambiguous\n", controlCluster.name.c_str()); exit(EXIT_FAILURE); }
+        machine = &candidate;
+      }
+      if (machine == nullptr || machine->source != MothershipClusterMachineSource::adopted)
+      { basics_log("updateAdoptedMachineRacks success=0 name=%s failure=machine UUID is not an adopted member\n", controlCluster.name.c_str()); exit(EXIT_FAILURE); }
+      machine->rackUUID = update.rackUUID;
+    }
+    AddMachines request = {};
+    bool changed = false;
+    if (applyAndPersistScopedClusterMutation(controlCluster, desiredCluster, request, changed, failure) == false)
+    {
+      basics_log("updateAdoptedMachineRacks success=0 name=%s failure=%s\n", controlCluster.name.c_str(), failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    basics_log("updateAdoptedMachineRacks success=1 name=%s changed=%d requested=%u topologyVersion=%llu topologyMachines=%u\n",
+               desiredCluster.name.c_str(), int(changed), unsigned(request.adoptedMachines.size()),
+               (unsigned long long)desiredCluster.topology.version, unsigned(desiredCluster.topology.machines.size()));
+  }
+
   void runSetTestClusterMachineCount(int argc, char *argv[])
   {
     if (argc < 2)
@@ -12766,6 +13823,1145 @@ private:
         (unsigned long long)(machineUUID >> 64), (unsigned long long)machineUUID,
         (unsigned long long)topologyVersion, failure.c_str());
     if (!submitted) exit(EXIT_FAILURE);
+  }
+
+  // Recovery commands are deliberately routed through the registered topology
+  // here rather than accepting a caller-provided address.  The caller supplies
+  // its immutable member UUID and includes its pinned identity predicate in
+  // `command`; a transport retry never widens that authority to another host.
+  bool remoteRuntimeRecoveryCommand(const MothershipProdigyCluster& cluster,
+                                    uint128_t machineUUID, const String& command,
+                                    String *output, String& failure,
+                                    const String *uploadSource = nullptr,
+                                    const String *uploadDestination = nullptr)
+  {
+    MothershipProdigyClusterMachine target = {};
+    uint32_t matches = 0;
+    for (const ClusterMachine& machine : cluster.topology.machines)
+      if (machine.uuid == machineUUID && machine.isBrain)
+      {
+        ++matches;
+        mothershipPopulateRemoveMachineFromTopology(machine, target);
+        mothershipHydrateTopologyRemoteCandidateSSH(cluster, target);
+      }
+    if (matches != 1 || target.ssh.address.empty() || target.ssh.hostPublicKeyOpenSSH.empty() ||
+        target.ssh.port == 0 || target.ssh.user != "root"_ctv)
+    {
+      failure.assign("remote runtime recovery member is not one exact pinned registered root SSH Brain"_ctv);
+      return false;
+    }
+    LIBSSH2_SESSION *session = nullptr;
+    int fd = -1;
+    if (!mothershipConnectSSHSession(target, session, fd, &failure,
+                                     &cluster.bootstrapSshKeyPackage, &cluster.bootstrapSshPrivateKeyPath)) return false;
+    const bool uploaded = !uploadSource || (uploadDestination &&
+        prodigyUploadLocalFileToSSHSession(session, fd, *uploadSource, *uploadDestination, 0600, &failure, 120'000));
+    const bool okay = uploaded && prodigyRunBlockingSSHCommand(session, fd, command, output, &failure, 120'000);
+    mothershipCloseSSHSession(session, fd);
+    return okay;
+  }
+
+  // Large attested commands retain the same exact script and predicates;
+  // publish their bytes privately through the existing SSH upload owner rather
+  // than exceeding libssh2's exec-packet bound with repeated shell quoting.
+  bool remoteRuntimeRecoveryScript(const MothershipProdigyCluster& cluster,
+      const MothershipRemoteRuntimeRecoveryMember& member,const String& command,
+      const std::string& localRoot,const std::string& remoteRoot,
+      String *output,String& failure)
+  {
+    using namespace MothershipTidesMigration;
+    if(command.size()<LIBSSH2_PACKET_MAXCOMP-1024)
+      return remoteRuntimeRecoveryCommand(cluster,member.machineUUID,command,output,failure);
+    if(command.size()>256*1024) {failure.assign("recovery script exceeds bounded publication size"_ctv);return false;}
+    String digest={};
+    if(!prodigyComputeSHA256Hex(command,digest,&failure)) return false;
+    const auto name="command-"+str(digest)+".sh";
+    const auto local=fs::path(localRoot)/name; const auto remote=remoteRoot+"/"+name;
+    String localPath=text(local.string()),remotePath=text(remote);
+    if(fs::exists(local)) {
+      String prior={};if(!mothershipVDCRead(localPath,prior,256*1024) || prior!=command) {
+        failure.assign("recovery script publication conflicts"_ctv);return false;
+      }
+    } else if(!mothershipVDCDurableWrite(text(localRoot),name.c_str(),command,&failure)) return false;
+    const auto guard="test \"$(cat /etc/machine-id)\" = "+quote(str(member.linuxMachineID))+
+        "; test \"$(cat /proc/sys/kernel/random/boot_id)\" = "+quote(str(member.bootID))+
+        "; test -d "+quote(remoteRoot)+"; test ! -L "+quote(remoteRoot)+
+        "; test \"$(stat -c '%u:%a' "+quote(remoteRoot)+")\" = 0:700; test ! -L "+quote(remote)+
+        "; if test -e "+quote(remote)+"; then test -f "+quote(remote)+"; test \"$(stat -c '%u:%a:%h' "+quote(remote)+")\" = 0:600:1; fi; ";
+    if(!remoteRuntimeRecoveryCommand(cluster,member.machineUUID,text(remoteRecoveryStrictShell(guard)),nullptr,failure)) return false;
+    if(!remoteRuntimeRecoveryCommand(cluster,member.machineUUID,"true"_ctv,nullptr,failure,&localPath,&remotePath)) return false;
+    const auto execute=guard+"test -f "+quote(remote)+"; test \"$(stat -c '%u:%a:%h' "+quote(remote)+")\" = 0:600:1; test \"$(sha256sum "+quote(remote)+
+        " | cut -d' ' -f1)\" = "+quote(str(digest))+"; exec env -u BASH_ENV bash --noprofile --norc -euo pipefail "+quote(remote);
+    return remoteRuntimeRecoveryCommand(cluster,member.machineUUID,text(remoteRecoveryStrictShell(execute)),output,failure);
+  }
+
+  // This is intentionally an observation, not a service operation.  Its
+  // double systemd PID read prevents an admitted source identity from being
+  // assembled across a restart, and its exact cgroup check binds the main
+  // executable to the service cohort that later phases may freeze.
+  template<typename SourceIdentity>
+  bool observeRemoteRuntimeRecoverySource(const MothershipProdigyCluster& cluster,
+                                          uint128_t machineUUID, const String& runtimeRoot,
+                                          const SourceIdentity& admission,
+                                          MothershipRemoteRuntimeRecoveryMember& member,
+                                          String& failure)
+  {
+    using namespace MothershipTidesMigration;
+    if (runtimeRoot.empty() || runtimeRoot[0] != '/')
+    {
+      failure.assign("remote runtime recovery root is not absolute"_ctv);
+      return false;
+    }
+    const std::string program=R"PY(python3 - <<'REMOTE_RUNTIME'
+import hashlib,json,os,pathlib,re,subprocess
+p=pathlib.Path
+root=p(os.environ['PRODIGY_RECOVERY_RUNTIME_ROOT'])
+def value(k): return subprocess.check_output(['systemctl','show','-p',k,'--value','prodigy'],text=True).strip()
+assert value('ActiveState')=='active' and value('FragmentPath')=='/etc/systemd/system/prodigy.service'
+assert re.findall(r'path=([^ ;]+)',value('ExecStart'))==[str(root/'prodigy')]
+pid=int(value('MainPID')); assert pid>1
+def starttime(): return int(p('/proc',str(pid),'stat').read_text().rsplit(')',1)[1].split()[19])
+start=starttime()
+cg=p('/proc',str(pid),'cgroup').read_text().splitlines(); assert cg==['0::/system.slice/prodigy.service']
+def sha(path):
+ with path.open('rb') as f:return hashlib.file_digest(f,'sha256').hexdigest()
+env=dict(v.split(b'=',1) for v in p('/proc',str(pid),'environ').read_bytes().split(b'\0') if v)
+assert env.get(b'PRODIGY_STATE_DB',b'/var/lib/prodigy/state')==b'/var/lib/prodigy/state'
+assert env.get(b'PRODIGY_STATE_SECRETS_DB',b'/var/lib/prodigy/state.secrets')==b'/var/lib/prodigy/state.secrets'
+print(json.dumps(dict(machineID=p('/etc/machine-id').read_text().strip(),bootID=p('/proc/sys/kernel/random/boot_id').read_text().strip(),pid=str(pid),start=str(start),runtimeSHA=sha(p('/proc',str(pid),'exe')),installedSHA=sha(root/'prodigy'),bundleSHA=sha(root/'prodigy.bundle.tar.zst')),sort_keys=True))
+assert int(value('MainPID'))==pid
+assert starttime()==start
+REMOTE_RUNTIME
+)PY";
+    std::string command="PRODIGY_RECOVERY_RUNTIME_ROOT="+quote(str(runtimeRoot))+" "+program;
+    String output = {};
+    if (!remoteRuntimeRecoveryCommand(cluster,machineUUID,text(command),&output,failure)) return false;
+    try
+    {
+      simdjson::dom::parser parser; simdjson::dom::element doc;
+      require(parser.parse(output.data(),output.size()).get(doc) == simdjson::SUCCESS, "remote runtime recovery observation JSON is invalid");
+      const String machineID=text(field(doc,"machineID")), bootID=text(field(doc,"bootID"));
+      const std::string pid=field(doc,"pid"), start=field(doc,"start");
+      uint64_t parsedPID=0, parsedStart=0;
+      require(mothershipVDCParseUnsigned(pid.data(),pid.data()+pid.size(),parsedPID) && parsedPID>1 &&
+              mothershipVDCParseUnsigned(start.data(),start.data()+start.size(),parsedStart) && parsedStart>0,
+              "remote runtime recovery source process identity is invalid");
+      require(text(field(doc,"runtimeSHA"))==admission.sourceProdigySHA256 &&
+              text(field(doc,"bundleSHA"))==admission.sourceBundleSHA256 &&
+              text(field(doc,"runtimeSHA"))==text(field(doc,"installedSHA")),
+              "remote runtime recovery source executable identity differs");
+      member.machineUUID=machineUUID; member.linuxMachineID=machineID; member.bootID=bootID;
+      member.sourceProcessPID=parsedPID; member.sourceProcessStartTicks=parsedStart;
+      require(MothershipClusterRegistry::remoteRuntimeRecoveryMemberIdentityValid(member),
+              "remote runtime recovery source machine or process identity is invalid");
+      return true;
+    }
+    catch (const std::exception& error)
+    {
+      failure.assign(error.what());
+      return false;
+    }
+  }
+
+  void runRemoteRuntimeRecoveryLocal(int argc,char *argv[])
+  {
+    String root=argc>0?String(argv[0]):String(), binding=argc>1?String(argv[1]):String();
+    String member=argc>2?String(argv[2]):String(), mode=argc>3?String(argv[3]):String();
+    const bool separateDriver=argc==6 && std::strcmp(argv[4],"--driver-bundle")==0;
+    String driverBundle=separateDriver?String(argv[5]):String();
+    String failure={},output={}; uint128_t uuid=0;
+    if ((argc!=4 && !separateDriver) || !prodigyParseCanonicalHex128(member,uuid) ||
+        !mothershipRemoteRuntimeRecoveryLocal(root,binding,uuid,mode,driverBundle,output,&failure)) {
+      basics_log("remoteRuntimeRecoveryLocal success=0 failure=%s\n",failure.c_str()); exit(EXIT_FAILURE);
+    }
+    std::printf("%s\n",output.c_str());
+  }
+
+  // A cohort replacement is a separate, explicit recovery operation. It uses
+  // ordinary upgrade admission before fencing and adds durable stopped-store,
+  // application and kernel witnesses. No member may start until all members
+  // have the admitted target installed; a controller retry resumes this record.
+  bool verifyRestoredRemoteRuntimeRecoveryParent(
+      const MothershipProdigyCluster& cluster, const MothershipRemoteRuntimeRecoveryCohortRecord& parent,
+      const MothershipUpgradeAdmissionRecord& childAdmission, const String& registryPath,
+      Vector<MothershipRemoteRuntimeRecoveryMember>& currentMembers,
+      Vector<String>& restorationReceipts, ClusterTopology& parentTopology, String& failure)
+  {
+    using namespace MothershipTidesMigration;
+    try {
+      const auto parentOperation=parent.operationID;
+      require(parent.phase==MothershipRemoteRuntimeRecoveryPhase::frozen &&
+              MothershipClusterRegistry::remoteRuntimeRecoveryAllProofsSealed(parent),
+              "recovery handoff requires sealed never-installed parent");
+      String operation={};operation.assignItoh(parentOperation);
+      const auto localRoot=fs::path(str(registryPath)).parent_path()/"runtime-recovery"/str(operation);
+      MothershipRetainedRecovery::privateFile(localRoot/"request.bin");
+      MothershipRetainedRecovery::privateFile(localRoot/"abort-before-installation.bin");
+      String originalBytes=text(read(localRoot/"request.bin")),abortBytes=text(read(localRoot/"abort-before-installation.bin"));
+      MothershipRemoteRuntimeRecoveryRequest original={};MothershipRemoteRuntimeRecoveryAbortRequest abort={};
+      String binding={},parentBytes={},parentSHA={},abortSHA={};BitseryEngine::serialize(parentBytes,parent);
+      require(BitseryEngine::deserializeSafe(originalBytes,original) && (original.version==1 || original.version==2) &&
+              MothershipClusterRegistry::remoteRuntimeRecoveryIdentityMatches(original.cohort,parent) &&
+              BitseryEngine::deserializeSafe(abortBytes,abort) && abort.version==1 &&
+              prodigyComputeSHA256Hex(originalBytes,binding,&failure) &&
+              prodigyComputeSHA256Hex(parentBytes,parentSHA,&failure) &&
+              prodigyComputeSHA256Hex(abortBytes,abortSHA,&failure) &&
+              abort.requestSHA256==binding && abort.frozenCohortSHA256==parentSHA &&
+              abort.sources.size()==3 && abort.restartInhibited.size()==3 && abort.proofFileSHA256.size()==3,
+              "recovery handoff restored-parent binding differs");
+      String originalTopologyBytes={},originalTopologySHA={};
+      require(BitseryEngine::serialize(originalTopologyBytes,original.topology) &&
+              prodigyComputeSHA256Hex(originalTopologyBytes,originalTopologySHA,&failure) &&
+              originalTopologySHA==parent.topologySHA256,
+              "recovery handoff original parent topology digest differs");
+      parentTopology=original.topology;
+      currentMembers.clear();restorationReceipts.clear();
+      const auto root="/var/lib/prodigy/runtime-recovery/"+str(operation);
+      for(uint32_t index=0;index<3;++index) {
+        const auto& saved=parent.members[index];const auto& restored=abort.sources[index];
+        MothershipRemoteRuntimeRecoveryMember current={};
+        require(observeRemoteRuntimeRecoverySource(cluster,saved.machineUUID,parent.runtimeRoot,childAdmission,current,failure) &&
+                current.machineUUID==restored.machineUUID && current.linuxMachineID==saved.linuxMachineID &&
+                current.bootID==saved.bootID && current.linuxMachineID==restored.linuxMachineID &&
+                current.bootID==restored.bootID && current.sourceProcessPID==restored.sourceProcessPID &&
+                current.sourceProcessStartTicks==restored.sourceProcessStartTicks && abort.restartInhibited[index]<=1 &&
+                prodigyIsSHA256HexDigest(abort.proofFileSHA256[index]),
+                "recovery handoff source differs from restored same-boot identity");
+        std::string verify="test -d "+quote(root)+"; test ! -L "+quote(root)+
+            "; test \"$(stat -c '%u:%a' "+quote(root)+")\" = 0:700; ";
+        for(const auto name:{"source-runtime","remote-recovery-quiesced","remote-recovery-installed","remote-recovery-activation-ready","remote-recovery-started"})
+          for(const auto suffix:{"",".new"}) {
+            const auto path=root+"/"+name+suffix;verify+="test ! -e "+quote(path)+"; test ! -L "+quote(path)+"; ";
+          }
+        for(const auto& entry:std::array<std::pair<std::string,std::string>,2>{{
+            {"request.bin",str(binding)},{"stopped-proof.bin",str(abort.proofFileSHA256[index])}}})
+          verify+="test -f "+quote(root+"/"+entry.first)+"; test ! -L "+quote(root+"/"+entry.first)+
+              "; test \"$(stat -c '%u:%a:%h' "+quote(root+"/"+entry.first)+")\" = 0:600:1; test \"$(sha256sum "+
+              quote(root+"/"+entry.first)+" | cut -d' ' -f1)\" = "+quote(entry.second)+"; ";
+        verify+=runtimeStartupUnfencePredicate(root,str(binding),"/etc/systemd/system/prodigy.service.d",abort.restartInhibited[index]!=0)+
+            remoteRecoveryMarkerPredicate(root+"/remote-recovery-aborted-before-installation",str(abortSHA))+
+            "systemctl is-active --quiet prodigy; test \"$(systemctl show -p MainPID --value prodigy)\" = "+std::to_string(current.sourceProcessPID)+
+            "; test \"$(awk '$1 == \"frozen\" { print $2 }' /sys/fs/cgroup/system.slice/prodigy.service/cgroup.events)\" = 0; ";
+        String ignored={};require(remoteRuntimeRecoveryCommand(cluster,current.machineUUID,text(remoteRecoveryStrictShell(verify)),&ignored,failure),
+                                 "recovery handoff parent effect reconciliation failed");
+        String material=abortSHA;material.append('\0');String memberBytes={};BitseryEngine::serialize(memberBytes,current);
+        material.append(memberBytes);material.append(abort.proofFileSHA256[index]);String receipt={};
+        require(prodigyComputeSHA256Hex(material,receipt,&failure),"recovery handoff receipt digest failed");
+        currentMembers.push_back(std::move(current));restorationReceipts.push_back(std::move(receipt));
+      }
+      return true;
+    } catch(const std::exception& error) {if(failure.empty())failure.assign(error.what());return false;}
+  }
+
+  void runRecoverRemoteClusterRuntime(int argc,char *argv[])
+  {
+    using namespace MothershipTidesMigration;
+    using Phase=MothershipRemoteRuntimeRecoveryPhase;
+    String failure={}; MothershipRemoteRuntimeRecoveryCohortRecord record={};
+    try {
+      require(argc>=4 && std::strcmp(argv[3],"--accept-cohort-interruption")==0,
+              "usage: recoverRemoteClusterRuntime CLUSTER APPROVED_BUNDLE OPERATION_ID --accept-cohort-interruption [--check] [--driver-bundle APPROVED_CONTROLLER_BUNDLE] [--handoff-before-installation PARENT_OPERATION_ID|--successor-after-activation PARENT_OPERATION_ID]");
+      bool check=false, activationSuccessor=false; String driverInput={},parentText={}; uint128_t parentOperation=0;
+      for(int i=4;i<argc;++i) {
+        if(std::strcmp(argv[i],"--check")==0 && !check) check=true;
+        else if(std::strcmp(argv[i],"--driver-bundle")==0 && driverInput.empty() && i+1<argc) driverInput.assign(argv[++i]);
+        else if(std::strcmp(argv[i],"--handoff-before-installation")==0 && parentText.empty() && i+1<argc) parentText.assign(argv[++i]);
+        else if(std::strcmp(argv[i],"--successor-after-activation")==0 && parentText.empty() && i+1<argc) { parentText.assign(argv[++i]); activationSuccessor=true; }
+        else require(false,"invalid or repeated recovery controller option");
+      }
+      require(parentText.empty() || (prodigyParseCanonicalHex128(parentText,parentOperation) && parentOperation),"recovery parent operation ID invalid");
+      String identity(argv[0]), bundleInput(argv[1]), operationText(argv[2]);
+      uint128_t operation=0;
+      require(prodigyParseCanonicalHex128(operationText,operation) && operation!=0,"recovery operation ID is invalid");
+      MothershipProdigyCluster cluster={};
+      require(loadClusterForScopedMutation("recoverRemoteClusterRuntime",identity,cluster,failure) &&
+              cluster.deploymentMode==MothershipClusterDeploymentMode::remote && cluster.provider==MothershipClusterProvider::vultr &&
+              cluster.nBrains==3 && cluster.topology.machines.size()==3,"recovery requires one registered three-Brain remote cluster");
+      pathCheck(str(cluster.remoteProdigyPath));
+      String registryPath={}; { auto registry=openClusterRegistry(); registryPath=registry.path(); }
+      MothershipRemoteRuntimeRecoveryExecutionLock lock;
+      require(lock.acquire(registryPath),"another runtime recovery executor is active or lock ownership is invalid");
+      MachineCpuArchitecture architecture=MachineCpuArchitecture::unknown;
+      String bundlePath={}; ProdigyApprovedUpgradeBundle approved={},approvedDriver={};
+      require(resolveProdigyBundleTargetArchitecture(identity.c_str(),architecture,&failure) &&
+              prodigyResolveBundleArtifactInput(bundleInput,architecture,bundlePath,&failure) &&
+              prodigyApproveBundleUpgradeContract(bundlePath,approved,&failure) && approved.verifyRetainedSnapshot(&failure),
+              "recovery target bundle approval failed");
+      require(approved.contract.minimumHealthyBrains <= cluster.nBrains && approved.contract.requiredFreeBytes != 0,
+              "recovery target quorum or capacity policy does not fit the registered cohort");
+      String driverSHA={};
+      require(prodigyComputeFileSHA256Hex("/proc/self/exe"_ctv,driverSHA,&failure),"recovery controller identity unavailable");
+      if(driverInput.empty()) require(driverSHA==approved.contract.mothershipSHA256,
+              "recovery must execute the target Mothership or name a separately approved compatible driver bundle");
+      else {
+        String driverPath={};
+        MothershipUpgradeIdentity targetIdentity={};
+        targetIdentity.releaseID=approved.contract.releaseID; targetIdentity.contractSHA256=approved.contract.contractSHA256;
+        targetIdentity.prodigySHA256=approved.contract.prodigySHA256; targetIdentity.mothershipSHA256=approved.contract.mothershipSHA256;
+        String architectureName={}; architectureName.assign(machineCpuArchitectureName(architecture));
+        require(prodigyResolveBundleArtifactInput(driverInput,architecture,driverPath,&failure) &&
+                prodigyApproveBundleUpgradeContract(driverPath,approvedDriver,&failure) && approvedDriver.verifyRetainedSnapshot(&failure) &&
+                prodigyValidateRuntimeRecoveryDriver(approvedDriver,driverSHA,targetIdentity,architectureName,cluster.clusterUUID,&failure),
+                "recovery controller artifact or exact target compatibility is unqualified");
+        basics_log("recoverRemoteClusterRuntime controllerBundleSHA256=%s controllerSHA256=%s targetBundleSHA256=%s\n",
+                   approvedDriver.bundleSHA256.c_str(),driverSHA.c_str(),approved.bundleSHA256.c_str());
+      }
+      MothershipUpgradeAdmissionRecord admission={};
+      MothershipRemoteRuntimeRecoveryHandoffRecord handoff={};
+      MothershipRemoteRuntimeRecoveryCohortRecord activationParent={};
+      bool recorded=false,handedOff=false;
+      {
+        auto registry=openClusterRegistry();
+        if (activationSuccessor) {
+          require(parentOperation && registry.loadRemoteRuntimeRecoveryCohort(cluster.clusterUUID,parentOperation,activationParent,&failure) &&
+                  activationParent.phase==Phase::activationStarted &&
+                  MothershipClusterRegistry::remoteRuntimeRecoveryAllProofsSealed(activationParent) &&
+                  MothershipClusterRegistry::remoteRuntimeRecoveryAllMembersInstalled(activationParent),
+                  "post-activation successor requires an installed phase-six parent");
+          String architectureName = {}; architectureName.assign(machineCpuArchitectureName(architecture));
+          require(prodigyValidateRuntimeRecoveryTarget(approved, architectureName, cluster.clusterUUID, &failure),
+                  "post-activation successor release policy is unqualified");
+          bool declaredSource = false;
+          for (const auto& source : approved.contract.sources)
+            declaredSource |= source.contractSHA256 == activationParent.targetContractSHA256 &&
+                source.prodigySHA256 == activationParent.targetProdigySHA256 &&
+                source.mothershipSHA256 == activationParent.targetMothershipSHA256;
+          require(declaredSource, "post-activation successor policy does not name the installed parent release");
+        } else require(registry.loadUpgradeAdmission(cluster.clusterUUID,operation,admission,&failure) && admission.eligible &&
+                (admission.approvedPath==uint8_t(MothershipUpgradePath::sameLogicalRollout) ||
+                 admission.approvedPath==uint8_t(MothershipUpgradePath::sameLogicalCohortRecovery)) &&
+                admission.targetBundleSHA256==approved.bundleSHA256 && admission.targetContractSHA256==approved.contract.contractSHA256,
+                "recovery lacks exact eligible immutable upgrade admission");
+        recorded=registry.loadRemoteRuntimeRecoveryCohort(cluster.clusterUUID,operation,record,&failure);
+        require(recorded || failure=="record not found"_ctv,"recovery record is unreadable or invalid");
+        failure.clear();
+        handedOff=registry.loadRemoteRuntimeRecoveryHandoffForChild(cluster.clusterUUID,operation,handoff,&failure);
+        require(handedOff || failure=="record not found"_ctv,"recovery handoff record is invalid");failure.clear();
+        if(handedOff && recorded) {
+          MothershipRemoteRuntimeRecoveryCohortRecord parent={};bool superseded=false;
+          require(registry.loadRemoteRuntimeRecoveryCohort(cluster.clusterUUID,handoff.parentOperationID,parent,&failure) &&
+                  registry.remoteRuntimeRecoveryParentSuperseded(parent,superseded,&failure) && superseded,
+                  "recovery child lost its immutable parent handoff");
+        }
+        if(recorded && (record.phase==Phase::frozen || record.phase==Phase::activationStarted)) {bool superseded=false;require(registry.remoteRuntimeRecoveryParentSuperseded(record,superseded,&failure) && !superseded,"recovery operation was handed off; resume its recorded child");}
+      }
+      require(!handedOff || (parentOperation==handoff.parentOperationID &&
+              activationSuccessor==(handoff.version>=3 && handoff.kind==MothershipRemoteRuntimeRecoveryHandoffRecord::Kind::activationStarted) &&
+              MothershipClusterRegistry::remoteRuntimeRecoveryParentToDeclaredTopologyValid(handoff.declaredTopology,cluster.topology)),
+              "recovery child registered configuration differs from its declared handoff");
+      require(!parentOperation || parentOperation!=operation,"recovery cannot hand off to itself");
+      require(driverInput.empty() || recorded,"a separate recovery controller may only resume an existing immutable operation");
+      auto currentTopology=handedOff?handoff.observedTopology:cluster.topology;
+      // Startup can persist a newer hardware observation. Replay the original
+      // request and its proofs while validating the current declaration's
+      // unchanged configuration through the shared observation comparison.
+      if(recorded && !handedOff) {
+        String canonical={};canonical.assignItoh(operation);
+        const auto immutableRequest=fs::path(str(registryPath)).parent_path()/"runtime-recovery"/str(canonical)/"request.bin";
+        if(fs::exists(immutableRequest)) {
+          MothershipRetainedRecovery::privateFile(immutableRequest);
+          MothershipRemoteRuntimeRecoveryRequest original={};
+          require(BitseryEngine::deserializeSafe(text(read(immutableRequest)),original) &&
+                  (original.version==1 || original.version==2) &&
+                  original.cohort.phase==Phase::admitted && MothershipClusterRegistry::remoteRuntimeRecoveryCohortValid(original.cohort) &&
+                  MothershipClusterRegistry::remoteRuntimeRecoveryIdentityMatches(original.cohort,record) &&
+                  MothershipClusterRegistry::remoteRuntimeRecoveryParentToDeclaredTopologyValid(original.topology,cluster.topology),
+                  "recovery immutable topology or current registered configuration differs");
+          currentTopology=original.topology;
+        } else require(record.phase==Phase::admitted,"recovery immutable request is missing after staging");
+      }
+      if(parentOperation && !handedOff) {ClusterCreateHooks hooks(this);
+        require(hooks.fetchSeedTopology(cluster,currentTopology,&failure) &&
+            MothershipClusterRegistry::remoteRuntimeRecoveryRackOnlyTopologyDriftValid(cluster.topology,currentTopology),
+            "recovery handoff topology differs beyond declared rack placement");}
+      String topologyBytes={},topologySHA={},admissionBytes={},admissionSHA={};
+      BitseryEngine::serialize(topologyBytes,currentTopology);
+      if (!activationSuccessor) BitseryEngine::serialize(admissionBytes,admission);
+      require(prodigyComputeSHA256Hex(topologyBytes,topologySHA,&failure) &&
+              (activationSuccessor || prodigyComputeSHA256Hex(admissionBytes,admissionSHA,&failure)),
+              "recovery authority binding digest failed");
+      const auto preflight=[&]() {
+        ClusterTopology observed={}; ClusterCreateHooks hooks(this);
+        // Process recovery applies to registered adopted machines as well as
+        // created machines. Validate the durable authorization projection;
+        // provider hard-reboot authority is neither needed nor exercised.
+        require(hooks.fetchSeedTopology(cluster,observed,&failure) && observed==currentTopology &&
+                mothershipValidateObservedMachineAuthorizationProjection(cluster.topology,observed,&failure),
+                "recovery authenticated topology or machine authorization differs");
+        if (activationSuccessor) {
+          require(approved.contract.requiredFreeBytes != 0, "recovery target lacks a staging-capacity bound");
+          const auto capacity = "import os,sys; required=int(sys.argv[1]); paths=sys.argv[2:]; "
+              "assert all(os.statvfs(p).f_bavail*os.statvfs(p).f_frsize>=required for p in paths)";
+          for (const auto& machine : currentTopology.machines) {
+            const auto command = "python3 -c " + quote(capacity) + " " +
+                std::to_string(approved.contract.requiredFreeBytes) + " " + quote(str(cluster.remoteProdigyPath)) + " /var/lib/prodigy";
+            require(remoteRuntimeRecoveryCommand(cluster,machine.uuid,text(command),nullptr,failure),
+                    "post-activation successor current member staging capacity is insufficient");
+          }
+          return;
+        }
+        require(configureControlTarget(identity.c_str(),&failure),"recovery control target unavailable");
+        ProdigyUpgradeAdmissionReportRequest request={}; request.operationID=operationText;
+        request.targetBundleSHA256=approved.bundleSHA256; request.targetContractSHA256=approved.contract.contractSHA256;
+        request.requiredStagingBytes=approved.contract.requiredFreeBytes;
+        MothershipUpgradeAdmissionReport report={}; MothershipUpgradePlannerInput input={};
+        require(request.requiredStagingBytes!=0 && validateFreshRuntimeUpgradeAdmission(approved,admission,architecture,&cluster,
+                  request,true,report,input,failure,RuntimeAdmissionValidation::executeCohortRecovery),
+                "recovery fresh typed upgrade admission failed");
+      };
+      if (!recorded) {
+        preflight();
+        record.clusterUUID=cluster.clusterUUID; record.operationID=operation; record.runtimeRoot=cluster.remoteProdigyPath;
+        record.authorityGeneration=activationSuccessor?activationParent.authorityGeneration:admission.authorityGeneration;
+        record.cohortInterruptionAccepted=true; record.topologySHA256=topologySHA;
+        record.sourceBundleSHA256=activationSuccessor?activationParent.targetBundleSHA256:admission.sourceBundleSHA256;
+        record.sourceContractSHA256=activationSuccessor?activationParent.targetContractSHA256:admission.sourceContractSHA256;
+        record.sourceProdigySHA256=activationSuccessor?activationParent.targetProdigySHA256:admission.sourceProdigySHA256;
+        record.sourceMothershipSHA256=activationSuccessor?activationParent.targetMothershipSHA256:admission.sourceMothershipSHA256;
+        record.targetBundleSHA256=approved.bundleSHA256; record.targetContractSHA256=approved.contract.contractSHA256;
+        record.targetProdigySHA256=approved.contract.prodigySHA256; record.targetMothershipSHA256=approved.contract.mothershipSHA256;
+        for(const auto& machine:currentTopology.machines) {
+          MothershipRemoteRuntimeRecoveryMember member={};
+          require(observeRemoteRuntimeRecoverySource(cluster,machine.uuid,cluster.remoteProdigyPath,record,member,failure),
+                  "recovery source member observation failed");
+          record.members.push_back(std::move(member));
+        }
+      }
+      if (activationSuccessor)
+        require(MothershipClusterRegistry::remoteRuntimeRecoveryActivationBindingDigest(activationParent,record,admissionSHA,&failure),
+                "post-activation successor authority binding digest failed");
+      if (!recorded) record.admissionRecordSHA256=admissionSHA;
+      require(record.topologySHA256==topologySHA && record.admissionRecordSHA256==admissionSHA &&
+              record.runtimeRoot==cluster.remoteProdigyPath && record.targetBundleSHA256==approved.bundleSHA256 &&
+              record.targetProdigySHA256==approved.contract.prodigySHA256 && record.targetMothershipSHA256==approved.contract.mothershipSHA256,
+              "recovery immutable record differs from registered topology, admission or target artifacts");
+      const auto prepareHandoff=[&](MothershipClusterRegistry& registry) {
+        MothershipRemoteRuntimeRecoveryCohortRecord parent={};
+        Vector<MothershipRemoteRuntimeRecoveryMember> restored={};Vector<String> receipts={};
+        require(registry.loadRemoteRuntimeRecoveryCohort(cluster.clusterUUID,parentOperation,parent,&failure),"recovery parent unavailable");
+        if (activationSuccessor) {
+          using namespace MothershipRetainedRecovery;
+          require(parent.phase==Phase::activationStarted && parent.operationID==activationParent.operationID,
+                  "post-activation successor parent changed");
+          String parentBytes={}, parentText={}; BitseryEngine::serialize(parentBytes,parent);
+          String parentOperationText={}; parentOperationText.assignItoh(parentOperation);
+          const auto parentRoot=fs::path(str(registryPath)).parent_path()/"runtime-recovery"/str(parentOperationText);
+          const auto digestPrivate=[&](const char *name,String& result) {
+            const auto path=parentRoot/name; MothershipRetainedRecovery::privateFile(path.string());
+            require(prodigyComputeFileSHA256Hex(text(path.string()),result,&failure),"post-activation parent evidence digest failed");
+          };
+          MothershipRemoteRuntimeRecoveryRequest parentRequest={};
+          RuntimeStartupRequest parentStartup={}; WitnessSet parentWitnesses={}; String parentRequestBytes={};
+          const auto requestPath=parentRoot/"request.bin", startupPath=parentRoot/"startup-request.bin", witnessesPath=parentRoot/"startup-witnesses.bin";
+          MothershipRetainedRecovery::privateFile(requestPath.string()); MothershipRetainedRecovery::privateFile(startupPath.string()); MothershipRetainedRecovery::privateFile(witnessesPath.string());
+          parentRequestBytes=text(read(requestPath));
+          String parentRequestSHA={},parentStartupSHA={},parentTopologyBytes={},parentTopologySHA={};
+          require(prodigyComputeSHA256Hex(parentRequestBytes,parentRequestSHA,&failure) &&
+                  prodigyComputeFileSHA256Hex(text(startupPath.string()),parentStartupSHA,&failure) &&
+                  BitseryEngine::deserializeSafe(parentRequestBytes,parentRequest) &&
+                  (parentRequest.version==1 || parentRequest.version==2) && parentRequest.cohort.phase==Phase::admitted &&
+                  MothershipClusterRegistry::remoteRuntimeRecoveryIdentityMatches(parentRequest.cohort,parent) &&
+                  BitseryEngine::serialize(parentTopologyBytes,parentRequest.topology) &&
+                  prodigyComputeSHA256Hex(parentTopologyBytes,parentTopologySHA,&failure) && parentTopologySHA==parent.topologySHA256 &&
+                  BitseryEngine::deserializeSafe(text(read(startupPath)),parentStartup) && runtimeStartupRequestValid(parentStartup,&failure) &&
+                  parentStartup.bindingSHA256==parentRequestSHA && parentStartup.clusterUUID==parent.clusterUUID &&
+                  parentStartup.targetBundleSHA256==parent.targetBundleSHA256 &&
+                  (parentStartup.version==1 || parentStartup.sourceBundleSHA256==parent.sourceBundleSHA256) &&
+                  parentStartup.topology==parentRequest.topology &&
+                  BitseryEngine::deserializeSafe(text(read(witnessesPath)),parentWitnesses) &&
+                  parentWitnesses.requestSHA==parentStartupSHA && parentWitnesses.witnesses.size()==3,
+                  "post-activation parent request or startup witness is invalid");
+          for (const auto& member : parent.members) {
+            const auto *source=runtimeStartupSourceForMember(parentStartup,member.machineUUID);
+            require(source && source->stateSHA256==member.stateSHA256 && source->secretsSHA256==member.secretsSHA256 &&
+                    source->snapshotSHA256==member.privateLoaderSHA256,
+                    "post-activation parent startup source differs from sealed capture");
+          }
+          handoff.version=3; handoff.kind=MothershipRemoteRuntimeRecoveryHandoffRecord::Kind::activationStarted;
+          handoff.clusterUUID=cluster.clusterUUID; handoff.parentOperationID=parentOperation; handoff.childOperationID=operation;
+          handoff.parentTopology=parentRequest.topology; handoff.declaredTopology=cluster.topology; handoff.observedTopology=currentTopology;
+          handoff.childAdmissionSHA256=admissionSHA;
+          digestPrivate("request.bin",handoff.parentRequestSHA256);
+          digestPrivate("startup-request.bin",handoff.parentStartupRequestSHA256);
+          digestPrivate("startup-witnesses.bin",handoff.parentStartupWitnessesSHA256);
+          // The three private archives must agree with the controller's
+          // immutable evidence before that evidence may authorize a successor.
+          const auto archiveRoot="/var/lib/prodigy/runtime-recovery/"+str(parentOperationText);
+          for (const auto& member : record.members) {
+            const auto verifyArchive="test \"$(cat /etc/machine-id)\" = "+quote(str(member.linuxMachineID))+
+                "; test \"$(sha256sum "+quote(archiveRoot+"/request.bin")+" | cut -d' ' -f1)\" = "+quote(str(handoff.parentRequestSHA256))+
+                "; test \"$(sha256sum "+quote(archiveRoot+"/startup-request.bin")+" | cut -d' ' -f1)\" = "+quote(str(handoff.parentStartupRequestSHA256))+
+                "; test \"$(sha256sum "+quote(archiveRoot+"/startup-witnesses.bin")+" | cut -d' ' -f1)\" = "+quote(str(handoff.parentStartupWitnessesSHA256))+"; ";
+            const auto sealPath=archiveRoot+"/startup-prepared.bin";
+            String encodedSeal={},sealBytes={}; MothershipRuntimeRecoveryPreparedSeal seal={};
+            const auto readSeal=verifyArchive+"test ! -L "+quote(sealPath)+"; test \"$(stat -c '%u:%a:%h' "+quote(sealPath)+
+                ")\" = 0:600:1; base64 -w0 "+quote(sealPath);
+            require(remoteRuntimeRecoveryCommand(cluster,member.machineUUID,text(remoteRecoveryStrictShell(readSeal)),&encodedSeal,failure) &&
+                    Base64::decode(encodedSeal,sealBytes) && BitseryEngine::deserializeSafe(sealBytes,seal) &&
+                    mothershipRuntimeRecoveryPreparedSealMatches(seal,handoff.parentStartupRequestSHA256,handoff.parentStartupWitnessesSHA256),
+                    "post-activation parent member archive or prepared witness seal differs");
+          }
+          for (const auto& member : record.members) { String bytes={},receipt={}; BitseryEngine::serialize(bytes,member);
+            require(prodigyComputeSHA256Hex(bytes,receipt,&failure),"post-activation current identity receipt failed"); receipts.push_back(std::move(receipt)); }
+          handoff.restorationReceiptSHA256=std::move(receipts);
+          require(prodigyComputeSHA256Hex(parentBytes,handoff.parentCohortSHA256,&failure) &&
+                  MothershipClusterRegistry::remoteRuntimeRecoveryInitialCohortDigest(record,handoff.childCohortSHA256,&failure),
+                  "post-activation successor identity digest failed");
+          return;
+        }
+        require(verifyRestoredRemoteRuntimeRecoveryParent(cluster,parent,admission,registryPath,restored,receipts,handoff.parentTopology,failure),
+                "recovery parent restoration verification failed");
+        for(uint32_t index=0;index<3;++index) {String left={},right={};BitseryEngine::serialize(left,restored[index]);BitseryEngine::serialize(right,record.members[index]);
+          require(left==right,"recovery current identities changed during handoff");}
+        String parentBytes={};BitseryEngine::serialize(parentBytes,parent);
+        handoff.clusterUUID=cluster.clusterUUID;handoff.parentOperationID=parentOperation;handoff.childOperationID=operation;
+        handoff.declaredTopology=cluster.topology;handoff.observedTopology=currentTopology;handoff.childAdmissionSHA256=admissionSHA;
+        handoff.restorationReceiptSHA256=std::move(receipts);
+        require(prodigyComputeSHA256Hex(parentBytes,handoff.parentCohortSHA256,&failure) &&
+                MothershipClusterRegistry::remoteRuntimeRecoveryInitialCohortDigest(record,handoff.childCohortSHA256,&failure),"recovery handoff identity digest failed");
+        basics_log("recoverRemoteClusterRuntime handoffParentTopologyVersion=%llu declaredTopologyVersion=%llu observedTopologyVersion=%llu\n",
+                   static_cast<unsigned long long>(handoff.parentTopology.version),
+                   static_cast<unsigned long long>(handoff.declaredTopology.version),
+                   static_cast<unsigned long long>(handoff.observedTopology.version));
+      };
+      if(check) {
+        require(record.phase<Phase::fenced,"live recovery is already fenced; resume its exact operation");
+        preflight();
+        if(parentOperation && !recorded) {
+          auto registry=openClusterRegistry();prepareHandoff(registry);
+          require(registry.validateRemoteRuntimeRecoveryHandoff(handoff,cluster,record,&failure),"recovery check handoff validation failed");
+        }
+        if(record.phase==Phase::staged) {
+          auto initial=record; initial.phase=Phase::admitted;
+          for(auto& member:initial.members) member.phaseReceipts.clear();
+          MothershipRemoteRuntimeRecoveryRequest request; request.cohort=initial; request.topology=currentTopology;
+          String bytes={},binding={},canonical={}; BitseryEngine::serialize(bytes,request); canonical.assignItoh(operation);
+          require(prodigyComputeSHA256Hex(bytes,binding,&failure),"recovery check binding digest failed");
+          const auto root="/var/lib/prodigy/runtime-recovery/"+str(canonical),fence=root+"/writers-fenced";
+          for(const auto& member:record.members) {
+            auto probe="test ! -L "+quote(fence)+"; if test -e "+quote(fence)+"; then "+
+                runtimeStartupFencePredicate(root,str(binding),"/etc/systemd/system/prodigy.service.d",true)+"fi; ";
+            for(const auto suffix:{"/remote-recovery-fenced","/remote-recovery-fenced.new"}) {
+              const auto marker=root+suffix;
+              probe+="test ! -L "+quote(marker)+"; if test -e "+quote(marker)+"; then "+
+                  remoteRecoveryMarkerPredicate(marker,str(binding))+runtimeStartupFencePredicate(root,str(binding),"/etc/systemd/system/prodigy.service.d",true)+"fi; ";
+            }
+            require(remoteRuntimeRecoveryCommand(cluster,member.machineUUID,text(remoteRecoveryStrictShell(probe)),nullptr,failure),
+                    "recovery check found an invalid partial startup fence");
+          }
+        }
+        basics_log("recoverRemoteClusterRuntime success=1 checked=1 dispatched=0 operationID=%s phase=%u\n",operationText.c_str(),unsigned(record.phase));
+        return;
+      }
+      if(!recorded) {
+        auto registry=openClusterRegistry(); MothershipRemoteRuntimeRecoveryCohortRecord saved={}; bool resumed=false;
+        if(parentOperation) {
+          prepareHandoff(registry);
+          MothershipRemoteRuntimeRecoveryHandoffRecord linked={};
+          require(registry.admitRemoteRuntimeRecoveryHandoff(handoff,cluster,record,linked,saved,resumed,&failure),"recovery handoff admission failed");
+          handoff=std::move(linked);handedOff=true;
+        } else require(registry.admitRemoteRuntimeRecoveryCohort(record,cluster,saved,resumed,&failure),"recovery cohort admission failed");
+        record=std::move(saved);
+      }
+      auto initial=record; initial.phase=Phase::admitted;
+      for(auto& member:initial.members) {
+        member.stateSHA256.clear(); member.secretsSHA256.clear(); member.containerInventorySHA256.clear();
+        member.privateLoaderSHA256.clear(); member.retainedNetworkSHA256.clear(); member.targetRuntimeInstalled=false; member.phaseReceipts.clear();
+      }
+      MothershipRemoteRuntimeRecoveryRequest request; request.cohort=initial; request.topology=currentTopology;
+      String requestBytes={},binding={}; BitseryEngine::serialize(requestBytes,request);
+      require(prodigyComputeSHA256Hex(requestBytes,binding,&failure),"recovery request digest failed");
+      String canonicalOperation={}; canonicalOperation.assignItoh(operation);
+      const std::string root="/var/lib/prodigy/runtime-recovery/"+str(canonicalOperation), target=root+"/target-runtime";
+      const std::string runtime=str(cluster.remoteProdigyPath), retained=root+"/source-runtime", cg="/sys/fs/cgroup/system.slice/prodigy.service";
+      const std::string inspectionRoot=driverInput.empty()?target:root+"/driver-"+str(approvedDriver.bundleSHA256).substr(0,16);
+      const auto localRoot=fs::path(str(registryPath)).parent_path()/"runtime-recovery"/str(canonicalOperation);
+      fs::create_directories(localRoot); ::chmod(localRoot.c_str(),0700);
+      String requestFile=text((localRoot/"request.bin").string());
+      if(fs::exists(localRoot/"request.bin")) require(read(localRoot/"request.bin")==str(requestBytes),"local recovery request conflicts");
+      else require(mothershipVDCDurableWrite(text(localRoot.string()),"request.bin",requestBytes,&failure),"local recovery request publication failed");
+      const auto identityGuard=[&](const auto& member) {
+        return "test \"$(cat /etc/machine-id)\" = "+quote(str(member.linuxMachineID))+"; test \"$(cat /proc/sys/kernel/random/boot_id)\" = "+quote(str(member.bootID))+"; ";
+      };
+      const auto sourceGuard=[&](const auto& member) {
+        const auto pid=std::to_string(member.sourceProcessPID);
+        const auto code="import pathlib; p=pathlib.Path('/proc/"+pid+"'); assert int((p/'stat').read_text().rsplit(')',1)[1].split()[19])=="+std::to_string(member.sourceProcessStartTicks)+"; assert (p/'cgroup').read_text()=='0::/system.slice/prodigy.service\\n'";
+        return identityGuard(member)+"test \"$(systemctl show -p MainPID --value prodigy)\" = "+pid+"; python3 -c "+quote(code)+
+            "; test \"$(sha256sum /proc/"+pid+"/exe | cut -d' ' -f1)\" = "+quote(str(record.sourceProdigySHA256))+"; ";
+      };
+      const auto installed=[&](const std::string& path) {
+        return "test \"$(sha256sum "+quote(path+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(str(record.targetProdigySHA256))+
+          "; test \"$(sha256sum "+quote(path+"/tools/mothership")+" | cut -d' ' -f1)\" = "+quote(str(record.targetMothershipSHA256))+
+          "; test \"$(sha256sum "+quote(path+"/prodigy.bundle.tar.zst")+" | cut -d' ' -f1)\" = "+quote(str(record.targetBundleSHA256))+"; ";
+      };
+      const auto inspect=[&](const auto& member,const char *mode) {
+        String id={}; id.assignItoh(member.machineUUID);
+        return "env -u PRODIGY_STATE_DB -u PRODIGY_STATE_SECRETS_DB LD_LIBRARY_PATH="+quote(inspectionRoot+"/lib")+" "+quote(inspectionRoot+"/tools/mothership")+
+            " remoteRuntimeRecoveryLocal "+quote(root)+" "+quote(str(binding))+" "+quote(str(id))+" "+mode+
+            (driverInput.empty()?std::string():" --driver-bundle "+quote(inspectionRoot+"/prodigy.bundle.tar.zst"));
+      };
+      const auto runStrict=[&](const auto& member,const std::string& command,String *output=nullptr) {
+        // Attested actions already own a strict shell. Wrapping their quoted
+        // script again can exceed the SSH exec packet before the server runs
+        // it. Keep its shell boundary; publish larger exact scripts privately.
+        String captured={}; String *reply=output?output:&captured;
+        const bool okay=remoteRuntimeRecoveryScript(cluster,member,text(command),localRoot.string(),root,reply,failure);
+        if(!okay && !reply->empty()) {
+          // The SSH owner may prefer stderr when both streams are populated.
+          // Preserve the verifier's structured rejection even when a bundle
+          // prefix fallback also emitted tar diagnostics on stderr.
+          failure.append("\nrecovery member="_ctv); String id={}; id.assignItoh(member.machineUUID); failure.append(id);
+          failure.append(" stdout: "_ctv); failure.append(*reply);
+        }
+        require(okay,"remote runtime recovery command failed; resume exact operation after reconciling recorded phase");
+      };
+      const auto run=[&](const auto& member,const std::string& command,String *output=nullptr) {
+        runStrict(member,remoteRecoveryStrictShell(command),output);
+      };
+      if(!driverInput.empty()) {
+        // A corrected inspector is part of the explicitly approved controller
+        // artifact. Stage it separately; never edit the immutable runtime
+        // target, request, stopped stores, or existing phase receipts.
+        const auto upload=inspectionRoot+".bundle";
+        const auto driverInstalled="test \"$(sha256sum "+quote(inspectionRoot+"/tools/mothership")+" | cut -d' ' -f1)\" = "+quote(str(driverSHA))+
+            "; test \"$(sha256sum "+quote(inspectionRoot+"/prodigy.bundle.tar.zst")+" | cut -d' ' -f1)\" = "+quote(str(approvedDriver.bundleSHA256))+"; ";
+        String install; prodigyBuildBundleInstallCommand(text(upload),text(inspectionRoot),install);
+        const auto action="test \"$(sha256sum "+quote(upload)+" | cut -d' ' -f1)\" = "+quote(str(approvedDriver.bundleSHA256))+
+            "; printf '%s\\n' "+quote(str(approvedDriver.bundleSHA256))+" > "+quote(upload+".sha256")+"; "+str(install);
+        for(const auto& member:record.members) {
+          run(member,identityGuard(member));
+          String destination=text(upload);
+          require(remoteRuntimeRecoveryCommand(cluster,member.machineUUID,text("true"),nullptr,failure,
+                    &approvedDriver.retainedSnapshotPath,&destination),"recovery controller helper upload failed");
+          runStrict(member,remoteRecoveryAttestedCommand(root,str(binding),"driver-"+str(approvedDriver.bundleSHA256).substr(0,16),
+                    identityGuard(member),identityGuard(member)+driverInstalled,action));
+        }
+      }
+      const auto sealPhase=[&](Phase phase) {
+        auto next=record; next.phase=phase;
+        for(auto& member:next.members) {
+          MothershipRemoteRuntimeRecoveryMember::PhaseReceipt receipt;
+          MothershipClusterRegistry::remoteRuntimeRecoveryOperationMarker(operation,member.machineUUID,phase,receipt.operationMarker);
+          String proof=receipt.operationMarker; proof.append('\0'); proof.append(binding);
+          require(prodigyComputeSHA256Hex(proof,receipt.receiptSHA256,&failure),"phase receipt digest failed"); member.phaseReceipts.push_back(std::move(receipt));
+        }
+        auto registry=openClusterRegistry(); MothershipRemoteRuntimeRecoveryCohortRecord saved; bool resumed=false;
+        require(registry.advanceRemoteRuntimeRecoveryCohort(next,phase,saved,resumed,&failure),"recovery phase publication failed"); record=std::move(saved);
+      };
+      if(record.phase==Phase::admitted) {
+        for(const auto& member:record.members) {
+          run(member,sourceGuard(member)+"umask 077; mkdir -p "+quote(root)+"; test ! -L "+quote(root)+"; test \"$(stat -c '%u:%a' "+quote(root)+")\" = 0:700; ");
+          String remoteRequest=text(root+"/request.upload"),remoteBundle=text(root+"/target.bundle.upload");
+          require(remoteRuntimeRecoveryCommand(cluster,member.machineUUID,text("true"),nullptr,failure,&requestFile,&remoteRequest),"recovery request upload failed");
+          require(remoteRuntimeRecoveryCommand(cluster,member.machineUUID,text("true"),nullptr,failure,&approved.retainedSnapshotPath,&remoteBundle),"recovery bundle upload failed");
+          String install; prodigyBuildBundleInstallCommand(remoteBundle,text(target),install);
+          const auto action="test \"$(sha256sum "+quote(root+"/request.upload")+" | cut -d' ' -f1)\" = "+quote(str(binding))+
+              "; if test -e "+quote(root+"/request.bin")+"; then cmp "+quote(root+"/request.upload")+" "+quote(root+"/request.bin")+
+              "; else mv -T "+quote(root+"/request.upload")+" "+quote(root+"/request.bin")+"; fi; test \"$(sha256sum "+quote(root+"/target.bundle.upload")+
+              " | cut -d' ' -f1)\" = "+quote(str(approved.bundleSHA256))+"; printf '%s\\n' "+quote(str(approved.bundleSHA256))+" > "+quote(root+"/target.bundle.upload.sha256")+"; "+str(install);
+          const auto kernelCheck="python3 -c "+quote("import hashlib,pathlib,sys; a=pathlib.Path(sys.argv[1]); b=pathlib.Path(sys.argv[2]); x={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in a.glob('*.ebpf.o')}; y={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in b.glob('*.ebpf.o')}; assert x and x==y")+" "+quote(runtime)+" "+quote(target)+"; ";
+          const auto predicate=sourceGuard(member)+installed(target)+"test \"$(sha256sum "+quote(root+"/request.bin")+" | cut -d' ' -f1)\" = "+quote(str(binding))+"; "+kernelCheck;
+          runStrict(member,remoteRecoveryAttestedCommand(root,str(binding),"staged",sourceGuard(member),predicate,action));
+        }
+        sealPhase(Phase::staged);
+      }
+      if(record.phase==Phase::staged) {
+        preflight();
+        for(const auto& member:record.members) {
+          const auto fenceCheck=sourceGuard(member)+runtimeStartupFencePredicate(root,str(binding),"/etc/systemd/system/prodigy.service.d",true);
+          runStrict(member,remoteRecoveryAttestedCommand(root,str(binding),"fenced",sourceGuard(member),fenceCheck,runtimeStartupFenceCommand(root,str(binding),"/etc/systemd/system/prodigy.service.d",true)));
+        }
+        sealPhase(Phase::fenced);
+      }
+      if(record.phase==Phase::fenced) {
+        // No service stop/kill occurs until all three sources are frozen.
+        for(const auto& member:record.members)
+          runStrict(member,remoteRecoveryAttestedCommand(root,str(binding),"frozen",sourceGuard(member),sourceGuard(member)+remoteRecoveryCgroupFrozenPredicate(cg),remoteRecoveryFreezeCgroupCommand(cg)));
+        for(auto& member:record.members) {
+          String output; run(member,sourceGuard(member)+inspect(member,"capture"),&output);
+          std::istringstream fields(str(output)); std::string values[5],extra;
+          for(auto& value:values) require(bool(fields>>value) && prodigyIsSHA256HexDigest(text(value)),"stopped recovery proof response is invalid");
+          require(!(fields>>extra),"stopped recovery proof response has trailing data");
+          member.stateSHA256=text(values[0]); member.secretsSHA256=text(values[1]); member.containerInventorySHA256=text(values[2]);
+          member.privateLoaderSHA256=text(values[3]); member.retainedNetworkSHA256=text(values[4]);
+        }
+        sealPhase(Phase::frozen);
+      }
+      const auto stopped=[&](const auto& member) {
+        return identityGuard(member)+"test \"$(systemctl show -p MainPID --value prodigy)\" = 0; if pgrep -x prodigy > /dev/null; then exit 1; fi; "+inspect(member,"stopped")+" > /dev/null; ";
+      };
+      if(record.phase==Phase::frozen) {
+        using namespace MothershipRetainedRecovery;
+        // Credential-bearing census and witness replies stay inside private
+        // controller files. Never append their stdout to transport errors.
+        const auto privateReply=[&](const auto& member,const char* mode,String& decoded) {
+          String encoded={},privateFailure={};
+          const bool okay=remoteRuntimeRecoveryScript(cluster,member,text(remoteRecoveryStrictShell(sourceGuard(member)+inspect(member,mode))),
+                                                      localRoot.string(),root,&encoded,privateFailure);
+          if(!okay) {
+            String id={};id.assignItoh(member.machineUUID);failure.assign("runtime recovery private startup operation failed member="_ctv);
+            failure.append(id);failure.append(" mode="_ctv);failure.append(mode);
+            // A failed SSH reply may still contain a credential-bearing partial
+            // census. Preserve both streams privately for diagnosis instead of
+            // discarding them or copying them into the public error log.
+            const auto evidence="private-startup-failure-"+str(id)+"-"+mode+"-"+
+                std::to_string(::getpid())+"-"+std::to_string(Time::msSinceBoot());
+            String evidenceFailure={};
+            if(mothershipVDCDurableWrite(text(localRoot.string()),(evidence+".stdout").c_str(),encoded,&evidenceFailure) &&
+               mothershipVDCDurableWrite(text(localRoot.string()),(evidence+".stderr").c_str(),privateFailure,&evidenceFailure)) {
+              failure.append(" evidence="_ctv);failure.append(text((localRoot/evidence).string()));
+            } else failure.append(" privateEvidenceWriteFailed=1"_ctv);
+            // Only fixed, credential-free verifier messages may cross this
+            // boundary. A census reply can contain live private credentials.
+            for(const char* reason:{"runtime recovery captured startup envelope decode failed",
+                                   "runtime recovery captured startup snapshot digest differs",
+                                   "runtime recovery captured startup snapshot decode failed",
+                                   "runtime recovery captured startup local identity differs",
+                                   "runtime recovery captured startup private path differs"}) {
+              const auto expected=std::string("remoteRuntimeRecoveryLocal success=0 failure=")+reason+"\n";
+              if(str(encoded)==expected) {failure.append(" reason="_ctv);failure.append(reason);break;}
+            }
+          }
+          require(okay,"runtime recovery private startup operation failed; inspect the member's private evidence");
+          if(!encoded.empty() && encoded[encoded.size()-1]=='\n')encoded.resize(encoded.size()-1);
+          require(Base64::decode(encoded,decoded),"runtime recovery private startup reply encoding invalid");
+        };
+        bool preparedCohort=false;
+        const auto savedStartup=localRoot/"startup-request.bin",savedWitnesses=localRoot/"startup-witnesses.bin";
+        if(fs::exists(savedStartup) && fs::exists(savedWitnesses)) {
+          privateFile(savedStartup.string());privateFile(savedWitnesses.string());
+          String requestSHA={},witnessSHA={};
+          require(prodigyComputeFileSHA256Hex(text(savedStartup.string()),requestSHA,&failure) &&
+                  prodigyComputeFileSHA256Hex(text(savedWitnesses.string()),witnessSHA,&failure),"runtime recovery sealed preparation identity unavailable");
+          preparedCohort=true;
+          for(const auto& member:record.members) {
+            String reply={},why={};
+            const auto verify=identityGuard(member)+"test \"$(sha256sum "+quote(root+"/startup-request.bin")+" | cut -d' ' -f1)\" = "+quote(str(requestSHA))+
+                "; test \"$(sha256sum "+quote(root+"/startup-witnesses.bin")+" | cut -d' ' -f1)\" = "+quote(str(witnessSHA))+"; "+inspect(member,"verify-prepared")+" > /dev/null; ";
+            if(!remoteRuntimeRecoveryScript(cluster,member,text(remoteRecoveryStrictShell(verify)),localRoot.string(),root,&reply,why)) preparedCohort=false;
+          }
+          if(!preparedCohort) for(const auto& member:record.members) run(member,sourceGuard(member));
+        }
+        if(!preparedCohort) {
+        RuntimeStartupRequest startup={};startup.version=2;startup.bindingSHA256=binding;startup.clusterUUID=record.clusterUUID;
+        startup.targetBundleSHA256=record.targetBundleSHA256;startup.sourceBundleSHA256=record.sourceBundleSHA256;startup.topology=currentTopology;
+        for(const auto& member:record.members) {
+          String bytes={};privateReply(member,"census",bytes);MothershipRuntimeRecoveryCensus census={};
+          require(BitseryEngine::deserializeSafe(bytes,census) && census.machine.machineUUID==member.machineUUID &&
+                  census.source.memberUUID==member.machineUUID && census.source.stateSHA256==member.stateSHA256 &&
+                  census.source.secretsSHA256==member.secretsSHA256 && census.source.snapshotSHA256==member.privateLoaderSHA256 &&
+                  prodigyIsSHA256HexDigest(census.source.stoppedProofSHA256),"runtime recovery private census proof differs");
+          if(!census.rejectedCandidateSHA256.empty()) {
+            require(startup.rejectedCandidateSHA256.empty() || startup.rejectedCandidateSHA256==census.rejectedCandidateSHA256,
+                    "runtime recovery sources disagree on rejected update candidate");
+            startup.rejectedCandidateSHA256=census.rejectedCandidateSHA256;
+          }
+          startup.sources.push_back(std::move(census.source));startup.machines.push_back(std::move(census.machine));
+        }
+        require(runtimeStartupRequestValid(startup,&failure),"runtime recovery complete startup request invalid");
+        const auto startupFile=localRoot/"startup-request.bin";String startupBytes={},startupSHA={};
+        if(fs::exists(startupFile)) {
+          privateFile(startupFile.string());startupBytes=text(read(startupFile));RuntimeStartupRequest saved={};
+          require(BitseryEngine::deserializeSafe(startupBytes,saved) && runtimeStartupRequestValid(saved,&failure) &&
+                  saved.bindingSHA256==binding && saved.clusterUUID==record.clusterUUID && saved.topology==currentTopology &&
+                  saved.targetBundleSHA256==record.targetBundleSHA256 &&
+                  (saved.version==1 || (saved.version==2 &&
+                   saved.sourceBundleSHA256==record.sourceBundleSHA256)),"runtime recovery saved startup request conflicts");
+          startup=std::move(saved);
+        } else {
+          BitseryEngine::serialize(startupBytes,startup);
+          require(durableRuntimeStartupRequest(startupFile.string(),startupBytes,&failure),"runtime recovery startup request publication failed");
+        }
+        require(prodigyComputeSHA256Hex(startupBytes,startupSHA,&failure),"runtime recovery startup request digest failed");
+        const auto uploadPrivate=[&](const auto& member,const char* filename,const String& expectedSHA) {
+          String local=text((localRoot/filename).string()),remote=text(root+"/"+filename+".upload");
+          require(remoteRuntimeRecoveryCommand(cluster,member.machineUUID,"true"_ctv,nullptr,failure,&local,&remote),"runtime recovery private startup upload failed");
+          const auto destination=root+"/"+filename;
+          run(member,sourceGuard(member)+"test ! -L "+quote(destination)+"; test \"$(sha256sum "+quote(str(remote))+" | cut -d' ' -f1)\" = "+quote(str(expectedSHA))+
+              "; if test -e "+quote(destination)+"; then test \"$(stat -c '%u:%a:%h' "+quote(destination)+")\" = 0:600:1; cmp "+quote(str(remote))+" "+quote(destination)+
+              "; else mv -T "+quote(str(remote))+" "+quote(destination)+"; sync -f "+quote(root)+"; fi; ");
+        };
+        WitnessSet shared={};shared.requestSHA=startupSHA;
+        for(const auto& member:record.members) {
+          uploadPrivate(member,"startup-request.bin",startupSHA);
+          String reply={};privateReply(member,"prepare-startup",reply);RuntimeStartupPrepared prepared={};
+          require(BitseryEngine::deserializeSafe(reply,prepared) && prepared.requestSHA256==startupSHA &&
+                  prepared.sourceSnapshotSHA256==member.privateLoaderSHA256 && prepared.candidateWitnesses.requestSHA==startupSHA &&
+                  prepared.candidateWitnesses.witnesses.size()==3,"runtime recovery prepared startup response invalid");
+          if(shared.witnesses.empty()) shared.witnesses=prepared.candidateWitnesses.witnesses;
+          else require(witnessesEquivalent(shared.witnesses,prepared.candidateWitnesses.witnesses),
+                       "runtime recovery sources disagree on retained startup authority");
+        }
+        const auto witnessesFile=localRoot/"startup-witnesses.bin";String witnessBytes={},witnessSHA={};
+        if(fs::exists(witnessesFile)) {
+          privateFile(witnessesFile.string());witnessBytes=text(read(witnessesFile));WitnessSet saved={};
+          require(BitseryEngine::deserializeSafe(witnessBytes,saved) && saved.requestSHA==startupSHA &&
+                  witnessesEquivalent(saved.witnesses,shared.witnesses),"runtime recovery sealed witnesses conflict");
+        } else {
+          BitseryEngine::serialize(witnessBytes,shared);
+          require(mothershipVDCDurableWrite(text(localRoot.string()),"startup-witnesses.bin",witnessBytes,&failure),"runtime recovery shared witness publication failed");
+        }
+        require(prodigyComputeSHA256Hex(witnessBytes,witnessSHA,&failure),"runtime recovery shared witness digest failed");
+        // All three private pairs are canonically prepared and sealed before
+        // any source process may be killed.
+        for(const auto& member:record.members) {
+          uploadPrivate(member,"startup-witnesses.bin",witnessSHA);
+          run(member,sourceGuard(member)+inspect(member,"finalize-startup")+" > /dev/null; ");
+        }
+        }
+        for(const auto& member:record.members) {
+          const auto before=sourceGuard(member)+inspect(member,"capture")+" > /dev/null; "+inspect(member,"verify-prepared")+
+              " > /dev/null; test \"$(cat "+quote(root+"/writers-fenced")+")\" = "+quote(str(binding))+"; ";
+          runStrict(member,remoteRecoveryAttestedCommand(root,str(binding),"quiesced",before,stopped(member),remoteRecoveryKillFrozenCgroupCommand(cg)));
+        }
+        sealPhase(Phase::quiesced);
+      }
+      if(record.phase==Phase::quiesced) {
+        for(auto& member:record.members) {
+          runStrict(member,remoteRecoveryAttestedCommand(root,str(binding),"installed",stopped(member)+installed(target),stopped(member)+installed(runtime),
+              retainedRuntimePublicationCommand(runtime,target,retained,str(record.sourceProdigySHA256),str(record.sourceBundleSHA256),str(record.targetProdigySHA256))));
+          member.targetRuntimeInstalled=true;
+        }
+        sealPhase(Phase::installed);
+      }
+      if(record.phase==Phase::installed) {
+        for(const auto& member:record.members)
+          runStrict(member,remoteRecoveryAttestedCommand(root,str(binding),"activation-ready",stopped(member)+installed(runtime),
+              stopped(member)+installed(runtime)+inspect(member,"verify-startup")+" > /dev/null; ",inspect(member,"publish-startup")+" > /dev/null; "));
+        sealPhase(Phase::activationStarted);
+      }
+      const auto active=[&](const auto& member) {
+        return identityGuard(member)+installed(runtime)+"systemctl is-active --quiet prodigy; pid=$(systemctl show -p MainPID --value prodigy); test \"$pid\" -gt 1; test \"$(sha256sum /proc/$pid/exe | cut -d' ' -f1)\" = "+quote(str(record.targetProdigySHA256))+"; "+inspect(member,"active")+" > /dev/null; ";
+      };
+      if(record.phase==Phase::activationStarted) {
+        for(const auto& member:record.members) {
+          const auto before=stopped(member)+installed(runtime)+inspect(member,"verify-startup")+
+              " > /dev/null; test \"$(cat "+quote(root+"/remote-recovery-activation-ready")+")\" = "+quote(str(binding))+"; ";
+          const auto action=runtimeStartupUnfenceCommand(root,str(binding),"/etc/systemd/system/prodigy.service.d",true)+
+              "systemctl reset-failed prodigy; systemctl start prodigy; ";
+          runStrict(member,remoteRecoveryAttestedCommand(root,str(binding),"started",before,active(member),action));
+        }
+      }
+      require(record.phase==Phase::activationStarted || record.phase==Phase::completed,"recovery phase is unsupported");
+      ClusterStatusReport status={}; bool healthy=false;
+      for(unsigned attempt=0;attempt<120;++attempt) {
+        if(productionClusterHealthy(cluster,status,failure) &&
+           MothershipClusterRegistry::remoteRuntimeRecoveryParentToDeclaredTopologyValid(currentTopology,status.topology)) { healthy=true; break; }
+        ::usleep(500'000);
+      }
+      require(healthy,"recovery awaits fresh healthy three-Brain quorum");
+      require(configureControlTarget(identity.c_str(),&failure),"recovery completion target unavailable");
+      ProdigyUpgradeAdmissionReportRequest observation={}; observation.operationID=operationText;
+      observation.targetBundleSHA256=approved.bundleSHA256; observation.targetContractSHA256=approved.contract.contractSHA256;
+      observation.requiredStagingBytes=approved.contract.requiredFreeBytes;
+      MothershipUpgradeAdmissionReport report={};
+      bool attested=false;
+      for(unsigned attempt=0;attempt<30;++attempt) {
+        // The first report starts the existing asynchronous peer probes.
+        // Completion still requires one fresh complete report for this exact
+        // operation and target; a partial report never seals the cohort.
+        attested=requestUpgradeAdmissionReport(observation,report,failure) && report.observationComplete && report.master &&
+            report.clusterUUID==cluster.clusterUUID && report.masterApprovedBundleSHA256==record.targetBundleSHA256 &&
+            report.authorityGeneration>=record.authorityGeneration && report.healthyCommissionedBrainCount==3 && report.peers.size()==3 &&
+            report.authorityQuorumHealthy && report.authorityAcknowledged && report.recoveryWitnessAcknowledged &&
+            report.commissionedPeerTransportVerified && report.fleetBundleDigestsFresh && report.fleetInventoriesFresh;
+        if(attested) for(const auto& peer:report.peers) attested=attested && peer.installedBundleSHA256==record.targetBundleSHA256 &&
+            peer.stateUploadFresh && peer.localInstalledBundleVerified && peer.authorityAcknowledged && peer.recoveryWitnessAcknowledged;
+        if(attested) break;
+        ::usleep(500'000);
+      }
+      require(attested,"recovery awaits fresh authenticated target inventory and authority acknowledgements");
+      for(const auto& member:record.members) run(member,active(member));
+      if(record.phase!=Phase::completed) sealPhase(Phase::completed);
+      basics_log("recoverRemoteClusterRuntime success=1 completed=1 operationID=%s members=3 bootIdentitiesPreserved=1 prodigySHA256=%s mothershipSHA256=%s\n",
+                 operationText.c_str(),record.targetProdigySHA256.c_str(),record.targetMothershipSHA256.c_str());
+    } catch(const std::exception& error) {
+      basics_log("recoverRemoteClusterRuntime success=0 phase=%u preserved=1 failure=%s detail=%s\n",unsigned(record.phase),error.what(),failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+  }
+
+  // Undo only the lifecycle fence of a frozen cohort whose source runtime is
+  // still installed and running. A same-boot automatic source restart may
+  // change its PID; record that observation separately, never rewrite the
+  // original cohort identity or reuse its old store proof for installation.
+  void runAbortRemoteRuntimeRecoveryBeforeInstall(int argc,char *argv[])
+  {
+    using namespace MothershipTidesMigration;
+    using Phase=MothershipRemoteRuntimeRecoveryPhase;
+    String failure={};
+    try {
+      require(argc==5 && std::strcmp(argv[3],"--driver-bundle")==0,
+              "usage: abortRemoteRuntimeRecoveryBeforeInstall CLUSTER ORIGINAL_TARGET OPERATION_ID --driver-bundle APPROVED_CONTROLLER_BUNDLE");
+      String identity(argv[0]),targetInput(argv[1]),operationText(argv[2]),driverInput(argv[4]);
+      uint128_t operation=0;
+      require(prodigyParseCanonicalHex128(operationText,operation) && operation,"abort recovery operation ID invalid");
+      MothershipProdigyCluster cluster={};
+      require(loadClusterForScopedMutation("abortRemoteRuntimeRecoveryBeforeInstall",identity,cluster,failure) &&
+              cluster.deploymentMode==MothershipClusterDeploymentMode::remote && cluster.provider==MothershipClusterProvider::vultr &&
+              cluster.nBrains==3 && cluster.topology.machines.size()==3,"abort requires the registered three-Brain remote cohort");
+      String registryPath={}; {auto registry=openClusterRegistry();registryPath=registry.path();}
+      MothershipRemoteRuntimeRecoveryExecutionLock lock;
+      require(lock.acquire(registryPath),"another runtime recovery executor is active");
+      MothershipRemoteRuntimeRecoveryCohortRecord record={}; MothershipUpgradeAdmissionRecord admission={};
+      ClusterTopology recoveryTopology=cluster.topology;
+      {auto registry=openClusterRegistry();require(registry.loadRemoteRuntimeRecoveryCohort(cluster.clusterUUID,operation,record,&failure) &&
+          registry.loadUpgradeAdmission(cluster.clusterUUID,operation,admission,&failure),"abort recovery authority unavailable");
+        if(record.phase==Phase::frozen) {bool superseded=false;
+          require(registry.remoteRuntimeRecoveryParentSuperseded(record,superseded,&failure) && !superseded,
+                  "abort refuses a parent already handed off to a fresh recovery operation");}
+        MothershipRemoteRuntimeRecoveryHandoffRecord handoff={};
+        const bool linked=registry.loadRemoteRuntimeRecoveryHandoffForChild(cluster.clusterUUID,operation,handoff,&failure);
+        require(linked || failure=="record not found"_ctv,"abort recovery handoff is unreadable");failure.clear();
+        if(linked) {
+          MothershipRemoteRuntimeRecoveryCohortRecord parent={};bool superseded=false;
+          require(MothershipClusterRegistry::remoteRuntimeRecoveryParentToDeclaredTopologyValid(handoff.declaredTopology,cluster.topology) &&
+                  registry.loadRemoteRuntimeRecoveryCohort(cluster.clusterUUID,handoff.parentOperationID,parent,&failure) &&
+                  registry.remoteRuntimeRecoveryParentSuperseded(parent,superseded,&failure) && superseded,"abort child handoff binding changed");
+          recoveryTopology=handoff.observedTopology;
+        }}
+      require(record.phase==Phase::frozen || record.phase==Phase::abortedBeforeInstallation,
+              "abort is restricted to a frozen, never-installed cohort");
+      auto frozen=record; frozen.phase=Phase::frozen;
+      for(auto& member:frozen.members) if(member.phaseReceipts.size()==4) member.phaseReceipts.resize(3);
+      require(MothershipClusterRegistry::remoteRuntimeRecoveryCohortValid(frozen) &&
+              MothershipClusterRegistry::remoteRuntimeRecoveryAllProofsSealed(frozen),"abort frozen proofs invalid");
+      MachineCpuArchitecture architecture=MachineCpuArchitecture::unknown;
+      ProdigyApprovedUpgradeBundle target={},driver={}; String targetPath={},driverPath={},selfSHA={};
+      require(resolveProdigyBundleTargetArchitecture(identity.c_str(),architecture,&failure) &&
+              prodigyResolveBundleArtifactInput(targetInput,architecture,targetPath,&failure) &&
+              prodigyApproveBundleUpgradeContract(targetPath,target,&failure) && target.verifyRetainedSnapshot(&failure) &&
+              target.bundleSHA256==record.targetBundleSHA256 && target.contract.contractSHA256==record.targetContractSHA256,
+              "abort original approved target differs");
+      MothershipUpgradeIdentity targetIdentity={};targetIdentity.releaseID=target.contract.releaseID;
+      targetIdentity.contractSHA256=target.contract.contractSHA256;targetIdentity.prodigySHA256=target.contract.prodigySHA256;
+      targetIdentity.mothershipSHA256=target.contract.mothershipSHA256;
+      String architectureName={};architectureName.assign(machineCpuArchitectureName(architecture));
+      require(prodigyResolveBundleArtifactInput(driverInput,architecture,driverPath,&failure) &&
+              prodigyApproveBundleUpgradeContract(driverPath,driver,&failure) && driver.verifyRetainedSnapshot(&failure) &&
+              prodigyComputeFileSHA256Hex("/proc/self/exe"_ctv,selfSHA,&failure) &&
+              prodigyValidateRuntimeRecoveryDriver(driver,selfSHA,targetIdentity,architectureName,cluster.clusterUUID,&failure),
+              "abort controller is not separately approved for the immutable target");
+      String canonical={};canonical.assignItoh(operation);
+      const auto root="/var/lib/prodigy/runtime-recovery/"+str(canonical);
+      const auto localRoot=fs::path(str(registryPath)).parent_path()/"runtime-recovery"/str(canonical);
+      const auto runtime=str(record.runtimeRoot); const std::string cg="/sys/fs/cgroup/system.slice/prodigy.service";
+      MothershipRemoteRuntimeRecoveryRequest original={};String originalBytes={},binding={};
+      MothershipRetainedRecovery::privateFile(localRoot/"request.bin");
+      require(mothershipVDCRead(text((localRoot/"request.bin").string()),originalBytes,16*1024*1024) &&
+              BitseryEngine::deserializeSafe(originalBytes,original) && (original.version==1 || original.version==2) &&
+              original.cohort.phase==Phase::admitted && MothershipClusterRegistry::remoteRuntimeRecoveryCohortValid(original.cohort) &&
+              MothershipClusterRegistry::remoteRuntimeRecoveryIdentityMatches(original.cohort,record) &&
+              prodigyComputeSHA256Hex(originalBytes,binding,&failure),"abort original request binding invalid");
+      require(MothershipClusterRegistry::remoteRuntimeRecoveryParentToDeclaredTopologyValid(original.topology,recoveryTopology),
+              "abort current registered configuration differs from its immutable topology");
+      recoveryTopology=original.topology;
+      String bytes={},digest={};auto topology=recoveryTopology;BitseryEngine::serialize(bytes,topology);
+      require(prodigyComputeSHA256Hex(bytes,digest,&failure) && digest==record.topologySHA256 &&
+              record.runtimeRoot==cluster.remoteProdigyPath,"abort original topology or runtime root differs");
+      BitseryEngine::serialize(bytes,admission);
+      require(admission.eligible && admission.targetBundleSHA256==record.targetBundleSHA256 &&
+              prodigyComputeSHA256Hex(bytes,digest,&failure) && digest==record.admissionRecordSHA256,
+              "abort immutable upgrade admission differs");
+      String frozenBytes={},frozenSHA={};BitseryEngine::serialize(frozenBytes,frozen);
+      require(prodigyComputeSHA256Hex(frozenBytes,frozenSHA,&failure),"abort frozen cohort digest unavailable");
+      const auto sourceGuard=[&](const auto& member) {
+        const auto pid=std::to_string(member.sourceProcessPID);
+        const auto process="import pathlib; p=pathlib.Path('/proc/"+pid+"'); assert int((p/'stat').read_text().rsplit(')',1)[1].split()[19])=="+
+            std::to_string(member.sourceProcessStartTicks)+"; assert (p/'cgroup').read_text()=='0::/system.slice/prodigy.service\\n'";
+        return "test \"$(cat /etc/machine-id)\" = "+quote(str(member.linuxMachineID))+"; test \"$(cat /proc/sys/kernel/random/boot_id)\" = "+quote(str(member.bootID))+
+            "; test \"$(systemctl show -p MainPID --value prodigy)\" = "+pid+"; python3 -c "+quote(process)+
+            "; test \"$(sha256sum /proc/"+pid+"/exe | cut -d' ' -f1)\" = "+quote(str(record.sourceProdigySHA256))+
+            "; test \"$(sha256sum "+quote(runtime+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(str(record.sourceProdigySHA256))+
+            "; test \"$(sha256sum "+quote(runtime+"/tools/mothership")+" | cut -d' ' -f1)\" = "+quote(str(record.sourceMothershipSHA256))+
+            "; test \"$(sha256sum "+quote(runtime+"/prodigy.bundle.tar.zst")+" | cut -d' ' -f1)\" = "+quote(str(record.sourceBundleSHA256))+"; ";
+      };
+      std::string untouched="test -d "+quote(root)+"; test ! -L "+quote(root)+"; test \"$(stat -c '%u:%a' "+quote(root)+")\" = 0:700; ";
+      for(const auto name:{"source-runtime","remote-recovery-quiesced","remote-recovery-installed","remote-recovery-activation-ready","remote-recovery-started"})
+        for(const auto suffix:{"",".new"}) {
+          const auto path=root+"/"+name+suffix;untouched+="test ! -e "+quote(path)+"; test ! -L "+quote(path)+"; ";
+        }
+      untouched+="test \"$(sha256sum "+quote(root+"/request.bin")+" | cut -d' ' -f1)\" = "+quote(str(binding))+"; test -f "+quote(root+"/stopped-proof.bin")+
+          "; test ! -L "+quote(root+"/stopped-proof.bin")+"; test \"$(stat -c '%u:%a:%h' "+quote(root+"/stopped-proof.bin")+")\" = 0:600:1; ";
+      const auto run=[&](const auto& member,const std::string& command,String *output=nullptr) {
+        String captured={};String *reply=output?output:&captured;
+        const bool okay=remoteRuntimeRecoveryCommand(cluster,member.machineUUID,text(remoteRecoveryStrictShell(command)),reply,failure);
+        if(!okay && !reply->empty()) {failure.append(" abort verifier: "_ctv);failure.append(*reply);}
+        require(okay,"abort member verification or lifecycle reconciliation failed");
+      };
+      MothershipRemoteRuntimeRecoveryAbortRequest abort={};String abortBytes={},abortSHA={};
+      const auto abortPath=localRoot/"abort-before-installation.bin";
+      struct stat localMetadata={};
+      require(::lstat(localRoot.c_str(),&localMetadata)==0 && S_ISDIR(localMetadata.st_mode) &&
+              localMetadata.st_uid==0 && (localMetadata.st_mode&0777)==0700,"abort evidence root ownership invalid");
+      if(fs::exists(abortPath) || fs::is_symlink(abortPath)) {
+        require(::lstat(abortPath.c_str(),&localMetadata)==0 && S_ISREG(localMetadata.st_mode) &&
+                localMetadata.st_uid==0 && localMetadata.st_nlink==1 && (localMetadata.st_mode&0777)==0600,
+                "abort request ownership invalid");
+        require(mothershipVDCRead(text(abortPath.string()),abortBytes,16*1024*1024) &&
+                BitseryEngine::deserializeSafe(abortBytes,abort),"abort request is unreadable");
+      } else {
+        require(record.phase==Phase::frozen,"terminal abort is missing its immutable request");
+        abort.requestSHA256=binding;abort.frozenCohortSHA256=frozenSHA;
+        // Observe every exact source before unfreezing any member. The
+        // original record and its sealed proofs are never edited.
+        for(const auto& saved:record.members) {
+          MothershipRemoteRuntimeRecoveryMember current={};
+          require(observeRemoteRuntimeRecoverySource(cluster,saved.machineUUID,record.runtimeRoot,admission,current,failure) &&
+                  current.linuxMachineID==saved.linuxMachineID && current.bootID==saved.bootID,
+                  "abort source runtime or unchanged VM identity unavailable");
+          String fenceMode={},proofSHA={};
+          const auto legacy=runtimeStartupFencePredicate(root,str(binding));
+          const auto inhibited=runtimeStartupFencePredicate(root,str(binding),"/etc/systemd/system/prodigy.service.d",true);
+          run(current,sourceGuard(current)+untouched+"if "+remoteRecoveryStrictShell(legacy)+"; then printf 0; elif "+
+              remoteRecoveryStrictShell(inhibited)+"; then printf 1; else exit 1; fi",&fenceMode);
+          require(fenceMode=="0"_ctv || fenceMode=="1"_ctv,"abort startup fence variant invalid");
+          run(current,sourceGuard(current)+untouched+"sha256sum "+quote(root+"/stopped-proof.bin")+" | cut -d' ' -f1",&proofSHA);
+          if(!proofSHA.empty() && proofSHA[proofSHA.size()-1]=='\n') proofSHA.resize(proofSHA.size()-1);
+          require(prodigyIsSHA256HexDigest(proofSHA),"abort frozen proof file digest invalid");
+          abort.sources.push_back(current);abort.restartInhibited.push_back(fenceMode=="1"_ctv?1:0);abort.proofFileSHA256.push_back(proofSHA);
+        }
+        BitseryEngine::serialize(abortBytes,abort);
+        require(mothershipVDCDurableWrite(text(localRoot.string()),"abort-before-installation.bin",abortBytes,&failure),"abort request publication failed");
+      }
+      require(abort.version==1 && abort.requestSHA256==binding && abort.frozenCohortSHA256==frozenSHA &&
+              abort.sources.size()==3 && abort.restartInhibited.size()==3 && abort.proofFileSHA256.size()==3 &&
+              prodigyComputeSHA256Hex(abortBytes,abortSHA,&failure),"abort request differs from the immutable frozen operation");
+      for(uint32_t index=0;index<3;++index) {
+        const auto& current=abort.sources[index];const auto& originalMember=record.members[index];
+        require(MothershipClusterRegistry::remoteRuntimeRecoveryMemberIdentityValid(current) &&
+                current.machineUUID==originalMember.machineUUID && current.linuxMachineID==originalMember.linuxMachineID &&
+                current.bootID==originalMember.bootID && abort.restartInhibited[index]<=1 &&
+                prodigyIsSHA256HexDigest(abort.proofFileSHA256[index]),"abort source observation is outside the admitted VM cohort");
+        run(current,sourceGuard(current)+untouched+"test \"$(sha256sum "+quote(root+"/stopped-proof.bin")+" | cut -d' ' -f1)\" = "+
+            quote(str(abort.proofFileSHA256[index]))+"; ");
+      }
+      for(uint32_t index=0;index<3;++index) {
+        const auto& current=abort.sources[index];const bool inhibit=abort.restartInhibited[index]!=0;
+        const auto unchangedProof="test \"$(sha256sum "+quote(root+"/stopped-proof.bin")+" | cut -d' ' -f1)\" = "+
+            quote(str(abort.proofFileSHA256[index]))+"; ";
+        const auto restored=sourceGuard(current)+untouched+unchangedProof+runtimeStartupUnfencePredicate(root,str(binding),"/etc/systemd/system/prodigy.service.d",inhibit)+
+            "systemctl is-active --quiet prodigy; test \"$(awk '$1 == \"frozen\" { print $2 }' "+quote(std::string(cg)+"/cgroup.events")+")\" = 0; ";
+        // The unfence owner also validates an exact partial release after an
+        // interrupted rename. Requiring the full active fence here would make
+        // that safe continuation unreachable.
+        const auto before=sourceGuard(current)+untouched+unchangedProof;
+        const auto action=runtimeStartupUnfenceCommand(root,str(binding),"/etc/systemd/system/prodigy.service.d",inhibit)+
+            "test -w "+quote(std::string(cg)+"/cgroup.freeze")+"; printf 0 > "+quote(std::string(cg)+"/cgroup.freeze")+
+            "; for i in $(seq 1 100); do test \"$(awk '$1 == \"frozen\" { print $2 }' "+quote(std::string(cg)+"/cgroup.events")+")\" = 0 && break; sleep 0.05; done; ";
+        const auto command=remoteRecoveryAttestedCommand(root,str(abortSHA),"aborted-before-installation",before,restored,action);
+        String reply={};require(remoteRuntimeRecoveryScript(cluster,current,text(command),localRoot.string(),root,&reply,failure),
+                                "abort source thaw or receipt failed");
+      }
+      ClusterStatusReport status={};bool healthy=false;
+      for(unsigned attempt=0;attempt<120;++attempt) {
+        if(productionClusterHealthy(cluster,status,failure) &&
+           MothershipClusterRegistry::remoteRuntimeRecoveryParentToDeclaredTopologyValid(recoveryTopology,status.topology)) {healthy=true;break;}
+        ::usleep(500'000);
+      }
+      require(healthy && configureControlTarget(identity.c_str(),&failure),"abort awaits restored source quorum");
+      ProdigyUpgradeAdmissionReportRequest observation={};observation.operationID=operationText;
+      observation.targetBundleSHA256=target.bundleSHA256;observation.targetContractSHA256=target.contract.contractSHA256;
+      observation.requiredStagingBytes=target.contract.requiredFreeBytes;
+      MothershipUpgradeAdmissionReport report={};MothershipUpgradePlannerInput input={};
+      require(validateFreshRuntimeUpgradeAdmission(target,admission,architecture,&cluster,observation,true,report,input,failure,
+                  RuntimeAdmissionValidation::restoreSourceBeforeInstallation) &&
+              report.masterApprovedBundleSHA256==record.sourceBundleSHA256,"abort awaits fresh source authority and inventory admission");
+      if(record.phase!=Phase::abortedBeforeInstallation) {
+        auto terminal=record;terminal.phase=Phase::abortedBeforeInstallation;
+        for(auto& member:terminal.members) {
+          MothershipRemoteRuntimeRecoveryMember::PhaseReceipt receipt;
+          MothershipClusterRegistry::remoteRuntimeRecoveryOperationMarker(operation,member.machineUUID,terminal.phase,receipt.operationMarker);
+          String material=receipt.operationMarker;material.append('\0');material.append(abortSHA);
+          require(prodigyComputeSHA256Hex(material,receipt.receiptSHA256,&failure),"abort receipt digest failed");
+          member.phaseReceipts.push_back(std::move(receipt));
+        }
+        auto registry=openClusterRegistry();MothershipRemoteRuntimeRecoveryCohortRecord saved={};
+        require(registry.abortRemoteRuntimeRecoveryCohort(terminal,saved,&failure),"abort registry terminal transition failed");
+      }
+      basics_log("abortRemoteRuntimeRecoveryBeforeInstall success=1 operationID=%s sourceCohortHealthy=1 bootIdentitiesPreserved=1 originalProofsPreserved=1\n",operationText.c_str());
+    } catch(const std::exception& error) {
+      basics_log("abortRemoteRuntimeRecoveryBeforeInstall success=0 preserved=1 failure=%s detail=%s\n",error.what(),failure.c_str());exit(EXIT_FAILURE);
+    }
+  }
+
+  // Retire only an operation that never crossed the fencing boundary. This
+  // preserves its evidence while allowing a corrected, separately admitted
+  // release. A source restart, partial fence, or later phase fails closed.
+  void runWithdrawRemoteRuntimeRecovery(int argc,char *argv[])
+  {
+    using namespace MothershipTidesMigration;
+    using Phase=MothershipRemoteRuntimeRecoveryPhase;
+    String failure={};
+    try {
+      const bool check=argc==4 && std::strcmp(argv[3],"--check")==0;
+      require(argc==3 || check,"usage: withdrawRemoteRuntimeRecovery CLUSTER ORIGINAL_APPROVED_TARGET_BUNDLE OPERATION_ID [--check]");
+      String identity(argv[0]),bundleInput(argv[1]),operationText(argv[2]); uint128_t operation=0;
+      require(prodigyParseCanonicalHex128(operationText,operation) && operation,"withdraw recovery operation identity is invalid");
+      MothershipProdigyCluster cluster={};
+      require(loadClusterForScopedMutation("withdrawRemoteRuntimeRecovery",identity,cluster,failure) &&
+              cluster.deploymentMode==MothershipClusterDeploymentMode::remote && cluster.nBrains==3 &&
+              cluster.topology.machines.size()==3,"withdraw recovery cluster identity is invalid");
+      String registryPath={}; {auto registry=openClusterRegistry();registryPath=registry.path();}
+      MothershipRemoteRuntimeRecoveryExecutionLock lock;
+      require(lock.acquire(registryPath),"another runtime recovery executor is active or lock ownership is invalid");
+      MothershipRemoteRuntimeRecoveryCohortRecord record={}; MothershipUpgradeAdmissionRecord admission={};
+      {auto registry=openClusterRegistry();
+        require(registry.loadRemoteRuntimeRecoveryCohort(cluster.clusterUUID,operation,record,&failure) &&
+                registry.loadUpgradeAdmission(cluster.clusterUUID,operation,admission,&failure),"withdraw recovery authority is unavailable");}
+      if(record.phase==Phase::withdrawnBeforeFence) {
+        basics_log("withdrawRemoteRuntimeRecovery success=1 resumed=1 operationID=%s\n",operationText.c_str());return;
+      }
+      require(record.phase<=Phase::staged,"runtime recovery already crossed its fencing boundary");
+      MachineCpuArchitecture architecture=MachineCpuArchitecture::unknown;
+      String bundlePath={}; ProdigyApprovedUpgradeBundle approved={};
+      require(resolveProdigyBundleTargetArchitecture(identity.c_str(),architecture,&failure) &&
+              prodigyResolveBundleArtifactInput(bundleInput,architecture,bundlePath,&failure) &&
+              prodigyApproveBundleUpgradeContract(bundlePath,approved,&failure) && approved.verifyRetainedSnapshot(&failure) &&
+              approved.bundleSHA256==record.targetBundleSHA256 && approved.contract.contractSHA256==record.targetContractSHA256,
+              "withdraw recovery original target artifact differs");
+      String bytes={},digest={}; auto topology=cluster.topology; BitseryEngine::serialize(bytes,topology);
+      require(prodigyComputeSHA256Hex(bytes,digest,&failure) && digest==record.topologySHA256 &&
+              record.runtimeRoot==cluster.remoteProdigyPath,"withdraw recovery registered topology differs");
+      BitseryEngine::serialize(bytes,admission);
+      require(prodigyComputeSHA256Hex(bytes,digest,&failure) && digest==record.admissionRecordSHA256,
+              "withdraw recovery original admission differs");
+      ClusterCreateHooks hooks(this); ClusterTopology observed={};
+      require(hooks.fetchSeedTopology(cluster,observed,&failure) && observed==cluster.topology &&
+              mothershipValidateObservedMachineAuthorizationProjection(cluster.topology,observed,&failure),
+              "withdraw recovery authenticated topology differs");
+      String canonical={}; canonical.assignItoh(operation);
+      const auto root="/var/lib/prodigy/runtime-recovery/"+str(canonical);
+      for(const auto& saved:record.members) {
+        MothershipRemoteRuntimeRecoveryMember current={};
+        require(observeRemoteRuntimeRecoverySource(cluster,saved.machineUUID,record.runtimeRoot,admission,current,failure) &&
+                current.linuxMachineID==saved.linuxMachineID && current.bootID==saved.bootID &&
+                current.sourceProcessPID==saved.sourceProcessPID && current.sourceProcessStartTicks==saved.sourceProcessStartTicks,
+                "withdraw recovery source machine or process changed");
+        std::string guard="test \"$(awk '$1 == \"frozen\" { print $2 }' /sys/fs/cgroup/system.slice/prodigy.service/cgroup.events)\" = 0; ";
+        for(const auto name:{"writers-fenced","remote-recovery-fenced","remote-recovery-frozen","remote-recovery-quiesced",
+                              "remote-recovery-installed","remote-recovery-activation-ready","remote-recovery-started","stopped-proof.bin"}) {
+          const auto path=root+"/"+name;
+          guard+="test ! -e "+quote(path)+"; test ! -L "+quote(path)+"; test ! -e "+quote(path+".new")+"; test ! -L "+quote(path+".new")+"; ";
+        }
+        require(remoteRuntimeRecoveryCommand(cluster,saved.machineUUID,text(remoteRecoveryStrictShell(guard)),nullptr,failure),
+                "withdraw recovery found a partial fence or retained-state effect");
+      }
+      require(configureControlTarget(identity.c_str(),&failure),"withdraw recovery control target unavailable");
+      ProdigyUpgradeAdmissionReportRequest request={};request.operationID=operationText;
+      request.targetBundleSHA256=approved.bundleSHA256;request.targetContractSHA256=approved.contract.contractSHA256;
+      request.requiredStagingBytes=approved.contract.requiredFreeBytes;
+      MothershipUpgradeAdmissionReport report={};MothershipUpgradePlannerInput input={};
+      require(validateFreshRuntimeUpgradeAdmission(approved,admission,architecture,&cluster,request,true,report,input,failure),
+              "withdraw recovery fresh source admission failed");
+      if(!check) {auto registry=openClusterRegistry();
+        require(registry.withdrawRemoteRuntimeRecoveryCohort(cluster.clusterUUID,operation,record,&failure),
+                "withdraw recovery registry transition failed");}
+      basics_log("withdrawRemoteRuntimeRecovery success=1 checked=%u operationID=%s sourceProcessesUnchanged=1 evidencePreserved=1\n",
+                 unsigned(check),operationText.c_str());
+    } catch(const std::exception& error) {
+      basics_log("withdrawRemoteRuntimeRecovery success=0 preserved=1 failure=%s detail=%s\n",error.what(),failure.c_str());exit(EXIT_FAILURE);
+    }
   }
 
   // Repairs one exact cloud member only when a previously admitted rollout
@@ -13358,6 +15554,12 @@ private:
       exit(EXIT_FAILURE);
     }
 
+    // The scoped registry read is closed before provider execution. Test
+    // observers may now open the registry without racing fault admission;
+    // they must still independently observe the requested outage.
+    std::printf("faultTestCluster admitted=1 identity=%s mode=%s machineIndices=%s\n",
+                identity.c_str(), mode.c_str(), machineIndices.c_str());
+    std::fflush(stdout);
     if (mothershipFaultVirtualDatacenterProvider(cluster, mode, machineIndices, uint32_t(durationMs), uint32_t(cycles), uint32_t(downMs), uint32_t(upMs), &failure) == false)
     {
       basics_log("faultTestCluster success=0 identity=%s failure=%s\n", identity.c_str(), failure.c_str());
@@ -21534,6 +23736,22 @@ LOCAL_RUNTIME
   bool admitTruthDeploymentPlacement(const DeploymentPlan& plan, String& failure)
   {
     const uint16_t applicationID = plan.config.applicationID;
+    MothershipGlobalSingleWriterGroup state; String reason;
+    const bool managed = [&] {
+      auto registry = openClusterRegistry();
+      return registry.findGlobalSingleWriterGroupForDeployment(plan.config.deploymentID(),state,&reason);
+    }();
+    if (managed) {
+      const auto site = socket.configuredClusterUUID();
+      if (mothershipGlobalSingleWriterDeploymentMatches(state,plan,site)) return projectGlobalSingleWriter(state,site,failure);
+      failure.assign("deployment must explicitly select its admitted global single-writer mode and site"_ctv);
+      return false;
+    }
+    if (reason != "record not found"_ctv) { failure=reason; return false; }
+    if (plan.stateful.writerMode == StatefulWriterMode::globalSingleWriter) {
+      failure.assign("global single-writer deployment requires an admitted group before dispatch"_ctv);
+      return false;
+    }
     if (!mothershipApplicationPlacementRequired(applicationID)) return true;
     const bool graph = applicationID == 2 || applicationID == 5;
     const bool graphReplica = prodigyGraphDeploymentPlanCanonical(plan, true);
@@ -21543,7 +23761,7 @@ LOCAL_RUNTIME
     }
     const uint128_t requested = socket.configuredClusterUUID();
     if (requested == 0) { failure.assign("Truth admission requires an exact registered cluster identity"_ctv); return false; }
-    if (graph && plan.stateful.allMasters) {
+    if (graph && plan.stateful.writerMode == StatefulWriterMode::allMasters) {
       // Graph genesis deliberately precedes cross-site seed authorization.  It
       // still dispatches only to the configured, durably registered cluster;
       // cousin permissions and remote seed admission remain their own owners.
@@ -21754,6 +23972,8 @@ LOCAL_RUNTIME
       if (result.failure.empty()) result.failure.assign("failed to connect to deployment control target"_ctv);
       return false;
     }
+
+    if (plan.stateful.writerMode == StatefulWriterMode::globalSingleWriter && !requireGlobalSingleWriterControlVersion(result.failure)) return false;
 
     debugLog("socket_connected");
     socket.wBuffer.reserve(socket.wBuffer.size() + 1024);
@@ -21995,6 +24215,8 @@ LOCAL_RUNTIME
 
     bool sawSubnet = false;
     bool statefulClientPrefixPresent = false;
+    bool writerModePresent = false, legacyWriterModePresent = false;
+    bool legacyAllMasters = false, legacyGlobalSingleWriter = false;
     debugLog("json_parsed");
 
     for (auto field : doc.get_object())
@@ -23316,6 +25538,33 @@ LOCAL_RUNTIME
             (void)subfield.value.get(b);
             plan.stateful.neverShard = b;
           }
+          else if (key.equal("writerMode"_ctv))
+          {
+            if (subfield.value.type() != simdjson::dom::element_type::STRING) {
+              deploymentFailure.assign("stateful.writerMode requires a string"_ctv);
+              return false;
+            }
+            std::string_view mode;
+            (void)subfield.value.get(mode);
+            if (mode == "localSingleWriter") plan.stateful.writerMode = StatefulWriterMode::localSingleWriter;
+            else if (mode == "allMasters") plan.stateful.writerMode = StatefulWriterMode::allMasters;
+            else if (mode == "globalSingleWriter") plan.stateful.writerMode = StatefulWriterMode::globalSingleWriter;
+            else {
+              deploymentFailure.assign("stateful.writerMode must be localSingleWriter, allMasters, or globalSingleWriter"_ctv);
+              return false;
+            }
+            writerModePresent = true;
+          }
+          else if (key.equal("globalSingleWriter"_ctv))
+          {
+            if (subfield.value.type() != simdjson::dom::element_type::BOOL)
+            {
+              deploymentFailure.assign("stateful.globalSingleWriter requires a bool"_ctv);
+              return false;
+            }
+            (void)subfield.value.get(legacyGlobalSingleWriter);
+            legacyWriterModePresent = true;
+          }
           else if (key.equal("allMasters"_ctv))
           {
             if (subfield.value.type() != simdjson::dom::element_type::BOOL)
@@ -23327,7 +25576,8 @@ LOCAL_RUNTIME
 
             bool b = false;
             (void)subfield.value.get(b);
-            plan.stateful.allMasters = b;
+            legacyAllMasters = b;
+            legacyWriterModePresent = true;
           }
           else
           {
@@ -24702,6 +26952,22 @@ LOCAL_RUNTIME
       }
     }
 
+    if (writerModePresent && legacyWriterModePresent) {
+      deploymentFailure.assign("stateful.writerMode cannot be combined with legacy writer flags"_ctv);
+      return false;
+    }
+    if (!writerModePresent) {
+      if (legacyAllMasters && legacyGlobalSingleWriter) {
+        deploymentFailure.assign("stateful.allMasters and globalSingleWriter are mutually exclusive"_ctv);
+        return false;
+      }
+      plan.stateful.writerMode = legacyGlobalSingleWriter ? StatefulWriterMode::globalSingleWriter :
+          legacyAllMasters ? StatefulWriterMode::allMasters : StatefulWriterMode::localSingleWriter;
+    }
+    if (plan.stateful.writerMode == StatefulWriterMode::globalSingleWriter && !prodigyGlobalSingleWriterPlanValid(plan)) {
+      deploymentFailure.assign("globalSingleWriter requires a stateful unsharded single-writer plan with distinct mesh roles and no hostnet or horizontal scalers"_ctv);
+      return false;
+    }
     if (plan.stateful.clientPrefix == 0 && (plan.isStateful || statefulClientPrefixPresent) &&
         !prodigyGraphDeploymentPlanCanonical(plan, true)) {
       deploymentFailure.assign("only the canonical non-client graph replica may omit writer authority"_ctv);
@@ -28942,6 +31208,81 @@ LOCAL_RUNTIME
         mothershipPairControlBoundaryValid(boundary, &failure);
   }
 
+  // This is deliberately a one-tuple underlay admission, not a general VDC
+  // route.  The durable cross-cluster gateway authority is the sole source of
+  // the UDP listener; pair-control merely binds its two live VDC parents.
+  bool validatePairControlMasqueTransit(const MothershipClusterPairEnrollmentIntent& intent,
+                                        uint128_t localMachineUUID, uint128_t peerMachineUUID,
+                                        Vector<String>& arguments, String& failure)
+  {
+    arguments.clear();
+    CrossClusterMasqueGatewayAuthority local = {}, peer = {};
+    MothershipProdigyCluster source = {}, destination = {};
+    String sourceIdentity = {}, destinationIdentity = {};
+    {
+      auto registry = openClusterRegistry();
+      if (!registry.loadCrossClusterMasqueGateway(intent.pairUUID, localMachineUUID, local, &failure) ||
+          !registry.loadCrossClusterMasqueGateway(intent.pairUUID, peerMachineUUID, peer, &failure)) return false;
+      sourceIdentity.assignItoh(local.localClusterUUID); destinationIdentity.assignItoh(local.peerClusterUUID);
+      if (!registry.getClusterByIdentity(sourceIdentity, source, &failure) ||
+          !registry.getClusterByIdentity(destinationIdentity, destination, &failure)) return false;
+    }
+    if (local.state != CrossClusterMasqueGatewayState::active || peer.state != CrossClusterMasqueGatewayState::active ||
+        local.pairUUID != intent.pairUUID || peer.pairUUID != intent.pairUUID ||
+        local.pairOperationUUID != intent.operationUUID || peer.pairOperationUUID != intent.operationUUID ||
+        local.localRole != CrossClusterMasqueGatewayRole::connector || peer.localRole != CrossClusterMasqueGatewayRole::listener ||
+        local.localClusterUUID != source.clusterUUID || local.peerClusterUUID != destination.clusterUUID ||
+        peer.localClusterUUID != destination.clusterUUID || peer.peerClusterUUID != source.clusterUUID ||
+        local.localMachineUUID != localMachineUUID || local.peerMachineUUID != peerMachineUUID ||
+        peer.localMachineUUID != peerMachineUUID || peer.peerMachineUUID != localMachineUUID ||
+        !local.listenerPublicUDPEndpoint.equals(peer.listenerPublicUDPEndpoint) ||
+        local.listenerPublicUDPPort != peer.listenerPublicUDPPort || !local.listenerPublicUDPEndpoint.is6 ||
+        local.listenerPublicUDPPort == 0 || !mothershipClusterUsesVirtualDatacenter(source) ||
+        !mothershipClusterUsesVirtualDatacenter(destination) || source.test.enableFakeIpv4Boundary ||
+        destination.test.enableFakeIpv4Boundary)
+    { failure.assign("MASQUE transit requires one current reciprocal connector/listener authority on the enrolled plain-VDC pair"_ctv); return false; }
+
+    auto privateEndpoint = [&](const Vector<ClusterPairControlEndpoint>& endpoints, uint128_t machineUUID, IPAddress& out) {
+      uint32_t matches = 0;
+      for (const auto& endpoint : endpoints) if (endpoint.nodeUUID == machineUUID && endpoint.address.is6 && !endpoint.address.isNull()) { out = endpoint.address; ++matches; }
+      return matches == 1;
+    };
+    const auto& sourceEndpoints = source.clusterUUID == intent.firstClusterUUID ? intent.firstEndpoints : intent.secondEndpoints;
+    const auto& destinationEndpoints = destination.clusterUUID == intent.firstClusterUUID ? intent.firstEndpoints : intent.secondEndpoints;
+    IPAddress sourcePrivate = {}, destinationPrivate = {};
+    if (!privateEndpoint(sourceEndpoints, localMachineUUID, sourcePrivate) ||
+        !privateEndpoint(destinationEndpoints, peerMachineUUID, destinationPrivate))
+    { failure.assign("MASQUE transit gateway machine is not an exact enrolled private endpoint"_ctv); return false; }
+    uint32_t publicMatches = 0, localPublicCollisions = 0;
+    for (const auto& machine : destination.topology.machines) {
+      if (machine.uuid != peerMachineUUID) continue;
+      for (const auto& address : machine.addresses.publicAddresses) {
+        IPAddress parsed = {};
+        if (ClusterMachine::parseIPAddressLiteral(address.address, parsed) && parsed.equals(local.listenerPublicUDPEndpoint)) ++publicMatches;
+      }
+    }
+    for (const auto& machine : source.topology.machines)
+      for (const auto& address : machine.addresses.publicAddresses) {
+        IPAddress parsed = {};
+        if (ClusterMachine::parseIPAddressLiteral(address.address, parsed) && parsed.equals(local.listenerPublicUDPEndpoint)) ++localPublicCollisions;
+      }
+    if (publicMatches != 1 || localPublicCollisions != 0)
+    { failure.assign("MASQUE listener UDP endpoint is not a unique remote peer-machine address"_ctv); return false; }
+    MothershipPairControlBoundaryDescriptor boundary = intent.testControlBoundary;
+    if (!intent.testControlBoundaryAdmitted || intent.testControlBoundaryClosed ||
+        !mothershipPairControlBoundaryArguments(boundary, "query"_ctv, arguments, &failure)) return false;
+    arguments[1] = "masque"_ctv;
+    String sourceMachine = {}, destinationMachine = {}, sourceAddress = {}, destinationPrivateAddress = {}, listenerAddress = {}, port = {};
+    sourceMachine.assignItoh(localMachineUUID); destinationMachine.assignItoh(peerMachineUUID);
+    if (!ClusterMachine::renderIPAddressLiteral(sourcePrivate, sourceAddress) ||
+        !ClusterMachine::renderIPAddressLiteral(destinationPrivate, destinationPrivateAddress) ||
+        !ClusterMachine::renderIPAddressLiteral(local.listenerPublicUDPEndpoint, listenerAddress)) return false;
+    port.assignItoa(local.listenerPublicUDPPort);
+    arguments.push_back(sourceMachine); arguments.push_back(destinationMachine); arguments.push_back(sourceAddress);
+    arguments.push_back(destinationPrivateAddress); arguments.push_back(listenerAddress); arguments.push_back(port);
+    return true;
+  }
+
   void runTestClusterPairControl(int argc, char *argv[])
   {
     String failure = {}, action = {};
@@ -28949,11 +31290,15 @@ LOCAL_RUNTIME
     MothershipPairControlServiceTransit service = {};
     MothershipPairControlFault fault = {};
     TestPairLifecycleLock lock = {};
+    uint128_t masqueLocalMachineUUID = 0, masquePeerMachineUUID = 0;
     bool valid = argc >= 2 && argc <= 9 && prodigyParseCanonicalHex128(String(argv[0]), operationUUID) && operationUUID != 0;
     if (valid) action.assign(argv[1]);
-    valid = valid && (action == "prepare"_ctv || action == "query"_ctv || action == "remove"_ctv || action == "service"_ctv || action == "fault"_ctv);
+    valid = valid && (action == "prepare"_ctv || action == "query"_ctv || action == "remove"_ctv || action == "service"_ctv || action == "masque"_ctv || action == "fault"_ctv);
     if (valid && action == "service"_ctv)
       valid = argc == 3 && parsePairControlServiceTransitJSON(String(argv[2]), service, failure);
+    else if (valid && action == "masque"_ctv)
+      valid = argc == 4 && prodigyParseCanonicalHex128(String(argv[2]), masqueLocalMachineUUID) && masqueLocalMachineUUID != 0 &&
+          prodigyParseCanonicalHex128(String(argv[3]), masquePeerMachineUUID) && masquePeerMachineUUID != 0;
     else if (valid && action == "fault"_ctv)
     {
       String direction = {};
@@ -28996,8 +31341,14 @@ LOCAL_RUNTIME
         valid = registry.recordClusterPairTestControlServiceTransit(operationUUID, service, intent, &failure);
       }
     }
+    if (valid && action == "masque"_ctv)
+    {
+      Vector<String> arguments = {};
+      valid = validatePairControlMasqueTransit(intent, masqueLocalMachineUUID, masquePeerMachineUUID, arguments, failure) &&
+          mothershipRunVirtualDatacenterProvider(std::move(arguments), &failure);
+    }
 
-    if (valid && !(action == "remove"_ctv && intent.testControlBoundaryClosed))
+    if (valid && action != "masque"_ctv && !(action == "remove"_ctv && intent.testControlBoundaryClosed))
     {
       Vector<String> arguments = {};
       if (action == "prepare"_ctv)
@@ -29047,9 +31398,9 @@ LOCAL_RUNTIME
       if (::inet_ntop(AF_INET6, service.sourceWhiteholeAddress.v6, source, sizeof(source))) sourceAddress.assign(source);
       if (::inet_ntop(AF_INET6, service.destinationWormholeAddress.v6, destination, sizeof(destination))) destinationAddress.assign(destination);
     }
-    basics_log("testClusterPairControl success=%u action=%s operationUUID=%016llx%016llx service=%u faultDelayMs=%u faultDurationMs=%u faultDirection=%s source=%s:%u destination=%s:%u failure=%s\n",
+    basics_log("testClusterPairControl success=%u action=%s operationUUID=%016llx%016llx service=%u masque=%u faultDelayMs=%u faultDurationMs=%u faultDirection=%s source=%s:%u destination=%s:%u failure=%s\n",
         unsigned(valid), action.c_str(), (unsigned long long)(operationUUID >> 64),
-        (unsigned long long)operationUUID, unsigned(action == "service"_ctv), fault.delayMilliseconds, fault.durationMilliseconds,
+        (unsigned long long)operationUUID, unsigned(action == "service"_ctv), unsigned(action == "masque"_ctv), fault.delayMilliseconds, fault.durationMilliseconds,
         mothershipPairControlFaultDirectionName(fault.direction), sourceAddress.c_str(),
         unsigned(action == "service"_ctv ? service.sourceTCPPort : 0), destinationAddress.c_str(),
         unsigned(action == "service"_ctv ? service.destinationTCPPort : 0), failure.c_str());
@@ -29869,20 +32220,61 @@ LOCAL_RUNTIME
 
   void runResumeClusterCreation(int argc, char *argv[])
   {
-    if (argc != 2 || std::strlen(argv[0]) != 34 || std::strncmp(argv[0], "0x", 2) != 0 || std::strlen(argv[1]) != 36)
-    { basics_log("usage: resumeClusterCreation [exact 0x cluster UUID] [expected seed cloud UUID]\n"); exit(EXIT_FAILURE); }
+    if (argc != 2 || std::strlen(argv[0]) != 34 || std::strncmp(argv[0], "0x", 2) != 0)
+    { basics_log("usage: resumeClusterCreation [exact 0x cluster UUID] [expected seed cloud UUID|approved test bundle.zst]\n"); exit(EXIT_FAILURE); }
     for (unsigned i = 2; i < 34; ++i)
       if (!((argv[0][i] >= '0' && argv[0][i] <= '9') || (argv[0][i] >= 'a' && argv[0][i] <= 'f')))
       { basics_log("resumeClusterCreation invalid cluster UUID\n"); exit(EXIT_FAILURE); }
-    for (unsigned i = 0; i < 36; ++i)
-      if ((i == 8 || i == 13 || i == 18 || i == 23) ? argv[1][i] != '-' :
-          !((argv[1][i] >= '0' && argv[1][i] <= '9') || (argv[1][i] >= 'a' && argv[1][i] <= 'f')))
-      { basics_log("resumeClusterCreation invalid seed cloud UUID\n"); exit(EXIT_FAILURE); }
     String failure = {}, identity = {}; identity.assign(argv[0]);
     MothershipProdigyCluster cluster = {};
     uint128_t requestedUUID = 0;
     bool found = false;
     { auto registry = openClusterRegistry(); found = registry.getClusterByIdentity(identity, cluster, &failure); }
+    if (prodigyParseCanonicalHex128(identity, requestedUUID) && found &&
+        cluster.deploymentMode == MothershipClusterDeploymentMode::test)
+    {
+      // Resume the exact failed creation through its original stand-up owner.
+      // Empty provider paths are mandatory: a partial or live runtime must use
+      // its existing recovery owner, never this fresh-start path.
+      TestPairLifecycleLock pairLock;
+      bool openBoundary = false;
+      bool valid = lockTestPairLifecycle(pairLock, failure);
+      if (valid) {
+        auto registry = openClusterRegistry();
+        valid = registry.getClusterByIdentity(identity, cluster, &failure) &&
+            registry.clusterHasOpenTestPairBoundary(requestedUUID, openBoundary, &failure) && !openBoundary;
+      }
+      if (valid) valid = mothershipCanResumeEmptyTestCreation(cluster, requestedUUID) &&
+          mothershipEmptyTestCreationPathsSafe(cluster, &failure);
+      String bundlePath(argv[1]), bundleDigest;
+      if (valid) valid = !bundlePath.empty() && prodigyIsZstdFile(bundlePath) &&
+          prodigyApproveBundleArtifact(bundlePath, bundleDigest, &failure);
+      MothershipProviderCredential dnsCredential;
+      if (valid) valid = validateClusterDNSProviderCredentialReference(cluster, failure, &dnsCredential);
+      if (!valid) {
+        if (failure.empty()) failure.assign("test creation resume requires an exact failed empty creation, no pair boundary, empty owned paths and an approved bundle"_ctv);
+        basics_log("resumeClusterCreation success=0 failure=%s\n", failure.c_str());
+        exit(EXIT_FAILURE);
+      }
+      ClusterCreateHooks hooks(this, {}, std::move(bundlePath), std::move(bundleDigest));
+      MothershipClusterCreateTimingSummary timing;
+      const auto *dns = cluster.dnsProvider == MothershipClusterProvider::unknown ? nullptr : &dnsCredential;
+      if (!mothershipStandUpCluster(cluster, nullptr, hooks, &timing, &failure, dns)) {
+        persistClusterRefreshFailure(cluster, failure);
+        basics_log("resumeClusterCreation success=0 failure=%s\n", failure.c_str());
+        exit(EXIT_FAILURE);
+      }
+      persistClusterTopology(cluster, cluster.topology);
+      basics_log("resumeClusterCreation success=1 deploymentMode=test\n");
+      printManagedCluster(cluster);
+      return;
+    }
+    if (std::strlen(argv[1]) != 36)
+    { basics_log("resumeClusterCreation invalid seed cloud UUID\n"); exit(EXIT_FAILURE); }
+    for (unsigned i = 0; i < 36; ++i)
+      if ((i == 8 || i == 13 || i == 18 || i == 23) ? argv[1][i] != '-' :
+          !((argv[1][i] >= '0' && argv[1][i] <= '9') || (argv[1][i] >= 'a' && argv[1][i] <= 'f')))
+      { basics_log("resumeClusterCreation invalid seed cloud UUID\n"); exit(EXIT_FAILURE); }
     if (!prodigyParseCanonicalHex128(identity, requestedUUID) || !found ||
         !mothershipCanResumeVultrSeedCreation(cluster, requestedUUID))
     { basics_log("resumeClusterCreation success=0 failure=cluster is not an eligible incomplete Vultr creation\n"); exit(EXIT_FAILURE); }
@@ -29902,6 +32294,359 @@ LOCAL_RUNTIME
   void runCreateCluster(int argc, char *argv[])
   {
     runCreateClusterRequest(argc, argv, false);
+  }
+
+  // A remote cluster may receive its immutable DNS/ACME identity after its
+  // initial bootstrap.  The normal bootstrap already owns the managed Certbot
+  // and hook layout; use that exact command builder here before the Brain is
+  // configured, rather than relying on an ambient host tool or a rollout.
+  bool provisionManagedACMEToolsForExistingCluster(
+      const MothershipProdigyCluster& cluster,
+      const ProdigyACMEConfig& acme,
+      String& failure)
+  {
+    failure.clear();
+    if (acme.configured() == false || cluster.remoteProdigyPath.size() == 0 ||
+        cluster.remoteProdigyPath[0] != '/' ||
+        prodigyMachineCpuArchitectureSupportedTarget(cluster.architecture) == false)
+    {
+      failure.assign("existing cluster ACME provisioning requires configured ACME, an absolute runtime root, and a supported architecture"_ctv);
+      return false;
+    }
+    if (cluster.deploymentMode != MothershipClusterDeploymentMode::remote)
+    {
+      // Local and test providers configure their in-process or VM runtime via
+      // the existing configure protocol; they have no adopted remote Brain to
+      // repair over SSH.
+      return true;
+    }
+
+    String localExecutablePath = {};
+    String approvedBundlePath = {};
+    String approvedBundleSHA256 = {};
+    if (prodigyResolveCurrentExecutablePath(localExecutablePath) == false ||
+        prodigyResolveBuiltBundleArtifact(localExecutablePath, cluster.architecture,
+                                          approvedBundlePath, &failure) == false ||
+        prodigyApproveBundleArtifact(approvedBundlePath, approvedBundleSHA256, &failure) == false)
+    {
+      if (failure.size() == 0)
+      {
+        failure.assign("existing cluster ACME provisioning requires the approved bundle beside the qualified Mothership executable"_ctv);
+      }
+      return false;
+    }
+
+    ProdigyInstallRootPaths installPaths = {};
+    prodigyBuildInstallRootPaths(cluster.remoteProdigyPath, installPaths);
+    String installedBundlePath = {};
+    prodigyResolveInstalledBundlePathForRoot(cluster.remoteProdigyPath, installedBundlePath);
+
+    String command = {};
+    command.assign("set -eu; test -r "_ctv);
+    prodigyAppendShellSingleQuoted(command, installedBundlePath);
+    command.append("; actualBundleSHA256=$(sha256sum "_ctv);
+    prodigyAppendShellSingleQuoted(command, installedBundlePath);
+    command.append(" | awk '{print $1}'); test \"$actualBundleSHA256\" = "_ctv);
+    prodigyAppendShellSingleQuoted(command, approvedBundleSHA256);
+    command.append("; "_ctv);
+    if (prodigyAppendManagedACMEToolsInstallCommand(installPaths.toolsDirectory, acme, command, &failure) == false)
+    {
+      return false;
+    }
+    command.append("; managedCertbotVersion=$(/opt/prodigy/certbot/bin/certbot --version); test \"$managedCertbotVersion\" = 'certbot 5.6.0'; printf 'PRODIGY_MANAGED_ACME_TOOLS bundleSHA256=%s certbotVersion=%s\\n' \"$actualBundleSHA256\" \"$managedCertbotVersion\"; sync -f /opt/prodigy && sync -f /usr/lib/prodigy"_ctv);
+
+    uint32_t provisionedBrains = 0;
+    for (const ClusterMachine& topologyMachine : cluster.topology.machines)
+    {
+      if (topologyMachine.isBrain == false)
+      {
+        continue;
+      }
+      MothershipProdigyClusterMachine machine = {};
+      machine.kind = topologyMachine.kind;
+      machine.isBrain = topologyMachine.isBrain;
+      machine.uuid = topologyMachine.uuid;
+      machine.ssh = topologyMachine.ssh;
+      machine.addresses = topologyMachine.addresses;
+      mothershipHydrateTopologyRemoteCandidateSSH(cluster, machine);
+      if (machine.ssh.address.size() == 0 || machine.ssh.user.size() == 0 ||
+          machine.ssh.hostPublicKeyOpenSSH.size() == 0 || machine.ssh.privateKeyPath.size() == 0)
+      {
+        failure.assign("existing cluster ACME provisioning lacks a complete registered Brain SSH identity"_ctv);
+        return false;
+      }
+
+      LIBSSH2_SESSION *session = nullptr;
+      int fd = -1;
+      String output = {};
+      const bool provisioned =
+          mothershipConnectSSHSession(machine, session, fd, &failure,
+                                      &cluster.bootstrapSshKeyPackage, &cluster.bootstrapSshPrivateKeyPath) &&
+          prodigyRunBlockingSSHCommand(session, fd, command, &output, &failure, 120'000);
+      mothershipCloseSSHSession(session, fd);
+      String expectedMarker = {};
+      expectedMarker.snprintf<"PRODIGY_MANAGED_ACME_TOOLS bundleSHA256={} certbotVersion=certbot 5.6.0"_ctv>(approvedBundleSHA256);
+      if (provisioned && std::strstr(output.c_str(), expectedMarker.c_str()) == nullptr)
+      {
+        failure.assign("existing cluster ACME provisioning did not verify the approved bundle and managed Certbot version"_ctv);
+      }
+      if (provisioned == false || failure.size() > 0)
+      {
+        if (failure.size() == 0)
+        {
+          failure.assign("existing cluster ACME tools provisioning failed"_ctv);
+        }
+        return false;
+      }
+      String machineUUID = {};
+      machineUUID.assignItoh(machine.uuid);
+      basics_log("enableClusterDNSACME provisioned=1 machineUUID=%s bundleSHA256=%s certbotVersion=5.6.0\n",
+                 machineUUID.c_str(), approvedBundleSHA256.c_str());
+      ++provisionedBrains;
+    }
+    if (provisionedBrains == 0)
+    {
+      failure.assign("existing cluster ACME provisioning found no Brain machines"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  // DNS and ACME are cluster identity once configured. This command enables an
+  // unconfigured durable record, or idempotently repairs the matching managed
+  // toolset before replaying its existing configuration acknowledgement. It
+  // deliberately does not stand up, restart, or otherwise alter a machine.
+  void runEnableClusterDNSACME(int argc, char *argv[])
+  {
+    if (argc != 2)
+    {
+      basics_log("usage: enableClusterDNSACME [cluster name|UUID] [json|-|@path]\n");
+      exit(EXIT_FAILURE);
+    }
+
+    String json = {};
+    if (resolveJSONArgument("enableClusterDNSACME", argv[1], json) == false)
+    {
+      exit(EXIT_FAILURE);
+    }
+    json.need(simdjson::SIMDJSON_PADDING);
+
+    simdjson::dom::parser parser;
+    simdjson::dom::element doc;
+    if (parser.parse(json.data(), json.size()).get(doc) || doc.type() != simdjson::dom::element_type::OBJECT)
+    {
+      basics_log("enableClusterDNSACME requires object json\n");
+      exit(EXIT_FAILURE);
+    }
+
+    MothershipClusterProvider dnsProvider = MothershipClusterProvider::unknown;
+    String dnsProviderCredentialName = {};
+    ProdigyACMEConfig acme = {};
+    bool sawDNSProvider = false, sawDNSCredential = false, sawACME = false;
+    for (auto field : doc.get_object())
+    {
+      String key = {};
+      key.setInvariant(field.key.data(), field.key.size());
+      if (key.equal("dnsProvider"_ctv))
+      {
+        String provider = {};
+        if (sawDNSProvider || field.value.type() != simdjson::dom::element_type::STRING)
+        {
+          basics_log("enableClusterDNSACME.dnsProvider requires one string\n");
+          exit(EXIT_FAILURE);
+        }
+        provider.setInvariant(field.value.get_c_str());
+        if (parseMothershipClusterProvider(provider, dnsProvider) == false || dnsProvider == MothershipClusterProvider::unknown)
+        {
+          basics_log("enableClusterDNSACME.dnsProvider invalid\n");
+          exit(EXIT_FAILURE);
+        }
+        sawDNSProvider = true;
+      }
+      else if (key.equal("dnsProviderCredentialName"_ctv))
+      {
+        if (sawDNSCredential || field.value.type() != simdjson::dom::element_type::STRING)
+        {
+          basics_log("enableClusterDNSACME.dnsProviderCredentialName requires one string\n");
+          exit(EXIT_FAILURE);
+        }
+        dnsProviderCredentialName.assign(field.value.get_c_str());
+        sawDNSCredential = true;
+      }
+      else if (key.equal("acme"_ctv))
+      {
+        if (sawACME || parseClusterACMEConfigJSON(field.value, acme, "enableClusterDNSACME.acme") == false)
+        {
+          exit(EXIT_FAILURE);
+        }
+        sawACME = true;
+      }
+      else
+      {
+        basics_log("enableClusterDNSACME invalid field\n");
+        exit(EXIT_FAILURE);
+      }
+    }
+
+    if (sawDNSProvider == false || sawDNSCredential == false || sawACME == false || acme.configured() == false)
+    {
+      basics_log("enableClusterDNSACME requires complete DNS and ACME configuration\n");
+      exit(EXIT_FAILURE);
+    }
+
+    String identity = {};
+    identity.assign(argv[0]);
+    String failure = {};
+    MothershipProdigyCluster existing = {};
+    // A configure message carries the current complete BrainConfig.  Hold the
+    // registry's existing full-record writer lock across the read, ACK, and
+    // durable transition so another accepted record update cannot make that
+    // snapshot stale or be overwritten by this narrow enablement.
+    MothershipClusterRegistry registry = openClusterRegistry();
+    MothershipClusterRegistry::BGPOriginPolicyLock registryLock = {};
+    if (registry.lockBGPOriginPolicy(registryLock, &failure) == false ||
+        registry.getClusterByIdentity(identity, existing, &failure) == false)
+    {
+      basics_log("enableClusterDNSACME success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    MothershipProdigyCluster candidate = existing;
+    const bool alreadyConfigured = existing.dnsProvider != MothershipClusterProvider::unknown ||
+                                   existing.dnsProviderCredentialName.size() != 0 || existing.acme.configured();
+    if (alreadyConfigured)
+    {
+      if (existing.dnsProvider != dnsProvider ||
+          existing.dnsProviderCredentialName.equals(dnsProviderCredentialName) == false ||
+          existing.acme != acme)
+      {
+        basics_log("enableClusterDNSACME success=0 failure=cluster DNS/ACME is already configured with a different identity\n");
+        exit(EXIT_FAILURE);
+      }
+    }
+    else
+    {
+      candidate.dnsProvider = dnsProvider;
+      candidate.dnsProviderCredentialName = dnsProviderCredentialName;
+      candidate.acme = acme;
+    }
+
+    MothershipProviderCredential providerCredential = {}, dnsCredential = {};
+    if (validateClusterProviderCredentialReference(candidate, failure, &providerCredential) == false ||
+        validateClusterDNSProviderCredentialReference(candidate, failure, &dnsCredential) == false)
+    {
+      basics_log("enableClusterDNSACME success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    BrainConfig config = {};
+    const MothershipProviderCredential *providerCredentialPtr =
+        candidate.providerCredentialName.size() == 0 ? nullptr : &providerCredential;
+    if (mothershipBuildClusterBrainConfig(candidate, providerCredentialPtr, config, &failure, &dnsCredential) == false)
+    {
+      basics_log("enableClusterDNSACME success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    if (provisionManagedACMEToolsForExistingCluster(candidate, acme, failure) == false)
+    {
+      basics_log("enableClusterDNSACME success=0 provisioned=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    // ClusterCreateHooks owns the existing configure request/acknowledgement
+    // protocol and its bounded control-socket retry behavior.  Reusing it here
+    // keeps credential propagation and runtime persistence in the one owner.
+    ClusterCreateHooks hooks(this);
+    if (hooks.configureSeedCluster(candidate, config, &failure) == false)
+    {
+      basics_log("enableClusterDNSACME success=0 configured=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    MothershipProdigyCluster stored = candidate;
+    if (alreadyConfigured == false && registry.enableInitialDNSACME(identity, dnsProvider, dnsProviderCredentialName, acme,
+                                                                      &stored, &failure, &registryLock) == false)
+    {
+      // The acknowledged runtime configuration is intentionally not hidden:
+      // a later normal configure derives only from the durable registry, so
+      // this conflict cannot manufacture a durable enablement.
+      basics_log("enableClusterDNSACME success=0 configured=1 persisted=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    basics_log("enableClusterDNSACME success=1 repaired=%u cluster=%s clusterUUID=%016llx%016llx\n",
+               unsigned(alreadyConfigured), stored.name.c_str(),
+               (unsigned long long)(stored.clusterUUID >> 64), (unsigned long long)stored.clusterUUID);
+  }
+
+  void runRotateClusterDNSCredential(int argc, char *argv[])
+  {
+    const bool check = argc == 4 && std::strcmp(argv[3], "--check") == 0;
+    if ((argc != 3 && argc != 4) || (argc == 4 && check == false))
+    {
+      basics_log("usage: rotateClusterDNSCredential [cluster name|UUID] [expected old credential] [new credential] [--check]\n");
+      exit(EXIT_FAILURE);
+    }
+    String identity = {}, expectedOld = {}, newName = {}, failure = {};
+    identity.assign(argv[0]); expectedOld.assign(argv[1]); newName.assign(argv[2]);
+    MothershipClusterRegistry registry = openClusterRegistry();
+    MothershipClusterRegistry::BGPOriginPolicyLock registryLock = {};
+    MothershipProdigyCluster existing = {};
+    if (registry.lockBGPOriginPolicy(registryLock, &failure) == false ||
+        registry.getClusterByIdentity(identity, existing, &failure) == false)
+    {
+      basics_log("rotateClusterDNSCredential success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    if (existing.dnsProvider == MothershipClusterProvider::unknown ||
+        existing.dnsProviderCredentialName.empty() || existing.acme.configured() == false ||
+        existing.dnsProviderCredentialName.equals(expectedOld) == false)
+    {
+      basics_log("rotateClusterDNSCredential success=0 failure=cluster DNS credential reference is not the expected complete configured value\n");
+      exit(EXIT_FAILURE);
+    }
+    MothershipProdigyCluster candidate = existing;
+    candidate.dnsProviderCredentialName = newName;
+    MothershipProviderCredential providerCredential = {}, dnsCredential = {};
+    if (validateClusterProviderCredentialReference(candidate, failure, &providerCredential) == false ||
+        validateClusterNativeExactDNSCredentialReference(candidate, failure, &dnsCredential) == false)
+    {
+      basics_log("rotateClusterDNSCredential success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    BrainConfig config = {};
+    const MothershipProviderCredential *providerCredentialPtr =
+        candidate.providerCredentialName.empty() ? nullptr : &providerCredential;
+    if (mothershipBuildClusterBrainConfig(candidate, providerCredentialPtr, config, &failure, &dnsCredential) == false)
+    {
+      basics_log("rotateClusterDNSCredential success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    if (expectedOld.equals(newName))
+    {
+      basics_log("rotateClusterDNSCredential success=1 idempotent=1 cluster=%s\n", existing.name.c_str());
+      return;
+    }
+    if (check)
+    {
+      basics_log("rotateClusterDNSCredential success=1 checked=1 cluster=%s\n", existing.name.c_str());
+      return;
+    }
+    ClusterCreateHooks hooks(this);
+    if (hooks.configureSeedCluster(candidate, config, &failure) == false)
+    {
+      basics_log("rotateClusterDNSCredential success=0 configured=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    MothershipProdigyCluster stored = {};
+    if (registry.rotateDNSCredentialReference(identity, expectedOld, newName, &stored, &failure, &registryLock) == false)
+    {
+      basics_log("rotateClusterDNSCredential success=0 configured=1 persisted=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    basics_log("rotateClusterDNSCredential success=1 cluster=%s clusterUUID=%016llx%016llx\n",
+               stored.name.c_str(), (unsigned long long)(stored.clusterUUID >> 64),
+               (unsigned long long)stored.clusterUUID);
   }
 
   void runCheckClusterProviderPlan(int argc, char *argv[])
@@ -29987,6 +32732,20 @@ LOCAL_RUNTIME
       if (!clusterRegistry.clusterHasOpenTestPairBoundary(cluster.clusterUUID, ownsBoundary, &failure) || ownsBoundary)
       {
         basics_log("removeCluster success=0 removed=0 failure=%s\n", ownsBoundary ? "remove the owned test pair boundary first" : failure.c_str());
+        exit(EXIT_FAILURE);
+      }
+    }
+
+    // Remote recovery and removal both manipulate the same operation roots
+    // and service fence.  Serialize the existing lifecycle owners before
+    // removal archives those roots and uninstalls the runtime.
+    MothershipRemoteRuntimeRecoveryExecutionLock recoveryLock;
+    if (cluster.deploymentMode == MothershipClusterDeploymentMode::remote)
+    {
+      auto registry = openClusterRegistry();
+      if (!recoveryLock.acquire(registry.path()))
+      {
+        basics_log("removeCluster success=0 removed=0 identity=%s failure=runtime recovery executor is active or lock ownership is invalid\n", name.c_str());
         exit(EXIT_FAILURE);
       }
     }
@@ -30152,6 +32911,91 @@ LOCAL_RUNTIME
                unsigned(resumeAfterDNS));
   }
 
+  // Normal rollout and recovery share the same fresh typed admission owner.
+  // Recovery adds stopped-state evidence after this check; it never relaxes
+  // the fleet identity, authority, capacity or compatibility requirements.
+  enum class RuntimeAdmissionValidation {
+    executeAdmittedUpdate,
+    executeCohortRecovery,
+    // Closing an abandoned, never-installed operation does not authorize an
+    // update. Its source may have restarted, so validate fresh planner gates
+    // without claiming the old process observation still holds.
+    restoreSourceBeforeInstallation,
+  };
+
+  bool validateFreshRuntimeUpgradeAdmission(
+      const ProdigyApprovedUpgradeBundle& approved,
+      const MothershipUpgradeAdmissionRecord& admission,
+      MachineCpuArchitecture targetArchitecture,
+      const MothershipProdigyCluster *registeredCluster,
+      const ProdigyUpgradeAdmissionReportRequest& observationRequest,
+      bool acceptActiveWorkloadInterruption,
+      MothershipUpgradeAdmissionReport& report,
+      MothershipUpgradePlannerInput& input, String& failure,
+      RuntimeAdmissionValidation validation = RuntimeAdmissionValidation::executeAdmittedUpdate)
+  {
+    report = {}; input = {}; failure.clear();
+    constexpr uint32_t maximumObservationAttempts = 3;
+    bool reportReceived = false;
+    for (uint32_t attempt = 0; attempt < maximumObservationAttempts; ++attempt)
+    {
+      if (!requestUpgradeAdmissionReport(observationRequest, report, failure)) return false;
+      reportReceived = true;
+      if (report.observationComplete) break;
+    }
+    if (!reportReceived)
+    {
+      return false;
+    }
+
+    MothershipUpgradeIdentity sourceIdentity = {};
+    sourceIdentity.releaseID = admission.sourceReleaseID;
+    sourceIdentity.contractSHA256 = admission.sourceContractSHA256;
+    sourceIdentity.prodigySHA256 = admission.sourceProdigySHA256;
+    sourceIdentity.mothershipSHA256 = admission.sourceMothershipSHA256;
+    String observedTargetArchitecture = {};
+    observedTargetArchitecture.assign(machineCpuArchitectureName(targetArchitecture));
+    buildUpgradePlannerInput(approved, sourceIdentity, report, observedTargetArchitecture,
+                             registeredCluster, input, failure,
+                             acceptActiveWorkloadInterruption);
+    if (failure.empty() && report.clusterUUID != admission.clusterUUID)
+      failure.assign("fresh upgrade report cluster identity differs from the admission record"_ctv);
+    if (failure.empty() && report.masterApprovedBundleSHA256 != admission.sourceBundleSHA256)
+      failure.assign("fresh master bundle digest differs from the admitted source bundle"_ctv);
+    if (failure.empty())
+      for (const ProdigyUpgradeAdmissionPeerObservation& peer : report.peers)
+        if (peer.installedBundleSHA256 != admission.sourceBundleSHA256)
+        {
+          failure.assign("fresh peer bundle digest differs from the admitted source bundle"_ctv);
+          break;
+        }
+    String semanticSHA256 = {};
+    if (failure.empty() && !semanticUpgradeAdmissionReportDigest(report, semanticSHA256, failure))
+    {
+      return false;
+    }
+    MothershipUpgradePlan freshPlan = mothershipPlanUpgrade(approved.contract, input);
+    if (failure.empty() && !freshPlan.eligible)
+      failure = freshPlan.firstStopGate;
+    const bool cohortPath = freshPlan.path == MothershipUpgradePath::sameLogicalCohortRecovery &&
+        validation != RuntimeAdmissionValidation::executeAdmittedUpdate && registeredCluster &&
+        registeredCluster->deploymentMode == MothershipClusterDeploymentMode::remote && registeredCluster->nBrains == 3 &&
+        registeredCluster->topology.machines.size() == 3;
+    if (failure.empty() && (uint8_t(freshPlan.path) != admission.approvedPath ||
+        (freshPlan.path != MothershipUpgradePath::sameLogicalRollout && !cohortPath)))
+      failure.assign("fresh plan does not permit the admitted runtime transition"_ctv);
+    if (failure.empty() && validation != RuntimeAdmissionValidation::restoreSourceBeforeInstallation &&
+        (freshPlan.inputSHA256 != admission.plannerInputSHA256 ||
+         report.authorityGeneration != admission.authorityGeneration || report.masterUUID != admission.masterUUID ||
+         report.masterBootNs != admission.masterBootNs || semanticSHA256 != admission.semanticObservationSHA256))
+      failure.assign("fresh report or plan no longer matches the durable admission; re-plan required"_ctv);
+    if (!failure.empty())
+    {
+      return false;
+    }
+    return true;
+  }
+
   void runUpdateProdigy(int argc, char *argv[])
   {
     uint8_t brainConcurrency = 0;
@@ -30217,6 +33061,12 @@ LOCAL_RUNTIME
     MothershipProdigyCluster upgradeCluster = {};
     const bool hasUpgradeCluster = tryLoadStoredClusterTarget(argv[0], upgradeCluster);
     MothershipClusterRegistry registry = openClusterRegistry();
+    bool recoveryPending = false;
+    if (!registry.remoteRuntimeRecoveryPending(configuredClusterUUID,recoveryPending,&failure) || recoveryPending)
+    {
+      basics_log("updateProdigy rejected: pending runtime recovery must be reconciled before another rollout: %s\n",failure.c_str());
+      exit(EXIT_FAILURE);
+    }
     MothershipUpgradeAdmissionRecord admission = {};
     if (!registry.loadUpgradeAdmission(configuredClusterUUID, operationID, admission, &failure))
     {
@@ -30243,57 +33093,10 @@ LOCAL_RUNTIME
     }
 
     MothershipUpgradeAdmissionReport report = {};
-    constexpr uint32_t maximumObservationAttempts = 3;
-    bool reportReceived = false;
-    for (uint32_t attempt = 0; attempt < maximumObservationAttempts; ++attempt)
-    {
-      if (!requestUpgradeAdmissionReport(observationRequest, report, failure)) break;
-      reportReceived = true;
-      if (report.observationComplete) break;
-    }
-    if (!reportReceived)
-    {
-      basics_log("updateProdigy rejected by upgrade admission: %s\n", failure.c_str());
-      exit(EXIT_FAILURE);
-    }
-
-    MothershipUpgradeIdentity sourceIdentity = {};
-    sourceIdentity.releaseID = admission.sourceReleaseID;
-    sourceIdentity.contractSHA256 = admission.sourceContractSHA256;
-    sourceIdentity.prodigySHA256 = admission.sourceProdigySHA256;
-    sourceIdentity.mothershipSHA256 = admission.sourceMothershipSHA256;
-    String observedTargetArchitecture = {};
-    observedTargetArchitecture.assign(machineCpuArchitectureName(targetArchitecture));
     MothershipUpgradePlannerInput input = {};
-    buildUpgradePlannerInput(approvedBundle, sourceIdentity, report, observedTargetArchitecture,
-                             hasUpgradeCluster ? &upgradeCluster : nullptr, input, failure,
-                             acceptActiveWorkloadInterruption);
-    if (failure.empty() && report.clusterUUID != admission.clusterUUID)
-      failure.assign("fresh upgrade report cluster identity differs from the admission record"_ctv);
-    if (failure.empty() && report.masterApprovedBundleSHA256 != admission.sourceBundleSHA256)
-      failure.assign("fresh master bundle digest differs from the admitted source bundle"_ctv);
-    if (failure.empty())
-      for (const ProdigyUpgradeAdmissionPeerObservation& peer : report.peers)
-        if (peer.installedBundleSHA256 != admission.sourceBundleSHA256)
-        {
-          failure.assign("fresh peer bundle digest differs from the admitted source bundle"_ctv);
-          break;
-        }
-    String semanticSHA256 = {};
-    if (failure.empty() && !semanticUpgradeAdmissionReportDigest(report, semanticSHA256, failure))
-    {
-      basics_log("updateProdigy rejected by upgrade admission: %s\n", failure.c_str());
-      exit(EXIT_FAILURE);
-    }
-    MothershipUpgradePlan freshPlan = mothershipPlanUpgrade(approvedBundle.contract, input);
-    if (failure.empty() && !freshPlan.eligible)
-      failure = freshPlan.firstStopGate;
-    if (failure.empty() && (freshPlan.path != MothershipUpgradePath::sameLogicalRollout ||
-                            freshPlan.inputSHA256 != admission.plannerInputSHA256 ||
-                            report.authorityGeneration != admission.authorityGeneration || report.masterUUID != admission.masterUUID ||
-                            report.masterBootNs != admission.masterBootNs || semanticSHA256 != admission.semanticObservationSHA256))
-      failure.assign("fresh report or plan no longer matches the durable admission; re-plan required"_ctv);
-    if (!failure.empty())
+    if (!validateFreshRuntimeUpgradeAdmission(approvedBundle, admission, targetArchitecture,
+          hasUpgradeCluster ? &upgradeCluster : nullptr, observationRequest,
+          acceptActiveWorkloadInterruption, report, input, failure))
     {
       basics_log("updateProdigy rejected by upgrade admission: %s\n", failure.c_str());
       exit(EXIT_FAILURE);
@@ -30402,8 +33205,10 @@ LOCAL_RUNTIME
     const char *reason = "release declares upgrade unsupported";
     if (approved.contract.disposition == MothershipUpgradeDisposition::sameClusterRollout) disposition = "same-cluster-rollout";
     else if (approved.contract.disposition == MothershipUpgradeDisposition::newClusterRequired) disposition = "new-cluster-required";
+    else if (approved.contract.disposition == MothershipUpgradeDisposition::sameClusterCohortRecovery) disposition = "same-cluster-cohort-recovery";
     if (approved.contract.disposition == MothershipUpgradeDisposition::sameClusterRollout) reason = "cluster preflight is required before rollout";
     else if (approved.contract.disposition == MothershipUpgradeDisposition::newClusterRequired) reason = "separate-cluster migration still requires workload bridges";
+    else if (approved.contract.disposition == MothershipUpgradeDisposition::sameClusterCohortRecovery) reason = "complete stopped-cohort recovery is required";
     auto compatibility = [](MothershipUpgradeCompatibilityState state) {
       if (state == MothershipUpgradeCompatibilityState::compatible) return "compatible";
       if (state == MothershipUpgradeCompatibilityState::incompatible) return "incompatible";
@@ -30475,6 +33280,9 @@ LOCAL_RUNTIME
     basics_log("placementPolicy success=%d appID=%u versionID=%llu operationID=%s durableGeneration=%llu failure=%s\n", int(response.success), unsigned(response.policy.applicationID), (unsigned long long)response.policy.versionID, response.policy.operationID.c_str(), (unsigned long long)response.durableGeneration, response.failure.c_str());
     if (!response.success) exit(EXIT_FAILURE);
   }
+
+#include <prodigy/mothership/mothership.truth.routes.inc>
+#include <prodigy/mothership/mothership.truth.control.inc>
 
   void runCancelDeployment(int argc, char *argv[])
   {
@@ -34544,7 +37352,7 @@ private:
       if (!prepareDeploymentPlan(cluster.name.c_str(), planArgument.c_str(), artifactPath.c_str(),
             one.plan, one.artifactPath, returnEarly, failure) ||
           !mothershipValidateDiscombobulatorContainerBlobContract(one.artifactPath, &failure)) return false;
-      if (!one.plan.isStateful || !one.plan.stateful.allMasters || one.plan.useHostNetworkNamespace ||
+      if (!one.plan.isStateful || one.plan.stateful.writerMode != StatefulWriterMode::allMasters || one.plan.useHostNetworkNamespace ||
           one.plan.config.applicationID != bound.applicationID ||
           one.plan.config.deploymentID() != bound.successorDeploymentID ||
           bound.successorDeploymentID <= bound.previousDeploymentID ||
@@ -36280,6 +39088,7 @@ public:
     };
 
     constexpr static Command commands[] = {
+        {"abortRemoteRuntimeRecoveryBeforeInstall", &Mothership::runAbortRemoteRuntimeRecoveryBeforeInstall},
         {"acme-cleanup-dns-01",             &Mothership::runACMECleanupDNS01ChallengeHook  },
         {"acme-import-lineage",             &Mothership::runACMELineageImportHook          },
         {"acme-present-dns-01",             &Mothership::runACMEPresentDNS01ChallengeHook  },
@@ -36293,6 +39102,7 @@ public:
         {"captureBrainStateLocal",          &Mothership::runCaptureBrainStateLocal         },
         {"checkClusterProviderPlan",        &Mothership::runCheckClusterProviderPlan       },
         {"clusterReport",                   &Mothership::runClusterReport                  },
+        {"configureGlobalSingleWriterGroup",             &Mothership::configureGlobalSingleWriterGroup                },
         {"configureLocalVMClusterLANIPv6",  &Mothership::runConfigureLocalVMClusterLANIPv6 },
         {"configureTestClusterPublicIngressSource", &Mothership::runConfigureTestClusterPublicIngressSource},
         {"containerLogs",                   &Mothership::runContainerLogs                  },
@@ -36309,6 +39119,7 @@ public:
         {"deploymentIdentity",              &Mothership::runDeploymentIdentity             },
         {"destroyProviderClusterMachines",  &Mothership::runDestroyProviderClusterMachines },
         {"destroyProviderMachines",         &Mothership::runDestroyProviderMachines        },
+        {"enableClusterDNSACME",            &Mothership::runEnableClusterDNSACME           },
         {"enrollClusterPair",               &Mothership::runEnrollClusterPair              },
         {"estimateClusterHourlyCost",       &Mothership::runEstimateClusterHourlyCost      },
         {"faultClusterNetwork",            &Mothership::runFaultClusterNetwork           },
@@ -36316,6 +39127,7 @@ public:
         {"faultRemoteCloudMachine",         &Mothership::runFaultRemoteCloudMachine        },
         {"faultTestCluster",                &Mothership::runFaultTestCluster               },
         {"faultTestClusters",               &Mothership::runFaultTestClusters              },
+        {"globalSingleWriterControl",              &Mothership::runGlobalSingleWriterControl              },
         {"growContainerPool",              &Mothership::runGrowContainerPool              },
         {"inspectLocalVMBoundaries",        &Mothership::runInspectLocalVMBoundaries       },
         {"inspectUpgradeBundle",            &Mothership::runInspectUpgradeBundle           },
@@ -36351,14 +39163,17 @@ public:
         {"pullRoutableSubnets",             &Mothership::runPullRoutableSubnets            },
         {"rearmRetainedStatefulDeployment", &Mothership::runRearmRetainedStatefulDeployment},
         {"recommendClusterForApplications", &Mothership::runRecommendClusterForApplications},
+        {"reconcileGlobalSingleWriter",                 &Mothership::runReconcileGlobalSingleWriter                 },
         {"recoverLocalClusterAuthority",    &Mothership::runRecoverLocalClusterAuthority   },
         {"recoverMaterializedStatefulDeployment", &Mothership::runRecoverMaterializedStatefulDeployment },
+        {"recoverRemoteClusterRuntime", &Mothership::runRecoverRemoteClusterRuntime},
         {"recoverRetainedFleet", &Mothership::runRecoverRetainedFleet},
         {"recoverStoppedLocalVM",           &Mothership::runRecoverStoppedLocalVM          },
         {"recoverTestClusterBundle",        &Mothership::runRecoverTestClusterBundle       },
         {"recoverTestClusterFollowerBrain", &Mothership::runRecoverTestClusterFollowerBrain},
         {"registerLocalVMBoundary",         &Mothership::runRegisterLocalVMBoundary        },
         {"registerRoutableSubnet",          &Mothership::runRegisterRoutableSubnet         },
+        {"remoteRuntimeRecoveryLocal", &Mothership::runRemoteRuntimeRecoveryLocal},
         {"removeCluster",                   &Mothership::runRemoveCluster                  },
         {"removeLocalVM",                   &Mothership::runRemoveLocalVM                  },
         {"removeProviderCredential",        &Mothership::runRemoveProviderCredential       },
@@ -36374,6 +39189,7 @@ public:
         {"retireTestPairSource",            &Mothership::runRetireTestPairSource           },
         {"revokeBGPOriginPrefix",           &Mothership::runRevokeBGPOriginPrefix          },
         {"revokeClusterPair",               &Mothership::runRevokeClusterPair              },
+        {"rotateClusterDNSCredential",      &Mothership::runRotateClusterDNSCredential     },
         {"rotateClusterPairEpoch",          &Mothership::runRotateClusterPairEpoch         },
         {"setLocalClusterMembership",       &Mothership::runSetLocalClusterMembership      },
         {"setTestClusterMachineCount",      &Mothership::runSetTestClusterMachineCount     },
@@ -36382,12 +39198,14 @@ public:
         {"testClusterPairControl",          &Mothership::runTestClusterPairControl         },
         {"transportCredentialLifecycle",    &Mothership::runTransportCredentialLifecycle   },
         {"unregisterRoutableSubnet",        &Mothership::runUnregisterRoutableSubnet       },
+        {"updateAdoptedMachineRacks",       &Mothership::runUpdateAdoptedMachineRacks      },
         {"updateProdigy",                   &Mothership::runUpdateProdigy                  },
         {"upsertApiCredentialSet",          &Mothership::runUpsertApiCredentialSet         },
         {"upsertDNSBinding",                &Mothership::runUpsertDNSBinding               },
         {"upsertMachineSchemas",            &Mothership::runUpsertMachineSchemas           },
         {"upsertTlsVaultFactory",           &Mothership::runUpsertTlsVaultFactory          },
         {"verifyRetiredConflictingClientLocal", &Mothership::runVerifyRetiredConflictingClientLocal},
+        {"withdrawRemoteRuntimeRecovery", &Mothership::runWithdrawRemoteRuntimeRecovery},
     };
 
     static_assert([] {
@@ -36457,6 +39275,9 @@ int main(int argc, char *argv[])
     message.append("\tjournals and launches the exact remote all-masters cohorts with native client access fenced until their retained source cut is applied\n");
     message.append("observeStatefulStoreSourceCut [cluster] [Hot deploymentID] [containerUUID] [operationUUID] [shardGroup] [shardCount]\n");
     message.append("\tcaptures, freshly queries, and releases one exact healthy Hot native source-cut proof; it does not deploy, reseed, reset, or alter serving state\n");
+    message.append("configureGlobalSingleWriterGroup GROUP OPERATION DEPLOYMENT GRACE_MS CLUSTER [CLUSTER [CLUSTER]]\n");
+    message.append("globalSingleWriterControl GROUP inspect|provisionOnce MEMBER\n");
+    message.append("reconcileGlobalSingleWriter GROUP [--watch]\n");
     message.append("configureLocalVMClusterLANIPv6 [cluster]\n");
     message.append("\tconfigures one deterministic private IPv6 /64 on the exact three sealed local-VM cluster LAN owners without changing their QEMU or WAN boundaries\n");
     message.append("createProviderCredential [json|-|@path]\n");
@@ -36487,11 +39308,17 @@ int main(int argc, char *argv[])
     message.append("\toptionally enables one cluster DNS provider and ACME with dnsProvider plus acme.accountEmail/acme.termsAgreed; see prodigy/docs/dns-providers.md\n");
     message.append("\tdeploymentMode=test creates a Mothership-managed virtual datacenter\n");
     message.append("\tan optional test initial bundle is a transient, approved explicit .zst archive used only to seed a test virtual datacenter\n");
-    message.append("resumeClusterCreation [exact 0x cluster UUID] [expected seed cloud UUID]\n");
+    message.append("enableClusterDNSACME [name|clusterUUID] [json|-|@path]\n");
+    message.append("\tenables complete DNS credential and ACME configuration exactly once on an existing unconfigured cluster through the durable configure acknowledgement; it does not restart or recreate machines\n");
+    message.append("rotateClusterDNSCredential [name|clusterUUID] [expected old credential] [new credential] [--check]\n");
+    message.append("\trotates only a complete cluster DNS credential reference through the configure acknowledgement and durable exact-old CAS; it does not restart or recreate machines\n");
+    message.append("resumeClusterCreation [exact 0x cluster UUID] [expected seed cloud UUID|approved test bundle.zst]\n");
     message.append("printClusters\n");
     message.append("\tlists all managed Prodigy cluster records with their clusterUUIDs\n");
     message.append("setLocalClusterMembership [name|clusterUUID] [json]\n");
     message.append("\trequires deploymentMode=local and atomically replaces the stored local membership spec with includeLocalMachine, machines, optional nBrains, and bootstrapSshUser/bootstrapSshPrivateKeyPath/bootstrapSshKeyPackage for adopted-machine bootstrap before reconciling and persisting on live success\n");
+    message.append("updateAdoptedMachineRacks [remote name|clusterUUID] [json|-|@path]\n");
+    message.append("\tupdates only nonzero logical rackUUID labels for exact existing adopted remote machineUUIDs through ordinary live topology reconciliation; it does not create, remove, restart, or relocate a machine\n");
     message.append("setTestClusterMachineCount [name|clusterUUID] [json]\n");
     message.append("\trequires deploymentMode=test and updates only test.machineCount through exact json field machineCount before restarting/reconciling and persisting on live success\n");
     message.append("adoptTestClusterSpare [name|clusterUUID]\n\tsubmits the configured SSH spare to ordinary Brain AddMachines and exits; observe native durable acceptance and cluster readiness separately\n");
@@ -36521,6 +39348,10 @@ int main(int argc, char *argv[])
     message.append("\trefreshes authoritative topology, resolves one exact Mothership-created Vultr machine, and submits one bounded provider hard reboot\n");
     message.append("repairRemoteCloudMachineRuntime [clusterName|clusterUUID] [machineUUID canonical hex] [upgrade operationUUID] [approved bundle] [expected Linux machine ID] [--check]\n");
     message.append("\trepairs one failed, empty remote runtime only when its immutable upgrade admission, provider topology, target machine identity, and live two-Brain quorum still match; --check performs no upload or install\n");
+    message.append("recoverRemoteClusterRuntime [clusterName|clusterUUID] [approved bundle] [upgrade operationUUID] --accept-cohort-interruption [--check] [--driver-bundle approved compatible controller bundle]\n");
+    message.append("\trecovers the admitted runtime cohort on unchanged machines; a separately approved controller may resume the immutable target after a controller fix\n");
+    message.append("withdrawRemoteRuntimeRecovery [cluster] [original approved target bundle] [operationUUID] [--check]\n");
+    message.append("\tretires an untouched recovery admission only while every original source process and unfenced machine identity still match\n");
     message.append("faultTestCluster [name|clusterUUID] [link|crash|flap] [machine indices csv] [durationMs] [cycles] [downMs] [upMs]\n");
     message.append("\trequests a bounded virtual-datacenter machine fault through the Mothership-owned test provider\n");
     message.append("faultTestClusters [first name|clusterUUID] [first machineIndex] [second name|clusterUUID] [second machineIndex] [durationMs]\n");
@@ -36591,7 +39422,7 @@ int main(int argc, char *argv[])
     message.append("\tconfigurePair derives and stages both reciprocal enrolled-pair authorities before either readiness wait; an optional artifact blob is verified and stored as the dedicated gateway kind\n");
     message.append("transportCredentialLifecycle [clusterName|clusterUUID] [operationUUID canonical hex] [query|request brain|neuron rotate|revoke nodeUUID canonical hex]\n");
     message.append("\trequests a new epoch from the originating cluster, or observes both sides; clusters negotiate and finish autonomously\n");
-    message.append("testClusterPairControl [enrollment operationUUID canonical hex] [prepare|query|remove|service JSON|fault delayMs durationMs [both|first-to-second|second-to-first]]\n");
+    message.append("testClusterPairControl [enrollment operationUUID canonical hex] [prepare|query|remove|service JSON|masque CONNECTOR_MACHINE_UUID LISTENER_MACHINE_UUID|fault delayMs durationMs [both|first-to-second|second-to-first]]\n");
     message.append("\tmanages enrolled TCP control transit, up to two reciprocal permission-verified Whitehole-to-protected-Wormhole test flows, and a bounded directed partition fault\n");
     message.append("clusterReport [target: local|clusterName|clusterUUID]\n");
     message.append("\tfetches the current cluster-wide machine and application status report from the master brain\n");

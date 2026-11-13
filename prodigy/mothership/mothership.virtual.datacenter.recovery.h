@@ -9,6 +9,7 @@
 #include <signal.h>
 #include <sched.h>
 #include <climits>
+#include <cstring>
 
 // Workers retain the live Brain as their plan owner. A sole Brain requires
 // the authenticated checkpoint path plus an exact incomplete-update receipt.
@@ -687,6 +688,30 @@ static inline bool mothershipVDCReadProcessFile(uint64_t pid, const char *name, 
   return mothershipVDCRead(path, result);
 }
 
+// A same-boot recovery may capture only after the source service's own cgroup
+// reports a completed freeze.  Keep this path construction in the VDC owner:
+// a compile-time String view is read-only and must first be copied before the
+// cgroup suffix is appended.
+static inline bool mothershipFrozenServiceCgroup(const MothershipVDCProcessIdentity& process,
+                                                 const String& cgroupRoot = "/sys/fs/cgroup"_ctv)
+{
+  String cgroup = {};
+  if (!mothershipVDCReadProcessFile(process.pid, "cgroup", cgroup)) return false;
+  const String prefix = "0::"_ctv;
+  if (cgroup.size() <= prefix.size() || std::memcmp(cgroup.data(), prefix.data(), prefix.size()) != 0) return false;
+  uint64_t end = prefix.size(); while (end < cgroup.size() && cgroup[end] != '\n') ++end;
+  if (end == prefix.size() || cgroup[prefix.size()] != '/') return false;
+  String events = {};
+  events.assign(cgroupRoot);
+  events.append(cgroup.data() + prefix.size(), end - prefix.size()); events.append("/cgroup.events"_ctv);
+  String contents = {};
+  if (!mothershipVDCRead(events, contents, 4096)) return false;
+  constexpr char frozen[] = "frozen 1\n";
+  for (uint64_t index = 0; index + sizeof(frozen) - 1 <= contents.size(); ++index)
+    if (std::memcmp(contents.data() + index, frozen, sizeof(frozen) - 1) == 0) return true;
+  return false;
+}
+
 static inline bool mothershipVDCReadArguments(uint64_t pid, Vector<String>& arguments)
 {
   String text = {};
@@ -706,7 +731,7 @@ static inline bool mothershipVDCReadArguments(uint64_t pid, Vector<String>& argu
 static inline bool mothershipVDCProviderArguments(const Vector<String>& arguments, const String& workspace,
                                                  uint64_t runtimeIdentity, String (&original)[12])
 {
-  if (arguments.size() != 15 && arguments.size() != 17) return false;
+  if (arguments.size() < 15 || arguments.size() > 19) return false;
   if (arguments[0].equals("bash"_ctv) == false && arguments[0].equals("/bin/bash"_ctv) == false) return false;
   constexpr char prefix[] = "/proc/self/fd/";
   uint64_t descriptor = 0;
@@ -718,12 +743,18 @@ static inline bool mothershipVDCProviderArguments(const Vector<String>& argument
   if (arguments[2].equals("--serve-adopt"_ctv))
   {
     uint64_t parsed = 0;
-    if (arguments.size() != 17 || mothershipVDCParseUnsigned(reinterpret_cast<const char *>(arguments[3].data()), reinterpret_cast<const char *>(arguments[3].data()) + arguments[3].size(), parsed) == false ||
+    if (arguments.size() < 17 || arguments.size() > 19 || mothershipVDCParseUnsigned(reinterpret_cast<const char *>(arguments[3].data()), reinterpret_cast<const char *>(arguments[3].data()) + arguments[3].size(), parsed) == false ||
         parsed != runtimeIdentity) return false;
     offset = 5;
   }
-  else if (arguments[2].equals("--serve"_ctv) == false || arguments.size() != 15) return false;
+  else if (arguments[2].equals("--serve"_ctv) == false || arguments.size() < 15 || arguments.size() > 17) return false;
   if (arguments[offset].equals(workspace) == false) return false;
+  const uint64_t tail = arguments.size() - offset - 12;
+  // The optional launch tail is [spare-machine-count, bgp-underlay].  Keep
+  // legacy no-tail/spare-only commands exact, and accept BGP only with its
+  // explicit spare slot so recovery cannot reinterpret arbitrary arguments.
+  if (tail > 2 || (tail >= 1 && !arguments[offset + 12].equals("0"_ctv) && !arguments[offset + 12].equals("1"_ctv)) ||
+      (tail == 2 && arguments[offset + 13].equals("1"_ctv) == false)) return false;
   for (uint64_t i = 0; i < 12; ++i) original[i] = arguments[offset + i];
   return true;
 }

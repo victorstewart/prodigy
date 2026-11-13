@@ -184,6 +184,37 @@ static inline bool switchboardHostTCXOpenPinnedLink(StringType auto&& bpffsRoot,
   return errno == ENOENT;
 }
 
+// Absence is a separately observable recovery state.  Do not mistake a
+// partially retained pair for absence: both directions, both retention pins,
+// and both authoritative flow-map pins must be absent.
+static inline bool switchboardHostTCXPairCleanlyAbsent(uint32_t ifindex, StringType auto&& bpffsRoot)
+{
+  if (switchboardHostTCXValidBPFFSRoot(bpffsRoot) == false || ifindex == 0) return false;
+  int ingressPin = -1, egressPin = -1;
+  bool ingressPinned = false, egressPinned = false;
+  const bool pinsAbsent = switchboardHostTCXOpenPinnedLink(bpffsRoot, ifindex, SwitchboardHostTCXDirection::ingress,
+                                                             ingressPin, ingressPinned) &&
+                          switchboardHostTCXOpenPinnedLink(bpffsRoot, ifindex, SwitchboardHostTCXDirection::egress,
+                                                             egressPin, egressPinned) &&
+                          !ingressPinned && !egressPinned;
+  if (ingressPin >= 0) ::close(ingressPin);
+  if (egressPin >= 0) ::close(egressPin);
+  String flowPath = {}, pendingPath = {};
+  switchboardHostTCXMapPinPath(flowPath, bpffsRoot, ifindex, false);
+  switchboardHostTCXMapPinPath(pendingPath, bpffsRoot, ifindex, true);
+  int flowFD = bpf_obj_get(flowPath.c_str()); const bool flowAbsent = flowFD < 0 && errno == ENOENT;
+  if (flowFD >= 0) ::close(flowFD);
+  int pendingFD = bpf_obj_get(pendingPath.c_str()); const bool pendingAbsent = pendingFD < 0 && errno == ENOENT;
+  if (pendingFD >= 0) ::close(pendingFD);
+  auto attachPointEmpty = [&](enum bpf_attach_type attachType) {
+    __u32 programID = 0;
+    struct bpf_prog_query_opts query = {};
+    query.sz = sizeof(query); query.prog_ids = &programID; query.prog_cnt = 1;
+    return bpf_prog_query_opts(ifindex, attachType, &query) == 0 && query.prog_cnt == 0;
+  };
+  return pinsAbsent && flowAbsent && pendingAbsent && attachPointEmpty(BPF_TCX_INGRESS) && attachPointEmpty(BPF_TCX_EGRESS);
+}
+
 static inline bool switchboardHostTCXReadPinnedIdentity(StringType auto&& bpffsRoot,
                                                          const SwitchboardHostTCXRetentionIdentity& expected,
                                                          SwitchboardHostTCXRetentionIdentity& observed)

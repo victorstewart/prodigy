@@ -120,7 +120,12 @@ enum class MothershipTopic : uint16_t {
   rearmRetainedStatefulDeployment,
   // Read-only inspection and narrowly fenced retirement of a dormant local
   // bundle recovery witness. Appended so older Brains fail closed.
-  repairLocalBundleRecoveryWitness
+  repairLocalBundleRecoveryWitness,
+  // Desired-only global membership projection. This frame never grants a
+  // writer or installs a committed application voting configuration.
+  commitGlobalSingleWriterMembership,
+  globalSingleWriterPlacement,
+  globalSingleWriterControl
 };
 
 constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
@@ -267,6 +272,12 @@ constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
       return "rearmRetainedStatefulDeployment";
     case MothershipTopic::repairLocalBundleRecoveryWitness:
       return "repairLocalBundleRecoveryWitness";
+    case MothershipTopic::commitGlobalSingleWriterMembership:
+      return "commitGlobalSingleWriterMembership";
+    case MothershipTopic::globalSingleWriterPlacement:
+      return "globalSingleWriterPlacement";
+    case MothershipTopic::globalSingleWriterControl:
+      return "globalSingleWriterControl";
   }
 
   return "unknown";
@@ -405,7 +416,8 @@ enum class NeuronTopic : uint16_t {
   nametagQualificationReplay,
   nametagQualificationWriterIsolation,
   nametagQualificationSeedFault,
-  nametagQualificationMachineBoot
+  nametagQualificationMachineBoot,
+  globalSingleWriterControl
 };
 
 enum class ContainerTopic : uint16_t {
@@ -447,6 +459,7 @@ enum class ContainerTopic : uint16_t {
   nametagQualificationCousinTransport,
   nametagQualificationReplay,
   nametagQualificationSeedFault,
+  globalSingleWriterControl
 };
 
 enum class PulseTopic : uint16_t {

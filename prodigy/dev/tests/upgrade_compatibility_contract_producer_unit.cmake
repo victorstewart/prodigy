@@ -46,9 +46,10 @@ string(JSON DEFAULT_PRODIGY_SHA GET "${DEFAULT_CONTRACT}" prodigySHA256)
 string(JSON DEFAULT_MOTHERSHIP_SHA GET "${DEFAULT_CONTRACT}" mothershipSHA256)
 string(JSON DEFAULT_IDENTITY_MODE GET "${DEFAULT_CONTRACT}" transportIdentityMode)
 string(JSON DEFAULT_AXIS GET "${DEFAULT_CONTRACT}" compatibility wire)
+string(JSON DEFAULT_RETIREMENT_READER GET "${DEFAULT_CONTRACT}" containerRetirementJournalVersion)
 if (NOT DEFAULT_RELEASE STREQUAL "local-build-unqualified" OR NOT DEFAULT_DISPOSITION STREQUAL "unsupported" OR
     NOT DEFAULT_IDENTITY_MODE STREQUAL "unsupported" OR NOT DEFAULT_AXIS STREQUAL "unknown" OR NOT DEFAULT_PRODIGY_SHA STREQUAL PRODIGY_SHA256 OR
-    NOT DEFAULT_MOTHERSHIP_SHA STREQUAL MOTHERSHIP_SHA256)
+    NOT DEFAULT_MOTHERSHIP_SHA STREQUAL MOTHERSHIP_SHA256 OR NOT DEFAULT_RETIREMENT_READER EQUAL 4)
    message(FATAL_ERROR "default producer contract is not fail-closed or does not bind computed component hashes")
 endif()
 
@@ -90,9 +91,11 @@ string(JSON QUALIFIED_MOTHERSHIP_SHA GET "${QUALIFIED_CONTRACT}" mothershipSHA25
 string(JSON QUALIFIED_SOURCE GET "${QUALIFIED_CONTRACT}" sourceContracts 0 releaseID)
 string(JSON QUALIFIED_IDENTITY_MODE GET "${QUALIFIED_CONTRACT}" transportIdentityMode)
 string(JSON QUALIFIED_MINIMUM GET "${QUALIFIED_CONTRACT}" minimumHealthyBrains)
+string(JSON QUALIFIED_RETIREMENT_READER GET "${QUALIFIED_CONTRACT}" containerRetirementJournalVersion)
 if (NOT QUALIFIED_RELEASE STREQUAL "v0.4.13" OR NOT QUALIFIED_DISPOSITION STREQUAL "same-cluster-rollout" OR
     NOT QUALIFIED_PRODIGY_SHA STREQUAL PRODIGY_SHA256 OR NOT QUALIFIED_MOTHERSHIP_SHA STREQUAL MOTHERSHIP_SHA256 OR
-    NOT QUALIFIED_IDENTITY_MODE STREQUAL "preserveClusterIdentity" OR NOT QUALIFIED_SOURCE STREQUAL "v0.4.12" OR NOT QUALIFIED_MINIMUM EQUAL 3)
+    NOT QUALIFIED_IDENTITY_MODE STREQUAL "preserveClusterIdentity" OR NOT QUALIFIED_SOURCE STREQUAL "v0.4.12" OR NOT QUALIFIED_MINIMUM EQUAL 3 OR
+    NOT QUALIFIED_RETIREMENT_READER EQUAL DEFAULT_RETIREMENT_READER)
    message(FATAL_ERROR "qualified producer contract does not preserve policy semantics and computed hashes")
 endif()
 
@@ -130,5 +133,25 @@ string(REPLACE "same-cluster-rollout" "new-cluster-required" NEW_CLUSTER "${POLI
 string(REPLACE "\"wire\": \"compatible\"" "\"wire\": \"incompatible\"" NEW_CLUSTER "${NEW_CLUSTER}")
 file(WRITE "${WORK}/new-cluster.json" "${NEW_CLUSTER}")
 run_generator(new_cluster "${WORK}/new-cluster.json" TRUE)
+
+string(REPLACE "same-cluster-rollout" "same-cluster-cohort-recovery" COHORT_RECOVERY "${POLICY_TEXT}")
+string(REPLACE "\"wire\": \"compatible\"" "\"wire\": \"incompatible\"" COHORT_RECOVERY "${COHORT_RECOVERY}")
+file(WRITE "${WORK}/cohort-recovery.json" "${COHORT_RECOVERY}")
+run_generator(cohort_recovery "${WORK}/cohort-recovery.json" TRUE)
+file(READ "${cohort_recovery_OUTPUT}" COHORT_RECOVERY_CONTRACT)
+string(JSON COHORT_RECOVERY_DISPOSITION GET "${COHORT_RECOVERY_CONTRACT}" disposition)
+string(JSON COHORT_RECOVERY_WIRE GET "${COHORT_RECOVERY_CONTRACT}" compatibility wire)
+if (NOT COHORT_RECOVERY_DISPOSITION STREQUAL "same-cluster-cohort-recovery" OR
+    NOT COHORT_RECOVERY_WIRE STREQUAL "incompatible")
+   message(FATAL_ERROR "cohort recovery producer contract does not preserve the qualified wire-incompatible disposition")
+endif()
+
+string(REPLACE "\"minimumHealthyBrains\": 3" "\"minimumHealthyBrains\": 2" COHORT_TOO_FEW "${COHORT_RECOVERY}")
+file(WRITE "${WORK}/cohort-too-few-brains.json" "${COHORT_TOO_FEW}")
+run_generator(cohort_too_few_brains "${WORK}/cohort-too-few-brains.json" FALSE)
+
+string(REPLACE "\"authorityState\": \"compatible\"" "\"authorityState\": \"incompatible\"" COHORT_BAD_AUTHORITY "${COHORT_RECOVERY}")
+file(WRITE "${WORK}/cohort-bad-authority.json" "${COHORT_BAD_AUTHORITY}")
+run_generator(cohort_bad_authority "${WORK}/cohort-bad-authority.json" FALSE)
 
 file(REMOVE_RECURSE "${WORK}")

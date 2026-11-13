@@ -339,7 +339,362 @@ static void assignFixtureBootstrapSSHKeyPackage(MothershipProdigyCluster& cluste
   }
 }
 
-int main(void)
+static void testTruthRegistry(TestSuite& suite, const String& directory)
+{
+  MothershipGlobalSingleWriterGroup state{};
+  auto& group = state.group;
+  group.genesisMemberIDs = {1, 2, 3};
+  group.highestAllocatedMemberID = 3;
+  group.membershipUUID = 71;
+  group.operationUUID = 72;
+  group.deploymentID = (uint64_t(10) << 48) | 8;
+  group.localClusterUUID = 73;
+  group.generation = group.expectedCommittedConfigIndex = 1;
+  state.graceMs = 5000;
+  state.sites = {73, 74};
+  for (int32_t id : group.genesisMemberIDs) {
+    GlobalSingleWriterMember member{};
+    member.memberID = id;
+    member.clusterUUID = id == 2 ? 74 : 73;
+    member.containerUUID = 100 + id;
+    member.privateIPv6 = IPAddress(uint128_t(id));
+    group.members.push_back(member);
+  }
+  String path, failure;
+  path.snprintf<"{}/truth"_ctv>(directory);
+  suite.expect(prodigyGlobalSingleWriterCommittedConfigDigest(group.membershipUUID, group.deploymentID, 1,
+      group.members, group.expectedCommittedConfigSHA256), "Truth genesis digest");
+  MothershipGlobalSingleWriterGrant grant{};
+  grant.membershipUUID = group.membershipUUID;
+  grant.operationUUID = group.operationUUID;
+  grant.deploymentID = group.deploymentID;
+  grant.localClusterUUID = group.localClusterUUID;
+  grant.memberID = group.members.front().memberID;
+  grant.containerUUID = group.members.front().containerUUID;
+  grant.bootNonce = 75;
+  {
+    MothershipClusterRegistry registry(path);
+    suite.expect(registry.saveGlobalSingleWriterGroup(0, state, &failure) && state.revision == 1, "Truth durable genesis");
+    auto independent = state;
+    independent.group.membershipUUID = 171; independent.group.operationUUID = 172;
+    independent.group.deploymentID = (uint64_t(42) << 48) | 8;
+    independent.revision = 0;
+    auto colliding = independent;
+    suite.expect(prodigyGlobalSingleWriterCommittedConfigDigest(colliding.group.membershipUUID,
+        colliding.group.deploymentID,1,colliding.group.members,colliding.group.expectedCommittedConfigSHA256) &&
+        !registry.saveGlobalSingleWriterGroup(0,colliding,&failure),
+        "global registry rejects cross-group incarnation and address reuse before either deployment launches");
+    for (auto& member : independent.group.members) {
+      member.containerUUID += 1000;
+      member.privateIPv6 = IPAddress(uint128_t(1000+member.memberID));
+    }
+    colliding = independent; colliding.group.members.front().privateIPv6 = state.group.members.front().privateIPv6;
+    suite.expect(prodigyGlobalSingleWriterCommittedConfigDigest(colliding.group.membershipUUID,
+        colliding.group.deploymentID,1,colliding.group.members,colliding.group.expectedCommittedConfigSHA256) &&
+        !registry.saveGlobalSingleWriterGroup(0,colliding,&failure), "global registry rejects distinct identities sharing a reserved endpoint");
+    suite.expect(prodigyGlobalSingleWriterCommittedConfigDigest(independent.group.membershipUUID,
+        independent.group.deploymentID,1,independent.group.members,independent.group.expectedCommittedConfigSHA256) &&
+        registry.saveGlobalSingleWriterGroup(0,independent,&failure), "app42 admits an independent global group beside Truth");
+    MothershipGlobalSingleWriterGroup found;
+    Vector<MothershipGlobalSingleWriterGroup> all;
+    suite.expect(registry.listGlobalSingleWriterGroups(all,&failure) && all.size()==2 &&
+        registry.findGlobalSingleWriterGroupForDeployment(independent.group.deploymentID,found,&failure) &&
+        found.group.membershipUUID == independent.group.membershipUUID,
+        "global registry finds the exact deployment among two independent groups");
+    auto duplicate = independent; ++duplicate.group.membershipUUID; duplicate.revision=0;
+    suite.expect(prodigyGlobalSingleWriterCommittedConfigDigest(duplicate.group.membershipUUID,
+        duplicate.group.deploymentID,1,duplicate.group.members,duplicate.group.expectedCommittedConfigSHA256) &&
+        !registry.saveGlobalSingleWriterGroup(0,duplicate,&failure), "global registry rejects two groups for one deployment");
+    DeploymentPlan plan;
+    plan.config.applicationID=42; plan.config.versionID=8; plan.config.type=ApplicationType::stateful;
+    plan.isStateful=true; plan.stateful.neverShard=true; plan.stateful.writerMode = StatefulWriterMode::globalSingleWriter;
+    plan.stateful.clientPrefix=prodigyRuntimeStatefulServicePrefix(42,9);
+    plan.stateful.siblingPrefix=prodigyRuntimeStatefulServicePrefix(42,11);
+    plan.stateful.cousinPrefix=prodigyRuntimeStatefulServicePrefix(42,12);
+    plan.stateful.seedingPrefix=prodigyRuntimeStatefulServicePrefix(42,13);
+    plan.stateful.shardingPrefix=prodigyRuntimeStatefulServicePrefix(42,14);
+    suite.expect(mothershipGlobalSingleWriterDeploymentMatches(independent,plan,73) &&
+        !mothershipGlobalSingleWriterDeploymentMatches(state,plan,73) &&
+        !mothershipGlobalSingleWriterDeploymentMatches(independent,plan,99),
+        "global plan admission binds the exact group deployment and selected site");
+    plan.stateful.writerMode = StatefulWriterMode::localSingleWriter;
+    suite.expect(!mothershipGlobalSingleWriterDeploymentMatches(independent,plan,73),
+        "configured global group cannot reinterpret an opted-out local plan");
+    auto v1 = state;
+    v1.version = 1;
+    v1.retiredBindings.clear();
+    String v1Bytes;
+    MothershipGlobalSingleWriterGroup v1Recovered = {};
+    suite.expect(BitseryEngine::serialize(v1Bytes, v1) && BitseryEngine::deserializeSafe(v1Bytes, v1Recovered) &&
+        v1Recovered.version == 1 && v1Recovered.retiredBindings.empty() &&
+        v1Recovered.group.members.size() == v1.group.members.size() &&
+        v1Recovered.group.members.front().containerUUID == v1.group.members.front().containerUUID,
+        "Truth v1 group codec has no retired-binding history");
+    auto unretiredBinding = state;
+    unretiredBinding.retiredBindings.push_back(state.group.members.front());
+    suite.expect(!mothershipGlobalSingleWriterGroupValid(unretiredBinding),
+        "Truth rejects retired binding absent from retired member IDs");
+    auto replacement = state;
+    const auto oldRemote = group.members[1];
+    replacement.retiredBindings.push_back(oldRemote);
+    replacement.incoming = oldRemote;
+    replacement.incoming.memberID = 5;
+    replacement.incoming.containerUUID = 105;
+    replacement.incoming.privateIPv6 = IPAddress(uint128_t(5));
+    replacement.incoming.clusterUUID = group.localClusterUUID;
+    replacement.outgoing = oldRemote;
+    replacement.cleanup = true;
+    replacement.version = 2;
+    replacement.group.highestAllocatedMemberID = 5;
+    replacement.group.members = {group.members[0], group.members[2], replacement.incoming};
+    replacement.group.retiredMemberIDs = {oldRemote.memberID};
+    replacement.group.generation = 3;
+    replacement.group.expectedCommittedConfigIndex = 4;
+    String replacementBytes;
+    MothershipGlobalSingleWriterGroup restored = {};
+    suite.expect(prodigyGlobalSingleWriterCommittedConfigDigest(group.membershipUUID, group.deploymentID, 4,
+        replacement.group.members, replacement.group.expectedCommittedConfigSHA256) && mothershipGlobalSingleWriterGroupValid(replacement) &&
+        BitseryEngine::serialize(replacementBytes, replacement) &&
+        BitseryEngine::deserializeSafe(replacementBytes, restored) && mothershipGlobalSingleWriterGroupValid(restored) &&
+        restored.retiredBindings.size() == 1 && restored.retiredBindings[0].containerUUID == oldRemote.containerUUID &&
+        restored.retiredBindings[0].privateIPv6.equals(oldRemote.privateIPv6),
+        "Truth restores the retired remote identity and endpoint from its v2 registry record");
+    suite.expect(restored.cleanup && restored.pendingRetirementIDs.empty() &&
+        mothershipGlobalSingleWriterDeferRetirement(restored,restored.outgoing) && restored.version == 3 &&
+        !restored.cleanup && !restored.outgoing.memberID && !restored.incoming.memberID &&
+        restored.pendingRetirementIDs == Vector<int32_t>{oldRemote.memberID} && mothershipGlobalSingleWriterGroupValid(restored),
+        "Truth migrates v2 cleanup without retaining a completed replacement as pending membership");
+    auto v1Cleanup = replacement;
+    v1Cleanup.version = 1; v1Cleanup.retiredBindings.clear();
+    String v1CleanupBytes;
+    MothershipGlobalSingleWriterGroup v1CleanupRecovered;
+    suite.expect(BitseryEngine::serialize(v1CleanupBytes,v1Cleanup) &&
+        BitseryEngine::deserializeSafe(v1CleanupBytes,v1CleanupRecovered) &&
+        mothershipGlobalSingleWriterDeferRetirement(v1CleanupRecovered,v1CleanupRecovered.outgoing) &&
+        mothershipGlobalSingleWriterGroupValid(v1CleanupRecovered) &&
+        v1CleanupRecovered.retiredBindings.front().containerUUID == oldRemote.containerUUID,
+        "Truth migrates v1 cleanup and recovers its exact binding from the legacy slot");
+    bool cleanupChanged = true;
+    unsigned attempted = 0;
+    suite.expect(mothershipGlobalSingleWriterRetryRetirements(restored,restored.group.members,[&](const auto& retired) {
+          ++attempted;
+          return retired.clusterUUID != oldRemote.clusterUUID;
+        },cleanupChanged) && attempted == 1 && !cleanupChanged &&
+        restored.pendingRetirementIDs == Vector<int32_t>{oldRemote.memberID},
+        "Truth unavailable retired site preserves its obligation without vetoing reconciliation");
+    std::vector<ProdigyGlobalSingleWriterPlacement::Voter> currentVoters;
+    for (const auto& member : restored.group.members)
+      currentVoters.push_back({member.memberID,member.clusterUUID,member.memberID != 5,member.memberID == 5 ? 100u : 0u});
+    const auto second = ProdigyGlobalSingleWriterPlacement::next(currentVoters,{group.localClusterUUID},4,
+        restored.group.highestAllocatedMemberID,200,10);
+    suite.expect(second.action == ProdigyGlobalSingleWriterPlacement::Action::addLearner && second.replacement.oldID == 5 &&
+        second.replacement.newID == 6 && second.replacement.target == group.localClusterUUID &&
+        !restored.outgoing.memberID && !restored.incoming.memberID,
+        "Truth can repair a later voter loss while the first retired site is still offline");
+    const auto oldLocal = restored.group.members.back();
+    auto freshLocal = oldLocal;
+    freshLocal.memberID = 6; freshLocal.containerUUID = 106; freshLocal.privateIPv6 = IPAddress(uint128_t(6));
+    restored.group.members.back() = freshLocal;
+    restored.group.highestAllocatedMemberID = 6;
+    restored.group.retiredMemberIDs.push_back(oldLocal.memberID);
+    restored.group.generation = 4; restored.group.expectedCommittedConfigIndex = 7;
+    suite.expect(prodigyGlobalSingleWriterCommittedConfigDigest(group.membershipUUID,group.deploymentID,7,
+        restored.group.members,restored.group.expectedCommittedConfigSHA256) &&
+        mothershipGlobalSingleWriterDeferRetirement(restored,oldLocal) && mothershipGlobalSingleWriterGroupValid(restored),
+        "Truth retains both exact physical retirements after a second committed replacement");
+    String deferredBytes;
+    MothershipGlobalSingleWriterGroup deferred;
+    suite.expect(BitseryEngine::serialize(deferredBytes,restored) && BitseryEngine::deserializeSafe(deferredBytes,deferred) &&
+        mothershipGlobalSingleWriterGroupValid(deferred) && deferred.pendingRetirementIDs == Vector<int32_t>({2,5}) &&
+        deferred.retiredBindings.front().containerUUID == oldRemote.containerUUID &&
+        deferred.retiredBindings.back().containerUUID == oldLocal.containerUUID,
+        "Truth v3 restart preserves all exact deferred physical retirements");
+    suite.expect(mothershipGlobalSingleWriterRetryRetirements(deferred,deferred.group.members,[&](const auto& retired) {
+          return retired.memberID == oldLocal.memberID;
+        },cleanupChanged) && cleanupChanged && deferred.pendingRetirementIDs == Vector<int32_t>{2} &&
+        deferred.retiredBindings.size() == 2,
+        "Truth removes only terminally destroyed cleanup while retaining route tombstones");
+    auto unsafeCommitted = deferred.group.members;
+    unsafeCommitted.push_back(oldRemote);
+    attempted = 0;
+    suite.expect(!mothershipGlobalSingleWriterRetryRetirements(deferred,unsafeCommitted,[&](const auto&) {
+          ++attempted; return true;
+        },cleanupChanged) && attempted == 0 && deferred.pendingRetirementIDs == Vector<int32_t>{2},
+        "Truth never physically retires a member present in the committed configuration");
+    auto wrongRetired = oldRemote; ++wrongRetired.containerUUID;
+    suite.expect(!mothershipGlobalSingleWriterDeferRetirement(deferred,wrongRetired),
+        "Truth cannot replace the exact binding of an outstanding retirement");
+    auto wrong = grant;
+    ++wrong.operationUUID;
+    suite.expect(!registry.recordGlobalSingleWriterGrantBeforeDispatch(wrong, &failure), "Truth rejects mismatched first grant");
+    suite.expect(registry.recordGlobalSingleWriterGrantBeforeDispatch(grant, &failure), "Truth persists exact grant before send");
+  }
+  {
+    MothershipClusterRegistry reopened(path);
+    MothershipGlobalSingleWriterGroup recovered;
+    suite.expect(reopened.loadGlobalSingleWriterGroup(group.membershipUUID,recovered, &failure) && recovered.revision == 1 &&
+        recovered.group.members.size() == 3 && recovered.sites == state.sites, "Truth 2+1 group survives reopen");
+    suite.expect(reopened.recordGlobalSingleWriterGrantBeforeDispatch(grant, &failure), "Truth exact grant retry after reopen");
+    ++grant.bootNonce;
+    suite.expect(!reopened.recordGlobalSingleWriterGrantBeforeDispatch(grant, &failure), "Truth consumed grant fences empty replacement disk");
+    suite.expect(reopened.saveGlobalSingleWriterGroup(1, recovered, &failure) && !reopened.saveGlobalSingleWriterGroup(1, state, &failure),
+        "Truth stale registry writer rejected");
+    MothershipApplicationPlacement placement;
+    bool resumed = false;
+    suite.expect(!reopened.admitApplicationPlacement(10, group.localClusterUUID, group.expectedCommittedConfigSHA256,
+        placement, resumed, &failure), "Truth global group fences legacy singleton");
+  }
+  path.snprintf<"{}/truth-legacy"_ctv>(directory);
+  MothershipClusterRegistry legacy(path);
+  MothershipApplicationPlacement placement;
+  bool resumed = false;
+  suite.expect(legacy.admitApplicationPlacement(10, group.localClusterUUID, group.expectedCommittedConfigSHA256,
+      placement, resumed, &failure) && !legacy.saveGlobalSingleWriterGroup(0, state, &failure), "Truth legacy singleton fences new group");
+}
+
+static void testGlobalSingleWriterCompatibility(TestSuite& suite, const String& directory)
+{
+  ClusterStatusReport report; MachineStatusReport master;
+  master.currentMaster=master.isBrain=master.controlPlaneReachable=master.runtimeReady=true;
+  master.runningProdigyVersion="66"_ctv; report.machineReports.push_back(master);
+  suite.expect(!mothershipGlobalSingleWriterControlVersionSupported(report), "legacy master is rejected before global payload dispatch");
+  report.machineReports.front().runningProdigyVersion="67"_ctv;
+  suite.expect(mothershipGlobalSingleWriterControlVersionSupported(report), "global-capable authenticated current master passes");
+  report.machineReports.front().runningProdigyVersion="67junk"_ctv;
+  suite.expect(!mothershipGlobalSingleWriterControlVersionSupported(report), "malformed version cannot satisfy global capability fence");
+  report.machineReports.front().runningProdigyVersion="67"_ctv;
+  report.machineReports.push_back(report.machineReports.front());
+  suite.expect(!mothershipGlobalSingleWriterControlVersionSupported(report), "ambiguous current master fails global capability fence");
+
+  String original, migrated, failure; original.snprintf<"{}/truth"_ctv>(directory);
+  migrated.snprintf<"{}/truth-group-migration"_ctv>(directory);
+  MothershipGlobalSingleWriterGroup legacy;
+  { MothershipClusterRegistry registry(original);
+    suite.expect(registry.loadGlobalSingleWriterGroup(71,legacy,&failure),"read source for legacy group migration"); }
+  String bytes; suite.expect(BitseryEngine::serialize(bytes,legacy),"encode original singleton group bytes");
+  { TidesDB database(migrated);
+    suite.expect(database.write("application_placements"_ctv,"truth/global"_ctv,bytes,&failure),"write original singleton storage fixture"); }
+  { MothershipClusterRegistry registry(migrated); MothershipGlobalSingleWriterGroup recovered;
+    suite.expect(registry.loadGlobalSingleWriterGroup(71,recovered,&failure) && recovered.revision==legacy.revision &&
+        registry.saveGlobalSingleWriterGroup(recovered.revision,recovered,&failure),"legacy singleton migrates to its typed group key on save"); }
+  { MothershipClusterRegistry registry(migrated); MothershipGlobalSingleWriterGroup recovered;
+    Vector<MothershipGlobalSingleWriterGroup> groups;
+    suite.expect(registry.loadGlobalSingleWriterGroup(71,recovered,&failure) && recovered.revision==legacy.revision+1 &&
+        registry.listGlobalSingleWriterGroups(groups,&failure) && groups.size()==1 && groups.front().revision==recovered.revision,
+        "typed migrated record shadows stale singleton after restart without duplicate groups"); }
+}
+
+static void testTruthPrivateRoutes(TestSuite& suite, const String& directory, uint16_t applicationID)
+{
+  const int64_t now = Time::now<TimeResolution::ms>();
+  Vector<GlobalSingleWriterMember> members;
+  for (int32_t id = 1; id <= 4; ++id) {
+    GlobalSingleWriterMember member;
+    member.memberID = id; member.clusterUUID = id == 1 ? 73 : 74; member.containerUUID = 100 + id;
+    member.privateIPv6 = IPAddress(uint128_t(id));
+    if (id == 4) member.role = GlobalSingleWriterMemberRole::learner;
+    members.push_back(member);
+  }
+  CousinRouteRecord seed;
+  seed.version = 3; seed.routeUUID = 501; seed.operationUUID = 601; seed.pairUUID = 701;
+  seed.logicalWorkloadUUID = 801; seed.logicalServiceUUID = 901;
+  seed.sourceClusterUUID = 73; seed.destinationClusterUUID = 74;
+  seed.sourceApplicationID = seed.destinationApplicationID = applicationID;
+  seed.sourceCousinServicePrefix = seed.destinationCousinServicePrefix = prodigyRuntimeStatefulServicePrefix(applicationID,11);
+  seed.slots.insert(0); seed.destinationPublicAddress = members[1].privateIPv6; seed.destinationTCPPort = 443;
+  seed.sourcePermissionUUID = 1001; seed.destinationPermissionUUID = 1002;
+  seed.transportProtocol = IPPROTO_TCP; seed.destinationCIDR = 128; seed.pathMTU = 1500;
+  seed.endpointKind = CousinRouteEndpointKind::privateContainer;
+  seed.generation = seed.keyEpoch = seed.rootGeneration = 1;
+  seed.issuedAtMs = now - 1; seed.expiresAtMs = now + 60'000;
+  const uint64_t deploymentID=(uint64_t(applicationID)<<48)|8;
+  suite.expect(globalSingleWriterSiblingRouteSlotZero(seed,deploymentID) &&
+      !globalSingleWriterSiblingRouteSlotZero(seed,(uint64_t(applicationID+1)<<48)|8),
+      "private global route selects the deployment application without Truth constants");
+  ProdigyLocalCousinServicePermission permission;
+  permission.localHalf=CousinRouteHalf::source;
+  permission.state=ProdigyLocalCousinServicePermissionState::active;
+  permission.localClusterUUID=seed.sourceClusterUUID; permission.peerClusterUUID=seed.destinationClusterUUID;
+  permission.localApplicationID=permission.peerApplicationID=applicationID;
+  permission.localDeploymentID=permission.peerDeploymentID=deploymentID;
+  permission.localCousinServicePrefix=seed.sourceCousinServicePrefix;
+  permission.peerCousinServicePrefix=seed.destinationCousinServicePrefix;
+  permission.authorizedService=MeshServices::constrainPrefixToGroup(permission.localCousinServicePrefix,0);
+  permission.purpose=ProdigyCousinServicePurpose::sibling; permission.destinationShardGroups=1; permission.slots.insert(0);
+  suite.expect(globalSingleWriterSiblingPermissionMatches(permission,seed,CousinRouteHalf::source,deploymentID),
+      "global sibling permission binds the application-owned admitted prefix");
+  ++permission.peerDeploymentID;
+  suite.expect(!globalSingleWriterSiblingPermissionMatches(permission,seed,CousinRouteHalf::source,deploymentID),
+      "global sibling permission rejects a different peer deployment");
+  auto second = seed; second.routeUUID++; second.operationUUID++; second.destinationPublicAddress = members[2].privateIPv6;
+  auto learner = seed; learner.routeUUID += 2; learner.operationUUID += 2; learner.destinationPublicAddress = members[3].privateIPv6;
+  auto voters = members; voters.pop_back();
+  suite.expect(!mothershipGlobalSingleWriterPrivateRoutesCoverMembers({seed},voters,73,74) &&
+      mothershipGlobalSingleWriterPrivateRoutesCoverMembers({seed,second},voters,73,74) &&
+      !mothershipGlobalSingleWriterPrivateRoutesCoverMembers({seed,second},members,73,74) &&
+      mothershipGlobalSingleWriterPrivateRoutesCoverMembers({seed,second,learner},members,73,74),
+      "Truth private routes cover both destination voters and the overlapping learner independently");
+  suite.expect(!mothershipGlobalSingleWriterPrivateRoutesCoverMembers({seed,seed,second},voters,73,74),
+      "Truth private member coverage rejects ambiguous endpoint owners");
+  String path, failure;
+  path.snprintf<"{}/global-private-routes-{itoa}"_ctv>(directory,applicationID);
+  auto record = [&](auto& registry,const auto& route) {
+    CousinRouteRecord saved; bool resumed = false;
+    return registry.recordCousinRoute(route,saved,resumed,&failure);
+  };
+  auto receipt = [&](auto& registry,const auto& route,CousinRouteHalf half) {
+    CousinRouteApplyReceipt value;
+    value.routeUUID = route.routeUUID; value.generation = route.generation;
+    value.localClusterUUID = half == CousinRouteHalf::source ? route.sourceClusterUUID : route.destinationClusterUUID;
+    value.localHalf = half; value.keyEpoch = route.keyEpoch; value.installedState = route.state;
+    value.localRuntimeRevision = route.generation;
+    CousinRouteApplyReceipt saved; bool resumed = false;
+    return cousinRouteAuthorizationDigest(route,value.authorizationSHA256) &&
+        registry.recordCousinRouteApplyReceipt(value,saved,resumed,&failure);
+  };
+  {
+    MothershipClusterRegistry registry(path);
+    suite.expect(record(registry,seed) && record(registry,second) && record(registry,learner),
+        "Truth private member routes share the admitted permission contract without replacing a surviving endpoint");
+    auto duplicate = learner; duplicate.routeUUID++; duplicate.operationUUID++;
+    suite.expect(!record(registry,duplicate),"Truth retry cannot mint a second route owner for the learner endpoint");
+    suite.expect(receipt(registry,seed,CousinRouteHalf::source) && receipt(registry,seed,CousinRouteHalf::destination),
+        "Truth existing private endpoint has both ordinary durable route receipts");
+  }
+  MothershipClusterRegistry registry(path);
+  Vector<uint16_t> applications = {applicationID};
+  Vector<CousinRouteRecord> recovered;
+  suite.expect(registry.listNametagSeedSuccessorRouteCandidates(73,applications,now,recovered,&failure) && recovered.size() == 3 &&
+      mothershipGlobalSingleWriterPrivateRoutesCoverMembers(recovered,members,73,74),
+      "Truth restart discovers the durable learner route instead of allocating it again");
+  MothershipGlobalSingleWriterGroup group;
+  group.retiredBindings.push_back(members[1]);
+  auto current = members; current.erase(current.begin()+1);
+  suite.expect(!mothershipGlobalSingleWriterPrivateRouteRetirementRequired(group,{members[0]},seed,false) &&
+      mothershipGlobalSingleWriterPrivateRouteRetirementRequired(group,current,seed,true),
+      "Truth retains an empty site's authorization template until its returning endpoint is installed");
+  auto reused = members[1]; reused.memberID = 5; reused.containerUUID = 105;
+  current.push_back(reused);
+  suite.expect(!mothershipGlobalSingleWriterPrivateRouteRetirementRequired(group,current,seed,true),
+      "Truth endpoint withdrawal preserves a current member that reused a retired address");
+  auto withdrawn = seed;
+  withdrawn.operationUUID += 10; ++withdrawn.generation; withdrawn.state = CousinRouteState::withdrawn;
+  withdrawn.withdrawalGeneration = withdrawn.generation; withdrawn.withdrawnAtMs = now;
+  suite.expect(record(registry,withdrawn) && receipt(registry,withdrawn,CousinRouteHalf::source),
+      "Truth retired endpoint records withdrawal before an interrupted second-half apply");
+  recovered.clear();
+  suite.expect(registry.listNametagSeedSuccessorRouteCandidates(73,applications,now,recovered,&failure,true) && recovered.size() == 3 &&
+      std::any_of(recovered.begin(),recovered.end(),[&](const auto& route) {
+        return cousinRouteExactMatches(route,withdrawn) &&
+            mothershipGlobalSingleWriterPrivateRouteRetirementRequired(group,{members[0]},route,false);
+      }) && receipt(registry,withdrawn,CousinRouteHalf::destination),
+      "Truth terminal scan resumes the exact pending withdrawal receipt without reviving its authorization");
+  recovered.clear();
+  suite.expect(registry.listNametagSeedSuccessorRouteCandidates(73,applications,now,recovered,&failure) && recovered.size() == 2,
+      "Truth normal route discovery excludes the terminal retired endpoint");
+}
+
+int main(int argc, char** argv)
 {
   TestSuite suite;
 
@@ -372,6 +727,14 @@ int main(void)
 
   String dbPath;
   dbPath.assign(created);
+  testTruthRegistry(suite, dbPath);
+  testGlobalSingleWriterCompatibility(suite, dbPath);
+  testTruthPrivateRoutes(suite, dbPath,10);
+  testTruthPrivateRoutes(suite, dbPath,42);
+  if (argc == 2 && std::strcmp(argv[1], "--truth") == 0) {
+    std::filesystem::remove_all(created);
+    return suite.failed ? EXIT_FAILURE : EXIT_SUCCESS;
+  }
   String pathFaultReopenPath;
   ProdigyCrossClusterPathFaultGatewayLifecycleRecord pathFaultReopenExpected = {};
   bool pathFaultReopenExpectedRecorded = false;
@@ -439,11 +802,20 @@ int main(void)
     bindings.clear();
     suite.expect(resumedRoutes.loadGraphReplicaRouteBindings(5, owner, replica, now, bindings, &failure) && bindings.size() == 2,
         "graph_route_restart_resume_accepted");
-    auto stale = sibling; stale.generation = 2; stale.operationUUID++; stale.issuedAtMs = now; stale.expiresAtMs = now + 60'000;
+    auto endpointSuccessor = sibling; endpointSuccessor.generation = 2; endpointSuccessor.operationUUID++;
+    endpointSuccessor.destinationPublicAddress.v6[15]++;
+    endpointSuccessor.issuedAtMs = now; endpointSuccessor.expiresAtMs = now + 60'000;
+    CousinRouteRecord loadedSuccessor = {};
+    suite.expect(recordRoute(resumedRoutes, endpointSuccessor) && recordReceipts(resumedRoutes, endpointSuccessor) &&
+        resumedRoutes.loadCousinRoute(endpointSuccessor.routeUUID, loadedSuccessor, &failure) &&
+        loadedSuccessor.generation == endpointSuccessor.generation &&
+        loadedSuccessor.destinationPublicAddress.equals(endpointSuccessor.destinationPublicAddress),
+        "graph_route_successor_replaces_exact_endpoint_after_receipts");
+    auto stale = endpointSuccessor; stale.generation = 3; stale.operationUUID++; stale.issuedAtMs = now; stale.expiresAtMs = now + 60'000;
     suite.expect(recordRoute(resumedRoutes, stale) && !resumedRoutes.loadGraphReplicaRouteBindings(5, owner, replica, now, bindings, &failure),
         "graph_route_stale_receipt_rejected");
     suite.expect(recordReceipts(resumedRoutes, stale), "graph_route_new_generation_receipts_recorded");
-    auto withdrawn = stale; withdrawn.generation = 3; withdrawn.operationUUID++; withdrawn.issuedAtMs = now + 1;
+    auto withdrawn = stale; withdrawn.generation = 4; withdrawn.operationUUID++; withdrawn.issuedAtMs = now + 1;
     withdrawn.expiresAtMs = now + 60'000; withdrawn.state = CousinRouteState::withdrawn;
     withdrawn.withdrawalGeneration = withdrawn.generation; withdrawn.withdrawnAtMs = now + 1;
     suite.expect(recordRoute(resumedRoutes, withdrawn) && !resumedRoutes.loadGraphReplicaRouteBindings(5, owner, replica, now + 2, bindings, &failure),
@@ -1391,6 +1763,47 @@ int main(void)
     suite.expect(refreshedRemoteAdopted.lastRefreshMs == 424'242, "upsert_existing_remote_adopted_refresh_ms");
     storedRemoteAdopted = refreshedRemoteAdopted;
 
+    MothershipProdigyCluster initialDNSACMEEnabled = {};
+    bool enableInitialDNSACME = registry.enableInitialDNSACME(
+        storedRemoteAdopted.name,
+        storedRemoteCreated.dnsProvider,
+        storedRemoteCreated.dnsProviderCredentialName,
+        storedRemoteCreated.acme,
+        &initialDNSACMEEnabled,
+        &failure);
+    suite.expect(enableInitialDNSACME, "enable_initial_dns_acme_for_existing_unconfigured_cluster");
+    suite.expect(initialDNSACMEEnabled.dnsProvider == storedRemoteCreated.dnsProvider &&
+                     initialDNSACMEEnabled.dnsProviderCredentialName.equals(storedRemoteCreated.dnsProviderCredentialName) &&
+                     initialDNSACMEEnabled.acme == storedRemoteCreated.acme,
+                 "enable_initial_dns_acme_persists_complete_identity");
+    storedRemoteAdopted = initialDNSACMEEnabled;
+    MothershipProdigyCluster repeatedDNSACMEEnablement = {};
+    suite.expect(!registry.enableInitialDNSACME(storedRemoteAdopted.name,
+                                                 storedRemoteCreated.dnsProvider,
+                                                 storedRemoteCreated.dnsProviderCredentialName,
+                                                 storedRemoteCreated.acme,
+                                                 &repeatedDNSACMEEnablement,
+                                                 &failure) &&
+                     failure.equals("cluster DNS/ACME is already configured"_ctv),
+                 "enable_initial_dns_acme_rejects_second_change");
+    MothershipProdigyCluster ordinaryInitialDNSACME = storedSecondTestLocal;
+    ordinaryInitialDNSACME.dnsProvider = storedRemoteCreated.dnsProvider;
+    ordinaryInitialDNSACME.dnsProviderCredentialName = storedRemoteCreated.dnsProviderCredentialName;
+    ordinaryInitialDNSACME.acme = storedRemoteCreated.acme;
+    suite.expect(!registry.upsertCluster(ordinaryInitialDNSACME, nullptr, &failure) &&
+                     failure.equals("dnsProvider is immutable for an existing cluster"_ctv),
+                 "ordinary_upsert_cannot_enable_initial_dns_acme");
+    MothershipProdigyCluster incompleteDNSACMEEnablement = {};
+    ProdigyACMEConfig noACME = {};
+    suite.expect(!registry.enableInitialDNSACME(storedSecondTestLocal.name,
+                                                 MothershipClusterProvider::cloudflare,
+                                                 "cloudflare-prod"_ctv,
+                                                 noACME,
+                                                 &incompleteDNSACMEEnablement,
+                                                 &failure) &&
+                     failure.equals("initial DNS/ACME enablement requires complete DNS and ACME configuration"_ctv),
+                 "enable_initial_dns_acme_rejects_partial_identity");
+
     MothershipProdigyCluster changedDNSProvider = storedRemoteCreated;
     changedDNSProvider.dnsProvider = MothershipClusterProvider::route53;
     changedDNSProvider.dnsProviderCredentialName = "route53-prod"_ctv;
@@ -1401,8 +1814,48 @@ int main(void)
     MothershipProdigyCluster changedDNSCredential = storedRemoteCreated;
     changedDNSCredential.dnsProviderCredentialName = "cloudflare-rotated"_ctv;
     bool upsertChangedDNSCredential = registry.upsertCluster(changedDNSCredential, nullptr, &failure);
-    suite.expect(upsertChangedDNSCredential, "upsert_existing_dns_credential_change_allowed");
-    storedRemoteCreated = changedDNSCredential;
+    suite.expect(upsertChangedDNSCredential == false, "upsert_existing_dns_credential_change_rejected");
+    suite.expect(failure.equals("dnsProviderCredentialName is immutable for an existing cluster outside DNS credential rotation"_ctv),
+                 "upsert_existing_dns_credential_change_reason");
+    MothershipProdigyCluster rotatedDNSCredential = {};
+    suite.expect(registry.rotateDNSCredentialReference(storedRemoteCreated.name,
+                                                        storedRemoteCreated.dnsProviderCredentialName,
+                                                        "cloudflare-rotated"_ctv,
+                                                        &rotatedDNSCredential,
+                                                        &failure),
+                 "rotate_dns_credential_exact_expected_old");
+    suite.expect(rotatedDNSCredential.dnsProvider == storedRemoteCreated.dnsProvider &&
+                     rotatedDNSCredential.acme == storedRemoteCreated.acme &&
+                     rotatedDNSCredential.dnsProviderCredentialName.equals("cloudflare-rotated"_ctv),
+                 "rotate_dns_credential_preserves_provider_and_acme");
+    suite.expect(!registry.rotateDNSCredentialReference(storedRemoteCreated.name,
+                                                         "cloudflare-prod"_ctv,
+                                                         "cloudflare-next"_ctv,
+                                                         nullptr,
+                                                         &failure) &&
+                     failure.equals("cluster DNS credential reference does not match expected old credential"_ctv),
+                 "rotate_dns_credential_rejects_stale_expected_old");
+    suite.expect(registry.rotateDNSCredentialReference(storedRemoteCreated.name,
+                                                        "cloudflare-rotated"_ctv,
+                                                        "cloudflare-rotated"_ctv,
+                                                        &rotatedDNSCredential,
+                                                        &failure),
+                 "rotate_dns_credential_exact_same_name_is_idempotent");
+    suite.expect(!registry.rotateDNSCredentialReference(storedSecondTestLocal.name,
+                                                         "cloudflare-prod"_ctv,
+                                                         "cloudflare-rotated"_ctv,
+                                                         nullptr,
+                                                         &failure) &&
+                     failure.equals("cluster requires complete configured DNS and ACME before credential rotation"_ctv),
+                 "rotate_dns_credential_rejects_unconfigured_cluster");
+    suite.expect(!registry.rotateDNSCredentialReference(storedRemoteCreated.name,
+                                                         "cloudflare-prod"_ctv,
+                                                         "cloudflare-rotated"_ctv,
+                                                         nullptr,
+                                                         &failure) &&
+                     failure.equals("cluster DNS credential reference does not match expected old credential"_ctv),
+                 "rotate_dns_credential_rejects_non_idempotent_replay");
+    storedRemoteCreated = rotatedDNSCredential;
 
     MothershipProdigyCluster changedACME = storedRemoteCreated;
     changedACME.acme.accountEmail = "security@example.com"_ctv;

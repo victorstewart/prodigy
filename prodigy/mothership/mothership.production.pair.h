@@ -521,7 +521,7 @@ static inline bool mothershipProductionPairIntentValid(const MothershipProductio
         targetPlan.config.applicationID != intent.targetWorkload.applicationID ||
         targetPlan.config.containerBlobSHA256 != intent.targetWorkload.artifactSHA256 ||
         targetPlan.config.containerBlobBytes != intent.targetWorkload.artifactBytes ||
-        targetPlan.stateful.allMasters || targetPlan.useHostNetworkNamespace || !targetPlan.wormholes.empty() ||
+        targetPlan.stateful.writerMode == StatefulWriterMode::allMasters || targetPlan.useHostNetworkNamespace || !targetPlan.wormholes.empty() ||
         !prodigyCousinAutomaticWhiteholePlanValid(targetPlan.whiteholes) ||
         !targetPlan.horizontalScalers.empty() || !targetPlan.verticalScalers.empty() ||
         targetPlan.canaryCount != 0)

@@ -19,7 +19,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <poll.h>
+#include <signal.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 class TestSuite {
@@ -59,14 +63,14 @@ static bool verifiedDisposableKVMBoundary()
   return kvm && virtStatus == 0;
 }
 
-static bool createPrivateVeth(VethPair& pair)
+static bool createPrivateVeth(VethPair& pair, const char *hostName = "hosttcx0", const char *peerName = "hosttcx1")
 {
   pair.host.ifidx = 0;
   pair.peer.ifidx = 0;
   std::memset(pair.host.mac, 0, sizeof(pair.host.mac));
   std::memset(pair.peer.mac, 0, sizeof(pair.peer.mac));
-  pair.host.name.assign("hosttcx0"_ctv);
-  pair.peer.name.assign("hosttcx1"_ctv);
+  pair.host.name.assign(hostName);
+  pair.peer.name.assign(peerName);
   pair.socket.configure();
   pair.createPair(-1);
   if (pair.host.ifidx == 0 || pair.peer.ifidx == 0) return false;
@@ -103,6 +107,159 @@ static bool pinWrongDirectionLink(uint32_t ifindex)
   const bool pinned = bpf_obj_pin(ingress.linkFD, wrongPath.c_str()) == 0;
   BPFProgram::closeTCXIdentity(ingress);
   return pinned;
+}
+
+class CrashRetentionNeuron final : public Neuron {
+public:
+  bool retainPrimaryForCrashTest(const String& device, bool& created)
+  {
+    eth.setDevice(device);
+    return retainExactHostTCXForUnexpectedRestart(eth, retainedPrimaryHostTCX,
+                                                   retainedPrimaryHostTCXPresent, nullptr, &created);
+  }
+
+  const SwitchboardHostTCXRetentionPair& retainedPrimaryForCrashTest(void) const
+  {
+    return retainedPrimaryHostTCX;
+  }
+
+  void releasePrimaryForCrashTest(void)
+  {
+    releaseExactHostTCXForGracefulShutdown(retainedPrimaryHostTCX,
+                                            retainedPrimaryHostTCXPresent, "crash-test-primary");
+  }
+};
+
+struct CrashRetentionReceipt {
+  uint32_t ifindex = 0;
+  SwitchboardHostTCXRetentionPair pair = {};
+  uint8_t retained = 0;
+};
+
+static bool writeCrashRetentionReceipt(int fd, const CrashRetentionReceipt& receipt)
+{
+  size_t written = 0;
+  while (written < sizeof(receipt))
+  {
+    const ssize_t result = ::write(fd, reinterpret_cast<const char *>(&receipt) + written, sizeof(receipt) - written);
+    if (result < 0 && errno == EINTR) continue;
+    if (result <= 0) return false;
+    written += size_t(result);
+  }
+  return true;
+}
+
+static bool readCrashRetentionReceipt(int fd, CrashRetentionReceipt& receipt)
+{
+  size_t read = 0;
+  while (read < sizeof(receipt))
+  {
+    pollfd poller = {.fd = fd, .events = POLLIN, .revents = 0};
+    const int ready = ::poll(&poller, 1, 2'000);
+    if (ready < 0 && errno == EINTR) continue;
+    if (ready <= 0 || (poller.revents & (POLLERR | POLLNVAL))) return false;
+    const ssize_t result = ::read(fd, reinterpret_cast<char *>(&receipt) + read, sizeof(receipt) - read);
+    if (result < 0 && errno == EINTR) continue;
+    if (result <= 0) return false;
+    read += size_t(result);
+  }
+  return true;
+}
+
+static bool waitForCrashRetentionChild(pid_t child, int& status)
+{
+  for (uint32_t attempt = 0; attempt != 200; ++attempt)
+  {
+    const pid_t waited = ::waitpid(child, &status, WNOHANG);
+    if (waited == child) return true;
+    if (waited < 0 && errno != EINTR) return false;
+    ::usleep(10'000);
+  }
+  return false;
+}
+
+static bool sameRetentionPair(const SwitchboardHostTCXRetentionPair& left,
+                              const SwitchboardHostTCXRetentionPair& right)
+{
+  return switchboardHostTCXIdentityEquals(left.ingress, right.ingress) &&
+         switchboardHostTCXIdentityEquals(left.egress, right.egress);
+}
+
+static bool testCrashRetainsAndNewNeuronAdopts(TestSuite& suite,
+                                               String& ingressObjectPath,
+                                               String& egressObjectPath)
+{
+  int pipeFDs[2] = {-1, -1};
+  if (::pipe2(pipeFDs, O_CLOEXEC) != 0)
+  {
+    suite.expect(false, "host_tcx_retention_crash_opens_private_receipt_pipe");
+    return false;
+  }
+  const pid_t parent = ::getpid();
+  const pid_t child = ::fork();
+  if (child == 0)
+  {
+    if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || ::getppid() != parent) _exit(EXIT_FAILURE);
+    ::close(pipeFDs[0]);
+    CrashRetentionReceipt receipt = {};
+    VethPair childPair = {};
+    // Keep the exact owning Neuron and its veth/router FDs live until the
+    // parent sends SIGKILL. `_exit` then avoids its graceful pin release.
+    CrashRetentionNeuron neuron = {};
+    bool created = false;
+    if (createPrivateVeth(childPair, "hosttcx2", "hosttcx3") &&
+        attachHostRouters(childPair.host, ingressObjectPath, egressObjectPath))
+    {
+      receipt.retained = neuron.retainPrimaryForCrashTest(childPair.host.name, created) && created;
+      receipt.ifindex = childPair.host.ifidx;
+      receipt.pair = neuron.retainedPrimaryForCrashTest();
+    }
+    const bool sent = writeCrashRetentionReceipt(pipeFDs[1], receipt);
+    ::close(pipeFDs[1]);
+    if (!sent || !receipt.retained) _exit(EXIT_FAILURE);
+    for (;;) ::pause();
+  }
+  ::close(pipeFDs[1]);
+  CrashRetentionReceipt receipt = {};
+  const bool received = child > 0 && readCrashRetentionReceipt(pipeFDs[0], receipt);
+  ::close(pipeFDs[0]);
+  suite.expect(received && receipt.retained && receipt.ifindex != 0,
+               "host_tcx_retention_crash_child_retains_exact_pair_before_kill");
+  if (!received || !receipt.retained || receipt.ifindex == 0)
+  {
+    if (child > 0) { (void)::kill(child, SIGKILL); int status = 0; (void)waitForCrashRetentionChild(child, status); }
+    return false;
+  }
+  suite.expect(::kill(child, SIGKILL) == 0, "host_tcx_retention_crash_kills_retaining_process");
+  int status = 0;
+  const bool reaped = waitForCrashRetentionChild(child, status);
+  suite.expect(reaped && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL,
+               "host_tcx_retention_crash_child_exits_without_graceful_release");
+  if (!reaped) return false;
+
+  EthDevice adoptedDevice = {};
+  adoptedDevice.setDevice("hosttcx2"_ctv);
+  suite.expect(adoptedDevice.ifidx == receipt.ifindex &&
+               switchboardHostTCXVerifyRetainedPair(adoptedDevice, "/sys/fs/bpf"_ctv, receipt.pair),
+               "host_tcx_retention_crash_pins_keep_exact_links_and_maps_alive");
+
+  CrashRetentionNeuron successor = {};
+  bool created = true;
+  const bool adopted = adoptedDevice.ifidx == receipt.ifindex &&
+      successor.retainPrimaryForCrashTest(adoptedDevice.name, created);
+  suite.expect(adopted && created == false && sameRetentionPair(successor.retainedPrimaryForCrashTest(), receipt.pair),
+               "host_tcx_retention_crash_new_neuron_adopts_without_new_link_ids");
+  successor.releasePrimaryForCrashTest();
+  SwitchboardHostTCXRetentionPair afterRelease = {};
+  bool present = true;
+  BPFProgram::TCXIdentity ingress = {}, egress = {};
+  const bool released = switchboardHostTCXReadRetainedPair(adoptedDevice, "/sys/fs/bpf"_ctv, afterRelease, present) && !present &&
+      !BPFProgram::openTCXIdentity(receipt.ifindex, BPF_TCX_INGRESS, receipt.pair.ingress.programID, ingress) &&
+      !BPFProgram::openTCXIdentity(receipt.ifindex, BPF_TCX_EGRESS, receipt.pair.egress.programID, egress);
+  BPFProgram::closeTCXIdentity(ingress);
+  BPFProgram::closeTCXIdentity(egress);
+  suite.expect(released, "host_tcx_retention_crash_graceful_release_removes_last_exact_links");
+  return received && reaped && adopted && created == false && released;
 }
 
 int main(int argc, char **argv)
@@ -142,8 +299,16 @@ int main(int argc, char **argv)
   bool present = true;
   suite.expect(switchboardHostTCXReadRetainedPair(pair.host, "/sys/fs/bpf"_ctv, retained, present) && present == false,
                "host_tcx_retention_admits_cold_missing_pins");
+  suite.expect(switchboardHostTCXPairCleanlyAbsent(pair.host.ifidx, "/sys/fs/bpf"_ctv),
+               "host_tcx_retention_accepts_cleanly_absent_primary_pair");
+  // A failed attach-point query is not absence.  UINT32_MAX cannot name this
+  // private veth and reaches the read-only kernel query after the pin checks.
+  suite.expect(!switchboardHostTCXPairCleanlyAbsent(uint32_t(-1), "/sys/fs/bpf"_ctv),
+               "host_tcx_retention_rejects_unqueryable_interface_as_absent");
   suite.expect(attachHostRouters(pair.host, ingressObjectPath, egressObjectPath), "host_tcx_retention_attaches_real_host_pair");
   if (suite.failed != 0) return 1;
+  suite.expect(!switchboardHostTCXPairCleanlyAbsent(pair.host.ifidx, "/sys/fs/bpf"_ctv),
+               "host_tcx_retention_rejects_live_unretained_pair_as_absent");
 
   String ingressPin = {};
   switchboardHostTCXRetentionPath(ingressPin, "/sys/fs/bpf"_ctv, pair.host.ifidx, SwitchboardHostTCXDirection::ingress);
@@ -165,6 +330,8 @@ int main(int argc, char **argv)
 
   suite.expect(switchboardHostTCXRetainCurrentPair(pair.host, "/sys/fs/bpf"_ctv, retained),
                "host_tcx_retention_retains_exact_live_pair");
+  suite.expect(!switchboardHostTCXPairCleanlyAbsent(pair.host.ifidx, "/sys/fs/bpf"_ctv),
+               "host_tcx_retention_rejects_complete_retained_pair_as_absent");
   suite.expect(switchboardHostTCXVerifyRetainedPair(pair.host, "/sys/fs/bpf"_ctv, retained),
                "host_tcx_retention_verifies_exact_live_pair");
 
@@ -312,15 +479,43 @@ int main(int argc, char **argv)
 
   suite.expect(switchboardHostTCXReleaseExact("/sys/fs/bpf"_ctv, retained.ingress),
                "host_tcx_retention_releases_exact_ingress_pin");
+  suite.expect(!switchboardHostTCXPairCleanlyAbsent(pair.host.ifidx, "/sys/fs/bpf"_ctv),
+               "host_tcx_retention_rejects_partial_retention_pin_as_absent");
   suite.expect(switchboardHostTCXReleaseExact("/sys/fs/bpf"_ctv, retained.egress),
                "host_tcx_retention_releases_exact_egress_pin");
   present = true;
   suite.expect(switchboardHostTCXReadRetainedPair(pair.host, "/sys/fs/bpf"_ctv, retained, present) && present == false,
                "host_tcx_retention_release_restores_cold_state");
+
+  // Preserve private map FDs only long enough to construct the two partial
+  // states below.  Neither state may be mistaken for a clean absent pair.
+  String flowPin = {}, pendingPin = {};
+  switchboardHostTCXMapPinPath(flowPin, "/sys/fs/bpf"_ctv, pair.host.ifidx, false);
+  switchboardHostTCXMapPinPath(pendingPin, "/sys/fs/bpf"_ctv, pair.host.ifidx, true);
+  const int flowFD = bpf_obj_get(flowPin.c_str());
+  const int pendingFD = bpf_obj_get(pendingPin.c_str());
+  suite.expect(flowFD >= 0 && pendingFD >= 0,
+               "host_tcx_retention_opens_authoritative_maps_for_partial_absence_cases");
   pair.host.detachBPF(BPF_TCX_INGRESS);
+  suite.expect(!switchboardHostTCXPairCleanlyAbsent(pair.host.ifidx, "/sys/fs/bpf"_ctv),
+               "host_tcx_retention_rejects_egress_only_live_direction_as_absent");
   pair.host.detachBPF(BPF_TCX_EGRESS);
   suite.expect(BPFProgram::openTCXIdentity(pair.host.ifidx, BPF_TCX_INGRESS, retained.ingress.programID, borrowed) == false,
                "host_tcx_retention_explicit_detach_removes_live_ingress_link");
+  const bool mapPinsRemoved = (::unlink(flowPin.c_str()) == 0 || errno == ENOENT) &&
+                              (::unlink(pendingPin.c_str()) == 0 || errno == ENOENT);
+  suite.expect(mapPinsRemoved && flowFD >= 0 && pendingFD >= 0 &&
+               bpf_obj_pin(flowFD, flowPin.c_str()) == 0 && bpf_obj_pin(pendingFD, pendingPin.c_str()) == 0,
+               "host_tcx_retention_constructs_map_only_partial_absence_state");
+  suite.expect(!switchboardHostTCXPairCleanlyAbsent(pair.host.ifidx, "/sys/fs/bpf"_ctv),
+               "host_tcx_retention_rejects_map_only_state_as_absent");
+  suite.expect(::unlink(flowPin.c_str()) == 0 && ::unlink(pendingPin.c_str()) == 0 &&
+               switchboardHostTCXPairCleanlyAbsent(pair.host.ifidx, "/sys/fs/bpf"_ctv),
+               "host_tcx_retention_accepts_only_complete_interface_bound_absence");
+  if (flowFD >= 0) ::close(flowFD);
+  if (pendingFD >= 0) ::close(pendingFD);
+
+  (void)testCrashRetainsAndNewNeuronAdopts(suite, ingressObjectPath, egressObjectPath);
 
   return suite.failed == 0 ? 0 : 1;
 }

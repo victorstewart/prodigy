@@ -447,6 +447,58 @@ static bool runMigrationResetCleanupFixture(const char *scenario)
   return okay;
 }
 
+static bool runRemoteRecoveryCleanupFixture(bool malformedDropin, bool stagingOnly = false, bool partialDropinArchive = false, const char *rejection = "")
+{
+  char templatePath[] = "/tmp/prodigy-runtime-recovery-remove-XXXXXX";
+  char *rootPath = ::mkdtemp(templatePath);
+  if (rootPath == nullptr) return false;
+  std::string root(rootPath), state = root + "/varlib", retained = root + "/retained", dropins = root + "/dropins", fake = root + "/fake";
+  const std::string operation = "0x0123456789abcdef0123456789abcdef";
+  const std::string operationRoot = state + "/runtime-recovery/" + operation;
+  ::mkdir(state.c_str(), 0700); ::mkdir((state + "/runtime-recovery").c_str(), 0700); ::mkdir(operationRoot.c_str(), 0700);
+  ::mkdir(dropins.c_str(), 0700); ::mkdir(fake.c_str(), 0700);
+  if (stagingOnly) { std::ofstream upload(operationRoot + "/request.upload", std::ios::binary); upload << "staged evidence"; }
+  else { std::ofstream request(operationRoot + "/request.bin", std::ios::binary); request << "immutable request bytes"; request.close(); ::chmod((operationRoot + "/request.bin").c_str(), 0600); }
+  if (stagingOnly)
+  {
+    String cleanup = {}; mothershipAppendRemoteRuntimeRecoveryCleanupCommand(uint128_t(0x1234), cleanup);
+    std::string command(cleanup.c_str()); replaceAll(command, "/var/lib/prodigy-retained", retained); replaceAll(command, "/var/lib/prodigy", state); replaceAll(command, "/etc/systemd/system/prodigy.service.d", dropins);
+    const std::string archived = retained + "/0x1234/runtime-recovery/" + operation;
+    const bool okay = ::system(("PATH=" + shellQuote(fake) + ":/usr/bin:/bin RECOVERY_TEST_ROOT=" + shellQuote(root) + " /bin/sh -c " + shellQuote(command)).c_str()) == 0 && ::access((archived + "/request.upload").c_str(), F_OK) == 0;
+    (void)::system(("/bin/rm -rf " + shellQuote(root)).c_str()); return okay;
+  }
+  FILE *pipe = ::popen(("sha256sum " + shellQuote(operationRoot + "/request.bin")).c_str(), "r");
+  char digest[80] = {}; const bool gotDigest = pipe != nullptr && std::fgets(digest, sizeof(digest), pipe) != nullptr && ::pclose(pipe) == 0;
+  if (!gotDigest) { (void)::system(("/bin/rm -rf " + shellQuote(root)).c_str()); return false; }
+  const std::string prefix(digest, 16);
+  const std::string dropin = dropins + "/99-tidesdb-migration-" + prefix + ".conf";
+  std::ofstream fence(dropin); fence << "[Unit]\nConditionPathExists=!" << operationRoot << "/writers-fenced\n[Service]\nRestart=" << (malformedDropin ? "always" : "no") << "\n"; fence.close(); ::chmod(dropin.c_str(), 0600);
+  if (partialDropinArchive && ::rename(dropin.c_str(), (operationRoot + "/startup-fence-" + prefix + ".conf.removed").c_str()) != 0) { (void)::system(("/bin/rm -rf " + shellQuote(root)).c_str()); return false; }
+  std::ofstream systemctl(fake + "/systemctl"); systemctl << "#!/bin/sh\necho reload >>\"$RECOVERY_TEST_ROOT/log\"\n"; systemctl.close(); ::chmod((fake + "/systemctl").c_str(), 0700);
+  String cleanup = {}; mothershipAppendRemoteRuntimeRecoveryCleanupCommand(uint128_t(0x1234), cleanup);
+  std::string command(cleanup.c_str());
+  replaceAll(command, "/var/lib/prodigy-retained", retained);
+  replaceAll(command, "/var/lib/prodigy", state);
+  replaceAll(command, "/etc/systemd/system/prodigy.service.d", dropins);
+  auto invoke = [&]() { return ::system(("PATH=" + shellQuote(fake) + ":/usr/bin:/bin RECOVERY_TEST_ROOT=" + shellQuote(root) + " /bin/sh -c " + shellQuote(command)).c_str()) == 0; };
+  const std::string archived = retained + "/0x1234/runtime-recovery/" + operation;
+  const std::string archivedDropin = archived + "/startup-fence-" + prefix + ".conf.removed";
+  const bool collision = std::string(rejection) == "collision";
+  const bool symlink = std::string(rejection) == "symlink";
+  if (collision) std::filesystem::create_directories(archived);
+  if (symlink) {
+    std::filesystem::rename(operationRoot, operationRoot + ".original");
+    std::filesystem::create_directory_symlink(operationRoot + ".original", operationRoot);
+  }
+  const bool first = invoke();
+  const bool okay = malformedDropin || collision || symlink
+      ? !first && ::access(operationRoot.c_str(), F_OK) == 0 && ::access(dropin.c_str(), F_OK) == 0
+      : first && ::access(operationRoot.c_str(), F_OK) != 0 && ::access(archivedDropin.c_str(), F_OK) == 0 &&
+          ::access(dropin.c_str(), F_OK) != 0 && invoke();
+  (void)::system(("/bin/rm -rf " + shellQuote(root)).c_str());
+  return okay;
+}
+
 int main(void)
 {
   TestSuite suite;
@@ -692,11 +744,18 @@ int main(void)
     suite.expect(runMigrationResetCleanupFixture("local-authority"), "remove_reset_accepts_exact_local_authority_migration_fence");
     suite.expect(runMigrationResetCleanupFixture("symlink"), "remove_reset_rejects_retained_backup_symlink");
     suite.expect(runMigrationResetCleanupFixture("collision"), "remove_reset_rejects_retained_backup_collision");
+    suite.expect(runRemoteRecoveryCleanupFixture(false), "remove_remote_runtime_recovery_archives_authenticated_fence_and_evidence_idempotently");
+    suite.expect(runRemoteRecoveryCleanupFixture(true), "remove_remote_runtime_recovery_rejects_unowned_fence_before_wipe");
+    suite.expect(runRemoteRecoveryCleanupFixture(false, true), "remove_remote_runtime_recovery_preserves_staging_only_evidence");
+    suite.expect(runRemoteRecoveryCleanupFixture(false, false, true), "remove_remote_runtime_recovery_resumes_after_own_dropin_archive");
+    suite.expect(runRemoteRecoveryCleanupFixture(false, false, false, "collision"), "remove_remote_runtime_recovery_collision_preserves_active_fence");
+    suite.expect(runRemoteRecoveryCleanupFixture(false, false, false, "symlink"), "remove_remote_runtime_recovery_symlink_preserves_active_fence");
   }
 
   {
     MothershipProdigyCluster cluster = {};
     cluster.deploymentMode = MothershipClusterDeploymentMode::remote;
+    cluster.clusterUUID = 0x1234;
     cluster.remoteProdigyPath = "/srv/prodigy/current"_ctv;
     cluster.controls.push_back(MothershipProdigyClusterControl {
         .kind = MothershipClusterControlKind::unixSocket,
@@ -704,6 +763,8 @@ int main(void)
 
     String command = {};
     mothershipBuildRemoteProdigyUninstallCommand(cluster, command);
+    suite.expect(::system(("/bin/sh -n -c " + shellQuote(std::string(command.c_str()))).c_str()) == 0,
+                 "remove_remote_uninstall_complete_command_has_valid_shell_syntax");
     suite.expect(stringContains(command, "systemctl show --property=LoadState --value prodigy") && stringContains(command, "failed to stop prodigy"), "remove_remote_uninstall_stops_and_verifies");
     suite.expect(stringContains(command, "/etc/systemd/system/prodigy.service"), "remove_remote_uninstall_removes_unit");
     suite.expect(stringContains(command, "/srv/prodigy/current"), "remove_remote_uninstall_removes_install_root");
@@ -714,7 +775,26 @@ int main(void)
     suite.expect(stringContains(command, "/srv/prodigy/run/control.sock"), "remove_remote_uninstall_removes_control_socket");
     suite.expect(stringContains(command, "/root/prodigy.bundle.new.tar.zst"), "remove_remote_uninstall_removes_staged_bundle");
     suite.expect(stringContains(command, "/run/prodigy /var/lib/prodigy /var/log/prodigy"), "remove_remote_uninstall_removes_runtime_state_and_logs");
+    suite.expect(stringContains(command, "/var/lib/prodigy-retained/0x1234/runtime-recovery"), "remove_remote_uninstall_preserves_runtime_recovery_evidence");
     suite.expect(stringContains(command, "systemctl daemon-reload || true; systemctl reset-failed prodigy || true"), "remove_remote_uninstall_reloads_systemd");
+  }
+
+  {
+    constexpr uint128_t clusterUUID = 0x1234;
+    String command = {};
+    mothershipBuildProdigyStateWipeCommand("/var/lib/prodigy/state"_ctv, clusterUUID, command);
+    suite.expect(::system(("/bin/sh -n -c " + shellQuote(std::string(command.c_str()))).c_str()) == 0,
+                 "remove_local_state_wipe_complete_default_command_has_valid_shell_syntax");
+    suite.expect(stringContains(command, "/var/lib/prodigy-retained/0x1234") &&
+                 stringContains(command, "rm -rf /run/prodigy /var/lib/prodigy"),
+                 "remove_local_state_wipe_default_command_preserves_then_wipes_owned_state");
+
+    mothershipBuildProdigyStateWipeCommand("/srv/prodigy/state"_ctv, clusterUUID, command);
+    suite.expect(::system(("/bin/sh -n -c " + shellQuote(std::string(command.c_str()))).c_str()) == 0,
+                 "remove_local_state_wipe_complete_external_command_has_valid_shell_syntax");
+    suite.expect(stringContains(command, "'/srv/prodigy/state'") &&
+                 stringContains(command, "rm -rf /run/prodigy /var/lib/prodigy"),
+                 "remove_local_state_wipe_external_command_removes_bound_external_state");
   }
 
   {

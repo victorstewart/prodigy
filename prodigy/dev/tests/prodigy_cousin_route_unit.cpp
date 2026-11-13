@@ -1890,11 +1890,22 @@ int main(void)
   suite.require(!mothershipPairControlServiceTransitsValid(invalidTransits, pairIntent.firstClusterUUID, pairIntent.secondClusterUUID),
                 "pair_control_transits_reject_duplicate_direction");
   invalidTransits = {reverseTransit, serviceTransit};
-  suite.require(!mothershipPairControlServiceTransitsValid(invalidTransits, pairIntent.firstClusterUUID, pairIntent.secondClusterUUID),
-                "pair_control_transits_reject_noncanonical_direction_order");
+  suite.require(mothershipPairControlServiceTransitsValid(invalidTransits, pairIntent.firstClusterUUID, pairIntent.secondClusterUUID),
+                "pair_control_transits_preserve_any_admission_order");
   invalidTransits = transits; invalidTransits.push_back(serviceTransit);
   suite.require(!mothershipPairControlServiceTransitsValid(invalidTransits, pairIntent.firstClusterUUID, pairIntent.secondClusterUUID),
-                "pair_control_transits_reject_more_than_two_directions");
+                "pair_control_transits_reject_duplicate_flow");
+  auto concurrentTransit = serviceTransit; ++concurrentTransit.sourceTCPPort;
+  Vector<MothershipPairControlServiceTransit> concurrentTransits = {serviceTransit, reverseTransit, concurrentTransit};
+  suite.require(mothershipPairControlServiceTransitsValid(concurrentTransits, pairIntent.firstClusterUUID, pairIntent.secondClusterUUID),
+                "pair_control_transits_allow_distinct_concurrent_source_bindings");
+  String concurrentReceipt;
+  for (const auto& transit : concurrentTransits) {
+    String line; mothershipPairControlBoundaryPreparedReceipt(controlBoundary, line, &transit); concurrentReceipt.append(line);
+  }
+  suite.require(mothershipPairControlBoundaryPreparedReceiptValid(controlBoundary, concurrentReceipt, concurrentTransits) &&
+                !mothershipPairControlBoundaryPreparedReceiptValid(controlBoundary, concurrentReceipt, transits),
+                "pair_control_receipt_requires_every_exact_admitted_flow");
   Vector<ClusterPairControlEndpoint> numericOrder = controlBoundary.firstEndpoints;
   numericOrder.push_back(validPairEndpoint(pairIntent.firstClusterUUID, 0x906, 16));
   String endpointCSV = {};
@@ -2082,8 +2093,8 @@ int main(void)
   suite.require(!mothershipPairControlBoundaryPreparedReceiptValid(controlBoundary, badReceipts, transits),
                 "pair_control_receipt_rejects_extra_direction_receipt");
   badReceipts = reverseReceipt; badReceipts.append(serviceReceipt);
-  suite.require(!mothershipPairControlBoundaryPreparedReceiptValid(controlBoundary, badReceipts, transits),
-                "pair_control_receipt_rejects_reordered_direction_receipts");
+  suite.require(mothershipPairControlBoundaryPreparedReceiptValid(controlBoundary, badReceipts, transits),
+                "pair_control_receipt_accepts_exact_flows_in_any_admission_order");
   MothershipPairControlServiceTransit receiptChangedTransit = serviceTransit;
   receiptChangedTransit.sourceTCPPort++;
   suite.require(!mothershipPairControlBoundaryPreparedReceiptValid(controlBoundary, serviceReceipt, &receiptChangedTransit),
@@ -2117,7 +2128,7 @@ int main(void)
                                                                             pairRecorded, &failure),
                   "pair_control_service_transit_exact_retry_is_idempotent");
     MothershipPairControlServiceTransit changedServiceTransit = serviceTransit;
-    changedServiceTransit.destinationTCPPort++;
+    changedServiceTransit.sourcePermissionUUID++;
     suite.require(!pairRegistry.recordClusterPairTestControlServiceTransit(pairIntent.operationUUID, changedServiceTransit,
                                                                              pairRecorded, &failure),
                   "pair_control_service_transit_rejects_changed_immutable_tuple");
@@ -2175,6 +2186,13 @@ int main(void)
       String bytes = currentBytes.substr(0, cut, Copy::yes);
       suite.require(!BitseryEngine::deserializeSafe(bytes, truncated), "pair_control_service_set_rejects_truncated_wire");
     }
+    suite.require(pairRegistry.recordClusterPairTestControlServiceTransit(pairIntent.operationUUID, concurrentTransit, pairRecorded, &failure) &&
+                  pairRecorded.testControlServiceTransits.size() == 3 &&
+                  mothershipPairControlServiceTransitEqual(pairRecorded.testControlServiceTransits[0], serviceTransit),
+                  "pair_control_source_pool_admission_preserves_original_flow");
+    suite.require(pairRegistry.recordClusterPairTestControlServiceTransit(pairIntent.operationUUID, concurrentTransit, pairRecorded, &failure) &&
+                  pairRecorded.testControlServiceTransits.size() == 3,
+                  "pair_control_source_pool_retry_is_idempotent");
     currentBytes[0] = 255;
     MothershipClusterPairEnrollmentIntent unsupported = {};
     suite.require(!BitseryEngine::deserializeSafe(currentBytes, unsupported) || !mothershipClusterPairEnrollmentIntentValid(unsupported),

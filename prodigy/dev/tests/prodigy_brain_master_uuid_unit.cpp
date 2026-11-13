@@ -363,6 +363,16 @@ public:
     recoverDeploymentsAfterNeuronState();
   }
 
+  bool testContainerRetirementAuthorityAcknowledged(void) const
+  {
+    return containerRetirementAuthorityAcknowledged();
+  }
+
+  bool testNormalizeRecoveredUnmaterializedQueuedMiddle(ApplicationDeployment *head)
+  {
+    return normalizeRecoveredUnmaterializedQueuedMiddle(head);
+  }
+
   bool testRecoveringPersistedNeuronInventory(void) const
   {
     return recoveringPersistedNeuronInventory;
@@ -381,6 +391,11 @@ public:
   bool testRecoveryPersistenceRetryPending(void) const
   {
     return recoveryPersistenceRetryPending;
+  }
+
+  void testCapturePersistentMasterAuthorityPackage(ProdigyPersistentMasterAuthorityPackage& package) const
+  {
+    capturePersistentMasterAuthorityPackage(package);
   }
 
   void testRetryDeferredRecoveryPersistence(void)
@@ -2765,6 +2780,280 @@ int main(void)
     ::rmdir(socketDirectory);
   };
 
+  auto runCollapsedUnstartedSuccessorFixture = [&]() {
+    withUniqueMothershipSocket("spin_application_collapses_unmaterialized_middle_deployment_socket_dir_created", [&] {
+      TestBrain brain = {};
+      brain.iaas = new NoopBrainIaaS();
+
+      DeploymentPlan baselinePlan = makeDeploymentPlan(61'014, 1);
+      DeploymentPlan middlePlan = makeDeploymentPlan(61'014, 2);
+      DeploymentPlan headPlan = makeDeploymentPlan(61'014, 3);
+
+      ApplicationDeployment *baseline = new ApplicationDeployment();
+      baseline->plan = baselinePlan;
+      baseline->state = DeploymentState::running;
+      ApplicationDeployment *middle = new ApplicationDeployment();
+      middle->plan = middlePlan;
+      middle->state = DeploymentState::none;
+      ApplicationDeployment *head = new ApplicationDeployment();
+      head->plan = headPlan;
+
+      baseline->next = middle;
+      middle->previous = baseline;
+      brain.deployments.insert_or_assign(baselinePlan.config.deploymentID(), baseline);
+      brain.deployments.insert_or_assign(middlePlan.config.deploymentID(), middle);
+      brain.deploymentsByApp.insert_or_assign(middlePlan.config.applicationID, middle);
+
+      brain.testSpinApplication(head);
+
+      suite.expect(brain.deploymentsByApp[headPlan.config.applicationID] == head,
+                   "spin_application_collapses_unmaterialized_middle_repoints_application_head");
+      suite.expect(brain.deployments.contains(baselinePlan.config.deploymentID()) &&
+                       brain.deployments.contains(headPlan.config.deploymentID()) &&
+                       brain.deployments.contains(middlePlan.config.deploymentID()) == false,
+                   "spin_application_collapses_unmaterialized_middle_replaces_indexed_predecessor");
+      suite.expect(baseline->next == head && head->previous == baseline,
+                   "spin_application_collapses_unmaterialized_middle_preserves_original_predecessor_link");
+      suite.expect(head->state == DeploymentState::waitingToDeploy,
+                   "spin_application_collapses_unmaterialized_middle_keeps_new_head_waiting");
+
+      baseline->next = nullptr;
+      head->previous = nullptr;
+      brain.deployments.clear();
+      brain.deploymentsByApp.clear();
+      delete head;
+      delete baseline;
+    });
+  };
+  if (const char *testOnly = ::getenv("PRODIGY_TEST_ONLY");
+      testOnly && std::strcmp(testOnly, "collapsed-unstarted-successor") == 0)
+  {
+    runCollapsedUnstartedSuccessorFixture();
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+
+  auto runRecoveredQueuedIntermediatesFixture = [&]() {
+    withUniqueMothershipSocket("recovered_queued_intermediates_socket_dir_created", [&] {
+      ScopedRing scopedRing = {};
+      NoopBrainIaaS provider = {};
+      TestBrain brain = {};
+      brain.iaas = &provider;
+      brain.weAreMaster = true;
+      brain.ignited = true;
+      brain.masterAuthorityRuntimeStateDurable = true;
+      brain.durableMasterAuthorityRuntimeStateGeneration = brain.masterAuthorityRuntimeState.generation;
+      brain.enableMachineRetirementAuthority();
+      ClusterMachine localAuthority = {};
+      localAuthority.uuid = thisNeuron->uuid;
+      localAuthority.isBrain = true;
+      brain.retirementTopology.machines.push_back(localAuthority);
+      suite.expect(brain.testContainerRetirementAuthorityAcknowledged(),
+                   "recovered_queued_intermediates_has_exact_local_retirement_authority");
+      Mesh mesh = {};
+      brain.mesh = &mesh;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+
+      DeploymentPlan predecessorPlan = makeDeploymentPlan(61'040, 1);
+      DeploymentPlan middlePlan = makeDeploymentPlan(61'040, 2);
+      DeploymentPlan headPlan = makeDeploymentPlan(61'040, 3);
+      ApplicationDeployment *predecessor = new ApplicationDeployment();
+      ApplicationDeployment *middle = new ApplicationDeployment();
+      ApplicationDeployment *head = new ApplicationDeployment();
+      predecessor->plan = predecessorPlan;
+      middle->plan = middlePlan;
+      head->plan = headPlan;
+      predecessor->state = DeploymentState::none;
+      middle->state = DeploymentState::none;
+      head->state = DeploymentState::waitingToDeploy;
+      predecessor->next = middle;
+      middle->previous = predecessor;
+      middle->next = head;
+      head->previous = middle;
+
+      ContainerView crashed = {};
+      crashed.uuid = uint128_t(0x6104001);
+      crashed.applicationID = predecessorPlan.config.applicationID;
+      crashed.deploymentID = predecessorPlan.config.deploymentID();
+      crashed.state = ContainerState::crashedRestarting;
+      predecessor->containers.insert(&crashed);
+      brain.containers.insert_or_assign(crashed.uuid, &crashed);
+      brain.deployments.insert_or_assign(predecessorPlan.config.deploymentID(), predecessor);
+      brain.deployments.insert_or_assign(middlePlan.config.deploymentID(), middle);
+      brain.deployments.insert_or_assign(headPlan.config.deploymentID(), head);
+      brain.deploymentPlans.insert_or_assign(middlePlan.config.deploymentID(), middlePlan);
+      brain.deploymentsByApp.insert_or_assign(headPlan.config.applicationID, head);
+
+      brain.testRecoverDeploymentsAfterNeuronState();
+
+      suite.expect(brain.persistCalls == 1,
+                   "recovered_queued_intermediates_persists_chain_collapse_once");
+      suite.expect(brain.deployments.contains(middlePlan.config.deploymentID()) == false &&
+                       brain.deploymentPlans.contains(middlePlan.config.deploymentID()) == false &&
+                       predecessor->next == head && head->previous == predecessor,
+                   "recovered_queued_intermediates_removes_only_empty_middle_and_its_durable_plan");
+      suite.expect(predecessor->state == DeploymentState::none &&
+                       predecessor->containers.contains(&crashed) &&
+                       brain.containers.find(crashed.uuid) != brain.containers.end() &&
+                       brain.containers.find(crashed.uuid)->second == &crashed,
+                   "recovered_queued_intermediates_preserves_crashed_owner_and_inventory");
+      ProdigyPersistentMasterAuthorityPackage exportedAuthority = {};
+      ProdigyPersistentMasterAuthorityPackage decodedAuthority = {};
+      String exportedAuthorityBytes = {};
+      brain.testCapturePersistentMasterAuthorityPackage(exportedAuthority);
+      suite.expect(BitseryEngine::serialize(exportedAuthorityBytes, exportedAuthority) &&
+                       BitseryEngine::deserializeSafe(exportedAuthorityBytes, decodedAuthority) &&
+                       !exportedAuthority.deploymentPlans.contains(middlePlan.config.deploymentID()) &&
+                       !decodedAuthority.deploymentPlans.contains(middlePlan.config.deploymentID()),
+                   "recovered_queued_intermediates_persistent_authority_round_trip_omits_middle");
+      brain.testRecoverDeploymentsAfterNeuronState();
+      suite.expect(brain.persistCalls == 1 && predecessor->next == head && head->previous == predecessor,
+                   "recovered_queued_intermediates_replay_is_idempotent");
+
+      crashed = {};
+      predecessor->containers.clear();
+      brain.containers.clear();
+      brain.deployments.clear();
+      brain.deploymentsByApp.clear();
+      delete head;
+      delete predecessor;
+      thisBrain = savedBrain;
+    });
+
+    withUniqueMothershipSocket("recovered_queued_intermediates_persistence_failure_socket_dir_created", [&] {
+      ScopedRing scopedRing = {};
+      NoopBrainIaaS provider = {};
+      TestBrain brain = {};
+      brain.iaas = &provider;
+      brain.weAreMaster = true;
+      brain.ignited = true;
+      brain.masterAuthorityRuntimeStateDurable = true;
+      brain.durableMasterAuthorityRuntimeStateGeneration = brain.masterAuthorityRuntimeState.generation;
+      brain.enableMachineRetirementAuthority();
+      ClusterMachine localAuthority = {};
+      localAuthority.uuid = thisNeuron->uuid;
+      localAuthority.isBrain = true;
+      brain.retirementTopology.machines.push_back(localAuthority);
+      suite.expect(brain.testContainerRetirementAuthorityAcknowledged(),
+                   "recovered_queued_intermediates_has_exact_local_retirement_authority");
+      brain.holdRuntimeStatePersist = true;
+      Mesh mesh = {};
+      brain.mesh = &mesh;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+
+      DeploymentPlan predecessorPlan = makeDeploymentPlan(61'041, 1);
+      DeploymentPlan middlePlan = makeDeploymentPlan(61'041, 2);
+      DeploymentPlan headPlan = makeDeploymentPlan(61'041, 3);
+      ApplicationDeployment *predecessor = new ApplicationDeployment();
+      ApplicationDeployment *middle = new ApplicationDeployment();
+      ApplicationDeployment *head = new ApplicationDeployment();
+      predecessor->plan = predecessorPlan;
+      middle->plan = middlePlan;
+      head->plan = headPlan;
+      predecessor->state = DeploymentState::none;
+      middle->state = DeploymentState::none;
+      head->state = DeploymentState::waitingToDeploy;
+      predecessor->next = middle;
+      middle->previous = predecessor;
+      middle->next = head;
+      head->previous = middle;
+      ContainerView crashed = {};
+      crashed.uuid = uint128_t(0x6104101);
+      crashed.applicationID = predecessorPlan.config.applicationID;
+      crashed.deploymentID = predecessorPlan.config.deploymentID();
+      crashed.state = ContainerState::crashedRestarting;
+      predecessor->containers.insert(&crashed);
+      brain.containers.insert_or_assign(crashed.uuid, &crashed);
+      brain.deployments.insert_or_assign(predecessorPlan.config.deploymentID(), predecessor);
+      brain.deployments.insert_or_assign(middlePlan.config.deploymentID(), middle);
+      brain.deployments.insert_or_assign(headPlan.config.deploymentID(), head);
+      brain.deploymentPlans.insert_or_assign(middlePlan.config.deploymentID(), middlePlan);
+      brain.deploymentsByApp.insert_or_assign(headPlan.config.applicationID, head);
+
+      brain.testRecoverDeploymentsAfterNeuronState();
+      suite.expect(brain.deployments.contains(middlePlan.config.deploymentID()) == false &&
+                       predecessor->next == head && head->previous == predecessor,
+                   "recovered_queued_intermediates_holds_only_private_candidate_before_receipt");
+      brain.finishRuntimeStatePersistence(false);
+      suite.expect(brain.testRecoveryPersistenceRetryPending() &&
+                       brain.deployments.find(middlePlan.config.deploymentID()) != brain.deployments.end() &&
+                       brain.deploymentPlans.find(middlePlan.config.deploymentID()) != brain.deploymentPlans.end() &&
+                       predecessor->next == middle && middle->previous == predecessor &&
+                       middle->next == head && head->previous == middle &&
+                       predecessor->containers.contains(&crashed),
+                   "recovered_queued_intermediates_restores_chain_after_failed_persistence");
+
+      crashed = {};
+      predecessor->containers.clear();
+      brain.containers.clear();
+      brain.deployments.clear();
+      brain.deploymentsByApp.clear();
+      delete head;
+      delete middle;
+      delete predecessor;
+      thisBrain = savedBrain;
+    });
+
+    auto expectRejectedRecoveryCollapse = [&](uint64_t applicationID, bool healthyPredecessor,
+                                                bool materializedMiddle, bool routableMiddle,
+                                                const char *expectation) {
+      TestBrain brain = {};
+      DeploymentPlan predecessorPlan = makeDeploymentPlan(applicationID, 1);
+      DeploymentPlan middlePlan = makeDeploymentPlan(applicationID, 2);
+      DeploymentPlan headPlan = makeDeploymentPlan(applicationID, 3);
+      ApplicationDeployment *predecessor = new ApplicationDeployment();
+      ApplicationDeployment *middle = new ApplicationDeployment();
+      ApplicationDeployment *head = new ApplicationDeployment();
+      predecessor->plan = predecessorPlan; middle->plan = middlePlan; head->plan = headPlan;
+      predecessor->state = DeploymentState::none; middle->state = DeploymentState::none;
+      head->state = DeploymentState::waitingToDeploy;
+      predecessor->next = middle; middle->previous = predecessor; middle->next = head; head->previous = middle;
+      Machine predecessorMachine = {};
+      predecessorMachine.state = MachineState::healthy;
+      ContainerView predecessorContainer = {};
+      predecessorContainer.machine = &predecessorMachine;
+      predecessorContainer.lifetime = ApplicationLifetime::base;
+      predecessorContainer.state = healthyPredecessor ? ContainerState::healthy : ContainerState::crashedRestarting;
+      predecessor->containers.insert(&predecessorContainer);
+      predecessor->rebuildRecoveredContainerCounts();
+      ContainerView middleContainer = {};
+      if (materializedMiddle) middle->containers.insert(&middleContainer);
+      brain.deployments.insert_or_assign(predecessorPlan.config.deploymentID(), predecessor);
+      brain.deployments.insert_or_assign(middlePlan.config.deploymentID(), middle);
+      brain.deployments.insert_or_assign(headPlan.config.deploymentID(), head);
+      brain.deploymentPlans.insert_or_assign(middlePlan.config.deploymentID(), middlePlan);
+      if (routableMiddle)
+      {
+        RoutableResourceLease lease = {};
+        lease.owner.deploymentID = middlePlan.config.deploymentID();
+        brain.routableResourceLeaseRuntimeState.push_back(std::move(lease));
+      }
+      const bool blocked = brain.testNormalizeRecoveredUnmaterializedQueuedMiddle(head);
+      suite.expect((routableMiddle ? blocked : !blocked) && brain.persistCalls == 0 &&
+                       brain.deployments.find(middlePlan.config.deploymentID())->second == middle &&
+                       brain.deploymentPlans.contains(middlePlan.config.deploymentID()) &&
+                       predecessor->next == middle && middle->previous == predecessor &&
+                       middle->next == head && head->previous == middle,
+                   expectation);
+      predecessor->containers.clear(); middle->containers.clear();
+      brain.deployments.clear(); brain.deploymentPlans.clear();
+      delete head; delete middle; delete predecessor;
+    };
+    expectRejectedRecoveryCollapse(61'042, true, false, false,
+                                   "recovered_queued_intermediates_keeps_healthy_predecessor");
+    expectRejectedRecoveryCollapse(61'043, false, true, false,
+                                   "recovered_queued_intermediates_keeps_materialized_middle");
+    expectRejectedRecoveryCollapse(61'044, false, false, true,
+                                   "recovered_queued_intermediates_keeps_routable_middle_lease");
+  };
+  if (const char *testOnly = ::getenv("PRODIGY_TEST_ONLY");
+      testOnly && std::strcmp(testOnly, "recovered-queued-intermediates") == 0)
+  {
+    runRecoveredQueuedIntermediatesFixture();
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+
   auto runFollowerBootstrapHeartbeatTickerFixture = [&]() -> void {
     // getBrains() binds the production Brain port. This selected fixture must
     // enter a private network namespace before it can create that listener.
@@ -3918,11 +4207,159 @@ int main(void)
     delete peer;
   };
 
+  auto runAdoptedRackTopologyRebindFixture = [&] {
+    BrainBase *savedBrain = thisBrain;
+    TestBrain brain = {};
+    NoopBrainIaaS provider = {};
+    brain.iaas = &provider;
+    thisBrain = &brain;
+
+    Rack *originalRack = new Rack();
+    originalRack->uuid = 1;
+    brain.racks.insert_or_assign(originalRack->uuid, originalRack);
+
+    Vector<Machine *> machines = {};
+    for (uint32_t index = 0; index < 3; ++index)
+    {
+      Machine *machine = new Machine();
+      machine->uuid = uint128_t(0x7a000 + index);
+      machine->rackUUID = originalRack->uuid;
+      machine->rack = originalRack;
+      machine->topologySource = uint8_t(ClusterMachineSource::adopted);
+      machine->lifetime = MachineLifetime::owned;
+      machine->state = MachineState::healthy;
+      machine->neuron.machine = machine;
+      originalRack->machines.insert(machine);
+      brain.machines.insert(machine);
+      brain.machinesByUUID.insert_or_assign(machine->uuid, machine);
+      machines.push_back(machine);
+    }
+
+    ApplicationDeployment *current = new ApplicationDeployment();
+    current->plan = makeDeploymentPlan(0x7a01, 1);
+    current->plan.config.type = ApplicationType::stateful;
+    current->plan.isStateful = true;
+    current->nShardGroups = 1;
+    brain.deployments.insert_or_assign(current->plan.config.deploymentID(), current);
+
+    MachineTicket placedTicket = {};
+    placedTicket.deployment = current;
+    Machine::Claim placedClaim = {};
+    placedClaim.ticket = &placedTicket;
+    placedClaim.nFit = 1;
+    placedClaim.shardGroups.push_back(0);
+    machines[2]->claims.push_back(std::move(placedClaim));
+    current->countPerMachine[machines[1]] = 2;
+    current->countPerMachine[machines[2]] = 1;
+    current->countPerRack[originalRack] = 3;
+    current->racksByShardGroup[0].insert(originalRack);
+
+    ClusterTopology corrected = {};
+    corrected.version = 9;
+    for (uint32_t index = 0; index < machines.size(); ++index)
+    {
+      ClusterMachine record = {};
+      record.source = ClusterMachineSource::adopted;
+      record.backing = ClusterMachineBacking::owned;
+      record.kind = MachineConfig::MachineKind::vm;
+      record.lifetime = MachineLifetime::owned;
+      record.uuid = machines[index]->uuid;
+      record.rackUUID = index + 1;
+      record.ssh.address.snprintf<"10.0.{}.{}"_ctv>(7, 10 + index);
+      record.ssh.user = "root"_ctv;
+      prodigyAppendUniqueClusterMachineAddress(record.addresses.privateAddresses, record.ssh.address, 24);
+      corrected.machines.push_back(std::move(record));
+    }
+
+    suite.expect(brain.testRestoreMachinesFromClusterTopology(corrected),
+                 "adopted_rack_topology_restore_accepts_in_place_labels");
+    Rack *rackOne = machines[0]->rack;
+    Rack *rackTwo = machines[1]->rack;
+    Rack *rackThree = machines[2]->rack;
+    suite.expect(rackOne != nullptr && rackTwo != nullptr && rackThree != nullptr &&
+                     rackOne->uuid == 1 && rackTwo->uuid == 2 && rackThree->uuid == 3 &&
+                     rackOne != rackTwo && rackTwo != rackThree &&
+                     rackOne->machines.contains(machines[0]) && rackTwo->machines.contains(machines[1]) &&
+                     rackThree->machines.contains(machines[2]),
+                 "adopted_rack_topology_restore_rebinds_runtime_rack_identity");
+    suite.expect(current->countPerRack.contains(originalRack) == false &&
+                     current->countPerRack.getIf(rackTwo) == 2 && current->countPerRack.getIf(rackThree) == 1 &&
+                     current->racksByShardGroup[0].contains(originalRack) == false &&
+                     current->racksByShardGroup[0].contains(rackThree),
+                 "adopted_rack_topology_restore_rekeys_current_placements");
+
+    ApplicationDeployment singleShard = {};
+    singleShard.nShardGroups = 1;
+    uint32_t singleShardFit = 0;
+    for (Machine *machine : machines)
+    {
+      if (singleShard.canPlaceReplicaForShardGroupOnRack(0, machine->rack))
+      {
+        singleShard.racksByShardGroup[0].insert(machine->rack);
+        ++singleShardFit;
+      }
+    }
+    suite.expect(singleShardFit == 3, "adopted_rack_topology_restore_single_shard_fits_three_racks");
+
+    ApplicationDeployment threeShards = {};
+    threeShards.nShardGroups = 3;
+    uint32_t threeShardFit = 0;
+    for (uint32_t shardGroup = 0; shardGroup < 3; ++shardGroup)
+    {
+      for (Machine *machine : machines)
+      {
+        if (threeShards.canPlaceReplicaForShardGroupOnRack(shardGroup, machine->rack))
+        {
+          threeShards.racksByShardGroup[shardGroup].insert(machine->rack);
+          ++threeShardFit;
+        }
+      }
+    }
+    suite.expect(threeShardFit == 9, "adopted_rack_topology_restore_three_shards_fit_nine_replicas");
+
+    suite.expect(brain.testRestoreMachinesFromClusterTopology(corrected) &&
+                     machines[0]->rack == rackOne && machines[1]->rack == rackTwo && machines[2]->rack == rackThree &&
+                     current->countPerRack.getIf(rackTwo) == 2 && current->countPerRack.getIf(rackThree) == 1,
+                 "adopted_rack_topology_restore_is_idempotent");
+
+    const uint32_t originalRackUUID = originalRack->uuid;
+    current->countPerRack[originalRack] = 0;
+    current->racksByShardGroup[0].insert(originalRack);
+    corrected.machines[0].rackUUID = 4;
+    suite.expect(brain.testRestoreMachinesFromClusterTopology(corrected) &&
+                     brain.racks.contains(originalRackUUID) == false && machines[0]->rack != nullptr &&
+                     machines[0]->rack->uuid == 4 && current->countPerRack.contains(originalRack) == false &&
+                     current->racksByShardGroup[0].contains(originalRack) == false,
+                 "adopted_rack_topology_restore_reaps_last_old_rack_and_zero_indexes");
+    Rack *rackFour = machines[0]->rack;
+
+    brain.deployments.clear();
+    delete current;
+    for (Machine *machine : machines)
+    {
+      brain.machines.erase(machine);
+      brain.machinesByUUID.erase(machine->uuid);
+      machine->rack->machines.erase(machine);
+      delete machine;
+    }
+    for (Rack *rack : {rackTwo, rackThree, rackFour})
+    {
+      brain.racks.erase(rack->uuid);
+      delete rack;
+    }
+    thisBrain = savedBrain;
+  };
+
   if (const char *testOnly = ::getenv("PRODIGY_TEST_ONLY"); testOnly != nullptr)
   {
     if (std::strcmp(testOnly, "forced-non-connector-fallback") == 0)
     {
       runForcedNonConnectorFallbackFixture();
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (std::strcmp(testOnly, "adopted-rack-topology-rebind") == 0)
+    {
+      runAdoptedRackTopologyRebindFixture();
       return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     if (std::strcmp(testOnly, "machine-claim-resume-mutation") == 0)
@@ -4016,6 +4453,7 @@ int main(void)
   }
 
   runStrandedFollowerReconnectFixture(suite);
+  runAdoptedRackTopologyRebindFixture();
   runInitialConnectFailureRetryFixture(suite);
   runPromotedCanonicalConnectorRecoveryFixture(suite, neuron);
   runGhostMasterRegistrationFixtures(suite);
@@ -9887,6 +10325,9 @@ int main(void)
     delete middle;
     delete baseline;
   });
+
+  runCollapsedUnstartedSuccessorFixture();
+  runRecoveredQueuedIntermediatesFixture();
 
   {
     ScopedRing scopedRing = {};

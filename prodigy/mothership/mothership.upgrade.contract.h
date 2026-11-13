@@ -12,6 +12,7 @@ enum class MothershipUpgradeDisposition : uint8_t {
   sameClusterRollout,
   newClusterRequired,
   unsupported,
+  sameClusterCohortRecovery,
 };
 
 enum class MothershipUpgradePath : uint8_t {
@@ -19,6 +20,7 @@ enum class MothershipUpgradePath : uint8_t {
   sameLogicalRollout,
   logicalClusterRelocation,
   separateClusterMigration,
+  sameLogicalCohortRecovery,
 };
 
 enum class MothershipUpgradeCompatibilityState : uint8_t {
@@ -57,6 +59,18 @@ struct MothershipUpgradeCompatibility {
   bool allCompatible(void) const
   {
     return wire == MothershipUpgradeCompatibilityState::compatible &&
+           persistentState == MothershipUpgradeCompatibilityState::compatible &&
+           authorityState == MothershipUpgradeCompatibilityState::compatible &&
+           transportTrust == MothershipUpgradeCompatibilityState::compatible &&
+           containerProtocol == MothershipUpgradeCompatibilityState::compatible &&
+           dataPlane == MothershipUpgradeCompatibilityState::compatible &&
+           appState == MothershipUpgradeCompatibilityState::compatible;
+  }
+
+  bool cohortRecoveryCompatible(void) const
+  {
+    return (wire == MothershipUpgradeCompatibilityState::compatible ||
+            wire == MothershipUpgradeCompatibilityState::incompatible) &&
            persistentState == MothershipUpgradeCompatibilityState::compatible &&
            authorityState == MothershipUpgradeCompatibilityState::compatible &&
            transportTrust == MothershipUpgradeCompatibilityState::compatible &&
@@ -280,11 +294,13 @@ static inline bool mothershipParseUpgradeContract(const String& json,
   if (disposition == "same-cluster-rollout"_ctv) contract.disposition = MothershipUpgradeDisposition::sameClusterRollout;
   else if (disposition == "new-cluster-required"_ctv) contract.disposition = MothershipUpgradeDisposition::newClusterRequired;
   else if (disposition == "unsupported"_ctv) contract.disposition = MothershipUpgradeDisposition::unsupported;
+  else if (disposition == "same-cluster-cohort-recovery"_ctv) contract.disposition = MothershipUpgradeDisposition::sameClusterCohortRecovery;
   else { if (failure) failure->assign("upgrade disposition is unknown"_ctv); return false; }
 
   if ((contract.transportIdentityMode != "preserveClusterIdentity"_ctv &&
        contract.transportIdentityMode != "unsupported"_ctv) ||
-      (contract.disposition == MothershipUpgradeDisposition::sameClusterRollout &&
+      ((contract.disposition == MothershipUpgradeDisposition::sameClusterRollout ||
+        contract.disposition == MothershipUpgradeDisposition::sameClusterCohortRecovery) &&
        contract.transportIdentityMode != "preserveClusterIdentity"_ctv))
   {
     if (failure) failure->assign("same-cluster transport identity preservation is unqualified"_ctv);
@@ -315,6 +331,13 @@ static inline bool mothershipParseUpgradeContract(const String& json,
        contract.compatibility.appState == MothershipUpgradeCompatibilityState::unknown))
   {
     if (failure) failure->assign("qualified upgrade compatibility may not contain unknown axes"_ctv);
+    return false;
+  }
+  if (contract.disposition == MothershipUpgradeDisposition::sameClusterCohortRecovery &&
+      (contract.minimumHealthyBrains < 3 || contract.requiredFreeBytes == 0 ||
+       !contract.compatibility.cohortRecoveryCompatible()))
+  {
+    if (failure) failure->assign("same-cluster cohort recovery requires three brains, staging capacity, and compatible retained state"_ctv);
     return false;
   }
 
@@ -603,9 +626,30 @@ static inline MothershipUpgradePlan mothershipPlanUpgrade(const MothershipUpgrad
     plan.firstStopGate = "bridge readiness and workload fencing"_ctv;
     return plan;
   }
-  if (contract.disposition != MothershipUpgradeDisposition::sameClusterRollout || input.sourceClusterUUID != input.targetClusterUUID)
+  if ((contract.disposition != MothershipUpgradeDisposition::sameClusterRollout &&
+       contract.disposition != MothershipUpgradeDisposition::sameClusterCohortRecovery) ||
+      input.sourceClusterUUID != input.targetClusterUUID)
   {
     mothershipUpgradeReject(plan, "same logical cluster identity is required"_ctv);
+    return plan;
+  }
+  if (contract.disposition == MothershipUpgradeDisposition::sameClusterCohortRecovery)
+  {
+    if (input.sourceClusterUUID != input.targetClusterUUID || input.requestProviderRelocation ||
+        !contract.compatibility.cohortRecoveryCompatible() ||
+        contract.transportIdentityMode != "preserveClusterIdentity"_ctv ||
+        !input.trustRootsAndUUIDBindingsMatch || !input.operatorAcceptedActiveWorkloadInterruption)
+    {
+      mothershipUpgradeReject(plan, "same-cluster cohort recovery requires exact identity, retained compatibility, and accepted interruption"_ctv);
+      return plan;
+    }
+    plan.path = MothershipUpgradePath::sameLogicalCohortRecovery;
+    plan.eligible = true;
+    plan.requiredPreconditions.push_back("operator accepted interruption of active workloads"_ctv);
+    plan.requiredPreconditions.push_back("all three members staged and recovery-fenced"_ctv);
+    mothershipUpgradeReceipt(plan, "activeWorkloadInterruptionAccepted"_ctv);
+    mothershipUpgradeReceipt(plan, "bundleStaged"_ctv);
+    plan.firstStopGate = "cohort recovery fencing"_ctv;
     return plan;
   }
   if (!contract.compatibility.allCompatible())

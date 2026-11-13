@@ -335,6 +335,69 @@ if test "$removed_migration_dropin" = 1; then sync -f "$dropin_directory"; syste
 )SH"_ctv);
 }
 
+// A remote runtime-recovery fence lives outside /var/lib/prodigy in a
+// systemd drop-in.  Preserve the operation directory before the ordinary
+// uninstall removes its state, and remove only a drop-in whose contents bind
+// to that directory's immutable request.  This is intentionally narrower
+// than the migration cleanup above: an unrelated prodigy.service.d policy is
+// never a cluster-removal artifact.
+static inline void mothershipAppendRemoteRuntimeRecoveryCleanupCommand(uint128_t clusterUUID, String& command)
+{
+  if (clusterUUID == 0) { command.append("echo 'runtime recovery cleanup requires a cluster UUID' >&2; exit 1; "_ctv); return; }
+  String retainedRoot = {};
+  retainedRoot.snprintf<"/var/lib/prodigy-retained/{itoh}/runtime-recovery"_ctv>(clusterUUID);
+  command.append("umask 077; recovery_root=/var/lib/prodigy/runtime-recovery; retained_recovery_root="_ctv);
+  prodigyAppendShellSingleQuoted(command, retainedRoot);
+  command.append(R"SH(;
+test ! -L "$recovery_root" || { echo 'refusing runtime recovery root symlink' >&2; exit 1; };
+if test -e "$recovery_root"; then
+  test -d "$recovery_root" && test -O "$recovery_root" && test "$(stat -c '%a' "$recovery_root")" = 700 || { echo 'unsafe runtime recovery root' >&2; exit 1; };
+  test ! -L "$retained_recovery_root" || { echo 'refusing retained runtime recovery symlink' >&2; exit 1; };
+  mkdir -p "$retained_recovery_root";
+  test -d "$retained_recovery_root" && test ! -L "$retained_recovery_root" && test -O "$retained_recovery_root" || { echo 'unsafe retained runtime recovery root' >&2; exit 1; };
+  chmod 700 "$retained_recovery_root";
+  test "$(stat -c %d "$recovery_root")" = "$(stat -c %d "$retained_recovery_root")" || { echo 'retained runtime recovery destination is not on the state filesystem' >&2; exit 1; };
+  for operation_root in "$recovery_root"/*; do
+    test -e "$operation_root" || test ! -L "$operation_root" || { echo 'refusing runtime recovery operation symlink' >&2; exit 1; };
+    test -e "$operation_root" || continue;
+    operation=${operation_root##*/}; operation_hex=${operation#0x};
+    case "$operation" in 0x????????????????????????????????) ;; *) echo 'invalid runtime recovery operation name' >&2; exit 1;; esac;
+    case "$operation_hex" in *[!0123456789abcdef]*) echo 'invalid runtime recovery operation name' >&2; exit 1;; esac;
+    test -d "$operation_root" && test ! -L "$operation_root" && test -O "$operation_root" && test "$(stat -c '%a' "$operation_root")" = 700 || { echo 'unsafe runtime recovery operation root' >&2; exit 1; };
+    destination="$retained_recovery_root/$operation";
+    test ! -e "$destination" && test ! -L "$destination" || { echo 'runtime recovery archival collision' >&2; exit 1; };
+    request="$operation_root/request.bin";
+    if test -e "$request" || test -L "$request"; then
+      test -f "$request" && test ! -L "$request" && test -O "$request" && test "$(stat -c '%a:%h' "$request")" = 600:1 || { echo 'unsafe runtime recovery request' >&2; exit 1; };
+      binding=$(sha256sum "$request" | awk '{print $1}');
+      case "$binding" in ????????????????????????????????????????????????????????????????) ;; *) echo 'invalid runtime recovery request digest' >&2; exit 1;; esac;
+      dropin=/etc/systemd/system/prodigy.service.d/99-tidesdb-migration-${binding%${binding#????????????????}}.conf;
+      removed="$operation_root/startup-fence-${binding%${binding#????????????????}}.conf.removed";
+      active_content="[Unit]\nConditionPathExists=!$operation_root/writers-fenced\n[Service]\nRestart=no\n";
+      legacy_content="[Unit]\nConditionPathExists=!$operation_root/writers-fenced\n";
+      test ! -L "$dropin" || { echo 'refusing runtime recovery drop-in symlink' >&2; exit 1; };
+      test ! -L "$removed" || { echo 'refusing archived runtime recovery drop-in symlink' >&2; exit 1; };
+      if test -e "$dropin"; then
+        test -f "$dropin" && test ! -L "$dropin" && test -O "$dropin" && test "$(stat -c '%a:%h' "$dropin")" = 600:1 || { echo 'unsafe runtime recovery drop-in' >&2; exit 1; };
+        { printf %b "$active_content" | cmp -s - "$dropin" || printf %b "$legacy_content" | cmp -s - "$dropin"; } || { echo 'runtime recovery drop-in binding differs' >&2; exit 1; };
+        test ! -e "$removed" || { echo 'runtime recovery archived drop-in collision' >&2; exit 1; };
+        mv -T "$dropin" "$removed" || { echo 'failed to archive runtime recovery drop-in' >&2; exit 1; };
+        sync -f "$operation_root";
+        removed_runtime_recovery_dropin=1;
+      elif test -e "$removed"; then
+        test -f "$removed" && test ! -L "$removed" && test -O "$removed" && test "$(stat -c '%a:%h' "$removed")" = 600:1 || { echo 'unsafe archived runtime recovery drop-in' >&2; exit 1; };
+        { printf %b "$active_content" | cmp -s - "$removed" || printf %b "$legacy_content" | cmp -s - "$removed"; } || { echo 'archived runtime recovery drop-in binding differs' >&2; exit 1; };
+      fi;
+    fi;
+    mv -T "$operation_root" "$destination" || { echo 'failed to preserve runtime recovery evidence' >&2; exit 1; };
+  done;
+  rmdir "$recovery_root" || { echo 'runtime recovery root has unarchived evidence' >&2; exit 1; };
+  sync -f "$retained_recovery_root";
+fi;
+if test "${removed_runtime_recovery_dropin:-0}" = 1; then systemctl daemon-reload; fi
+)SH"_ctv);
+}
+
 static inline void mothershipBuildProdigyStateWipeCommand(const String& stateDBPath, uint128_t clusterUUID, String& command)
 {
   command.assign("set -eu; "_ctv);
@@ -407,7 +470,12 @@ static inline void mothershipBuildRemoteProdigyUninstallCommand(const Mothership
 
   command.assign("set -eu; "_ctv);
   mothershipAppendProdigyOwnedStorageCleanupCommand(command);
-  command.append("; rm -f /etc/systemd/system/prodigy.service /etc/systemd/system/prodigy.service.tmp /etc/systemd/system/multi-user.target.wants/prodigy.service"_ctv);
+  command.append("; "_ctv);
+  mothershipAppendProdigyMigrationResetCleanupCommand(cluster.clusterUUID, command);
+  command.append("; "_ctv);
+  mothershipAppendRemoteRuntimeRecoveryCleanupCommand(cluster.clusterUUID, command);
+  mothershipAppendProdigyMigrationFenceCleanupCommand(command);
+  command.append("rm -f /etc/systemd/system/prodigy.service /etc/systemd/system/prodigy.service.tmp /etc/systemd/system/multi-user.target.wants/prodigy.service"_ctv);
   command.append(" "_ctv);
   prodigyAppendShellSingleQuoted(command, remoteUnitTempPath);
   command.append(" "_ctv);

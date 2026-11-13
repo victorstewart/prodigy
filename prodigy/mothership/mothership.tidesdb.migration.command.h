@@ -203,15 +203,186 @@ inline std::string retainedRuntimePublicationCommand(
 {
   std::string cmd="test \"$(systemctl show -p MainPID --value prodigy)\" = 0; ";
   cmd+="if test -e "+quote(retained)+"; then test \"$(sha256sum "+quote(retained+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(oldRuntimeSHA)+"; else test \"$(sha256sum "+quote(root+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(oldRuntimeSHA)+"; test \"$(sha256sum "+quote(root+"/prodigy.bundle.tar.zst")+" | cut -d' ' -f1)\" = "+quote(oldBundleSHA)+"; mv -T "+quote(root)+" "+quote(retained)+"; sync -f "+quote(fs::path(root).parent_path().string())+"; fi; ";
-  cmd+="if test ! -e "+quote(root)+"; then test ! -e "+quote(root+".migration-new")+"; cp -a --reflink=auto "+quote(staged)+" "+quote(root+".migration-new")+"; sync -f "+quote(root+".migration-new")+"; mv -T "+quote(root+".migration-new")+" "+quote(root)+"; sync -f "+quote(fs::path(root).parent_path().string())+"; fi; ";
+  // A controller can die during the copy after retaining the source. Preserve
+  // that incomplete copy under a unique name, then copy the immutable staged
+  // release again. Never merge a partial tree into the published runtime.
+  const auto pending=root+".migration-new";
+  cmd+="if test ! -e "+quote(root)+"; then test ! -L "+quote(pending)+"; if test -e "+quote(pending)+
+       "; then test -d "+quote(pending)+"; test \"$(stat -c %u "+quote(pending)+")\" = 0; interrupted=$(mktemp -d "+
+       quote(retained+".interrupted-copy.XXXXXX")+"); mv -T "+quote(pending)+" \"$interrupted/runtime\"; sync -f \"$interrupted\"; fi; cp -a --reflink=auto "+quote(staged)+" "+quote(pending)+"; sync -f "+quote(pending)+"; mv -T "+quote(pending)+" "+quote(root)+"; sync -f "+quote(fs::path(root).parent_path().string())+"; fi; ";
   return cmd+"test \"$(sha256sum "+quote(root+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(newRuntimeSHA)+"; ";
 }
 
-inline std::string runtimeStartupFenceCommand(const std::string& operationRoot,const std::string& bindingSHA) {
+inline std::string remoteRecoveryStrictShell(const std::string& script) {
+  // Recovery commands run through SSH accounts whose noninteractive startup
+  // environment is not part of the admitted runtime.  BASH_ENV must not add
+  // account-local code to an operation-bound predicate or action.
+  return "env -u BASH_ENV bash --noprofile --norc -euo pipefail -c "+quote(script);
+}
+
+inline std::string runtimeStartupFenceDropinPath(const std::string& bindingSHA,
+                                                 const std::string& dropinDirectory = "/etc/systemd/system/prodigy.service.d") {
+  require(prodigyIsSHA256HexDigest(text(bindingSHA)), "runtime fence binding digest invalid");
+  pathCheck(dropinDirectory);
+  return dropinDirectory+"/99-tidesdb-migration-"+bindingSHA.substr(0,16)+".conf";
+}
+
+inline std::string runtimeStartupFenceCommand(const std::string& operationRoot,const std::string& bindingSHA,
+                                              const std::string& dropinDirectory = "/etc/systemd/system/prodigy.service.d",
+                                              bool inhibitAutomaticRestart = false) {
+  pathCheck(operationRoot); require(prodigyIsSHA256HexDigest(text(bindingSHA)), "runtime fence binding digest invalid");
   const auto fence=operationRoot+"/writers-fenced";
-  const auto dropin="/etc/systemd/system/prodigy.service.d/99-tidesdb-migration-"+bindingSHA.substr(0,16)+".conf";
-  const auto content="[Unit]\nConditionPathExists=!"+fence+"\n";
-  return "umask 077; printf %s "+quote(bindingSHA)+" > "+quote(fence+".new")+"; sync -f "+quote(fence+".new")+"; mv -T "+quote(fence+".new")+" "+quote(fence)+"; sync -f "+quote(operationRoot)+"; mkdir -p /etc/systemd/system/prodigy.service.d; printf %s "+quote(content)+" > "+quote(dropin+".new")+"; sync -f "+quote(dropin+".new")+"; mv -T "+quote(dropin+".new")+" "+quote(dropin)+"; sync -f /etc/systemd/system/prodigy.service.d; systemctl daemon-reload";
+  const auto dropin=runtimeStartupFenceDropinPath(bindingSHA,dropinDirectory);
+  const auto content="[Unit]\nConditionPathExists=!"+fence+"\n"+
+      (inhibitAutomaticRestart ? "[Service]\nRestart=no\n" : "");
+  return "umask 077; printf %s "+quote(bindingSHA)+" > "+quote(fence+".new")+"; sync -f "+quote(fence+".new")+"; mv -T "+quote(fence+".new")+" "+quote(fence)+"; sync -f "+quote(operationRoot)+"; mkdir -p "+quote(dropinDirectory)+"; printf %s "+quote(content)+" > "+quote(dropin+".new")+"; sync -f "+quote(dropin+".new")+"; mv -T "+quote(dropin+".new")+" "+quote(dropin)+"; sync -f "+quote(dropinDirectory)+"; systemctl daemon-reload";
+}
+
+inline std::string runtimeStartupFencePredicate(const std::string& operationRoot,const std::string& bindingSHA,
+                                                const std::string& dropinDirectory = "/etc/systemd/system/prodigy.service.d",
+                                                bool inhibitAutomaticRestart = false) {
+  pathCheck(operationRoot); require(prodigyIsSHA256HexDigest(text(bindingSHA)), "runtime fence binding digest invalid");
+  const auto fence=operationRoot+"/writers-fenced";
+  const auto dropin=runtimeStartupFenceDropinPath(bindingSHA,dropinDirectory);
+  const auto content="[Unit]\nConditionPathExists=!"+fence+"\n"+
+      (inhibitAutomaticRestart ? "[Service]\nRestart=no\n" : "");
+  const auto conditions="import json,sys;d=json.load(sys.stdin);x=[r for r in d['data'] if r[0]=='ConditionPathExists' and r[3]==sys.argv[1]];assert d['type']=='a(sbbsi)' and len(x)==1 and x[0][1:3]==[False,True] and isinstance(x[0][4],int)";
+  return "test -f "+quote(fence)+"; test ! -L "+quote(fence)+"; test \"$(stat -c '%u:%a:%h' "+quote(fence)+")\" = '0:600:1'; test \"$(cat "+quote(fence)+")\" = "+quote(bindingSHA)+
+      "; test -f "+quote(dropin)+"; test ! -L "+quote(dropin)+"; test \"$(stat -c '%u:%a:%h' "+quote(dropin)+")\" = '0:600:1'; printf %s "+quote(content)+" | cmp -s - "+quote(dropin)+
+      "; systemctl show -p DropInPaths --value prodigy | tr ' ' '\\n' | grep -Fx -- "+quote(dropin)+" > /dev/null; test \"$(systemctl show -p NeedDaemonReload --value prodigy)\" = no; "+
+      (inhibitAutomaticRestart ? "test \"$(systemctl show -p Restart --value prodigy)\" = no; " : "")+
+      "busctl --json=short get-property org.freedesktop.systemd1 /org/freedesktop/systemd1/unit/prodigy_2eservice org.freedesktop.systemd1.Unit Conditions | python3 -c "+quote(conditions)+" "+quote(fence)+"; ";
+}
+
+// Releases only this operation's exact fence.  The released files remain as
+// immutable operation evidence; a retry accepts that retained pair, never an
+// ambient unit policy or a same-named file with different contents.
+inline std::string runtimeStartupUnfencePredicate(const std::string& operationRoot,const std::string& bindingSHA,
+                                                  const std::string& dropinDirectory = "/etc/systemd/system/prodigy.service.d",
+                                                  bool inhibitAutomaticRestart = false) {
+  pathCheck(operationRoot); require(prodigyIsSHA256HexDigest(text(bindingSHA)), "runtime unfence binding digest invalid");
+  const auto fence=operationRoot+"/writers-fenced";
+  const auto dropin=runtimeStartupFenceDropinPath(bindingSHA,dropinDirectory);
+  const auto releasedFence=operationRoot+"/writers-fenced.released";
+  const auto releasedDropin=operationRoot+"/startup-fence-"+bindingSHA.substr(0,16)+".conf.released";
+  const auto content="[Unit]\nConditionPathExists=!"+fence+"\n"+
+      (inhibitAutomaticRestart ? "[Service]\nRestart=no\n" : "");
+  const auto exactFence = [&](const std::string& path) {
+    return "test -f "+quote(path)+"; test ! -L "+quote(path)+"; test \"$(stat -c '%u:%a:%h' "+quote(path)+")\" = '0:600:1'; test \"$(cat "+quote(path)+")\" = "+quote(bindingSHA)+"; ";
+  };
+  const auto exactDropin = [&](const std::string& path) {
+    return "test -f "+quote(path)+"; test ! -L "+quote(path)+"; test \"$(stat -c '%u:%a:%h' "+quote(path)+")\" = '0:600:1'; printf %s "+quote(content)+" | cmp -s - "+quote(path)+"; ";
+  };
+  // Check the show command independently: `! pipeline` alone would turn a
+  // systemctl failure into a superficially successful absence result.
+  const auto absentLoadedDropin = "loaded=$(systemctl show -p DropInPaths --value prodigy); ! printf '%s\\n' \"$loaded\" | tr ' ' '\\n' | grep -Fx -- "+quote(dropin)+" > /dev/null; test \"$(systemctl show -p NeedDaemonReload --value prodigy)\" = no; ";
+  return exactFence(releasedFence)+exactDropin(releasedDropin)+
+      "test ! -e "+quote(fence)+"; test ! -L "+quote(fence)+"; test ! -e "+quote(dropin)+"; test ! -L "+quote(dropin)+"; "+absentLoadedDropin;
+}
+
+inline std::string runtimeStartupUnfenceCommand(const std::string& operationRoot,const std::string& bindingSHA,
+                                                const std::string& dropinDirectory = "/etc/systemd/system/prodigy.service.d",
+                                                bool inhibitAutomaticRestart = false) {
+  pathCheck(operationRoot); require(prodigyIsSHA256HexDigest(text(bindingSHA)), "runtime unfence binding digest invalid");
+  const auto fence=operationRoot+"/writers-fenced";
+  const auto dropin=runtimeStartupFenceDropinPath(bindingSHA,dropinDirectory);
+  const auto releasedFence=operationRoot+"/writers-fenced.released";
+  const auto releasedDropin=operationRoot+"/startup-fence-"+bindingSHA.substr(0,16)+".conf.released";
+  const auto released=runtimeStartupUnfencePredicate(operationRoot,bindingSHA,dropinDirectory,inhibitAutomaticRestart);
+  const auto exactFence = [&](const std::string& path) {
+    return "test -f "+quote(path)+"; test ! -L "+quote(path)+"; test \"$(stat -c '%u:%a:%h' "+quote(path)+")\" = '0:600:1'; test \"$(cat "+quote(path)+")\" = "+quote(bindingSHA)+"; ";
+  };
+  const auto content="[Unit]\nConditionPathExists=!"+fence+"\n"+
+      (inhibitAutomaticRestart ? "[Service]\nRestart=no\n" : "");
+  const auto exactDropin = [&](const std::string& path) {
+    return "test -f "+quote(path)+"; test ! -L "+quote(path)+"; test \"$(stat -c '%u:%a:%h' "+quote(path)+")\" = '0:600:1'; printf %s "+quote(content)+" | cmp -s - "+quote(path)+"; ";
+  };
+  // Each item has exactly one authenticated location.  A fully active pair
+  // also proves its live systemd state; a partial pair is an interrupted own
+  // release and is completed only after both retained/active forms validate.
+  const auto itemForms = "test ! -L "+quote(fence)+"; test ! -L "+quote(releasedFence)+"; test ! -L "+quote(dropin)+"; test ! -L "+quote(releasedDropin)+"; "+
+      "if test -e "+quote(fence)+"; then test ! -e "+quote(releasedFence)+"; "+exactFence(fence)+"else "+exactFence(releasedFence)+"fi; "+
+      "if test -e "+quote(dropin)+"; then test ! -e "+quote(releasedDropin)+"; "+exactDropin(dropin)+"else "+exactDropin(releasedDropin)+"fi; ";
+  const auto fullyActive = "test -e "+quote(fence)+" && test -e "+quote(dropin)+"; "+
+      runtimeStartupFencePredicate(operationRoot,bindingSHA,dropinDirectory,inhibitAutomaticRestart)+
+      "test ! -e "+quote(releasedFence)+"; test ! -e "+quote(releasedDropin)+"; ";
+  const auto moveRemaining = "if test -e "+quote(dropin)+"; then mv -T "+quote(dropin)+" "+quote(releasedDropin)+"; sync -f "+quote(operationRoot)+"; fi; "+
+      "if test -e "+quote(fence)+"; then mv -T "+quote(fence)+" "+quote(releasedFence)+"; sync -f "+quote(operationRoot)+"; fi; "+
+      "systemctl daemon-reload; "+released;
+  return "test \"$(stat -c '%d' "+quote(operationRoot)+")\" = \"$(stat -c '%d' "+quote(dropinDirectory)+")\"; "+
+      itemForms+"if test -e "+quote(fence)+" && test -e "+quote(dropin)+"; then "+fullyActive+"fi; "+moveRemaining;
+}
+
+inline std::string remoteRecoveryMarkerPredicate(const std::string& path,const std::string& bindingSHA) {
+  pathCheck(path); require(prodigyIsSHA256HexDigest(text(bindingSHA)),"remote recovery binding digest invalid");
+  return "test -f "+quote(path)+"; test ! -L "+quote(path)+"; test \"$(stat -c '%u:%a:%h' "+quote(path)+
+         ")\" = '0:600:1'; test \"$(cat "+quote(path)+")\" = "+quote(bindingSHA)+"; ";
+}
+// A recovery action may have completed after its controller lost the SSH
+// reply.  Every destructive remote step therefore writes an operation-bound
+// marker only after its predicate succeeds; a retry verifies that marker and
+// predicate, never issues the action again based on path existence alone.
+inline std::string remoteRecoveryAttestedCommand(const std::string& operationRoot,
+                                                 const std::string& bindingSHA,
+                                                 const std::string& phase,
+                                                 const std::string& safePrecondition,
+                                                 const std::string& predicate,
+                                                 const std::string& action) {
+  pathCheck(operationRoot); require(prodigyIsSHA256HexDigest(text(bindingSHA)), "remote recovery binding digest invalid");
+  require(!phase.empty() && phase.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789-") == std::string::npos,
+          "remote recovery phase name invalid");
+  const auto marker=operationRoot+"/remote-recovery-"+phase;
+  const auto effectLock=operationRoot+"/remote-recovery-effect.lock";
+  // A shell disables errexit throughout an `if` condition. Execute predicates
+  // in a fresh strict shell so an earlier failed identity check cannot be
+  // hidden by a later successful command in the same predicate.
+  const auto probe=remoteRecoveryStrictShell(predicate);
+  const auto perform=remoteRecoveryStrictShell(safePrecondition+"\n"+action+"\n"+predicate);
+  const auto checkMarker=[&](const std::string& path) {
+    return remoteRecoveryMarkerPredicate(path,bindingSHA);
+  };
+  const auto publish="mv -T "+quote(marker+".new")+" "+quote(marker)+"; sync -f "+quote(operationRoot)+"; ";
+  const auto seal="umask 077; test ! -e "+quote(marker+".new")+"; test ! -L "+quote(marker+".new")+
+                  "; (set -o noclobber; printf %s "+quote(bindingSHA)+" > "+quote(marker+".new")+"); "+
+                  checkMarker(marker+".new")+"sync -f "+quote(marker+".new")+"; "+publish;
+  // First reconcile the postcondition.  In particular, an SSH disconnect
+  // between a destructive action and its durable marker must never cause a
+  // retry to issue the action again.  A marker is only trusted when it is the
+  // private, root-owned regular file for this exact immutable binding.
+  const auto script="test -d "+quote(operationRoot)+"; test ! -L "+quote(operationRoot)+
+         "; test \"$(stat -c '%u:%a' "+quote(operationRoot)+")\" = '0:700'; "
+         "test ! -L "+quote(effectLock)+"; if test ! -e "+quote(effectLock)+"; then (umask 077; set -o noclobber; : > "+quote(effectLock)+") 2>/dev/null || :; fi; "
+         "test -f "+quote(effectLock)+"; test ! -L "+quote(effectLock)+"; test \"$(stat -c '%u:%a:%h' "+quote(effectLock)+")\" = '0:600:1'; "
+         "exec 9> "+quote(effectLock)+"; flock -n 9; test ! -L "+quote(marker)+
+         "; test ! -L "+quote(marker+".new")+"; if test -e "+quote(marker)+"; then "+checkMarker(marker)+probe+
+         "; elif test -e "+quote(marker+".new")+"; then "+checkMarker(marker+".new")+probe+"; "+publish+
+         "else if "+probe+"; then :; else "+perform+"; fi; "+seal+"fi; ";
+  return remoteRecoveryStrictShell(script)+"; ";
+}
+
+inline std::string remoteRecoveryCgroupFrozenPredicate(const std::string& serviceCgroup) {
+  return "test -r "+quote(serviceCgroup+"/cgroup.events")+" && test \"$(awk '$1 == \"frozen\" { print $2 }' "+quote(serviceCgroup+"/cgroup.events")+
+         ")\" = 1";
+}
+
+inline std::string remoteRecoveryCgroupUnpopulatedPredicate(const std::string& serviceCgroup) {
+  return "test -r "+quote(serviceCgroup+"/cgroup.events")+" && test \"$(awk '$1 == \"populated\" { print $2 }' "+quote(serviceCgroup+"/cgroup.events")+
+         ")\" = 0";
+}
+
+inline std::string remoteRecoveryFreezeCgroupCommand(const std::string& serviceCgroup) {
+  const auto script="test -w "+quote(serviceCgroup+"/cgroup.freeze")+"; printf 1 > "+quote(serviceCgroup+"/cgroup.freeze")+
+         "; for i in $(seq 1 100); do "+remoteRecoveryCgroupFrozenPredicate(serviceCgroup)+" && break; sleep 0.05; done; "+
+         remoteRecoveryCgroupFrozenPredicate(serviceCgroup)+"; ";
+  return remoteRecoveryStrictShell(script)+"; ";
+}
+
+inline std::string remoteRecoveryKillFrozenCgroupCommand(const std::string& serviceCgroup) {
+  const auto exited="{ test ! -e "+quote(serviceCgroup)+" || { "+remoteRecoveryCgroupUnpopulatedPredicate(serviceCgroup)+"; }; }";
+  const auto script=remoteRecoveryCgroupFrozenPredicate(serviceCgroup)+"; test -w "+quote(serviceCgroup+"/cgroup.kill")+
+         "; printf 1 > "+quote(serviceCgroup+"/cgroup.kill")+"; for i in $(seq 1 100); do "+
+         exited+" && break; sleep 0.05; done; "+exited+"; ";
+  return remoteRecoveryStrictShell(script)+"; ";
 }
 inline std::string runtimeServiceExecStartCheck(const std::string& runtimeRoot) {
   return "systemctl show -p ExecStart --value prodigy | grep -F -- "+quote(runtimeRoot+"/prodigy")+" > /dev/null; ";

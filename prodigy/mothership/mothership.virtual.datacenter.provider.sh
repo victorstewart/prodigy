@@ -456,6 +456,55 @@ valid_retained_cgroup_root()
       "${retained_cgroup_root}" == /sys/fs/cgroup/*/prodigy-vdc-"${runtime_identity}" ]]
 }
 
+# An adopter may find that the empty control leaf was removed while the
+# retained provider and its machine leaves remained live.  The control leaf is
+# only the provider-launch parking leaf; it is never runtime ownership.  Do
+# not rebuild scope delegation here: recover only its exact empty pathname
+# while the live provider cgroup authenticates the retained root.
+retained_cgroup_control_absent_recoverable()
+{
+   local retained_cgroup_scope="$1" retained_cgroup_root="$2" runtime_identity="$3"
+   local canonical_scope="" child="" children="" enabled="" processes=""
+   valid_retained_cgroup_root "${retained_cgroup_root}" "${runtime_identity}" || return 1
+   canonical_scope="$(realpath -m -- "${retained_cgroup_scope}")" || return 1
+   [[ "${canonical_scope}" == "${retained_cgroup_scope}" &&
+      "${retained_cgroup_root}" == "${retained_cgroup_scope}/prodigy-vdc-${runtime_identity}" &&
+      ( "${retained_cgroup_scope}" == /sys/fs/cgroup || "${retained_cgroup_scope}" == /sys/fs/cgroup/* ) &&
+      -d "${retained_cgroup_scope}" && -d "${retained_cgroup_root}" &&
+      ! -e "${retained_cgroup_scope}/prodigy-vdc-control" && ! -L "${retained_cgroup_scope}/prodigy-vdc-control" &&
+      -r "${retained_cgroup_scope}/cgroup.procs" && -r "${retained_cgroup_scope}/cgroup.subtree_control" ]] || return 1
+   [[ "$(findmnt -n -o FSTYPE -T "${retained_cgroup_scope}")" == cgroup2 ]] || return 1
+   processes="$(cat -- "${retained_cgroup_scope}/cgroup.procs")" || return 1
+   [[ -z "${processes}" ]] || return 1
+   enabled=" $(<"${retained_cgroup_scope}/cgroup.subtree_control") "
+   local controller=""
+   for controller in cpuset cpu memory pids
+   do
+      [[ "${enabled}" == *" ${controller} "* ]] || return 1
+   done
+   children="$(find "${retained_cgroup_scope}" -mindepth 1 -maxdepth 1 -type d -print)" || return 1
+   while IFS= read -r child
+   do
+      [[ -z "${child}" ]] && continue
+      [[ "${child##*/}" =~ ^prodigy-vdc-[0-9]+$ ]] || return 1
+   done <<< "${children}"
+}
+
+restore_retained_cgroup_control_if_absent()
+{
+   local retained_cgroup_scope="$1" retained_cgroup_root="$2" runtime_identity="$3"
+   local retained_cgroup_lock=""
+   retained_cgroup_control_absent_recoverable "${retained_cgroup_scope}" "${retained_cgroup_root}" "${runtime_identity}" || return 1
+   retained_cgroup_lock="/run/prodigy-vdc-cgroup-$(stat -Lc %i "${retained_cgroup_scope}").lock" || return 1
+   (
+      exec {retained_cgroup_lock_fd}>"${retained_cgroup_lock}" || return 1
+      flock "${retained_cgroup_lock_fd}" || return 1
+      retained_cgroup_control_absent_recoverable "${retained_cgroup_scope}" "${retained_cgroup_root}" "${runtime_identity}" || return 1
+      mkdir "${retained_cgroup_scope}/prodigy-vdc-control" || return 1
+      flock -u "${retained_cgroup_lock_fd}"
+   )
+}
+
 restore_cgroup_scope_if_idle()
 {
    if [[ -n "${1:-}" ]]
@@ -505,8 +554,8 @@ provider_process()
    [[ "${arguments[0]:-}" == bash || "${arguments[0]:-}" == /bin/bash ]] || return 1
    [[ "${arguments[1]:-}" =~ ^/proc/self/fd/[0-9]+$ ]] || return 1
    case "${arguments[2]:-}" in
-      --serve) [[ ( "${#arguments[@]}" -eq 15 || "${#arguments[@]}" -eq 16 || "${#arguments[@]}" -eq 18 ) && "${arguments[3]}" == "${workspace}" ]] ;;
-      --serve-adopt) [[ "${#arguments[@]}" -eq 17 && "${arguments[3]}" =~ ^[0-9]+$ && "${arguments[5]}" == "${workspace}" && "${arguments[4]}" == "${workspace}/virtual-datacenter.recovery/"* ]] ;;
+      --serve) [[ ( "${#arguments[@]}" -eq 15 || "${#arguments[@]}" -eq 16 || "${#arguments[@]}" -eq 17 || "${#arguments[@]}" -eq 18 ) && "${arguments[3]}" == "${workspace}" ]] ;;
+      --serve-adopt) [[ ( "${#arguments[@]}" -eq 17 || "${#arguments[@]}" -eq 18 || "${#arguments[@]}" -eq 19 || "${#arguments[@]}" -eq 20 ) && "${arguments[3]}" =~ ^[0-9]+$ && "${arguments[5]}" == "${workspace}" && "${arguments[4]}" == "${workspace}/virtual-datacenter.recovery/"* ]] ;;
       *) return 1 ;;
    esac
 }
@@ -1995,12 +2044,14 @@ PAIR_PROBE
 # two currently-live VDC parent namespaces.
 pair_control_parse()
 {
-   [[ ( "$#" -eq 12 || "$#" -eq 14 || "$#" -eq 15 || "$#" -eq 19 || "$#" -eq 25 ) && "${EUID}" -eq 0 ]] || return 2
+   [[ ( "$#" -eq 12 || "$#" -eq 14 || "$#" -eq 15 || "$#" -eq 18 || "$#" -eq 19 || "$#" -eq 25 ) && "${EUID}" -eq 0 ]] || return 2
    pair_control_args=("${@:1:12}")
    pair_control_service_args=()
+   pair_control_masque_args=()
    pair_control_fault_delay_ms=""; pair_control_fault_duration_ms=""; pair_control_fault_direction=both
    pair_control_fault_kind=drop; pair_control_fault_latency_ms=0; pair_control_fault_percentage_bps=0; pair_control_fault_seed=0
    if [[ "$#" -eq 25 ]]; then pair_control_service_args=("${@:13:13}"); fi
+   if [[ "$#" -eq 18 ]]; then pair_control_masque_args=("${@:13:6}"); fi
    if [[ "$#" -eq 14 || "$#" -eq 15 ]]; then
       pair_control_fault_delay_ms="${13}"; pair_control_fault_duration_ms="${14}"
       [[ "$#" -eq 15 ]] && pair_control_fault_direction="${15}"
@@ -2064,6 +2115,35 @@ PAIR_CONTROL_FAULT_PARSE
       pair_control_parse_service_args "${pair_control_service_args[@]}" || return 2
       pair_control_service_side || return 2
    fi
+   if [[ ${#pair_control_masque_args[@]} -ne 0 ]]; then
+      pair_control_parse_masque_args "${pair_control_masque_args[@]}" || return 2
+      pair_control_masque_side || return 2
+   fi
+}
+
+# One authenticated MASQUE connector-to-listener UDP tuple.  This is an
+# underlay exception selected by Mothership from the durable gateway authority,
+# never a public/subnet forwarding rule.
+pair_control_parse_masque_args()
+{
+   [[ "$#" -eq 6 ]] || return 2
+   pair_control_masque_source_machine="$1"; pair_control_masque_destination_machine="$2"
+   pair_control_masque_source_private6="$3"; pair_control_masque_destination_private6="$4"
+   pair_control_masque_destination_public6="$5"; pair_control_masque_udp_port="$6"
+   python3 - "$pair_control_masque_source_machine" "$pair_control_masque_destination_machine" \
+      "$pair_control_masque_source_private6" "$pair_control_masque_destination_private6" \
+      "$pair_control_masque_destination_public6" "$pair_control_masque_udp_port" <<'PAIR_CONTROL_MASQUE_PARSE'
+import ipaddress,re,sys
+source_machine,destination_machine,source_private,destination_private,destination_public,port=sys.argv[1:]
+ident=re.compile(r'^0x[0-9a-f]{2,32}$')
+assert all(ident.fullmatch(v) and len(v[2:])%2==0 and int(v,16)!=0 for v in (source_machine,destination_machine))
+assert source_machine != destination_machine
+assert str(int(port))==port and 1<=int(port)<=65535
+for value in (source_private,destination_private,destination_public):
+ address=ipaddress.IPv6Address(value)
+ assert address.compressed==value and not (address.is_unspecified or address.is_multicast or address.is_loopback or address.is_link_local)
+assert len({source_private,destination_private,destination_public})==3
+PAIR_CONTROL_MASQUE_PARSE
 }
 
 # Service tuple arguments are supplied only by the typed Mothership owner.
@@ -2102,6 +2182,11 @@ PAIR_CONTROL_SERVICE_PARSE
 pair_control_service_descriptor()
 {
    printf '%s\n' "${pair_control_service_args[@]}"
+}
+
+pair_control_masque_descriptor()
+{
+   printf '%s\n' "${pair_control_masque_args[@]}"
 }
 
 pair_control_descriptor() { printf '%s\n' "${pair_control_args[@]}"; }
@@ -2225,7 +2310,17 @@ pair_control_remove_owned_link()
    if pair_link_presence "pc-$side" "$link"; then :; else
       present=$?; [[ "$present" == 1 ]] && return 0; return 1
    fi
-   pair_control_link_owned "$side" "$link" || return 1
+   if pair_control_link_owned "$side" "$link"; then :; else
+      # The owned peer can disappear after the successful inventory above but
+      # before its identity read. Treat only a fresh successful absence as
+      # completion; a surviving replacement or an inventory error remains
+      # fail-closed.
+      if pair_link_presence "pc-$side" "$link"; then return 1; else
+         present=$?
+         [[ "$present" == 1 ]] && return 0
+         return 1
+      fi
+   fi
    ip -n "pc-$side" link del "$link" || {
       if pair_link_presence "pc-$side" "$link"; then return 1; else
          present=$?; [[ "$present" == 1 ]] && return 0; return 1
@@ -2317,12 +2412,48 @@ pair_control_cleanup_inside()
       pair_control_remove_service_route "$pair_control_router_ns" "$name" \
          "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" "${pair_control_service_destination_side}0"
    }
-   local service_cleanup
-   if pair_control_cleanup_service_one_inside base; then service_cleanup=0; else service_cleanup=$?; fi
-   [[ "$service_cleanup" == 0 || "$service_cleanup" == 3 ]] || status=1
-   if [[ "$service_cleanup" == 3 ]] && { [[ -e "$(pair_control_service_path service-descriptor opposite)" || -L "$(pair_control_service_path service-descriptor opposite)" ]]; }; then status=1; fi
-   if pair_control_cleanup_service_one_inside opposite; then service_cleanup=0; else service_cleanup=$?; fi
-   [[ "$service_cleanup" == 0 || "$service_cleanup" == 3 ]] || status=1
+   local service_cleanup service_slot
+   for service_slot in $(pair_control_service_slots); do
+      if pair_control_cleanup_service_one_inside "$service_slot"; then service_cleanup=0; else service_cleanup=$?; fi
+      [[ "$service_cleanup" == 0 || "$service_cleanup" == 3 ]] || status=1
+   done
+   local masque_cleanup
+   if pair_control_load_masque_descriptor; then
+      # Do not dismantle the carrier if the selected machine namespace can no
+      # longer be proved to be the journaled owner.  Leaving its exact route
+      # and the private carrier intact is safer than creating a half-cleaned
+      # path that could be mistaken for a fresh admission.
+      if pair_control_masque_bind_source_machine; then
+         pair_control_remove_masque_machine_route "$pair_control_masque_source_namespace" masque-source-machine-route \
+            "${pair_control_masque_destination_public6}/128" "$pair_control_masque_source_router" bond0 "$pair_control_masque_source_private6" || masque_cleanup=1
+         [[ "${masque_cleanup:-0}" != 1 ]] && pair_control_remove_service_route "pc-$pair_control_masque_source_side" masque-source-route \
+            "${pair_control_masque_destination_public6}/128" "$pair_control_masque_source_router" vdcbr0 || masque_cleanup=1
+         if [[ "${masque_cleanup:-0}" == 0 ]]; then
+            if [[ -e "/run/netns/$pair_control_router_ns" ]]; then
+               [[ -f "$pair_control_dir/router-namespace" && ! -L "$pair_control_dir/router-namespace" &&
+                  "$(stat -Lc %i "/run/netns/$pair_control_router_ns")" == "$(<"$pair_control_dir/router-namespace")" ]] &&
+                  pair_control_remove_masque_snat &&
+                  pair_control_remove_service_route "$pair_control_router_ns" masque-router-destination-route \
+                     "${pair_control_masque_destination_public6}/128" "$pair_control_masque_destination_private6" "${pair_control_masque_destination_side}0" || masque_cleanup=1
+               [[ "${masque_cleanup:-0}" != 1 ]] && pair_control_remove_service_route "$pair_control_router_ns" masque-router-source-public-route \
+                  "${pair_control_masque_source_public6}/128" "$pair_control_masque_source_private6" "${pair_control_masque_source_side}0" || masque_cleanup=1
+            else
+               # Recovery binds both surviving VDC parents into a fresh mount
+               # namespace. The dead supervisor's private router is gone.
+               pair_control_owner_dead || masque_cleanup=1
+            fi
+         fi
+      else
+         masque_cleanup=1
+      fi
+      if [[ "${masque_cleanup:-0}" == 0 && -n "${pair_control_masque_source_namespace:-}" && -e "/run/netns/$pair_control_masque_source_namespace" ]]; then
+         umount "/run/netns/$pair_control_masque_source_namespace" || masque_cleanup=1
+      fi
+      [[ "${masque_cleanup:-0}" == 0 ]] || status=1
+   else
+      masque_cleanup=$?
+      [[ "$masque_cleanup" == 3 ]] || status=1
+   fi
    # The router is owned only by this supervisor's private mount namespace.
    if [[ -n "${pair_control_router_ns:-}" && -e "/run/netns/$pair_control_router_ns" ]]; then
       [[ -f "$pair_control_dir/router-namespace" && "$(stat -Lc %i "/run/netns/$pair_control_router_ns")" == "$(<"$pair_control_dir/router-namespace")" ]] || status=1
@@ -2407,22 +2538,37 @@ print(rows[0]["mtu"])
 '
 }
 
+# Keep the two legacy filenames usable; additional immutable tuples have
+# bounded numbered slots. Every slot is independently authorized by Mothership.
+pair_control_service_slots()
+{
+   printf '%s\n' base opposite
+   local i
+   for ((i=2;i<64;i++)); do printf 'flow-%s\n' "$i"; done
+}
+
 pair_control_service_suffix()
 {
-   [[ "$1" == base || "$1" == opposite ]] || return 2
-   [[ "$1" == base ]] || printf '%s' '-opposite'
+   case "$1" in
+      base) ;;
+      opposite) printf '%s' '-opposite' ;;
+      flow-*) [[ "${1#flow-}" =~ ^([2-9]|[1-5][0-9]|6[0-3])$ ]] || return 2; printf -- '-%s' "$1" ;;
+      *) return 2 ;;
+   esac
 }
 
 pair_control_service_path()
 {
-   local name="$1" slot="$2"
-   printf '%s/%s%s\n' "$pair_control_dir" "$name" "$(pair_control_service_suffix "$slot")"
+   local name="$1" slot="$2" suffix
+   suffix="$(pair_control_service_suffix "$slot")" || return 2
+   printf '%s/%s%s\n' "$pair_control_dir" "$name" "$suffix"
 }
 
 pair_control_service_name()
 {
-   local name="$1" slot="$2"
-   printf '%s%s\n' "$name" "$(pair_control_service_suffix "$slot")"
+   local name="$1" slot="$2" suffix
+   suffix="$(pair_control_service_suffix "$slot")" || return 2
+   printf '%s%s\n' "$name" "$suffix"
 }
 
 pair_control_load_service_descriptor()
@@ -2430,8 +2576,7 @@ pair_control_load_service_descriptor()
    local slot="${1:-base}" path
    path="$(pair_control_service_path service-descriptor "$slot")" || return 2
    pair_control_service_args=()
-   # Status 3 is reserved for a genuinely absent optional slot. Every
-   # malformed, unsafe, or unparsable descriptor is a hard failure.
+   # Only a genuinely absent slot is optional. Malformed state fails closed.
    [[ -e "$path" || -L "$path" ]] || return 3
    [[ -f "$path" && ! -L "$path" ]] || return 2
    mapfile -t pair_control_service_args < "$path" || return 2
@@ -2439,47 +2584,27 @@ pair_control_load_service_descriptor()
    pair_control_parse_service_args "${pair_control_service_args[@]}" || return 2
 }
 
-# Keep the legacy root descriptor as the first service.  A second, opposite
-# direction is stored in an explicitly named sibling, never folded into a
-# mutable aggregate.  This leaves old one-service journals byte-for-byte
-# usable during query and recovery cleanup.
 pair_control_select_service_slot()
 {
-   local requested existing=() base_source opposite_path
+   local requested slot free_slot="" loaded
    requested="$(pair_control_service_descriptor)" || return 1
-   if pair_control_load_service_descriptor base; then
-      existing=("${pair_control_service_args[@]}")
-   else
-      local loaded=$?
-      [[ "$loaded" == 3 ]] || return 1
-      pair_control_service_transit_slot=base
-      pair_control_service_args=()
-      mapfile -t pair_control_service_args <<< "$requested"
-      pair_control_parse_service_args "${pair_control_service_args[@]}" || return 1
-      return 0
-   fi
-   if [[ "$(printf '%s\n' "${existing[@]}")" == "$requested" ]]; then
-      pair_control_service_transit_slot=base
-      pair_control_service_args=("${existing[@]}")
-      return 0
-   fi
-   base_source="$pair_control_service_source_uuid"
+   for slot in $(pair_control_service_slots); do
+      if pair_control_load_service_descriptor "$slot"; then
+         if [[ "$(pair_control_service_descriptor)" == "$requested" ]]; then
+            pair_control_service_transit_slot="$slot"
+            return 0
+         fi
+      else
+         loaded=$?
+         [[ "$loaded" == 3 ]] || return 1
+         [[ -n "$free_slot" ]] || free_slot="$slot"
+      fi
+   done
+   [[ -n "$free_slot" ]] || return 1
+   pair_control_service_transit_slot="$free_slot"
    pair_control_service_args=()
    mapfile -t pair_control_service_args <<< "$requested"
-   pair_control_parse_service_args "${pair_control_service_args[@]}" || return 1
-   # There are exactly two cluster identities. A second tuple may only be the
-   # reverse direction of the legacy/root tuple.
-   [[ "$pair_control_service_source_uuid" != "$base_source" ]] || return 1
-   opposite_path="$(pair_control_service_path service-descriptor opposite)" || return 1
-   if [[ -e "$opposite_path" || -L "$opposite_path" ]]; then
-      pair_control_load_service_descriptor opposite || return 1
-      [[ "$(pair_control_service_descriptor)" == "$requested" ]] || return 1
-   else
-      pair_control_service_args=()
-      mapfile -t pair_control_service_args <<< "$requested"
-      pair_control_parse_service_args "${pair_control_service_args[@]}" || return 1
-   fi
-   pair_control_service_transit_slot=opposite
+   pair_control_parse_service_args "${pair_control_service_args[@]}"
 }
 
 pair_control_service_side()
@@ -2510,6 +2635,95 @@ for path,address in ((source_manifest,source),(destination_manifest,destination)
     values={ipaddress.IPv6Address(node['private6']) for node in json.load(open(path,encoding='utf-8'))['nodes']}
     assert address in values
 PAIR_CONTROL_SERVICE_INGRESSES
+}
+
+pair_control_masque_side()
+{
+   local addresses first_router second_router
+   addresses="$(pair_control_addresses)" || return 1
+   read -r _ first_router _ second_router <<< "$addresses" || return 1
+   if [[ "$pair_control_masque_source_machine" == "$pair_control_masque_destination_machine" ]]; then return 1; fi
+   # The typed caller does identity-to-side binding.  The provider independently
+   # proves only that the exact two private addresses and listener public tuple
+   # remain in the two current manifests.
+   if [[ "$pair_control_masque_source_private6" == "$pair_control_masque_destination_private6" ]]; then return 1; fi
+   local side_index=""
+   side_index="$(python3 - "$pair_control_first_workspace/test-cluster-manifest.json" "$pair_control_second_workspace/test-cluster-manifest.json" \
+       "$pair_control_masque_source_private6" "$pair_control_masque_destination_private6" "$pair_control_masque_destination_public6" <<'PAIR_CONTROL_MASQUE_SIDES'
+import ipaddress,json,sys
+first,second,source,destination,public=sys.argv[1:]
+source=ipaddress.IPv6Address(source); destination=ipaddress.IPv6Address(destination); public=ipaddress.IPv6Address(public)
+first_nodes=json.load(open(first,encoding='utf-8'))['nodes']; second_nodes=json.load(open(second,encoding='utf-8'))['nodes']
+def find(nodes,address,key): return [node for node in nodes if ipaddress.IPv6Address(node[key])==address]
+source_first=find(first_nodes,source,'private6'); source_second=find(second_nodes,source,'private6')
+destination_first=find(first_nodes,destination,'private6'); destination_second=find(second_nodes,destination,'private6')
+assert len(source_first)+len(source_second)==1 and len(destination_first)+len(destination_second)==1
+assert bool(source_first) != bool(destination_first)
+destination_nodes=second_nodes if source_first else first_nodes
+assert len([node for node in destination_nodes if ipaddress.IPv6Address(node['private6'])==destination and ipaddress.IPv6Address(node['public6'])==public])==1
+source_nodes=(first_nodes if source_first else second_nodes)
+node=(source_first if source_first else source_second)[0]
+assert isinstance(node.get('index'),int) and 1<=node['index']<=128
+source_public=ipaddress.IPv6Address(node['public6'])
+assert source_public.compressed==node['public6'] and source_public != public
+assert len([candidate for candidate in source_nodes if ipaddress.IPv6Address(candidate['public6'])==source_public])==1
+print(('first' if source_first else 'second')+' '+str(node['index'])+' '+str(source_public))
+PAIR_CONTROL_MASQUE_SIDES
+   )" || return 1
+   read -r pair_control_masque_source_side pair_control_masque_source_machine_index pair_control_masque_source_public6 <<< "$side_index"
+   [[ ( "$pair_control_masque_source_side" == first || "$pair_control_masque_source_side" == second ) &&
+      "$pair_control_masque_source_machine_index" =~ ^[1-9][0-9]*$ && -n "$pair_control_masque_source_public6" ]] || return 1
+   if [[ "$pair_control_masque_source_side" == first ]]; then
+      pair_control_masque_destination_side=second
+      pair_control_masque_source_router="$first_router"; pair_control_masque_destination_router="$second_router"
+   else
+      pair_control_masque_destination_side=first
+      pair_control_masque_source_router="$second_router"; pair_control_masque_destination_router="$first_router"
+   fi
+}
+
+# The listener address is on-link in every plain VDC.  Bind the selected
+# connector machine's exact namespace through its current provider owner so a
+# /128 route beats NDP for the synthetic shared public /64.  The namespace
+# inode is journaled and must keep matching the live provider handle.
+pair_control_masque_bind_source_machine()
+{
+   local workspace runtime subnet endpoints provider_pid source tag inode current
+   workspace="$pair_control_first_workspace"; runtime="$pair_control_first_runtime"; subnet="$pair_control_first_subnet"; endpoints="$pair_control_first_endpoints"
+   [[ "$pair_control_masque_source_side" == first ]] || { workspace="$pair_control_second_workspace"; runtime="$pair_control_second_runtime"; subnet="$pair_control_second_subnet"; endpoints="$pair_control_second_endpoints"; }
+   provider_pid="$(pair_control_parent_identity "$workspace" "$runtime" "$subnet" "$endpoints")" || return 1
+   source="/proc/$provider_pid/root/run/netns/pvd-m${pair_control_masque_source_machine_index}-${runtime}"
+   [[ -e "$source" && ! -L "$source" ]] || return 1
+   tag="$(pair_control_tag)" || return 1
+   pair_control_masque_source_namespace="pcm-${tag}"
+   if [[ -e "/run/netns/$pair_control_masque_source_namespace" ]]; then
+      [[ -f "$pair_control_dir/masque-source-machine-namespace" && ! -L "$pair_control_dir/masque-source-machine-namespace" ]] || return 1
+      inode="$(stat -Lc %i "$source")"; current="$(stat -Lc %i "/run/netns/$pair_control_masque_source_namespace")" || return 1
+      [[ "$inode" == "$current" && "$inode" == "$(<"$pair_control_dir/masque-source-machine-namespace")" ]] || return 1
+      return 0
+   fi
+   touch "/run/netns/$pair_control_masque_source_namespace" || return 1
+   mount --bind "$source" "/run/netns/$pair_control_masque_source_namespace" || return 1
+   inode="$(stat -Lc %i "$source")"; current="$(stat -Lc %i "/run/netns/$pair_control_masque_source_namespace")" || return 1
+   [[ "$inode" == "$current" ]] || return 1
+   if [[ -e "$pair_control_dir/masque-source-machine-namespace" ]]; then
+      [[ -f "$pair_control_dir/masque-source-machine-namespace" && ! -L "$pair_control_dir/masque-source-machine-namespace" &&
+         "$(<"$pair_control_dir/masque-source-machine-namespace")" == "$inode" ]] || return 1
+   else
+      pair_write "$pair_control_dir/masque-source-machine-namespace" "$inode" || return 1
+   fi
+}
+
+pair_control_load_masque_descriptor()
+{
+   local path="$pair_control_dir/masque-descriptor"
+   pair_control_masque_args=()
+   [[ -e "$path" || -L "$path" ]] || return 3
+   [[ -f "$path" && ! -L "$path" ]] || return 2
+   mapfile -t pair_control_masque_args < "$path" || return 2
+   [[ ${#pair_control_masque_args[@]} -eq 6 ]] || return 2
+   pair_control_parse_masque_args "${pair_control_masque_args[@]}" || return 2
+   pair_control_masque_side || return 2
 }
 
 pair_control_service_route_exact()
@@ -2553,10 +2767,246 @@ pair_control_service_route_journal_valid()
       "$(<"$pair_control_dir/$name")" == "$expected" ]]
 }
 
+# The connector machine owns both a synthetic public address and a private
+# address on bond0.  Pin the private source on the one admitted listener /128:
+# this makes the return packet select the already-routed private carrier rather
+# than the colliding synthetic public /64.
+pair_control_masque_machine_route_expected()
+{
+   [[ "$#" -eq 4 ]] || return 2
+   printf '%s via %s dev %s src %s\n' "$1" "$2" "$3" "$4"
+}
+
+pair_control_masque_machine_route_exact()
+{
+   [[ "$#" -eq 5 ]] || return 2
+   local namespace="$1" prefix="$2" gateway="$3" device="$4" source="$5" rows
+   rows="$(ip -n "$namespace" -j -6 route show exact "$prefix")" || return 2
+   python3 - "$prefix" "$gateway" "$device" "$source" "$rows" <<'PAIR_CONTROL_MASQUE_MACHINE_ROUTE_EXACT'
+import ipaddress,json,sys
+prefix,gateway,device,source,encoded=sys.argv[1:]
+try:
+    rows=json.loads(encoded)
+    if not isinstance(rows,list): raise ValueError('route list')
+    # An empty exact-prefix query is the normal pre-install state.  Preserve
+    # status 1 for it so the owner can durably write its intent and add the
+    # one authorized route; malformed or competing route state stays distinct.
+    if not rows: raise SystemExit(1)
+    if len(rows)!=1: raise ValueError('route count')
+    route=rows[0]
+    destination=route.get('dst')
+    if destination is None: raise ValueError('missing destination')
+    if '/' not in destination: destination += '/128'
+    if ipaddress.IPv6Network(destination,strict=True)!=ipaddress.IPv6Network(prefix,strict=True): raise ValueError('destination')
+    if route.get('gateway')!=gateway or route.get('dev')!=device: raise ValueError('next hop')
+    if route.get('prefsrc',route.get('src'))!=source: raise ValueError('source')
+except (KeyError,ValueError):
+    raise SystemExit(2)
+PAIR_CONTROL_MASQUE_MACHINE_ROUTE_EXACT
+}
+
+pair_control_masque_machine_route_journal_valid()
+{
+   local name="$1" prefix="$2" gateway="$3" device="$4" source="$5" expected
+   expected="$(pair_control_masque_machine_route_expected "$prefix" "$gateway" "$device" "$source")" || return 1
+   [[ -f "$pair_control_dir/$name-intent" && ! -L "$pair_control_dir/$name-intent" &&
+      -f "$pair_control_dir/$name" && ! -L "$pair_control_dir/$name" &&
+      "$(<"$pair_control_dir/$name-intent")" == "$expected" &&
+      "$(<"$pair_control_dir/$name")" == "$expected" ]]
+}
+
+pair_control_install_masque_machine_route()
+{
+   local namespace="$1" name="$2" prefix="$3" gateway="$4" device="$5" source="$6" expected state owned=0
+   expected="$(pair_control_masque_machine_route_expected "$prefix" "$gateway" "$device" "$source")" || return 1
+   if [[ -e "$pair_control_dir/$name-intent" || -L "$pair_control_dir/$name-intent" ]]; then
+      [[ -f "$pair_control_dir/$name-intent" && ! -L "$pair_control_dir/$name-intent" && "$(<"$pair_control_dir/$name-intent")" == "$expected" ]] || return 1
+      owned=1
+   elif [[ -e "$pair_control_dir/$name" || -L "$pair_control_dir/$name" ]]; then
+      return 1
+   fi
+   if pair_control_masque_machine_route_exact "$namespace" "$prefix" "$gateway" "$device" "$source"; then
+      [[ "$owned" == 1 ]] || return 1
+   else
+      state=$?
+      [[ "$state" == 1 ]] || return 1
+      [[ "$owned" == 1 ]] || pair_write "$pair_control_dir/$name-intent" "$expected" || return 1
+      ip -n "$namespace" -6 route add "$prefix" via "$gateway" dev "$device" src "$source" || return 1
+      pair_control_masque_machine_route_exact "$namespace" "$prefix" "$gateway" "$device" "$source" || return 1
+   fi
+   pair_write "$pair_control_dir/$name" "$expected"
+}
+
+pair_control_remove_masque_machine_route()
+{
+   local namespace="$1" name="$2" prefix="$3" gateway="$4" device="$5" source="$6" expected state
+   [[ -e "$pair_control_dir/$name-intent" || -L "$pair_control_dir/$name-intent" ||
+      -e "$pair_control_dir/$name" || -L "$pair_control_dir/$name" ]] || return 0
+   expected="$(pair_control_masque_machine_route_expected "$prefix" "$gateway" "$device" "$source")" || return 1
+   [[ -f "$pair_control_dir/$name-intent" && ! -L "$pair_control_dir/$name-intent" && "$(<"$pair_control_dir/$name-intent")" == "$expected" ]] || return 1
+   if [[ -e "$pair_control_dir/$name" || -L "$pair_control_dir/$name" ]]; then
+      [[ -f "$pair_control_dir/$name" && ! -L "$pair_control_dir/$name" && "$(<"$pair_control_dir/$name")" == "$expected" ]] || return 1
+   fi
+   if pair_control_masque_machine_route_exact "$namespace" "$prefix" "$gateway" "$device" "$source"; then
+      ip -n "$namespace" -6 route del "$prefix" via "$gateway" dev "$device" src "$source" || return 1
+   else
+      state=$?
+      [[ "$state" == 1 ]] || return 1
+   fi
+}
+
+# Only parent-local delivery routes can be shared between pair operations.
+# The parent runtime and namespace inode, rather than pc-first/pc-second (which
+# are operation-local aliases), identify their existing VDC lifecycle owner.
+pair_control_parent_local_service_route_name()
+{
+   [[ "$1" =~ ^service-(source|destination)-local-route(-opposite|-flow-([2-9]|[1-5][0-9]|6[0-3]))?$ ]]
+}
+
+pair_control_parent_local_service_route()
+{
+   local action="$1" namespace="$2" name="$3" prefix="$4" gateway="$5" device="$6" side workspace runtime route_lock_fd status
+   pair_control_parent_local_service_route_name "$name" || return 1
+   case "$namespace" in
+      pc-first) side=first; workspace="$pair_control_first_workspace"; runtime="$pair_control_first_runtime" ;;
+      pc-second) side=second; workspace="$pair_control_second_workspace"; runtime="$pair_control_second_runtime" ;;
+      *) return 1 ;;
+   esac
+   # Fault admission already retains both workspace locks across its query.
+   # Read-only validation must not try to acquire those same locks again.
+   if [[ "$action" == validate ]]; then
+      pair_control_parent_local_service_route_locked "$@"
+      return
+   fi
+   pair_lock_workspace "$workspace" route_lock_fd || return 1
+   if pair_control_parent_local_service_route_locked "$action" "$namespace" "$name" "$prefix" "$gateway" "$device"; then
+      status=0
+   else status=$?; fi
+   pair_unlock_workspace "$route_lock_fd" || return 1
+   return "$status"
+}
+
+pair_control_parent_local_service_route_locked()
+{
+   local action="$1" namespace="$2" name="$3" prefix="$4" gateway="$5" device="$6"
+   local inode expected identity digest operation directory reference entry owner entries other=0 state legacy=0
+   # side, workspace and runtime are selected by the locked caller. This also
+   # rejects a live replacement provider before reading or changing its routes.
+   pair_control_current_parent_bound "$side" || return 1
+   inode="$(<"$pair_control_dir/$side-namespace")"
+   [[ "$inode" =~ ^[1-9][0-9]*$ && "$runtime" =~ ^[1-9][0-9]*$ && "$device" == vdcbr0 ]] || return 1
+   expected="$(pair_control_service_route_expected "$prefix" "$gateway" "$device")" || return 1
+   identity="$runtime $inode $expected"
+   digest="$(printf '%s\n' "$identity" | sha256sum | awk '{print $1}')" || return 1
+   operation="$(pair_control_digest)" || return 1
+   [[ "$digest" =~ ^[0-9a-f]{64}$ && "$operation" =~ ^[0-9a-f]{64}$ ]] || return 1
+   directory="$workspace/virtual-datacenter.service-routes"
+   [[ ! -L "$directory" && ( ! -e "$directory" || -d "$directory" ) ]] || return 1
+   if [[ -e "$pair_control_dir/$name-intent" || -L "$pair_control_dir/$name-intent" ]]; then
+      pair_regular_root_receipt "$pair_control_dir/$name-intent" &&
+         [[ "$(<"$pair_control_dir/$name-intent")" == "$expected" ]] || return 1
+      legacy=1
+   fi
+   if [[ -e "$pair_control_dir/$name" || -L "$pair_control_dir/$name" ]]; then
+      [[ "$legacy" == 1 ]] && pair_regular_root_receipt "$pair_control_dir/$name" &&
+         [[ "$(<"$pair_control_dir/$name")" == "$expected" ]] || return 1
+   fi
+   directory="$directory/$digest"
+   [[ ! -L "$directory" && ( ! -e "$directory" || -d "$directory" ) ]] || return 1
+   reference="$directory/ref-$operation-$name"
+   if [[ -e "$directory/owner" || -L "$directory/owner" ]]; then
+      pair_regular_root_receipt "$directory/owner" && [[ "$(<"$directory/owner")" == "$identity" ]] || return 1
+   else
+      # A legacy operation can migrate its exact intent on replay or clean it
+      # up directly. Never adopt an unjournaled, already-present kernel route.
+      if [[ -d "$directory" ]]; then
+         entries="$(ls -A -- "$directory")" || return 1
+         [[ -z "$entries" ]] || return 1
+      fi
+      if pair_control_service_route_exact "$namespace" "$prefix" "$gateway" "$device"; then
+         [[ "$legacy" == 1 ]] || return 1
+         state=0
+      else state=$?; [[ "$state" == 1 ]] || return 1; fi
+      if [[ "$action" == remove ]]; then
+         [[ "$legacy" == 1 ]] || return 0
+         [[ "$state" == 1 ]] || ip -n "$namespace" -6 route del "$prefix" via "$gateway" dev "$device" || return 1
+         return 0
+      fi
+      [[ "$action" != validate ]] || { [[ "$legacy" == 1 && "$state" == 0 ]]; return; }
+      [[ "$action" == install ]] || return 1
+      mkdir -p -m 0700 "$directory" || return 1
+      pair_write "$directory/owner" "$identity" || return 1
+   fi
+   # References survive process loss until their exact operation is recovered.
+   # A corrupt/symlinked reference must never turn another owner into absence.
+   for entry in "$directory"/ref-*; do
+      [[ -e "$entry" || -L "$entry" ]] || continue
+      owner="${entry##*/ref-}"; owner="${owner:0:64}"
+      [[ "$owner" =~ ^[0-9a-f]{64}$ ]] &&
+         pair_control_parent_local_service_route_name "${entry##*/ref-$owner-}" &&
+         pair_regular_root_receipt "$entry" && [[ "$(<"$entry")" == "$owner $identity" ]] || return 1
+      [[ "$entry" == "$reference" ]] || other=1
+   done
+   if [[ -e "$directory/removed" || -L "$directory/removed" ]]; then
+      pair_regular_root_receipt "$directory/removed" && [[ "$(<"$directory/removed")" == "$identity" ]] || return 1
+   fi
+   case "$action" in
+      install)
+         # A released owner is a retry witness, not permission to adopt an
+         # identical route subsequently installed by somebody else.
+         if [[ -e "$directory/removed" ]]; then
+            if pair_control_service_route_exact "$namespace" "$prefix" "$gateway" "$device"; then return 1; else
+               state=$?; [[ "$state" == 1 ]] || return 1
+            fi
+         fi
+         pair_write "$pair_control_dir/$name-intent" "$expected" || return 1
+         pair_write "$reference" "$operation $identity" || return 1
+         if [[ -e "$directory/removed" ]]; then rm -- "$directory/removed" && sync -f "$directory" || return 1; fi
+         if pair_control_service_route_exact "$namespace" "$prefix" "$gateway" "$device"; then :; else
+            state=$?; [[ "$state" == 1 ]] || return 1
+            ip -n "$namespace" -6 route add "$prefix" via "$gateway" dev "$device" || return 1
+            pair_control_service_route_exact "$namespace" "$prefix" "$gateway" "$device" || return 1
+         fi
+         pair_write "$pair_control_dir/$name" "$expected"
+         ;;
+      validate)
+         [[ -f "$reference" && ! -L "$reference" && ! -e "$directory/removed" ]]
+         ;;
+      remove)
+         # Absence means a crash before reference publication, or a completed
+         # previous release. In either case another operation still owns its
+         # own refs; a retry must not fall back to legacy route deletion.
+         [[ -e "$reference" ]] || return 0
+         if pair_control_service_route_exact "$namespace" "$prefix" "$gateway" "$device"; then
+            if [[ "$other" == 0 ]]; then
+               ip -n "$namespace" -6 route del "$prefix" via "$gateway" dev "$device" || return 1
+               if pair_control_service_route_exact "$namespace" "$prefix" "$gateway" "$device"; then return 1; else
+                  state=$?; [[ "$state" == 1 ]] || return 1
+               fi
+            fi
+         else state=$?; [[ "$state" == 1 ]] || return 1; fi
+         [[ "$other" == 1 ]] || pair_write "$directory/removed" "$identity" || return 1
+         rm -- "$reference" && sync -f "$directory"
+         ;;
+      *) return 1 ;;
+   esac
+}
+
 pair_control_install_service_route()
 {
-   local namespace="$1" name="$2" prefix="$3" gateway="$4" device="$5" expected state owned=0
+   if pair_control_parent_local_service_route_name "$2"; then
+      pair_control_parent_local_service_route install "$@"
+      return
+   fi
+   local namespace="$1" name="$2" prefix="$3" gateway="$4" device="$5" expected state owned=0 shared digest
    expected="$(pair_control_service_route_expected "$prefix" "$gateway" "$device")" || return 1
+   digest="$(printf '%s\n%s\n' "$namespace" "$expected" | sha256sum | awk '{print $1}')" || return 1
+   [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+   shared="$pair_control_dir/service-route-owner-$digest"
+   if [[ -e "$shared" || -L "$shared" ]]; then
+      [[ -f "$shared" && ! -L "$shared" && "$(<"$shared")" == "$namespace $expected" ]] || return 1
+      owned=1
+   fi
    if [[ -e "$pair_control_dir/$name-intent" || -L "$pair_control_dir/$name-intent" ]]; then
       [[ -f "$pair_control_dir/$name-intent" && ! -L "$pair_control_dir/$name-intent" && "$(<"$pair_control_dir/$name-intent")" == "$expected" ]] || return 1
       owned=1
@@ -2564,15 +3014,17 @@ pair_control_install_service_route()
       return 1
    fi
    if pair_control_service_route_exact "$namespace" "$prefix" "$gateway" "$device"; then
-      # An identical pre-existing route is not ours unless intent preceded it.
       [[ "$owned" == 1 ]] || return 1
    else
       state=$?
       [[ "$state" == 1 ]] || return 1
-      [[ "$owned" == 1 ]] || pair_write "$pair_control_dir/$name-intent" "$expected" || return 1
+      pair_write "$shared" "$namespace $expected" || return 1
+      pair_write "$pair_control_dir/$name-intent" "$expected" || return 1
       ip -n "$namespace" -6 route add "$prefix" via "$gateway" dev "$device" || return 1
       pair_control_service_route_exact "$namespace" "$prefix" "$gateway" "$device" || return 1
    fi
+   pair_write "$shared" "$namespace $expected" || return 1
+   pair_write "$pair_control_dir/$name-intent" "$expected" || return 1
    pair_write "$pair_control_dir/$name" "$expected"
 }
 
@@ -2595,6 +3047,10 @@ pair_control_install_service_inside()
    # Rebuild the restrictive policy with every descriptor persisted before
    # either of this direction's external /128 routes becomes live.
    pair_control_firewall || return 1
+   pair_control_service_args=()
+   mapfile -t pair_control_service_args <<< "$requested"
+   pair_control_parse_service_args "${pair_control_service_args[@]}" || return 1
+   pair_control_service_side || return 1
    name="$(pair_control_service_name service-source-route "$pair_control_service_transit_slot")" || return 1
    pair_control_install_service_route "pc-$pair_control_service_source_side" "$name" \
       "${pair_control_service_destination_address}/128" "$pair_control_service_source_router" vdcbr0 || return 1
@@ -2640,6 +3096,11 @@ pair_control_validate_service_one_inside()
    pair_control_service_route_journal_valid "$name" "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" vdcbr0 || return 1
    name="$(pair_control_service_name service-destination-local-route "$slot")" || return 1
    pair_control_service_route_journal_valid "$name" "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" vdcbr0 || return 1
+   pair_control_parent_local_service_route validate "pc-$pair_control_service_destination_side" "$name" \
+      "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" vdcbr0 || return 1
+   name="$(pair_control_service_name service-source-local-route "$slot")" || return 1
+   pair_control_parent_local_service_route validate "pc-$pair_control_service_source_side" "$name" \
+      "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" vdcbr0 || return 1
    pair_control_service_route_exact "pc-$pair_control_service_source_side" "${pair_control_service_destination_address}/128" "$pair_control_service_source_router" vdcbr0 || return 1
    pair_control_service_route_exact "pc-$pair_control_service_destination_side" "${pair_control_service_source_address}/128" "$pair_control_service_destination_router" vdcbr0 || return 1
    pair_control_service_route_exact "$pair_control_router_ns" "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" "${pair_control_service_source_side}0" || return 1
@@ -2650,16 +3111,75 @@ pair_control_validate_service_one_inside()
 
 pair_control_validate_service_inside()
 {
-   local loaded opposite_descriptor
-   if pair_control_validate_service_one_inside base; then loaded=0; else loaded=$?; fi
-   if [[ "$loaded" == 3 ]]; then
-      opposite_descriptor="$(pair_control_service_path service-descriptor opposite)" || return 1
-      [[ ! -e "$opposite_descriptor" && ! -L "$opposite_descriptor" ]] || return 1
-      return 0
+   local loaded slot
+   for slot in $(pair_control_service_slots); do
+      if pair_control_validate_service_one_inside "$slot"; then loaded=0; else loaded=$?; fi
+      [[ "$loaded" == 0 || "$loaded" == 3 ]] || return 1
+   done
+}
+
+pair_control_install_masque_inside()
+{
+   [[ ${#pair_control_masque_args[@]} -eq 6 ]] || return 1
+   local requested=""
+   requested="$(pair_control_masque_descriptor)" || return 1
+   if [[ -e "$pair_control_dir/masque-descriptor" || -L "$pair_control_dir/masque-descriptor" ]]; then
+      [[ -f "$pair_control_dir/masque-descriptor" && ! -L "$pair_control_dir/masque-descriptor" &&
+         "$(<"$pair_control_dir/masque-descriptor")" == "$requested" ]] || return 1
+   else
+      pair_write "$pair_control_dir/masque-descriptor" "$requested" || return 1
    fi
-   [[ "$loaded" == 0 ]] || return 1
-   if pair_control_validate_service_one_inside opposite; then loaded=0; else loaded=$?; fi
-   [[ "$loaded" == 0 || "$loaded" == 3 ]] || return 1
+   pair_control_masque_side || return 1
+   # Persist the tuple before the restrictive firewall and each exact /128
+   # route.  A partial crash therefore fails closed on recovery.
+   pair_control_firewall || return 1
+   pair_control_masque_bind_source_machine || return 1
+   pair_control_install_service_route "pc-$pair_control_masque_source_side" masque-source-route \
+      "${pair_control_masque_destination_public6}/128" "$pair_control_masque_source_router" vdcbr0 || return 1
+   pair_control_install_service_route "$pair_control_router_ns" masque-router-destination-route \
+      "${pair_control_masque_destination_public6}/128" "$pair_control_masque_destination_private6" "${pair_control_masque_destination_side}0" || return 1
+   # The listener reply is reverse-SNATed to the connector's public identity.
+   # Its site can share the listener's synthetic /64, so a journaled /128 via
+   # the verified connector private endpoint must beat that connected route.
+   pair_control_install_service_route "$pair_control_router_ns" masque-router-source-public-route \
+      "${pair_control_masque_source_public6}/128" "$pair_control_masque_source_private6" "${pair_control_masque_source_side}0" || return 1
+   # This route is the decisive override for the connector: its ordinary
+   # public /64 connected route would otherwise issue NDP locally instead of
+   # entering the Mothership-owned pair carrier.
+   pair_control_install_masque_machine_route "$pair_control_masque_source_namespace" masque-source-machine-route \
+      "${pair_control_masque_destination_public6}/128" "$pair_control_masque_source_router" bond0 "$pair_control_masque_source_private6" || return 1
+   pair_write "$pair_control_dir/masque-phase" prepared
+}
+
+pair_control_validate_masque_inside()
+{
+   local loaded
+   if pair_control_load_masque_descriptor; then loaded=0; else loaded=$?; fi
+   [[ "$loaded" == 0 ]] || return "$loaded"
+   [[ -f "$pair_control_dir/masque-phase" && ! -L "$pair_control_dir/masque-phase" && "$(<"$pair_control_dir/masque-phase")" == prepared ]] || return 1
+   pair_control_masque_bind_source_machine || return 1
+   pair_control_service_route_journal_valid masque-source-route "${pair_control_masque_destination_public6}/128" "$pair_control_masque_source_router" vdcbr0 || return 1
+   pair_control_service_route_journal_valid masque-router-destination-route "${pair_control_masque_destination_public6}/128" "$pair_control_masque_destination_private6" "${pair_control_masque_destination_side}0" || return 1
+   pair_control_service_route_journal_valid masque-router-source-public-route "${pair_control_masque_source_public6}/128" "$pair_control_masque_source_private6" "${pair_control_masque_source_side}0" || return 1
+   pair_control_masque_machine_route_journal_valid masque-source-machine-route "${pair_control_masque_destination_public6}/128" "$pair_control_masque_source_router" bond0 "$pair_control_masque_source_private6" || return 1
+   pair_control_service_route_exact "pc-$pair_control_masque_source_side" "${pair_control_masque_destination_public6}/128" "$pair_control_masque_source_router" vdcbr0 || return 1
+   pair_control_service_route_exact "$pair_control_router_ns" "${pair_control_masque_destination_public6}/128" "$pair_control_masque_destination_private6" "${pair_control_masque_destination_side}0" || return 1
+   pair_control_service_route_exact "$pair_control_router_ns" "${pair_control_masque_source_public6}/128" "$pair_control_masque_source_private6" "${pair_control_masque_source_side}0" || return 1
+   pair_control_masque_snat_present || return 1
+   pair_control_masque_machine_route_exact "$pair_control_masque_source_namespace" "${pair_control_masque_destination_public6}/128" "$pair_control_masque_source_router" bond0 "$pair_control_masque_source_private6"
+}
+
+pair_control_router_namespace_missing_owned()
+{
+   local namespace="$1" recorded
+   [[ -n "${pair_control_router_ns:-}" && "$namespace" == "$pair_control_router_ns" &&
+      ! -e "/run/netns/$namespace" ]] || return 1
+   [[ -f "$pair_control_dir/router-namespace" && ! -L "$pair_control_dir/router-namespace" ]] || return 2
+   recorded="$(<"$pair_control_dir/router-namespace")"
+   [[ "$recorded" =~ ^[1-9][0-9]*$ ]] || return 2
+   # A live pair owner may still recreate its private router.  Only recovery of
+   # a dead owner can treat its recorded, now-unreachable mount as removed.
+   pair_control_owner_dead || return 2
 }
 
 pair_control_remove_service_route()
@@ -2671,6 +3191,21 @@ pair_control_remove_service_route()
    [[ -f "$pair_control_dir/$name-intent" && ! -L "$pair_control_dir/$name-intent" && "$(<"$pair_control_dir/$name-intent")" == "$expected" ]] || return 1
    if [[ -e "$pair_control_dir/$name" || -L "$pair_control_dir/$name" ]]; then
       [[ -f "$pair_control_dir/$name" && ! -L "$pair_control_dir/$name" && "$(<"$pair_control_dir/$name")" == "$expected" ]] || return 1
+   fi
+   if pair_control_parent_local_service_route_name "$name"; then
+      pair_control_parent_local_service_route remove "$@"
+      return
+   fi
+   # The router namespace is private to the pair supervisor.  A recovery mount
+   # can still clean both durable parent routes after that supervisor has died,
+   # but must not try `ip -n` against the absent private router.
+   if pair_control_router_namespace_missing_owned "$namespace"; then
+      return 0
+   else
+      state=$?
+      # A matching private router name that is absent is never an `ip -n`
+      # target unless the durable record proves its dead-owner completion.
+      [[ "$state" == 1 ]] || return 1
    fi
    if pair_control_service_route_exact "$namespace" "$prefix" "$gateway" "$device"; then
       ip -n "$namespace" -6 route del "$prefix" via "$gateway" dev "$device" || return 1
@@ -2704,7 +3239,7 @@ pair_control_firewall()
    ip netns exec "$pair_control_router_ns" ip6tables -A FORWARD -i first0 -o second0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
    ip netns exec "$pair_control_router_ns" ip6tables -A FORWARD -i second0 -o first0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
    local service_slot service_load
-   for service_slot in base opposite; do
+   for service_slot in $(pair_control_service_slots); do
       if pair_control_load_service_descriptor "$service_slot"; then
          pair_control_service_side || return 1
          ip netns exec "$pair_control_router_ns" ip6tables -A FORWARD \
@@ -2716,11 +3251,96 @@ pair_control_firewall()
          [[ "$service_load" == 3 ]] || return 1
       fi
    done
+   local masque_load
+   if pair_control_load_masque_descriptor; then
+      pair_control_masque_side || return 1
+      ip netns exec "$pair_control_router_ns" ip6tables -A FORWARD \
+         -i "${pair_control_masque_source_side}0" -o "${pair_control_masque_destination_side}0" \
+         -s "$pair_control_masque_source_public6" -d "$pair_control_masque_destination_public6" \
+         -p udp --dport "$pair_control_masque_udp_port" -j ACCEPT || return 1
+      # Include the complete installed NAT and filter state in the receipt.
+      pair_control_install_masque_snat || return 1
+   else
+      masque_load=$?
+      [[ "$masque_load" == 3 ]] || return 1
+   fi
    # NDP is link-local to each VDC bridge and router interface. It never
    # traverses this router's FORWARD hook, so there is no broad ICMPv6 rule.
    digest="$(pair_control_firewall_digest)" || return 1
    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
    pair_write "$pair_control_dir/firewall-digest" "$digest"
+}
+
+# The carrier preserves the listener's public destination but translates only
+# this authenticated connector tuple to the router address on the listener's
+# private link.  Conntrack reverses that translation; the separately journaled
+# source-public /128 route then delivers the reply back to the connector.
+pair_control_masque_snat_expected()
+{
+   [[ "$#" -eq 0 ]] || return 2
+   printf 'POSTROUTING -o %s -s %s -d %s -p udp --dport %s SNAT %s\n' \
+      "${pair_control_masque_destination_side}0" "$pair_control_masque_source_public6" \
+      "$pair_control_masque_destination_public6" "$pair_control_masque_udp_port" "$pair_control_masque_destination_router"
+}
+
+pair_control_masque_snat_present()
+{
+   ip netns exec "$pair_control_router_ns" ip6tables -t nat -C POSTROUTING \
+      -o "${pair_control_masque_destination_side}0" -s "$pair_control_masque_source_public6" \
+      -d "$pair_control_masque_destination_public6" -p udp --dport "$pair_control_masque_udp_port" \
+      -j SNAT --to-source "$pair_control_masque_destination_router"
+}
+
+pair_control_install_masque_snat()
+{
+   local expected present owned=0
+   expected="$(pair_control_masque_snat_expected)" || return 1
+   if [[ -e "$pair_control_dir/masque-router-snat-intent" || -L "$pair_control_dir/masque-router-snat-intent" ]]; then
+      [[ -f "$pair_control_dir/masque-router-snat-intent" && ! -L "$pair_control_dir/masque-router-snat-intent" &&
+         "$(<"$pair_control_dir/masque-router-snat-intent")" == "$expected" ]] || return 1
+      owned=1
+   elif [[ -e "$pair_control_dir/masque-router-snat" || -L "$pair_control_dir/masque-router-snat" ]]; then
+      return 1
+   fi
+   if pair_control_masque_snat_present; then
+      [[ "$owned" == 1 ]] || return 1
+   else
+      present=$?
+      [[ "$present" == 1 ]] || return 1
+      [[ "$owned" == 1 ]] || pair_write "$pair_control_dir/masque-router-snat-intent" "$expected" || return 1
+      ip netns exec "$pair_control_router_ns" ip6tables -t nat -A POSTROUTING \
+         -o "${pair_control_masque_destination_side}0" -s "$pair_control_masque_source_public6" \
+         -d "$pair_control_masque_destination_public6" -p udp --dport "$pair_control_masque_udp_port" \
+         -j SNAT --to-source "$pair_control_masque_destination_router" || return 1
+      pair_control_masque_snat_present || return 1
+   fi
+   pair_write "$pair_control_dir/masque-router-snat" "$expected"
+}
+
+pair_control_remove_masque_snat()
+{
+   local expected present
+   [[ -e "$pair_control_dir/masque-router-snat-intent" || -L "$pair_control_dir/masque-router-snat-intent" ||
+      -e "$pair_control_dir/masque-router-snat" || -L "$pair_control_dir/masque-router-snat" ]] || return 0
+   expected="$(pair_control_masque_snat_expected)" || return 1
+   [[ -f "$pair_control_dir/masque-router-snat-intent" && ! -L "$pair_control_dir/masque-router-snat-intent" &&
+      "$(<"$pair_control_dir/masque-router-snat-intent")" == "$expected" ]] || return 1
+   if [[ -e "$pair_control_dir/masque-router-snat" || -L "$pair_control_dir/masque-router-snat" ]]; then
+      [[ -f "$pair_control_dir/masque-router-snat" && ! -L "$pair_control_dir/masque-router-snat" &&
+         "$(<"$pair_control_dir/masque-router-snat")" == "$expected" ]] || return 1
+   fi
+   if pair_control_masque_snat_present; then
+      ip netns exec "$pair_control_router_ns" ip6tables -t nat -D POSTROUTING \
+         -o "${pair_control_masque_destination_side}0" -s "$pair_control_masque_source_public6" \
+         -d "$pair_control_masque_destination_public6" -p udp --dport "$pair_control_masque_udp_port" \
+         -j SNAT --to-source "$pair_control_masque_destination_router" || return 1
+      if pair_control_masque_snat_present; then return 1; else present=$?; [[ "$present" == 1 ]] || return 1; fi
+   else
+      present=$?
+      # An owner may have persisted intent and then died before adding the
+      # rule.  Its absence is the completed no-op, as for owned route cleanup.
+      [[ "$present" == 1 ]] || return 1
+   fi
 }
 
 pair_control_serve()
@@ -2864,6 +3484,9 @@ pair_control_query_inside()
    [[ "$(ip -n pc-first -o -6 route show exact "$pair_control_second_subnet")" == "$(<"$pair_control_dir/first-route-intent")"* ]] || { echo "pair-control query rejected: first-route" >&2; return 1; }
    [[ "$(ip -n pc-second -o -6 route show exact "$pair_control_first_subnet")" == "$(<"$pair_control_dir/second-route-intent")"* ]] || { echo "pair-control query rejected: second-route" >&2; return 1; }
    pair_control_validate_service_inside || { echo "pair-control query rejected: service" >&2; return 1; }
+   local masque_valid
+   if pair_control_validate_masque_inside; then masque_valid=0; else masque_valid=$?; fi
+   [[ "$masque_valid" == 0 || "$masque_valid" == 3 ]] || { echo "pair-control query rejected: masque" >&2; return 1; }
    [[ -f "$pair_control_dir/firewall-digest" && ! -L "$pair_control_dir/firewall-digest" &&
       "$(<"$pair_control_dir/firewall-digest")" =~ ^[0-9a-f]{64}$ &&
       "$(pair_control_firewall_digest)" == "$(<"$pair_control_dir/firewall-digest")" ]] || { echo "pair-control query rejected: firewall" >&2; return 1; }
@@ -2874,30 +3497,17 @@ pair_control_query_inside()
          "$pair_control_service_source_address" "$pair_control_service_source_port" "$pair_control_service_destination_address" "$pair_control_service_destination_port" \
          "$pair_control_service_source_ingress_private6" "$pair_control_service_destination_ingress_private6"
    }
-   local load_status base_source opposite_source base_args=() opposite_args=()
-   if pair_control_load_service_descriptor base; then
-      base_args=("${pair_control_service_args[@]}"); base_source="$pair_control_service_source_uuid"
-      if pair_control_load_service_descriptor opposite; then
-         opposite_args=("${pair_control_service_args[@]}"); opposite_source="$pair_control_service_source_uuid"
-         [[ "$base_source" != "$opposite_source" ]] || return 1
-         # The receipt order is the boundary's first cluster then second
-         # cluster, independent of which direction was admitted first.
-         if [[ "$base_source" == "$pair_control_first_uuid" ]]; then
-            pair_control_service_args=("${base_args[@]}"); pair_control_parse_service_args "${pair_control_service_args[@]}" || return 1; pair_control_emit_service_receipt
-            pair_control_service_args=("${opposite_args[@]}"); pair_control_parse_service_args "${pair_control_service_args[@]}" || return 1; pair_control_emit_service_receipt
-         else
-            [[ "$opposite_source" == "$pair_control_first_uuid" ]] || return 1
-            pair_control_service_args=("${opposite_args[@]}"); pair_control_parse_service_args "${pair_control_service_args[@]}" || return 1; pair_control_emit_service_receipt
-            pair_control_service_args=("${base_args[@]}"); pair_control_parse_service_args "${pair_control_service_args[@]}" || return 1; pair_control_emit_service_receipt
-         fi
+   local load_status slot count=0
+   for slot in $(pair_control_service_slots); do
+      if pair_control_load_service_descriptor "$slot"; then
+         pair_control_emit_service_receipt
+         count=$((count+1))
       else
          load_status=$?
          [[ "$load_status" == 3 ]] || return 1
-         pair_control_service_args=("${base_args[@]}"); pair_control_parse_service_args "${pair_control_service_args[@]}" || return 1; pair_control_emit_service_receipt
       fi
-   else
-      load_status=$?
-      [[ "$load_status" == 3 && ! -e "$(pair_control_service_path service-descriptor opposite)" && ! -L "$(pair_control_service_path service-descriptor opposite)" ]] || return 1
+   done
+   if [[ "$count" == 0 ]]; then
       printf 'PAIR_CONTROL operationID=%s firstClusterUUID=%s secondClusterUUID=%s firstRuntimeIdentity=%s secondRuntimeIdentity=%s firstPrivate6Subnet=%s secondPrivate6Subnet=%s port=%s phase=prepared\n' \
          "$pair_control_id" "$pair_control_first_uuid" "$pair_control_second_uuid" "$pair_control_first_runtime" "$pair_control_second_runtime" "$pair_control_first_subnet" "$pair_control_second_subnet" "$pair_control_port"
    fi
@@ -3282,7 +3892,7 @@ pair_control_fault_inside()
 pair_control_action()
 {
    local action="$1"; shift
-   [[ "$action" == query || "$action" == remove || "$action" == service || "$action" == fault ]] || return 2
+   [[ "$action" == query || "$action" == remove || "$action" == service || "$action" == masque || "$action" == fault ]] || return 2
    pair_control_parse "$@" || return
    if [[ "$action" == remove && ! -e "$pair_control_dir" ]]; then return 0; fi
    [[ -r "$pair_control_dir/descriptor" && ! -L "$pair_control_dir/descriptor" && "$(pair_control_descriptor)" == "$(<"$pair_control_dir/descriptor")" &&
@@ -3307,13 +3917,16 @@ pair_control_action()
    if [[ "$action" == service ]]; then
       exec nsenter -t "$pair_control_pid" -m -- bash "$0" --pair-control-inside service "$@"
    fi
+   if [[ "$action" == masque ]]; then
+      exec nsenter -t "$pair_control_pid" -m -- bash "$0" --pair-control-inside masque "$@"
+   fi
    exec nsenter -t "$pair_control_pid" -m -- bash "$0" --pair-control-inside "$@"
 }
 
 pair_control_inside()
 {
    local action=query
-   if [[ "${1:-}" == service || "${1:-}" == fault ]]; then action="$1"; shift; fi
+   if [[ "${1:-}" == service || "${1:-}" == masque || "${1:-}" == fault ]]; then action="$1"; shift; fi
    pair_control_parse "$@" || return
    pair_control_owner_live || { echo "pair-control query rejected: live-owner" >&2; return 1; }
    [[ "$(stat -Lc %i /proc/self/ns/mnt)" == "$pair_control_mount" && "$(pair_control_descriptor)" == "$(<"$pair_control_dir/descriptor")" ]] || { echo "pair-control query rejected: owner-mount-or-descriptor" >&2; return 1; }
@@ -3325,6 +3938,9 @@ pair_control_inside()
    read -r _ pair_control_first_router _ pair_control_second_router <<< "$addresses" || return 1
    if [[ "$action" == service ]]; then
       pair_control_install_service_inside || return 1
+   fi
+   if [[ "$action" == masque ]]; then
+      pair_control_install_masque_inside || return 1
    fi
    if [[ "$action" == fault ]]; then
       pair_control_fault_inside
@@ -3501,7 +4117,10 @@ stop_datacenter()
 
 launch_datacenter()
 {
-   [[ ( "$#" -eq 12 || "$#" -eq 13 || "$#" -eq 15 ) && "${EUID}" -eq 0 ]] || return 2
+   # The BGP/MASQUE underlay selector is an optional second tail argument.
+   # The source-preserving public-ingress selector is a third tail argument.
+   # Keep the legacy twelve- and spare-machine thirteen-argument forms exact.
+   [[ ( "$#" -eq 12 || "$#" -eq 13 || "$#" -eq 14 || "$#" -eq 15 ) && "${EUID}" -eq 0 ]] || return 2
    local workspace="$1"
    local control_socket_path="${12}"
    valid_workspace "${workspace}" && valid_control_socket_path "${control_socket_path}" || return 2
@@ -3605,7 +4224,9 @@ case "${1:-}" in
       exit
       ;;
    --serve-adopt)
-      [[ "$#" -eq 15 ]] || { echo "serve-adopt requires runtime identity, operation directory, and original provider arguments" >&2; exit 2; }
+      # Keep adoption compatible with the 12/13 launch arguments, optional
+      # BGP-underlay tail (14), and source-preserving ingress tail (15).
+      [[ "$#" -eq 15 || "$#" -eq 16 || "$#" -eq 17 || "$#" -eq 18 ]] || { echo "serve-adopt requires runtime identity, operation directory, and original provider arguments" >&2; exit 2; }
       adopted_mode=1
       adopted_runtime_identity="$2"
       adopted_operation_dir="$3"
@@ -3626,7 +4247,7 @@ then
    exec unshare --mount --propagation private -- bash "$0" --serve "$@"
 fi
 
-if [[ ( "$#" -ne 12 && "$#" -ne 13 && "$#" -ne 15 ) || "${EUID}" -ne 0 ]]
+if [[ ( "$#" -ne 12 && "$#" -ne 13 && "$#" -ne 14 && "$#" -ne 15 ) || "${EUID}" -ne 0 ]]
 then
    echo "virtual datacenter provider requires workspace, machine count, brain count, MTU, fake-boundary flag, host netns inode, machine resources, storage devices, and control socket as root" >&2
    exit 2
@@ -3645,6 +4266,7 @@ storage_device_count="${10}"
 storage_device_mb="${11}"
 control_socket_path="${12}"
 spare_machine_count="${13:-0}"
+bgp_underlay="${14:-0}"
 public_ingress_source="${15:-}"
 [[ "$spare_machine_count" == 0 || "$spare_machine_count" == 1 ]]
 datacenter_fragment="$(network_fragment_from_control_socket_path "${control_socket_path}")"
@@ -3669,6 +4291,7 @@ if ! valid_workspace "${workspace}" ||
    ! [[ "${machine_storage_mb}" =~ ^[0-9]+$ ]] || [[ "${machine_storage_mb}" -lt 1 || "${machine_storage_mb}" -gt 1048576 ]] ||
    ! [[ "${storage_device_count}" =~ ^[0-9]+$ ]] || [[ "${storage_device_count}" -gt 16 ]] ||
    ! [[ "${storage_device_mb}" =~ ^[0-9]+$ ]] || [[ "${storage_device_mb}" -lt 1 || "${storage_device_mb}" -gt 1048576 ]] ||
+   [[ "${bgp_underlay}" != "0" && "${bgp_underlay}" != "1" ]] ||
    ! [[ -z "${public_ingress_source}" || "${public_ingress_source}" =~ ^198\.18\.([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.([1-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-4])$ ]] ||
    ! valid_control_socket_path "${control_socket_path}"
 then
@@ -3708,10 +4331,21 @@ fi
 # This is deliberately after the initial mount-namespace reexec.  It closes the
 # launch/arm race until the provider has published its durable identity/runtime.
 workspace_startup_lock_fd=""
-pair_lock_workspace "${workspace}" workspace_startup_lock_fd || exit 1
+adopter_pre_ready_failure()
+{
+   local stage="$1" status="$2" temporary=""
+   if [[ "${adopted_mode}" -eq 1 && -d "${adopted_operation_dir}" && ! -L "${adopted_operation_dir}" ]]
+   then
+      temporary="${adopted_operation_dir}/adopter-pre-ready-failure.$$.tmp"
+      printf 'stage=%s status=%s\n' "${stage}" "${status}" > "${temporary}" 2>/dev/null &&
+         mv -f "${temporary}" "${adopted_operation_dir}/adopter-pre-ready-failure" 2>/dev/null || true
+   fi
+}
+pair_lock_workspace "${workspace}" workspace_startup_lock_fd || { status="$?"; adopter_pre_ready_failure "workspace-lock" "${status}"; exit "${status}"; }
 if pair_workspace_reset_flagged "${workspace}"
 then
    pair_unlock_workspace "${workspace_startup_lock_fd}"
+   adopter_pre_ready_failure "workspace-reset" 1
    exit 1
 fi
 
@@ -3720,16 +4354,17 @@ runtime_identity="${pid}"
 if [[ "${adopted_mode}" -eq 1 ]]
 then
    [[ "${adopted_runtime_identity}" =~ ^[0-9]+$ && "${adopted_runtime_identity}" -gt 1 && -d "${adopted_operation_dir}" ]] || {
-      echo "invalid adopted provider identity" >&2; exit 2;
+      adopter_pre_ready_failure "adopted-identity" 2; echo "invalid adopted provider identity" >&2; exit 2;
    }
    runtime_identity="${adopted_runtime_identity}"
 fi
 underlay_mtu=$((inter_container_mtu + 40))
 public_ingress_mtu=1500
-# Public wormholes require a standard 1500-byte underlay even when their
-# containers use the 1448-byte inner budget. Private-only fixtures retain the
-# selected inner MTU plus IPv6 encapsulation overhead.
-if [[ "${fake_boundary}" == "1" && "${underlay_mtu}" -lt "${public_ingress_mtu}" ]]
+# Public wormholes and Mothership-authorized private BGP/MASQUE carriers require
+# a standard 1500-byte underlay even when their containers use the 1448-byte
+# inner budget. Other private-only fixtures retain the selected inner MTU plus
+# IPv6 encapsulation overhead.
+if [[ ( "${fake_boundary}" == "1" || "${bgp_underlay}" == "1" ) && "${underlay_mtu}" -lt "${public_ingress_mtu}" ]]
 then
    underlay_mtu="${public_ingress_mtu}"
 fi
@@ -3946,6 +4581,7 @@ failed()
    local status="$1"
    local line="$2"
    atomic_write "${failure_path}" "provider failed status=${status} line=${line}\n"
+   adopter_pre_ready_failure "provider-runtime-line-${line}" "${status}"
    exit "${status}"
 }
 
@@ -4358,7 +4994,12 @@ else
    cgroup_scope="${cgroup_root%/prodigy-vdc-${runtime_identity}}"
    cgroup_control="${cgroup_scope}/prodigy-vdc-control"
    cgroup_lock="/run/prodigy-vdc-cgroup-$(stat -Lc %i "${cgroup_scope}").lock"
-   [[ -d "${filesystem_root}" && -r "${runtime_path}" && -d "${cgroup_root}" && -d "${cgroup_scope}" && -d "${cgroup_control}" && -w "${cgroup_root}/provider/cgroup.procs" ]] || failed 1 "$LINENO"
+   [[ -d "${filesystem_root}" && -r "${runtime_path}" && -d "${cgroup_root}" && -d "${cgroup_scope}" && -w "${cgroup_root}/provider/cgroup.procs" ]] || failed 1 "$LINENO"
+   if [[ ! -d "${cgroup_control}" ]]
+   then
+      restore_retained_cgroup_control_if_absent "${cgroup_scope}" "${cgroup_root}" "${runtime_identity}" || failed 1 "$LINENO"
+   fi
+   [[ -d "${cgroup_control}" && ! -L "${cgroup_control}" ]] || failed 1 "$LINENO"
    mapfile -t machine_pids < "${runtime_path}"
    [[ "${#machine_pids[@]}" -eq "${machine_count}" ]] || failed 1 "$LINENO"
    if [[ -r "${workspace}/virtual-datacenter.forwarding" ]]

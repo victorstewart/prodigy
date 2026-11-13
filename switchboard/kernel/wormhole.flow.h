@@ -323,7 +323,12 @@ __attribute__((__always_inline__)) static inline bool switchboardClaimWormholeFl
   bpf_memcpy(&desired->binding, binding, sizeof(desired->binding));
   bpf_memcpy(desired->container, container, sizeof(desired->container));
   desired->disposition = disposition;
-  desired->admission_profile = binding->admission_profile;
+  // Pair admission authorizes public portal traversal.  A private mesh flow
+  // reaches this common state machine without a route identity, so retaining
+  // a portal's PAIR_GRANT profile would make its SYN-ACK immediately stale.
+  desired->admission_profile = disposition == SWITCHBOARD_WORMHOLE_FLOW_PRIVATE
+                                   ? SWITCHBOARD_WORMHOLE_ADMISSION_NONE
+                                   : binding->admission_profile;
   if (admission != NULL) desired->admission = *admission;
   desired->phase = SWITCHBOARD_WORMHOLE_FLOW_PENDING;
   desired->expiresAtNs = now + switchboardWormholeInitialFlowLifetimeNs(proto);

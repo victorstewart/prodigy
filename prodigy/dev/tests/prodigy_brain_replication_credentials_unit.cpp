@@ -1472,7 +1472,6 @@ public:
   ContainerPlan lastLaunchedContainerPlanForTest = {};
   NeuronContainerMetricPolicy lastLaunchedContainerMetricPolicyForTest = {};
   uint128_t lastLaunchedContainerReplaceUUIDForTest = 0;
-  ProdigyStatefulStoreGenerationSelection lastLaunchedGenerationSelectionForTest = {.protocolVersion = 0};
   bool interceptContainerLaunchForTest = false;
 
   TestNeuron()
@@ -1693,22 +1692,20 @@ public:
   void launchContainerFromBrain(ContainerPlan plan,
                                 uint128_t replaceContainerUUID,
                                 NeuronContainerMetricPolicy metricPolicy,
-                                RetainedContainerStorageSource retainedSource = {},
-                                ProdigyStatefulStoreGenerationSelection selection = {.protocolVersion = 0}) override
+                                RetainedContainerStorageSource retainedSource = {}) override
   {
     if (interceptContainerLaunchForTest == false)
     {
       Neuron::launchContainerFromBrain(
-          std::move(plan), replaceContainerUUID, metricPolicy, retainedSource, std::move(selection));
+          std::move(plan), replaceContainerUUID, metricPolicy, retainedSource);
       return;
     }
     ++launchedContainerPlansForTest;
     lastLaunchedContainerPlanForTest = std::move(plan);
     lastLaunchedContainerMetricPolicyForTest = metricPolicy;
     lastLaunchedContainerReplaceUUIDForTest = replaceContainerUUID;
-    lastLaunchedGenerationSelectionForTest = std::move(selection);
     lastLaunchedContainerAdmissionGenerationForTest =
-        beginPendingContainerLaunch(lastLaunchedContainerPlanForTest, lastLaunchedGenerationSelectionForTest);
+        beginPendingContainerLaunch(lastLaunchedContainerPlanForTest);
   }
 
   void downloadContainer(CoroutineStack *coro, uint64_t deploymentID) override
@@ -3825,7 +3822,7 @@ static void seedStatefulDeployRequestPlan(DeploymentPlan& plan, uint16_t applica
   plan.stateful.allowUpdateInPlace = true;
   plan.stateful.seedingAlways = false;
   plan.stateful.neverShard = false;
-  plan.stateful.allMasters = false;
+  plan.stateful.writerMode = StatefulWriterMode::localSingleWriter;
 }
 
 static void configureStatefulTopologySourceContainer(ContainerView& container,
@@ -3935,6 +3932,238 @@ static void testSpinApplicationInvalidPlanUsesSingleTopicFrame(TestSuite& suite)
   suite.expect(frameCount == 1, "spin_application_invalid_plan_uses_single_frame");
   suite.expect(sawInvalidPlan, "spin_application_invalid_plan_sets_invalid_code");
   suite.expect(invalidPlanReason == "invalid plan: applicationID not reserved"_ctv, "spin_application_invalid_plan_includes_reason");
+}
+
+static void testGlobalSingleWriterEndpointReservations(TestSuite& suite)
+{
+  ScopedRing ring;
+  TestBrain brain;
+  BrainBase* previousBrain = thisBrain; thisBrain = &brain;
+  brain.weAreMaster = brain.ignited = brain.masterAuthorityRuntimeStateDurable = true;
+  brain.masterAuthorityRuntimeState.generation = brain.durableMasterAuthorityRuntimeStateGeneration = 1;
+  brain.brainConfig.clusterUUID = 17; brain.brainConfig.datacenterFragment = 7;
+  Machine machine;
+  machine.uuid = 99; machine.fragment = 0x12345; machine.state = MachineState::healthy; machine.runtimeReady = true;
+  machine.neuron.machine = &machine; machine.neuron.connected = true;
+  machine.neuron.isFixedFile = true; machine.neuron.fslot = 9;
+  brain.machines.insert(&machine);
+  Mothership stream;
+  auto commit = [&](const GlobalSingleWriterMembershipProjection& group) {
+    String bytes, request; auto copy=group;
+    BitseryEngine::serialize(bytes,copy);
+    const auto before=brain.masterAuthorityRuntimeState.generation;
+    brain.mothershipHandler(&stream,buildMothershipMessage(request,MothershipTopic::commitGlobalSingleWriterMembership,bytes));
+    return brain.masterAuthorityRuntimeState.generation == before+1 && brain.masterAuthorityRuntimeStateDurable;
+  };
+  auto configure = [&](uint16_t applicationID,uint128_t groupUUID) {
+    GlobalSingleWriterMembershipProjection group;
+    group.membershipUUID=groupUUID; group.operationUUID=groupUUID+1; group.localClusterUUID=brain.brainConfig.clusterUUID;
+    group.deploymentID=(uint64_t(applicationID)<<48)|1; group.generation=group.expectedCommittedConfigIndex=1;
+    group.genesisMemberIDs={1,2,3}; group.highestAllocatedMemberID=3;
+    for (int32_t id=1;id<=3;++id) {
+      ProdigyGlobalSingleWriterPlacementExchange offer = {};
+      offer.membershipUUID=group.membershipUUID; offer.deploymentID=group.deploymentID;
+      offer.localClusterUUID=group.localClusterUUID; offer.reserved=group.members;
+      offer.member.memberID=id; offer.member.clusterUUID=group.localClusterUUID; offer.member.containerUUID=groupUUID+id+10;
+      suite.expect(brain.applyGlobalSingleWriterPlacement(offer),"global_reservations_offer_exact_prelaunch_endpoint");
+      group.members.push_back(offer.member);
+    }
+    suite.expect(prodigyGlobalSingleWriterCommittedConfigDigest(group.membershipUUID,group.deploymentID,1,
+        group.members,group.expectedCommittedConfigSHA256) && commit(group),"global_reservations_commit_before_deployment");
+    return group;
+  };
+  const auto first=configure(42,1000), second=configure(43,2000);
+  suite.expect(brain.containers.empty() && machine.usedContainerFragments.empty() &&
+      brain.globalSingleWriterMemberships().size()==2 && prodigyGlobalSingleWriterMembershipsDisjoint(first,second),
+      "two_global_groups_configured_before_deployment_have_distinct_durable_endpoints");
+  const auto& member=first.members.front(); const uint8_t fragment=member.privateIPv6.v6[15];
+  suite.expect(!machine.containerFragmentAvailable(fragment,brain.globalSingleWriterMemberships(),17) &&
+      !machine.claimContainerFragment(fragment,brain.globalSingleWriterMemberships(),17,second.deploymentID,second.members.front().containerUUID) &&
+      machine.claimContainerFragment(fragment,brain.globalSingleWriterMemberships(),17,first.deploymentID,member.containerUUID),
+      "global_reserved_fragment_can_only_be_claimed_by_its_exact_deployment_and_container");
+  machine.relinquishContainerFragment(fragment);
+  suite.expect(!machine.containerFragmentAvailable(fragment,brain.globalSingleWriterMemberships(),17) &&
+      machine.claimContainerFragment(fragment,brain.globalSingleWriterMemberships(),17,first.deploymentID,member.containerUUID),
+      "physical_release_preserves_reservation_and_allows_exact_recovery");
+  machine.usedContainerFragments.clear();
+  for (uint16_t value=1;value<=255;++value)
+    if (value!=200 && machine.containerFragmentAvailable(uint8_t(value),brain.globalSingleWriterMemberships(),17))
+      machine.usedContainerFragments.insert(value);
+  suite.expect(machine.getContainerFragment(brain.globalSingleWriterMemberships(),17)==200,
+      "ordinary_allocator_skips_all_unlaunched_global_reservations");
+  machine.usedContainerFragments.clear();
+
+  auto conflict=second; conflict.membershipUUID=3000; conflict.operationUUID=3001; conflict.deploymentID=(uint64_t(44)<<48)|1;
+  for (auto& binding:conflict.members) binding.containerUUID+=1000;
+  suite.expect(prodigyGlobalSingleWriterCommittedConfigDigest(conflict.membershipUUID,conflict.deploymentID,1,
+      conflict.members,conflict.expectedCommittedConfigSHA256) && !commit(conflict),
+      "brain_projection_admission_rejects_cross_group_reserved_address_collision");
+  for (auto& binding:conflict.members)
+    binding.privateIPv6=IPAddress(MeshNode::addressForFragment(container_network_subnet6,7,machine.fragment,uint8_t(210+binding.memberID)));
+  ContainerView live;
+  live.uuid=9000; live.deploymentID=(uint64_t(45)<<48)|1; live.machine=&machine; live.fragment=conflict.members.front().privateIPv6.v6[15];
+  std::memcpy(&live.meshAddress,conflict.members.front().privateIPv6.v6,sizeof(live.meshAddress));
+  brain.containers[live.uuid]=&live; machine.usedContainerFragments.insert(live.fragment);
+  suite.expect(prodigyGlobalSingleWriterCommittedConfigDigest(conflict.membershipUUID,conflict.deploymentID,1,
+      conflict.members,conflict.expectedCommittedConfigSHA256) && !commit(conflict),
+      "brain_projection_admission_rejects_endpoint_owned_by_live_ordinary_container");
+  brain.containers.erase(live.uuid); machine.usedContainerFragments.clear();
+
+  BrainReplicatedContainerRuntimeState recovered;
+  recovered.plan.uuid=member.containerUUID; recovered.plan.config.applicationID=42; recovered.plan.config.versionID=1;
+  IPPrefix recoveredAddress; recoveredAddress.network=member.privateIPv6; recoveredAddress.cidr=128;
+  recovered.plan.addresses.push_back(recoveredAddress);
+  suite.expect(Brain::globalSingleWriterBindingsMatchRuntimePlan(first,recovered.plan),
+      "recovered_runtime_retains_its_exact_global_identity");
+  recovered.plan.uuid=9001;
+  suite.expect(!Brain::globalSingleWriterBindingsMatchRuntimePlan(first,recovered.plan) &&
+      brain.applyReplicatedContainerRuntimeStateNow(recovered)==Brain::ReplicatedContainerRuntimeStateApplyResult::rejected,
+      "runtime_replay_cannot_take_a_reserved_global_endpoint");
+
+  {
+    // Exact reconciliation plans both local views before scheduling either.
+    // The first durable spin captures one scheduled view and its still-planned
+    // sibling; only the launched identity belongs in runtime inventory.
+    ApplicationDeployment deployment;
+    seedStatefulDeployRequestPlan(deployment.plan,42); deployment.plan.config.versionID=1;
+    deployment.plan.stateful.writerMode=StatefulWriterMode::globalSingleWriter;
+    deployment.plan.stateful.neverShard=true; deployment.nShardGroups=1;
+    deployment.plan.stateful.clientPrefix=prodigyRuntimeStatefulServicePrefix(42,1);
+    deployment.plan.stateful.siblingPrefix=prodigyRuntimeStatefulServicePrefix(42,2);
+    deployment.plan.stateful.cousinPrefix=prodigyRuntimeStatefulServicePrefix(42,3);
+    deployment.plan.stateful.seedingPrefix=prodigyRuntimeStatefulServicePrefix(42,4);
+    deployment.plan.stateful.shardingPrefix=prodigyRuntimeStatefulServicePrefix(42,5);
+    brain.deployments[first.deploymentID]=&deployment;
+    std::array<ContainerView,2> local{};
+    for (size_t index=0;index<local.size();++index) {
+      auto& view=local[index]; const auto& binding=first.members[index];
+      view.uuid=binding.containerUUID; view.deploymentID=first.deploymentID; view.applicationID=42;
+      view.machine=&machine; view.fragment=binding.privateIPv6.v6[15]; view.isStateful=true;
+      view.lifetime=ApplicationLifetime::base; view.state=index ? ContainerState::planned : ContainerState::scheduled;
+      view.globalSingleWriterMemberID=binding.memberID;
+      if (index) std::memcpy(&view.requiredGlobalSingleWriterMeshAddress,binding.privateIPv6.v6,sizeof(view.requiredGlobalSingleWriterMeshAddress));
+      else {
+        std::memcpy(&view.meshAddress,binding.privateIPv6.v6,sizeof(view.meshAddress));
+        IPPrefix address; address.network=binding.privateIPv6; address.cidr=128; view.addresses.push_back(address);
+      }
+      brain.containers[view.uuid]=&view; deployment.containers.insert(&view);
+    }
+    BrainReplicatedContainerRuntimeState planned;
+    suite.expect(brain.captureReplicatedContainerRuntimeState(&local[1],planned) && planned.plan.addresses.empty() &&
+        brain.isUnsentStatefulServingReservation(planned),
+        "planned_global_sibling_is_reconstructable_from_projection_before_first_spin_snapshot");
+    auto notUnsent=planned; notUnsent.plan.state=ContainerState::scheduled;
+    suite.expect(!brain.isUnsentStatefulServingReservation(notUnsent),
+        "scheduled_global_identity_is_not_discarded_by_unlaunched_capture_filter");
+    ProdigyPersistentMasterAuthorityPackage snapshot;
+    brain.capturePersistentMasterAuthorityPackage(snapshot);
+    suite.expect(snapshot.containerRuntimeStates.size()==1 && snapshot.containerRuntimeStates.front().plan.uuid==local[0].uuid &&
+        snapshot.runtimeState.globalSingleWriterMembershipProjections.front().members.size()==3,
+        "mixed_two_member_snapshot_retains_scheduled_identity_and_durable_unlaunched_membership");
+    TestBrain restored; restored.brainConfig.clusterUUID=17; restored.brainConfig.datacenterFragment=7;
+    thisBrain=&restored;
+    suite.expect(restored.applyPersistentMasterAuthorityPackage(snapshot),
+        "mixed_two_member_snapshot_restores_after_crash_during_first_durable_spin");
+    auto pending=restored.pendingReplicatedContainerRuntimeStates.find(first.deploymentID);
+    suite.expect(pending!=restored.pendingReplicatedContainerRuntimeStates.end() && pending->second.size()==1 &&
+        pending->second.front().plan.uuid==local[0].uuid,
+        "restore_keeps_only_launched_member_pending_for_runtime_replay");
+    Machine recoveredMachine; recoveredMachine.fragment=machine.fragment;
+    suite.expect(!recoveredMachine.containerFragmentAvailable(local[1].fragment,restored.globalSingleWriterMemberships(),17) &&
+        recoveredMachine.claimContainerFragment(local[1].fragment,restored.globalSingleWriterMemberships(),17,first.deploymentID,local[1].uuid),
+        "unlaunched_local_sibling_keeps_its_reservation_and_can_be_reconstructed_exactly");
+    auto malformed=snapshot; malformed.containerRuntimeStates.push_back(planned);
+    TestBrain rejected; rejected.brainConfig.clusterUUID=17; rejected.brainConfig.datacenterFragment=7;
+    suite.expect(!rejected.applyPersistentMasterAuthorityPackage(malformed),
+        "runtime_restore_still_rejects_addressless_member_misrepresented_as_inventory");
+    thisBrain=&brain;
+    for (auto& view:local) { brain.containers.erase(view.uuid); deployment.containers.erase(&view); }
+    brain.deployments.erase(first.deploymentID);
+  }
+
+  auto retired=first; auto replacement=retired.members.front();
+  replacement.memberID=4; replacement.containerUUID+=100;
+  replacement.privateIPv6=IPAddress(MeshNode::addressForFragment(container_network_subnet6,7,machine.fragment,201));
+  retired.members.erase(retired.members.begin()); retired.members.push_back(replacement);
+  retired.retiredMemberIDs={1}; retired.highestAllocatedMemberID=4; ++retired.generation; ++retired.expectedCommittedConfigIndex;
+  machine.usedContainerFragments.insert(fragment);
+  suite.expect(prodigyGlobalSingleWriterCommittedConfigDigest(retired.membershipUUID,retired.deploymentID,
+      retired.expectedCommittedConfigIndex,retired.members,retired.expectedCommittedConfigSHA256) && commit(retired) &&
+      !machine.containerFragmentAvailable(fragment,brain.globalSingleWriterMemberships(),17),
+      "committed_retirement_does_not_release_a_still_owned_physical_fragment");
+  machine.relinquishContainerFragment(fragment);
+  suite.expect(machine.containerFragmentAvailable(fragment,brain.globalSingleWriterMemberships(),17),
+      "retired_fragment_becomes_available_only_after_projection_and_physical_ownership_end");
+  brain.machines.erase(&machine); thisBrain=previousBrain;
+}
+
+static void testMalformedWriterModeRejectedBeforeAdmission(TestSuite& suite)
+{
+  StreamingTestBrain brain = {};
+  NoopBrainIaaS iaas = {};
+  Mothership mothership = {};
+  brain.iaas = &iaas; brain.weAreMaster = true; brain.noMasterYet = false;
+  brain.ignited = true; brain.persistedMachineInventoryEnumerated = true; brain.mothership = &mothership;
+  mothership.isFixedFile = true; mothership.fslot = 1;
+
+  DeploymentPlan plan = {};
+  seedStatefulDeployRequestPlan(plan, 42);
+  plan.stateful.neverShard = true; plan.stateful.writerMode = StatefulWriterMode::globalSingleWriter;
+  plan.stateful.clientPrefix = prodigyRuntimeStatefulServicePrefix(42, 1);
+  plan.stateful.siblingPrefix = prodigyRuntimeStatefulServicePrefix(42, 2);
+  plan.stateful.cousinPrefix = prodigyRuntimeStatefulServicePrefix(42, 3);
+  plan.stateful.seedingPrefix = prodigyRuntimeStatefulServicePrefix(42, 4);
+  plan.stateful.shardingPrefix = prodigyRuntimeStatefulServicePrefix(42, 5);
+  String encoded = {}, stateful = {};
+  BitseryEngine::serialize(encoded, plan); BitseryEngine::serialize(stateful, plan.stateful);
+  DeploymentPlan decoded = {};
+  if (!suite.require(BitseryEngine::deserializeSafe(encoded, decoded) && prodigyGlobalSingleWriterPlanValid(decoded),
+                     "malformed_writer_mode_starts_from_valid_global_plan")) return;
+  // Locate the separately encoded stateful object, proving it is unique, so
+  // only its final writer-mode byte changes when surrounding fields evolve.
+  const auto* first = encoded.data(); const auto* end = first + encoded.size();
+  const auto* statefulAt = std::search(first, end, stateful.data(), stateful.data() + stateful.size());
+  if (!suite.require(stateful.size() == 44 && statefulAt != end &&
+      std::search(statefulAt + 1, end, stateful.data(), stateful.data() + stateful.size()) == end &&
+      statefulAt[stateful.size() - 1] == 2, "malformed_writer_mode_locates_exact_serialized_mode_byte")) return;
+  const uint64_t modeOffset = uint64_t(statefulAt - first) + stateful.size() - 1;
+  const uint64_t authorityGeneration = brain.masterAuthorityRuntimeState.generation;
+
+  for (uint8_t mode : {uint8_t(3), uint8_t(255)}) {
+    String malformed = encoded; malformed[modeOffset] = mode;
+    decoded = {};
+    suite.require(!BitseryEngine::deserializeSafe(malformed, decoded), "malformed_writer_mode_fixture_fails_codec");
+    mothership.wBuffer.clear(); String request = {};
+    brain.mothershipHandler(&mothership, buildMothershipMessage(request, MothershipTopic::spinApplication,
+        plan.config.applicationID, malformed, "must not inspect artifact"_ctv));
+    uint32_t replies = 0; bool rejected = false;
+    forEachMessageInBuffer(mothership.wBuffer, [&](Message* frame) {
+      ++replies;
+      if (MothershipTopic(frame->topic) != MothershipTopic::spinApplication) return;
+      uint8_t* args = frame->args; uint8_t code = 0; String reason = {};
+      Message::extractArg<ArgumentNature::fixed>(args, code); Message::extractToStringView(args, reason);
+      rejected = args == frame->terminal() && code == uint8_t(SpinApplicationResponseCode::invalidPlan) &&
+          reason == "invalid plan: unsupported or malformed deployment plan"_ctv;
+    });
+    suite.expect(replies == 1 && rejected, "malformed_writer_mode_spin_rejects_before_application_admission");
+
+    mothership.wBuffer.clear(); request.clear();
+    brain.mothershipHandler(&mothership, buildMothershipMessage(request, MothershipTopic::measureApplication, malformed));
+    replies = 0; bool emptyMeasurement = false;
+    forEachMessageInBuffer(mothership.wBuffer, [&](Message* frame) {
+      ++replies;
+      if (MothershipTopic(frame->topic) != MothershipTopic::measureApplication) return;
+      uint8_t* args = frame->args; uint32_t base = 1, surge = 1, fit = 1;
+      Message::extractArg<ArgumentNature::fixed>(args, base);
+      Message::extractArg<ArgumentNature::fixed>(args, surge);
+      Message::extractArg<ArgumentNature::fixed>(args, fit);
+      emptyMeasurement = args == frame->terminal() && base == 0 && surge == 0 && fit == 0;
+    });
+    suite.expect(replies == 1 && emptyMeasurement, "malformed_writer_mode_measure_returns_zero_capacity");
+    suite.expect(brain.deployments.empty() && brain.deploymentPlans.empty() && brain.pendingMothershipSpinArtifacts.empty() &&
+        brain.masterAuthorityRuntimeState.generation == authorityGeneration,
+        "malformed_writer_mode_handlers_leave_deployment_and_authority_unchanged");
+  }
 }
 
 static void testSpinApplicationCredentialPolicyAdmission(TestSuite& suite)
@@ -7880,7 +8109,9 @@ static void testBrainHandlerReplicationPaths(TestSuite& suite)
   metricSamples.push_back(metric);
   {
     String serialized;
-    BitseryEngine::serialize(serialized, metricSamples);
+    ProdigyMetricSamplesSnapshot snapshot = {};
+    snapshot.samples = metricSamples;
+    BitseryEngine::serialize(serialized, snapshot);
     Message *message = buildBrainMessage(messageBuffer, BrainTopic::replicateMetricsSnapshot, serialized);
     brain.brainHandler(&peer, message);
   }
@@ -8039,8 +8270,8 @@ static void testReconcileStateReplicatesCredentialAndTlsState(TestSuite& suite)
       String serializedSamples;
       Message::extractToStringView(args, serializedSamples);
 
-      Vector<ProdigyMetricSample> decoded;
-      if (BitseryEngine::deserializeSafe(serializedSamples, decoded) && decoded.size() == 1)
+      ProdigyMetricSamplesSnapshot decoded = {};
+      if (BitseryEngine::deserializeSafe(serializedSamples, decoded) && decoded.samples.size() == 1)
       {
         foundMetricsSnapshot = true;
       }
@@ -8056,6 +8287,96 @@ static void testReconcileStateReplicatesCredentialAndTlsState(TestSuite& suite)
   suite.expect(foundMasterAuthority, "reconcile_state_emits_master_authority_replication");
   suite.expect(foundRecoveryWitness, "reconcile_state_projects_local_bundle_recovery_witness");
   suite.expect(foundMetricsSnapshot, "reconcile_state_emits_metrics_snapshot_replication");
+}
+
+static void testReconcileStateReplicatesWideMetricsSnapshot(TestSuite& suite)
+{
+  constexpr uint32_t sampleCount = uint32_t(UINT16_MAX) + 1;
+  constexpr uint32_t samplesPerSeries = 1024;
+  constexpr int64_t firstSampleMs = 1'700'000'100'000;
+  constexpr uint64_t deploymentID = 0x5511;
+  constexpr uint64_t metricKey = 0x5522;
+
+  TestBrain source;
+  BrainView follower;
+  for (uint32_t index = 0; index < sampleCount; ++index)
+  {
+    source.metrics.record(deploymentID, uint128_t(0x6600 + index / samplesPerSeries), metricKey,
+                          firstSampleMs + index, double(index % 251));
+  }
+
+  Vector<ProdigyMetricSample> expected;
+  source.metrics.exportSamples(expected);
+  suite.expect(expected.size() == sampleCount, "reconcile_state_wide_metrics_fixture_exceeds_16_bit_container");
+
+  ProdigyMetricSamplesSnapshot smallSnapshot = {};
+  smallSnapshot.samples.push_back(expected[0]);
+  String legacySmall = {}, wideSmall = {};
+  suite.expect(BitseryEngine::serialize(legacySmall, smallSnapshot.samples) &&
+                   BitseryEngine::serialize(wideSmall, smallSnapshot) && legacySmall == wideSmall,
+               "reconcile_state_wide_metrics_preserves_small_snapshot_wire");
+
+  BrainReconcileStateRequest request = {};
+  String serializedRequest = {}, requestBuffer = {}, serializedSamples = {};
+  BitseryEngine::serialize(serializedRequest, request);
+  source.brainHandler(&follower, buildBrainMessage(requestBuffer, BrainTopic::reconcileState, serializedRequest));
+  const bool captured = extractSerializedBrainPayload(follower.wBuffer, BrainTopic::replicateMetricsSnapshot, serializedSamples);
+
+  ProdigyMetricSamplesSnapshot capturedSnapshot = {};
+  const bool decoded = captured && BitseryEngine::deserializeSafe(serializedSamples, capturedSnapshot) &&
+                       capturedSnapshot.samples.size() == sampleCount;
+  suite.expect(decoded, "reconcile_state_wide_metrics_uses_wide_snapshot_payload");
+  if (!decoded) return;
+
+  TestBrain receiver;
+  BrainView peer;
+  String receiverBuffer = {};
+  receiver.brainHandler(&peer, buildBrainMessage(receiverBuffer, BrainTopic::replicateMetricsSnapshot, serializedSamples));
+
+  Vector<ProdigyMetricSample> received;
+  receiver.metrics.exportSamples(received);
+  Vector<uint8_t> seen;
+  seen.resize(sampleCount);
+  bool preserved = received.size() == sampleCount;
+  for (const ProdigyMetricSample& sample : received)
+  {
+    if (sample.ms < firstSampleMs || sample.ms >= firstSampleMs + sampleCount)
+    {
+      preserved = false;
+      break;
+    }
+    const uint32_t index = uint32_t(sample.ms - firstSampleMs);
+    if (sample.deploymentID != deploymentID || sample.containerUUID != uint128_t(0x6600 + index / samplesPerSeries) ||
+        sample.metricKey != metricKey || sample.value != float(index % 251) || seen[index] != 0)
+    {
+      preserved = false;
+      break;
+    }
+    seen[index] = 1;
+  }
+  for (uint8_t observed : seen) preserved &= observed == 1;
+  suite.expect(preserved && receiver.persistCalls == 1,
+               "reconcile_state_wide_metrics_receiver_imports_every_sample_once");
+
+  String truncated = serializedSamples;
+  truncated.resize(truncated.size() - 1);
+  const uint32_t persistedBeforeMalformed = receiver.persistCalls;
+  String malformedBuffer = {};
+  receiver.brainHandler(&peer, buildBrainMessage(malformedBuffer, BrainTopic::replicateMetricsSnapshot, truncated));
+  Vector<ProdigyMetricSample> afterMalformed;
+  receiver.metrics.exportSamples(afterMalformed);
+  bool unchanged = afterMalformed.size() == received.size() && receiver.persistCalls == persistedBeforeMalformed;
+  for (const ProdigyMetricSample& sample : afterMalformed)
+  {
+    if (sample.ms < firstSampleMs || sample.ms >= firstSampleMs + sampleCount ||
+        sample.deploymentID != deploymentID || sample.containerUUID != uint128_t(0x6600 + uint32_t(sample.ms - firstSampleMs) / samplesPerSeries) ||
+        sample.metricKey != metricKey || sample.value != float(uint32_t(sample.ms - firstSampleMs) % 251))
+    {
+      unchanged = false;
+      break;
+    }
+  }
+  suite.expect(unchanged, "reconcile_state_wide_metrics_rejects_truncated_payload_without_mutation");
 }
 
 static void testPreStagedSystemArtifactReplication(TestSuite& suite)
@@ -9531,6 +9852,80 @@ static void testCrossClusterMasqueGatewayLifecycleOnSharedHost(TestSuite& suite)
                          return runtime.launchDispatched;
                        }),
                "cross_cluster_masque_gateway_terminal_failure_reprojects_two_retained_active_authorities_without_launch");
+
+  // A newly added lower pair moves an already-running higher pair from the
+  // first reserved fragment to the second.  While its exact old process waits
+  // for a terminal kill acknowledgement, normal registration must replay no
+  // stale gateway bootstrap; an inventory report of that process must instead
+  // requeue its exact kill.
+  CrossClusterMasqueGatewayAuthority lower =
+      authority(0xc100, 0xc101, 0xc102, 2, "mtbgplower"_ctv);
+  {
+    ProdigyClusterPairEnrollment enrollment = {};
+    enrollment.pairUUID = lower.pairUUID;
+    enrollment.localClusterUUID = lower.localClusterUUID;
+    enrollment.peerClusterUUID = lower.peerClusterUUID;
+    enrollment.operationUUID = lower.pairOperationUUID;
+    enrollment.rootGeneration = 1;
+    enrollment.agreedKeyEpoch = lower.keyGeneration;
+    enrollment.localAuthorityGeneration = lower.pairAuthorityGeneration;
+    enrollment.state = ProdigyClusterPairEnrollmentState::active;
+    ProdigyClusterPairEnrollmentOperation operation = {};
+    operation.pairUUID = lower.pairUUID;
+    operation.operationUUID = lower.pairOperationUUID;
+    operation.localAuthorityGeneration = lower.pairAuthorityGeneration;
+    operation.initialProjectionDelivered = true;
+    brain.masterAuthorityRuntimeState.clusterPairEnrollments.push_back(
+        std::move(enrollment));
+    brain.masterAuthorityRuntimeState.clusterPairEnrollmentOperations.push_back(
+        std::move(operation));
+  }
+  brain.crossClusterMasqueGatewayBrainRuntimes.clear();
+  brain.pendingCrossClusterMasqueGatewayRetirements.clear();
+  brain.masterAuthorityRuntimeState.crossClusterMasqueGatewayAuthorities = {second};
+  brain.persistedMachineInventoryUploaded.insert(host.uuid);
+  host.runtimeReady = true;
+  host.neuron.wBuffer.clear();
+  brain.reconcileCrossClusterMasqueGatewayRuntimeState();
+  suite.require(brain.crossClusterMasqueGatewayBrainRuntimes.size() == 1 &&
+                    brain.crossClusterMasqueGatewayBrainRuntimes[0].plan.fragment ==
+                        prodigyCrossClusterMasqueGatewayRuntimeFragmentFirst,
+                "cross_cluster_masque_gateway_lower_pair_fixture_launches_high_pair_first");
+  const ContainerPlan displacedPlan =
+      brain.crossClusterMasqueGatewayBrainRuntimes[0].plan;
+  brain.masterAuthorityRuntimeState.crossClusterMasqueGatewayAuthorities = {lower, second};
+  suite.require(prodigyCrossClusterMasqueGatewayAuthoritiesValid(
+                    brain.masterAuthorityRuntimeState.crossClusterMasqueGatewayAuthorities,
+                    brain.brainConfig.clusterUUID),
+                "cross_cluster_masque_gateway_lower_pair_fixture_authorities_are_valid");
+  host.neuron.wBuffer.clear();
+  brain.reconcileCrossClusterMasqueGatewayRuntimeState();
+  const bool displacedPending =
+      brain.crossClusterMasqueGatewayBrainRuntimes.size() == 1 &&
+      brain.crossClusterMasqueGatewayBrainRuntimes[0].killPending;
+  Vector<String> pendingRegistrationBootstraps = {};
+  String pendingRegistrationFailure = {};
+  const bool pendingRegistrationAccepted =
+      brain.collectNeuronStateUploadBootstraps(
+          &host, pendingRegistrationBootstraps, &pendingRegistrationFailure);
+  suite.expect(displacedPending && pendingRegistrationAccepted &&
+                   pendingRegistrationBootstraps.empty(),
+               "cross_cluster_masque_gateway_pending_fragment_move_does_not_replay_stale_registration_bootstrap");
+
+  host.neuron.wBuffer.clear();
+  suite.require(brain.handleUploadedCrossClusterMasqueGatewayContainer(
+                    &host.neuron, displacedPlan),
+                "cross_cluster_masque_gateway_pending_fragment_move_accepts_old_inventory_for_retirement");
+  uint32_t requeuedKills = 0;
+  forEachMessageInBuffer(host.neuron.wBuffer, [&](Message *message) {
+    if (NeuronTopic(message->topic) != NeuronTopic::killContainer) return;
+    uint8_t *args = message->args;
+    uint128_t killed = 0;
+    Message::extractArg<ArgumentNature::fixed>(args, killed);
+    if (killed == displacedPlan.uuid) ++requeuedKills;
+  });
+  suite.expect(requeuedKills == 1,
+               "cross_cluster_masque_gateway_pending_fragment_move_requeues_exact_old_kill_after_registration");
 }
 
 static void testCrossClusterMasqueGatewayConnectorLeaseLifecycle(TestSuite& suite)
@@ -14647,7 +15042,7 @@ static void testRecoveredStatelessWormholesReplayAndAwaitAcknowledgement(TestSui
   // The same recovery owner must replay protected stateful COUSIN portals.
   deployment.plan.isStateful = true;
   deployment.plan.config.type = ApplicationType::stateful;
-  deployment.plan.stateful.allMasters = false;
+  deployment.plan.stateful.writerMode = StatefulWriterMode::localSingleWriter;
   deployment.plan.stateful.cousinPrefix = MeshServices::generateStatefulService(62'551, 3);
   container.isStateful = true; container.shardGroup = 0;
   deployment.nShardGroups = 1;
@@ -14941,7 +15336,7 @@ static void testRetainedStatelessHealthRestoresRunning(TestSuite& suite)
   stateful.plan = makeDeploymentPlan(62'573, 265'325'899'677'729ULL);
   stateful.plan.isStateful = true;
   stateful.plan.config.type = ApplicationType::stateful;
-  stateful.plan.stateful.allMasters = false;
+  stateful.plan.stateful.writerMode = StatefulWriterMode::localSingleWriter;
   stateful.plan.stateful.clientPrefix = (uint64_t(62'573) << 48) | (uint64_t(1) << 40);
   stateful.plan.stateful.siblingPrefix = (uint64_t(62'573) << 48) | (uint64_t(2) << 40);
   stateful.plan.stateful.seedingPrefix = (uint64_t(62'573) << 48) | (uint64_t(3) << 40);
@@ -27042,214 +27437,6 @@ static void testNeuronPendingLaunchStateUploadRetainsCanonicalUUID(TestSuite& su
                "neuron_pending_launch_failure_or_completion_releases_claim");
 }
 
-static void testNativeRepairNeuronEndpointFence(TestSuite& suite)
-{
-  TestNeuron neuron = {};
-  constexpr uint128_t cluster = 0x952001, targetNode = 0x952002, donorNode = 0x952003;
-  neuron.seedLocalContainerSubnetForTest(7, 0x10203); neuron.setControlClusterUUIDForTest(cluster);
-  auto addressFor = [&](uint8_t fragment) {
-    IPPrefix address = {}; address.network.is6 = true; address.cidr = 128;
-    std::memcpy(address.network.v6, container_network_subnet6.value, sizeof(container_network_subnet6.value));
-    address.network.v6[11] = 7; address.network.v6[12] = 1; address.network.v6[13] = 2;
-    address.network.v6[14] = 3; address.network.v6[15] = fragment; return address;
-  };
-  Container target = {}, donor = {};
-  target.plan.uuid = 0x952004; target.plan.fragment = 4; target.plan.config.applicationID = 3;
-  target.plan.config.versionID = 1; target.plan.config.type = ApplicationType::stateful;
-  target.plan.isStateful = true; target.plan.state = ContainerState::healthy; target.plan.shardGroup = 1;
-  target.plan.nShardGroups = 3; target.plan.addresses.push_back(addressFor(target.plan.fragment));
-  target.plan.statefulMeshRoles = {.client = 0x952100, .sibling = 0x952101, .seeding = 0x952102};
-  for (uint64_t service : {target.plan.statefulMeshRoles.seeding, target.plan.statefulMeshRoles.sibling})
-    target.plan.subscriptions.emplace(service, Subscription(service, ContainerState::scheduled,
-        ContainerState::destroying, SubscriptionNature::all));
-  donor.plan = target.plan; donor.plan.uuid = 0x952005; donor.plan.fragment = 5;
-  donor.plan.addresses.clear(); donor.plan.addresses.push_back(addressFor(donor.plan.fragment));
-  donor.plan.advertisements.emplace(donor.plan.statefulMeshRoles.seeding,
-      Advertisement(donor.plan.statefulMeshRoles.seeding, ContainerState::scheduled, ContainerState::destroying, 12002));
-  donor.plan.advertisements.emplace(donor.plan.statefulMeshRoles.sibling,
-      Advertisement(donor.plan.statefulMeshRoles.sibling, ContainerState::scheduled, ContainerState::destroying, 12003));
-
-  ProdigyCousinSessionRecord repair = {};
-  repair.protocolVersion = ProdigyCousinSessionNativeRepairProtocolVersion; repair.sessionUUID = 0x952006;
-  repair.requestUUID = 0x952007; repair.repairGenerationUUID = 0x952008;
-  auto& authority = repair.repairAuthority;
-  authority.protocolVersion = ProdigyStatefulStoreSeedAuthority::sourceCutVersion; authority.authorityGeneration = 1;
-  authority.operationUUID = 0x952009; authority.applicationID = 3; authority.storeKind = DeploymentIdentityStoreKind::kv;
-  authority.shardGroup = target.plan.shardGroup; authority.nShardGroups = target.plan.nShardGroups;
-  authority.targetClusterUUID = cluster; authority.targetDeploymentID = target.plan.config.deploymentID();
-  authority.targetContainerUUID = target.plan.uuid; authority.sourceClusterUUID = cluster;
-  authority.sourceDeploymentID = donor.plan.config.deploymentID(); authority.sourceContainerUUID = donor.plan.uuid;
-  authority.seedGeneration = 1; authority.fixtureSHA256.assign("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
-  authority.sourceContentWatermarkSHA256.assign("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"_ctv);
-  authority.sourceCatchupWatermarkSHA256.assign("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"_ctv);
-  authority.sourceBaselineOperationUUID = 0x95200a; authority.sourceRequestUUID = 0x95200b;
-  authority.sourceMemberRequestUUID = 0x95200c; authority.seedRouteUUID = 0x95200d;
-  authority.cutUUID = 0x95200e; authority.cutGeneration = 1;
-  authority.sourceCutScope = ProdigyStatefulStoreSourceCutScope::fullShardGroup; authority.retainUntilMilliseconds = UINT64_MAX;
-  repair.repairTarget = {.containerUUID = target.plan.uuid, .nodeUUID = targetNode,
-      .address = target.plan.addresses.front().network, .tcpPort = 50001};
-  repair.repairDonor = {.containerUUID = donor.plan.uuid, .nodeUUID = donorNode,
-      .address = donor.plan.addresses.front().network, .tcpPort = 12002};
-  repair.repairPurpose = ProdigyCohortRepairPurpose::seed; repair.repairService = target.plan.statefulMeshRoles.seeding;
-  repair.repairExpiresAtMilliseconds = INT64_MAX;
-  target.statefulStoreGenerationProtocol = 1;
-  target.statefulStoreGenerationSelection = {.protocolVersion = ProdigyStatefulStoreGenerationSelection::version,
-      .generationUUID = repair.repairGenerationUUID, .servingRevision = 1,
-      .admittedPlanSHA256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"_ctv,
-      .authority = repair.repairAuthority};
-
-  neuron.controlTransportCredentials.self.nodeUUID = targetNode;
-  suite.require(prodigyCousinSessionRecordValid(repair) && target.statefulStoreGenerationLaunchReady(),
-                "native_repair_neuron_fixture_has_valid_record_and_selected_home");
-  auto pollutedLegacyRoute = repair; pollutedLegacyRoute.rootGeneration = 1;
-  suite.expect(!prodigyCousinSessionRecordValid(pollutedLegacyRoute),
-               "native_repair_neuron_rejects_legacy_pair_route_fields");
-  flow_key targetFlow = {}, donorFlow = {};
-  suite.expect(Container::privateSessionTCPFlow(repair, CousinRouteHalf::source, targetFlow) &&
-                   Container::privateSessionTCPFlow(repair, CousinRouteHalf::destination, donorFlow) &&
-                   std::memcmp(targetFlow.srcv6, repair.repairTarget.address.v6, 16) == 0 &&
-                   std::memcmp(targetFlow.dstv6, repair.repairDonor.address.v6, 16) == 0 &&
-                   targetFlow.port16[0] == htons(repair.repairTarget.tcpPort) &&
-                   targetFlow.port16[1] == htons(repair.repairDonor.tcpPort) &&
-                   std::memcmp(donorFlow.srcv6, repair.repairDonor.address.v6, 16) == 0 &&
-                   donorFlow.port16[0] == htons(repair.repairDonor.tcpPort),
-               "native_repair_neuron_direct_flow_uses_only_typed_endpoints");
-  suite.expect(neuron.nativeRepairEndpointMatchesContainer(repair, CousinRouteHalf::source, target),
-               "native_repair_neuron_target_requires_selected_home_subscription_and_ephemeral_source");
-  auto wrongAuthority = repair; ++wrongAuthority.repairAuthority.cutGeneration;
-  suite.expect(!neuron.nativeRepairEndpointMatchesContainer(wrongAuthority, CousinRouteHalf::source, target),
-               "native_repair_neuron_target_rejects_nonexact_selected_cut_authority");
-  auto collidingTarget = target;
-  collidingTarget.plan.advertisements.emplace(0x952103,
-      Advertisement(0x952103, ContainerState::scheduled, ContainerState::destroying, repair.repairTarget.tcpPort));
-  suite.expect(!neuron.nativeRepairEndpointMatchesContainer(repair, CousinRouteHalf::source, collidingTarget),
-               "native_repair_neuron_target_rejects_advertised_source_port_collision");
-  Neuron::CousinSessionLocalPending pending = {};
-  pending.sessionUUID = repair.sessionUUID + 1; pending.containerUUID = target.plan.uuid;
-  pending.localHalf = CousinRouteHalf::source; pending.session = repair; pending.session.sessionUUID = pending.sessionUUID;
-  pending.expiresAtMs = Time::msSinceBoot() + 1000; neuron.cousinSessionLocalPendings.push_back(pending);
-  suite.expect(!neuron.nativeRepairEndpointMatchesContainer(repair, CousinRouteHalf::source, target),
-               "native_repair_neuron_target_rejects_live_same_tuple_reservation");
-  neuron.cousinSessionLocalPendings.clear();
-  pending.session = {}; pending.session.sourceTCPPort = repair.repairTarget.tcpPort;
-  neuron.cousinSessionLocalPendings.push_back(pending);
-  suite.expect(!neuron.nativeRepairEndpointMatchesContainer(repair, CousinRouteHalf::source, target),
-               "native_repair_neuron_target_rejects_ordinary_live_source_port_reservation");
-  neuron.cousinSessionLocalPendings.clear();
-
-  neuron.controlTransportCredentials.self.nodeUUID = donorNode;
-  suite.expect(neuron.nativeRepairEndpointMatchesContainer(repair, CousinRouteHalf::destination, donor),
-               "native_repair_neuron_seed_donor_requires_exact_advertised_seeding_listener");
-  auto wrongPortDonor = donor; wrongPortDonor.plan.advertisements.at(repair.repairService).port++;
-  suite.expect(!neuron.nativeRepairEndpointMatchesContainer(repair, CousinRouteHalf::destination, wrongPortDonor),
-               "native_repair_neuron_donor_rejects_unbound_repair_port");
-  auto catchup = repair; catchup.repairPurpose = ProdigyCohortRepairPurpose::catchup;
-  catchup.repairService = donor.plan.statefulMeshRoles.sibling;
-  catchup.repairDonor.tcpPort = donor.plan.advertisements.at(catchup.repairService).port;
-  suite.expect(neuron.nativeRepairEndpointMatchesContainer(catchup, CousinRouteHalf::destination, donor),
-               "native_repair_neuron_catchup_uses_sibling_listener_not_seed_listener");
-  auto alternate = catchup;
-  ++alternate.repairAuthority.sourceContainerUUID; // immutable historical snapshot came from another sibling
-  suite.expect(neuron.nativeRepairEndpointMatchesContainer(alternate, CousinRouteHalf::destination, donor),
-               "native_repair_neuron_catchup_admits_exact_alternate_sibling");
-  alternate.repairPurpose = ProdigyCohortRepairPurpose::seed;
-  suite.expect(!neuron.nativeRepairEndpointMatchesContainer(alternate, CousinRouteHalf::destination, donor),
-               "native_repair_neuron_alternate_sibling_cannot_seed_historical_snapshot");
-}
-
-static void testNeuronSpinContainerRetainsStatefulStoreGenerationSelection(TestSuite& suite)
-{
-  ScopedFreshRing ring = {};
-  suite.require(Ring::getRingFD() > 0, "neuron_spin_generation_fixture_owns_ring");
-  TestNeuron neuron = {};
-  neuron.interceptContainerLaunchForTest = true;
-  neuron.seedBrainStreamForTest(false);
-  neuron.seedLocalContainerSubnetForTest(1, 0x123d);
-
-  ContainerPlan plan = {};
-  plan.uuid = uint128_t(0x51aa07);
-  plan.config.applicationID = 7;
-  plan.config.versionID = 9;
-  plan.config.type = ApplicationType::stateful;
-  plan.isStateful = true;
-  plan.state = ContainerState::scheduled;
-  plan.shardGroup = 0;
-  plan.nShardGroups = 1;
-
-  ProdigyStatefulStoreGenerationSelection selection = {};
-  selection.generationUUID = 0x51aa08;
-  selection.servingRevision = 1;
-  selection.admittedPlanSHA256 =
-      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv;
-  selection.authority.protocolVersion = ProdigyStatefulStoreSeedAuthority::sourceCutVersion;
-  selection.authority.authorityGeneration = 1;
-  selection.authority.operationUUID = 0x51aa09;
-  selection.authority.applicationID = plan.config.applicationID;
-  selection.authority.storeKind = DeploymentIdentityStoreKind::kv;
-  selection.authority.shardGroup = plan.shardGroup;
-  selection.authority.nShardGroups = plan.nShardGroups;
-  selection.authority.targetClusterUUID = 0x51aa0a;
-  selection.authority.targetDeploymentID = plan.config.deploymentID();
-  selection.authority.targetContainerUUID = plan.uuid;
-  selection.authority.sourceClusterUUID = 0x51aa0b;
-  selection.authority.sourceDeploymentID = plan.config.deploymentID() - 1;
-  selection.authority.sourceContainerUUID = 0x51aa0c;
-  selection.authority.seedGeneration = 1;
-  selection.authority.fixtureSHA256 = selection.admittedPlanSHA256;
-  selection.authority.sourceContentWatermarkSHA256 =
-      "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"_ctv;
-  selection.authority.sourceCatchupWatermarkSHA256 =
-      "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"_ctv;
-  selection.authority.sourceBaselineOperationUUID = 0x51aa0d;
-  selection.authority.sourceRequestUUID = 0x51aa0e;
-  selection.authority.sourceMemberRequestUUID = 0x51aa0f;
-  selection.authority.seedRouteUUID = 0x51aa10;
-  selection.authority.cutUUID = 0x51aa11;
-  selection.authority.cutGeneration = 1;
-  selection.authority.sourceCutScope = ProdigyStatefulStoreSourceCutScope::fullShardGroup;
-  selection.authority.retainUntilMilliseconds = 1;
-  suite.require(prodigyStatefulStoreGenerationSelectionMatchesPlan(selection, plan),
-                "neuron_spin_generation_fixture_binds_exact_plan");
-
-  NeuronContainerBootstrap bootstrap = {};
-  bootstrap.plan = plan;
-  bootstrap.statefulStoreGenerationSelection = selection;
-  String serialized = {}, frame = {};
-  suite.require(BitseryEngine::serialize(serialized, bootstrap),
-                "neuron_spin_generation_selected_bootstrap_serializes");
-  neuron.dispatchBrainMessageForTest(buildNeuronMessage(
-      frame, NeuronTopic::spinContainer, uint128_t(0), serialized));
-  suite.expect(neuron.launchedContainerPlansForTest == 1 &&
-                   neuron.lastLaunchedContainerPlanForTest.uuid == plan.uuid &&
-                   neuron.lastLaunchedGenerationSelectionForTest.generationUUID == selection.generationUUID &&
-                   neuron.pendingContainerStoreGenerationMatches(plan.uuid, selection),
-               "neuron_spin_generation_selected_bootstrap_reaches_launch_owner_unchanged");
-
-  NeuronContainerBootstrap absentSelectionReplay = {};
-  absentSelectionReplay.plan = plan;
-  String replaySerialized = {}, replayFrame = {};
-  suite.require(BitseryEngine::serialize(replaySerialized, absentSelectionReplay),
-                "neuron_spin_generation_absent_selection_replay_serializes");
-  uint32_t header = Message::appendHeader(replayFrame, NeuronTopic::stateUpload);
-  local_container_subnet6 fragment = {};
-  fragment.dpfx = 1;
-  fragment.mpfx[1] = 0x12;
-  fragment.mpfx[2] = 0x3d;
-  Message::appendAlignedBuffer<Alignment::one>(
-      replayFrame, reinterpret_cast<const uint8_t *>(&fragment), sizeof(fragment));
-  Message::appendValue(replayFrame, replaySerialized);
-  Message::finish(replayFrame, header);
-  neuron.dispatchBrainMessageForTest(reinterpret_cast<Message *>(replayFrame.data()));
-  suite.expect(neuron.launchedContainerPlansForTest == 1 &&
-                   neuron.isPendingContainerLaunch(plan.uuid) &&
-                   neuron.pendingContainerStoreGenerationMatches(plan.uuid, selection) &&
-                   !neuron.pendingContainerStoreGenerationMatches(
-                       plan.uuid, ProdigyStatefulStoreGenerationSelection{.protocolVersion = 0}),
-               "neuron_stateupload_replay_cannot_downgrade_pending_selected_generation");
-  neuron.finishPendingContainerLaunch(
-      plan.uuid, neuron.lastLaunchedContainerAdmissionGenerationForTest);
-}
-
 static void testNeuronPendingLaunchControlReplacementReissuesAuthenticatedReplay(TestSuite& suite)
 {
   TestNeuron neuron = {};
@@ -28217,136 +28404,6 @@ static void testNeuronStateUploadSkipsExistingLiveContainer(TestSuite& suite)
 
   neuron.containerByPid.erase(container->pid);
   neuron.containers.erase(container->plan.uuid);
-  delete container;
-}
-
-static void testNeuronStateUploadStagesGenerationRestartBeforeTimerCancellation(TestSuite& suite)
-{
-  ScopedFreshRing scopedRing;
-  suite.require(Ring::getRingFD() > 0, "generation_restart_has_owned_ring");
-  TestNeuron neuron = {};
-  neuron.uuid = 0x5104;
-  neuron.observeRestartDispatch = true;
-  neuron.seedBrainStreamForTest(false);
-  neuron.brainStreamForTest()->fslot = -1;
-  neuron.seedLocalContainerSubnetForTest(7, 0x123457);
-
-  Container *container = new Container();
-  container->plan = ContainerPlan{};
-  container->plan.uuid = uint128_t(0x5105);
-  container->plan.config.applicationID = 62'014;
-  container->plan.config.versionID = 1;
-  container->plan.config.type = ApplicationType::stateful;
-  container->plan.isStateful = true;
-  container->plan.state = ContainerState::scheduled;
-  container->plan.shardGroup = 0;
-  container->plan.nShardGroups = 1;
-  container->pid = 42'424;
-  container->infop.si_pid = container->pid;
-  container->statefulStoreGenerationProtocol = 1;
-
-  auto selection = [&](uint128_t generation, uint64_t authorityGeneration, uint64_t seedGeneration) {
-    ProdigyStatefulStoreGenerationSelection value = {};
-    value.generationUUID = generation;
-    value.servingRevision = 9;
-    value.admittedPlanSHA256 =
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv;
-    value.authority.protocolVersion = ProdigyStatefulStoreSeedAuthority::sourceCutVersion;
-    value.authority.authorityGeneration = authorityGeneration;
-    value.authority.operationUUID = 0x5106;
-    value.authority.applicationID = container->plan.config.applicationID;
-    value.authority.storeKind = DeploymentIdentityStoreKind::kv;
-    value.authority.shardGroup = container->plan.shardGroup;
-    value.authority.nShardGroups = container->plan.nShardGroups;
-    value.authority.targetClusterUUID = 0x5107;
-    value.authority.targetDeploymentID = container->plan.config.deploymentID();
-    value.authority.targetContainerUUID = container->plan.uuid;
-    value.authority.sourceClusterUUID = 0x5108;
-    value.authority.sourceDeploymentID = container->plan.config.deploymentID() - 1;
-    value.authority.sourceContainerUUID = 0x5109;
-    value.authority.seedGeneration = seedGeneration;
-    value.authority.fixtureSHA256 = value.admittedPlanSHA256;
-    value.authority.sourceContentWatermarkSHA256 =
-        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"_ctv;
-    value.authority.sourceCatchupWatermarkSHA256 =
-        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"_ctv;
-    value.authority.sourceBaselineOperationUUID = 0x510a;
-    value.authority.sourceRequestUUID = 0x510b;
-    value.authority.sourceMemberRequestUUID = 0x510c;
-    value.authority.seedRouteUUID = 0x510d;
-    value.authority.cutUUID = 0x510e;
-    value.authority.cutGeneration = authorityGeneration;
-    value.authority.sourceCutScope = ProdigyStatefulStoreSourceCutScope::fullShardGroup;
-    value.authority.retainUntilMilliseconds = 1;
-    return value;
-  };
-  const auto previous = selection(0x5110, 1, 1);
-  const auto next = selection(0x5111, 2, 2);
-  suite.require(prodigyStatefulStoreGenerationSelectionMatchesPlan(previous, container->plan) &&
-                    prodigyStatefulStoreGenerationSelectionStrictlyAdvances(previous, next) &&
-                    prodigyStatefulStoreGenerationSelectionStrictlyAdvances(
-                        ProdigyStatefulStoreGenerationSelection{.protocolVersion = 0}, next),
-                "neuron_generation_restart_staging_fixture_is_ordered");
-  container->statefulStoreGenerationSelection = previous;
-
-  ScopedTempDir cgroupRoot = {};
-  const auto cgroup = cgroupRoot.path / "cgroup";
-  suite.require(cgroupRoot.valid() && std::filesystem::create_directories(cgroup) &&
-                    writeTextFile(cgroup / "cgroup.events", "populated 0\n"),
-                "neuron_generation_restart_staging_cgroup_fixture_created");
-  container->cgroup = open(cgroup.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-  TimeoutPacket *timer = new TimeoutPacket();
-  timer->identifier = container->plan.uuid;
-  timer->flags = uint64_t(NeuronTimeoutFlags::restartContainer);
-  timer->setTimeoutMs(30'000);
-  container->restartTimer = timer;
-  neuron.containers.insert_or_assign(container->plan.uuid, container);
-
-  NeuronContainerBootstrap first = {};
-  first.plan = container->plan;
-  first.statefulStoreGenerationSelection = next;
-  String firstSerialized = {};
-  suite.require(BitseryEngine::serialize(firstSerialized, first),
-                "neuron_generation_restart_staging_selected_bootstrap_serializes");
-  String frame = {};
-  uint32_t header = Message::appendHeader(frame, NeuronTopic::stateUpload);
-  local_container_subnet6 fragment = {};
-  fragment.dpfx = 7;
-  fragment.mpfx[0] = 0x12;
-  fragment.mpfx[1] = 0x34;
-  fragment.mpfx[2] = 0x57;
-  Message::appendAlignedBuffer<Alignment::one>(frame, reinterpret_cast<const uint8_t *>(&fragment), sizeof(fragment));
-  Message::appendValue(frame, firstSerialized);
-  Message::appendValue(frame, "malformed-second-inventory-entry"_ctv);
-  Message::finish(frame, header);
-  neuron.dispatchBrainMessageForTest(reinterpret_cast<Message *>(frame.data()));
-
-  suite.expect(container->restartTimer == timer &&
-                   prodigyStatefulStoreGenerationSelectionsEqual(
-                       container->statefulStoreGenerationSelection, previous) &&
-                   container->killedOnPurpose == false,
-               "neuron_generation_restart_staging_rejects_late_malformed_entry_before_timer_or_home_mutation");
-
-  // A complete valid replay reaches the restart owner once. The fixture
-  // intercepts process launch after the production timer/selection handoff.
-  container->statefulStoreGenerationSelection = {.protocolVersion = 0};
-  frame.clear();
-  header = Message::appendHeader(frame, NeuronTopic::stateUpload);
-  Message::appendAlignedBuffer<Alignment::one>(frame, reinterpret_cast<const uint8_t *>(&fragment), sizeof(fragment));
-  Message::appendValue(frame, firstSerialized);
-  Message::finish(frame, header);
-  neuron.dispatchBrainMessageForTest(reinterpret_cast<Message *>(frame.data()));
-  suite.expect(neuron.restartDispatches == 1 && container->restartTimer == nullptr &&
-                   prodigyStatefulStoreGenerationSelectionsEqual(container->statefulStoreGenerationSelection, next),
-               "generation_restart_claims_timer_and_dispatches_selected_home_once");
-  neuron.dispatchBrainMessageForTest(reinterpret_cast<Message *>(frame.data()));
-  suite.expect(neuron.restartDispatches == 1,
-               "duplicate_selected_inventory_does_not_restart_again");
-
-  neuron.containers.erase(container->plan.uuid);
-  container->restartTimer = nullptr;
-  delete timer;
-  if (container->cgroup >= 0) close(container->cgroup);
   delete container;
 }
 
@@ -30016,7 +30073,7 @@ static void checkDeferredStatefulFailedMachineRecoveryKeepsExistingOwner(
 
   ApplicationDeployment deployment = {};
   seedStatefulDeployRequestPlan(deployment.plan, applicationID);
-  deployment.plan.stateful.allMasters = true;
+  deployment.plan.stateful.writerMode = StatefulWriterMode::allMasters;
   deployment.state = DeploymentState::running;
   deployment.nShardGroups = 1;
   deployment.nTargetBase = deployment.nDeployedBase = deployment.nHealthyBase = 3;
@@ -31441,7 +31498,7 @@ static void testLateStatefulHealthResumesRecoveredDeployment(TestSuite& suite)
   deployment.plan = makeDeploymentPlan(62'041, 1);
   deployment.plan.isStateful = true;
   deployment.plan.config.type = ApplicationType::stateful;
-  deployment.plan.stateful.allMasters = true;
+  deployment.plan.stateful.writerMode = StatefulWriterMode::allMasters;
   deployment.nTargetBase = 1;
   deployment.nDeployedBase = 1;
   brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
@@ -33172,278 +33229,6 @@ static void testBrainReplicatedMetricAppendCannotAuthorizeStatefulTopologyCutove
   brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
   brain.deployments.erase(deployment.plan.config.deploymentID());
   thisBrain = previousBrain;
-}
-
-static void exerciseNativeMemberLease(TestSuite& suite, StreamingTestBrain& brain, ContainerView& target, ContainerView& donor,
-                                     const ProdigyStatefulStoreGenerationSelection& home)
-{
-  target.state = ContainerState::scheduled;
-  target.runtimeReady = true;
-  const auto& a = home.authority;
-  if (!suite.require(brain.ensureNativeMemberRepairSession(home, ProdigyCohortRepairPurpose::seed) && brain.cousinSessions.size() == 1,
-          "repair_controller_installs_held_cut_on_actual_donor")) return;
-  auto acknowledge = [&](Brain::CousinSessionState& session, ContainerView& member, ProdigyCousinSessionLocalKind kind) {
-    ProdigyCousinSessionLocalAck ack = {};
-    ack.sessionUUID = session.record.sessionUUID; ack.leaseGeneration = session.leaseGeneration;
-    ack.kind = kind; ack.success = true;
-    brain.receiveCousinSessionLocalAck(&member.machine->neuron, member.uuid, ack);
-  };
-  suite.expect(brain.ensureNativeMemberRepairSession(home, ProdigyCohortRepairPurpose::seed) && brain.cousinSessions.size() == 1,
-               "repair_pending_seed_grant_is_idempotent");
-  auto& seed = brain.cousinSessions.front();
-  suite.expect(seed.pendingLocalHalf == CousinRouteHalf::destination && !seed.sourceActivated && !seed.acknowledgedNativeLeaseGeneration,
-               "repair_seed_target_waits_for_donor_install");
-  acknowledge(seed, target, ProdigyCousinSessionLocalKind::install);
-  suite.expect(!seed.destinationInstalled, "repair_wrong_node_cannot_ack_donor_install");
-  acknowledge(seed, donor, ProdigyCousinSessionLocalKind::install);
-  suite.expect(seed.destinationInstalled && !seed.sourceActivated && seed.pendingLocalHalf == CousinRouteHalf::source,
-               "repair_donor_ack_dispatches_target_activation");
-  acknowledge(seed, target, ProdigyCousinSessionLocalKind::activate);
-  suite.expect(seed.sourceActivated && seed.acknowledgedNativeLeaseGeneration == 1, "repair_both_local_halves_acknowledged");
-
-  ProdigyStatefulStoreReceipt proof = {};
-  proof.protocolVersion = ProdigyStatefulStoreReceipt::sourceCutVersion;
-  proof.localClusterUUID = a.targetClusterUUID; proof.localContainerUUID = a.targetContainerUUID;
-  proof.deploymentID = a.targetDeploymentID; proof.storeKind = a.storeKind; proof.shardGroup = a.shardGroup; proof.nShardGroups = a.nShardGroups;
-  proof.writable = proof.siblingSessionHealthy = true; proof.siblingSessionUUID = seed.record.sessionUUID; proof.siblingSessionGeneration = 1;
-  proof.seededFromClusterUUID = a.sourceClusterUUID; proof.seededFromContainerUUID = a.sourceContainerUUID;
-  proof.sourceDeploymentID = a.sourceDeploymentID; proof.seedGeneration = a.seedGeneration; proof.seedFixtureSHA256 = a.fixtureSHA256;
-  proof.appliedWatermarkSHA256 = proof.sourceCatchupWatermarkSHA256 = proof.materializedHeadsSHA256 = a.sourceCatchupWatermarkSHA256;
-  proof.materializedContentSHA256 = proof.sourceContentWatermarkSHA256 = a.sourceContentWatermarkSHA256;
-  proof.operationUUID = a.operationUUID; proof.sourceBaselineOperationUUID = a.sourceBaselineOperationUUID;
-  proof.sourceRequestUUID = a.sourceRequestUUID; proof.sourceMemberRequestUUID = a.sourceMemberRequestUUID;
-  proof.cutUUID = a.cutUUID; proof.cutGeneration = a.cutGeneration; proof.seedRouteUUID = a.seedRouteUUID;
-  proof.retainUntilMilliseconds = a.retainUntilMilliseconds; proof.sourceCutScope = a.sourceCutScope;
-  proof.cutMaterialized = proof.committedHeadsDominateCut = true;
-  auto publish = [&] { brain.receiveStatefulStoreReceipt(&target.machine->neuron, proof); };
-  publish();
-  suite.expect(!brain.nativeMemberProofCurrent(target, home), "repair_seed_receipt_cannot_promote");
-  if (!suite.require(brain.ensureNativeMemberRepairSession(home, ProdigyCohortRepairPurpose::catchup) && brain.cousinSessions.size() == 2,
-                     "repair_controller_installs_distinct_ordinary_catchup_session")) return;
-  auto& change = brain.cousinSessions.back();
-  proof.siblingSessionUUID = change.record.sessionUUID;
-  acknowledge(change, donor, ProdigyCousinSessionLocalKind::install);
-  publish();
-  suite.expect(!brain.nativeMemberProofCurrent(target, home), "repair_catchup_proof_waits_for_target_ack");
-  acknowledge(change, target, ProdigyCousinSessionLocalKind::activate);
-  publish();
-  suite.expect(brain.nativeMemberProofCurrent(target, home) && brain.statefulSourceCuts.at(donor.uuid).releasing,
-               "repair_authenticated_committed_catchup_proof_releases_native_cut");
-  proof.state = ProdigyStatefulStoreReceiptState::withdrawn; proof.siblingSessionHealthy = false; publish();
-  suite.expect(!brain.nativeMemberProofCurrent(target, home), "repair_withdrawn_stream_fences_completed_home");
-}
-
-static void testNativeMemberRepairController(TestSuite& suite)
-{
-  ScopedFreshRing ring;
-  TestNeuron local;
-  auto *oldNeuron = thisNeuron;
-  auto *oldBrain = thisBrain;
-  local.uuid = 0x782101;
-  thisNeuron = &local;
-  StreamingTestBrain brain;
-  thisBrain = &brain;
-  brain.weAreMaster = true; brain.nBrains = 1; brain.masterAuthorityEpoch = 13;
-  brain.hasAuthoritativeTopology = true; brain.brainConfig.clusterUUID = 0x7821;
-  ClusterMachine self = {}; self.uuid = local.uuid; self.isBrain = true;
-  brain.authoritativeTopology.machines.push_back(self);
-  brain.masterAuthorityRuntimeState.generation = brain.durableMasterAuthorityRuntimeStateGeneration = 9;
-  brain.masterAuthorityRuntimeStateDurable = true; brain.holdRuntimePersistence = true;
-  ApplicationDeployment deployment;
-  deployment.plan = makeDeploymentPlan(3, 88); deployment.plan.isStateful = true;
-  deployment.plan.config.type = ApplicationType::stateful; deployment.plan.stateful.allMasters = true;
-  deployment.plan.config.containerBlobSHA256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv;
-  deployment.plan.config.containerBlobBytes = 42;
-  deployment.nShardGroups = 3;
-  const auto deployID = deployment.plan.config.deploymentID();
-  brain.deployments.insert_or_assign(deployID, &deployment);
-  Machine machines[2] = {};
-  ContainerView members[2] = {};
-  auto& scope = brain.masterAuthorityRuntimeState.statefulServingAuthorities.emplace_back();
-  scope.applicationID = 3; scope.deploymentID = deployID; scope.allMasters = true; scope.revision = 9;
-  scope.phase = StatefulWorkerTopologyUpgradePhase::initialAllMastersSeedBootstrap;
-  scope.targetConfig = deployment.plan.config;
-  auto& bootstrapScope = scope.initialAllMastersSeedBootstrap;
-  auto& bootstrap = bootstrapScope.bootstrap;
-  bootstrap.sourceClusterUUID = 7; bootstrap.targetClusterUUID = brain.brainConfig.clusterUUID;
-  bootstrap.targetDeploymentID = deployID; bootstrap.qualificationRunUUID = 1;
-  bootstrap.successorOperationUUID = 2; bootstrap.shardGroup = 2; bootstrap.expectedSeedGeneration = 1;
-  bootstrapScope.baselineOperationUUID = 3; bootstrapScope.nShardGroups = 3;
-  String normalizedPlan = {};
-  suite.require(BitseryEngine::serialize(normalizedPlan, deployment.plan) &&
-                    prodigyComputeSHA256Hex(normalizedPlan, bootstrapScope.planSHA256),
-                "repair_fixture_binds_canonical_bootstrap_plan");
-  bootstrapScope.artifactSHA256 = deployment.plan.config.containerBlobSHA256;
-  bootstrapScope.artifactBytes = deployment.plan.config.containerBlobBytes;
-  constexpr uint64_t bootstrapClientService = 0x7821'1001;
-  auto& root = brain.masterAuthorityRuntimeState.transportCredentialAuthorityRoot;
-  root.authorityEpoch = 41; root.keyEpoch = 42; root.authorityGeneration = 9;
-  std::fill(std::begin(root.root), std::end(root.root), uint8_t(0x2b));
-  ProdigyTransportCredentialEnrollment brainEnrollment = {};
-  brainEnrollment.operationUUID = 0x3240; brainEnrollment.nodeUUID = local.uuid;
-  brainEnrollment.clusterUUID = brain.brainConfig.clusterUUID;
-  brainEnrollment.authorityEpoch = root.authorityEpoch; brainEnrollment.keyEpoch = root.keyEpoch;
-  brainEnrollment.authorityGeneration = root.authorityGeneration;
-  brainEnrollment.role = ProdigyTransportCredentialNodeRole::brain; brainEnrollment.state = ProdigyTransportCredentialEnrollmentState::active;
-  brain.masterAuthorityRuntimeState.transportCredentialEnrollments.push_back(brainEnrollment);
-  for (unsigned i = 0; i < 2; ++i)
-  {
-    auto& machine = machines[i]; auto& member = members[i];
-    machine.uuid = local.uuid + i; machine.neuron.machine = &machine;
-    machine.neuron.connected = machine.neuron.isFixedFile = machine.neuron.artifactChunksEnabled = true;
-    machine.neuron.fslot = 17 + i; machine.neuron.ioGeneration = machine.neuron.verifiedInstalledBundleIOGeneration = 7;
-    machine.neuron.verifiedInstalledBundleAuthorityEpoch = brain.masterAuthorityEpoch;
-    machine.neuron.verifiedInstalledBundleSHA256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv;
-    ProdigyTransportCredentialEnrollment enrollment = {};
-    enrollment.operationUUID = 0x3250 + i; enrollment.nodeUUID = machine.uuid; enrollment.clusterUUID = brain.brainConfig.clusterUUID;
-    enrollment.authorityEpoch = root.authorityEpoch; enrollment.keyEpoch = root.keyEpoch; enrollment.authorityGeneration = root.authorityGeneration;
-    enrollment.role = ProdigyTransportCredentialNodeRole::neuron; enrollment.state = ProdigyTransportCredentialEnrollmentState::active;
-    brain.masterAuthorityRuntimeState.transportCredentialEnrollments.push_back(enrollment);
-    reserveTransportStream(machine.neuron);
-    if (i != 0)
-    {
-      ProdigyTransportTLSStream remote;
-      reserveTransportStream(remote);
-      ProdigyTransportCredentialBootstrap node = {};
-      String prelude;
-      suite.require(prodigyBuildTransportCredentialBootstrap(root, enrollment, brain.masterAuthorityRuntimeState.transportCredentialEnrollments,
-              true, node, brain.masterAuthorityRuntimeState.generation) && prodigyRenderLocalTransportCredentialPrelude(node, prelude) &&
-          brain.beginInternalControlTransport(&machine.neuron, false, ProdigyTransportCredentialNodeRole::neuron, machine.uuid) &&
-          remote.beginTransportAEGISWithPrelude(true, machine.uuid, prelude,
-            [node](const String& claim, std::array<uint8_t, 32>& key, String& context, uint128_t& peer) {
-              return prodigyResolveTransportCredentialBootstrapPeer(node, claim, "brain-neuron"_ctv, key.data(), context, peer);
-            }) && completeTransportHandshake(machine.neuron, remote), "repair_fixture_authenticates_remote_enrolled_donor");
-    }
-    machine.neuron.verifiedInstalledBundleIOGeneration = machine.neuron.ioGeneration = 7 + i;
-    machine.neuron.pendingSend = true; // capture frames without submitting a socket operation
-    brain.machines.insert(&machine); brain.machinesByUUID.insert_or_assign(machine.uuid, &machine); brain.neurons.insert(&machine.neuron);
-    member.uuid = 0x782110 + i; member.machine = &machine; member.deploymentID = deployID; member.applicationID = 3;
-    member.isStateful = true; member.shardGroup = 2; member.lifetime = ApplicationLifetime::base;
-    member.state = i ? ContainerState::healthy : ContainerState::crashedRestarting; member.runtimeReady = i == 1;
-    const IPAddress address(i ? "fd42::32" : "fd42::31", true);
-    std::memcpy(&member.meshAddress, address.v6, 16);
-    member.explicitStatefulMeshRoles.seeding = bootstrapClientService + 1;
-    member.explicitStatefulMeshRoles.sibling = bootstrapClientService + 2;
-    for (const auto service : {member.explicitStatefulMeshRoles.seeding, member.explicitStatefulMeshRoles.sibling})
-    {
-      if (i == 0) member.subscriptions.insert_or_assign(service, Subscription(service, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::all));
-      else member.advertisements.insert_or_assign(service, Advertisement(service, ContainerState::scheduled, ContainerState::destroying, uint16_t(20020 + service - bootstrapClientService)));
-    }
-    member.explicitStatefulMeshRoles.client = bootstrapClientService;
-    member.advertisements.insert_or_assign(bootstrapClientService,
-        Advertisement(bootstrapClientService, ContainerState::healthy, ContainerState::destroying, uint16_t(19081 + i)));
-    member.explicitStatefulTopology.shardGroup = 2;
-    member.explicitStatefulTopology.servingMode = StatefulTopologyServingMode::allMastersSeedBootstrap;
-    member.explicitStatefulTopology.allMastersSeedBootstrap = bootstrap;
-    brain.containers.insert_or_assign(member.uuid, &member); deployment.containers.insert(&member);
-    BrainReplicatedContainerRuntimeState sealed = {};
-    suite.require(brain.captureReplicatedContainerRuntimeState(&member, sealed), "repair_fixture_captures_shard_member");
-    auto& entry = scope.members.emplace_back(); entry.machineUUID = machine.uuid; entry.containerUUID = member.uuid;
-    entry.shardGroup = 2; entry.advertiseClient = true;
-    suite.require(prodigyStatefulServingRuntimeDigest(sealed, entry.planSHA256), "repair_fixture_seals_member");
-    brain.statefulServingRuntimeStates.push_back(std::move(sealed));
-  }
-  suite.require(prodigyValidateStatefulServingAuthorities(brain.masterAuthorityRuntimeState.statefulServingAuthorities,
-                    brain.statefulServingRuntimeStates, brain.masterAuthorityRuntimeState.generation),
-                "repair_fixture_bootstrap_authority_is_serializable");
-  auto& runtime = brain.masterAuthorityRuntimeState;
-  auto& requests = runtime.statefulServingMemberRepairs;
-  auto& target = members[0]; auto& donor = members[1];
-  ProdigyStatefulStoreBootFailure failure = {};
-  failure.kind = ProdigyStatefulStoreBootFailureKind::permission; failure.stage = ProdigyStatefulStoreBootFailureStage::environmentInspection;
-  failure.systemErrno = EACCES;
-  auto deliver = [&] {
-    String report;
-    suite.require(prodigyStatefulStoreBootFailureEncodeReport("native startup"_ctv, failure, report), "repair_fixture_encodes_failure");
-    brain.acceptNativeMemberRepair(&machines[0].neuron, &deployment, &target, report);
-  };
-  deliver(); suite.expect(requests.empty(), "repair_permission_failure_never_allocates_new_home");
-  failure.kind = ProdigyStatefulStoreBootFailureKind::missingMetadata; failure.stage = ProdigyStatefulStoreBootFailureStage::kvdbOpen;
-  failure.systemErrno = ENOENT; failure.generationUUID = 34;
-  deliver(); suite.expect(requests.empty(), "repair_stale_generation_report_cannot_seed");
-  const ProdigyStatefulServingAuthority *sealedScope = nullptr;
-  String sealedTargetDigest = {};
-  const auto *sealedTarget = prodigyStatefulServingRepairMember(runtime, brain.statefulServingRuntimeStates,
-      target.deploymentID, target.shardGroup, target.uuid, target.machine->uuid, sealedScope, sealedTargetDigest);
-  suite.expect(sealedTarget != nullptr && sealedScope == &scope &&
-                   sealedTargetDigest == scope.members.front().planSHA256,
-               "repair_fixture_target_matches_exact_sealed_member");
-  suite.expect(brain.containerRetirementNeuronAuthorized(&machines[0].neuron, machines[0].uuid),
-               "repair_fixture_target_machine_is_authenticated");
-  suite.expect(brain.statefulServingResourceObservationSupported(&machines[0]),
-               "repair_fixture_target_has_current_bundle_witness");
-  suite.expect(brain.masterAuthorityRuntimeStateDurable && brain.masterAuthorityPersistencePending == 0 &&
-                   brain.durableMasterAuthorityRuntimeStateGeneration == runtime.generation &&
-                   brain.statefulServingRecoveryReady(),
-               "repair_fixture_runtime_authority_is_current_and_durable");
-  suite.expect(brain.statefulStoreGenerationPeersCapable(true),
-               "repair_fixture_all_authoritative_brains_ack_member_repair_capability");
-  suite.expect(brain.containerRetirementAuthorityAcknowledged(),
-               "repair_fixture_all_authoritative_brains_ack_current_retirement_authority");
-  failure.generationUUID = 0; deliver();
-  suite.require(requests.size() == 1 && !runtime.statefulStoreGenerationSelections.size(), "repair_records_failed_home_before_selecting_a_source");
-  if (requests.size() == 1)
-  {
-    const auto operation = requests.front().operationUUID;
-    brain.driveNativeMemberRepairs();
-    suite.expect(requests.front().challenge.protocolVersion == 0, "repair_waits_for_request_persistence");
-    brain.finishRuntimePersistence(true);
-    deliver();
-    brain.driveNativeMemberRepairs();
-    suite.expect(requests.size() == 1 && requests.front().operationUUID == operation && !requests.front().challenge.protocolVersion,
-                 "repair_duplicate_failure_and_missing_donor_have_no_side_effect");
-    Brain::StatefulStoreReceiptCache cache = {};
-    auto& proof = cache.receipt;
-    proof.protocolVersion = ProdigyStatefulStoreReceipt::sourceCutVersion;
-    proof.localClusterUUID = brain.brainConfig.clusterUUID; proof.localContainerUUID = donor.uuid;
-    proof.deploymentID = proof.sourceDeploymentID = deployID; proof.storeKind = DeploymentIdentityStoreKind::kv;
-    proof.shardGroup = 2; proof.nShardGroups = 3; proof.writable = proof.siblingSessionHealthy = true;
-    proof.siblingSessionUUID = 11; proof.siblingSessionGeneration = 1; proof.seededFromClusterUUID = 12; proof.seededFromContainerUUID = 13;
-    proof.seedGeneration = 2; proof.operationUUID = 14; proof.sourceBaselineOperationUUID = 15; proof.sourceRequestUUID = 16;
-    proof.sourceMemberRequestUUID = 17; proof.seedRouteUUID = 18; proof.cutUUID = 19; proof.cutGeneration = 20;
-    proof.cutMaterialized = proof.committedHeadsDominateCut = true; proof.retainUntilMilliseconds = 1;
-    const auto& sha = machines[0].neuron.verifiedInstalledBundleSHA256;
-    proof.materializedContentSHA256 = proof.sourceContentWatermarkSHA256 = proof.seedFixtureSHA256 = sha;
-    proof.materializedHeadsSHA256 = proof.sourceCatchupWatermarkSHA256 = proof.appliedWatermarkSHA256 = sha;
-    cache.neuronMachineUUID = machines[1].uuid; cache.neuronIOGeneration = machines[1].neuron.ioGeneration; cache.authorityEpoch = brain.masterAuthorityEpoch;
-    suite.require(prodigyStatefulStoreReceiptValid(proof), "repair_fixture_valid_previous_donor_lineage");
-    brain.statefulStoreReceiptCaches.push_back(cache);
-    brain.driveNativeMemberRepairs();
-    suite.expect(requests.front().challenge.sourceContainerUUID == donor.uuid && requests.front().challenge.shardGroup == 2 &&
-                     requests.front().challenge.memberRequestUUID != 0 && runtime.statefulStoreGenerationSelections.empty(),
-                 "repair_chooses_one_exact_donor_in_nonzero_shard_before_copy");
-    String encoded; ProdigyMasterAuthorityRuntimeState restored = {};
-    suite.expect(BitseryEngine::serialize(encoded, runtime) && BitseryEngine::deserializeSafe(encoded, restored) &&
-                     restored.statefulServingMemberRepairs == requests,
-                 "repair_donor_challenge_and_failed_home_survive_durable_round_trip");
-    if (requests.front().challenge.protocolVersion != 0)
-    {
-      brain.finishRuntimePersistence(true); brain.driveNativeMemberRepairs();
-      auto pending = brain.statefulSourceCuts.find(donor.uuid);
-      suite.expect(pending != brain.statefulSourceCuts.end(), "repair_dispatches_durable_native_donor_challenge");
-      if (pending != brain.statefulSourceCuts.end())
-      {
-        auto receipt = pending->second.outstanding; receipt.response = true; receipt.ready = true;
-        receipt.cutUUID = 0x7192; receipt.cutGeneration = 3; receipt.contentSHA256 = receipt.headsSHA256 = sha;
-        String bytes, frame; BitseryEngine::serialize(bytes, receipt);
-        brain.neuronHandler(&machines[1].neuron, buildNeuronMessage(frame, NeuronTopic::statefulStoreSourceCut, donor.uuid, bytes));
-        suite.expect(runtime.statefulStoreGenerationSelections.size() == 1 &&
-                     runtime.statefulStoreGenerationSelections.front().authority.cutUUID == receipt.cutUUID &&
-                     runtime.statefulStoreGenerationSelections.front().authority.targetContainerUUID == target.uuid &&
-                     runtime.statefulStoreGenerationSelections.front().authority.sourceContainerUUID == donor.uuid &&
-                     runtime.statefulStoreGenerationSelections.front().authority.operationUUID == operation,
-                     "repair_native_donor_reply_selects_one_exact_generation");
-        if (!runtime.statefulStoreGenerationSelections.empty())
-        {
-          brain.finishRuntimePersistence(true);
-          exerciseNativeMemberLease(suite, brain, target, donor, runtime.statefulStoreGenerationSelections.front());
-        }
-      }
-    }
-  }
-  for (unsigned i = 0; i < 2; ++i) { deployment.containers.erase(&members[i]); brain.containers.erase(members[i].uuid);
-    brain.neurons.erase(&machines[i].neuron); brain.machinesByUUID.erase(machines[i].uuid); brain.machines.erase(&machines[i]); }
-  brain.deployments.erase(deployID); thisBrain = oldBrain; thisNeuron = oldNeuron;
 }
 
 static void testBrainNeuronHandlerHandlesRestartingContainerFailure(TestSuite& suite)
@@ -35655,13 +35440,23 @@ static void testLocalBundleRecoveryWaitsForCapturedInventory(TestSuite& suite)
 static void testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(TestSuite& suite)
 {
   ScopedRing scopedRing = {};
-  TestBrain brain = {};
+  TransportCredentialCohortTestBrain brain = {};
   NoopBrainIaaS iaas = {};
   brain.iaas = &iaas;
   brain.weAreMaster = true;
   brain.ignited = true;
   brain.persistedMachineInventoryEnumerated = true;
   brain.brainConfig.datacenterFragment = 1;
+  brain.nBrains = 1;
+
+  TestNeuron self = {};
+  self.uuid = uint128_t(0x5219f000);
+  NeuronBase *previousNeuron = thisNeuron;
+  thisNeuron = &self;
+  ClusterMachine selfMember = {};
+  selfMember.uuid = self.uuid;
+  selfMember.isBrain = true;
+  brain.authoritativeTopology.machines.push_back(selfMember);
 
   BrainBase *previousBrain = thisBrain;
   thisBrain = &brain;
@@ -35686,6 +35481,7 @@ static void testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(Tes
   deployment.state = DeploymentState::running;
   brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
   brain.deploymentsByApp.insert_or_assign(deployment.plan.config.applicationID, &deployment);
+  brain.deploymentPlans.insert_or_assign(deployment.plan.config.deploymentID(), deployment.plan);
 
   ContainerView retained = {};
   retained.uuid = uint128_t(0x5219f002);
@@ -35712,6 +35508,8 @@ static void testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(Tes
   machine.runtimeReady = true;
   brain.masterAuthorityRuntimeStateDurable = true;
   brain.durableMasterAuthorityRuntimeStateGeneration = brain.masterAuthorityRuntimeState.generation;
+  suite.require(brain.containerRetirementAuthorityAcknowledged(),
+                "persisted_inventory_runtime_fixture_has_current_retirement_authority");
   brain.updateSelfWorkerExpectedBundleSHA256 =
       "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"_ctv;
   suite.require(brain.prepareLocalBundleExecRecovery(),
@@ -35739,6 +35537,20 @@ static void testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(Tes
                    deployment.containers.contains(restored->second) &&
                    brain.recoveringPersistedNeuronInventory,
                "persisted_inventory_runtime_does_not_discard_unready_retained_stateless_container_before_exact_uploads");
+
+  // Old snapshots could persist a scheduler reservation that never launched.
+  // It must wait on the same authenticated recovery inventory without becoming
+  // a ghost runtime or blocking bootstrap of the retained real container.
+  BrainReplicatedContainerRuntimeState unlaunched = {};
+  unlaunched.machineUUID = machine.uuid;
+  unlaunched.plan.uuid = uint128_t(0x5219f003);
+  unlaunched.plan.config = deployment.plan.config;
+  unlaunched.plan.state = ContainerState::planned;
+  brain.applyReplicatedContainerRuntimeState(unlaunched);
+  suite.expect(!brain.containers.contains(unlaunched.plan.uuid) &&
+                   brain.pendingReplicatedContainerRuntimeStates.contains(deployment.plan.config.deploymentID()) &&
+                   brain.recoveringPersistedNeuronInventory,
+               "persisted_inventory_runtime_legacy_reservation_waits_without_materializing_ghost");
 
   // A digest-matching registration and the exact fresh inventory upload let
   // the existing central recovery owner release the coordinator barrier.
@@ -35783,11 +35595,24 @@ static void testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(Tes
                                                                                                         machine.fragment)));
   }
   restored = brain.containers.find(retained.uuid);
-  suite.expect(brain.recoveringPersistedNeuronInventory == false &&
-                   restored != brain.containers.end() && restored->second != nullptr &&
-                   deployment.containers.contains(restored->second),
+  const bool recoveryCompleted = !brain.recoveringPersistedNeuronInventory &&
+      restored != brain.containers.end() && restored->second != nullptr &&
+      deployment.containers.contains(restored->second) &&
+      !brain.containers.contains(unlaunched.plan.uuid) &&
+      brain.pendingReplicatedContainerRuntimeStates.empty();
+  suite.expect(recoveryCompleted,
                "persisted_inventory_runtime_central_recovery_releases_after_fresh_switchboard_ack");
 
+  if (auto ghost = brain.containers.find(unlaunched.plan.uuid); ghost != brain.containers.end())
+  {
+    ContainerView *view = ghost->second;
+    deployment.containers.erase(view);
+    machine.removeContainerIndexEntry(view->deploymentID, view);
+    brain.containers.erase(ghost);
+    delete view;
+  }
+
+  restored = brain.containers.find(retained.uuid);
   if (restored != brain.containers.end() && restored->second != nullptr)
   {
     ContainerView *view = restored->second;
@@ -35801,10 +35626,12 @@ static void testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(Tes
   }
   brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
   brain.deployments.erase(deployment.plan.config.deploymentID());
+  brain.deploymentPlans.erase(deployment.plan.config.deploymentID());
   brain.neurons.erase(&machine.neuron);
   brain.machinesByUUID.erase(machine.uuid);
   brain.machines.erase(&machine);
   thisBrain = previousBrain;
+  thisNeuron = previousNeuron;
 }
 
 static void testMachineConstructionInitializesLifecycleState(TestSuite& suite)
@@ -39076,7 +38903,7 @@ static void testOrphanedMaterializedStatefulHeadRecovery(TestSuite& suite)
   head->plan.config.architecture = nametagCurrentBuildMachineArchitecture();
   head->plan.config.containerBlobSHA256.assign("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"_ctv);
   head->plan.canaryCount = 0;
-  head->plan.stateful.allMasters = false;
+  head->plan.stateful.writerMode = StatefulWriterMode::localSingleWriter;
   head->plan.stateful.allowUpdateInPlace = true;
   head->plan.stateful.clientPrefix = (uint64_t(applicationID) << 48) | (uint64_t(1) << 40);
   head->plan.stateful.siblingPrefix = (uint64_t(applicationID) << 48) | (uint64_t(2) << 40);
@@ -40371,7 +40198,7 @@ static void testInitialSeedLaunchAcknowledgement(TestSuite& suite)
 
   ApplicationDeployment deployment = {};
   deployment.plan = makeDeploymentPlan(2, 112);
-  deployment.plan.isStateful = true; deployment.plan.stateful.allMasters = true;
+  deployment.plan.isStateful = true; deployment.plan.stateful.writerMode = StatefulWriterMode::allMasters;
   deployment.plan.config.type = ApplicationType::stateful;
   deployment.plan.canaryCount = 0; deployment.plan.canariesMustLiveForMinutes = 0;
   deployment.plan.stateful.neverShard = true;
@@ -44637,6 +44464,247 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite, bool handof
           selfMachine.neuron.cousinDiscoveryVersion = savedDiscoveryVersion;
           suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA), "automatic_client_authority_restores_legacy_fixture_scope");
         }
+        for (uint16_t globalApplication : {uint16_t(10), uint16_t(42)}) {
+          // A replacement learner overlaps an existing remote voter. Both use
+          // the same sibling permission and slot, but need independent private
+          // sessions. Exercise the real driver behind its authenticated gates.
+          const auto savedAuthority = permissionBrain.masterAuthorityRuntimeState;
+          const auto savedDiscovery = permissionBrain.cousinDiscoveryReceipts;
+          const auto savedMasque = permissionBrain.crossClusterMasqueReadinessReceipts;
+          const auto savedBGP = permissionBrain.crossClusterPrivateBGPReadinessReceipts;
+          const auto savedAutomaticDrive = permissionBrain.lastCousinAutomaticSessionDriveMs;
+          struct SavedPrivateNeuron {
+            bool member, neuronMember, ready, cousinCapable;
+            uint8_t cousinVersion; uint32_t projectionVersion;
+            uint64_t generation; String fingerprint, acknowledgedFingerprint;
+          };
+          std::array<Machine *, 3> privateMachines = {&selfMachine, &peerAMachine, &peerBMachine};
+          std::array<SavedPrivateNeuron, 3> savedPrivateNeurons = {};
+          for (size_t index = 0; index < privateMachines.size(); ++index) {
+            auto *machine = privateMachines[index]; auto& neuron = machine->neuron;
+            savedPrivateNeurons[index] = {permissionBrain.machines.contains(machine), permissionBrain.neurons.contains(&neuron),
+                machine->runtimeReady, neuron.cousinDiscoveryCapable, neuron.cousinDiscoveryVersion,
+                neuron.clusterPairProjectionVersion, neuron.clusterPairProjectionGeneration,
+                neuron.clusterPairProjectionFingerprint, neuron.clusterPairProjectionAcknowledgedFingerprint};
+            machine->runtimeReady = true; neuron.cousinDiscoveryCapable = true; neuron.cousinDiscoveryVersion = 3;
+            neuron.clusterPairProjectionVersion = 3;
+            permissionBrain.machines.insert(machine); permissionBrain.neurons.insert(&neuron);
+          }
+          permissionBrain.cousinSessions.clear(); selfMachine.neuron.wBuffer.clear();
+          for (BrainView *peer : {&permissionPeerA, &permissionPeerB}) {
+            String capabilityFrame = {};
+            permissionBrain.brainHandler(peer, buildBrainMessage(capabilityFrame, BrainTopic::acknowledgeCapabilities,
+                uint64_t(2 | 32 | 64 | 256 | 512 | 1024 | 8192 | 32768 | 65536)));
+          }
+          auto& privateOperation = permissionBrain.masterAuthorityRuntimeState.clusterPairEnrollmentOperations.front();
+          privateOperation.protocolVersion = ProdigyClusterPairEnrollmentOperation::privateDiscoveryVersion;
+          privateOperation.privateDiscoveryActivationUUID = privateOperation.operationUUID;
+          privateOperation.privateDiscoveryPhase = ProdigyPairPrivateDiscoveryPhase::active;
+          privateOperation.privateDiscoveryTransitionGeneration = permissionBrain.masterAuthorityRuntimeState.generation;
+
+          ApplicationDeployment truth = {};
+          truth.plan.config = live.plan.config; truth.plan.config.applicationID = globalApplication;
+          truth.plan.config.type = ApplicationType::stateful; truth.plan.isStateful = true;
+          truth.plan.stateful.neverShard = true; truth.plan.stateful.writerMode = StatefulWriterMode::globalSingleWriter; truth.nShardGroups = 1;
+          truth.plan.stateful.clientPrefix = prodigyRuntimeStatefulServicePrefix(globalApplication, 1);
+          truth.plan.stateful.siblingPrefix = prodigyRuntimeStatefulServicePrefix(globalApplication, 11);
+          truth.plan.stateful.cousinPrefix = prodigyRuntimeStatefulServicePrefix(globalApplication, 3);
+          truth.plan.stateful.seedingPrefix = prodigyRuntimeStatefulServicePrefix(globalApplication, 4);
+          truth.plan.stateful.shardingPrefix = prodigyRuntimeStatefulServicePrefix(globalApplication, 5);
+          const uint64_t sibling = MeshServices::constrainPrefixToGroup(prodigyRuntimeStatefulServicePrefix(globalApplication, 11), 0);
+          truth.plan.subscriptions.emplace_back(sibling, ContainerState::healthy, ContainerState::destroying, SubscriptionNature::all);
+          ContainerView truthSource = {};
+          truthSource.uuid = 0x9e10; truthSource.machine = &selfMachine; truthSource.fragment = 3;
+          truthSource.deploymentID = truth.plan.config.deploymentID(); truthSource.isStateful = true;
+          truthSource.state = ContainerState::healthy; truthSource.runtimeReady = true;
+          truthSource.subscriptions.emplace(sibling, truth.plan.subscriptions.front());
+          IPAddress localAddress = prodigyContainerDatacenterSitePrefix(1).network; localAddress.v6[15] = 1;
+          std::memcpy(&truthSource.meshAddress, localAddress.v6, 16);
+          truth.containers.insert(&truthSource);
+          permissionBrain.deployments.insert_or_assign(truthSource.deploymentID, &truth);
+          permissionBrain.containers.insert_or_assign(truthSource.uuid, &truthSource);
+
+          auto truthPermission = activePermission.permission;
+          truthPermission.protocolVersion = ProdigyLocalCousinServicePermission::purposeVersion;
+          truthPermission.permissionUUID = 0x9e01; truthPermission.purpose = ProdigyCousinServicePurpose::sibling;
+          truthPermission.localApplicationID = truthPermission.peerApplicationID = globalApplication;
+          truthPermission.localCousinServicePrefix = truthPermission.peerCousinServicePrefix = prodigyRuntimeStatefulServicePrefix(globalApplication, 11);
+          truthPermission.localDeploymentID = truthPermission.peerDeploymentID = truthSource.deploymentID;
+          truthPermission.authorizedService = sibling; truthPermission.destinationShardGroup = 0; truthPermission.destinationShardGroups = 1;
+          truthPermission.slots = {}; truthPermission.slots.insert(0);
+          String truthPlanBytes = {};
+          suite.require(BitseryEngine::serialize(truthPlanBytes, truth.plan) &&
+              prodigyComputeSHA256Hex(truthPlanBytes, truthPermission.canonicalPlanSHA256),
+              "global_single_writer_private_sessions_bind_exact_live_sibling_plan");
+          truthPermission.peerCanonicalPlanSHA256 = truthPermission.canonicalPlanSHA256;
+          truthPermission.peerArtifactSHA256 = truthPermission.artifactSHA256;
+          truthPermission.peerArtifactBytes = truthPermission.artifactBytes;
+          auto remoteTruthPermission = truthPermission;
+          remoteTruthPermission.permissionUUID = 0x9e02; remoteTruthPermission.localHalf = CousinRouteHalf::destination;
+          std::swap(remoteTruthPermission.localClusterUUID, remoteTruthPermission.peerClusterUUID);
+          permissionBrain.masterAuthorityRuntimeState.localCousinServicePermissions = {truthPermission};
+
+          GlobalSingleWriterMembershipProjection membership = {};
+          membership.membershipUUID = 0x9e03; membership.operationUUID = 0x9e04;
+          membership.localClusterUUID = clusterUUID; membership.deploymentID = truthSource.deploymentID;
+          membership.generation = 1; membership.expectedCommittedConfigIndex = 5;
+          membership.expectedCommittedConfigSHA256 = truthPermission.canonicalPlanSHA256;
+          membership.genesisMemberIDs = {1, 2, 3}; membership.highestAllocatedMemberID = 4; membership.replacementPending = true;
+          for (int32_t id = 1; id <= 4; ++id) {
+            GlobalSingleWriterMember member = {}; member.memberID = id;
+            member.clusterUUID = id % 2 ? clusterUUID : truthPermission.peerClusterUUID;
+            member.containerUUID = id == 1 ? truthSource.uuid : uint128_t(0x9e10 + id);
+            member.privateIPv6 = prodigyContainerDatacenterSitePrefix(id % 2 ? 1 : 2).network;
+            member.privateIPv6.v6[15] = uint8_t(id);
+            member.role = id == 4 ? GlobalSingleWriterMemberRole::learner : GlobalSingleWriterMemberRole::voter;
+            membership.members.push_back(member);
+          }
+          suite.require(prodigyGlobalSingleWriterMembershipProjectionValid(membership), "global_single_writer_private_sessions_committed_voters_overlap_learner");
+          permissionBrain.masterAuthorityRuntimeState.globalSingleWriterMembershipProjections = {membership};
+          const auto savedPeerVersion = permissionPeerA.version;
+          permissionPeerA.version = ProdigyGlobalSingleWriterMinimumVersion - 1;
+          suite.expect(!permissionBrain.deploymentReplicationAllowedForPeer(truthSource.deploymentID, &permissionPeerA) &&
+              !permissionBrain.peerCanReceiveMasterAuthorityState(&permissionPeerA),
+              "global_single_writer_rejects_legacy_plan_and_authority_replication");
+          permissionPeerA.version = ProdigyGlobalSingleWriterMinimumVersion;
+          suite.expect(permissionBrain.deploymentReplicationAllowedForPeer(truthSource.deploymentID, &permissionPeerA),
+              "global_single_writer_accepts_current_plan_replication");
+          permissionPeerA.version = savedPeerVersion;
+
+          auto gateway = makeGatewayReadinessReplayAuthority();
+          const auto& pair = permissionBrain.masterAuthorityRuntimeState.clusterPairEnrollments.front();
+          gateway.pairUUID = pair.pairUUID; gateway.pairOperationUUID = pair.operationUUID;
+          gateway.localClusterUUID = clusterUUID; gateway.peerClusterUUID = pair.peerClusterUUID;
+          gateway.localMachineUUID = selfMachine.uuid; gateway.peerMachineUUID = cacheRemote.nodeUUID;
+          gateway.pairAuthorityGeneration = pair.localAuthorityGeneration; gateway.keyGeneration = pair.agreedKeyEpoch;
+          suite.require(prodigyDeriveCrossClusterMasquePrivateBGPTuple(gateway), "global_single_writer_private_sessions_derive_gateway_scope");
+          gateway.privateSessionCredentialSHA256 = gateway.artifactSHA256;
+          permissionBrain.masterAuthorityRuntimeState.crossClusterMasqueGatewayAuthorities = {gateway};
+          auto truthReceipt = cacheReceipt;
+          truthReceipt.snapshot.protocolVersion = ProdigyCousinDiscoverySnapshot::privateContainerVersion;
+          truthReceipt.snapshot.records.clear(); truthReceipt.sequence += 100;
+          permissionBrain.masterAuthorityRuntimeState.cousinRoutes.clear();
+          for (size_t index : {size_t(1), size_t(3)}) {
+            auto counterpart = remoteCounterpart; counterpart.permission = remoteTruthPermission;
+            counterpart.containerUUID = membership.members[index].containerUUID;
+            counterpart.containerID = uint32_t(0x01020300 + index); counterpart.shardGroup = 0; counterpart.shardGroups = 1;
+            counterpart.service = sibling; counterpart.ownedSlots = truthPermission.slots;
+            counterpart.routablePrefixUUID = 0; counterpart.publicAddress = membership.members[index].privateIPv6;
+            counterpart.publicTCPPort = counterpart.servicePort; counterpart.wormholeRevision.clear();
+            truthReceipt.snapshot.records.push_back(counterpart);
+            auto route = sessionRoute; route.version = 3; route.endpointKind = CousinRouteEndpointKind::privateContainer;
+            route.routeUUID = uint128_t(0x9e20 + index); route.operationUUID = uint128_t(0x9e30 + index);
+            route.sourceApplicationID = route.destinationApplicationID = globalApplication;
+            route.sourceCousinServicePrefix = route.destinationCousinServicePrefix = prodigyRuntimeStatefulServicePrefix(globalApplication, 11);
+            route.sourcePermissionUUID = truthPermission.permissionUUID; route.destinationPermissionUUID = remoteTruthPermission.permissionUUID;
+            route.slots = truthPermission.slots; route.destinationRoutablePrefixUUID = 0; route.destinationCIDR = 128;
+            route.destinationPublicAddress = counterpart.publicAddress; route.destinationTCPPort = counterpart.publicTCPPort;
+            suite.require(cousinRouteStructurallyValid(route), "global_single_writer_private_sessions_exact_remote_route_valid");
+            permissionBrain.masterAuthorityRuntimeState.cousinRoutes.push_back(route);
+          }
+          suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA), "global_single_writer_private_sessions_qualify_current_authority");
+          for (auto *machine : privateMachines) {
+            ProdigyLocalClusterPairControlProjection privateProjection = {}; String privateFingerprint = {};
+            suite.require(permissionBrain.buildLocalClusterPairControlProjection(machine->uuid, privateProjection, privateFingerprint),
+                "global_single_writer_private_sessions_build_private_discovery_projection");
+            machine->neuron.clusterPairProjectionGeneration = privateProjection.committedAuthorityGeneration;
+            machine->neuron.clusterPairProjectionFingerprint = machine->neuron.clusterPairProjectionAcknowledgedFingerprint = privateFingerprint;
+          }
+          // The surrounding fixture committed a newer permission generation
+          // after cacheReceipt was made. Bind this receipt to the freshly
+          // acknowledged private-discovery carrier projection above.
+          truthReceipt.projectionGeneration = selfMachine.neuron.clusterPairProjectionGeneration;
+          suite.require(permissionBrain.localCousinServicePermissionMatchesCurrentLivePlan(truthPermission),
+              "global_single_writer_private_sessions_permission_matches_current_live_plan");
+          suite.require(permissionBrain.clusterPairPrivateDiscoveryActive(pair.pairUUID, pair.rootGeneration, pair.peerClusterUUID),
+              "global_single_writer_private_sessions_require_acknowledged_private_discovery");
+          ProdigyCrossClusterMasqueGatewayReadiness masque = {};
+          masque.pairUUID = gateway.pairUUID; masque.localClusterUUID = clusterUUID; masque.localMachineUUID = selfMachine.uuid;
+          masque.keyEpoch = gateway.keyGeneration; masque.authorityGeneration = gateway.pairAuthorityGeneration;
+          masque.gatewayGeneration = gateway.generation; masque.authenticatedMasqueQUICReady = true;
+          ProdigyCrossClusterPrivateBGPReadiness bgp = {};
+          bgp.scope.pairUUID = gateway.pairUUID; bgp.scope.operationUUID = gateway.pairOperationUUID;
+          bgp.scope.keyEpoch = gateway.keyGeneration; bgp.scope.tunnelSlot = gateway.tunnelSlot;
+          bgp.scope.clusterUUID = clusterUUID; bgp.scope.machineUUID = selfMachine.uuid;
+          bgp.scope.authorityGeneration = gateway.pairAuthorityGeneration; bgp.scope.gatewayGeneration = gateway.generation;
+          bgp.peerMachineUUID = gateway.peerMachineUUID; bgp.localSitePrefix = gateway.localSitePrefix; bgp.peerSitePrefix = gateway.peerSitePrefix;
+          bgp.localSitePrefixAnnounced = bgp.sessionEstablished = bgp.peerSitePrefixImported = bgp.switchboardFallbackInstalled = true;
+          String readinessBytes = {}, readinessFrame = {};
+          BitseryEngine::serialize(readinessBytes, masque);
+          permissionBrain.neuronHandler(&selfMachine.neuron, buildNeuronMessage(readinessFrame, NeuronTopic::crossClusterMasqueGatewayReadinessReceipt, readinessBytes));
+          readinessBytes.clear(); readinessFrame.clear(); BitseryEngine::serialize(readinessBytes, bgp);
+          permissionBrain.neuronHandler(&selfMachine.neuron, buildNeuronMessage(readinessFrame, NeuronTopic::crossClusterPrivateBGPReadinessReceipt, readinessBytes));
+          suite.require(permissionBrain.cousinPrivateRouteGatewayReady(permissionBrain.masterAuthorityRuntimeState.cousinRoutes.front(), CousinRouteHalf::source),
+              "global_single_writer_private_sessions_require_live_authenticated_gateway_and_bgp_receipts");
+          permissionBrain.cousinDiscoveryReceipts.clear();
+          auto wrongAddressReceipt = truthReceipt;
+          ++wrongAddressReceipt.snapshot.records.front().publicAddress.v6[15];
+          permissionBrain.masterAuthorityRuntimeState.cousinRoutes.front().destinationPublicAddress = wrongAddressReceipt.snapshot.records.front().publicAddress;
+          suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA), "global_single_writer_private_sessions_qualify_mismatched_discovered_address_route");
+          suite.require(prodigyCousinDiscoveryReceiptValid(wrongAddressReceipt), "global_single_writer_private_sessions_wrong_address_receipt_is_authenticated_and_well_formed");
+          permissionBrain.receiveCousinDiscoverySnapshot(&selfMachine.neuron, wrongAddressReceipt);
+          suite.require(permissionBrain.queryCousinCounterparts({1, truthPermission.permissionUUID, 0}).records.size() == 2,
+              "global_single_writer_private_sessions_wrong_address_reaches_membership_admission_gate");
+          ProdigyCousinSessionRequest truthRequest = {};
+          truthRequest.requestUUID = 0x9e40; truthRequest.permissionUUID = truthPermission.permissionUUID; truthRequest.bindingNonce = 0x9e41;
+          suite.expect(!permissionBrain.cousinSessionSourceRequest(&selfMachine.neuron, truthSource.uuid, truthRequest, true, &membership.members[1]),
+              "global_single_writer_private_sessions_reject_discovered_ip_outside_exact_member_binding");
+          permissionBrain.masterAuthorityRuntimeState.cousinRoutes.front().destinationPublicAddress = membership.members[1].privateIPv6;
+          suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA), "global_single_writer_private_sessions_restore_exact_member_address_route");
+          ++truthReceipt.sequence;
+          permissionBrain.receiveCousinDiscoverySnapshot(&selfMachine.neuron, truthReceipt);
+          suite.require(permissionBrain.queryCousinCounterparts({1, truthPermission.permissionUUID, 0}).records.size() == 2,
+              "global_single_writer_private_sessions_discover_overlapping_remote_voter_and_learner");
+          auto wrongMember = membership.members[1]; ++wrongMember.containerUUID;
+          suite.expect(!permissionBrain.cousinSessionSourceRequest(&selfMachine.neuron, truthSource.uuid, truthRequest, true, &wrongMember),
+              "global_single_writer_private_sessions_reject_uncommitted_counterpart_identity");
+          auto driveTruth = [&] { permissionBrain.lastCousinAutomaticSessionDriveMs = 0; permissionBrain.driveCousinSessions(); };
+          driveTruth();
+          if (suite.require(permissionBrain.cousinSessions.size() == 2, "global_single_writer_private_sessions_driver_preserves_voter_and_adds_learner")) {
+            const auto first = permissionBrain.cousinSessions[0]; const auto second = permissionBrain.cousinSessions[1];
+            suite.expect(prodigyCousinSessionUsesPrivateContainerEndpoints(first.record) && prodigyCousinSessionUsesPrivateContainerEndpoints(second.record) &&
+                first.record.sourcePermission.permissionUUID == truthPermission.permissionUUID &&
+                second.record.sourcePermission.permissionUUID == truthPermission.permissionUUID && first.record.slot == 0 && second.record.slot == 0 &&
+                first.record.destination.containerUUID == membership.members[1].containerUUID &&
+                second.record.destination.containerUUID == membership.members[3].containerUUID &&
+                first.record.sourceBindingNonce != second.record.sourceBindingNonce && first.record.sourceTCPPort != second.record.sourceTCPPort &&
+                permissionBrain.cousinSessionLocalCurrent(first) && permissionBrain.cousinSessionLocalCurrent(second),
+                "global_single_writer_private_sessions_bind_two_exact_members_with_distinct_private_source_tuples");
+            driveTruth();
+            suite.expect(permissionBrain.cousinSessions.size() == 2 &&
+                prodigyCousinSessionExact(permissionBrain.cousinSessions[0].record, first.record) &&
+                prodigyCousinSessionExact(permissionBrain.cousinSessions[1].record, second.record),
+                "global_single_writer_private_sessions_repeated_driver_keeps_both_leases_without_duplicates");
+            auto retired = membership; retired.members.erase(retired.members.begin() + 1); retired.retiredMemberIDs = {2};
+            ++retired.generation; ++retired.expectedCommittedConfigIndex;
+            suite.require(prodigyGlobalSingleWriterMembershipProjectionValid(retired), "global_single_writer_private_sessions_retirement_projection_valid");
+            permissionBrain.masterAuthorityRuntimeState.globalSingleWriterMembershipProjections = {retired};
+            suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA), "global_single_writer_private_sessions_qualify_retirement_projection");
+            suite.expect(!permissionBrain.cousinSessionLocalCurrent(first) && permissionBrain.cousinSessionLocalCurrent(second),
+                "global_single_writer_private_sessions_retired_voter_fenced_while_learner_remains_current");
+            driveTruth();
+            suite.expect(permissionBrain.cousinSessions.size() == 1 &&
+                prodigyCousinSessionExact(permissionBrain.cousinSessions.front().record, second.record),
+                "global_single_writer_private_sessions_driver_retires_only_removed_member");
+          }
+          permissionBrain.cousinSessions.clear(); permissionBrain.containers.erase(truthSource.uuid);
+          permissionBrain.deployments.erase(truthSource.deploymentID); truth.containers.erase(&truthSource);
+          permissionBrain.lastCousinAutomaticSessionDriveMs = savedAutomaticDrive;
+          selfMachine.neuron.wBuffer.clear();
+          permissionBrain.masterAuthorityRuntimeState = savedAuthority;
+          permissionBrain.cousinDiscoveryReceipts = savedDiscovery;
+          permissionBrain.crossClusterMasqueReadinessReceipts = savedMasque; permissionBrain.crossClusterPrivateBGPReadinessReceipts = savedBGP;
+          for (size_t index = 0; index < privateMachines.size(); ++index) {
+            auto *machine = privateMachines[index]; auto& neuron = machine->neuron; const auto& saved = savedPrivateNeurons[index];
+            machine->runtimeReady = saved.ready; neuron.cousinDiscoveryCapable = saved.cousinCapable;
+            neuron.cousinDiscoveryVersion = saved.cousinVersion; neuron.clusterPairProjectionVersion = saved.projectionVersion;
+            neuron.clusterPairProjectionGeneration = saved.generation; neuron.clusterPairProjectionFingerprint = saved.fingerprint;
+            neuron.clusterPairProjectionAcknowledgedFingerprint = saved.acknowledgedFingerprint;
+            if (!saved.member) permissionBrain.machines.erase(machine);
+            if (!saved.neuronMember) permissionBrain.neurons.erase(&neuron);
+          }
+          suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA), "global_single_writer_private_sessions_restore_surrounding_authority_fixture");
+        }
         permissionBrain.cousinSessions.clear(); permissionBrain.containers.erase(sourceApp.uuid);
         permissionBrain.masterAuthorityRuntimeState.cousinRoutes.clear();
         suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA),
@@ -45915,18 +45983,25 @@ static void testAuthorityElectionFrontierRefreshesDurablePeerRevision(TestSuite&
 
 int main(void)
 {
-  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "native-member-repair-controller") == 0)
+  if (const char* only=getenv("PRODIGY_TEST_ONLY"); only && strcmp(only,"global-writer-reservations")==0) {
+    TestSuite suite; testGlobalSingleWriterEndpointReservations(suite);
+    std::printf("GLOBAL_WRITER_RESERVATIONS_RESULT passed=%d failed=%d\n",suite.passed,suite.failed);
+    return suite.failed ? EXIT_FAILURE : EXIT_SUCCESS;
+  }
+
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "credential-wide-metrics-snapshot") == 0)
   {
     TestSuite suite;
-    testNativeMemberRepairController(suite);
-    std::printf("NATIVE_MEMBER_REPAIR_CONTROLLER failed_assertions=%d\n", suite.failed);
+    testReconcileStateReplicatesWideMetricsSnapshot(suite);
+    std::printf("WIDE_METRICS_SNAPSHOT_RESULT passed=%d failed=%d\n", suite.passed, suite.failed);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
-  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "native-repair-neuron-gate") == 0)
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "persisted-inventory-runtime") == 0)
   {
     TestSuite suite;
-    testNativeRepairNeuronEndpointFence(suite);
-    std::printf("NATIVE_REPAIR_NEURON_GATE_RESULT failed_assertions=%d\n", suite.failed);
+    testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(suite);
+    std::printf("PERSISTED_INVENTORY_RUNTIME_RESULT passed=%d failed=%d\n", suite.passed, suite.failed);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "authority-frontier-refresh") == 0)
@@ -46016,8 +46091,6 @@ int main(void)
     testStatefulServingAuthorityFanoutCapability(suite);
     testRestoredRuntimeRequiresFreshInventory(suite);
     testStatefulServingLaunchAdmission(suite);
-    testStatefulStoreGenerationBootstrapProjection(suite);
-    testStatefulStoreGenerationProjection(suite);
     testStatefulServingResourceAdjustment(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
@@ -46190,6 +46263,7 @@ int main(void)
   {
     ScopedRing ring = {};
     testSpinApplicationInvalidPlanUsesSingleTopicFrame(suite);
+    testMalformedWriterModeRejectedBeforeAdmission(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "credential-fixture-repairs") == 0)
@@ -46197,6 +46271,7 @@ int main(void)
     ScopedRing ring = {};
     testBrainHandlerReplicationPaths(suite);
     testReconcileStateReplicatesCredentialAndTlsState(suite);
+    testReconcileStateReplicatesWideMetricsSnapshot(suite);
     testMothershipTunnelProviderReconcileBackfillsDesiredStateAndArtifact(suite);
     testMothershipConfigureAppliesClusterUUID(suite);
     testMothershipConfigureRetriesPersistenceBackpressure(suite);
@@ -46448,11 +46523,9 @@ int main(void)
       only != nullptr && strcmp(only, "duplicate-inventory-recovery") == 0)
   {
     testNeuronPendingLaunchStateUploadRetainsCanonicalUUID(suite);
-    testNeuronSpinContainerRetainsStatefulStoreGenerationSelection(suite);
     testNeuronPendingLaunchControlReplacementReissuesAuthenticatedReplay(suite);
     testNeuronFreshScheduledStateUploadResumesOrdinarySpin(suite);
     testNeuronStateUploadSkipsExistingLiveContainer(suite);
-    testNeuronStateUploadStagesGenerationRestartBeforeTimerCancellation(suite);
     testNeuronControlClosePreservesExactOwnersUntilFreshInventory(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
@@ -46501,12 +46574,6 @@ int main(void)
       only != nullptr && strcmp(only, "brain-recovery-inventory-healthy-gate") == 0)
   {
     testMachineHealthyDefersStatelessRecoveryUntilInventoryComplete(suite);
-    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
-  }
-  if (const char *only = getenv("PRODIGY_TEST_ONLY");
-      only != nullptr && strcmp(only, "persisted-inventory-runtime") == 0)
-  {
-    testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
@@ -46932,6 +46999,7 @@ int main(void)
   testNeuronContainerHandlerRecordsMasterLocalTlsResumptionAckWithoutBrainStream(suite);
   testBrainHandlerReplicationPaths(suite);
   testReconcileStateReplicatesCredentialAndTlsState(suite);
+  testReconcileStateReplicatesWideMetricsSnapshot(suite);
   testPreStagedSystemArtifactReplication(suite);
   testSystemContainerArtifactKindAwareIO(suite);
   testSystemContainerArtifactReplicationQueuesTypedBlob(suite);
@@ -46957,6 +47025,8 @@ int main(void)
   testMothershipConfigureLowersSharedCPUOvercommitWithoutMovingClaims(suite);
   testReplicateMasterAuthorityRejectsClusterTakeover(suite);
   testSpinApplicationInvalidPlanUsesSingleTopicFrame(suite);
+  testGlobalSingleWriterEndpointReservations(suite);
+  testMalformedWriterModeRejectedBeforeAdmission(suite);
   testSpinApplicationRejectsDuplicateNonTaskDeploymentIDWithoutMutation(suite);
   testSpinApplicationProgressAppendsAfterOkayFrame(suite);
   testSpinApplicationProgressAcceptsDirectFdMothership(suite);
@@ -47130,9 +47200,6 @@ int main(void)
   testNeuronDeliversOnlyBoundNametagQualificationApplicationCommand(suite);
   testNeuronSourceBaselineRelayRequiresApp11(suite);
   testBrainSourceBaselineQueryRecoversReceipt(suite);
-  testStatefulStoreGenerationBootstrapProjection(suite);
-  testStatefulStoreGenerationProjection(suite);
-  testNeuronSpinContainerRetainsStatefulStoreGenerationSelection(suite);
   testNeuronContainerHandlerMarksMasterLocalContainerHealthyWithoutBrainStream(suite);
   testNeuronContainerHandlerRelaysHealthyToMasterPeerWithoutBrainStream(suite);
   testNeuronContainerHandlerMarksMasterLocalContainerHealthyWithActiveBrainStream(suite);
@@ -47141,7 +47208,6 @@ int main(void)
   testContainerStoreEvictsExternallyRemovedCachedImage(suite);
   testNeuronSpinContainerRejectReportsFailure(suite);
   testNeuronStateUploadSkipsExistingLiveContainer(suite);
-  testNeuronStateUploadStagesGenerationRestartBeforeTimerCancellation(suite);
   testNeuronHandlerKillContainerStopsContainerAndEchoesBrain(suite);
   testNeuronHandlerKillContainerFencesAbsentQueuedLaunch(suite);
   testNeuronHandlerKillContainerCancelsPendingRestart(suite);

@@ -63,9 +63,6 @@ pub enum Instruction {
     Execute {
         argv: Vec<String>,
     },
-    StatefulStoreGenerationProtocol {
-        version: u8,
-    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
@@ -105,8 +102,6 @@ pub struct ResolvedBuildSpec {
     pub runs: Vec<ResolvedRun>,
     pub survives: Vec<String>,
     pub execute: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stateful_store_generation_protocol: Option<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -167,7 +162,6 @@ pub fn resolve_build_spec(
     let mut runs = Vec::new();
     let mut survives = Vec::new();
     let mut execute = None;
-    let mut stateful_store_generation_protocol = None;
 
     for instruction in &spec.instructions {
         match instruction {
@@ -238,17 +232,6 @@ pub fn resolve_build_spec(
                 }
                 execute = Some(resolved);
             }
-            Instruction::StatefulStoreGenerationProtocol { version } => {
-                if *version != 1 {
-                    bail!("STATEFUL_STORE_GENERATION_PROTOCOL supports only version 1");
-                }
-                if stateful_store_generation_protocol.is_some() {
-                    bail!(
-                        "multiple STATEFUL_STORE_GENERATION_PROTOCOL instructions are not allowed"
-                    );
-                }
-                stateful_store_generation_protocol = Some(*version);
-            }
         }
     }
 
@@ -273,10 +256,6 @@ pub fn resolve_build_spec(
         }
     }
 
-    if stateful_store_generation_protocol.is_some() && output_kind != OutputKind::App {
-        bail!("STATEFUL_STORE_GENERATION_PROTOCOL is only valid for app builds");
-    }
-
     Ok(ResolvedBuildSpec {
         from: spec.from.clone(),
         declared_args,
@@ -287,7 +266,6 @@ pub fn resolve_build_spec(
         runs,
         survives,
         execute,
-        stateful_store_generation_protocol,
     })
 }
 
@@ -348,16 +326,6 @@ fn parse_instruction(line: &str) -> Result<ParsedInstruction> {
             argv: parse_exec_array(rest)?,
         }));
     }
-    if let Some(rest) = line.strip_prefix("STATEFUL_STORE_GENERATION_PROTOCOL ") {
-        let version = rest.trim();
-        if version != "1" {
-            bail!("STATEFUL_STORE_GENERATION_PROTOCOL supports only version 1");
-        }
-        return Ok(ParsedInstruction::Instruction(
-            Instruction::StatefulStoreGenerationProtocol { version: 1 },
-        ));
-    }
-
     bail!("unsupported instruction");
 }
 

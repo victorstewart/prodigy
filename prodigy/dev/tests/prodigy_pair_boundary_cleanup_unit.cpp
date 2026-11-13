@@ -41,18 +41,25 @@ static void testPairOwnedLinkCleanupRace(TestSuite& suite)
   std::string text((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
   const size_t begin = text.find("pair_link_identity()\n{\n");
   const size_t end = text.find("\npair_require_no_clients()\n", begin);
-  suite.expect(begin != std::string::npos && end != std::string::npos,
+  const size_t controlBegin = text.find("pair_control_link_owned()\n{\n");
+  const size_t controlEnd = text.find("\npair_control_addresses()\n", controlBegin);
+  suite.expect(begin != std::string::npos && end != std::string::npos &&
+               controlBegin != std::string::npos && controlEnd != std::string::npos,
                "pair_cleanup_fixture_extracts_owned_link_owner");
-  if (begin == std::string::npos || end == std::string::npos) return;
+  if (begin == std::string::npos || end == std::string::npos ||
+      controlBegin == std::string::npos || controlEnd == std::string::npos) return;
 
   // Execute the real identity/remove helper with only a mocked `ip` command.
   // The race case models the kernel dropping the source veth peer after the
   // initial probe but before its JSON identity query.  A still-present foreign
   // link must remain an error and must never receive `link del`.
-  std::string script = "set -euo pipefail\n" + text.substr(begin, end - begin) + R"TEST(
+  std::string script = "set -euo pipefail\n" + text.substr(begin, end - begin) +
+                       text.substr(controlBegin, controlEnd - controlBegin) + R"TEST(
 pair_dir="$PWD/pair"
-mkdir -p "$pair_dir"
+pair_control_dir="$PWD/pair-control"
+mkdir -p "$pair_dir" "$pair_control_dir"
 printf '[1,2,"02:aa:bb:cc:dd:ee"]\n' > "$pair_dir/source-link"
+printf '[1,2,"02:aa:bb:cc:dd:ee"]\n' > "$pair_control_dir/first-link"
 cat > "$PWD/ip" <<'IP'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -60,7 +67,7 @@ mode="$(<"$PWD/mode")"
 args="$*"
 if [[ "$args" == *"-j link show"* && "$args" == *"pairSource0"* ]]; then
   case "$mode" in
-    vanished) echo 'Device "pairSource0" does not exist.' >&2; exit 1 ;;
+    vanished|control_vanished) echo 'Device "pairSource0" does not exist.' >&2; exit 1 ;;
     replacement) printf '[{"ifindex":9,"link_index":8,"address":"02:ff:ff:ff:ff:ff"}]\n'; exit 0 ;;
     owned|disappear_delete) printf '[{"ifindex":1,"link_index":2,"address":"02:aa:bb:cc:dd:ee"}]\n'; exit 0 ;;
   esac
@@ -72,7 +79,7 @@ if [[ "$args" == *"-j link show"* ]]; then
     lookup_error) echo 'RTNETLINK answers: Permission denied' >&2; exit 2 ;;
     malformed) printf '{not json}\n'; exit 0 ;;
     malformed_json) printf '[{}]\n'; exit 0 ;;
-    vanished|disappear_delete) [[ "$count" == 1 ]] && printf '[{"ifname":"pairSource0"}]\n' || printf '[]\n'; exit 0 ;;
+    vanished|disappear_delete|control_vanished) [[ "$count" == 1 ]] && printf '[{"ifname":"pairSource0"}]\n' || printf '[]\n'; exit 0 ;;
     replacement|owned) printf '[{"ifname":"pairSource0"}]\n'; exit 0 ;;
   esac
 fi
@@ -107,6 +114,10 @@ if run_case malformed_json; then exit 1; fi
 [[ ! -e deletions ]]
 run_case owned
 [[ "$(<deletions)" == del ]]
+rm -f inventory-count deletions
+printf 'control_vanished\n' > mode
+pair_control_remove_owned_link first pairSource0
+[[ ! -e deletions ]]
 )TEST";
   char temporary[] = "./pair-boundary-cleanup-unit.XXXXXX";
   if (::mkdtemp(temporary) == nullptr)
@@ -147,18 +158,19 @@ static void testPairControlServiceDescriptorStatusIsolation(TestSuite& suite)
     const size_t begin = text.find(first), end = text.find(after, begin);
     return begin == std::string::npos || end == std::string::npos ? std::string{} : text.substr(begin, end - begin);
   };
-  const std::string descriptors = extract("pair_control_service_suffix()\n{\n", "\npair_control_service_side()\n");
+  const std::string descriptors = extract("pair_control_service_slots()\n{\n", "\npair_control_service_side()\n");
+  const std::string installRoute = extract("pair_control_parent_local_service_route_name()\n{\n", "\npair_control_install_service_inside()\n");
   const std::string validation = extract("pair_control_validate_service_one_inside()\n{\n", "\npair_control_remove_service_route()\n");
   const std::string cleanup = extract("pair_control_cleanup_inside()\n{\n", "\npair_control_bind_parents()\n");
-  suite.expect(!descriptors.empty() && !validation.empty() && !cleanup.empty(),
+  suite.expect(!descriptors.empty() && !validation.empty() && !cleanup.empty() && !installRoute.empty(),
                "pair_service_status_fixture_extracts_real_provider_helpers");
-  if (descriptors.empty() || validation.empty() || cleanup.empty()) return;
+  if (descriptors.empty() || validation.empty() || cleanup.empty() || installRoute.empty()) return;
 
   // The external route and namespace operations are mocked.  The status
   // plumbing itself is real extracted provider code: absence is optional only
   // for a missing descriptor, never for malformed state or a failed owned
   // route removal.
-  const std::string script = "set -euo pipefail\n" + descriptors + validation + cleanup + R"TEST(
+  const std::string script = "set -euo pipefail\n" + descriptors + validation + cleanup + installRoute + R"TEST(
 pair_control_dir="$PWD/pair"
 pair_control_router_ns=""
 pair_control_first_link=""
@@ -175,10 +187,12 @@ pair_control_parse_service_args() {
   pair_control_service_source_router=fd42:1::1; pair_control_service_destination_router=fd42:2::1
   return 0
 }
+pair_control_service_descriptor() { printf '%s\n' "${pair_control_service_args[@]}"; }
 pair_control_service_side() { return 0; }
 pair_control_service_route_journal_valid() { [[ "$mode" != validation_fail ]]; }
 pair_control_service_route_exact() { [[ "$mode" != validation_fail ]]; }
 pair_control_remove_service_route() { [[ "$mode" != cleanup_fail ]]; }
+pair_control_load_masque_descriptor() { return 3; }
 pair_write() { printf '%s\n' "$2" > "$1"; }
 write_descriptor() { for _ in $(seq 1 13); do printf x; printf '\n'; done > "$pair_control_dir/service-descriptor"; }
 status_of() { if "$@"; then printf 0; else printf '%s' "$?"; fi; }
@@ -191,9 +205,36 @@ write_descriptor
 printf prepared > "$pair_control_dir/service-phase"
 mode=validation_fail
 [[ "$(status_of pair_control_validate_service_inside)" == 1 ]]
+# Independent same-direction tuples retain the first descriptor and choose
+# distinct durable slots. Retrying either tuple must reuse its original slot.
+mode=valid
+pair_control_service_args=(); for _ in $(seq 1 13); do pair_control_service_args+=(y); done
+pair_control_select_service_slot
+[[ "$pair_control_service_transit_slot" == opposite ]]
+pair_write "$(pair_control_service_path service-descriptor opposite)" "$(pair_control_service_descriptor)"
+pair_control_service_args=(); for _ in $(seq 1 13); do pair_control_service_args+=(z); done
+pair_control_select_service_slot
+[[ "$pair_control_service_transit_slot" == flow-2 ]]
+pair_write "$(pair_control_service_path service-descriptor flow-2)" "$(pair_control_service_descriptor)"
+pair_control_service_args=(); for _ in $(seq 1 13); do pair_control_service_args+=(y); done
+pair_control_select_service_slot
+[[ "$pair_control_service_transit_slot" == opposite ]]
+[[ "$(head -1 "$pair_control_dir/service-descriptor")" == x ]]
 mode=cleanup_fail
 if pair_control_cleanup_inside; then exit 1; fi
 [[ ! -e "$pair_control_dir/phase" ]]
+# Multiple ports can share a route only after this operation journaled ownership.
+pair_control_service_route_expected() { printf '%s via %s dev %s\n' "$1" "$2" "$3"; }
+pair_control_service_route_exact() { [[ -f "$PWD/kernel-route" ]]; }
+ip() { printf added >> "$PWD/adds"; touch "$PWD/kernel-route"; }
+pair_control_install_service_route pc-first service-source-route ::1/128 ::2 vdcbr0
+[[ "$(cat adds)" == added ]]
+pair_control_install_service_route pc-first service-source-route-flow-2 ::1/128 ::2 vdcbr0
+[[ "$(cat adds)" == added ]]
+[[ "$(cat "$pair_control_dir/service-source-route-flow-2-intent")" == '::1/128 via ::2 dev vdcbr0' ]]
+# The identical bytes in another namespace or without journaled intent are foreign.
+if pair_control_install_service_route pc-second service-foreign-route ::1/128 ::2 vdcbr0; then exit 1; fi
+if pair_control_install_service_route pc-first service-foreign-route ::3/128 ::2 vdcbr0; then exit 1; fi
 )TEST";
   char temporary[] = "./pair-service-status-unit.XXXXXX";
   if (::mkdtemp(temporary) == nullptr) { suite.expect(false, "pair_service_status_fixture_creates_directory"); return; }
@@ -926,13 +967,16 @@ pair_control_netem_forget_removed_links
 [[ ! -e "$pair_control_dir/netem-active" && ! -e "$pair_control_dir/netem-first-intent" && "$(<"$pair_control_dir/netem-restored")" == *'ownedPeersRemoved=1' ]]
 # Exercise the actual supervisor/dead-owner cleanup integration as well as
 # the helpers. Namespace inventories below are only empty fixture files.
+pair_control_service_slots() { printf '%s\n' base opposite; }
 pair_control_load_service_descriptor() { return 3; }
+pair_control_load_masque_descriptor() { return 3; }
 pair_control_service_path() { printf '%s/%s-%s' "$pair_control_dir" "$1" "$2"; }
 pair_control_remove_owned_link() {
   [[ "$failure:$1" != cleanup-link:second ]] || return 1
   rm -f "$PWD/state/pc-$1"
   if [[ "$1" == first ]]; then rm -f "$PWD/state/second0"; else rm -f "$PWD/state/first0"; fi
 }
+
 pair_link_presence() { [[ -e "$PWD/state/$1" ]] && return 0; return 1; }
 umount() { rm -f -- "$1"; }
 stat() { [[ "$*" == "-Lc %i $PWD/namespaces/pc-r-unit" ]] || return 1; printf 999; }
@@ -978,6 +1022,322 @@ if pair_control_cleanup_inside; then exit 1; fi
   std::filesystem::remove_all(temporary, error);
 }
 
+static void testPairControlMasqueMachineRouteAbsent(TestSuite& suite)
+{
+  std::string sourcePath = __FILE__;
+  const size_t root = sourcePath.rfind("/dev/tests/");
+  suite.expect(root != std::string::npos, "pair_masque_route_fixture_locates_provider_owner");
+  if (root == std::string::npos) return;
+  sourcePath.resize(root);
+  sourcePath += "/mothership/mothership.virtual.datacenter.provider.sh";
+  std::ifstream source(sourcePath);
+  if (!source) { suite.expect(false, "pair_masque_route_fixture_reads_provider_owner"); return; }
+  const std::string text((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
+  const size_t begin = text.find("pair_control_masque_machine_route_exact()\n{\n");
+  const size_t end = text.find("\npair_control_masque_machine_route_journal_valid()\n", begin);
+  suite.expect(begin != std::string::npos && end != std::string::npos,
+               "pair_masque_route_fixture_extracts_exact_route_validator");
+  if (begin == std::string::npos || end == std::string::npos) return;
+
+  // Execute the production validator with a mocked read-only `ip` response.
+  // A clean [] is the expected state before the provider owns and installs its
+  // exact /128; it must be distinguishable from malformed JSON.
+  const std::string script = "set -euo pipefail\n" + text.substr(begin, end - begin) + R"TEST(
+mode=empty
+ip() {
+  [[ "$*" == "-n pcm-unit -j -6 route show exact 2001:db8:100::d/128" ]] || return 99
+  if [[ "$mode" == empty ]]; then printf '[]\n'; else printf '[{not-json}\n'; fi
+}
+check_status() {
+  local expected="$1" status=0
+  if pair_control_masque_machine_route_exact pcm-unit 2001:db8:100::d/128 fd00:10::1 bond0 fd00:10::a; then status=0; else status=$?; fi
+  [[ "$status" == "$expected" ]]
+}
+check_status 1
+mode=malformed
+check_status 2
+)TEST";
+  char temporary[] = "./pair-masque-route-unit.XXXXXX";
+  if (::mkdtemp(temporary) == nullptr) { suite.expect(false, "pair_masque_route_fixture_creates_directory"); return; }
+  String path = {}, failure = {};
+  mothershipVirtualDatacenterPath(String(temporary), "probe.sh", path);
+  const bool written = mothershipVirtualDatacenterWriteFile(path, String(script.c_str()), 0700, &failure);
+  const pid_t child = written ? ::fork() : -1;
+  if (child == 0) { if (::chdir(temporary) != 0) _exit(125); ::execl("/bin/bash", "bash", "probe.sh", static_cast<char *>(nullptr)); _exit(127); }
+  int status = 0; pid_t waited = -1;
+  if (child > 0) do { waited = ::waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+  suite.expect(written && child > 0 && waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+               "pair_masque_route_absence_is_installable_and_malformed_state_fails_closed");
+  std::error_code error;
+  std::filesystem::remove_all(temporary, error);
+}
+
+static void testPairControlAbsentRouterServiceRouteCleanup(TestSuite& suite)
+{
+  std::string sourcePath = __FILE__;
+  const size_t root = sourcePath.rfind("/dev/tests/");
+  if (root == std::string::npos) { suite.expect(false, "pair_absent_router_service_fixture_locates_provider"); return; }
+  sourcePath.resize(root);
+  sourcePath += "/mothership/mothership.virtual.datacenter.provider.sh";
+  std::ifstream source(sourcePath);
+  if (!source) { suite.expect(false, "pair_absent_router_service_fixture_reads_provider"); return; }
+  const std::string text((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
+  const size_t begin = text.find("pair_control_router_namespace_missing_owned()\n{\n");
+  const size_t end = text.find("\npair_control_firewall_digest()\n", begin);
+  suite.expect(begin != std::string::npos && end != std::string::npos,
+               "pair_absent_router_service_fixture_extracts_owned_cleanup");
+  if (begin == std::string::npos || end == std::string::npos) return;
+
+  // A recovery process must leave parent-route cleanup to its callers, but an
+  // already-gone private router is a completed no-op only with its immutable
+  // route journal and a dead recorded owner.  No `ip -n` operation is allowed.
+  const std::string script = "set -euo pipefail\n" + text.substr(begin, end - begin) + R"TEST(
+pair_control_dir="$PWD/pair"; pair_dir="$pair_control_dir"; mkdir -p "$pair_control_dir"
+pair_control_router_ns="pc-r-cleanup-fixture-$$"
+pair_control_owner_dead() { [[ "$owner" == dead ]]; }
+pair_control_parent_local_service_route_name() { return 1; }
+pair_control_service_route_expected() { printf '%s via %s dev %s\n' "$1" "$2" "$3"; }
+pair_control_service_route_exact() { : > "$PWD/ip-was-called"; return 2; }
+ip() { : > "$PWD/ip-was-called"; return 2; }
+prefix=2001:db8:42::2/128; gateway=fd42::1; device=first0; name=service-router-source-route
+expected="$prefix via $gateway dev $device"
+seed() {
+  rm -f "$PWD/ip-was-called" "$pair_control_dir"/*
+  printf '999\n' > "$pair_control_dir/router-namespace"
+  printf '%s\n' "$expected" > "$pair_control_dir/$name-intent"
+  printf '%s\n' "$expected" > "$pair_control_dir/$name"
+}
+owner=dead; seed
+pair_control_remove_service_route "$pair_control_router_ns" "$name" "$prefix" "$gateway" "$device"
+[[ ! -e "$PWD/ip-was-called" ]]
+owner=live; seed
+if pair_control_remove_service_route "$pair_control_router_ns" "$name" "$prefix" "$gateway" "$device"; then exit 1; fi
+[[ ! -e "$PWD/ip-was-called" ]]
+owner=dead; seed; printf foreign > "$pair_control_dir/$name-intent"
+if pair_control_remove_service_route "$pair_control_router_ns" "$name" "$prefix" "$gateway" "$device"; then exit 1; fi
+[[ ! -e "$PWD/ip-was-called" ]]
+owner=dead; seed; rm -f "$pair_control_dir/router-namespace"
+if pair_control_remove_service_route "$pair_control_router_ns" "$name" "$prefix" "$gateway" "$device"; then exit 1; fi
+[[ ! -e "$PWD/ip-was-called" ]]
+)TEST";
+  char temporary[] = "./pair-absent-router-service-unit.XXXXXX";
+  if (::mkdtemp(temporary) == nullptr) { suite.expect(false, "pair_absent_router_service_fixture_creates_directory"); return; }
+  String path = {}, failure = {};
+  mothershipVirtualDatacenterPath(String(temporary), "probe.sh", path);
+  const bool written = mothershipVirtualDatacenterWriteFile(path, String(script.c_str()), 0700, &failure);
+  const pid_t child = written ? ::fork() : -1;
+  if (child == 0) { if (::chdir(temporary) != 0) _exit(125); ::execl("/bin/bash", "bash", "probe.sh", static_cast<char *>(nullptr)); _exit(127); }
+  int status = 0; pid_t waited = -1;
+  if (child > 0) do { waited = ::waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+  suite.expect(written && child > 0 && waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+               "pair_absent_router_service_cleanup_requires_dead_owner_and_exact_journal");
+  std::error_code error;
+  std::filesystem::remove_all(temporary, error);
+}
+
+static void testPairControlSharedParentDeliveryRoutes(TestSuite& suite)
+{
+  std::string sourcePath = __FILE__;
+  const size_t root = sourcePath.rfind("/dev/tests/");
+  if (root == std::string::npos) { suite.expect(false, "pair_shared_parent_fixture_locates_provider"); return; }
+  sourcePath.resize(root); sourcePath += "/mothership/mothership.virtual.datacenter.provider.sh";
+  std::ifstream source(sourcePath);
+  if (!source) { suite.expect(false, "pair_shared_parent_fixture_reads_provider"); return; }
+  const std::string text((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
+  const auto extract = [&](const char *first, const char *after) {
+    const size_t begin = text.find(first), end = text.find(after, begin);
+    return begin == std::string::npos || end == std::string::npos ? std::string{} : text.substr(begin, end - begin);
+  };
+  const auto install = extract("pair_control_parent_local_service_route_name()\n{\n", "\npair_control_install_service_inside()\n");
+  const auto remove = extract("pair_control_remove_service_route()\n{\n", "\npair_control_firewall_digest()\n");
+  suite.expect(!install.empty() && !remove.empty(), "pair_shared_parent_fixture_extracts_production_owners");
+  if (install.empty() || remove.empty()) return;
+  // Only the route inventory, kernel mutation, live namespace proof and the
+  // external lock/durable-write primitives are mocked. The actual install,
+  // reference validation, crash replay and cleanup owners execute below.
+  const std::string script = "set -euo pipefail\n" + install + remove + R"TEST(
+mkdir -p "$PWD/vdc" "$PWD/ab" "$PWD/cb"
+pair_control_first_workspace="$PWD/vdc"; pair_control_second_workspace="$PWD/vdc"
+pair_control_first_runtime=1001; pair_control_second_runtime=1001
+printf '901\n' > "$PWD/ab/second-namespace"
+printf '901\n' > "$PWD/cb/first-namespace"
+pair_control_current_parent_bound() { [[ "$(<"$pair_control_dir/$1-namespace")" == 901 && "$runtime" == 1001 ]]; }
+pair_lock_workspace() { mkdir "$1/lock" 2>/dev/null || return 1; printf -v "$2" '%s' "$1/lock"; }
+pair_unlock_workspace() { rmdir "$1"; }
+pair_regular_root_receipt() { [[ -f "$1" && ! -L "$1" ]]; }
+pair_write() { [[ "$1" != "$fail_write" ]] || return 1; printf '%s\n' "$2" > "$1"; }
+sync() { :; }
+pair_control_digest() { printf '%064d\n' "$operation_id"; }
+pair_control_service_route_expected() { printf '%s via %s dev %s\n' "$1" "$2" "$3"; }
+pair_control_router_namespace_missing_owned() { return 1; }
+prefix=2001:db8::b/128; gateway=fd00:b::1; expected="$prefix via $gateway dev vdcbr0"
+pair_control_service_route_exact() {
+  [[ -f "$PWD/kernel-route" ]] || return 1
+  [[ "$(<"$PWD/kernel-route")" == "$(pair_control_service_route_expected "$2" "$3" "$4")" ]] || return 2
+}
+ip() {
+  [[ "$1" == -n && "$3" == -6 && "$4" == route ]] || return 99
+  printf '%s\n' "$5" >> "$PWD/kernel-operations"
+  case "$5" in
+    add) printf '%s\n' "$expected" > "$PWD/kernel-route" ;;
+    del) rm "$PWD/kernel-route" ;;
+    *) return 99 ;;
+  esac
+}
+select_ab() { pair_control_dir="$PWD/ab"; operation_id=1; namespace=pc-second; }
+select_cb() { pair_control_dir="$PWD/cb"; operation_id=2; namespace=pc-first; }
+name=service-destination-local-route; fail_write=""
+install() { pair_control_install_service_route "$namespace" "$name" "$prefix" "$gateway" vdcbr0; }
+remove() { pair_control_remove_service_route "$namespace" "$name" "$prefix" "$gateway" vdcbr0; }
+validate() { pair_control_parent_local_service_route validate "$namespace" "$name" "$prefix" "$gateway" vdcbr0; }
+ref() { printf '%s/ref-%064d-%s' "$route_directory" "$operation_id" "$name"; }
+
+# Two pairs can use opposite aliases for the same verified VDC namespace.
+select_ab; install; validate
+route_directory="$(printf '%s\n' "$PWD/vdc/virtual-datacenter.service-routes/"*)"
+select_cb; install; validate
+[[ "$(cat "$PWD/kernel-operations")" == add ]]
+select_ab; remove; remove
+[[ -f "$PWD/kernel-route" && ! -e "$(ref)" ]]
+select_cb; validate; remove; remove
+[[ ! -e "$PWD/kernel-route" && "$(cat "$PWD/kernel-operations")" == $'add\ndel' ]]
+# The retained retry witness cannot reclaim an identical foreign route after
+# every reference was released. Repeated cleanup must leave that route alone.
+printf '%s\n' "$expected" > "$PWD/kernel-route"
+if install; then exit 1; fi
+remove
+[[ -f "$PWD/kernel-route" ]]
+rm "$PWD/kernel-route"
+
+# Multiple source ports within one pair also retain independent references.
+select_ab; install
+name=service-destination-local-route-flow-2; install
+name=service-destination-local-route; remove
+[[ -f "$PWD/kernel-route" ]]
+name=service-destination-local-route-flow-2; remove
+[[ ! -e "$PWD/kernel-route" ]]
+name=service-destination-local-route
+
+# A crash before reference publication cannot release another pair's route.
+select_ab; install
+select_cb; fail_write="$(ref)"
+if install; then exit 1; fi
+fail_write=""; remove
+[[ -f "$PWD/kernel-route" ]]
+install
+# A crash after reference publication but before completion replays exactly.
+rm "$pair_control_dir/$name"
+fail_write="$pair_control_dir/$name"
+if install; then exit 1; fi
+fail_write=""; install; validate
+select_ab; remove
+select_cb
+# A dead supervisor's last route may already have vanished; recovery releases
+# its durable reference without attempting a kernel mutation against absence.
+rm "$PWD/kernel-route"
+before="$(cat "$PWD/kernel-operations")"; remove
+[[ ! -e "$(ref)" && "$(cat "$PWD/kernel-operations")" == "$before" ]]
+
+# Reject a changed namespace, a held lifecycle lock and foreign kernel state.
+select_ab; install
+select_cb; printf '902\n' > "$pair_control_dir/first-namespace"
+if install || remove || validate; then exit 1; fi
+printf '901\n' > "$pair_control_dir/first-namespace"
+pair_control_first_runtime=1002
+if install; then exit 1; fi
+pair_control_first_runtime=1001
+mkdir "$PWD/vdc/lock"
+if install || remove; then exit 1; fi
+select_ab; validate
+select_cb
+rmdir "$PWD/vdc/lock"
+install
+printf foreign > "$PWD/kernel-route"
+if remove; then exit 1; fi
+[[ -e "$(ref)" ]]
+printf '%s\n' "$expected" > "$PWD/kernel-route"
+
+# Malformed, symlinked or mismatched owner/reference receipts fail closed.
+badref="$(ref)"; cp "$badref" "$PWD/reference-copy"
+printf foreign > "$badref"
+select_ab
+if install || remove || validate; then exit 1; fi
+cp "$PWD/reference-copy" "$badref"
+rm "$badref"; ln -s "$PWD/reference-copy" "$badref"
+if install || remove; then exit 1; fi
+rm "$badref"; cp "$PWD/reference-copy" "$badref"
+cp "$route_directory/owner" "$PWD/owner-copy"
+printf foreign > "$route_directory/owner"
+if install || remove; then exit 1; fi
+cp "$PWD/owner-copy" "$route_directory/owner"
+remove; select_cb; remove
+[[ ! -f "$PWD/kernel-route" ]]
+
+# Legacy exact intents remain recoverable, but foreign routes are not adopted.
+rm -rf "$PWD/vdc/virtual-datacenter.service-routes"
+select_ab; rm -f "$pair_control_dir/$name" "$pair_control_dir/$name-intent"
+printf '%s\n' "$expected" > "$PWD/kernel-route"
+if install; then exit 1; fi
+[[ ! -e "$pair_control_dir/$name-intent" ]]
+printf '%s\n' "$expected" > "$pair_control_dir/$name-intent"
+remove
+[[ ! -e "$PWD/kernel-route" ]]
+printf '%s\n' "$expected" > "$PWD/kernel-route"
+install; validate; remove
+[[ ! -e "$PWD/kernel-route" ]]
+printf 'PASS shared parent delivery routes, cleanup, crash recovery and identity rejection\n'
+)TEST";
+  char temporary[] = "./pair-shared-parent-unit.XXXXXX";
+  if (::mkdtemp(temporary) == nullptr) { suite.expect(false, "pair_shared_parent_fixture_creates_directory"); return; }
+  String path = {}, failure = {};
+  mothershipVirtualDatacenterPath(String(temporary), "probe.sh", path);
+  const bool written = mothershipVirtualDatacenterWriteFile(path, String(script.c_str()), 0700, &failure);
+  const pid_t child = written ? ::fork() : -1;
+  if (child == 0) { if (::chdir(temporary) != 0) _exit(125); ::execl("/bin/bash", "bash", "probe.sh", static_cast<char *>(nullptr)); _exit(127); }
+  int status = 0; pid_t waited = -1;
+  if (child > 0) do { waited = ::waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+  suite.expect(written && child > 0 && waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+               "pair_shared_parent_routes_preserve_other_pairs_and_fail_closed_on_foreign_state");
+  std::error_code error;
+  std::filesystem::remove_all(temporary, error);
+}
+
+static void testPairControlMasqueTransitContract(TestSuite& suite)
+{
+  std::string sourcePath = __FILE__;
+  const size_t root = sourcePath.rfind("/dev/tests/");
+  suite.expect(root != std::string::npos, "pair_masque_fixture_locates_provider_owner");
+  if (root == std::string::npos) return;
+  sourcePath.resize(root);
+  const std::string providerPath = sourcePath + "/mothership/mothership.virtual.datacenter.provider.sh";
+  const std::string mothershipPath = sourcePath + "/mothership/mothership.cpp";
+  std::ifstream provider(providerPath), mothership(mothershipPath);
+  if (!provider || !mothership) { suite.expect(false, "pair_masque_fixture_reads_owned_sources"); return; }
+  const std::string script((std::istreambuf_iterator<char>(provider)), std::istreambuf_iterator<char>());
+  const std::string cpp((std::istreambuf_iterator<char>(mothership)), std::istreambuf_iterator<char>());
+  suite.expect(script.find("pair_control_parse_masque_args()") != std::string::npos &&
+                   script.find("-p udp --dport \"$pair_control_masque_udp_port\"") != std::string::npos &&
+                   script.find("${pair_control_masque_destination_public6}/128") != std::string::npos &&
+                   script.find("masque-source-machine-route") != std::string::npos &&
+                   script.find("pair_control_masque_bind_source_machine") != std::string::npos &&
+                   script.find("pair_control_masque_machine_route_exact") != std::string::npos &&
+                   script.find("dev \"$device\" src \"$source\"") != std::string::npos &&
+                   script.find("pair_control_validate_masque_inside") != std::string::npos,
+               "pair_masque_provider_admits_one_journaled_udp_128_tuple_and_source_pinned_machine_route");
+  suite.expect(script.find("pair_control_masque_source_public6") != std::string::npos &&
+                   script.find("masque-router-source-public-route") != std::string::npos &&
+                   script.find("pair_control_masque_snat_present") != std::string::npos &&
+                   script.find("masque-router-snat-intent") != std::string::npos &&
+                   script.find("--to-source \"$pair_control_masque_destination_router\"") != std::string::npos,
+               "pair_masque_provider_derives_unique_connector_public_identity_and_journals_exact_reverse_snat");
+  suite.expect(cpp.find("validatePairControlMasqueTransit") != std::string::npos &&
+                   cpp.find("loadCrossClusterMasqueGateway(intent.pairUUID, localMachineUUID") != std::string::npos &&
+                   cpp.find("local.localRole != CrossClusterMasqueGatewayRole::connector") != std::string::npos &&
+                   cpp.find("peer.localRole != CrossClusterMasqueGatewayRole::listener") != std::string::npos &&
+                   cpp.find("action == \"masque\"_ctv") != std::string::npos,
+               "pair_masque_cli_derives_tuple_from_reciprocal_enrolled_authority");
+}
+
 int main()
 {
   TestSuite suite;
@@ -986,6 +1346,10 @@ int main()
   testPairControlFaultDirectionSelection(suite);
   testPairControlFaultEmitsOnlyFaultReceipt(suite);
   testPairControlNetemOwnershipAndCleanup(suite);
+  testPairControlMasqueMachineRouteAbsent(suite);
+  testPairControlAbsentRouterServiceRouteCleanup(suite);
+  testPairControlSharedParentDeliveryRoutes(suite);
+  testPairControlMasqueTransitContract(suite);
   testPairDrainObservationParser(suite);
   testPairGuestResetFenceParser(suite);
   testPairGuestResetAbsenceProofFailsClosed(suite);

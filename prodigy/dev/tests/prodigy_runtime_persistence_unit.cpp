@@ -1654,6 +1654,327 @@ static void testLocalBundleRecoveryDefersCheckpointUntilArtifactLeaseReleases(Te
   havePersistedBrainSnapshot = false;
 }
 
+static void testAuthenticatedStateUploadInventoryDiagnostics(TestSuite& suite)
+{
+  ProdigyHostControlNetwork network;
+  ProdigyBrain brain(network, {});
+  brain.weAreMaster = true;
+  brain.masterAuthorityRuntimeStateDurable = true;
+  brain.durableMasterAuthorityRuntimeStateGeneration = brain.masterAuthorityRuntimeState.generation;
+  Machine machine = {};
+  machine.uuid = 0xa5513001ULL;
+  machine.state = MachineState::healthy;
+  machine.runtimeReady = true;
+  brain.machines.insert(&machine);
+  brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+  brain.persistedMachineInventoryUploaded.insert(machine.uuid);
+  brain.persistedMachineStateUploadPlansByMachine.insert_or_assign(machine.uuid, Vector<String> {});
+
+  Vector<String> bootstraps = {};
+  String diagnostic = {};
+  const bool matchingEmptyInventory =
+      brain.collectAuthenticatedNeuronStateUploadBootstraps(&machine, bootstraps, &diagnostic);
+  suite.expect(matchingEmptyInventory && bootstraps.empty() && diagnostic.empty(),
+               "runtime_stateupload_inventory_matching_empty_inventory_is_accepted");
+
+  ApplicationDeployment deployment = {};
+  deployment.plan.config.applicationID = 0xa551;
+  deployment.plan.config.versionID = 0x3003;
+  deployment.plan.hasApiCredentialPolicy = true;
+  deployment.plan.apiCredentialPolicy.applicationID = deployment.plan.config.applicationID;
+  const uint64_t deploymentID = deployment.plan.config.deploymentID();
+  brain.deployments.insert_or_assign(deploymentID, &deployment);
+  ContainerView unmatched = {};
+  unmatched.uuid = 0xa5513002ULL;
+  unmatched.machine = &machine;
+  unmatched.deploymentID = deploymentID;
+  unmatched.state = ContainerState::scheduled;
+  unmatched.fragment = 1;
+  machine.upsertContainerIndexEntry(unmatched.deploymentID, &unmatched);
+  brain.containers.insert_or_assign(unmatched.uuid, &unmatched);
+
+  const bool canonicalMismatchAccepted =
+      brain.collectAuthenticatedNeuronStateUploadBootstraps(&machine, bootstraps, &diagnostic);
+  suite.expect(!canonicalMismatchAccepted && bootstraps.empty() &&
+                   std::strstr(diagnostic.c_str(), "machine=0xa5513001") != nullptr &&
+                   std::strstr(diagnostic.c_str(), "container=0xa5513002") != nullptr &&
+                   std::strstr(diagnostic.c_str(), "category=authenticated-upload-set-mismatch") != nullptr &&
+                   std::strstr(diagnostic.c_str(), "canonical=1") != nullptr &&
+                   std::strstr(diagnostic.c_str(), "uploaded=0") != nullptr,
+               "runtime_stateupload_inventory_canonical_authenticated_mismatch_is_diagnostic");
+
+  bool completionCalled = false, completionDurable = true;
+  brain.prepareLocalBundleExecRecoveryAsync([&](bool durable) {
+    completionCalled = true;
+    completionDurable = durable;
+  });
+  suite.expect(completionCalled && !completionDurable && brain.updateSelfMachineRecoveryWitnesses.empty() &&
+                   std::strstr(brain.updateSelfWorkerFailure.c_str(), "machine container ownership needs a fresh authenticated stateUpload for bundle exec") != nullptr &&
+                   std::strstr(brain.updateSelfWorkerFailure.c_str(), "machine=0xa5513001") != nullptr &&
+                   std::strstr(brain.updateSelfWorkerFailure.c_str(), "category=authenticated-upload-set-mismatch") != nullptr,
+               "runtime_stateupload_inventory_bundle_recovery_forwards_reason_without_checkpoint");
+
+  // Reproduce the EWR reservation: it has never acquired a runtime fragment.
+  // Diagnostics must explain the blocker without exempting it from admission.
+  unmatched.state = ContainerState::planned;
+  unmatched.fragment = 0;
+  const bool plannedAccepted =
+      brain.collectAuthenticatedNeuronStateUploadBootstraps(&machine, bootstraps, &diagnostic);
+  suite.expect(!plannedAccepted && bootstraps.empty() &&
+                   std::strstr(diagnostic.c_str(), "machine=0xa5513001") != nullptr &&
+                   std::strstr(diagnostic.c_str(), "container=0xa5513002") != nullptr &&
+                   std::strstr(diagnostic.c_str(), "category=canonical-planner-reservation-unlaunched") != nullptr,
+               "runtime_stateupload_inventory_planner_reservation_is_diagnostic_and_fail_closed");
+  unmatched.state = ContainerState::scheduled;
+  unmatched.fragment = 1;
+
+  ContainerPlan uploadedPlan = {};
+  uploadedPlan.uuid = unmatched.uuid;
+  uploadedPlan.config = deployment.plan.config;
+  uploadedPlan.state = ContainerState::scheduled;
+  uploadedPlan.fragment = 1;
+  String uploadedPlanBytes = {};
+  BitseryEngine::serialize(uploadedPlanBytes, uploadedPlan);
+  brain.persistedMachineStateUploadPlansByMachine[machine.uuid] = {uploadedPlanBytes};
+  const bool matchingRuntimeAccepted =
+      brain.collectAuthenticatedNeuronStateUploadBootstraps(&machine, bootstraps, &diagnostic);
+  suite.expect(matchingRuntimeAccepted && bootstraps.size() == 1 && diagnostic.empty(),
+               "runtime_stateupload_inventory_exact_authenticated_runtime_still_accepted");
+
+  brain.persistedMachineStateUploadPlansByMachine[machine.uuid] = {uploadedPlanBytes, uploadedPlanBytes};
+  const bool duplicateAccepted =
+      brain.collectAuthenticatedNeuronStateUploadBootstraps(&machine, bootstraps, &diagnostic);
+  suite.expect(!duplicateAccepted && bootstraps.empty() &&
+                   std::strstr(diagnostic.c_str(), "category=authenticated-upload-duplicate") != nullptr,
+               "runtime_stateupload_inventory_duplicate_rejection_discards_partial_witness");
+
+  uploadedPlan.uuid = 0xa5513006ULL;
+  uploadedPlanBytes.clear();
+  BitseryEngine::serialize(uploadedPlanBytes, uploadedPlan);
+  brain.persistedMachineStateUploadPlansByMachine[machine.uuid] = {uploadedPlanBytes};
+  const bool unknownAccepted =
+      brain.collectAuthenticatedNeuronStateUploadBootstraps(&machine, bootstraps, &diagnostic);
+  suite.expect(!unknownAccepted && bootstraps.empty() &&
+                   std::strstr(diagnostic.c_str(), "category=authenticated-upload-not-canonical") != nullptr,
+               "runtime_stateupload_inventory_unknown_uuid_remains_rejected");
+
+  brain.containers.erase(unmatched.uuid);
+  machine.removeContainerIndexEntry(unmatched.deploymentID, &unmatched);
+  brain.deployments.erase(deploymentID);
+  brain.persistedMachineStateUploadPlansByMachine.erase(machine.uuid);
+  brain.persistedMachineInventoryUploaded.erase(machine.uuid);
+  brain.machinesByUUID.erase(machine.uuid);
+  brain.machines.erase(&machine);
+  (void)network.shutdown();
+}
+
+static void testVolatileStatelessPlannerReservationRecoveryBarrier(TestSuite& suite)
+{
+  PersistenceRing ring;
+  ProdigyHostControlNetwork network;
+  ProdigyBrain brain(network, {});
+  brain.weAreMaster = true;
+  brain.ignited = true;
+  brain.recoveringPersistedNeuronInventory = true;
+  brain.persistedMachineInventoryEnumerated = true;
+  brain.masterAuthorityRuntimeStateDurable = true;
+  brain.durableMasterAuthorityRuntimeStateGeneration = brain.masterAuthorityRuntimeState.generation;
+
+  ApplicationDeployment deployment = {};
+  deployment.plan.config.applicationID = 0xa552;
+  deployment.plan.config.versionID = 0x3004;
+  const uint64_t deploymentID = deployment.plan.config.deploymentID();
+  brain.deploymentPlans.insert_or_assign(deploymentID, deployment.plan);
+  brain.deployments.insert_or_assign(deploymentID, &deployment);
+
+  Machine machine = {};
+  machine.uuid = 0xa5523001ULL;
+  machine.state = MachineState::healthy;
+  machine.runtimeReady = true;
+  machine.neuron.fd = 1;
+  machine.neuron.isFixedFile = true;
+  machine.neuron.fslot = 1;
+  machine.neuron.connected = true;
+  machine.neuron.ioGeneration = 7;
+  brain.machines.insert(&machine);
+  brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+  brain.persistedMachineInventoryUploaded.insert(machine.uuid);
+  // A current report from every live Machine is required. The extra Machines
+  // make a duplicate or wrong-owner UUID unambiguously unsafe.
+  Machine wrongMachine = {};
+  wrongMachine.uuid = 0xa5523003ULL;
+  wrongMachine.state = MachineState::healthy;
+  wrongMachine.runtimeReady = true;
+  wrongMachine.neuron.fd = 1;
+  wrongMachine.neuron.isFixedFile = true;
+  wrongMachine.neuron.fslot = 2;
+  wrongMachine.neuron.connected = true;
+  wrongMachine.neuron.ioGeneration = 8;
+  Machine thirdMachine = {};
+  thirdMachine.uuid = 0xa5523004ULL;
+  thirdMachine.state = MachineState::healthy;
+  thirdMachine.runtimeReady = true;
+  thirdMachine.neuron.fd = 1;
+  thirdMachine.neuron.isFixedFile = true;
+  thirdMachine.neuron.fslot = 3;
+  thirdMachine.neuron.connected = true;
+  thirdMachine.neuron.ioGeneration = 9;
+  brain.machines.insert(&wrongMachine);
+  brain.machines.insert(&thirdMachine);
+  brain.machinesByUUID.insert_or_assign(wrongMachine.uuid, &wrongMachine);
+  brain.machinesByUUID.insert_or_assign(thirdMachine.uuid, &thirdMachine);
+  brain.persistedMachineInventoryUploaded.insert(wrongMachine.uuid);
+  brain.persistedMachineInventoryUploaded.insert(thirdMachine.uuid);
+  ProdigyBrain::ContainerRetirementInventory inventory = {};
+  inventory.authorityEpoch = brain.masterAuthorityEpoch;
+  inventory.ioGeneration = machine.neuron.ioGeneration;
+  brain.containerRetirementInventoryByMachine.insert_or_assign(machine.uuid, inventory);
+  inventory.ioGeneration = wrongMachine.neuron.ioGeneration;
+  brain.containerRetirementInventoryByMachine.insert_or_assign(wrongMachine.uuid, inventory);
+  inventory.ioGeneration = thirdMachine.neuron.ioGeneration;
+  brain.containerRetirementInventoryByMachine.insert_or_assign(thirdMachine.uuid, inventory);
+
+  BrainReplicatedContainerRuntimeState reservation = {};
+  reservation.machineUUID = machine.uuid;
+  reservation.plan.uuid = 0xa5523002ULL;
+  reservation.plan.config = deployment.plan.config;
+  reservation.plan.state = ContainerState::planned;
+  reservation.plan.fragment = 0;
+  reservation.plan.runtimeReady = false;
+  suite.expect(brain.isVolatileStatelessPlannerReservation(reservation) &&
+                   brain.volatileStatelessPlannerReservationInventoryCurrent(reservation),
+               "runtime_recovery_volatile_stateless_planner_reservation_requires_current_fleet_absence");
+
+  ContainerView conflictingCanonical = {};
+  brain.containers.insert_or_assign(reservation.plan.uuid, &conflictingCanonical);
+  suite.expect(!brain.volatileStatelessPlannerReservationInventoryCurrent(reservation),
+               "runtime_recovery_absent_report_cannot_discard_conflicting_canonical_owner");
+  brain.containers.erase(reservation.plan.uuid);
+  thirdMachine.state = MachineState::hardwareFailure;
+  brain.persistedMachineInventoryUploaded.erase(thirdMachine.uuid);
+  suite.expect(!brain.volatileStatelessPlannerReservationInventoryCurrent(reservation),
+               "runtime_recovery_failed_machine_does_not_exempt_missing_inventory");
+  thirdMachine.state = MachineState::healthy;
+  brain.persistedMachineInventoryUploaded.insert(thirdMachine.uuid);
+
+  BrainReplicatedContainerRuntimeState statefulReservation = reservation;
+  statefulReservation.plan.isStateful = true;
+  BrainReplicatedContainerRuntimeState scheduledReservation = reservation;
+  scheduledReservation.plan.state = ContainerState::scheduled;
+  scheduledReservation.plan.fragment = 1;
+  BrainReplicatedContainerRuntimeState hostReservation = reservation;
+  hostReservation.plan.useHostNetworkNamespace = true;
+  BrainReplicatedContainerRuntimeState systemReservation = reservation;
+  systemReservation.plan.system.kind = SystemContainerKind::mothershipTunnelProvider;
+  suite.expect(!brain.isVolatileStatelessPlannerReservation(statefulReservation) &&
+                   !brain.isVolatileStatelessPlannerReservation(scheduledReservation) &&
+                   !brain.isVolatileStatelessPlannerReservation(hostReservation) &&
+                   !brain.isVolatileStatelessPlannerReservation(systemReservation),
+               "runtime_recovery_stateful_scheduled_system_and_host_plans_remain_normal_pending_runtime");
+
+  BrainReplicatedContainerRuntimeState wrongBlobReservation = reservation;
+  wrongBlobReservation.plan.config.containerBlobBytes = 1;
+  suite.expect(!brain.isVolatileStatelessPlannerReservation(wrongBlobReservation) &&
+                   brain.applyReplicatedContainerRuntimeStateNow(wrongBlobReservation) ==
+                       ProdigyBrain::ReplicatedContainerRuntimeStateApplyResult::deferred &&
+                   !brain.containers.contains(wrongBlobReservation.plan.uuid),
+               "runtime_recovery_malformed_legacy_blob_identity_remains_deferred_without_materialization");
+  suite.expect(brain.applyReplicatedContainerRuntimeStateNow(hostReservation) ==
+                       ProdigyBrain::ReplicatedContainerRuntimeStateApplyResult::deferred &&
+                   brain.applyReplicatedContainerRuntimeStateNow(systemReservation) ==
+                       ProdigyBrain::ReplicatedContainerRuntimeStateApplyResult::deferred &&
+                   !brain.containers.contains(reservation.plan.uuid),
+               "runtime_recovery_malformed_legacy_host_and_system_rows_remain_deferred_without_materialization");
+
+  brain.pendingReplicatedContainerRuntimeStates[deploymentID] = {reservation};
+  brain.applyPendingReplicatedContainerRuntimeStates(deploymentID);
+  suite.expect(!brain.pendingReplicatedContainerRuntimeStates.contains(deploymentID) &&
+                   !brain.containers.contains(reservation.plan.uuid),
+               "runtime_recovery_absent_legacy_reservation_is_dropped_without_materializing_container");
+
+  brain.persistedMachineInventoryUploaded.erase(machine.uuid);
+  suite.expect(brain.applyReplicatedContainerRuntimeStateNow(reservation) ==
+                       ProdigyBrain::ReplicatedContainerRuntimeStateApplyResult::deferred &&
+                   !brain.containers.contains(reservation.plan.uuid),
+               "runtime_recovery_volatile_stateless_planner_reservation_waits_for_missing_machine_inventory");
+  brain.persistedMachineInventoryUploaded.insert(machine.uuid);
+  brain.containerRetirementInventoryByMachine[machine.uuid].ioGeneration = machine.neuron.ioGeneration - 1;
+  suite.expect(!brain.volatileStatelessPlannerReservationInventoryCurrent(reservation),
+               "runtime_recovery_volatile_stateless_planner_reservation_waits_for_current_control_generation");
+  brain.containerRetirementInventoryByMachine[machine.uuid].ioGeneration = machine.neuron.ioGeneration;
+
+  brain.containerRetirementInventoryByMachine[wrongMachine.uuid].present.insert(reservation.plan.uuid);
+  suite.expect(!brain.volatileStatelessPlannerReservationInventoryCurrent(reservation),
+               "runtime_recovery_wrong_machine_uuid_report_remains_closed");
+  brain.containerRetirementInventoryByMachine[wrongMachine.uuid].present.erase(reservation.plan.uuid);
+
+  brain.containerRetirementInventoryByMachine[machine.uuid].present.insert(reservation.plan.uuid);
+  ContainerView actual = {};
+  actual.uuid = reservation.plan.uuid;
+  actual.machine = &machine;
+  actual.deploymentID = deploymentID;
+  actual.fragment = 1;
+  actual.state = ContainerState::scheduled;
+  brain.containers.insert_or_assign(actual.uuid, &actual);
+  machine.upsertContainerIndexEntry(deploymentID, &actual);
+  deployment.containers.insert(&actual);
+  suite.expect(brain.volatileStatelessPlannerReservationInventoryCurrent(reservation),
+               "runtime_recovery_volatile_stateless_planner_reservation_accepts_exact_authenticated_adoption");
+
+  brain.containerRetirementInventoryByMachine[thirdMachine.uuid].present.insert(reservation.plan.uuid);
+  suite.expect(!brain.volatileStatelessPlannerReservationInventoryCurrent(reservation),
+               "runtime_recovery_multiple_machine_uuid_reports_remain_closed");
+  brain.containerRetirementInventoryByMachine[thirdMachine.uuid].present.erase(reservation.plan.uuid);
+
+  brain.pendingReplicatedContainerRuntimeStates[deploymentID] = {reservation};
+  brain.applyPendingReplicatedContainerRuntimeStates(deploymentID);
+  suite.expect(!brain.pendingReplicatedContainerRuntimeStates.contains(deploymentID) &&
+                   brain.containers.at(actual.uuid) == &actual &&
+                   actual.state == ContainerState::scheduled,
+               "runtime_recovery_present_legacy_reservation_keeps_authenticated_actual_unchanged");
+
+  actual.fragment = 0;
+  suite.expect(!brain.volatileStatelessPlannerReservationInventoryCurrent(reservation),
+               "runtime_recovery_volatile_stateless_planner_reservation_rejects_unlaunched_present_conflict");
+  actual.fragment = 1;
+  brain.pendingReplicatedContainerRuntimeStates[deploymentID] = {reservation};
+  suite.expect(brain.replayRestoredContainerInventory(),
+               "runtime_recovery_only_volatile_reservation_does_not_block_actual_inventory_replay");
+  brain.pendingReplicatedContainerRuntimeStates[deploymentID].push_back(scheduledReservation);
+  suite.expect(!brain.pendingReplicatedContainerRuntimeStatesContainOnlyVolatileStatelessPlannerReservations(),
+               "runtime_recovery_stateful_or_scheduled_pending_runtime_keeps_replay_barrier_closed");
+  suite.expect(!brain.replayRestoredContainerInventory(),
+               "runtime_recovery_normal_pending_runtime_blocks_actual_inventory_replay");
+
+  brain.pendingReplicatedContainerRuntimeStates.erase(deploymentID);
+  brain.persistedMachineInventoryUploaded.erase(thirdMachine.uuid);
+  String blocker = {};
+  suite.expect(!brain.finalizePersistedNeuronInventoryRecovery(&blocker) && !blocker.empty(),
+               "runtime_recovery_finalization_remains_closed_without_current_machine_inventory");
+  brain.persistedMachineInventoryUploaded.insert(thirdMachine.uuid);
+  deployment.containers.erase(&actual);
+  machine.removeContainerIndexEntry(deploymentID, &actual);
+  brain.containers.erase(actual.uuid);
+  brain.containerRetirementInventoryByMachine.erase(machine.uuid);
+  brain.containerRetirementInventoryByMachine.erase(wrongMachine.uuid);
+  brain.containerRetirementInventoryByMachine.erase(thirdMachine.uuid);
+  brain.persistedMachineInventoryUploaded.erase(machine.uuid);
+  brain.persistedMachineInventoryUploaded.erase(wrongMachine.uuid);
+  brain.persistedMachineInventoryUploaded.erase(thirdMachine.uuid);
+  brain.machinesByUUID.erase(machine.uuid);
+  brain.machinesByUUID.erase(wrongMachine.uuid);
+  brain.machinesByUUID.erase(thirdMachine.uuid);
+  brain.machines.erase(&machine);
+  brain.machines.erase(&wrongMachine);
+  brain.machines.erase(&thirdMachine);
+  brain.deployments.erase(deploymentID);
+  brain.deploymentPlans.erase(deploymentID);
+  machine.neuron.fd = -1;
+  wrongMachine.neuron.fd = -1;
+  thirdMachine.neuron.fd = -1;
+  (void)network.shutdown();
+}
+
 static void testFollowerMetricIngestionTrimsBeforePersistence(TestSuite& suite)
 {
   PersistenceRing ring;
@@ -2647,6 +2968,14 @@ int main(void)
     testPersistentLocalCousinServicePermissions(suite);
     return suite.failed == 0 ? 0 : 1;
   }
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only != nullptr &&
+      std::strcmp(only, "stateupload-inventory-diagnostics") == 0)
+  {
+    testAuthenticatedStateUploadInventoryDiagnostics(suite);
+    testVolatileStatelessPlannerReservationRecoveryBarrier(suite);
+    std::printf("STATEUPLOAD_INVENTORY_DIAGNOSTICS_RESULT failed_assertions=%d\n", suite.failed);
+    return suite.failed == 0 ? 0 : 1;
+  }
   testProductionPairProjectionWriterUsesColocatedNeuronAuthority(suite);
   testNeuronClusterPairControlProjectionDurabilityAndStreamFence(suite);
   testClusterPairRuntimeRequiresFreshDurableProjectionAfterRestart(suite);
@@ -2692,6 +3021,8 @@ int main(void)
   }
   testProductionUpdateProgressDefersReentrantPersistenceUntilArtifactLeaseReleases(suite);
   testLocalBundleRecoveryDefersCheckpointUntilArtifactLeaseReleases(suite);
+  testAuthenticatedStateUploadInventoryDiagnostics(suite);
+  testVolatileStatelessPlannerReservationRecoveryBarrier(suite);
   testFollowerMetricIngestionTrimsBeforePersistence(suite);
   testLargeMetricHistoryUsesImmutableAsyncCapture(suite);
   testProductionPersistenceAPI(suite);
