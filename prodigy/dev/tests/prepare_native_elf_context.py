@@ -53,6 +53,9 @@ def dependencies(binary: pathlib.Path) -> list[pathlib.Path]:
         if candidate.startswith("/"):
             paths.add(pathlib.Path(candidate))
     paths.add(interpreter(binary))
+    # Discombobulator canonicalizes merged-/usr aliases. Include both the ELF
+    # lookup spelling and its real target so that closure survives that step.
+    paths.update(path.resolve(strict=True) for path in tuple(paths))
     return sorted(paths, key=str)
 
 
