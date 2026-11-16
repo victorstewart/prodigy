@@ -449,7 +449,9 @@ static void serialize(S&& serializer, RearmRetainedStatefulDeployment& payload)
 
 enum class ProdigyLocalBundleRecoveryWitnessRepairAction : uint8_t {
   query = 1,
-  retire = 2
+  retire = 2,
+  queryLegacy = 3,
+  migrateLegacy = 4
 };
 
 class ProdigyLocalBundleRecoveryWitnessMachineScope {
@@ -493,7 +495,7 @@ static void serialize(S&& serializer, ProdigyLocalBundleRecoveryWitnessRepairSco
   serializer.value8b(scope.expectedMasterBootNs);
   serializer.text1b(scope.installedBundleSHA256, 64);
   serializer.text1b(scope.witnessExpectedBundleSHA256, 64);
-  serializer.container(scope.machines, 3, [](auto& nested, auto& machine) { nested.object(machine); });
+  serializer.container(scope.machines, 255, [](auto& nested, auto& machine) { nested.object(machine); });
 }
 
 static inline bool prodigyLocalBundleRecoveryWitnessRepairScopeValid(
@@ -504,7 +506,7 @@ static inline bool prodigyLocalBundleRecoveryWitnessRepairScopeValid(
       scope.expectedMasterUUID == 0 || scope.expectedMasterBootNs <= 0 ||
       !prodigyIsSHA256HexDigest(scope.installedBundleSHA256) ||
       !prodigyIsSHA256HexDigest(scope.witnessExpectedBundleSHA256) ||
-      scope.machines.size() != 3)
+      scope.machines.empty() || scope.machines.size() > 255)
   {
     return false;
   }
@@ -569,7 +571,8 @@ static inline bool prodigyLocalBundleRecoveryWitnessRepairReceiptValid(
 class ProdigyLocalBundleRecoveryWitnessRepairJournal {
 public:
   static constexpr uint32_t legacyVersion = 1;
-  static constexpr uint32_t version = 2;
+  static constexpr uint32_t previousVersion = 2;
+  static constexpr uint32_t version = 3;
   uint32_t protocolVersion = version;
   Vector<ProdigyLocalBundleRecoveryWitnessRepairReceipt> receipts;
 };
@@ -585,6 +588,7 @@ static inline bool prodigyLocalBundleRecoveryWitnessRepairJournalValid(
     const ProdigyLocalBundleRecoveryWitnessRepairJournal& journal)
 {
   if ((journal.protocolVersion != ProdigyLocalBundleRecoveryWitnessRepairJournal::legacyVersion &&
+       journal.protocolVersion != ProdigyLocalBundleRecoveryWitnessRepairJournal::previousVersion &&
        journal.protocolVersion != ProdigyLocalBundleRecoveryWitnessRepairJournal::version) ||
       journal.receipts.size() > 64)
   {
@@ -594,6 +598,8 @@ static inline bool prodigyLocalBundleRecoveryWitnessRepairJournalValid(
   {
     const auto& receipt = journal.receipts[index];
     if (!prodigyLocalBundleRecoveryWitnessRepairReceiptValid(receipt) ||
+        (journal.protocolVersion != ProdigyLocalBundleRecoveryWitnessRepairJournal::version &&
+         receipt.scope.machines.size() != 3) ||
         (journal.protocolVersion == ProdigyLocalBundleRecoveryWitnessRepairJournal::legacyVersion &&
          prodigyLocalBundleRecoveryWitnessRepairScopeSuperseded(receipt.scope))) return false;
     for (uint32_t earlier = 0; earlier < index; ++earlier)
@@ -612,11 +618,12 @@ constexpr static uint64_t prodigyLocalBundleRecoveryWitnessRepairJournalVersionI
 constexpr static uint64_t prodigyLocalBundleRecoveryWitnessRepairJournalMaximumPayloadBytes =
     64 * 1024;
 
-// One shared payload serves query and retire in both directions. `response`
+// One shared payload serves inspection and repair in both directions. `response`
 // prevents a reflected request from being accepted as a durable receipt.
 class RepairLocalBundleRecoveryWitness {
 public:
-  static constexpr uint32_t version = 2;
+  static constexpr uint32_t legacyVersion = 2;
+  static constexpr uint32_t version = 3;
   uint32_t protocolVersion = version;
   bool response = false;
   ProdigyLocalBundleRecoveryWitnessRepairAction action =

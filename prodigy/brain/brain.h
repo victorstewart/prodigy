@@ -44029,6 +44029,93 @@ public:
     return true;
   }
 
+  bool inspectLegacyLocalBundleRecoveryMigrationScope(
+      uint128_t operationUUID, ProdigyLocalBundleRecoveryWitnessRepairScope& scope,
+      Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness>& witnesses, String& failure)
+  {
+    scope = {};
+    witnesses.clear();
+    failure.clear();
+    const auto reject = [&](const char *reason) { failure.assign(reason); return false; };
+    const auto state = capturePersistentUpdateSelfState();
+    if (operationUUID == 0 || !weAreMaster || !ignited || nBrains != 1 ||
+        masterAuthorityEpoch == 0 || !recoveryAuthoritySnapshotDurable() ||
+        masterAuthorityPersistencePending != 0 || !masterAuthorityRuntimeStateAcknowledgedByRegisteredPeers() ||
+        !prodigyPersistentUpdateSelfStatesEquivalent(masterAuthorityRuntimeState.updateSelf, state))
+      return reject("legacy migration authority is not current and durable");
+    if (!recoveringPersistedNeuronInventory || !persistedMachineInventoryEnumerated ||
+        machines.size() < 2 || machines.size() > 255 || !pendingReplicatedContainerRuntimeStates.empty() ||
+        recoveryPersistencePending || !pendingMaterializedRecoveryPersistence.empty() ||
+        state.state != uint8_t(UpdateSelfState::idle) || state.expectedEchos || state.bundleEchos ||
+        state.relinquishEchos || state.plannedMasterPeerKey || state.pendingDesignatedMasterPeerKey ||
+        state.useStagedBundleOnly || !state.bundleEchoPeerKeys.empty() ||
+        !state.relinquishEchoPeerKeys.empty() || !state.followerBootNsByPeerKey.empty() ||
+        !state.followerRebootedPeerKeys.empty() || !state.machineRecoveryWitnesses.empty() ||
+        state.localMachineUUID == 0 || !state.localBundleRegistered || state.localContainerBootstraps.empty() ||
+        !prodigyIsSHA256HexDigest(state.workerExpectedBundleSHA256) || !state.workerFailure.empty() ||
+        updateSelfFollowerConcurrency != 0 || !updateSelfTransitionIssuedPeerKeys.empty() ||
+        !updateSelfFollowerReadyPeerKeys.empty() || !updateSelfTransitionSentPeerKeys.empty() ||
+        updateSelfWorkerMothership != nullptr || updateSelfPersistencePending ||
+        updateSelfPersistenceQueued || updateSelfPersistenceFailed || !updateSelfDurableContinuations.empty())
+      return reject("legacy migration coordinator is not an exact dormant singleton");
+    if (!state.bundleBlob.empty())
+    {
+      String digest = {};
+      if (!prodigyComputeSHA256Hex(state.bundleBlob, digest) ||
+          !digest.equals(state.workerExpectedBundleSHA256))
+        return reject("legacy migration retained bundle payload does not match its expected digest");
+    }
+    Machine *local = findMachineByUUID(state.localMachineUUID);
+    if (local == nullptr || !local->isThisMachine || !local->isBrain)
+      return reject("legacy migration local witness is not the sole Brain");
+    bytell_hash_set<uint128_t> workers = {};
+    for (Machine *machine : machines)
+    {
+      if (machine == nullptr || machine->uuid == 0 || machine->state == MachineState::hardwareFailure ||
+          machine->state == MachineState::decommissioning || (machine != local && machine->isBrain))
+        return reject("legacy migration fleet is not an exact live singleton-Brain topology");
+      if (machine != local && !workers.insert(machine->uuid).second)
+        return reject("legacy migration fleet contains duplicate workers");
+    }
+    const auto exactWorkers = [&](const Vector<uint128_t>& progress) {
+      if (progress.size() != workers.size()) return false;
+      bytell_hash_set<uint128_t> seen = {};
+      for (uint128_t uuid : progress)
+        if (!workers.contains(uuid) || !seen.insert(uuid).second) return false;
+      return true;
+    };
+    if (!exactWorkers(state.workerMachineUUIDs) || !exactWorkers(state.workerStagedMachineUUIDs) ||
+        !exactWorkers(state.workerTransitionIssuedMachineUUIDs) || !exactWorkers(state.workerRebootedMachineUUIDs) ||
+        !exactWorkers(state.workerStateUploadedMachineUUIDs))
+      return reject("legacy migration worker transition or inventory acknowledgements are incomplete");
+    bytell_hash_set<uint128_t> localInventory = {};
+    for (const auto& [deployment, containers] : local->containersByDeploymentID)
+      for (const ContainerView *container : containers)
+        if (container != nullptr) localInventory.insert(container->uuid);
+    if (!durableRecoveryWitnessBootstrapsProjectable(local, state.localContainerBootstraps, failure) ||
+        !machineBundleInventoryIncludesCapturedBootstraps(local, state.localContainerBootstraps, localInventory))
+      return reject("legacy migration retained local bootstrap identity does not match current authority");
+    if (!collectBundleExecMachineRecoveryWitnesses(witnesses, failure, true) || witnesses.size() != machines.size())
+      return false;
+    scope.operationUUID = operationUUID;
+    scope.clusterUUID = brainConfig.clusterUUID;
+    scope.expectedAuthorityGeneration = masterAuthorityRuntimeState.generation;
+    scope.expectedMasterUUID = selfBrainUUID();
+    scope.expectedMasterBootNs = boottimens;
+    scope.installedBundleSHA256 = state.workerExpectedBundleSHA256;
+    scope.witnessExpectedBundleSHA256 = state.workerExpectedBundleSHA256;
+    for (const auto& witness : witnesses)
+    {
+      auto bootstraps = witness.containerBootstraps;
+      String encoded = {}, digest = {};
+      if (!BitseryEngine::serialize(encoded, bootstraps) || !prodigyComputeSHA256Hex(encoded, digest))
+        return reject("legacy migration inventory fingerprint failed");
+      scope.machines.push_back({.machineUUID = witness.machineUUID, .bundleRegistered = true,
+          .bootstrapCount = uint32_t(bootstraps.size()), .bootstrapInventorySHA256 = std::move(digest)});
+    }
+    return prodigyLocalBundleRecoveryWitnessRepairScopeValid(scope);
+  }
+
   bool inspectLocalBundleRecoveryWitnessRepairScope(
       uint128_t operationUUID,
       ProdigyLocalBundleRecoveryWitnessRepairScope& scope,
@@ -44225,6 +44312,75 @@ public:
     return true;
   }
 
+  // Both ordinary bundle checkpoints and explicit legacy migration capture
+  // through the same authenticated Neuron inventory owner.
+  bool collectBundleExecMachineRecoveryWitnesses(
+      Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness>& witnesses,
+      String& failure, bool requireInstalledBundle = false)
+  {
+    witnesses.clear();
+    failure.clear();
+    bytell_hash_set<uint128_t> seen = {};
+    for (Machine *machine : machines)
+    {
+      if (machine == nullptr || machine->state == MachineState::hardwareFailure ||
+          machine->state == MachineState::decommissioning)
+      {
+        continue;
+      }
+      if (machine->uuid == 0 || seen.insert(machine->uuid).second == false)
+      {
+        failure.assign("machine identity unavailable while preparing bundle exec"_ctv);
+        return false;
+      }
+      ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
+      witness.machineUUID = machine->uuid;
+      String inventoryDiagnostic = {};
+      if (collectAuthenticatedNeuronStateUploadBootstraps(machine, witness.containerBootstraps, &inventoryDiagnostic) == false)
+      {
+        // A normal stateUpload remains the single owner of inventory refresh.
+        // Do not checkpoint a stale or scheduler-derived view; ask Neuron for
+        // its current authenticated inventory and let the existing retry path
+        // attempt this operation again after the reply.
+        queueNeuronStateUploadForMachine(machine);
+        failure.assign("machine container ownership needs a fresh authenticated stateUpload for bundle exec"_ctv);
+        if (inventoryDiagnostic.empty() == false)
+        {
+          failure.snprintf_add<": {}"_ctv>(inventoryDiagnostic);
+        }
+        return false;
+      }
+      if (requireInstalledBundle)
+      {
+        const NeuronView& neuron = machine->neuron;
+        const auto fresh = containerRetirementInventoryByMachine.find(machine->uuid);
+        if (!neuronControlStreamActive(machine) || neuron.artifactCapabilityPending ||
+            neuron.verifiedInstalledBundleIOGeneration != neuron.ioGeneration ||
+            neuron.verifiedInstalledBundleAuthorityEpoch != masterAuthorityEpoch ||
+            !neuron.verifiedInstalledBundleSHA256.equals(updateSelfWorkerExpectedBundleSHA256) ||
+            fresh == containerRetirementInventoryByMachine.end() ||
+            fresh->second.authorityEpoch != masterAuthorityEpoch ||
+            fresh->second.ioGeneration != neuron.ioGeneration)
+        {
+          failure.assign("legacy migration needs current authenticated bundle and inventory attestations"_ctv);
+          witnesses.clear();
+          return false;
+        }
+        witness.bundleRegistered = true;
+      }
+      witnesses.push_back(std::move(witness));
+    }
+    if (witnesses.empty())
+    {
+      failure.assign("no machine inventory available while preparing bundle exec"_ctv);
+      return false;
+    }
+    std::sort(witnesses.begin(), witnesses.end(), [](const auto& lhs, const auto& rhs) {
+      return lhs.machineUUID < rhs.machineUUID;
+    });
+    return true;
+  }
+
   void prepareLocalBundleExecRecoveryAsync(PersistenceCompletion completion)
   {
     if (updateSelfMachineRecoveryWitnesses.empty() == false &&
@@ -44250,46 +44406,10 @@ public:
     // transition, so a promoted successor can require each retained inventory
     // rather than scheduling a deficit beside it.
     Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness> witnesses = {};
-    bytell_hash_set<uint128_t> seen = {};
-    for (Machine *machine : machines)
+    if (!collectBundleExecMachineRecoveryWitnesses(witnesses, updateSelfWorkerFailure))
     {
-      if (machine == nullptr || machine->state == MachineState::hardwareFailure ||
-          machine->state == MachineState::decommissioning)
-      {
-        continue;
-      }
-      if (machine->uuid == 0 || seen.insert(machine->uuid).second == false)
-      {
-        updateSelfWorkerFailure.assign("machine identity unavailable while preparing bundle exec"_ctv);
-        completion(false); return;
-      }
-      ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
-      witness.machineUUID = machine->uuid;
-      String inventoryDiagnostic = {};
-      if (collectAuthenticatedNeuronStateUploadBootstraps(machine, witness.containerBootstraps, &inventoryDiagnostic) == false)
-      {
-        // A normal stateUpload remains the single owner of inventory refresh.
-        // Do not checkpoint a stale or scheduler-derived view; ask Neuron for
-        // its current authenticated inventory and let the existing retry path
-        // attempt this operation again after the reply.
-        queueNeuronStateUploadForMachine(machine);
-        updateSelfWorkerFailure.assign("machine container ownership needs a fresh authenticated stateUpload for bundle exec"_ctv);
-        if (inventoryDiagnostic.empty() == false)
-        {
-          updateSelfWorkerFailure.snprintf_add<": {}"_ctv>(inventoryDiagnostic);
-        }
-        completion(false); return;
-      }
-      witnesses.push_back(std::move(witness));
-    }
-    if (witnesses.empty())
-    {
-      updateSelfWorkerFailure.assign("no machine inventory available while preparing bundle exec"_ctv);
       completion(false); return;
     }
-    std::sort(witnesses.begin(), witnesses.end(), [](const auto& lhs, const auto& rhs) {
-      return lhs.machineUUID < rhs.machineUUID;
-    });
     const Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness> previousWitnesses =
         updateSelfMachineRecoveryWitnesses;
     const uint128_t previousLocalMachineUUID = updateSelfLocalMachineUUID;
@@ -55784,21 +55904,28 @@ public:
               BitseryEngine::deserializeSafe(serializedRequest, request);
           const bool validAction =
               request.action == ProdigyLocalBundleRecoveryWitnessRepairAction::query ||
-              request.action == ProdigyLocalBundleRecoveryWitnessRepairAction::retire;
+              request.action == ProdigyLocalBundleRecoveryWitnessRepairAction::retire ||
+              request.action == ProdigyLocalBundleRecoveryWitnessRepairAction::queryLegacy ||
+              request.action == ProdigyLocalBundleRecoveryWitnessRepairAction::migrateLegacy;
+          const bool query = request.action == ProdigyLocalBundleRecoveryWitnessRepairAction::query ||
+              request.action == ProdigyLocalBundleRecoveryWitnessRepairAction::queryLegacy;
+          const bool migration = request.action == ProdigyLocalBundleRecoveryWitnessRepairAction::queryLegacy ||
+              request.action == ProdigyLocalBundleRecoveryWitnessRepairAction::migrateLegacy;
           const auto& emptyScope = request.scope;
           const bool scopeEmpty = emptyScope.operationUUID == 0 && emptyScope.clusterUUID == 0 &&
               emptyScope.expectedAuthorityGeneration == 0 && emptyScope.expectedMasterUUID == 0 &&
               emptyScope.expectedMasterBootNs == 0 && emptyScope.installedBundleSHA256.empty() &&
               emptyScope.witnessExpectedBundleSHA256.empty() && emptyScope.machines.empty();
           if (!decodedRequest ||
-              request.protocolVersion != RepairLocalBundleRecoveryWitness::version ||
+              (request.protocolVersion != RepairLocalBundleRecoveryWitness::version &&
+               (request.protocolVersion != RepairLocalBundleRecoveryWitness::legacyVersion || migration)) ||
               request.response || !validAction || request.operationUUID == 0 ||
               request.clusterUUID == 0 || !scopeEmpty || request.witnessPresent || request.eligible ||
               request.success || request.idempotent || request.completed ||
               request.durableGeneration != 0 || request.acceptedAtMs != 0 || !request.failure.empty() ||
-              (request.action == ProdigyLocalBundleRecoveryWitnessRepairAction::query &&
+              (query &&
                !request.scopeSHA256.empty()) ||
-              (request.action == ProdigyLocalBundleRecoveryWitnessRepairAction::retire &&
+              (!query &&
                !prodigyIsSHA256HexDigest(request.scopeSHA256)))
           {
             reject("invalid local bundle recovery witness repair request");
@@ -55832,7 +55959,7 @@ public:
           if (existing != journal.receipts.end())
           {
             if (existing->scope.clusterUUID != request.clusterUUID ||
-                (request.action == ProdigyLocalBundleRecoveryWitnessRepairAction::retire &&
+                (!query &&
                  !existing->scopeSHA256.equals(request.scopeSHA256)))
             {
               reject("local bundle recovery witness repair operation UUID collision");
@@ -55855,8 +55982,13 @@ public:
           ProdigyLocalBundleRecoveryWitnessRepairScope inspected = {};
           bool witnessPresent = false;
           String predicateFailure = {};
-          const bool eligible = inspectLocalBundleRecoveryWitnessRepairScope(
-              request.operationUUID, inspected, witnessPresent, predicateFailure);
+          Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness> migratedWitnesses = {};
+          const bool eligible = migration
+              ? inspectLegacyLocalBundleRecoveryMigrationScope(request.operationUUID, inspected,
+                    migratedWitnesses, predicateFailure)
+              : inspectLocalBundleRecoveryWitnessRepairScope(
+                    request.operationUUID, inspected, witnessPresent, predicateFailure);
+          if (migration) witnessPresent = updateSelfLocalMachineUUID != 0;
           response.scope = inspected;
           response.witnessPresent = witnessPresent;
           response.eligible = eligible;
@@ -55866,7 +55998,7 @@ public:
             reject("local bundle recovery witness repair scope fingerprint failed");
             break;
           }
-          if (request.action == ProdigyLocalBundleRecoveryWitnessRepairAction::query)
+          if (query)
           {
             response.success = true;
             response.failure = std::move(predicateFailure);
@@ -55907,14 +56039,21 @@ public:
             reject("local bundle recovery witness repair journal cannot accept the receipt");
             break;
           }
-          // The same-bundle predicate proves every other coordinator field
-          // empty. The superseded predicate separately proves that any worker
-          // and follower-concurrency residue belongs to this exact durable
-          // three-machine witness and that the persisted-inventory barrier is
-          // already holding scheduling. Clear the complete durable coordinator
-          // in the same authority commit as the immutable receipt; stale
-          // bootstraps are never projected.
-          restorePersistentUpdateSelfState(ProdigyPersistentUpdateSelfState{});
+          // The repair receipt and coordinator change share one authority
+          // commit. Migration changes only the proof representation; retirement
+          // clears the separately proved dormant coordinator. Scheduling stays
+          // behind the existing inventory finalizer in both cases.
+          if (migration)
+          {
+            // Preserve every worker acknowledgement. Only the proof representation
+            // changes; the existing finalizer still owns scheduling and completion.
+            updateSelfMachineRecoveryWitnesses = std::move(migratedWitnesses);
+            updateSelfLocalMachineUUID = 0;
+            updateSelfLocalMachineFragment = 0;
+            updateSelfLocalBundleRegistered = false;
+            updateSelfLocalContainerBootstraps.clear();
+          }
+          else restorePersistentUpdateSelfState(ProdigyPersistentUpdateSelfState{});
           updateSelfFollowerConcurrency = 0;
           updateSelfTransitionIssuedPeerKeys.clear();
           updateSelfFollowerReadyPeerKeys.clear();
@@ -55925,7 +56064,8 @@ public:
           const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
           commitMasterAuthorityStateChangeAsync(
               [this, lifetime, mothership, epoch, incarnation, operationUUID = request.operationUUID,
-               receipt, before, beforeCoordinator, beforeDurable,
+               receipt, migration, action = request.action, protocolVersion = request.protocolVersion,
+               before, beforeCoordinator, beforeDurable,
                beforeDurableGeneration, generation](bool durable) mutable {
                 if (lifetime.expired()) return;
                 if (masterAuthorityEpoch != epoch) return;
@@ -55949,11 +56089,16 @@ public:
                   durableMasterAuthorityRuntimeStateGeneration = beforeDurableGeneration;
                 }
                 if (durable && candidateCurrent &&
-                    prodigyLocalBundleRecoveryWitnessRepairScopeSuperseded(receipt.scope))
+                    (migration || prodigyLocalBundleRecoveryWitnessRepairScopeSuperseded(receipt.scope)))
                 {
                   recoveringPersistedNeuronInventory = true;
                   recoveredNeuronPairingsUnified = false;
                   persistedInventoryConfirmedAbsentContainers.clear();
+                  if (migration)
+                  {
+                    persistedMachineInventoryUploaded.clear();
+                    persistedMachineStateUploadPlansByMachine.clear();
+                  }
                   for (Machine *machine : machines)
                     if (machine != nullptr && machine->state != MachineState::hardwareFailure &&
                         machine->state != MachineState::decommissioning)
@@ -55963,8 +56108,9 @@ public:
                     mothership->connectionIncarnation != incarnation ||
                     !streamIsActive(mothership) || Ring::socketIsClosing(mothership)) return;
                 RepairLocalBundleRecoveryWitness response = {};
+                response.protocolVersion = protocolVersion;
                 response.response = true;
-                response.action = ProdigyLocalBundleRecoveryWitnessRepairAction::retire;
+                response.action = action;
                 response.operationUUID = operationUUID;
                 response.clusterUUID = receipt.scope.clusterUUID;
                 response.scope = receipt.scope;
