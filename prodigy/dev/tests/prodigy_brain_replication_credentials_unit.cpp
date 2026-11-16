@@ -10432,6 +10432,32 @@ static void testCrossClusterMasqueGatewayConnectorLeaseLifecycle(TestSuite& suit
                    replayFailure.empty(),
                "masque_connector_durable_witness_projects_application_and_gateway_after_brain_reload");
 
+  // Election materializes ordinary plans and clears their deferred entries
+  // before Neuron inventory arrives. The materialized owner remains canonical
+  // even while its recovery state is none.
+  promoted.deploymentPlans.erase(applicationDeploymentID);
+  const auto savedDeploymentState = applicationDeployment.state;
+  applicationDeployment.state = DeploymentState::none;
+  promoted.deployments.insert_or_assign(applicationDeploymentID, &applicationDeployment);
+  suite.expect(promoted.deploymentPlans.empty() &&
+                   promoted.durableRecoveryWitnessBootstrapsProjectable(
+                       &host, restoredWitness.containerBootstraps, replayFailure) && replayFailure.empty(),
+               "durable_witness_uses_materialized_owner_after_election_clears_deferred_plans");
+  promoted.deploymentPlans.insert_or_assign(applicationDeploymentID, applicationPlan);
+  ++applicationDeployment.plan.config.containerBlobBytes;
+  suite.expect(!promoted.durableRecoveryWitnessBootstrapsProjectable(
+                   &host, restoredWitness.containerBootstraps, replayFailure) &&
+                   replayFailure == "durable retained bootstrap does not match canonical deployment authority"_ctv,
+               "durable_witness_rejects_changed_materialized_owner_despite_matching_deferred_plan");
+  --applicationDeployment.plan.config.containerBlobBytes;
+  promoted.deployments.erase(applicationDeploymentID);
+  promoted.deploymentPlans.erase(applicationDeploymentID);
+  suite.expect(!promoted.durableRecoveryWitnessBootstrapsProjectable(
+                   &host, restoredWitness.containerBootstraps, replayFailure),
+               "durable_witness_rejects_absent_materialized_and_deferred_authority");
+  applicationDeployment.state = savedDeploymentState;
+  promoted.deploymentPlans.insert_or_assign(applicationDeploymentID, applicationPlan);
+
   Vector<String> staleGatewayWitness = restoredWitness.containerBootstraps;
   bool mutatedGateway = false;
   for (String& serialized : staleGatewayWitness)

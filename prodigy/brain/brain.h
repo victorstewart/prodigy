@@ -24503,11 +24503,14 @@ public:
         }
         continue;
       }
-      const auto authority = deploymentPlans.find(bootstrap.plan.config.deploymentID());
-      if (authority == deploymentPlans.end() || authority->second.config.applicationID != bootstrap.plan.config.applicationID ||
-          authority->second.config.versionID != bootstrap.plan.config.versionID ||
-          authority->second.config.containerBlobSHA256 != bootstrap.plan.config.containerBlobSHA256 ||
-          authority->second.config.containerBlobBytes != bootstrap.plan.config.containerBlobBytes)
+      // Election moves ordinary plans into their materialized deployment
+      // owners before clearing the deferred-plan map. Resolve both owners in
+      // the established order so that recovery can replay an existing plan.
+      const DeploymentPlan *authority = prodigyWormholeDeploymentPlan(*this, bootstrap.plan.config.deploymentID());
+      if (authority == nullptr || authority->config.applicationID != bootstrap.plan.config.applicationID ||
+          authority->config.versionID != bootstrap.plan.config.versionID ||
+          authority->config.containerBlobSHA256 != bootstrap.plan.config.containerBlobSHA256 ||
+          authority->config.containerBlobBytes != bootstrap.plan.config.containerBlobBytes)
       {
         failure.assign("durable retained bootstrap does not match canonical deployment authority");
         return false;
