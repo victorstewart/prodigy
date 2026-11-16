@@ -22978,6 +22978,13 @@ public:
       return false;
     }
 
+    // Bundle recovery may request inventory before ignition. That explicit
+    // request still needs a bounded acknowledgement on its own connection;
+    // otherwise the pre-ignition shortcut disables its only reconnect owner.
+    if (neuron->machine != nullptr && neuron->machine->stateUploadRequestPending &&
+        neuron->machine->stateUploadRequestIOGeneration == neuron->ioGeneration)
+      return false;
+
     return ignited == false || brainConfig.datacenterFragment == 0 || machineNeedsNeuronStateRefresh(neuron->machine) == false;
   }
 

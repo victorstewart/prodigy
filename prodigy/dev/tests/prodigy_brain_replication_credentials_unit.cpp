@@ -32101,13 +32101,14 @@ static void testBrainNeuronStateUploadRequiresMatchingAssignedFragmentForMachine
   thisBrain = previousBrain;
 }
 
-static void testBrainNeuronControlHandshakeWatchdogClosesStalledRebootRecovery(TestSuite& suite)
+static void testBrainNeuronControlHandshakeWatchdogClosesStalledRebootRecovery(
+    TestSuite& suite, bool preIgnitionInventory = false)
 {
   ScopedFreshRing scopedRing = {};
 
   TestBrain brain = {};
   brain.weAreMaster = true;
-  brain.ignited = true;
+  brain.ignited = !preIgnitionInventory;
   brain.brainConfig.datacenterFragment = 1;
 
   Machine machine = {};
@@ -32127,11 +32128,24 @@ static void testBrainNeuronControlHandshakeWatchdogClosesStalledRebootRecovery(T
   brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
   brain.neurons.insert(&machine.neuron);
 
+  if (preIgnitionInventory)
+  {
+    suite.expect(brain.neuronControlHandshakeComplete(&machine.neuron),
+                 "pre_ignition_without_inventory_request_preserves_handshake_shortcut");
+    machine.stateUploadRequestPending = true;
+    machine.stateUploadRequestIOGeneration = machine.neuron.ioGeneration + 1;
+    suite.expect(brain.neuronControlHandshakeComplete(&machine.neuron),
+                 "pre_ignition_stale_generation_does_not_block_handshake");
+    machine.stateUploadRequestIOGeneration = machine.neuron.ioGeneration;
+    suite.expect(!brain.neuronControlHandshakeComplete(&machine.neuron),
+                 "pre_ignition_current_inventory_request_requires_acknowledgement");
+  }
+
   brain.refreshNeuronControlHandshakeWatchdogForTest(&machine.neuron, "unit-stalled");
   TimeoutPacket *watchdog = brain.neuronControlHandshakeWatchdogForTest(&machine.neuron);
   suite.expect(watchdog != nullptr, "brain_neuron_handshake_watchdog_arms_for_reboot_recovery");
 
-  brain.dispatchTimeout(watchdog);
+  if (watchdog != nullptr) brain.dispatchTimeout(watchdog);
 
   suite.expect(brain.neuronControlHandshakeWatchdogForTest(&machine.neuron) == nullptr, "brain_neuron_handshake_watchdog_consumes_timeout");
   suite.expect(machine.neuronConnectFailStreak == 1, "brain_neuron_handshake_watchdog_counts_stalled_control_stream");
@@ -46576,6 +46590,12 @@ int main(void)
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "pre-ignition-neuron-inventory") == 0)
+  {
+    testBrainNeuronControlHandshakeWatchdogClosesStalledRebootRecovery(suite, true);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "worker-state-upload-exec-fence") == 0)
   {
     testWorkerStateUploadClearsOnlyValidatedExecFence(suite);
@@ -47264,6 +47284,7 @@ int main(void)
   testBrainNeuronStateUploadRequiresMatchingAssignedFragmentForMachineRuntimeReady(suite);
   testNeuronControlClosePreservesExactOwnersUntilFreshInventory(suite);
   testBrainNeuronControlHandshakeWatchdogClosesStalledRebootRecovery(suite);
+  testBrainNeuronControlHandshakeWatchdogClosesStalledRebootRecovery(suite, true);
   testBrainPeerHandshakeWatchdogClosesStalledRegistration(suite);
   testBrainPeerHandshakeWatchdogCancelsAfterFreshRegistration(suite);
   testBrainNeuronControlHandshakeWatchdogCancelsAfterRuntimeReadyUpload(suite);
