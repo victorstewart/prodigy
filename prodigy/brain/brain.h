@@ -20582,6 +20582,11 @@ public:
       return true;
     }
 
+    // A proof conversion is visible in memory before its authority receipt.
+    // Keep the existing scheduling barrier closed until that proof is durable.
+    if (!recoveryAuthoritySnapshotDurable())
+      return reject("recovered inventory authority is not durable");
+
     if (persistedMachineInventoryEnumerated == false)
     {
       return reject("persisted machine inventory is not enumerated");
@@ -24690,10 +24695,13 @@ public:
   // A bundle-exec checkpoint has a stricter provenance requirement than a
   // normal registration replay: it may capture only Neuron-authenticated
   // stateUpload records, and only while their complete UUID set still equals
-  // the canonical machine index. A membership change makes this return false;
-  // the caller requests the established fresh stateUpload before retrying.
+  // the canonical machine index. Only an in-place legacy migration may
+  // retain quiescent, unlaunched reservations outside that runtime inventory,
+  // while the durable recovery finalizer holds scheduling. Ordinary exec
+  // checkpoints still require the complete canonical set.
   bool collectAuthenticatedNeuronStateUploadBootstraps(
-      Machine *machine, Vector<String>& serializedBootstraps, String *diagnostic = nullptr)
+      Machine *machine, Vector<String>& serializedBootstraps, String *diagnostic = nullptr,
+      bool legacyMigration = false)
   {
     serializedBootstraps.clear();
     if (diagnostic != nullptr)
@@ -24738,7 +24746,7 @@ public:
       return reject("authenticated-upload-missing"_ctv);
     }
 
-    bytell_hash_set<uint128_t> canonical = {};
+    bytell_hash_set<uint128_t> canonical = {}, canonicalIdentities = {};
     for (const auto& [deploymentID, machineContainers] : machine->containersByDeploymentID)
     {
       for (const ContainerView *container : machineContainers)
@@ -24762,11 +24770,29 @@ public:
           return reject("canonical-container-wrong-deployment"_ctv, deploymentID, container->uuid,
                         canonical.size(), uploaded->second.size());
         }
-        if (canonical.insert(container->uuid).second == false)
-        {
+        if (!canonicalIdentities.insert(container->uuid).second)
           return reject("canonical-container-duplicate"_ctv, deploymentID, container->uuid,
                         canonical.size(), uploaded->second.size());
+        if (legacyMigration && container->state == ContainerState::planned &&
+            container->fragment == 0 && !container->runtimeReady)
+        {
+          auto owner = deployments.find(deploymentID);
+          auto indexed = containers.find(container->uuid);
+          if (!recoveringPersistedNeuronInventory || !recoveryAuthoritySnapshotDurable() ||
+              !pendingMothershipSpinArtifacts.empty() || !container->whiteholes.empty() ||
+              indexed == containers.end() || indexed->second != container ||
+              owner == deployments.end() || owner->second == nullptr ||
+              std::none_of(owner->second->containers.begin(), owner->second->containers.end(),
+                           [container](const ContainerView *owned) { return owned == container; }) ||
+              !owner->second->unlaunchedPlannerReservationsQuiescent())
+            return reject("canonical-planner-reservation-not-fenced"_ctv, deploymentID,
+                          container->uuid, canonical.size(), uploaded->second.size());
+          // Preserve the canonical reservation and its accounting. It owns no
+          // runtime bootstrap, and the existing recovery barrier prevents a
+          // launch until the migrated witnesses and fresh inventory settle.
+          continue;
         }
+        canonical.insert(container->uuid);
       }
     }
 
@@ -44336,7 +44362,8 @@ public:
       ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
       witness.machineUUID = machine->uuid;
       String inventoryDiagnostic = {};
-      if (collectAuthenticatedNeuronStateUploadBootstraps(machine, witness.containerBootstraps, &inventoryDiagnostic) == false)
+      if (collectAuthenticatedNeuronStateUploadBootstraps(
+              machine, witness.containerBootstraps, &inventoryDiagnostic, requireInstalledBundle) == false)
       {
         // A normal stateUpload remains the single owner of inventory refresh.
         // Do not checkpoint a stale or scheduler-derived view; ask Neuron for

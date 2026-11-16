@@ -11747,18 +11747,26 @@ public:
     delete this;
   }
 
+  bool schedulingExecutionQuiescent(void) const
+  {
+    return !currentlyExecutingWork && !schedulingStack.execution && !retiredSchedulingExecution &&
+        !consumingSchedulingExecution && schedulingStack.waiters.empty() && nSuspended == 0 &&
+        waitingOnContainers.empty() && !waitingOnCompactions && !canaryStack;
+  }
+
+  bool unlaunchedPlannerReservationsQuiescent(void) const
+  {
+    return schedulingExecutionQuiescent() && toSchedule.empty() &&
+        deferredDurableContainerSpins.empty() && !durableContainerLaunchPersistenceContinuationQueued;
+  }
+
   // A failed health barrier may retain planner-only views for replacements
   // which were never sent to a Neuron.  They reserve accounting but own no
   // process or storage, so discard them only as a single all-planned cohort.
   bool canDiscardUnlaunchedMaterializedRecoveryViews(void) const
   {
     if (state != DeploymentState::failed || materializedStatefulRecoveryHealthFailed == false ||
-        currentlyExecutingWork || schedulingStack.execution || retiredSchedulingExecution ||
-        consumingSchedulingExecution || !schedulingStack.waiters.empty() || nSuspended != 0 ||
-        !waitingOnContainers.empty() || waitingOnCompactions || canaryStack)
-    {
-      return false;
-    }
+        !schedulingExecutionQuiescent()) return false;
     for (ContainerView *container : containers)
     {
       if (container == nullptr || container->machine == nullptr || container->state != ContainerState::planned ||

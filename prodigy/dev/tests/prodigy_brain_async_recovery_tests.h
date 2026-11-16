@@ -1684,6 +1684,13 @@ static void testMaterializedRecoveryBlockers(TestSuite& suite)
   String blocker = {};
   brain.recoveringPersistedNeuronInventory = true;
   suite.expect(!brain.finalizePersistedNeuronInventoryRecovery(&blocker) &&
+                   blocker.equal("recovered inventory authority is not durable"_ctv) &&
+                   brain.recoveringPersistedNeuronInventory,
+               "materialized_recovery_reports_non_durable_authority_before_inventory_blockers");
+  brain.masterAuthorityRuntimeState.generation = 1;
+  brain.masterAuthorityRuntimeStateDurable = true;
+  brain.durableMasterAuthorityRuntimeStateGeneration = 1;
+  suite.expect(!brain.finalizePersistedNeuronInventoryRecovery(&blocker) &&
                    blocker.equal("persisted machine inventory is not enumerated"_ctv),
                "materialized_recovery_reports_unenumerated_inventory_blocker");
 

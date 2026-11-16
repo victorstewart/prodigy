@@ -46124,6 +46124,38 @@ static void testLegacyCoordinatorMigration(TestSuite& suite)
   }
   suite.require(fixtureReady, "legacy_coordinator_migration_has_four_current_control_streams");
 
+  ContainerView reservation = {};
+  reservation.uuid = uint128_t(0x991299);
+  reservation.deploymentID = deployment.plan.config.deploymentID();
+  reservation.applicationID = deployment.plan.config.applicationID;
+  reservation.machine = &machines[3];
+  reservation.state = ContainerState::planned;
+  deployment.containers.insert(&reservation);
+  machines[3].upsertContainerIndexEntry(reservation.deploymentID, &reservation);
+  brain.containers.insert_or_assign(reservation.uuid, &reservation);
+  Vector<String> reservationCapture = {};
+  String reservationDiagnostic = {};
+  suite.expect(!brain.collectAuthenticatedNeuronStateUploadBootstraps(
+                   &machines[3], reservationCapture, &reservationDiagnostic) &&
+                   std::strstr(reservationDiagnostic.c_str(), "canonical-planner-reservation-unlaunched") != nullptr,
+               "legacy_coordinator_migration_keeps_ordinary_exec_capture_strict");
+  deployment.waitingOnContainers.insert_or_assign(&reservation, ContainerState::healthy);
+  suite.expect(!brain.collectAuthenticatedNeuronStateUploadBootstraps(
+                   &machines[3], reservationCapture, &reservationDiagnostic, true) &&
+                   std::strstr(reservationDiagnostic.c_str(), "canonical-planner-reservation-not-fenced") != nullptr,
+               "legacy_coordinator_migration_refuses_pending_container_completion");
+  deployment.waitingOnContainers.erase(&reservation);
+  DeploymentWork queuedLaunch = {};
+  queuedLaunch.getBase()->lifecycle = LifecycleOp::construct;
+  queuedLaunch.getBase()->machine = &machines[3];
+  queuedLaunch.getBase()->container = &reservation;
+  deployment.toSchedule.push_back(&queuedLaunch);
+  suite.expect(!brain.collectAuthenticatedNeuronStateUploadBootstraps(
+                   &machines[3], reservationCapture, &reservationDiagnostic, true) &&
+                   std::strstr(reservationDiagnostic.c_str(), "canonical-planner-reservation-not-fenced") != nullptr,
+               "legacy_coordinator_migration_refuses_queued_launch_work");
+  deployment.toSchedule.clear();
+
   brain.updateSelfBundleBlob = bundle;
   brain.updateSelfWorkerExpectedBundleSHA256 = digest;
   brain.updateSelfLocalMachineUUID = machines[0].uuid;
@@ -46144,7 +46176,7 @@ static void testLegacyCoordinatorMigration(TestSuite& suite)
   brain.masterAuthorityRuntimeState.updateSelf = brain.capturePersistentUpdateSelfState();
 
   const auto unchangedLegacy = [&](const ProdigyPersistentUpdateSelfState& before) {
-    return equalSerializedObjects(before, brain.capturePersistentUpdateSelfState()) &&
+    return prodigyPersistentUpdateSelfStatesEquivalent(before, brain.capturePersistentUpdateSelfState()) &&
         !brain.masterAuthorityRuntimeState.taskExecutions.contains(
             prodigyLocalBundleRecoveryWitnessRepairJournalExecutionID) &&
         brain.recoveringPersistedNeuronInventory;
@@ -46215,7 +46247,19 @@ static void testLegacyCoordinatorMigration(TestSuite& suite)
       migrationFrame, MothershipTopic::repairLocalBundleRecoveryWitness, migrationPayload));
   suite.require(mothership.wBuffer.empty() && brain.pendingRuntimePersistence.size() == 1,
                 "legacy_coordinator_migration_persistence_failure_is_held_before_reply");
+  String heldBlocker = {};
+  suite.expect(!brain.finalizePersistedNeuronInventoryRecovery(&heldBlocker) &&
+                   heldBlocker.equals("recovered inventory authority is not durable"_ctv) &&
+                   brain.recoveringPersistedNeuronInventory,
+               "legacy_coordinator_migration_pending_receipt_keeps_scheduling_barrier_closed");
   brain.finishRuntimePersistence(false);
+  if (!unchangedLegacy(beforePersistenceFailure))
+    std::fprintf(stderr, "legacy migration rollback: coordinatorEqual=%d journalPresent=%d recovering=%d generation=%llu pending=%llu\n",
+                 equalSerializedObjects(beforePersistenceFailure, brain.capturePersistentUpdateSelfState()),
+                 brain.masterAuthorityRuntimeState.taskExecutions.contains(prodigyLocalBundleRecoveryWitnessRepairJournalExecutionID),
+                 brain.recoveringPersistedNeuronInventory,
+                 (unsigned long long)brain.masterAuthorityRuntimeState.generation,
+                 (unsigned long long)brain.masterAuthorityPersistencePending);
   suite.expect(unchangedLegacy(beforePersistenceFailure),
                "legacy_coordinator_migration_persistence_failure_rolls_back_legacy_state");
   RepairLocalBundleRecoveryWitness persistenceRejected = {};
@@ -46233,6 +46277,11 @@ static void testLegacyCoordinatorMigration(TestSuite& suite)
                     brain.persistedMachineInventoryUploaded.empty() &&
                     brain.persistedMachineStateUploadPlansByMachine.empty(),
                 "legacy_coordinator_migration_atomically_replaces_singleton_with_four_witnesses");
+  suite.expect(reservation.state == ContainerState::planned && reservation.fragment == 0 &&
+                   !reservation.runtimeReady && brain.containers.at(reservation.uuid) == &reservation &&
+                   machines[3].containersByDeploymentID.hasEntryFor(reservation.deploymentID, &reservation) &&
+                   deployment.containers.contains(&reservation),
+               "legacy_coordinator_migration_preserves_unlaunched_reservation_and_accounting");
   Mesh mesh = {};
   brain.mesh = &mesh;
   for (uint32_t index = 0; index < 4; ++index)
@@ -46293,6 +46342,8 @@ static void testLegacyCoordinatorMigration(TestSuite& suite)
                "legacy_coordinator_migration_replays_exact_durable_receipt");
 
   brain.activeMotherships.erase(&mothership);
+  machines[3].removeContainerIndexEntry(reservation.deploymentID, &reservation);
+  brain.containers.erase(reservation.uuid);
   for (uint32_t index = 0; index < 4; ++index)
   {
     machines[index].removeContainerIndexEntry(containers[index].deploymentID, &containers[index]);
