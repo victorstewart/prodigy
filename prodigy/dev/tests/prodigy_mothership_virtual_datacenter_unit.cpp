@@ -50,8 +50,20 @@ static void testBrainCaptureCanonicalPaths(TestSuite& suite)
   std::filesystem::create_directories(vdc.string() + ".secrets");
   suite.expect(!mothershipVDCBrainCaptureStatePaths(processRoot, primary, secrets, &failure),
                "capture_paths_reject_ambiguous");
-  std::filesystem::remove_all(native);
   std::filesystem::remove_all(native.string() + ".secrets");
+  suite.expect(!mothershipVDCBrainCaptureStatePaths(processRoot, primary, secrets, &failure),
+               "capture_paths_auto_rejects_partial_alternate");
+  suite.expect(mothershipVDCBrainCaptureStatePaths(
+                   processRoot, primary, secrets, &failure, "/containers/prodigy.state"_ctv) &&
+                   primary.equals(String(vdc.c_str())),
+               "capture_paths_explicit_vdc_ignores_partial_alternate");
+  suite.expect(!mothershipVDCBrainCaptureStatePaths(
+                   processRoot, primary, secrets, &failure, "/containers/prodigy.state/nope"_ctv),
+               "capture_paths_reject_noncanonical_selector");
+  suite.expect(!mothershipVDCBrainCaptureStatePaths(
+                   processRoot, primary, secrets, &failure, defaultProdigyPersistentStateDBPath()),
+               "capture_paths_explicit_rejects_missing_pair");
+  std::filesystem::remove_all(native);
   suite.expect(mothershipVDCBrainCaptureStatePaths(processRoot, primary, secrets, &failure) &&
                primary.equals(String(vdc.c_str())), "capture_paths_preserve_vdc");
   std::filesystem::remove_all(vdc.string() + ".secrets");

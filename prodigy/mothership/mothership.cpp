@@ -4087,7 +4087,7 @@ static bool mothershipVDCCaptureLocalCheckpoint(MothershipVDCBundleRecovery& ope
 // guard has verified that process resumed.
 static bool mothershipVDCCaptureBrainStateLocal(
     uint128_t expectedClusterUUID, uint128_t expectedMachineUUID,
-    uint64_t expectedPID, const String& directory, String *failure)
+    uint64_t expectedPID, const String& directory, const String& statePathSelector, String *failure)
 {
   auto reject = [&](const char *message) {
     if (failure && failure->empty()) failure->assign(message);
@@ -4095,6 +4095,7 @@ static bool mothershipVDCCaptureBrainStateLocal(
   };
   if (expectedClusterUUID == 0 || expectedMachineUUID == 0 || expectedPID < 2 ||
       !mothershipVDCPrivateDirectory(directory) ||
+      !mothershipVDCBrainCaptureStatePathSelectorValid(statePathSelector) ||
       std::getenv("PRODIGY_STATE_DB") != nullptr ||
       std::getenv("PRODIGY_STATE_SECRETS_DB") != nullptr)
     return reject("invalid isolated Brain state capture input");
@@ -4124,7 +4125,8 @@ static bool mothershipVDCCaptureBrainStateLocal(
 
   MothershipVDCProcessResumeGuard resume(receipt.process);
   if (!resume.freeze(failure)) return false;
-  if (!mothershipVDCBrainCaptureStatePaths(processRoot, source, sourceSecrets, failure)) return false;
+  if (!mothershipVDCBrainCaptureStatePaths(
+          processRoot, source, sourceSecrets, failure, statePathSelector)) return false;
   if (!mothershipVDCCopyPrivateStateTree(source, copy, failure) ||
       !mothershipVDCCopyPrivateStateTree(sourceSecrets, copySecrets, failure))
     return reject("private crash-consistent Brain state capture failed");
@@ -15211,15 +15213,17 @@ REMOTE_RUNTIME
     String machineText = argc > 1 ? String(argv[1]) : String();
     String pidText = argc > 2 ? String(argv[2]) : String();
     String directory = argc > 3 ? String(argv[3]) : String();
+    String statePathSelector = argc > 4 ? String(argv[4]) : String();
     uint128_t clusterUUID = 0, machineUUID = 0;
     uint64_t pid = 0;
     const char *pidBegin = reinterpret_cast<const char *>(pidText.data());
     String failure = {};
-    const bool valid = argc == 4 &&
+    const bool valid = (argc == 4 || argc == 5) &&
         prodigyParseCanonicalHex128(clusterText, clusterUUID) &&
         prodigyParseCanonicalHex128(machineText, machineUUID) &&
         mothershipVDCParseUnsigned(pidBegin, pidBegin + pidText.size(), pid) && pid > 1 &&
-        mothershipVDCCaptureBrainStateLocal(clusterUUID, machineUUID, pid, directory, &failure);
+        mothershipVDCCaptureBrainStateLocal(
+            clusterUUID, machineUUID, pid, directory, statePathSelector, &failure);
     basics_log("captureBrainStateLocal success=%u clusterUUID=%s machineUUID=%s pid=%llu failure=%s\n",
                unsigned(valid), clusterText.c_str(), machineText.c_str(),
                (unsigned long long)pid, failure.c_str());
