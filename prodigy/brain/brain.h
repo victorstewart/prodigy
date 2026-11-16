@@ -21809,11 +21809,15 @@ public:
 
       // A queued successor becomes the application index head before the
       // predecessor has recovered.  Consume only empty queued successors and
-      // recover the first materialized predecessor exactly once; its existing
-      // roll-forward path owns successor activation and lifetime changes.
-      while (head->previous != nullptr && head->lifecycleIsUnmaterialized() &&
+      // recover the first runtime-bearing predecessor exactly once. A restored
+      // in-place planner reservation retains accounting but cannot supply that
+      // topology; its ordinary healthy-predecessor handoff rebinds the work.
+      while (head->previous != nullptr &&
              (head->state == DeploymentState::none || head->state == DeploymentState::waitingToDeploy))
       {
+        Vector<std::pair<ContainerView *, ContainerView *>> replacements;
+        if (!head->lifecycleIsUnmaterialized() &&
+            !head->collectRecoveredUnlaunchedStatefulReplacements(replacements)) break;
         head = head->previous;
       }
       bool heldByOperatorCancellation = false;

@@ -3686,11 +3686,12 @@ private:
         nShardGroups = previous->nShardGroups;
         if (nShardGroups == 0)
         {
-          // A cold retained recovery can restore the successor's canonical
-          // runtime inventory after its empty predecessor.  Do not invent a
-          // topology from an empty predecessor; recover it only from the
-          // authenticated container shard groups already owned here.
+          // Cold reconstruction has not necessarily recovered the predecessor's
+          // counters yet. Derive topology from either owner's materialized
+          // runtime inventory; planner-only reservations supply no topology.
           nShardGroups = recoveredStatefulShardGroupCount();
+          if (prodigyMaterializedStatefulRecoveryPlansAreCompatible(previous->plan, plan))
+            nShardGroups = std::max(nShardGroups, previous->recoveredStatefulShardGroupCount());
         }
       }
       else
@@ -7572,11 +7573,8 @@ public:
     return planStatefulConstruction(machine, container, dataStrategy);
   }
 
-  DeploymentWork *planStatefulUpdateInPlace(ContainerView *oldContainer, Vector<uint32_t> assignedGPUMemoryMBs = {}, Vector<AssignedGPUDevice> assignedGPUDevices = {})
+  DeploymentWork *planStatefulUpdateInPlace(ContainerView *oldContainer, ContainerView *container)
   {
-    ContainerView *container = constructOnMachine(oldContainer->machine, ApplicationLifetime::base, std::move(assignedGPUMemoryMBs), std::move(assignedGPUDevices));
-    container->shardGroup = oldContainer->shardGroup;
-
     DeploymentWork *work = workPool.get();
     work->emplace<StatefulWork>(LifecycleOp::updateInPlace, container, oldContainer);
 
@@ -7587,6 +7585,13 @@ public:
     oldContainer->plannedWork = work;
 
     return work;
+  }
+
+  DeploymentWork *planStatefulUpdateInPlace(ContainerView *oldContainer, Vector<uint32_t> assignedGPUMemoryMBs = {}, Vector<AssignedGPUDevice> assignedGPUDevices = {})
+  {
+    ContainerView *container = constructOnMachine(oldContainer->machine, ApplicationLifetime::base, std::move(assignedGPUMemoryMBs), std::move(assignedGPUDevices));
+    container->shardGroup = oldContainer->shardGroup;
+    return planStatefulUpdateInPlace(oldContainer, container);
   }
 
   DeploymentWork *planStatelessDestruction(ContainerView *container, const char *reason = "unspecified")
@@ -11011,6 +11016,23 @@ public:
       }
     }
 
+    Vector<std::pair<ContainerView *, ContainerView *>> recoveredReplacements;
+    const bool hasUnownedStatefulReservation = plan.isStateful && std::any_of(
+        containers.begin(), containers.end(), [](const ContainerView *container) {
+          return container && container->state == ContainerState::planned &&
+              container->fragment == 0 && !container->runtimeReady && !container->plannedWork;
+        });
+    if (hasUnownedStatefulReservation)
+    {
+      // A restored reservation already owns its UUID and scalar/GPU accounting.
+      // Rebind its lost work only at the normal healthy-predecessor handoff;
+      // measurement and partial cohorts must not allocate a second replacement.
+      if (onlyMeasure || !collectRecoveredUnlaunchedStatefulReplacements(recoveredReplacements) ||
+          previous->nTarget() == 0 || previous->nHealthy() != previous->nTarget() ||
+          previous->nDeployed() != previous->nTarget()) co_return;
+      rebuildRecoveredContainerCounts();
+    }
+
     Vector<uint32_t> shardsForCreation; // only stateful
 
     bytell_hash_map<Machine *, MachineResourcesDelta> initialMachineResources; // used when measuring to revert
@@ -11042,6 +11064,11 @@ public:
     if (previous && previous->containers.size() > 0)
     {
       containersToDestroy = previous->containers;
+    }
+    for (const auto& [source, reservation] : recoveredReplacements)
+    {
+      toSchedule.push_back(planStatefulUpdateInPlace(source, reservation));
+      containersToDestroy.erase(source);
     }
 
     // by the time we get to architect, by the time this new deployment is deploying, all previous work from the last deployment has completed
@@ -11758,6 +11785,51 @@ public:
   {
     return schedulingExecutionQuiescent() && toSchedule.empty() &&
         deferredDurableContainerSpins.empty() && !durableContainerLaunchPersistenceContinuationQueued;
+  }
+
+  bool collectRecoveredUnlaunchedStatefulReplacements(
+      Vector<std::pair<ContainerView *, ContainerView *>>& replacements) const
+  {
+    replacements.clear();
+    const auto reject = [&] { replacements.clear(); return false; };
+    if (!thisBrain || !previous || previous->next != this || !plan.isStateful ||
+        !previous->plan.isStateful || !plan.stateful.allowUpdateInPlace ||
+        !prodigyMaterializedStatefulRecoveryPlansAreCompatible(previous->plan, plan) ||
+        (state != DeploymentState::none && state != DeploymentState::waitingToDeploy &&
+         state != DeploymentState::deploying) ||
+        containers.empty() || !unlaunchedPlannerReservationsQuiescent()) return false;
+    bytell_hash_set<ContainerView *> sources;
+    for (ContainerView *reservation : containers)
+    {
+      if (!reservation || !reservation->machine ||
+          !BrainBase::neuronControlStreamActive(reservation->machine) || !reservation->machine->runtimeReady ||
+          reservation->deploymentID != plan.config.deploymentID() ||
+          reservation->state != ContainerState::planned || reservation->fragment != 0 ||
+          reservation->runtimeReady || reservation->plannedWork || !reservation->whiteholes.empty() ||
+          !reservation->isStateful || reservation->lifetime != ApplicationLifetime::base ||
+          !thisBrain->containers.contains(reservation->uuid) ||
+          thisBrain->containers.at(reservation->uuid) != reservation ||
+          !reservation->machine->containersByDeploymentID.hasEntryFor(reservation->deploymentID, reservation))
+        return reject();
+      ContainerView *source = nullptr;
+      for (ContainerView *candidate : previous->containers)
+      {
+        if (!candidate || candidate->machine != reservation->machine ||
+            candidate->shardGroup != reservation->shardGroup) continue;
+        if (source || candidate->deploymentID != previous->plan.config.deploymentID() ||
+            !candidate->isStateful || candidate->lifetime != ApplicationLifetime::base ||
+            candidate->state != ContainerState::healthy || !candidate->runtimeReady ||
+            candidate->fragment == 0 || candidate->plannedWork ||
+            !thisBrain->containers.contains(candidate->uuid) ||
+            thisBrain->containers.at(candidate->uuid) != candidate ||
+            !candidate->machine->containersByDeploymentID.hasEntryFor(candidate->deploymentID, candidate))
+          return reject();
+        source = candidate;
+      }
+      if (!source || !sources.insert(source).second) return reject();
+      replacements.emplace_back(source, reservation);
+    }
+    return true;
   }
 
   // A failed health barrier may retain planner-only views for replacements
