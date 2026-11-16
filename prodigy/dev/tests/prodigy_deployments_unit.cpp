@@ -4525,6 +4525,23 @@ int main(void)
     suite.expect(crashBackoffReady(), "replacement_observed_crash_backoff_owner_admitted");
     suite.expect(ContainerManager::observedCrashBackoffPredecessorCgroupIsEmpty(&crashed, &crashBackoffFailure),
                  "replacement_observed_crash_backoff_cgroup_empty_required");
+    Container storageTarget;
+    storageTarget.cgroup = dup(crashed.cgroup);
+    suite.expect(ContainerManager::storageTargetIsQuiescent(&storageTarget, &crashBackoffFailure),
+                 "storage_ownership_fresh_target_has_an_empty_created_cgroup");
+    storageTarget.pid = 321;
+    suite.expect(!ContainerManager::storageTargetIsQuiescent(&storageTarget, &crashBackoffFailure),
+                 "storage_ownership_unobserved_process_rejected");
+    storageTarget.infop.si_pid = 321;
+    storageTarget.infop.si_code = CLD_EXITED;
+    suite.expect(ContainerManager::storageTargetIsQuiescent(&storageTarget, &crashBackoffFailure),
+                 "storage_ownership_observed_exit_and_empty_cgroup_admitted");
+    suite.expect(writeFileFixture(crashBackoffCgroup / "cgroup.events", "populated 1\n") &&
+                 !ContainerManager::storageTargetIsQuiescent(&storageTarget, &crashBackoffFailure) &&
+                 writeFileFixture(crashBackoffCgroup / "cgroup.events", "populated 0\n"),
+                 "storage_ownership_populated_cgroup_rejected");
+    close(storageTarget.cgroup); storageTarget.cgroup = -1; storageTarget.pid = -1;
+
     suite.expect(writeFileFixture(crashBackoffCgroup / "cgroup.events", "populated 1\n") &&
                      !ContainerManager::observedCrashBackoffPredecessorCgroupIsEmpty(&crashed, &crashBackoffFailure) &&
                      writeFileFixture(crashBackoffCgroup / "cgroup.events", "populated 0\n"),
