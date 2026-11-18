@@ -6,6 +6,7 @@ add_executable(hello_prodigy_v2 hello_prodigy.cpp)
 foreach(_hello_prodigy_target IN ITEMS hello_prodigy_v1 hello_prodigy_v2)
    target_include_directories(${_hello_prodigy_target} PRIVATE "${PRODIGY_ROOT}")
    depos_link(${_hello_prodigy_target} PRIVATE ${PRODIGY_COMMON_DEPO_TARGETS} pthread)
+   target_link_options(${_hello_prodigy_target} PRIVATE -static)
    target_compile_options(${_hello_prodigy_target} PRIVATE -O2)
 endforeach()
 target_compile_definitions(hello_prodigy_v1 PRIVATE HELLO_PRODIGY_VERSION="v1")
@@ -27,12 +28,9 @@ function(_hello_prodigy_artifact version)
               build
               --file "${_recipe}"
               --context "bin=$<TARGET_FILE_DIR:hello_prodigy_${version}>"
-              --context "ebpf=${CMAKE_BINARY_DIR}"
               --output "${_artifact}"
               --kind app
       DEPENDS hello_prodigy_${version}
-              container_egress_router
-              container_ingress_router
               "${CMAKE_CURRENT_SOURCE_DIR}/HelloProdigy.DiscombobuFile.in"
               "${_recipe}"
               "${DISCOMBOBULATOR_MANIFEST}"
