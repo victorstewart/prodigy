@@ -67,7 +67,7 @@ Mothership accepted the two example plans with `deploy <cluster> <plan-json> <ap
 
 Raw run directories in the measurement checkout are under `.run/e2e-app-recovery-20261118/guest-files/runs/`. The two controlled series are `cross-placement/1..6` and `ram-matrix-pairs/1..6`. Each contains the application and cluster reports, deployment inputs, timestamped payload evidence, direct fault witnesses and cleanup receipts.
 
-The Rust SDK suite with Tokio enabled passed 21/21 on Linux ARM64. Shell syntax and git diff whitespace checks passed. The existing dependency-materialization CMake source check fails at line 95 looking for a masque_tunnel version string on both d734e33 and the changed tree. The language exercised end-to-end here was Rust.
+The Rust SDK suite with Tokio enabled passed 21/21 on Linux ARM64. Shell syntax and git diff whitespace checks passed. At that revision the dependency-materialization CMake check failed at line 95 on both trees. Commit fd36cc1 subsequently repaired the check. The preceding trials used the in-container Rust SDK. The native C++ trials appear below.
 
 | Cause | Origin | Fix |
 |---|---|---|
@@ -75,3 +75,59 @@ The Rust SDK suite with Tokio enabled passed 21/21 on Linux ARM64. Shell syntax 
 | Child-cgroup vector omitted by Rust | baf0ed2, 2026-07-11 | 43ad5cb |
 | Tokio exposes only the health signal | f8db33d, 2026-04-23 | 00b4a61 |
 | Mesh runner waits for advertiser health before subscriber submission | b768168, 2026-05-04 | 7f9c9db |
+
+## Control-plane persistence and container launch
+
+The three-machine test above supplied the runtime baseline. We compared the same Rust app artifact in three deployments and advertiser-machine crashes on each build. The original Brain logged 92, 90 and 92 rejected ordinary snapshot submissions because all eight job slots were occupied. It had already captured the control model, accounted its size and detached the snapshot for the writer. Commit e665cc6 checks for a full job queue first and uses the existing candidate submission path for exact byte admission. Receipt-bearing calls still return failure immediately on rejection. Ordinary calls schedule a single retry which captures the latest state after capacity returns.
+
+A Linux ARM64 benchmark filled the real ArtifactIO queue with eight held jobs and invoked the production Brain method 100 times per run. It used two peer records and 192 metric observations. The explicit failure receipt and subsequent durable generation 117 were checked on each run. With tracing disabled and stderr on guest tmpfs, the three baseline batches took 1.251, 0.922 and 0.888 ms in total. The changed batches took 0.021, 0.006 and 0.006 ms. Median per-call time across the middle run went from 8.17 µs to 0.041 µs. This includes the cost of the old synchronous rejection diagnostic. Normal cluster measurements showed little change.
+
+| Event from start of first deploy, median of three | Baseline | Snapshot change |
+|---|---:|---:|
+| First verified Rust dependency reply | 429 ms | 428 ms |
+| Both apps observed healthy | 651 ms | 644 ms |
+| First verified reply after advertiser-follower crash, measured from fault onset | 2,570 ms | 2,519 ms |
+
+In three further successful deployments, gated Neuron timestamps separated storage, clone, identity, netkit, egress and ingress setup. In the first, the advertiser reached rootfs-ready at 144 ms, storage-ready at 144 ms, clone and identity at 147 ms, and host networking at 148 ms. Egress was installed at 298 ms and ingress at 407 ms. The process-started marker was at 407 ms, with Brain health at 411 ms. The subscriber showed the same pattern. A separate diagnostic deployment was accepted but never reached launch within the health observation window. Only one follower's metadata echo was observed per deployment there. The provider removed that cluster and the three independently recreated clusters completed. Its missing latency is excluded from the successful timing distribution.
+
+We also deployed three Rust advertisers with one per machine and one subscriber, verified placement through Mothership, then crashed the master for 12 s. When the subscriber lived on another machine it produced 12 successful replies during the outage, the first at 650 ms. The first two samples placed the subscriber on the master. Their first fresh replies came at 14.08 and 12.88 s. The surviving-subscriber observation does not identify which advertiser served its pre-fault connection. With a sole advertiser on the failed master, the new master still requires authoritative live-machine inventory before scheduling. Election and serving recovery are distinct events.
+
+The full runtime-persistence unit suite passed on ARM64 after commit 5958040 corrected the event-ring fixture in the inventory diagnostic test. Its constructor previously aborted before the assertions on both the baseline and the snapshot-change build. The dependency check passed for version-first and namespace-first manifests, with separate rejection cases for stale versions and duplicate records.
+
+## Native C++ HTTP dependency
+
+The advertiser was the repository's `hello_prodigy_v1` executable. A second C++ application used `NeuronHub` and `Ring`, subscribed to the advertiser, opened an IPv6 TCP connection, requested `GET /healthz`, and required both HTTP 200 and the exact v1 response body. It declared runtime readiness when it could receive a pairing and application health after its first valid response. Mothership deployed them on different machines in a three-machine test cluster. We used an internal service advertisement on port 8080 so the subscriber exercised a real mesh pairing. The example's public-ingress plan was outside this measurement. The probe runs once per second after success and retries after a failure or pairing change. Timings are first witnessed responses at that cadence.
+
+The original ARM64 example executable requested `/lib/ld-linux-aarch64.so.1`. Its `FROM scratch` build failed Discombobulator's target-runtime closure check before either application could run. Commit `797bc27` introduced this combination on 2026-09-06. The stricter target-workspace closure in `2b49ffe` on 2026-10-31 exposed it. Commit `ab9b583` made v1 and v2 self-contained. Both packaged through the real `--kind app` path. All native timing controls use a packageable static executable.
+
+The original recipe also copied 1,077,928 bytes of router objects into the build workspace. Inspection of both Discombobulator Btrfs send streams showed that the original length was 8,386,579 bytes and the shortened recipe produced 8,386,087. Both streams wrote the same 8,375,168-byte executable and 134-byte launch metadata. The old artifact retained two extra directories. The compressed artifacts were 3,234,271 and 3,234,130 bytes. Removing those build inputs saved 141 bytes on the wire in this build. Neuron obtains the live routers from its runtime bundle.
+
+Commit `f81f5c8` lets the linker discard unused sections and strips the copy shipped in the app. The local executable retains its symbols. Link-time section removal alone produced a 3,186,593-byte v1 artifact. Stripping the shipping copy brought it to 2,869,233 bytes, 11.3% below the static control. The executable inside went from 8,375,168 to 6,896,056 bytes. v2 also packaged successfully. The comparison used the same subscriber bytes throughout.
+
+| Native C++ event, median (range), three deployments per column | Baseline runtime, full app | Updated runtime, full app | Updated runtime, smaller app |
+|---|---:|---:|---:|
+| Create cluster to three machines reported ready | 2,467 (2,354–2,580) ms | 2,358 (2,344–2,457) ms | 2,399 (2,367–2,402) ms |
+| Deploy to first verified HTTP response | 688 (446–688) ms | 447 (398–711) ms | 696 (694–717) ms |
+| Deploy to both applications reported healthy | 1,167 (677–1,206) ms | 658 (651–936) ms | 715 (715–1,200) ms |
+| Create cluster to both applications reported healthy | 3,639 (3,246–3,816) ms | 3,181 (3,062–3,366) ms | 3,186 (3,180–3,635) ms |
+
+In the three smaller-app runs the master was elected 1,022–1,026 ms after cluster creation. The last Neuron inventory was ready at 1,542–1,591 ms. Brain recorded the last Neuron runtime-ready at 2,220–2,227 ms. One additional updated-runtime run timed out during cluster configuration at 120 seconds, before application submission. Its missing startup latency is excluded.
+
+The timing difference between deployments depended on when Brain dispatched the subscriber. In the two fastest updated-runtime controls it dispatched the subscriber at 103 and 105 ms after initial deploy, while the advertiser was still starting. In the 711 ms control it dispatched at 402 ms, after the advertiser process started at 382 ms. All three smaller-app trials had this latter ordering. This experiment establishes a byte saving. It does not establish a reduction in end-to-end startup latency. Across the updated launches, the measured egress setup took 137–167 ms and the following ingress setup took 104–128 ms, including replacement launches.
+
+Two additional diagnostic runs used the Brain readiness markers in `2143bc4` and timed the actual libbpf calls on the Neuron launch path. Each included an initial advertiser, a subscriber and an advertiser replacement, giving 12 direction-specific object loads. Opening an ELF took 0.267–0.831 ms. Each successful object load took 90.8–134.9 ms, including 0.80–1.09 ms in map creation and 0.031–0.052 ms in BTF loads. The kernel program-load calls consumed **1,320.756 of 1,336.896 ms (98.8%)** inside the object loads. This includes verification and other kernel load work. The measurements do not separate verifier and JIT time. The declared-network ingress program reuses a flow map pinned by egress, so parallelizing both complete loads would change their dependency ordering.
+
+### Native recovery from advertiser failure
+
+Mothership held the advertised machine down for 12 seconds. Of nine ordinary runs, seven lost an advertiser on a follower. The first confirmed HTTP response at a different address came at 12.220–12.483 s. The other two lost an advertiser on the master. Their first responses came at 12.807 and 13.001 s. All nine runs verified a fresh payload and a stable recovered cluster. Two more instrumented follower crashes reproduced the control-plane delay.
+
+| Time from crash | Diagnostic 1 | Diagnostic 2 |
+|---|---:|---:|
+| Replacement healthy and Neuron receives runtime-ready | 2,543 ms | 2,417 ms |
+| Brain records readiness held for Switchboard wormhole acknowledgements | 2,543 ms | 2,417 ms |
+| Acknowledgements complete and Brain releases runtime readiness | 12,411 ms | 12,336 ms |
+| Subscriber receives activation and verifies the HTTP response | 12,411 ms | 12,337 ms |
+
+Hello reports healthy before it reports runtime-ready. For a stateless deployment, health starts a fleet Switchboard transaction, including when the desired external route set is empty. Brain retains the subsequent runtime-ready notification until the tracked machines acknowledge the routing revision. The native subscriber's old endpoint attempts timed out in roughly a quarter of a second. After activation it verified the replacement response in 0 and 1 ms. The roughly ten-second interval was spent waiting for routing acknowledgements. The Rust advertiser reports runtime readiness before application health. In those runs the subscriber received its pairing before health started the routing transaction. The two workloads followed different recovery paths. The fleet contract explicitly covers empty revisions and disconnected live machines. Container route IDs include a reusable eight-bit fragment. Bypassing the withdrawal acknowledgement on an empty plan would need independent evidence that the ID has no stale route.
+
+Mothership issued successful removal receipts for all 11 completed native test clusters. The full-app harness also emitted a shell diagnostic after the third updated-runtime control finished. The three individual exit codes, payload checks and removal receipts were verified. The separate 120-second configuration timeout produced no completed-cluster receipt. The disposable guest for that failed batch stopped through the boundary launcher. This workload covers one internal HTTP dependency and advertiser-machine failure. A database election, log catch-up or storage promotion would add its own recovery work.
