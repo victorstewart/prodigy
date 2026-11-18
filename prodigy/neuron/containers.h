@@ -1584,24 +1584,38 @@ public:
   ProdigyOverlayValueMirror<switchboard_overlay_prefix6_key, switchboard_overlay_hosted_ingress_route6> installedPeerHostedIngressRouteKeys6 = {};
   ProdigyOverlayValueMirror<portal_definition, switchboard_whitehole_binding> installedPeerWhiteholeBindingKeys = {};
   bool syncDeclaredNetworkPairingPolicy(bool invalidateAuthorizedFlows,
-                                        uint128_t revokedPeerAddress,
-                                        uint16_t revokedServicePort,
-                                        bool revokedAdvertisement)
+                                        uint128_t address, uint16_t port, bool advertisement)
   {
-    if (plan.networkAccess != ContainerNetworkAccess::declaredOnly)
+    if (plan.networkAccess != ContainerNetworkAccess::declaredOnly) return true;
+
+    // The plan already includes this transition. Only removal can leave the
+    // same tuple installed through a different service.
+    BPFProgram *program = advertisement ? primary_program : peer_program;
+    bool updated = false;
+    if (program && address && port && declaredNetworkPairingsValid(plan))
     {
-      return true;
+      container_service_peer entry = {};
+      std::memcpy(entry.address, &address, sizeof(entry.address));
+      entry.port = htons(port);
+      bool install = !invalidateAuthorizedFlows || declaredNetworkReferencesEndpoint(plan, address, port, advertisement);
+      auto writeEntry = [&](int mapFD) {
+        if (mapFD < 0) return;
+        if (install)
+        {
+          const __u8 value = 1;
+          updated = bpf_map_update_elem(mapFD, &entry, &value, BPF_ANY) == 0;
+        }
+        else updated = bpf_map_delete_elem(mapFD, &entry) == 0 || errno == ENOENT;
+      };
+      if (advertisement) program->openMap("ct_adv_sources"_ctv, writeEntry);
+      else program->openMap("ct_sub_targets"_ctv, writeEntry);
     }
-    if (syncDeclaredNetworkPolicy(false) == false)
+    if (!updated || (invalidateAuthorizedFlows && !revokeAuthorizedTCPFlows(address, port, advertisement)))
     {
+      clearDeclaredNetworkPolicy();
       return false;
     }
-    if (invalidateAuthorizedFlows == false)
-    {
-      return true;
-    }
-    return revokedPeerAddress != 0 && revokedServicePort != 0 &&
-           revokeAuthorizedTCPFlows(revokedPeerAddress, revokedServicePort, revokedAdvertisement);
+    return true;
   }
 
   static bool authorizedTCPFlowMatchesRevokedPairing(const flow_key& flow,
@@ -2353,6 +2367,14 @@ public:
     }
   }
 
+  void clearDeclaredNetworkPolicy()
+  {
+    (void)clearBPFMap<container_service_peer>(peer_program, "ct_sub_targets"_ctv);
+    (void)clearBPFMap<container_service_peer>(primary_program, "ct_adv_sources"_ctv);
+    (void)clearAuthorizedTCPFlows();
+    denyDeclaredNetwork();
+  }
+
   bool syncDeclaredNetworkPolicy(bool invalidateAuthorizedFlows = true)
   {
     if (plan.networkAccess != ContainerNetworkAccess::declaredOnly)
@@ -2394,10 +2416,7 @@ public:
               syncBPFSet(primary_program, "ct_adv_sources"_ctv, advertisementSources);
     if (ok == false)
     {
-      (void)clearBPFMap<container_service_peer>(peer_program, "ct_sub_targets"_ctv);
-      (void)clearBPFMap<container_service_peer>(primary_program, "ct_adv_sources"_ctv);
-      (void)clearAuthorizedTCPFlows();
-      denyDeclaredNetwork();
+      clearDeclaredNetworkPolicy();
     }
     return ok;
   }

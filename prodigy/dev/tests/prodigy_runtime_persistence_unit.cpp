@@ -2131,6 +2131,196 @@ static void testLargeMetricHistoryUsesImmutableAsyncCapture(TestSuite& suite)
   havePersistedBrainSnapshot = false;
 }
 
+static void testMetricCheckpointPersistence(TestSuite& suite)
+{
+  ScopedPersistentRoot root;
+  auto sorted = [](Vector<ProdigyMetricSample> samples) {
+    std::sort(samples.begin(), samples.end(), [](const auto& left, const auto& right) {
+      return std::tie(left.deploymentID, left.containerUUID, left.metricKey, left.ms, left.value) <
+             std::tie(right.deploymentID, right.containerUUID, right.metricKey, right.ms, right.value);
+    });
+    return samples;
+  };
+  auto save = [&](ProdigyPersistentStateStore& store, MetricsStore& metrics, uint128_t clusterUUID) {
+    ProdigyPersistentBrainSnapshot snapshot = {};
+    snapshot.brainConfig.clusterUUID = clusterUUID;
+    snapshot.metricCapture = metrics.captureSnapshot();
+    String failure = {};
+    return store.saveBrainSnapshot(snapshot, &failure);
+  };
+  auto recovered = [&](ProdigyPersistentStateStore& store, uint128_t clusterUUID,
+                       const Vector<ProdigyMetricSample>& expected) {
+    ProdigyPersistentBrainSnapshot snapshot = {};
+    String failure = {};
+    return store.loadBrainSnapshot(snapshot, &failure) &&
+        snapshot.brainConfig.clusterUUID == clusterUUID && sorted(snapshot.metricSamples) == sorted(expected);
+  };
+
+  MetricsStore metrics;
+  ProdigyPersistentStateStore store(root.path);
+  Vector<ProdigyMetricSample> expected = {};
+  suite.expect(save(store, metrics, 0xC001) && recovered(store, 0xC001, expected),
+               "metric_checkpoint_empty_snapshot_round_trips");
+
+  // New series and repeated timestamps exercise an append cursor boundary
+  // which cannot be represented by timestamp alone.
+  metrics.record(7, 0xA, 1, 100, 1);
+  metrics.record(7, 0xA, 1, 100, 2);
+  metrics.record(7, 0xA, 1, 101, 3);
+  metrics.record(7, 0xB, 2, 100, 4);
+  metrics.exportSamples(expected);
+  suite.expect(save(store, metrics, 0xC002) && recovered(store, 0xC002, expected),
+               "metric_checkpoint_new_series_and_equal_timestamps_round_trip");
+
+  // Trim removes one series entirely while retaining another. A new record
+  // under the same identity must start a fresh lineage rather than replaying
+  // a stale suffix from the removed ring.
+  metrics.record(7, 0xA, 1, 1'000, 5);
+  metrics.record(7, 0xB, 2, 1'000, 6);
+  metrics.trimRetention(1'000, 1);
+  metrics.exportSamples(expected);
+  suite.expect(save(store, metrics, 0xC003) && recovered(store, 0xC003, expected),
+               "metric_checkpoint_trim_and_series_deletion_round_trip");
+  metrics.clear();
+  metrics.record(7, 0xA, 1, 2'000, 7);
+  metrics.record(7, 0xA, 1, 2'000, 8);
+  metrics.exportSamples(expected);
+  suite.expect(save(store, metrics, 0xC004) && recovered(store, 0xC004, expected),
+               "metric_checkpoint_clear_and_same_key_recreate_round_trip");
+
+  store.close();
+  ProdigyPersistentStateStore reopened(root.path);
+  suite.expect(recovered(reopened, 0xC004, expected),
+               "metric_checkpoint_close_reopen_restores_control_and_metrics");
+
+  // An unreachable corrupt frame in the inactive slot must not affect the
+  // last published control checkpoint.
+  reopened.close();
+  {
+    TidesDB raw(root.path, TidesDB::Durability::full);
+    String garbage("not-a-metric-frame"_ctv), failure = {};
+    suite.expect(raw.write("brain"_ctv, "metrics.v1.2.63"_ctv, garbage, &failure),
+                 "metric_checkpoint_writes_unpublished_garbage_fixture");
+    raw.close();
+  }
+  ProdigyPersistentStateStore afterGarbage(root.path);
+  suite.expect(recovered(afterGarbage, 0xC004, expected),
+               "metric_checkpoint_ignores_unpublished_corrupt_frame");
+
+  // Frame 63 is the last append frame.  A subsequent change stages a base in
+  // the other slot before publishing its control record.  Restoring the old
+  // record models an interrupted publication: the staged new slot must stay
+  // unreachable and the old committed history must replay exactly.
+  ScopedPersistentRoot rolloverRoot;
+  MetricsStore rolloverMetrics;
+  rolloverMetrics.record(8, 0xB1, 1, 0, 0);
+  Vector<ProdigyMetricSample> expectedA = {};
+  Vector<ProdigyMetricSample> expectedB = {};
+  String rawA = {};
+  {
+    ProdigyPersistentStateStore rolloverStore(rolloverRoot.path);
+    bool saved = save(rolloverStore, rolloverMetrics, 0xC101);
+    for (uint32_t frame = 1; saved && frame <= ProdigyMetricCheckpointRef::lastFrame; ++frame)
+    {
+      rolloverMetrics.record(8, 0xB1, 1, int64_t(frame), frame);
+      saved = save(rolloverStore, rolloverMetrics, 0xC101);
+    }
+    rolloverMetrics.exportSamples(expectedA);
+    suite.expect(saved, "metric_checkpoint_reaches_last_append_frame_before_rollover");
+    rolloverStore.close();
+  }
+  {
+    TidesDB raw(rolloverRoot.path, TidesDB::Durability::full);
+    String failure = {};
+    ProdigyPersistentStoredBrainSnapshot stored = {};
+    suite.expect(raw.read("brain"_ctv, "snapshot"_ctv, rawA, &failure) &&
+                     BitseryEngine::deserializeSafe(rawA, stored) &&
+                     stored.checkpoint.slot == 1 &&
+                     stored.checkpoint.frame == ProdigyMetricCheckpointRef::lastFrame,
+                 "metric_checkpoint_captures_published_control_at_frame_63");
+    raw.close();
+  }
+  {
+    ProdigyPersistentStateStore rolloverStore(rolloverRoot.path);
+    rolloverMetrics.record(8, 0xB1, 1, int64_t(ProdigyMetricCheckpointRef::lastFrame) + 1,
+                           ProdigyMetricCheckpointRef::lastFrame + 1);
+    rolloverMetrics.exportSamples(expectedB);
+    suite.expect(save(rolloverStore, rolloverMetrics, 0xC102),
+                 "metric_checkpoint_stages_and_publishes_rollover_base");
+    rolloverStore.close();
+  }
+  {
+    TidesDB raw(rolloverRoot.path, TidesDB::Durability::full);
+    String failure = {};
+    suite.expect(raw.write("brain"_ctv, "snapshot"_ctv, rawA, &failure),
+                 "metric_checkpoint_restores_previous_control_after_staged_rollover");
+    raw.close();
+  }
+  {
+    ProdigyPersistentStateStore rollbackStore(rolloverRoot.path);
+    suite.expect(recovered(rollbackStore, 0xC101, expectedA),
+                 "metric_checkpoint_recovers_old_control_and_history_after_interrupted_rollover");
+    suite.expect(save(rollbackStore, rolloverMetrics, 0xC102) &&
+                     recovered(rollbackStore, 0xC102, expectedB),
+                 "metric_checkpoint_recommits_rollover_generation_after_rollback");
+    rollbackStore.close();
+  }
+  {
+    TidesDB raw(rolloverRoot.path, TidesDB::Durability::full);
+    String committed, failure = {}, referencedKey = {};
+    ProdigyPersistentStoredBrainSnapshot stored = {};
+    const bool readCommitted = raw.read("brain"_ctv, "snapshot"_ctv, committed, &failure) &&
+        BitseryEngine::deserializeSafe(committed, stored) && stored.checkpoint.slot != 0;
+    referencedKey.snprintf<"metrics.v1.{itoa}.{itoa}"_ctv>(unsigned(stored.checkpoint.slot), unsigned(stored.checkpoint.frame));
+    String garbage("corrupt-referenced-metric-frame"_ctv);
+    suite.expect(readCommitted && raw.write("brain"_ctv, referencedKey, garbage, &failure),
+                 "metric_checkpoint_corrupts_referenced_rollover_frame");
+    raw.close();
+
+    ProdigyPersistentStateStore corruptStore(rolloverRoot.path);
+    ProdigyPersistentBrainSnapshot corruptSnapshot = {};
+    failure.clear();
+    suite.expect(!corruptStore.loadBrainSnapshot(corruptSnapshot, &failure) && !failure.empty(),
+                 "metric_checkpoint_rejects_corrupt_referenced_frame");
+    failure.clear();
+    suite.expect(corruptStore.removeBrainSnapshot(&failure),
+                 "metric_checkpoint_removal_cleans_control_and_frames");
+    corruptStore.close();
+
+    TidesDB cleaned(rolloverRoot.path, TidesDB::Durability::full);
+    String ignored = {};
+    suite.expect(!cleaned.read("brain"_ctv, "snapshot"_ctv, committed, &ignored) &&
+                     !cleaned.read("brain"_ctv, referencedKey, committed, &ignored) &&
+                     !cleaned.read("brain"_ctv, "metrics.v1.1.63"_ctv, committed, &ignored),
+                 "metric_checkpoint_removal_removes_referenced_and_prior_metric_keys");
+    cleaned.close();
+  }
+
+  constexpr uint32_t containers = 200, dimensions = 3, samplesPerSeries = 6 * 60 * 60 / 5;
+  constexpr uint64_t sampleCount = uint64_t(containers) * dimensions * samplesPerSeries;
+  MetricsStore admissionMetrics;
+  for (uint32_t container = 0; container < containers; ++container)
+    for (uint32_t dimension = 0; dimension < dimensions; ++dimension)
+      for (uint32_t sample = 0; sample < samplesPerSeries; ++sample)
+        admissionMetrics.record(7, uint128_t(container + 1), uint64_t(dimension + 1),
+                                int64_t(sample) * 5'000, sample);
+
+  ProdigyPersistentBrainSnapshot snapshot = {};
+  snapshot.metricCapture = admissionMetrics.captureSnapshot();
+  const uint64_t encodedSampleBytes = 44;
+  const uint64_t historicalTwoEncodeCharge = snapshot.metricCapture->retainedBytes() * 2 +
+      sampleCount * (sizeof(ProdigyMetricSample) + 3 * encodedSampleBytes) + 15;
+  const uint64_t admitted = ProdigyPersistentStateWriter::retainedBytesFor(snapshot);
+  suite.expect(snapshot.metricCapture->sampleCount() == sampleCount &&
+                   historicalTwoEncodeCharge > ProdigyPersistentStateWriter::maximumRetainedBytes &&
+                   admitted > 0 && admitted <= ProdigyPersistentStateWriter::maximumRetainedBytes,
+               "metric_checkpoint_200x3x4320_admission_is_bounded");
+  std::printf("METRIC_ADMISSION containers=%u dimensions=%u samples=%llu oldCharge=%llu newCharge=%llu limit=%llu\n",
+              containers, dimensions, (unsigned long long)sampleCount,
+              (unsigned long long)historicalTwoEncodeCharge, (unsigned long long)admitted,
+              (unsigned long long)ProdigyPersistentStateWriter::maximumRetainedBytes);
+}
+
 static void testSnapshotReservationProfileNormalizesTopologyCapacity(TestSuite& suite)
 {
   const ProdigyPersistentBrainSnapshot savedSnapshot = persistedBrainSnapshot;
@@ -3019,12 +3209,20 @@ int main(void)
     testPersistentWriterDetachesViewBackedSchemaFields(suite);
     return suite.failed == 0 ? 0 : 1;
   }
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only != nullptr &&
+      std::strcmp(only, "metric-checkpoint") == 0)
+  {
+    testMetricCheckpointPersistence(suite);
+    testLargeMetricHistoryUsesImmutableAsyncCapture(suite);
+    return suite.failed == 0 ? 0 : 1;
+  }
   testProductionUpdateProgressDefersReentrantPersistenceUntilArtifactLeaseReleases(suite);
   testLocalBundleRecoveryDefersCheckpointUntilArtifactLeaseReleases(suite);
   testAuthenticatedStateUploadInventoryDiagnostics(suite);
   testVolatileStatelessPlannerReservationRecoveryBarrier(suite);
   testFollowerMetricIngestionTrimsBeforePersistence(suite);
   testLargeMetricHistoryUsesImmutableAsyncCapture(suite);
+  testMetricCheckpointPersistence(suite);
   testProductionPersistenceAPI(suite);
   testPersistentWriterPreservesTransportLifecycleSchema(suite);
   testTerminalLocalBrainFenceOverridesOlderSnapshot(suite);

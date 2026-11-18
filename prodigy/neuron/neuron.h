@@ -465,6 +465,10 @@ protected:
   bytell_hash_subvector<uint32_t, LocalWhiteholeBindingEntry> whiteholeBindingsByContainer;
   bytell_hash_subvector<uint64_t, CoroutineStack *> pendingContainerDownloads;
   std::unique_ptr<ProdigyArtifactIO> artifactIO;
+  // Storage accounting walks a container filesystem and can take arbitrarily
+  // longer than a metric cadence.  Keep it off both the Ring and the artifact
+  // worker: deploy/download progress must not sit behind telemetry.
+  std::unique_ptr<ProdigyArtifactIO> storageTelemetryIO;
   // Receipt-driven operations may complete after their control stream was
   // replaced.  The callback must not touch a destroyed Neuron.
   std::shared_ptr<uint8_t> asyncOperationLifetime = std::make_shared<uint8_t>(0);
@@ -678,10 +682,17 @@ protected:
 
     uint64_t lastSampleNs = 0;
     uint64_t lastCpuUsageUs = 0;
+    uint64_t lastStorageRequestNs = 0;
+    uint64_t storageRequestGeneration = 0;
     bool hasLastCpuUsage = false;
   };
 
   bytell_hash_map<uint128_t, ContainerMetricSampleState> metricSampleStateByContainer;
+  uint128_t storageTelemetryCursor = 0;
+  bool storageTelemetryCursorSet = false;
+  uint64_t nextStorageTelemetryRequestGeneration = 0;
+  bool storageTelemetryInFlight = false;
+  std::atomic<bool> stopStorageTelemetry = false;
 
   const MachineHardwareProfile *latestHardwareProfileIfReady(void) const override
   {
@@ -2420,7 +2431,8 @@ protected:
     return parseUnsignedDecimal(memoryCurrent, memoryCurrentBytes);
   }
 
-  static bool approximateDirectoryUsageBytes(const String& path, uint64_t& usageBytes)
+  static bool approximateDirectoryUsageBytes(const String& path, uint64_t& usageBytes,
+                                             const std::atomic<bool> *stop = nullptr)
   {
     namespace fs = std::filesystem;
     std::error_code ec;
@@ -2454,6 +2466,7 @@ protected:
 
     while (iterator != end)
     {
+      if (stop && stop->load(std::memory_order_relaxed)) return false;
       const fs::directory_entry& entry = *iterator;
       std::error_code entryError;
       fs::file_status status = entry.symlink_status(entryError);
@@ -2559,14 +2572,13 @@ protected:
     return true;
   }
 
-  static bool sampleContainerStorageUtilPct(const Container *container, uint64_t& utilPct)
+  static bool containerStoragePayloadPath(const Container *container, String& storagePath)
   {
     if (container == nullptr || container->plan.config.storageMB == 0)
     {
       return false;
     }
 
-    String storagePath;
     if (container->storagePayloadPath.size() > 0)
     {
       storagePath.assign(container->storagePayloadPath);
@@ -2576,13 +2588,13 @@ protected:
       storagePath.snprintf<"/containers/storage/{itoa}"_ctv>(container->plan.uuid);
     }
 
-    uint64_t usageBytes = 0;
-    if (approximateDirectoryUsageBytes(storagePath, usageBytes) == false)
-    {
-      return false;
-    }
+    return true;
+  }
 
-    uint64_t storageLimitBytes = uint64_t(container->plan.config.storageMB) * 1024ULL * 1024ULL;
+  static bool storageUtilPctForUsage(const Container *container, uint64_t usageBytes, uint64_t& utilPct)
+  {
+    if (container == nullptr) return false;
+    const uint64_t storageLimitBytes = uint64_t(container->plan.config.storageMB) * 1024ULL * 1024ULL;
     if (storageLimitBytes == 0)
     {
       return false;
@@ -2602,9 +2614,134 @@ protected:
     return true;
   }
 
+  struct StorageMetricScan final {
+    String path = {};
+    uint64_t usageBytes = 0;
+    bool collected = false;
+  };
+
+  void completeStorageMetricScan(uint128_t containerUUID, uint64_t requestGeneration,
+                                 NeuronBrainControlStream *requestStream, uint64_t streamGeneration,
+                                 uint64_t deploymentID, uint64_t storageLimitBytes,
+                                 std::shared_ptr<StorageMetricScan> scan)
+  {
+    storageTelemetryInFlight = false;
+    if (stopStorageTelemetry.load(std::memory_order_relaxed)) return;
+    const auto scheduleNext = [this] {
+      const uint64_t nowNs = monotonicNowNs();
+      if (nowNs > 0) queueDueStorageMetricScan(nowNs);
+    };
+    const auto found = containers.find(containerUUID);
+    if (found == containers.end()) { scheduleNext(); return; }
+    ContainerMetricSampleState *state = nullptr;
+    if (auto sample = metricSampleStateByContainer.find(containerUUID); sample != metricSampleStateByContainer.end())
+      state = &sample->second;
+    String currentStoragePath = {};
+    uint64_t utilPct = 0;
+    if (state == nullptr || state->storageRequestGeneration != requestGeneration ||
+        brain != requestStream || requestStream == nullptr || requestStream->ioGeneration != streamGeneration ||
+        !streamIsActive(requestStream) || (activeMetricsMask(found->second) &
+        ProdigyMetrics::maskForScalingDimension(ScalingDimension::storage)) == 0 || !scan->collected ||
+        found->second->plan.config.deploymentID() != deploymentID || storageLimitBytes == 0 ||
+        containerStoragePayloadPath(found->second, currentStoragePath) == false || currentStoragePath != scan->path ||
+        uint64_t(found->second->plan.config.storageMB) * 1024ULL * 1024ULL != storageLimitBytes ||
+        storageUtilPctForUsage(found->second, scan->usageBytes, utilPct) == false)
+    {
+      scheduleNext();
+      return;
+    }
+
+    const int64_t sampleTimeMs = Time::now<TimeResolution::ms>();
+    uint32_t headerOffset = Message::appendHeader(requestStream->wBuffer, NeuronTopic::containerStatistics);
+    Message::append(requestStream->wBuffer, found->second->plan.config.deploymentID());
+    Message::append(requestStream->wBuffer, containerUUID);
+    Message::append(requestStream->wBuffer, sampleTimeMs);
+    Message::append(requestStream->wBuffer, ProdigyMetrics::runtimeContainerStorageUtilPctKey());
+    Message::append(requestStream->wBuffer, utilPct);
+    Message::finish(requestStream->wBuffer, headerOffset);
+    Ring::queueSend(requestStream);
+    scheduleNext();
+  }
+
+  bool ensureStorageTelemetryIO(void)
+  {
+    if (storageTelemetryIO != nullptr) return true;
+    storageTelemetryIO = ProdigyArtifactIO::startOwned();
+    return storageTelemetryIO != nullptr;
+  }
+
+  void queueDueStorageMetricScan(uint64_t sampleTimeNs)
+  {
+    if (storageTelemetryInFlight || stopStorageTelemetry.load(std::memory_order_relaxed) || brain == nullptr || !streamIsActive(brain)) return;
+
+    Container *selected = nullptr;
+    uint128_t selectedUUID = 0;
+    auto eligible = [this, sampleTimeNs](uint128_t uuid, Container *container) {
+      if (container == nullptr || (activeMetricsMask(container) &
+          ProdigyMetrics::maskForScalingDimension(ScalingDimension::storage)) == 0 ||
+          container->plan.config.storageMB == 0) return false;
+      ContainerMetricSampleState& state = metricSampleStateByContainer[uuid];
+      const uint64_t cadenceNs = uint64_t(normalizedMetricsCadenceMs(container)) * 1'000'000ULL;
+      return state.storageRequestGeneration == 0 ||
+          (sampleTimeNs > state.lastStorageRequestNs && sampleTimeNs - state.lastStorageRequestNs >= cadenceNs);
+    };
+    auto iterator = containers.begin();
+    if (storageTelemetryCursorSet)
+    {
+      auto cursor = containers.find(storageTelemetryCursor);
+      if (cursor != containers.end())
+      {
+        iterator = cursor;
+        ++iterator;
+        if (iterator == containers.end()) iterator = containers.begin();
+      }
+    }
+    for (size_t examined = 0; iterator != containers.end() && examined < containers.size(); ++examined)
+    {
+      const uint128_t uuid = iterator->first;
+      Container *container = iterator->second;
+      ++iterator;
+      if (iterator == containers.end()) iterator = containers.begin();
+      if (eligible(uuid, container)) { selected = container; selectedUUID = uuid; break; }
+    }
+    if (selected == nullptr) return;
+
+    String storagePath = {};
+    if (containerStoragePayloadPath(selected, storagePath) == false) return;
+    const uint64_t storageLimitBytes = uint64_t(selected->plan.config.storageMB) * 1024ULL * 1024ULL;
+    if (storageLimitBytes == 0) return;
+    if (ensureStorageTelemetryIO() == false) return;
+    ContainerMetricSampleState& state = metricSampleStateByContainer[selectedUUID];
+    const uint64_t requestGeneration = ++nextStorageTelemetryRequestGeneration;
+    const uint64_t deploymentID = selected->plan.config.deploymentID();
+    const std::weak_ptr<uint8_t> lifetime = asyncOperationLifetime;
+    NeuronBrainControlStream *requestStream = brain;
+    const uint64_t streamGeneration = requestStream->ioGeneration;
+    auto scan = std::make_shared<StorageMetricScan>();
+    scan->path = std::move(storagePath);
+    if (!storageTelemetryIO->submit(0,
+          [scan, stop = &stopStorageTelemetry] { scan->collected = approximateDirectoryUsageBytes(scan->path, scan->usageBytes, stop); },
+          [this, lifetime, selectedUUID, requestGeneration, requestStream, streamGeneration, deploymentID, storageLimitBytes, scan] {
+            if (lifetime.expired()) return;
+            completeStorageMetricScan(selectedUUID, requestGeneration, requestStream, streamGeneration, deploymentID, storageLimitBytes, scan);
+          },
+          [this, lifetime, selectedUUID, requestGeneration, requestStream, streamGeneration, deploymentID, storageLimitBytes, scan](std::exception_ptr) {
+            scan->collected = false;
+            if (lifetime.expired()) return;
+            completeStorageMetricScan(selectedUUID, requestGeneration, requestStream, streamGeneration, deploymentID, storageLimitBytes, scan);
+          })) return;
+
+    state.lastStorageRequestNs = sampleTimeNs;
+    state.storageRequestGeneration = requestGeneration;
+    storageTelemetryCursor = selectedUUID;
+    storageTelemetryCursorSet = true;
+    storageTelemetryInFlight = true;
+  }
+
   void collectContainerMetricsAndForward(uint64_t sampleTimeNs)
   {
     bool queuedToBrain = false;
+    bool hasStorageMetric = false;
     int64_t sampleTimeMs = Time::now<TimeResolution::ms>();
 
     for (const auto& [containerUUID, container] : containers)
@@ -2617,6 +2754,7 @@ protected:
         continue;
       }
 
+      hasStorageMetric |= (mask & ProdigyMetrics::maskForScalingDimension(ScalingDimension::storage)) != 0;
       auto& sampleState = metricSampleStateByContainer[container->plan.uuid];
       uint32_t cadenceMs = normalizedMetricsCadenceMs(container);
       if (sampleState.lastSampleNs > 0)
@@ -2654,17 +2792,6 @@ protected:
         }
       }
 
-      if ((mask & ProdigyMetrics::maskForScalingDimension(ScalingDimension::storage)) > 0)
-      {
-        uint64_t value = 0;
-        if (sampleContainerStorageUtilPct(container, value))
-        {
-          metricKeys[metricCount] = ProdigyMetrics::runtimeContainerStorageUtilPctKey();
-          metricValues[metricCount] = value;
-          metricCount += 1;
-        }
-      }
-
       sampleState.lastSampleNs = sampleTimeNs;
 
       if (metricCount == 0 || brain == nullptr)
@@ -2691,6 +2818,7 @@ protected:
     {
       Ring::queueSend(brain);
     }
+    if (hasStorageMetric) queueDueStorageMetricScan(sampleTimeNs);
   }
 
   template <typename T>
@@ -5866,6 +5994,7 @@ public:
 
   ~Neuron()
   {
+    stopStorageTelemetry.store(true, std::memory_order_relaxed);
     resetDeferredHardwareInventoryRetry();
     asyncOperationLifetime.reset();
     bgpConfigurationRefresh.reset();
@@ -5873,6 +6002,7 @@ public:
     // owner can be destroyed. Late Netlink/command callbacks then observe a
     // detached operation instead of this Neuron.
     pendingStateUploadRestores.clear();
+    storageTelemetryIO.reset();
     artifactIO.reset();
     if (wormholeFlowGC)
     {
@@ -7399,10 +7529,12 @@ public:
 
   bool quiesceArtifactIOForBundleExec(void) override
   {
+    stopStorageTelemetry.store(true, std::memory_order_relaxed);
     const bool artifactsReady = !artifactIO || artifactIO->quiesceForExec();
+    const bool storageTelemetryReady = !storageTelemetryIO || storageTelemetryIO->quiesceForExec();
     const bool ringsReady = !switchboard || switchboard->quiesceRingPreparationForExec();
     const bool pairControlReady = !pairControlRuntime || pairControlRuntime->quiesce();
-    return artifactsReady && ringsReady && pairControlReady;
+    return artifactsReady && storageTelemetryReady && ringsReady && pairControlReady;
   }
 
   bool quiesceContainerControlSocketsForBundleExec(void) override
@@ -11903,6 +12035,10 @@ public:
     pendingSubscriptionPairings.erase(container->plan.uuid);
     pendingCredentialRefreshes.erase(container->plan.uuid);
     metricSampleStateByContainer.erase(container->plan.uuid);
+    if (storageTelemetryCursorSet && storageTelemetryCursor == container->plan.uuid)
+    {
+      storageTelemetryCursorSet = false;
+    }
 
     RingDispatcher::eraseMultiplexee(container);
   }

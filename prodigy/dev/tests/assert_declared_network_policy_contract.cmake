@@ -83,11 +83,14 @@ file(READ "${PRODIGY_ROOT}/switchboard/kernel/container.egress.router.ebpf.c" _c
 file(READ "${PRODIGY_ROOT}/prodigy/neuron/containers.h" _containers)
 file(READ "${PRODIGY_ROOT}/prodigy/neuron/neuron.h" _neuron)
 if(NOT _containers MATCHES "syncDeclaredNetworkPairingPolicy\\(bool invalidateAuthorizedFlows," OR
-   NOT _containers MATCHES "syncDeclaredNetworkPolicy\\(false\\)" OR
+   NOT _containers MATCHES "declaredNetworkReferencesEndpoint" OR
+   NOT _containers MATCHES "bpf_map_update_elem\\(mapFD, &entry, &value, BPF_ANY\\)" OR
+   NOT _containers MATCHES "bpf_map_delete_elem\\(mapFD, &entry\\)" OR
    NOT _containers MATCHES "authorizedTCPFlowMatchesRevokedPairing" OR
    NOT _containers MATCHES "revokeAuthorizedTCPFlows" OR
+   NOT _containers MATCHES "denyDeclaredNetwork\\(\\)" OR
    NOT _neuron MATCHES "syncDeclaredNetworkPairingPolicy\\(activate == false, address")
-   message(FATAL_ERROR "declared-network pairing refresh must preserve flows on activation and selectively revoke them on deactivation")
+   message(FATAL_ERROR "declared-network live pairing refresh must update one shared-aware tuple, fail closed, preserve activation flows, and selectively revoke deactivated flows")
 endif()
 string(FIND "${_container_egress}" "if (localSubnetContainsDaddr(daddr6))" _local_route_action)
 string(FIND "${_containers}" "host.addDirectRoute(address, 128, AF_INET6);" _local_route_install)

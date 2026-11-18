@@ -7,8 +7,10 @@
 #include <prodigy/neuron/neuron.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -747,8 +749,9 @@ public:
 
   bool quiesceArtifactIOForTest()
   {
-    if (artifactIO == nullptr) return true;
+    if (artifactIO == nullptr && storageTelemetryIO == nullptr) return true;
     if (quiesceArtifactIOForBundleExec() == false) return false;
+    storageTelemetryIO.reset();
     artifactIO.reset();
     return true;
   }
@@ -803,6 +806,72 @@ public:
   void trackContainerForReplyTest(Container *container)
   {
     containers.insert_or_assign(container->plan.uuid, container);
+  }
+
+  void trackContainerForStorageTelemetryTest(Container *container)
+  {
+    containers.insert_or_assign(container->plan.uuid, container);
+  }
+
+  void untrackContainerForStorageTelemetryTest(uint128_t uuid)
+  {
+    containers.erase(uuid);
+    metricSampleStateByContainer.erase(uuid);
+    if (storageTelemetryCursorSet && storageTelemetryCursor == uuid) storageTelemetryCursorSet = false;
+  }
+
+  void sampleStorageTelemetryForTest(uint64_t nowNs)
+  {
+    collectContainerMetricsAndForward(nowNs);
+  }
+
+  bool sampleStorageTelemetrySynchronouslyForTest(const Container *container, uint64_t& utilPct)
+  {
+    String path = {};
+    uint64_t usageBytes = 0;
+    return containerStoragePayloadPath(container, path) && approximateDirectoryUsageBytes(path, usageBytes) &&
+        storageUtilPctForUsage(container, usageBytes, utilPct);
+  }
+
+  bool storageTelemetryInFlightForTest(void) const { return storageTelemetryInFlight != 0; }
+
+  bool queueStorageTelemetryBlockerForTest(std::atomic<bool>& entered, std::atomic<bool>& release)
+  {
+    return ensureStorageTelemetryIO() && storageTelemetryIO->submit(0,
+        [&entered, &release] { entered.store(true); while (!release.load()) usleep(1'000); },
+        [] {}, [](std::exception_ptr) {});
+  }
+
+  uint32_t storageMetricMessagesForTest(uint128_t first, uint128_t second) const
+  {
+    if (brain == nullptr) return 0;
+    uint32_t found = 0;
+    uint64_t offset = 0;
+    while (offset + Message::headerBytes <= brain->wBuffer.size())
+    {
+      Message *message = reinterpret_cast<Message *>(brain->wBuffer.data() + offset);
+      if (message->size < Message::headerBytes || offset + message->size > brain->wBuffer.size()) return 0;
+      if (NeuronTopic(message->topic) == NeuronTopic::containerStatistics)
+      {
+        uint8_t *args = message->args;
+        uint64_t deploymentID = 0, key = 0, value = 0;
+        uint128_t uuid = 0;
+        int64_t sampleTimeMs = 0;
+        Message::extractArg<ArgumentNature::fixed>(args, deploymentID);
+        Message::extractArg<ArgumentNature::fixed>(args, uuid);
+        Message::extractArg<ArgumentNature::fixed>(args, sampleTimeMs);
+        Message::extractArg<ArgumentNature::fixed>(args, key);
+        Message::extractArg<ArgumentNature::fixed>(args, value);
+        if ((uuid == first || uuid == second) && key == ProdigyMetrics::runtimeContainerStorageUtilPctKey()) ++found;
+      }
+      offset += message->size;
+    }
+    return found;
+  }
+
+  void clearBrainBufferForStorageTelemetryTest(void)
+  {
+    if (brain != nullptr) brain->wBuffer.clear();
   }
 
   void untrackContainerForReplyTest(uint128_t uuid)
@@ -881,7 +950,7 @@ public:
   {
     // main() keeps this owner alive until quiesceForExec observes the terminal
     // raw-poll cancellation CQE. Do not destroy it beside Ring shutdown.
-    if (artifactIO != nullptr) std::abort();
+    if (artifactIO != nullptr || storageTelemetryIO != nullptr) std::abort();
     if (brain && brain->fd >= 0) ::close(brain->fd);
     if (retained && retained->fd >= 0) ::close(retained->fd);
     for (NeuronBrainControlStream *stream : retired)
@@ -1051,6 +1120,103 @@ static void testContainerMaterializationYieldsRingAndFencesRetirement(TestSuite&
   ring.timedOut = false;
   runRingUntil(ring, [&] { return neuron.quiesceArtifactIOForTest(); });
   suite.expect(ring.timedOut == false, "container_materialization_test_quiesces_artifact_worker_before_ring_shutdown");
+  thisNeuron = savedNeuron;
+}
+
+static void testStorageTelemetryAsyncFairnessAndSessionFence(TestSuite& suite)
+{
+  ArtifactRing ring = {};
+  ScopedArtifactStore store = {};
+  TestNeuron neuron = {};
+  NeuronBase *savedNeuron = thisNeuron;
+  thisNeuron = &neuron;
+  const bool started = store.root.size() != 0 && neuron.startForArtifactTest(store.root);
+  suite.expect(started, "storage_telemetry_test_starts_bounded_worker");
+  if (!started) { thisNeuron = savedNeuron; return; }
+
+  const std::filesystem::path firstPath = std::filesystem::path(store.root.c_str()) / "storage-first";
+  const std::filesystem::path secondPath = std::filesystem::path(store.root.c_str()) / "storage-second";
+  std::filesystem::create_directories(firstPath);
+  std::filesystem::create_directories(secondPath);
+  for (uint32_t directory = 0; directory < 100; ++directory)
+  {
+    const std::filesystem::path directoryPath = firstPath / std::to_string(directory);
+    std::filesystem::create_directories(directoryPath);
+    for (uint32_t file = 0; file < 100; ++file)
+      std::ofstream(directoryPath / std::to_string(file), std::ios::binary) << "0123456789abcdef0123456789abcdef";
+  }
+  std::ofstream(secondPath / "payload") << "second";
+  Container first = {}, second = {};
+  first.plan.uuid = uint128_t(0x5101); second.plan.uuid = uint128_t(0x5102);
+  first.plan.config.storageMB = 1; second.plan.config.storageMB = 1;
+  first.neuronScalingDimensionsMask = ProdigyMetrics::maskForScalingDimension(ScalingDimension::storage);
+  second.neuronScalingDimensionsMask = first.neuronScalingDimensionsMask;
+  first.neuronMetricsCadenceMs = 250; second.neuronMetricsCadenceMs = 250;
+  first.storagePayloadPath.assign(firstPath.c_str()); second.storagePayloadPath.assign(secondPath.c_str());
+  neuron.trackContainerForStorageTelemetryTest(&first);
+  neuron.trackContainerForStorageTelemetryTest(&second);
+  struct timespec ts = {};
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  const uint64_t nowNs = uint64_t(ts.tv_sec) * 1'000'000'000ULL + uint64_t(ts.tv_nsec);
+  uint64_t syncUtilPct = 0;
+  const auto syncStarted = std::chrono::steady_clock::now();
+  const bool syncCollected = neuron.sampleStorageTelemetrySynchronouslyForTest(&first, syncUtilPct);
+  const auto syncElapsedUs = std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now() - syncStarted).count();
+  const auto dispatchStarted = std::chrono::steady_clock::now();
+  neuron.sampleStorageTelemetryForTest(nowNs);
+  const auto dispatchElapsedUs = std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now() - dispatchStarted).count();
+  std::printf("STORAGE_TELEMETRY_BENCHMARK fixture_files=10000 sync_ok=%d sync_util_pct=%llu sync_walk_us=%lld async_dispatch_us=%lld\n",
+              int(syncCollected), static_cast<unsigned long long>(syncUtilPct), static_cast<long long>(syncElapsedUs),
+              static_cast<long long>(dispatchElapsedUs));
+  runRingUntil(ring, [&] { return neuron.storageMetricMessagesForTest(first.plan.uuid, second.plan.uuid) == 2; });
+  suite.expect(!ring.timedOut && neuron.storageMetricMessagesForTest(first.plan.uuid, second.plan.uuid) == 2,
+               "storage_telemetry_rotates_due_containers_without_hash_head_starvation");
+
+  ring.timedOut = false;
+  neuron.clearBrainBufferForStorageTelemetryTest();
+  std::atomic<bool> entered {false}, release {false};
+  suite.expect(neuron.queueStorageTelemetryBlockerForTest(entered, release) && waitForArtifactWorker(entered),
+               "storage_telemetry_test_blocks_only_telemetry_worker");
+  neuron.sampleStorageTelemetryForTest(nowNs + 250'000'000ULL);
+  neuron.advanceBrainGenerationForReplyTest();
+  neuron.deactivateBrainForReplyTest();
+  release.store(true);
+  runRingUntil(ring, [&] { return !neuron.storageTelemetryInFlightForTest(); });
+  suite.expect(!ring.timedOut && neuron.storageMetricMessagesForTest(first.plan.uuid, second.plan.uuid) == 0,
+               "storage_telemetry_rejects_stale_control_session_completion");
+
+  ring.timedOut = false;
+  neuron.reactivateBrainForReplyTest();
+  neuron.untrackContainerForStorageTelemetryTest(second.plan.uuid);
+  neuron.clearBrainBufferForStorageTelemetryTest();
+  neuron.sampleStorageTelemetryForTest(nowNs + 500'000'000ULL);
+  runRingUntil(ring, [&] { return neuron.storageMetricMessagesForTest(first.plan.uuid, second.plan.uuid) == 1; });
+  neuron.sampleStorageTelemetryForTest(nowNs + 750'000'000ULL);
+  runRingUntil(ring, [&] { return neuron.storageMetricMessagesForTest(first.plan.uuid, second.plan.uuid) == 2; });
+  suite.expect(!ring.timedOut && neuron.storageMetricMessagesForTest(first.plan.uuid, second.plan.uuid) == 2,
+               "storage_telemetry_resamples_single_due_container_after_cursor_wrap");
+
+  ring.timedOut = false;
+  neuron.clearBrainBufferForStorageTelemetryTest();
+  std::atomic<bool> replacementEntered {false}, replacementRelease {false};
+  const std::filesystem::path replacementPath = std::filesystem::path(store.root.c_str()) / "storage-replacement";
+  std::filesystem::create_directories(replacementPath);
+  std::ofstream(replacementPath / "payload") << "replacement";
+  suite.expect(neuron.queueStorageTelemetryBlockerForTest(replacementEntered, replacementRelease) &&
+                   waitForArtifactWorker(replacementEntered),
+               "storage_telemetry_test_blocks_replaced_volume_completion");
+  neuron.sampleStorageTelemetryForTest(nowNs + 1'000'000'000ULL);
+  first.storagePayloadPath.assign(replacementPath.c_str());
+  replacementRelease.store(true);
+  runRingUntil(ring, [&] { return !neuron.storageTelemetryInFlightForTest(); });
+  suite.expect(!ring.timedOut && neuron.storageMetricMessagesForTest(first.plan.uuid, second.plan.uuid) == 0,
+               "storage_telemetry_rejects_replaced_volume_completion");
+
+  ring.timedOut = false;
+  runRingUntil(ring, [&] { return neuron.quiesceArtifactIOForTest(); });
+  suite.expect(!ring.timedOut, "storage_telemetry_test_quiesces_workers_before_ring_shutdown");
   thisNeuron = savedNeuron;
 }
 
@@ -1337,6 +1503,14 @@ int main()
     TestSuite suite = {};
     testContainerMaterializationYieldsRingAndFencesRetirement(suite);
     std::printf("CONTAINER_MATERIALIZATION_ASYNC_RESULT failed_assertions=%d\n", suite.failed);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "storage-telemetry") == 0)
+  {
+    TestSuite suite = {};
+    testStorageTelemetryAsyncFairnessAndSessionFence(suite);
+    std::printf("STORAGE_TELEMETRY_RESULT failed_assertions=%d\n", suite.failed);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   TestSuite suite = {};

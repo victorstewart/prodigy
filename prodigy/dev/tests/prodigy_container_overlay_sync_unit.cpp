@@ -2407,25 +2407,146 @@ static void testDeclaredNetworkIdleTCPFlowReauthorization(TestSuite& suite)
   egress.close();
 }
 
+static void testDeclaredNetworkSharedPairingReferences(TestSuite& suite)
+{
+  constexpr uint64_t firstService = 0x7182;
+  constexpr uint64_t secondService = 0x7183;
+  constexpr uint16_t port = 43105;
+  constexpr uint128_t endpoint = uint128_t(0xfdf8d94c7c33e26eULL) << 64 | 0xca4bf50100000cf3ULL;
+
+  ContainerPlan plan = {};
+  plan.networkAccess = ContainerNetworkAccess::declaredOnly;
+  plan.fragment = 1;
+  for (const uint64_t service : {firstService, secondService})
+  {
+    plan.subscriptions.insert_or_assign(
+        service, Subscription(service, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::any));
+    plan.advertisements.insert_or_assign(
+        service, Advertisement(service, ContainerState::scheduled, ContainerState::destroying, port));
+  }
+
+  const SubscriptionPairing firstSubscription(0x101, endpoint, firstService, port);
+  const SubscriptionPairing secondSubscription(0x102, endpoint, secondService, port);
+  const AdvertisementPairing firstAdvertisement(0x201, endpoint, firstService);
+  const AdvertisementPairing secondAdvertisement(0x202, endpoint, secondService);
+  suite.require(plan.applySubscriptionPairing(firstSubscription, true) &&
+                    plan.applyAdvertisementPairing(firstAdvertisement, true) &&
+                    declaredNetworkPairingsValid(plan),
+                "declared_shared_pairing_plan_accepts_first_operator_tuple");
+  suite.expect(declaredNetworkReferencesEndpoint(plan, endpoint, port, false) &&
+                   declaredNetworkReferencesEndpoint(plan, endpoint, port, true),
+               "declared_shared_pairing_plan_references_first_tuple_in_both_directions");
+
+  suite.require(plan.applySubscriptionPairing(secondSubscription, true) &&
+                    plan.applyAdvertisementPairing(secondAdvertisement, true) &&
+                    declaredNetworkPairingsValid(plan),
+                "declared_shared_pairing_plan_accepts_second_operator_tuple");
+  suite.expect(declaredNetworkReferencesEndpoint(plan, endpoint, port, false) &&
+                   declaredNetworkReferencesEndpoint(plan, endpoint, port, true),
+               "declared_shared_pairing_plan_keeps_shared_tuple_after_second_service");
+
+  suite.require(plan.applySubscriptionPairing(firstSubscription, false) &&
+                    plan.applyAdvertisementPairing(firstAdvertisement, false),
+                "declared_shared_pairing_plan_removes_first_service");
+  suite.expect(declaredNetworkReferencesEndpoint(plan, endpoint, port, false) &&
+                   declaredNetworkReferencesEndpoint(plan, endpoint, port, true),
+               "declared_shared_pairing_plan_retains_shared_tuple_for_second_service");
+
+  suite.require(plan.applySubscriptionPairing(secondSubscription, false) &&
+                    plan.applyAdvertisementPairing(secondAdvertisement, false),
+                "declared_shared_pairing_plan_removes_last_service");
+  suite.expect(!declaredNetworkReferencesEndpoint(plan, endpoint, port, false) &&
+                   !declaredNetworkReferencesEndpoint(plan, endpoint, port, true),
+               "declared_shared_pairing_plan_removes_unreferenced_tuple_in_both_directions");
+}
+
 static void testDeclaredNetworkPairingRevocationPreservesUnrelatedFlows(TestSuite& suite)
 {
-  String objectPath = {};
-  objectPath.assign(PRODIGY_TEST_BINARY_DIR);
-  objectPath.append("/container.egress.router.declared.ebpf.o"_ctv);
+  String egressPath = {};
+  egressPath.assign(PRODIGY_TEST_BINARY_DIR);
+  egressPath.append("/container.egress.router.declared.ebpf.o"_ctv);
+  String ingressPath = {};
+  ingressPath.assign(PRODIGY_TEST_BINARY_DIR);
+  ingressPath.append("/container.ingress.router.declared.ebpf.o"_ctv);
 
   BPFProgram peerProgram = {};
-  if (suite.require(peerProgram.load(objectPath, "ct_egress"_ctv),
-                    "declared_pairing_revocation_loads_declared_egress_router") == false)
+  BPFProgram primaryProgram = {};
+  const bool programsLoaded =
+      suite.require(peerProgram.load(egressPath, "ct_egress"_ctv),
+                    "declared_pairing_revocation_loads_declared_egress_router") &&
+      suite.require(primaryProgram.load(ingressPath, "ct_ingress"_ctv),
+                    "declared_pairing_revocation_loads_declared_ingress_router");
+  if (!programsLoaded)
   {
+    primaryProgram.close();
+    peerProgram.close();
     return;
   }
 
   Container container = {};
   container.peer_program = &peerProgram;
+  container.primary_program = &primaryProgram;
+  container.plan.networkAccess = ContainerNetworkAccess::declaredOnly;
+  container.plan.fragment = 1;
   uint128_t revokedPeer = 0;
   uint128_t retainedPeer = 0;
   parseIPv6Bytes("fdf8:d94c:7c33:e26e:ca4b:f501:0:cf3", reinterpret_cast<uint8_t *>(&revokedPeer));
   parseIPv6Bytes("fdf8:d94c:7c33:e26e:ca4b:f501:0:bd7", reinterpret_cast<uint8_t *>(&retainedPeer));
+
+  constexpr uint64_t firstService = 0x7182;
+  constexpr uint64_t secondService = 0x7183;
+  constexpr uint16_t sharedPort = 43105;
+  for (const uint64_t service : {firstService, secondService})
+  {
+    container.plan.subscriptions.insert_or_assign(
+        service, Subscription(service, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::any));
+    container.plan.advertisements.insert_or_assign(
+        service, Advertisement(service, ContainerState::scheduled, ContainerState::destroying, sharedPort));
+  }
+  const SubscriptionPairing firstSubscription(0x101, revokedPeer, firstService, sharedPort);
+  const SubscriptionPairing secondSubscription(0x102, revokedPeer, secondService, sharedPort);
+  const AdvertisementPairing firstAdvertisement(0x201, revokedPeer, firstService);
+  const AdvertisementPairing secondAdvertisement(0x202, revokedPeer, secondService);
+  container_service_peer sharedTuple = {};
+  std::memcpy(sharedTuple.address, &revokedPeer, sizeof(sharedTuple.address));
+  sharedTuple.port = htons(sharedPort);
+  __u8 installed = 0;
+
+  suite.require(container.plan.applySubscriptionPairing(firstSubscription, true) &&
+                    container.plan.applyAdvertisementPairing(firstAdvertisement, true) &&
+                    container.syncDeclaredNetworkPairingPolicy(false, revokedPeer, sharedPort, false) &&
+                    container.syncDeclaredNetworkPairingPolicy(false, revokedPeer, sharedPort, true),
+                "declared_pairing_sync_installs_first_shared_tuple");
+  suite.expect(lookupProgramMapElement(peerProgram, "ct_sub_targets"_ctv, sharedTuple, installed) && installed == 1 &&
+                   lookupProgramMapElement(primaryProgram, "ct_adv_sources"_ctv, sharedTuple, installed) && installed == 1,
+               "declared_pairing_sync_installs_first_shared_tuple_in_both_maps");
+
+  suite.require(container.plan.applySubscriptionPairing(secondSubscription, true) &&
+                    container.plan.applyAdvertisementPairing(secondAdvertisement, true) &&
+                    container.syncDeclaredNetworkPairingPolicy(false, revokedPeer, sharedPort, false) &&
+                    container.syncDeclaredNetworkPairingPolicy(false, revokedPeer, sharedPort, true),
+                "declared_pairing_sync_adds_second_shared_service");
+  suite.expect(lookupProgramMapElement(peerProgram, "ct_sub_targets"_ctv, sharedTuple, installed) && installed == 1 &&
+                   lookupProgramMapElement(primaryProgram, "ct_adv_sources"_ctv, sharedTuple, installed) && installed == 1,
+               "declared_pairing_sync_preserves_shared_tuple_after_second_service");
+
+  suite.require(container.plan.applySubscriptionPairing(firstSubscription, false) &&
+                    container.plan.applyAdvertisementPairing(firstAdvertisement, false) &&
+                    container.syncDeclaredNetworkPairingPolicy(true, revokedPeer, sharedPort, false) &&
+                    container.syncDeclaredNetworkPairingPolicy(true, revokedPeer, sharedPort, true),
+                "declared_pairing_sync_removes_first_shared_service");
+  suite.expect(lookupProgramMapElement(peerProgram, "ct_sub_targets"_ctv, sharedTuple, installed) && installed == 1 &&
+                   lookupProgramMapElement(primaryProgram, "ct_adv_sources"_ctv, sharedTuple, installed) && installed == 1,
+               "declared_pairing_sync_retains_tuple_while_second_service_remains");
+
+  suite.require(container.plan.applySubscriptionPairing(secondSubscription, false) &&
+                    container.plan.applyAdvertisementPairing(secondAdvertisement, false) &&
+                    container.syncDeclaredNetworkPairingPolicy(true, revokedPeer, sharedPort, false) &&
+                    container.syncDeclaredNetworkPairingPolicy(true, revokedPeer, sharedPort, true),
+                "declared_pairing_sync_removes_last_shared_service");
+  suite.expect(lookupProgramMapElement(peerProgram, "ct_sub_targets"_ctv, sharedTuple, installed) == false &&
+                   lookupProgramMapElement(primaryProgram, "ct_adv_sources"_ctv, sharedTuple, installed) == false,
+               "declared_pairing_sync_removes_tuple_after_last_service");
 
   auto makeFlow = [](uint128_t peer, uint16_t sourcePort, uint16_t destinationPort) -> flow_key {
     flow_key flow = {};
@@ -2467,7 +2588,9 @@ static void testDeclaredNetworkPairingRevocationPreservesUnrelatedFlows(TestSuit
                    lookupProgramMapElement(peerProgram, "ct_tcp_flows"_ctv, retainedAdvertisementService, loaded),
                "declared_pairing_revocation_keeps_unrelated_flows_after_both_roles");
 
+  container.primary_program = nullptr;
   container.peer_program = nullptr;
+  primaryProgram.close();
   peerProgram.close();
 }
 
@@ -2703,13 +2826,22 @@ int main(void)
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
 
-  if (const char *allow = std::getenv("PRODIGY_DEV_ALLOW_BPF_ATTACH"); allow == nullptr || std::strcmp(allow, "1") != 0)
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && std::strcmp(only, "declared-network-shared-pairing-plan") == 0)
   {
-    std::fprintf(stderr, "SKIP: container overlay sync unit loads BPF programs; set PRODIGY_DEV_ALLOW_BPF_ATTACH=1 only inside an authorized isolated VM\n");
-    return 77;
+    TestSuite suite = {};
+    testDeclaredNetworkSharedPairingReferences(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
 
   TestSuite suite = {};
+  testDeclaredNetworkSharedPairingReferences(suite);
+  if (const char *allow = std::getenv("PRODIGY_DEV_ALLOW_BPF_ATTACH"); allow == nullptr || std::strcmp(allow, "1") != 0)
+  {
+    std::fprintf(stderr, "SKIP: container overlay sync unit loads BPF programs; set PRODIGY_DEV_ALLOW_BPF_ATTACH=1 only inside an authorized isolated VM\n");
+    return suite.failed == 0 ? 77 : EXIT_FAILURE;
+  }
+
   if (const char *only = std::getenv("PRODIGY_TEST_ONLY");
       only != nullptr && std::strcmp(only, "adopted-host-ingress-overlay") == 0)
   {

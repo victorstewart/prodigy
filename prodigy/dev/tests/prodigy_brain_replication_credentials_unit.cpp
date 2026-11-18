@@ -2466,11 +2466,6 @@ public:
     return sampleContainerMemoryUtilPct(container, utilPct);
   }
 
-  static bool sampleContainerStorageUtilPctForTest(const Container *container, uint64_t& utilPct)
-  {
-    return sampleContainerStorageUtilPct(container, utilPct);
-  }
-
   void collectContainerMetricsAndForwardForTest(uint64_t sampleTimeNs)
   {
     collectContainerMetricsAndForward(sampleTimeNs);
@@ -24528,8 +24523,6 @@ static void testNeuronMetricSamplingHelpers(TestSuite& suite)
   suite.expect(writeTextFile(cgroupPath / "cpu.stat", "usage_usec 1000000\n"), "neuron_metric_helpers_rewrites_cpu_stat");
   suite.expect(TestNeuron::sampleContainerCpuUtilPctForTest(&container, sampleState, 2'000'000'000ULL, utilPct) && utilPct == 50, "neuron_metric_helpers_cpu_sampling_computes_util_pct");
   suite.expect(TestNeuron::sampleContainerMemoryUtilPctForTest(&container, utilPct) && utilPct == 25, "neuron_metric_helpers_memory_sampling_computes_util_pct");
-  suite.expect(TestNeuron::sampleContainerStorageUtilPctForTest(&container, utilPct) && utilPct == 50, "neuron_metric_helpers_storage_sampling_computes_util_pct");
-
   ::close(cgroupFD);
 }
 
@@ -24543,12 +24536,9 @@ static void testNeuronCollectsContainerMetricsAndForwardsToBrain(TestSuite& suit
   }
 
   std::filesystem::path cgroupPath = temp.path / "cgroup";
-  std::filesystem::path storagePath = temp.path / "storage";
   suite.expect(std::filesystem::create_directories(cgroupPath), "neuron_collect_metrics_creates_cgroup_dir");
-  suite.expect(std::filesystem::create_directories(storagePath), "neuron_collect_metrics_creates_storage_dir");
   suite.expect(writeTextFile(cgroupPath / "cpu.stat", "usage_usec 500000\n"), "neuron_collect_metrics_writes_initial_cpu_stat");
   suite.expect(writeTextFile(cgroupPath / "memory.current", "262144\n"), "neuron_collect_metrics_writes_memory_current");
-  suite.expect(writeSizedFile(storagePath / "payload.bin", 524'288), "neuron_collect_metrics_writes_storage_payload");
 
   int cgroupFD = ::open(cgroupPath.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   suite.expect(cgroupFD >= 0, "neuron_collect_metrics_opens_synthetic_cgroup");
@@ -24566,12 +24556,10 @@ static void testNeuronCollectsContainerMetricsAndForwardsToBrain(TestSuite& suit
   container.plan.config.versionID = 2;
   container.plan.config.nLogicalCores = 1;
   container.plan.config.memoryMB = 1;
-  container.plan.config.storageMB = 1;
   container.neuronScalingDimensionsMask =
-      ProdigyMetrics::maskForScalingDimension(ScalingDimension::cpu) | ProdigyMetrics::maskForScalingDimension(ScalingDimension::memory) | ProdigyMetrics::maskForScalingDimension(ScalingDimension::storage);
+      ProdigyMetrics::maskForScalingDimension(ScalingDimension::cpu) | ProdigyMetrics::maskForScalingDimension(ScalingDimension::memory);
   container.neuronMetricsCadenceMs = 250;
   container.cgroup = cgroupFD;
-  container.storagePayloadPath.assign(storagePath.c_str());
   neuron.registerContainerForTest(&container);
 
   auto countMetricValue = [&](uint64_t metricKey, uint64_t expectedValue) -> uint32_t {
@@ -24612,7 +24600,6 @@ static void testNeuronCollectsContainerMetricsAndForwardsToBrain(TestSuite& suit
   neuron.collectContainerMetricsAndForwardForTest(1'000'000'000ULL);
   suite.expect(countMetricValue(ProdigyMetrics::runtimeContainerCpuUtilPctKey(), 50) == 0, "neuron_collect_metrics_first_sample_skips_cpu_until_baseline");
   suite.expect(countMetricValue(ProdigyMetrics::runtimeContainerMemoryUtilPctKey(), 25) == 1, "neuron_collect_metrics_first_sample_emits_memory_metric");
-  suite.expect(countMetricValue(ProdigyMetrics::runtimeContainerStorageUtilPctKey(), 50) == 1, "neuron_collect_metrics_first_sample_emits_storage_metric");
 
   neuron.brainOutboundForTest().clear();
   neuron.collectContainerMetricsAndForwardForTest(1'100'000'000ULL);
@@ -24622,7 +24609,6 @@ static void testNeuronCollectsContainerMetricsAndForwardsToBrain(TestSuite& suit
   neuron.collectContainerMetricsAndForwardForTest(2'000'000'000ULL);
   suite.expect(countMetricValue(ProdigyMetrics::runtimeContainerCpuUtilPctKey(), 50) == 1, "neuron_collect_metrics_second_sample_emits_cpu_metric");
   suite.expect(countMetricValue(ProdigyMetrics::runtimeContainerMemoryUtilPctKey(), 25) == 1, "neuron_collect_metrics_second_sample_keeps_memory_metric");
-  suite.expect(countMetricValue(ProdigyMetrics::runtimeContainerStorageUtilPctKey(), 50) == 1, "neuron_collect_metrics_second_sample_keeps_storage_metric");
 
   neuron.unregisterContainerForTest(container.plan.uuid);
   ::close(cgroupFD);
@@ -45983,6 +45969,14 @@ static void testAuthorityElectionFrontierRefreshesDurablePeerRevision(TestSuite&
 
 int main(void)
 {
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only && std::strcmp(only, "neuron-runtime-metrics") == 0)
+  {
+    TestSuite suite;
+    testNeuronMetricSamplingHelpers(suite);
+    testNeuronCollectsContainerMetricsAndForwardsToBrain(suite);
+    std::printf("NEURON_RUNTIME_METRICS_RESULT passed=%d failed=%d\n", suite.passed, suite.failed);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (const char* only=getenv("PRODIGY_TEST_ONLY"); only && strcmp(only,"global-writer-reservations")==0) {
     TestSuite suite; testGlobalSingleWriterEndpointReservations(suite);
     std::printf("GLOBAL_WRITER_RESERVATIONS_RESULT passed=%d failed=%d\n",suite.passed,suite.failed);
