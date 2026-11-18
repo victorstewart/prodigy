@@ -506,6 +506,9 @@ pub struct ContainerParameters
    pub memory_mb: u32,
    pub storage_mb: u32,
    pub logical_cores: u16,
+   /// Inherited cgroup FDs supplied by the runtime before the neuron FD.
+   /// Keep this in the compact startup projection's wire order.
+   pub isolated_child_cgroups: Vec<i32>,
    pub neuron_fd: i32,
    pub low_cpu: i32,
    pub high_cpu: i32,
@@ -517,11 +520,23 @@ pub struct ContainerParameters
    pub datacenter_unique_tag: u8,
    pub flags: Vec<u64>,
    pub credential_bundle: Option<CredentialBundle>,
+   pub deployment_id: u64,
+   pub task_attempt_number: u32,
 }
 
 impl ContainerParameters
 {
    pub fn decode(bytes: &[u8]) -> io::Result<Self>
+   {
+      // `PRDPAR01` historically had no version discriminator. Try the current
+      // compact projection first, then its documented pre-cgroup/tail shape so
+      // archived fixtures and retained legacy launches remain readable.
+      Self::decode_projection(bytes, true).or_else(|current_error| {
+         Self::decode_projection(bytes, false).map_err(|_| current_error)
+      })
+   }
+
+   fn decode_projection(bytes: &[u8], has_isolated_child_cgroups: bool) -> io::Result<Self>
    {
       let mut reader = Reader::new(bytes);
       reader.header(CONTAINER_PARAMETERS_MAGIC)?;
@@ -530,6 +545,17 @@ impl ContainerParameters
       let memory_mb = reader.u32()?;
       let storage_mb = reader.u32()?;
       let logical_cores = reader.u16()?;
+      let isolated_child_cgroups = if has_isolated_child_cgroups {
+         let count = reader.u8()? as usize;
+         if count > 64 { return Err(invalid_data("too many isolated child cgroups")); }
+         let mut fds = Vec::with_capacity(count);
+         for _ in 0..count {
+            let fd = reader.i32()?;
+            if fd < 3 { return Err(invalid_data("invalid isolated child cgroup fd")); }
+            fds.push(fd);
+         }
+         fds
+      } else { Vec::new() };
       let neuron_fd = reader.i32()?;
       let low_cpu = reader.i32()?;
       let high_cpu = reader.i32()?;
@@ -585,12 +611,19 @@ impl ContainerParameters
          None
       };
 
+      let (deployment_id, task_attempt_number) = if reader.remaining() == 0 {
+         (0, 0)
+      } else {
+         (reader.u64()?, reader.u32()?)
+      };
+
       reader.finish()?;
       Ok(Self {
          uuid,
          memory_mb,
          storage_mb,
          logical_cores,
+         isolated_child_cgroups,
          neuron_fd,
          low_cpu,
          high_cpu,
@@ -614,6 +647,8 @@ impl ContainerParameters
          datacenter_unique_tag,
          flags,
          credential_bundle,
+         deployment_id,
+         task_attempt_number,
       })
    }
 
@@ -625,6 +660,12 @@ impl ContainerParameters
       writer.u32(self.memory_mb);
       writer.u32(self.storage_mb);
       writer.u16(self.logical_cores);
+      if self.isolated_child_cgroups.len() > 64 { return Err(invalid_data("too many isolated child cgroups")); }
+      writer.u8(self.isolated_child_cgroups.len() as u8);
+      for fd in &self.isolated_child_cgroups {
+         if *fd < 3 { return Err(invalid_data("invalid isolated child cgroup fd")); }
+         writer.i32(*fd);
+      }
       writer.i32(self.neuron_fd);
       writer.i32(self.low_cpu);
       writer.i32(self.high_cpu);
@@ -678,6 +719,9 @@ impl ContainerParameters
             TlsResumptionSnapshot::encode_fields,
          )?;
       }
+
+      writer.u64(self.deployment_id);
+      writer.u32(self.task_attempt_number);
 
       Ok(writer.finish())
    }
@@ -1417,7 +1461,10 @@ fn decode_vec<T>(
 ) -> io::Result<Vec<T>>
 {
    let count = reader.u32()? as usize;
-   let mut items = Vec::with_capacity(count);
+   // Startup bytes may be a pre-cgroup legacy projection. The current-wire
+   // probe must never turn a misaligned u32 into an attacker-controlled
+   // allocation before an item has actually decoded.
+   let mut items = Vec::new();
    for _ in 0..count
    {
       items.push(decode_item(reader)?);
@@ -1476,6 +1523,8 @@ impl<'a> Reader<'a> {
       self.offset = end;
       Ok(slice)
    }
+
+   fn remaining(&self) -> usize { self.bytes.len().saturating_sub(self.offset) }
 
    fn header(&mut self, expected: &[u8; 8]) -> io::Result<()>
    {
@@ -1736,6 +1785,7 @@ mod tests {
          memory_mb: 1024,
          storage_mb: 2048,
          logical_cores: 3,
+         isolated_child_cgroups: vec![17, 18],
          neuron_fd: 9,
          low_cpu: 1,
          high_cpu: 3,
@@ -1774,6 +1824,8 @@ mod tests {
             tls_resumption_snapshots: Vec::new(),
             bundle_generation: 123,
          }),
+         deployment_id: 0xAABB_CCDD_EEFF_0001,
+         task_attempt_number: 7,
       };
 
       let encoded = parameters.encode().unwrap();
@@ -1789,6 +1841,8 @@ mod tests {
       writer.u32(parameters.memory_mb);
       writer.u32(parameters.storage_mb);
       writer.u16(parameters.logical_cores);
+      writer.u8(parameters.isolated_child_cgroups.len() as u8);
+      for fd in &parameters.isolated_child_cgroups { writer.i32(*fd); }
       writer.i32(parameters.neuron_fd);
       writer.i32(parameters.low_cpu);
       writer.i32(parameters.high_cpu);
@@ -1858,6 +1912,9 @@ mod tests {
          .unwrap();
       }
 
+      writer.u64(parameters.deployment_id);
+      writer.u32(parameters.task_attempt_number);
+
       writer.finish()
    }
 
@@ -1869,6 +1926,7 @@ mod tests {
          memory_mb: 3072,
          storage_mb: 4096,
          logical_cores: 4,
+         isolated_child_cgroups: vec![27],
          neuron_fd: 7,
          low_cpu: 2,
          high_cpu: 5,
@@ -1907,11 +1965,17 @@ mod tests {
             tls_resumption_snapshots: Vec::new(),
             bundle_generation: 101,
          }),
+         deployment_id: 0x1122_3344_5566_7788,
+         task_attempt_number: 9,
       };
 
       let encoded = encode_current_container_parameters(&parameters);
       let decoded = ContainerParameters::decode(&encoded).unwrap();
       assert_eq!(decoded, parameters);
+      assert_eq!(decoded.isolated_child_cgroups, vec![27]);
+      assert_eq!(decoded.deployment_id, 0x1122_3344_5566_7788);
+      assert_eq!(decoded.task_attempt_number, 9);
+      assert!(ContainerParameters::decode(&encoded[..encoded.len() - 4]).is_err());
    }
 
    #[test]
@@ -1989,6 +2053,9 @@ mod tests {
       assert_eq!(parameters.advertisement_pairings[0].application_id, 0x3344);
       assert_eq!(parameters.datacenter_unique_tag, 23);
       assert_eq!(parameters.flags, vec![44, 55, 66]);
+      assert!(parameters.isolated_child_cgroups.is_empty());
+      assert_eq!(parameters.deployment_id, 0);
+      assert_eq!(parameters.task_attempt_number, 0);
       let bundle = parameters.credential_bundle.unwrap();
       assert_eq!(bundle.bundle_generation, 101);
       assert_eq!(bundle.tls_resumption_snapshots.len(), 1);
