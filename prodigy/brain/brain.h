@@ -12983,6 +12983,14 @@ public:
     if (!statefulTopologyRetirementActivationEnabled())
     {
       (void)reconcileContainerRetirements();
+      // A cold-restored stateless planner reservation can be the only pending
+      // runtime row. It has no stateful retirement owner to wake recovery, so
+      // re-enter the existing recovery/finalizer owner on this heartbeat. That
+      // owner alone applies or discards the row after authenticated inventory.
+      if (recoveringPersistedNeuronInventory &&
+          (pendingReplicatedContainerRuntimeStates.empty() ||
+           pendingReplicatedContainerRuntimeStatesContainOnlyVolatileStatelessPlannerReservations()))
+        recoverDeploymentsAfterNeuronState();
       return;
     }
     (void)reconcileContainerRetirements();
@@ -12999,7 +13007,9 @@ public:
     // The last delayed authority ACK can materialize the last inventory record
     // on this heartbeat, with no further Neuron event to wake recovery. Rejoin
     // the existing inventory/scheduler owner rather than scheduling here.
-    if (recoveringPersistedNeuronInventory && pendingReplicatedContainerRuntimeStates.empty())
+    if (recoveringPersistedNeuronInventory &&
+        (pendingReplicatedContainerRuntimeStates.empty() ||
+         pendingReplicatedContainerRuntimeStatesContainOnlyVolatileStatelessPlannerReservations()))
       recoverDeploymentsAfterNeuronState();
   }
 

@@ -46218,6 +46218,49 @@ static void testLegacyCoordinatorMigration(TestSuite& suite)
   brain.restorePersistentUpdateSelfState(legacyBeforeMismatch);
   brain.masterAuthorityRuntimeState.updateSelf = brain.capturePersistentUpdateSelfState();
 
+  // A persisted, unlaunched stateless reservation is not a runtime to adopt.
+  // An ordinary retirement heartbeat must re-enter its existing replay owner
+  // after the exact authenticated fleet inventory proves it absent. A
+  // malformed lookalike remains pending; it must not be bypassed.
+  BrainReplicatedContainerRuntimeState absentReservation = {};
+  absentReservation.plan = reservation.generatePlan(deployment.plan);
+  absentReservation.plan.uuid = uint128_t(0x9912a0);
+  absentReservation.plan.state = ContainerState::planned;
+  absentReservation.plan.fragment = 0;
+  absentReservation.plan.runtimeReady = false;
+  absentReservation.machineUUID = machines[3].uuid;
+  auto malformedReservation = absentReservation;
+  malformedReservation.machineUUID = 0;
+  brain.pendingReplicatedContainerRuntimeStates[deployment.plan.config.deploymentID()].push_back(
+      malformedReservation);
+  brain.resumeStatefulTopologyRetirements();
+  suite.expect(!brain.pendingReplicatedContainerRuntimeStates.empty() &&
+                   brain.containers.size() == 5 && brain.containers.contains(reservation.uuid) &&
+                   brain.containers.contains(containers[0].uuid) &&
+                   brain.containers.contains(containers[1].uuid) && brain.containers.contains(containers[2].uuid) &&
+                   brain.containers.contains(containers[3].uuid),
+               "legacy_coordinator_migration_heartbeat_keeps_unproven_reservation_and_materialized_inventory");
+  brain.pendingReplicatedContainerRuntimeStates.clear();
+  const auto retainedInventory = brain.containerRetirementInventoryByMachine.at(machines[3].uuid);
+  brain.containerRetirementInventoryByMachine.erase(machines[3].uuid);
+  brain.pendingReplicatedContainerRuntimeStates[deployment.plan.config.deploymentID()].push_back(
+      absentReservation);
+  brain.resumeStatefulTopologyRetirements();
+  suite.expect(!brain.pendingReplicatedContainerRuntimeStates.empty() &&
+                   brain.containers.size() == 5 && brain.containers.contains(reservation.uuid) &&
+                   brain.containers.contains(containers[0].uuid) &&
+                   brain.containers.contains(containers[1].uuid) && brain.containers.contains(containers[2].uuid) &&
+                   brain.containers.contains(containers[3].uuid),
+               "legacy_coordinator_migration_heartbeat_requires_current_authenticated_inventory");
+  brain.containerRetirementInventoryByMachine.insert_or_assign(machines[3].uuid, retainedInventory);
+  brain.resumeStatefulTopologyRetirements();
+  suite.require(brain.pendingReplicatedContainerRuntimeStates.empty() &&
+                    brain.containers.size() == 5 && brain.containers.contains(reservation.uuid) &&
+                    brain.containers.contains(containers[0].uuid) &&
+                    brain.containers.contains(containers[1].uuid) && brain.containers.contains(containers[2].uuid) &&
+                    brain.containers.contains(containers[3].uuid),
+                "legacy_coordinator_migration_heartbeat_redrives_proven_absent_reservation_only");
+
   Mothership mothership = {};
   mothership.isFixedFile = true;
   mothership.fslot = 71;
