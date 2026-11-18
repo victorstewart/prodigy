@@ -193,9 +193,16 @@ async fn main() -> io::Result<()>
    if let Role::Advertiser { port } = role
    {
       let listener = TcpListener::bind(SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port)).await?;
+      neuron.runtime_ready().await?;
       neuron.ready().await?;
       ready_sent = true;
       reactor.once(Event::MeshComplete, run_advertiser(listener));
+   }
+   else
+   {
+      // A subscriber is ready for pairing delivery before its advertised
+      // dependency becomes available. Health remains gated on the exchange.
+      neuron.runtime_ready().await?;
    }
 
    while let Some(event) = reactor.next().await

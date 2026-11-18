@@ -52,6 +52,7 @@ pub struct TokioReactor<E>
 enum Command
 {
    Ready,
+   RuntimeReady,
 }
 
 pub struct TokioNeuron<D: Dispatch>
@@ -68,6 +69,7 @@ pub struct TokioNeuronHandle
    parameters: ContainerParameters,
    command_tx: mpsc::Sender<Command>,
    ready_sent: bool,
+   runtime_ready_sent: bool,
 }
 
 impl<E> ReactorSink<E>
@@ -227,6 +229,7 @@ where
          parameters,
          command_tx,
          ready_sent: false,
+         runtime_ready_sent: false,
       }
    }
 
@@ -250,6 +253,11 @@ where
                   Some(Command::Ready) =>
                   {
                      self.hub.queue_ready();
+                     self.flush_outbound().await?;
+                  }
+                  Some(Command::RuntimeReady) =>
+                  {
+                     self.hub.queue_runtime_ready();
                      self.flush_outbound().await?;
                   }
                   None =>
@@ -298,6 +306,21 @@ impl TokioNeuronHandle
       self.ready_sent = true;
       Ok(())
    }
+
+   pub async fn runtime_ready(&mut self) -> io::Result<()>
+   {
+      if self.runtime_ready_sent
+      {
+         return Ok(());
+      }
+
+      self.command_tx
+         .send(Command::RuntimeReady)
+         .await
+         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "neuron reactor closed"))?;
+      self.runtime_ready_sent = true;
+      Ok(())
+   }
 }
 
 impl<D: Dispatch> TokioNeuron<D>
@@ -344,7 +367,7 @@ mod tests
    use std::os::fd::IntoRawFd;
    use std::os::unix::net::UnixStream as StdUnixStream;
 
-   use crate::{build_message_frame, DefaultDispatch};
+   use crate::{build_message_frame, build_ready_frame, build_runtime_ready_frame, DefaultDispatch};
 
    use super::*;
 
@@ -380,8 +403,17 @@ mod tests
          event => panic!("unexpected reactor event: {event:?}"),
       }
 
-      let mut bytes = vec![0u8; 16];
+      let ready = build_ready_frame().unwrap();
+      let mut bytes = vec![0u8; ready.len()];
       neuron_stream.read_exact(&mut bytes).await.unwrap();
+      assert_eq!(bytes, ready);
+
+      neuron.runtime_ready().await.unwrap();
+      neuron.runtime_ready().await.unwrap();
+      let runtime_ready = build_runtime_ready_frame().unwrap();
+      let mut bytes = vec![0u8; runtime_ready.len()];
+      neuron_stream.read_exact(&mut bytes).await.unwrap();
+      assert_eq!(bytes, runtime_ready);
 
       neuron_stream
          .write_all(&build_message_frame(crate::ContainerTopic::Stop, &[]).unwrap())
