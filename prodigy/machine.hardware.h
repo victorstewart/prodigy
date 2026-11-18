@@ -706,7 +706,7 @@ inline bool ProdigyHardwareInventoryShell::start()
       "case $path in /*) ;; *) exit 1;; esac; done || exit 1; "
       "printf 'prodigy-env\\000'; exec /usr/bin/env -0"_ctv);
   command.append(" inventory \"$(umask)\" \"$(command -v sh)\" \"$(command -v timeout)\""_ctv);
-  if (!prodigyRunBlockingLocalCommandCaptureStdout(command, exported)) return false;
+  if (!prodigyRunBlockingLocalCommandCaptureStdout(command, exported, nullptr, nullptr)) return false;
   constexpr char marker[] = "prodigy-env";
   if (exported.size() <= sizeof(marker) || memcmp(exported.data(), marker, sizeof(marker)) != 0) return false;
   char *cursor = reinterpret_cast<char *>(exported.data()) + sizeof(marker);
