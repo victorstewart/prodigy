@@ -343,6 +343,18 @@ int main()
                      std::this_thread::sleep_for(std::chrono::milliseconds(250));
                    }, [&] { ++lateCallbacks; }, [&](std::exception_ptr) { ++lateCallbacks; }),
                    "artifact_io_accepts_cancelable_work");
+      for (uint32_t i = 1; i < ProdigyArtifactIO::maximumJobs; ++i)
+      {
+        suite.expect(io->submitFinal(0, [] {}, [&] { ++lateCallbacks; },
+                                     [&](std::exception_ptr) { ++lateCallbacks; }),
+                     "artifact_io_fills_remaining_slots_before_shutdown");
+      }
+      uint32_t waitResponses = 0;
+      io->whenJobSlotAvailable([&](bool available) {
+        ++waitResponses;
+        suite.expect(!available, "artifact_io_shutdown_rejects_waiting_admission");
+      });
+      suite.expect(waitResponses == 0, "artifact_io_full_worker_defers_waiting_admission");
       ring.tickAction = [&] {
         if (entered)
         {
@@ -355,6 +367,7 @@ int main()
       ring.armTick(1);
       ring.armDeadline(400);
       Ring::start();
+      suite.expect(waitResponses == 1, "artifact_io_shutdown_resumes_waiting_admission_once");
       ring.drainAction = [] { Ring::exit = true; };
       ring.armDrain(25);
       Ring::exit = false;

@@ -1017,10 +1017,30 @@ public:
   }
 };
 
+class ContainerArtifactVerificationTest final {
+public:
+  bool completed = false;
+  bool result = true;
+  bool nextJobAdmitted = false;
+  String failure = {};
+
+  void start(const String& path, const String& digest, uint64_t bytes,
+             uint128_t uuid, uint64_t admissionGeneration, ProdigyArtifactIO *handoff = nullptr)
+  {
+    result = co_await ContainerManager::verifyCompressedContainerBlobAsync(
+        path, digest, bytes, uuid, admissionGeneration, &failure);
+    if (result && handoff)
+    {
+      nextJobAdmitted = handoff->submit(0, [] {}, [] {}, [](std::exception_ptr) {});
+    }
+    completed = true;
+  }
+};
+
 class ArtifactMaterializationPulse final : public TimeoutDispatcher {
 public:
   std::atomic<bool> *workerEntered = nullptr;
-  ArtifactMaterializationTask *task = nullptr;
+  bool *completed = nullptr;
   bool firedWhileWorkerBlocked = false;
 
   void dispatchTimeout(TimeoutPacket *) override
@@ -1029,7 +1049,7 @@ public:
     // inline implementation can leave an unrelated worker busy yet complete
     // this launch before the Ring gets its timer turn.
     firedWhileWorkerBlocked = workerEntered != nullptr && workerEntered->load() &&
-        task != nullptr && task->completed == false;
+        completed != nullptr && *completed == false;
   }
 };
 
@@ -1069,7 +1089,7 @@ static void testContainerMaterializationYieldsRingAndFencesRetirement(TestSuite&
   auto queuePulse = [&](std::atomic<bool>& entered, ArtifactMaterializationTask& task,
                         ArtifactMaterializationPulse& pulse, TimeoutPacket& packet) {
     pulse.workerEntered = &entered;
-    pulse.task = &task;
+    pulse.completed = &task.completed;
     packet.dispatcher = &pulse;
     packet.clear();
     packet.setTimeoutMs(25);
@@ -1120,6 +1140,139 @@ static void testContainerMaterializationYieldsRingAndFencesRetirement(TestSuite&
   ring.timedOut = false;
   runRingUntil(ring, [&] { return neuron.quiesceArtifactIOForTest(); });
   suite.expect(ring.timedOut == false, "container_materialization_test_quiesces_artifact_worker_before_ring_shutdown");
+  thisNeuron = savedNeuron;
+}
+
+static void testContainerArtifactVerificationYieldsAndFencesLaunch(TestSuite& suite)
+{
+  ScopedArtifactStore store = {};
+  ArtifactRing ring = {};
+  TestNeuron neuron = {};
+  NeuronBase *savedNeuron = thisNeuron;
+  thisNeuron = &neuron;
+  const bool started = store.root.size() != 0 && neuron.startForArtifactTest(store.root);
+  suite.expect(started, "container_artifact_verification_starts_worker");
+  if (!started) { thisNeuron = savedNeuron; return; }
+
+  String validPath = {};
+  validPath.snprintf<"{}/valid.zst"_ctv>(store.root);
+  String validBlob = {};
+  const bool fixtureLoaded = loadFixture(validBlob);
+  suite.expect(fixtureLoaded,
+               "container_artifact_verification_loads_discombobulator_built_fixture");
+  if (!fixtureLoaded)
+  {
+    runRingUntil(ring, [&] { return neuron.quiesceArtifactIOForTest(); });
+    thisNeuron = savedNeuron;
+    return;
+  }
+  suite.expect(Filesystem::openWriteAtClose(-1, validPath, validBlob) == int(validBlob.size()),
+               "container_artifact_verification_writes_discombobulator_built_fixture");
+  String validDigest = {};
+  suite.expect(prodigyComputeSHA256Hex(validBlob, validDigest),
+               "container_artifact_verification_hashes_valid_fixture");
+  if (validDigest.size() == 0)
+  {
+    runRingUntil(ring, [&] { return neuron.quiesceArtifactIOForTest(); });
+    thisNeuron = savedNeuron;
+    return;
+  }
+
+  auto queueBlocker = [&](std::atomic<bool>& entered) {
+    ProdigyArtifactIO *io = neuron.containerArtifactIO();
+    return io != nullptr && io->submit(0,
+        [&entered] { entered.store(true); usleep(250'000); }, [] {}, [](std::exception_ptr) {});
+  };
+
+  ContainerPlan validPlan = {};
+  validPlan.uuid = uint128_t(0xc011b001);
+  const uint64_t validGeneration = neuron.beginPendingContainerLaunch(validPlan);
+  std::atomic<bool> entered {false};
+  suite.expect(validGeneration != 0 && queueBlocker(entered) && waitForArtifactWorker(entered),
+               "container_artifact_verification_queues_predecessor_worker_job");
+  ContainerArtifactVerificationTest validTask = {};
+  validTask.start(validPath, validDigest, validBlob.size(), validPlan.uuid, validGeneration);
+  ArtifactMaterializationPulse pulse = {};
+  TimeoutPacket pulsePacket = {};
+  pulse.workerEntered = &entered;
+  pulse.completed = &validTask.completed;
+  pulsePacket.dispatcher = &pulse;
+  pulsePacket.setTimeoutMs(25);
+  Ring::queueTimeout(&pulsePacket);
+  runRingUntil(ring, [&] { return validTask.completed; });
+  suite.expect(!ring.timedOut && pulse.firedWhileWorkerBlocked,
+               "container_artifact_verification_worker_leaves_ring_responsive");
+  suite.expect(validTask.result && validTask.failure.empty() && neuron.isPendingContainerLaunch(validPlan.uuid),
+               "container_artifact_verification_accepts_full_hash_and_header_before_launch");
+  neuron.finishPendingContainerLaunch(validPlan.uuid, validGeneration);
+
+  ContainerPlan stalePlan = {};
+  stalePlan.uuid = uint128_t(0xc011b002);
+  const uint64_t staleGeneration = neuron.beginPendingContainerLaunch(stalePlan);
+  std::atomic<bool> staleEntered {false};
+  suite.expect(staleGeneration != 0 && queueBlocker(staleEntered) && waitForArtifactWorker(staleEntered),
+               "container_artifact_verification_queues_stale_worker_job");
+  ContainerArtifactVerificationTest staleTask = {};
+  staleTask.start(validPath, validDigest, validBlob.size(), stalePlan.uuid, staleGeneration);
+  neuron.finishPendingContainerLaunch(stalePlan.uuid, staleGeneration);
+  runRingUntil(ring, [&] { return staleTask.completed; });
+  suite.expect(!staleTask.result && staleTask.failure.equal("container launch retired during artifact verification"_ctv),
+               "container_artifact_verification_stale_completion_cannot_authorize_launch");
+
+  ContainerPlan rejectedPlan = {};
+  rejectedPlan.uuid = uint128_t(0xc011b003);
+  const uint64_t rejectedGeneration = neuron.beginPendingContainerLaunch(rejectedPlan);
+  String wrongDigest = validDigest;
+  wrongDigest[0] = wrongDigest[0] == '0' ? '1' : '0';
+  ContainerArtifactVerificationTest rejectedTask = {};
+  rejectedTask.start(validPath, wrongDigest, validBlob.size(), rejectedPlan.uuid, rejectedGeneration);
+  runRingUntil(ring, [&] { return rejectedTask.completed; });
+  suite.expect(!rejectedTask.result && rejectedTask.failure.size() > 0 && neuron.isPendingContainerLaunch(rejectedPlan.uuid),
+               "container_artifact_verification_digest_rejection_preserves_launch_until_failure_report");
+  neuron.finishPendingContainerLaunch(rejectedPlan.uuid, rejectedGeneration);
+
+  // Nine admissions exceed ArtifactIO's eight retained-job slots. Every
+  // request still runs the same full SHA/header gate after cooperative retry;
+  // none may be rejected merely because its co-located replicas arrived first.
+  ContainerArtifactVerificationTest burst[9] = {};
+  uint128_t burstUUIDs[9] = {};
+  uint64_t burstGenerations[9] = {};
+  bool burstAdmitted = true;
+  for (uint32_t index = 0; index < 9; ++index)
+  {
+    burstUUIDs[index] = uint128_t(0xc011b100 + index);
+    ContainerPlan burstPlan = {};
+    burstPlan.uuid = burstUUIDs[index];
+    burstGenerations[index] = neuron.beginPendingContainerLaunch(burstPlan);
+    burstAdmitted = burstAdmitted && burstGenerations[index] != 0;
+    burst[index].start(validPath, validDigest, validBlob.size(), burstUUIDs[index], burstGenerations[index],
+                       index == 0 ? neuron.containerArtifactIO() : nullptr);
+  }
+  runRingUntil(ring, [&] {
+    for (const ContainerArtifactVerificationTest& task : burst)
+      if (!task.completed) return false;
+    return true;
+  });
+  suite.expect(burst[0].nextJobAdmitted,
+               "container_artifact_verification_releases_full_queue_slot_before_materialization");
+  bool burstVerified = burstAdmitted;
+  for (uint32_t index = 0; index < 9; ++index)
+  {
+    const bool verified = burst[index].completed && burst[index].result &&
+        burst[index].failure.empty() && neuron.isPendingContainerLaunch(burstUUIDs[index]);
+    if (!verified || ring.timedOut)
+    {
+      std::fprintf(stderr, "artifact verification replica %u completed=%d verified=%d pending=%d timeout=%d failure=%s\n",
+                   index, burst[index].completed, burst[index].result, neuron.isPendingContainerLaunch(burstUUIDs[index]),
+                   ring.timedOut, burst[index].failure.c_str());
+    }
+    burstVerified = burstVerified && verified;
+    neuron.finishPendingContainerLaunch(burstUUIDs[index], burstGenerations[index]);
+  }
+  suite.expect(!ring.timedOut && burstVerified,
+               "container_artifact_verification_retries_nine_co_located_replicas_without_bypassing_gate");
+
+  runRingUntil(ring, [&] { return neuron.quiesceArtifactIOForTest(); });
   thisNeuron = savedNeuron;
 }
 
@@ -1503,6 +1656,14 @@ int main()
     TestSuite suite = {};
     testContainerMaterializationYieldsRingAndFencesRetirement(suite);
     std::printf("CONTAINER_MATERIALIZATION_ASYNC_RESULT failed_assertions=%d\n", suite.failed);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "container-artifact-verification-async") == 0)
+  {
+    TestSuite suite = {};
+    testContainerArtifactVerificationYieldsAndFencesLaunch(suite);
+    std::printf("CONTAINER_ARTIFACT_VERIFICATION_ASYNC_RESULT failed_assertions=%d\n", suite.failed);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = std::getenv("PRODIGY_TEST_ONLY");

@@ -3813,6 +3813,7 @@ private:
   friend class Neuron;
   friend class ContainerManagerGatewayRecoveryTestAccess;
   friend class ContainerManagerStorageTestAccess;
+  friend class ContainerArtifactVerificationTest;
 
   int slicefd;
   static inline bool rootCgroupSeeded = false;
@@ -8531,6 +8532,66 @@ private:
     }
 
     return true;
+  }
+
+  // Hash and validate the contract on the artifact worker before touching
+  // a predecessor. Each launch owns its path and expected bytes across waits.
+  static ProdigyHostTask<bool> verifyCompressedContainerBlobAsync(
+      String compressedContainerPath, String expectedDigest, uint64_t expectedBytes,
+      uint128_t containerUUID, uint64_t admissionGeneration, String *failureReport)
+  {
+    NeuronBase *neuron = thisNeuron;
+    ProdigyArtifactIO *io = nullptr;
+    for (;;)
+    {
+      if (!neuron || !neuron->pendingContainerLaunchIsCurrent(containerUUID, admissionGeneration))
+      {
+        failureReport->assign("container launch retired during artifact verification"_ctv);
+        co_return false;
+      }
+      io = neuron->containerArtifactIO();
+      if (!io)
+      {
+        failureReport->assign("container artifact verification worker unavailable"_ctv);
+        co_return false;
+      }
+      // The worker streams a file and retains no image buffer. Only its job
+      // limit can block this zero-byte submission while the worker is running.
+      if (io->admission(0) != ProdigyArtifactIO::Admission::jobCapacity) break;
+      const bool available = co_await ProdigyHostCompletion<bool>(
+          [io](auto resume) { io->whenJobSlotAvailable(std::move(resume)); });
+      if (!available)
+      {
+        failureReport->assign("container artifact verification worker stopped"_ctv);
+        co_return false;
+      }
+    }
+
+    struct Result {
+      bool verified = false;
+      String failure = {};
+    };
+    auto result = std::make_shared<Result>();
+    const bool submitted = co_await ProdigyHostCompletion<bool>(
+        [io, path = std::move(compressedContainerPath), digest = std::move(expectedDigest), expectedBytes, result](auto complete) {
+          if (!io->submitFinal(0, [path, digest, expectedBytes, result] {
+                result->verified = verifyCompressedContainerBlob(path, digest, expectedBytes, &result->failure);
+              }, [complete] { complete(true); }, [result, complete](std::exception_ptr) {
+                result->failure.assign("container artifact verification worker failed"_ctv);
+                complete(true);
+              }))
+          {
+            result->failure.assign("container artifact verification worker admission rejected"_ctv);
+            complete(false);
+          }
+        });
+    if (!neuron->pendingContainerLaunchIsCurrent(containerUUID, admissionGeneration))
+    {
+      failureReport->assign("container launch retired during artifact verification"_ctv);
+      co_return false;
+    }
+    *failureReport = std::move(result->failure);
+    co_return submitted && result->verified;
   }
 
   static bool prepareContainerDeviceMountTarget(
@@ -14510,12 +14571,22 @@ public:
     if (systemContainer == false)
     {
       String blobVerificationFailure = {};
-      if (verifyCompressedContainerBlob(
+      if (co_await verifyCompressedContainerBlobAsync(
               compressedContainerPath,
               plan.config.containerBlobSHA256,
               plan.config.containerBlobBytes,
+              plan.uuid,
+              launchAdmissionGeneration,
               &blobVerificationFailure) == false)
       {
+        // A terminal kill or newer control generation can retire this launch
+        // while its worker owns the verifier.  That obsolete completion must
+        // not report a failure against the newer owner.
+        if (thisNeuron != nullptr &&
+            thisNeuron->pendingContainerLaunchIsCurrent(plan.uuid, launchAdmissionGeneration) == false)
+        {
+          co_return;
+        }
         if (blobVerificationFailure.size() == 0)
         {
           blobVerificationFailure.assign("container image verification failed"_ctv);

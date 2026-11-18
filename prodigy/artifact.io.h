@@ -42,6 +42,7 @@ private:
     Completion completion = {};
     Failure failure = {};
     std::exception_ptr exception = {};
+    bool releaseBeforeCallback = false;
   };
 
   mutable std::mutex mutex;
@@ -62,6 +63,25 @@ private:
   bool workerExited = true;
   Job *callbackJob = nullptr;
   bool callbackContinuation = false;
+  // Ring-owned launch coroutines waiting for a job slot. Only admitted jobs
+  // retain a worker lease. Shutdown wakes the waiters with a negative result.
+  std::deque<std::function<void(bool)>> slotWaiters;
+  bool notifyingWaiters = false;
+
+  void notifySlotWaiters()
+  {
+    if (notifyingWaiters || slotWaiters.empty()) return;
+    notifyingWaiters = true;
+    while (!slotWaiters.empty())
+    {
+      const Admission state = admission(0);
+      if (state == Admission::jobCapacity) break;
+      auto resume = std::move(slotWaiters.front());
+      slotWaiters.pop_front();
+      resume(state == Admission::admitted);
+    }
+    notifyingWaiters = false;
+  }
 
   Admission admissionLocked(uint64_t bytes) const
   {
@@ -76,6 +96,20 @@ private:
   {
     retainedBytes -= job.bytes;
     --retainedJobs;
+  }
+
+  bool submitLocked(uint64_t bytes, Work work, Completion completion, Failure failure,
+                    bool releaseBeforeCallback)
+  {
+    if (work == nullptr || completion == nullptr || failure == nullptr ||
+        admissionLocked(bytes) != Admission::admitted) return false;
+    queued.push_back({.generation = generation, .bytes = bytes, .work = std::move(work),
+                      .completion = std::move(completion), .failure = std::move(failure),
+                      .releaseBeforeCallback = releaseBeforeCallback});
+    retainedBytes += bytes;
+    ++retainedJobs;
+    condition.notify_one();
+    return true;
   }
 
   void signalRing()
@@ -184,14 +218,17 @@ public:
 
   bool submit(uint64_t bytes, Work work, Completion completion, Failure failure)
   {
-    if (work == nullptr || completion == nullptr || failure == nullptr) return false;
     std::lock_guard lock(mutex);
-    if (admissionLocked(bytes) != Admission::admitted) return false;
-    queued.push_back({.generation = generation, .bytes = bytes, .work = std::move(work), .completion = std::move(completion), .failure = std::move(failure)});
-    retainedBytes += bytes;
-    ++retainedJobs;
-    condition.notify_one();
-    return true;
+    return submitLocked(bytes, std::move(work), std::move(completion), std::move(failure), false);
+  }
+
+  // A terminal callback that will not request continueWith() may release its
+  // lease before resuming its Ring owner. This lets the next independent
+  // operation (for example verify -> materialize) claim the slot immediately.
+  bool submitFinal(uint64_t bytes, Work work, Completion completion, Failure failure)
+  {
+    std::lock_guard lock(mutex);
+    return submitLocked(bytes, std::move(work), std::move(completion), std::move(failure), true);
   }
 
   // Ring owners use this to distinguish a replayable capacity miss from an
@@ -203,6 +240,15 @@ public:
     return admissionLocked(bytes);
   }
 
+  // Ring-thread only. A resumed caller can submit before the next waiter is
+  // notified. A stopped worker rejects all outstanding waits.
+  void whenJobSlotAvailable(std::function<void(bool)> resume)
+  {
+    const Admission state = admission(0);
+    if (state == Admission::jobCapacity) slotWaiters.push_back(std::move(resume));
+    else resume(state == Admission::admitted);
+  }
+
   // Ring-callback only. Replaces the current job in-place and preserves its
   // queue slot and byte lease, so prepare->publish cannot temporarily count
   // one artifact twice or be rejected when all eight slots are occupied.
@@ -210,7 +256,7 @@ public:
   // capacity-gated.
   bool continueWith(Work work, Completion completion, Failure failure)
   {
-    if (callbackJob == nullptr || callbackContinuation || stopping || work == nullptr || completion == nullptr || failure == nullptr) return false;
+    if (callbackJob == nullptr || callbackJob->releaseBeforeCallback || callbackContinuation || stopping || work == nullptr || completion == nullptr || failure == nullptr) return false;
     callbackJob->work = std::move(work);
     callbackJob->completion = std::move(completion);
     callbackJob->failure = std::move(failure);
@@ -233,7 +279,7 @@ public:
   // intentionally does not change stop()/destructor's eager-retirement path.
   bool quiesceForExec()
   {
-    if (callbackJob != nullptr) return false;
+    if (callbackJob != nullptr || notifyingWaiters) return false;
     if (execQuiesced) return true;
     if (execQuiescing)
     {
@@ -273,6 +319,7 @@ public:
       for (const Job& job : completed) releaseJobLocked(job);
       completed.clear();
     }
+    notifySlotWaiters();
     condition.notify_all();
     if (wakePoll == Ring::invalidRawPollTicket)
     {
@@ -310,6 +357,11 @@ public:
       // closure after that point.
       callbackJob = &job;
       callbackContinuation = false;
+      if (job.releaseBeforeCallback)
+      {
+        std::lock_guard lock(mutex);
+        releaseJobLocked(job);
+      }
       if (stopping == false && job.generation == generation)
       {
         // continueWith replaces the next callback in job. Move the active
@@ -326,11 +378,12 @@ public:
         queued.push_back(std::move(job));
         condition.notify_one();
       }
-      else
+      else if (!job.releaseBeforeCallback)
       {
         releaseJobLocked(job);
       }
     }
+    notifySlotWaiters();
     armWakePoll();
   }
 
@@ -351,6 +404,7 @@ public:
       for (const Job& job : completed) releaseJobLocked(job);
       completed.clear();
     }
+    notifySlotWaiters();
     if (wakePoll != Ring::invalidRawPollTicket) (void)Ring::cancelRawFDPoll(wakePoll);
     wakePoll = Ring::invalidRawPollTicket;
     if (installed)

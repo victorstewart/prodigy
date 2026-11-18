@@ -2278,12 +2278,15 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_neuron_hub_unit
    )
    add_test(NAME prodigy_neuron_artifact_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_neuron_artifact_unit)
+   add_test(NAME prodigy_container_artifact_verification_async
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=container-artifact-verification-async $<TARGET_FILE:prodigy_neuron_artifact_unit>)
    add_test(NAME prodigy_storage_telemetry
       COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=storage-telemetry $<TARGET_FILE:prodigy_neuron_artifact_unit>)
    set_tests_properties(
       prodigy_artifact_io_unit
       prodigy_mothership_artifact_responsiveness_unit
       prodigy_neuron_artifact_unit
+      prodigy_container_artifact_verification_async
       PROPERTIES ENVIRONMENT "PRODIGY_TEST_APP_ARTIFACT=${PRODIGY_PINGPONG_CONTAINER_ARTIFACT}"
    )
 
