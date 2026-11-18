@@ -3142,6 +3142,7 @@ public:
       return false;
     }
 
+    prodigyTraceContainerStage("neuron-netkit-created", plan.config.deploymentID(), plan.uuid);
     auto& host = netdevs.host;
     auto& peer = netdevs.peer;
 
@@ -3241,6 +3242,7 @@ public:
     }
 
     // add us to host map
+    prodigyTraceContainerStage("neuron-netkit-routes-prepared", plan.config.deploymentID(), plan.uuid);
     if (thisNeuron->ensureHostNetworkingReady(failureReport) == false)
     {
       if (peernetnsfd >= 0)
@@ -3287,6 +3289,7 @@ public:
       }
       return false;
     }
+    prodigyTraceContainerStage("neuron-host-router-ready", plan.config.deploymentID(), plan.uuid);
     peer_program = host.attachBPF(prodigyContainerEgressNetkitAttachType(), path, "ct_egress"_ctv,
                                   [&](struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
                                     switchboardConfigureDevelopmentWhiteholeMapAllocation(obj);
@@ -3319,6 +3322,7 @@ public:
       return false;
     }
 
+    prodigyTraceContainerStage("neuron-egress-attached", plan.config.deploymentID(), plan.uuid);
     peer_program->setArrayElement("lc_subnet"_ctv, 0, thisNeuron->lcsubnet6);
     peer_program->setArrayElement("mac_map"_ctv, 0, thisNeuron->eth.mac);
     peer_program->setArrayElement("gw_mac_map"_ctv, 0, thisNeuron->eth.gateway_mac);
@@ -3391,6 +3395,7 @@ public:
       }
       return false;
     }
+    prodigyTraceContainerStage("neuron-ingress-attached", plan.config.deploymentID(), plan.uuid);
     primary_program->setArrayElement("lc_subnet"_ctv, 0, thisNeuron->lcsubnet6);
     if (syncSystemIngressAllowlist(failureReport) == false)
     {
@@ -12416,6 +12421,7 @@ public:
         co_return false;
       }
     }
+    prodigyTraceContainerStage("neuron-storage-prepared", plan.config.deploymentID(), plan.uuid);
     co_return true;
   }
 
@@ -14216,6 +14222,7 @@ public:
     }
     else // host, clone doesn't return until child calls exec
     {
+      prodigyTraceContainerStage("neuron-process-cloned", container->plan.config.deploymentID(), container->plan.uuid);
       seccomp_release(containerSeccomp);
       close(startupSync[0]);
       if (socs[1] >= 0)
@@ -14268,6 +14275,7 @@ public:
         return false;
       }
 
+      prodigyTraceContainerStage("neuron-identity-prepared", container->plan.config.deploymentID(), container->plan.uuid);
       if (exposeNeuronSocket)
       {
         container->setUnixPairHalf(socs[0]);
@@ -14343,6 +14351,7 @@ public:
         }
       }
 
+      prodigyTraceContainerStage("neuron-network-prepared", container->plan.config.deploymentID(), container->plan.uuid);
       thisNeuron->pushContainer(container);
       if (container->plan.system.kind == SystemContainerKind::crossClusterMasqueGateway &&
           !container->gatewayReadinessListenerReady)
