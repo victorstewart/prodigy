@@ -6,14 +6,14 @@ add_executable(hello_prodigy_v2 hello_prodigy.cpp)
 foreach(_hello_prodigy_target IN ITEMS hello_prodigy_v1 hello_prodigy_v2)
    target_include_directories(${_hello_prodigy_target} PRIVATE "${PRODIGY_ROOT}")
    depos_link(${_hello_prodigy_target} PRIVATE ${PRODIGY_COMMON_DEPO_TARGETS} pthread)
-   target_link_options(${_hello_prodigy_target} PRIVATE -static)
-   target_compile_options(${_hello_prodigy_target} PRIVATE -O2)
+   target_link_options(${_hello_prodigy_target} PRIVATE -static "LINKER:--gc-sections")
+   target_compile_options(${_hello_prodigy_target} PRIVATE -O2 -ffunction-sections -fdata-sections)
 endforeach()
 target_compile_definitions(hello_prodigy_v1 PRIVATE HELLO_PRODIGY_VERSION="v1")
 target_compile_definitions(hello_prodigy_v2 PRIVATE HELLO_PRODIGY_VERSION="v2")
 
 function(_hello_prodigy_artifact version)
-   set(HELLO_PRODIGY_BINARY "hello_prodigy_${version}")
+   set(HELLO_PRODIGY_BINARY "hello_prodigy_${version}.stripped")
    set(_recipe "${HELLO_PRODIGY_ASSETS_DIR}/hello-prodigy-${version}.DiscombobuFile")
    set(_artifact "${HELLO_PRODIGY_ASSETS_DIR}/hello-prodigy-${version}.${PRODIGY_RESOLVED_TARGET_ARCH}.container.zst")
    set(_plan_source "${CMAKE_CURRENT_SOURCE_DIR}/hello-prodigy-${version}.deployment.plan.v1.json")
@@ -22,12 +22,16 @@ function(_hello_prodigy_artifact version)
    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/HelloProdigy.DiscombobuFile.in" "${_recipe}" @ONLY)
    add_custom_command(
       OUTPUT "${_artifact}"
+      BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/${HELLO_PRODIGY_BINARY}"
+      COMMAND "${CMAKE_STRIP}" --strip-unneeded
+              -o "${CMAKE_CURRENT_BINARY_DIR}/${HELLO_PRODIGY_BINARY}"
+              "$<TARGET_FILE:hello_prodigy_${version}>"
       COMMAND "${CMAKE_COMMAND}" -E env
               CARGO_TARGET_DIR=${DISCOMBOBULATOR_CARGO_TARGET_DIR}
               cargo run --quiet --manifest-path "${DISCOMBOBULATOR_MANIFEST}" --
               build
               --file "${_recipe}"
-              --context "bin=$<TARGET_FILE_DIR:hello_prodigy_${version}>"
+              --context "bin=${CMAKE_CURRENT_BINARY_DIR}"
               --output "${_artifact}"
               --kind app
       DEPENDS hello_prodigy_${version}
