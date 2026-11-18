@@ -83,7 +83,8 @@ foreach(contract IN ITEMS
    [["$ENV{DEPOS_ROOT}"]]
    "\${PRODIGY_DEPOFILES_DIR}/masque-tunnel.DepoFile"
    "file(STRINGS \"\${DEPOS_MANIFEST_FILE}\" _prodigy_masque_tunnel_manifest_lines"
-   "masque_tunnel VERSION [^ )]+\${_prodigy_masque_tunnel_manifest_namespace_suffix}"
+   [=[REGEX "^depos_require\\(masque_tunnel( VERSION [^ )]+${_prodigy_masque_tunnel_manifest_namespace_suffix}|${_prodigy_masque_tunnel_manifest_namespace_suffix} VERSION [^ )]+)\\)$"]=]
+   "if (NOT _prodigy_masque_tunnel_manifest_count EQUAL 1)"
    "_prodigy_masque_tunnel_materialized_version"
    "expected \${_prodigy_masque_tunnel_version} from \${_prodigy_masque_tunnel_depofile}"
    "\${_prodigy_masque_tunnel_version}/bin/masque-tunnel"
@@ -126,9 +127,14 @@ if (DEFINED PRODIGY_DEPOS_MANIFEST_FILE)
          " NAMESPACE ${PRODIGY_DEPOS_MANIFEST_VISIBLE_NAMESPACE}")
    endif()
    file(STRINGS "${PRODIGY_DEPOS_MANIFEST_FILE}" materialized_masque_tunnel_lines
-      REGEX "^depos_require\\(masque_tunnel VERSION ${PRODIGY_MASQUE_TUNNEL_VERSION}${materialized_masque_tunnel_namespace_suffix}\\)$")
+      REGEX "^depos_require\\(masque_tunnel( VERSION [^ )]+${materialized_masque_tunnel_namespace_suffix}|${materialized_masque_tunnel_namespace_suffix} VERSION [^ )]+)\\)$")
    list(LENGTH materialized_masque_tunnel_lines materialized_masque_tunnel_count)
    if (NOT materialized_masque_tunnel_count EQUAL 1)
       message(FATAL_ERROR "Generated Depos manifest must contain exactly one current masque_tunnel request for the configured namespace and version.")
+   endif()
+   list(GET materialized_masque_tunnel_lines 0 materialized_masque_tunnel_line)
+   string(REGEX MATCH " VERSION ([^ )]+)" version_token "${materialized_masque_tunnel_line}")
+   if (NOT CMAKE_MATCH_1 STREQUAL PRODIGY_MASQUE_TUNNEL_VERSION)
+      message(FATAL_ERROR "Generated Depos manifest has masque_tunnel ${CMAKE_MATCH_1}, expected ${PRODIGY_MASQUE_TUNNEL_VERSION}.")
    endif()
 endif()
