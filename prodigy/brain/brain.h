@@ -13076,16 +13076,20 @@ public:
   bool isVolatileStatelessPlannerReservation(const BrainReplicatedContainerRuntimeState& state) const
   {
     const uint64_t deploymentID = state.plan.config.deploymentID();
-    const auto authoritative = deploymentPlans.find(deploymentID);
+    // Election materializes an accepted plan into deployments before it clears
+    // deploymentPlans. Resolve through the established canonical owner order;
+    // a pending legacy row must not become non-volatile merely because that
+    // deferred cache was drained.
+    const DeploymentPlan *authoritative = prodigyWormholeDeploymentPlan(*this, deploymentID);
     return state.plan.uuid != 0 && state.machineUUID != 0 &&
            isStatelessPlannerReservationShape(state) &&
            state.plan.system.kind == SystemContainerKind::none &&
            !state.plan.useHostNetworkNamespace &&
-           authoritative != deploymentPlans.end() && !authoritative->second.isStateful &&
-           authoritative->second.config.applicationID == state.plan.config.applicationID &&
-           authoritative->second.config.versionID == state.plan.config.versionID &&
-           authoritative->second.config.containerBlobSHA256.equals(state.plan.config.containerBlobSHA256) &&
-           authoritative->second.config.containerBlobBytes == state.plan.config.containerBlobBytes;
+           authoritative != nullptr && authoritative->config.deploymentID() == deploymentID && !authoritative->isStateful &&
+           authoritative->config.applicationID == state.plan.config.applicationID &&
+           authoritative->config.versionID == state.plan.config.versionID &&
+           authoritative->config.containerBlobSHA256.equals(state.plan.config.containerBlobSHA256) &&
+           authoritative->config.containerBlobBytes == state.plan.config.containerBlobBytes;
   }
 
   bool volatileStatelessPlannerReservationInventoryCurrent(
@@ -13117,18 +13121,19 @@ public:
     if (observedOwners == 0) return !containers.contains(state.plan.uuid);
     const auto actual = containers.find(state.plan.uuid);
     const auto owner = deployments.find(state.plan.config.deploymentID());
-    const auto authoritative = deploymentPlans.find(state.plan.config.deploymentID());
+    const DeploymentPlan *authoritative = prodigyWormholeDeploymentPlan(*this, state.plan.config.deploymentID());
     return observedOwners == 1 && actual != containers.end() && actual->second != nullptr && actual->second->machine != nullptr &&
            actual->second->uuid == state.plan.uuid && !actual->second->isStateful &&
            actual->second->state != ContainerState::planned &&
            actual->second->machine->uuid == state.machineUUID &&
            actual->second->deploymentID == state.plan.config.deploymentID() && actual->second->fragment != 0 &&
            owner != deployments.end() && owner->second != nullptr && !owner->second->plan.isStateful &&
-           authoritative != deploymentPlans.end() && !authoritative->second.isStateful &&
-           owner->second->plan.config.applicationID == authoritative->second.config.applicationID &&
-           owner->second->plan.config.versionID == authoritative->second.config.versionID &&
-           owner->second->plan.config.containerBlobSHA256.equals(authoritative->second.config.containerBlobSHA256) &&
-           owner->second->plan.config.containerBlobBytes == authoritative->second.config.containerBlobBytes &&
+           authoritative != nullptr && authoritative->config.deploymentID() == state.plan.config.deploymentID() &&
+           !authoritative->isStateful &&
+           owner->second->plan.config.applicationID == authoritative->config.applicationID &&
+           owner->second->plan.config.versionID == authoritative->config.versionID &&
+           owner->second->plan.config.containerBlobSHA256.equals(authoritative->config.containerBlobSHA256) &&
+           owner->second->plan.config.containerBlobBytes == authoritative->config.containerBlobBytes &&
            owner->second->containers.contains(actual->second) &&
            actual->second->machine->containersByDeploymentID.contains(actual->second->deploymentID) &&
            actual->second->machine->containersByDeploymentID.find(actual->second->deploymentID)->second.contains(actual->second);

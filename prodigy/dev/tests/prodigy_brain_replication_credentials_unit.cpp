@@ -46229,6 +46229,21 @@ static void testLegacyCoordinatorMigration(TestSuite& suite)
   absentReservation.plan.fragment = 0;
   absentReservation.plan.runtimeReady = false;
   absentReservation.machineUUID = machines[3].uuid;
+  // Materialized deployments are canonical once election drains the deferred
+  // map. Keep the volatile-row checks strict against that owner, including a
+  // mismatched active digest/size, rather than relying on deploymentPlans.
+  brain.deploymentPlans.erase(deployment.plan.config.deploymentID());
+  suite.require(brain.deploymentPlans.empty() &&
+                    prodigyWormholeDeploymentPlan(brain, deployment.plan.config.deploymentID()) == &deployment.plan,
+                "legacy_coordinator_migration_materialized_plan_is_canonical_after_deferred_drain");
+  const DeploymentPlan canonicalDeploymentPlan = deployment.plan;
+  ++deployment.plan.config.containerBlobBytes;
+  brain.pendingReplicatedContainerRuntimeStates[deployment.plan.config.deploymentID()].push_back(absentReservation);
+  brain.resumeStatefulTopologyRetirements();
+  suite.expect(!brain.pendingReplicatedContainerRuntimeStates.empty(),
+               "legacy_coordinator_migration_materialized_plan_mismatch_keeps_reservation_pending");
+  brain.pendingReplicatedContainerRuntimeStates.clear();
+  deployment.plan = canonicalDeploymentPlan;
   auto malformedReservation = absentReservation;
   malformedReservation.machineUUID = 0;
   brain.pendingReplicatedContainerRuntimeStates[deployment.plan.config.deploymentID()].push_back(
@@ -46260,6 +46275,7 @@ static void testLegacyCoordinatorMigration(TestSuite& suite)
                     brain.containers.contains(containers[1].uuid) && brain.containers.contains(containers[2].uuid) &&
                     brain.containers.contains(containers[3].uuid),
                 "legacy_coordinator_migration_heartbeat_redrives_proven_absent_reservation_only");
+  brain.deploymentPlans.insert_or_assign(deployment.plan.config.deploymentID(), deployment.plan);
 
   Mothership mothership = {};
   mothership.isFixedFile = true;
