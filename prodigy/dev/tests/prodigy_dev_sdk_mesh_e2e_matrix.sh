@@ -901,7 +901,7 @@ deploy_plan_to_cluster()
    for _ in $(seq 1 120)
    do
       if env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
-         timeout "${mothership_deploy_timeout}" "${MOTHERSHIP_BIN}" deploy "${cluster_name}" "$(cat "${plan_json}")" "${container_blob}" \
+         timeout "${mothership_deploy_timeout}" "${MOTHERSHIP_BIN}" deploy "${cluster_name}" "$(cat "${plan_json}")" "${container_blob}" --submit-only \
          >"${deploy_log}" 2>&1
       then
          deployed=1
@@ -1175,8 +1175,8 @@ EOF
 
       reserve_plan_resources "${cluster_name}" "${mothership_db_path}" "${resolved_advertiser_plan}" "${resolved_subscriber_plan}" "${language}"
       deploy_plan_to_cluster "${cluster_name}" "${mothership_db_path}" "${resolved_advertiser_plan}" "${blob}" "${deploy_advertiser_log}"
-      wait_for_application_healthy "${cluster_name}" "${mothership_db_path}" "${advertiser_app}" "${advertiser_report_log}"
       deploy_plan_to_cluster "${cluster_name}" "${mothership_db_path}" "${resolved_subscriber_plan}" "${blob}" "${deploy_subscriber_log}"
+      wait_for_application_healthy "${cluster_name}" "${mothership_db_path}" "${advertiser_app}" "${advertiser_report_log}"
       wait_for_application_healthy "${cluster_name}" "${mothership_db_path}" "${subscriber_app}" "${subscriber_report_log}"
 
       if ! env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \

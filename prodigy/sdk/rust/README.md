@@ -32,7 +32,7 @@ Recommended example order:
 - [`examples/aegis_roundtrip.rs`](./examples/aegis_roundtrip.rs)
   Current transport-neutral Aegis quickstart. It starts from a `SubscriptionPairing`, builds TFO bytes, encrypts one frame, and decrypts it on the peer side.
 - [`examples/mesh_pingpong.rs`](./examples/mesh_pingpong.rs)
-  Current control-plane reference example using startup pairings, live updates, explicit ACKs, and ready signaling. This example expects Prodigy runtime startup state or a deployment-plan-driven bring-up.
+  The advertiser calls `runtime_ready().await?` after binding its listener. The subscriber calls it before waiting for a pairing, then calls `ready().await?` after three successful exchanges. Once the application and service IDs are reserved, submit both deployment plans with `mothership deploy ... --submit-only` and check both applications with `applicationReport`. The subscriber can initialize while the advertiser starts.
 - [`examples/opinionated_aegis_roundtrip.rs`](./examples/opinionated_aegis_roundtrip.rs)
   Higher-level paired-service example using `PairingBook` and `AegisStream`.
 
