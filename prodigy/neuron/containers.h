@@ -13386,6 +13386,45 @@ public:
     return applyContainerResourceTargets(container, targetCores, targetMemoryMB, targetStorageMB, failureReport);
   }
 
+  // A state upload recovers the leaf fd of a surviving workload. On its
+  // next launch, recover the same sibling cgroups a fresh launch provisions.
+  static bool ensureIsolatedChildCgroupDescriptors(Container *container, String *failureReport)
+  {
+    const auto& config = container->plan.config;
+    if (config.isolatedChildMemoryMB == 0) return container->isolatedChildCgroups.empty();
+    if (config.maxPids < 2 || config.maxPids - 1 > prodigyContainerRuntimeLimits.maxIsolatedChildCgroups)
+    {
+      if (failureReport) failureReport->assign("invalid isolated-child cgroup bounds"_ctv);
+      return false;
+    }
+    const uint32_t expected = config.maxPids - 1;
+    if (container->isolatedChildCgroups.size() == expected) return true;
+    if (!container->isolatedChildCgroups.empty())
+    {
+      if (failureReport) failureReport->assign("incomplete isolated-child cgroup descriptor set"_ctv);
+      return false;
+    }
+
+    Vector<int> recovered;
+    recovered.reserve(expected);
+    for (uint32_t index = 0; index < expected; ++index)
+    {
+      String sibling;
+      sibling.snprintf<"../isolated.{itoa}"_ctv>(index);
+      const int fd = openat(container->cgroup, sibling.c_str(), O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+      if (fd < 0)
+      {
+        if (failureReport) failureReport->snprintf<"failed to reopen isolated-child cgroup {itoa}: {}"_ctv>(
+            index, String(strerror(errno)));
+        for (int acquired : recovered) close(acquired);
+        return false;
+      }
+      recovered.push_back(fd);
+    }
+    container->isolatedChildCgroups = std::move(recovered);
+    return true;
+  }
+
   static bool startContainer(Container *container, bool isRestart = false, String *failureReport = nullptr)
   {
     if (container == nullptr)
@@ -13418,6 +13457,7 @@ public:
       }
       return false;
     }
+    if (!ensureIsolatedChildCgroupDescriptors(container, failureReport)) return false;
     ensureSigchldIsWaitable();
 
     if (prepareContainerArtifactParent(failureReport) == false)
