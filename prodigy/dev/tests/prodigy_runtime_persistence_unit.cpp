@@ -1656,6 +1656,7 @@ static void testLocalBundleRecoveryDefersCheckpointUntilArtifactLeaseReleases(Te
 
 static void testAuthenticatedStateUploadInventoryDiagnostics(TestSuite& suite)
 {
+  PersistenceRing ring;
   ProdigyHostControlNetwork network;
   ProdigyBrain brain(network, {});
   brain.weAreMaster = true;
