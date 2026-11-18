@@ -1297,40 +1297,27 @@ static inline bool prodigyAdoptProbedMachinePeerAddressesIfUnspecified(ClusterMa
   return true;
 }
 
-static inline void prodigyResolveLocalBundleReportDigests(
-    const String& localExecutablePath,
-    const String& stagedBundlePath,
-    String& localInstalledBundleSHA256,
-    String& stagedBundleSHA256)
-{
-  localInstalledBundleSHA256.clear();
-  stagedBundleSHA256.clear();
-
-  (void)prodigyResolveInstalledBundleDigestForExecutable(localExecutablePath, localInstalledBundleSHA256);
-
-  if (prodigyFileReadable(stagedBundlePath))
-  {
-    String digestFailure = {};
-    (void)prodigyComputeFileSHA256Hex(stagedBundlePath, stagedBundleSHA256, &digestFailure);
-  }
-}
-
 static inline void prodigyAssignMachineBundleReportDigests(
     MachineStatusReport& report,
     bool isThisMachine,
     const char *updateStage,
-    const String& localInstalledBundleSHA256,
-    const String& stagedBundleSHA256,
+    const String& localExecutablePath,
+    const String& stagedBundlePath,
     const NeuronView *neuron = nullptr,
     bool controlStreamActive = false,
     uint64_t authorityEpoch = 0)
 {
   if (isThisMachine)
   {
-    report.approvedBundleSHA256.assign(localInstalledBundleSHA256);
-    if (strcmp(updateStage, "idle") != 0 && stagedBundleSHA256.size() > 0)
+    report.approvedBundleSHA256.clear();
+    report.stagedBundleSHA256.clear();
+    (void)prodigyResolveInstalledBundleDigestForExecutable(
+        localExecutablePath, report.approvedBundleSHA256);
+    if (strcmp(updateStage, "idle") != 0 && prodigyFileReadable(stagedBundlePath))
     {
-      report.stagedBundleSHA256.assign(stagedBundleSHA256);
+      String digestFailure = {};
+      (void)prodigyComputeFileSHA256Hex(
+          stagedBundlePath, report.stagedBundleSHA256, &digestFailure);
     }
     return;
   }
@@ -51553,15 +51540,9 @@ public:
             return "idle";
           };
 
-          String localInstalledBundleSHA256 = {};
-          String stagedBundleSHA256 = {};
           String localExecutablePath = {};
           (void)prodigyResolveCurrentExecutablePath(localExecutablePath);
-          prodigyResolveLocalBundleReportDigests(
-              localExecutablePath,
-              prodigyStagedBundlePath(),
-              localInstalledBundleSHA256,
-              stagedBundleSHA256);
+          const String stagedBundlePath = prodigyStagedBundlePath();
 
           for (Machine *machine : machines)
           {
@@ -51716,7 +51697,7 @@ public:
             const char *updateStage = resolveMachineUpdateStage(machine);
             mreport.updateStage.assign(updateStage);
             prodigyAssignMachineBundleReportDigests(
-                mreport, machine->isThisMachine, updateStage, localInstalledBundleSHA256, stagedBundleSHA256,
+                mreport, machine->isThisMachine, updateStage, localExecutablePath, stagedBundlePath,
                 &machine->neuron, mreport.controlPlaneReachable, masterAuthorityEpoch);
             mreport.hardware = machine->hardware;
           }

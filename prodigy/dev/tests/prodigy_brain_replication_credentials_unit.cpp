@@ -10726,18 +10726,13 @@ static void testClusterReportUsesCurrentInstallAndLocalUpdateAuthority(TestSuite
   suite.require(prodigyComputeSHA256Hex(stagedBundle, expectedStagedDigest, &digestFailure),
                 "cluster_report_computes_staged_bundle_digest");
 
-  String localDigest = {};
-  String stagedDigest = {};
-  prodigyResolveLocalBundleReportDigests(
-      fixtureExecutable, fixtureStagedPath, localDigest, stagedDigest);
-  suite.expect(localDigest.equal(expectedCurrentDigest) && stagedDigest.equal(expectedStagedDigest),
-               "cluster_report_resolves_private_current_and_staged_bundle_digests");
-
   String missingExecutable = fixtureRoot;
   missingExecutable.append("/missing/prodigy"_ctv);
-  prodigyResolveLocalBundleReportDigests(
-      missingExecutable, fixtureStagedPath, localDigest, stagedDigest);
-  suite.expect(localDigest.size() == 0 && stagedDigest.equal(expectedStagedDigest),
+  MachineStatusReport missingInstallReport = {};
+  prodigyAssignMachineBundleReportDigests(
+      missingInstallReport, true, "waitingForBundle", missingExecutable, fixtureStagedPath);
+  suite.expect(missingInstallReport.approvedBundleSHA256.size() == 0 &&
+                   missingInstallReport.stagedBundleSHA256.equal(expectedStagedDigest),
                "cluster_report_missing_current_install_bundle_has_no_fallback");
 
   MachineStatusReport localActive = {};
@@ -10769,31 +10764,31 @@ static void testClusterReportUsesCurrentInstallAndLocalUpdateAuthority(TestSuite
           prodigyNeuronArtifactCapabilityValidationMatches(&follower, follower.ioGeneration, latestCapabilityValidation),
       "cluster_report_repeated_registration_rejects_stale_capability_completion");
   prodigyAssignMachineBundleReportDigests(
-      localActive, true, "waitingForBundle", expectedCurrentDigest, expectedStagedDigest);
+      localActive, true, "waitingForBundle", fixtureExecutable, fixtureStagedPath);
   prodigyAssignMachineBundleReportDigests(
-      verifiedFollower, false, "idle", "master-has-changed-bundle"_ctv, expectedStagedDigest,
+      verifiedFollower, false, "idle", fixtureExecutable, fixtureStagedPath,
       &follower, true, 17);
   prodigyAssignMachineBundleReportDigests(
-      mixedBundleFollower, false, "idle", expectedCurrentDigest, expectedStagedDigest,
+      mixedBundleFollower, false, "idle", fixtureExecutable, fixtureStagedPath,
       &mixedBundleNeuron, true, 17);
   prodigyAssignMachineBundleReportDigests(
-      disconnectedFollower, false, "idle", expectedCurrentDigest, expectedStagedDigest,
+      disconnectedFollower, false, "idle", fixtureExecutable, fixtureStagedPath,
       &follower, false, 17);
   follower.ioGeneration += 1;
   prodigyAssignMachineBundleReportDigests(
-      staleFollower, false, "idle", expectedCurrentDigest, expectedStagedDigest,
+      staleFollower, false, "idle", fixtureExecutable, fixtureStagedPath,
       &follower, true, 17);
   follower.ioGeneration -= 1;
   prodigyAssignMachineBundleReportDigests(
-      staleAuthorityFollower, false, "idle", expectedCurrentDigest, expectedStagedDigest,
+      staleAuthorityFollower, false, "idle", fixtureExecutable, fixtureStagedPath,
       &follower, true, 18);
   follower.artifactCapabilityPending = true;
   prodigyAssignMachineBundleReportDigests(
-      pendingFollower, false, "idle", expectedCurrentDigest, expectedStagedDigest,
+      pendingFollower, false, "idle", fixtureExecutable, fixtureStagedPath,
       &follower, true, 17);
   follower.artifactCapabilityPending = false;
   prodigyAssignMachineBundleReportDigests(
-      localIdle, true, "idle", expectedCurrentDigest, expectedStagedDigest);
+      localIdle, true, "idle", fixtureExecutable, fixtureStagedPath);
   suite.expect(
       localActive.approvedBundleSHA256.equal(expectedCurrentDigest) &&
           localActive.stagedBundleSHA256.equal(expectedStagedDigest) &&
@@ -10892,7 +10887,7 @@ static void testClusterReportUsesCurrentInstallAndLocalUpdateAuthority(TestSuite
                  "cluster_report_epoch_change_retries_mixed_bundle_attestation_under_current_authority");
     MachineStatusReport mixedBundleReport = {};
     prodigyAssignMachineBundleReportDigests(
-        mixedBundleReport, false, "idle", expectedCurrentDigest, expectedStagedDigest,
+        mixedBundleReport, false, "idle", fixtureExecutable, fixtureStagedPath,
         &neuron, true, promotionBrain.masterAuthorityEpoch);
     suite.expect(
         neuron.artifactChunksEnabled == false &&
