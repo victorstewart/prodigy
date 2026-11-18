@@ -15917,6 +15917,42 @@ REMOTE_RUNTIME
                unsigned(index), successorSHA.c_str());
   }
 
+  void runRepairTestClusterStorageMounts(int argc, char *argv[])
+  {
+    if (argc != 4 || (std::strcmp(argv[2], "--check") != 0 && std::strcmp(argv[2], "--apply") != 0) || !argv[3][0])
+    {
+      basics_log("repairTestClusterStorageMounts success=0 failure=usage: repairTestClusterStorageMounts CLUSTER MACHINE_INDEX --check|--apply CSV_CONTAINER_UUIDS\n");
+      exit(EXIT_FAILURE);
+    }
+
+    MothershipProdigyCluster cluster = {};
+    String failure = {};
+    uint64_t index = 0;
+    if (!loadClusterForScopedMutation("repairTestClusterStorageMounts", argv[0], cluster, failure) ||
+        cluster.deploymentMode != MothershipClusterDeploymentMode::test ||
+        !mothershipParseUnsignedArgument(argv[1], cluster.test.machineCount, index) || index == 0)
+    {
+      basics_log("repairTestClusterStorageMounts success=0 failure=%s\n",
+                 failure.empty() ? "expected a registered test machine" : failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    Vector<String> arguments = {};
+    arguments.emplace_back("--recover-storage-mounts"_ctv);
+    arguments.push_back(cluster.test.workspaceRoot);
+    arguments.emplace_back();
+    arguments.back().assignItoa(index);
+    arguments.emplace_back(argv[2]);
+    arguments.emplace_back(argv[3]);
+    if (!mothershipRunVirtualDatacenterProvider(std::move(arguments), &failure))
+    {
+      basics_log("repairTestClusterStorageMounts success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    basics_log("repairTestClusterStorageMounts success=1 machineIndex=%llu mode=%s\n",
+               (unsigned long long)index, argv[2]);
+  }
+
   // This is deliberately a disposable, exact-runtime19b fixture operation.
   // It does not admit a production rollout, attest application health or prove
   // an authority quorum after the retained process is replaced.
@@ -39135,6 +39171,7 @@ public:
         {"removeProviderCredential",        &Mothership::runRemoveProviderCredential       },
         {"repairLocalBundleRecoveryWitness", &Mothership::runRepairLocalBundleRecoveryWitness},
         {"repairRemoteCloudMachineRuntime", &Mothership::runRepairRemoteCloudMachineRuntime},
+        {"repairTestClusterStorageMounts",  &Mothership::runRepairTestClusterStorageMounts },
         {"repairTestClusterTransport",      &Mothership::runRepairTestClusterTransport     },
         {"reserveApplicationID",            &Mothership::runReserveApplicationID           },
         {"reserveServiceID",                &Mothership::runReserveServiceID               },
@@ -39215,7 +39252,7 @@ int main(int argc, char *argv[])
   if (argc < 2)
   {
     constexpr static char usage[] =
-        "must be called like: ./mothership [operation: help, bootstrapNametagAllMasters, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, repairLocalBundleRecoveryWitness, repairRemoteCloudMachineRuntime, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, checkClusterProviderPlan, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultClusterNetwork, faultLocalClusterMachine, faultRemoteCloudMachine, faultTestCluster, faultTestClusters, prepareProductionPair, productionPair, launchLocalVM, removeLocalVM, registerLocalVMBoundary, inspectLocalVMBoundaries, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, rearmRetainedStatefulDeployment, recoverLocalClusterAuthority, recoverMaterializedStatefulDeployment, recoverTestClusterBundle, recoverTestClusterFollowerBrain, taskReport, containerLogs, credentialExpiryNotifications, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, authorizeBGPOriginPrefix, revokeBGPOriginPrefix, listBGPOriginPrefixes, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
+        "must be called like: ./mothership [operation: help, bootstrapNametagAllMasters, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, repairLocalBundleRecoveryWitness, repairRemoteCloudMachineRuntime, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, checkClusterProviderPlan, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultClusterNetwork, faultLocalClusterMachine, faultRemoteCloudMachine, faultTestCluster, faultTestClusters, prepareProductionPair, productionPair, launchLocalVM, removeLocalVM, registerLocalVMBoundary, inspectLocalVMBoundaries, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, rearmRetainedStatefulDeployment, recoverLocalClusterAuthority, recoverMaterializedStatefulDeployment, recoverTestClusterBundle, repairTestClusterStorageMounts, recoverTestClusterFollowerBrain, taskReport, containerLogs, credentialExpiryNotifications, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, authorizeBGPOriginPrefix, revokeBGPOriginPrefix, listBGPOriginPrefixes, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
     std::fwrite(usage, 1, sizeof(usage) - 1, stdout);
     exit(EXIT_FAILURE);
   }
@@ -39281,6 +39318,8 @@ int main(int argc, char *argv[])
     message.append("migrateTidesDB9To10 [private versioned plan JSON path] [optional rollback before activation]\n");
     message.append("recoverTestClusterBundle [name|clusterUUID] [approved bundle] [machineIndex] [expected installed bundle SHA256] [optional expected incomplete worker bundle SHA256 for sole Brain]\n");
     message.append("\tadopts an exact retained test-provider owner and replaces one worker while preserving descendant cgroups; application health must be observed separately\n");
+    message.append("repairTestClusterStorageMounts CLUSTER MACHINE_INDEX --check|--apply CSV_CONTAINER_UUIDS\n");
+    message.append("\tverifies the selected Btrfs storage mounts on a replacement test machine and, with --apply, reattaches missing mounts to their original volumes\n");
     message.append("recoverTestClusterFollowerBrain [name|clusterUUID] [approved target bundle] [machineIndex] [expected installed source bundle SHA256] [optional test fault phase]\n");
     message.append("\ttest-only exact-runtime19b three-Brain follower replacement; optional frozen|rootInstalled|workerReplaced exits 86 after its durable transition, and the retry omits it\n");
     message.append("faultClusterNetwork [operationUUID] [physicalBoundaryUUID] [both|source-to-target|target-to-source] [durationMs]\n");

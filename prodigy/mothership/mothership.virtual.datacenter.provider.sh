@@ -4042,7 +4042,156 @@ fresh_provider_netns_handles()
 adopted_mode=0
 adopted_runtime_identity=""
 adopted_operation_dir=""
+# A replacement test machine has its own private mount namespace. Its applications
+# can still hold the original Btrfs /data subvolumes in their child namespaces.
+recover_storage_mounts()
+{
+   python3 - "$@" <<'PYSTORAGE'
+import ctypes
+import fcntl
+import os
+from pathlib import Path
+import re
+import stat
+import struct
+import sys
+
+def require(condition, message):
+    if not condition:
+        raise SystemExit("retained storage: " + message)
+
+def identity(path):
+    value = os.stat(path)
+    return value.st_dev, value.st_ino
+
+def read_mounts(path):
+    rows = []
+    for line in path.read_text().splitlines():
+        fields = line.split()
+        separator = fields.index("-")
+        rows.append((fields[3], fields[4], fields[5:separator],
+                     fields[separator + 1], fields[separator + 2]))
+    return rows
+
+def cgroup(proc):
+    lines = (proc / "cgroup").read_text().splitlines()
+    return lines[0][3:] if len(lines) == 1 and lines[0].startswith("0::") else ""
+
+def start_tick(proc):
+    return int((proc / "stat").read_text().rsplit(")", 1)[1].split()[19])
+
+require(len(sys.argv) == 5, "expected workspace, machine, mode, and container IDs")
+workspace, index, mode, selection = sys.argv[1:]
+workspace = Path(workspace)
+ids = selection.split(",")
+require(mode in ("--check", "--apply") and index.isdecimal() and int(index) > 0, "invalid mode or machine")
+require(0 < len(ids) <= 255 and len(ids) == len(set(ids)) and
+        all(re.fullmatch(r"[1-9][0-9]{0,38}", x) and int(x) < 1 << 128 for x in ids),
+        "invalid selection")
+require(workspace.is_absolute() and workspace.resolve() == workspace, "invalid workspace")
+lock = open(workspace / "virtual-datacenter.recovery.lock", "rb")
+fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+journal = workspace / "virtual-datacenter.recovery"
+active = (journal / "active").read_text().strip()
+require(re.fullmatch(r"machine[1-9][0-9]*-[0-9a-f]{64}-[0-9a-f]{64}", active), "invalid recovery identity")
+op = journal / active
+require((op / "complete").read_text().strip() == active and
+        (op / "selected-machine").read_text().strip() == index, "no completed replacement for this machine")
+machines = (workspace / "virtual-datacenter.runtime").read_text().splitlines()
+require(int(index) <= len(machines), "unknown machine")
+pid, tick, netns = map(int, (op / "replaced").read_text().split())
+require(str(pid) == machines[int(index)-1], "replacement no longer owns this machine")
+machine = Path("/proc") / str(pid)
+machine_pidfd = os.pidfd_open(pid)
+namespace = os.open(machine / "ns/mnt", os.O_RDONLY)
+root = machine / "root"
+require(start_tick(machine) == tick and (machine / "ns/net").stat().st_ino == netns and
+        identity(machine / "ns/net") != identity("/proc/self/ns/net") and
+        identity(machine / "ns/mnt") != identity("/proc/self/ns/mnt") and
+        identity(root / "mnt/prodigy-vdc-workspace") == identity(workspace), "machine boundary changed")
+group = cgroup(machine)
+require(group.endswith("/machine" + index + "/prodigy-runtime"), "invalid machine cgroup")
+owner = group.rsplit("/", 1)[0]
+wanted = {owner + "/containers.slice/" + value + ".slice/leaf": value for value in ids}
+live = {}
+for proc in Path("/proc").glob("[0-9]*"):
+    try:
+        value = wanted.get(cgroup(proc))
+        if value is None:
+            continue
+        matches = [m for m in read_mounts(proc / "mountinfo") if m[1] == "/storage"]
+        require(len(matches) == 1, "ambiguous application storage for " + value)
+        origin, _, _, filesystem, device = matches[0]
+        require(origin == "/data" and filesystem == "btrfs" and re.fullmatch(r"/dev/loop[0-9]+", device),
+                "unexpected application storage for " + value)
+        payload = identity(proc / "root/storage")
+        if value in live:
+            require(live[value][1:3] == (payload, device), "conflicting application storage for " + value)
+        else:
+            live[value] = (proc, payload, device, os.pidfd_open(int(proc.name)))
+    except (FileNotFoundError, ProcessLookupError):
+        continue
+require(set(live) == set(ids), "selected application is missing")
+
+def matching_mounts(value):
+    dest = "/containers/storage/" + value
+    table = read_mounts(machine / "mountinfo")
+    covering = [m for m in table if m[1] == "/" or dest == m[1] or dest.startswith(m[1] + "/")]
+    require(bool(covering), "target has no containing mount")
+    cover = max(covering, key=lambda m:len(m[1]))
+    require(not any(x.startswith("shared:") for x in cover[2]), "target mount propagates outside machine")
+    return [m for m in table if m[1] == dest]
+
+# Check the whole selection before mounting anything. Pin the existing devices,
+# payload identity, and destination directories. Existing exact mounts are valid
+# on a retry. No volume creation, filesystem formatting, or detach is involved.
+pending = []
+for value in ids:
+    proc, payload, dev, _ = live[value]
+    backing = workspace / ".prodigy/container-storage" / (value + ".btrfs.loop")
+    require(stat.S_ISREG(backing.lstat().st_mode), "unexpected backing file for " + value)
+    device_fd = os.open(dev, os.O_RDONLY | os.O_NOFOLLOW)
+    require(stat.S_ISBLK(os.fstat(device_fd).st_mode), "invalid loop device")
+    info = fcntl.ioctl(device_fd, 0x4c05, bytes(232))   # LOOP_GET_STATUS64
+    backing_dev, backing_ino, _, offset, limit = struct.unpack_from("=5Q", info)
+    require((backing_dev, backing_ino) == identity(backing) and offset == 0 and limit == 0,
+            "loop backing differs for " + value)
+    dest = root / "containers/storage" / value
+    target_fd = os.open(dest, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    mounts = matching_mounts(value)
+    if mounts:
+        require(len(mounts)==1 and mounts[0][0]=="/" and mounts[0][3:]==("btrfs",dev) and
+                identity(dest / "data") == payload, "conflicting existing mount for " + value)
+        continue
+    require(not os.listdir(target_fd), "target would conceal existing content for " + value)
+    pending.append((value, device_fd, target_fd, payload, dev))
+require(start_tick(machine)==tick, "machine changed during inspection")
+print("verified=%d missing=%d mode=%s" % (len(ids), len(pending), mode), flush=True)
+if mode == "--apply" and pending:
+    os.setns(namespace, os.CLONE_NEWNS)
+    libc = ctypes.CDLL(None, use_errno=True)
+    for value, source, target, payload, dev in pending:
+        proc = live[value][0]
+        require(cgroup(proc) in wanted and wanted[cgroup(proc)] == value and identity(proc / "root/storage") == payload and
+                identity(root / "containers/storage" / value) == identity("/proc/self/fd/" + str(target)) and
+                start_tick(machine)==tick and not matching_mounts(value), "storage identity changed before mount")
+        require(os.stat(dev, follow_symlinks=False).st_rdev == os.fstat(source).st_rdev, "loop device changed")
+        # Btrfs retains the source name in mountinfo. Use its stable kernel device
+        # name while the verified descriptor pins this loop's association.
+        source_name = os.fsencode(dev)
+        target_name = os.fsencode("/proc/self/fd/" + str(target))
+        if libc.mount(source_name, target_name, b"btrfs", ctypes.c_ulong(2 | 4), b"subvolid=5") != 0:
+            raise OSError(ctypes.get_errno(), "reattach " + value)
+        dest = root / "containers/storage" / value
+        rows = matching_mounts(value)
+        require(len(rows)==1 and rows[0][0]=="/" and rows[0][3:]==("btrfs",dev) and
+                identity(dest / "data") == payload, "reattached payload identity differs for " + value)
+        print("reattached=" + value, flush=True)
+PYSTORAGE
+}
+
 case "${1:-}" in
+   --recover-storage-mounts) shift; recover_storage_mounts "$@"; exit ;;
    --enter-spare) shift; enter_spare_machine "$@"; exit ;;
    --run-spare) shift; run_spare_machine "$@"; exit ;;
    --pair-launch) shift; pair_launch "$@"; exit ;;
