@@ -29529,6 +29529,7 @@ public:
       if (container->wormholeRuntimePendingMachines.empty() == false ||
           container->wormholeRuntimeFailedMachines.empty() == false)
       {
+        prodigyTraceContainerStage("brain-runtime-ready-waiting-for-wormhole-acks", container->deploymentID, container->uuid);
         container->runtimeReady = false;
         container->wormholeRuntimeFailureSuppressedReady = true;
         replicateContainerRuntimeStateToFollowers(container);
@@ -34822,6 +34823,7 @@ public:
     {
       return;
     }
+    prodigyTraceContainerStage("brain-wormhole-acks-complete", container->deploymentID, container->uuid);
     container->wormholeRuntimeFailureSuppressedReady = false;
     if (auto deployment = deployments.find(container->deploymentID);
         deployment != deployments.end() && deployment->second != nullptr)
