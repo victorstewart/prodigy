@@ -1325,6 +1325,8 @@ public:
           if (result.bootStateDurable) persistentBootState = std::move(*cachedBootState);
           if (result.snapshotDurable && !result.bootStateDurable)
             basics_log("ProdigyBrain candidate snapshot committed but boot-state follow-up failed: %s\n", result.failure.c_str());
+          if (!result.snapshotDurable)
+            std::fprintf(stderr, "ProdigyBrain snapshot persistence failed: %s\n", result.failure.c_str());
           if (*callback) (*callback)(result.snapshotDurable && result.bootStateDurable);
         });
     return admitted ? UpdateSelfPersistenceAdmission::admitted
@@ -1540,78 +1542,39 @@ public:
 
   void persistLocalRuntimeStateAsync(PersistenceCompletion completion = {}) override
   {
-    ProdigyPersistentBrainSnapshot snapshot = buildPersistentBrainSnapshot();
-    prodigyDeriveBrainPeersFromSnapshot(snapshot.brainPeers, snapshot);
-    ProdigyPersistentBootState bootState = buildPersistentBootState(snapshot);
-    const uint64_t retainedBytes = retainedBytesForSnapshot(snapshot, bootState);
-    if (!retainedBytes)
-    {
-      std::fprintf(stderr, "ProdigyBrain snapshot persistence rejected: retained snapshot has zero bytes\n");
-      std::fflush(stderr);
-      if (completion) completion(false);
-      return;
-    }
     if (!ensurePersistentWriter())
     {
       std::fprintf(stderr, "ProdigyBrain snapshot persistence rejected: persistent writer is unavailable\n");
-      std::fflush(stderr);
       if (completion) completion(false);
       return;
     }
-    auto cachedSnapshot = std::make_shared<ProdigyPersistentBrainSnapshot>(std::move(snapshot));
-    auto cachedBootState = std::make_shared<ProdigyPersistentBootState>(std::move(bootState));
-    if (!ProdigyPersistentStateWriter::detach(*cachedSnapshot) ||
-        !ProdigyPersistentStateWriter::detach(*cachedBootState))
+
+    // A full job queue cannot accept even the smallest valid snapshot. Wait
+    // for capacity before collecting the control graph and retained metrics.
+    auto result = UpdateSelfPersistenceAdmission::backpressured;
+    if (persistentWriter->admission(1) != ProdigyArtifactIO::Admission::jobCapacity)
+      result = submitPersistentBrainSnapshotCandidate(buildPersistentBrainSnapshot(), completion);
+    if (result == UpdateSelfPersistenceAdmission::admitted) return;
+
+    if (result == UpdateSelfPersistenceAdmission::rejected)
+      std::fprintf(stderr, "ProdigyBrain snapshot persistence rejected by writer\n");
+    if (completion)
     {
-      std::fprintf(stderr, "ProdigyBrain snapshot persistence rejected: snapshot ownership detach failed\n");
-      std::fflush(stderr);
-      if (completion) completion(false);
+      completion(false);
       return;
     }
-    auto callback = std::make_shared<PersistenceCompletion>(std::move(completion));
-    const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
-    const ProdigyArtifactIO::Admission admission = persistentWriter->admission(retainedBytes);
-    const bool admitted = persistentWriter->submitSnapshot(*cachedSnapshot, *cachedBootState, retainedBytes,
-        [cachedSnapshot, cachedBootState, callback, lifetime](auto&& result) mutable {
-          if (lifetime.expired()) return;
-          if (result.snapshotDurable)
-          {
-            prodigyReplaceCachedBrainSnapshot(persistedBrainSnapshot, std::move(*cachedSnapshot));
-            havePersistedBrainSnapshot = true;
-          }
-          if (result.bootStateDurable) persistentBootState = std::move(*cachedBootState);
-          if (result.snapshotDurable && !result.bootStateDurable)
-            basics_log("ProdigyBrain snapshot committed but boot-state follow-up failed: %s\n", result.failure.c_str());
-          if (!result.snapshotDurable)
-          {
-            std::fprintf(stderr, "ProdigyBrain snapshot persistence failed: %s\n", result.failure.c_str());
-            std::fflush(stderr);
-          }
-          if (*callback) (*callback)(result.snapshotDurable && result.bootStateDurable);
-        });
-    if (!admitted)
+    if (result == UpdateSelfPersistenceAdmission::backpressured &&
+        !ordinaryRuntimeSnapshotBackpressureRetryQueued)
     {
-      std::fprintf(stderr,
-                   "ProdigyBrain snapshot persistence rejected: writer did not admit request admission=%s retainedBytes=%llu\n",
-                   prodigyArtifactIOAdmissionName(admission), static_cast<unsigned long long>(retainedBytes));
-      std::fflush(stderr);
-      if (*callback)
+      ordinaryRuntimeSnapshotBackpressureRetryQueued = true;
+      const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+      if (!deferPersistenceBackpressureContinuation([this, lifetime] {
+            if (lifetime.expired()) return;
+            ordinaryRuntimeSnapshotBackpressureRetryQueued = false;
+            persistLocalRuntimeStateAsync();
+          }))
       {
-        (*callback)(false);
-      }
-      else if ((admission == ProdigyArtifactIO::Admission::jobCapacity ||
-                admission == ProdigyArtifactIO::Admission::byteCapacity) &&
-               !ordinaryRuntimeSnapshotBackpressureRetryQueued)
-      {
-        ordinaryRuntimeSnapshotBackpressureRetryQueued = true;
-        if (!deferPersistenceBackpressureContinuation([this, lifetime] {
-              if (lifetime.expired()) return;
-              ordinaryRuntimeSnapshotBackpressureRetryQueued = false;
-              persistLocalRuntimeStateAsync();
-            }))
-        {
-          ordinaryRuntimeSnapshotBackpressureRetryQueued = false;
-        }
+        ordinaryRuntimeSnapshotBackpressureRetryQueued = false;
       }
     }
   }
