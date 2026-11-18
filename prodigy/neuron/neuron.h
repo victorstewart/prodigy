@@ -573,43 +573,7 @@ protected:
   // reconnecting. The replacement Neuron reopens them after stateUpload.
   bool bundleExecQuiescing = false;
   class WormholeFlowGC final : public TimeoutDispatcher {
-    class PinnedMap {
-    public:
-      uint32_t ifindex = 0;
-
-      template <typename Name, typename Callback>
-      void openMap(Name&& name, Callback&& callback)
-      {
-        String path = {};
-        if (name.equal("wh_flows"_ctv))
-        {
-          switchboardWormholeFlowPinPath(path, ifindex);
-        }
-        else if (name.equal("wh_pending"_ctv))
-        {
-          switchboardWormholePendingFlowPinPath(path, ifindex);
-        }
-        else if (name.equal("wh_pair_grants"_ctv))
-        {
-          switchboardPairAdmissionGrantPinPath(path, ifindex);
-        }
-        else if (name.equal("wh_pair_routes"_ctv))
-        {
-          switchboardPairAdmissionRoutePinPath(path, ifindex);
-        }
-        else
-        {
-          callback(-1);
-          return;
-        }
-        int mapFD = bpf_obj_get(path.c_str());
-        callback(mapFD);
-        if (mapFD >= 0)
-        {
-          ::close(mapFD);
-        }
-      }
-    } map;
+    SwitchboardWormholeFlowGCPinnedMaps map;
 
     TimeoutPacket tick;
     SwitchboardWormholeFlowGCCursor cursor;
@@ -625,9 +589,8 @@ protected:
     }
 
   public:
-    explicit WormholeFlowGC(uint32_t ifindex)
+    explicit WormholeFlowGC(uint32_t ifindex) : map(ifindex)
     {
-      map.ifindex = ifindex;
       arm();
     }
 
@@ -636,6 +599,7 @@ protected:
       if (stopping == false)
       {
         stopping = true;
+        map.reset();
         Ring::queueCancelTimeout(&tick);
       }
     }
@@ -2158,6 +2122,8 @@ protected:
                (unsigned long long)result.hardware.disks.size(),
                (unsigned long long)result.hardware.network.nics.size());
     hardwareProfile = std::move(result.hardware);
+    if (prodigyMachineHardwareInventoryReady(hardwareProfile))
+      prodigyTraceMachineStage("neuron-inventory-ready", uuid);
     serializedHardwareProfile = std::move(result.serializedHardwareProfile);
     resetDeferredHardwareInventoryRetry();
 
@@ -6774,6 +6740,8 @@ public:
         }
       case ContainerTopic::healthy:
         {
+          if (container->plan.state != ContainerState::healthy)
+            prodigyTraceContainerStage("neuron-healthy", container->plan.config.deploymentID(), container->plan.uuid);
           container->plan.state = ContainerState::healthy;
           basics_log("neuron containerHealthy uuid=%llu deploymentID=%llu appID=%u\n",
                      (unsigned long long)container->plan.uuid,
@@ -6878,6 +6846,8 @@ public:
         }
       case ContainerTopic::runtimeReady:
         {
+          if (!container->plan.runtimeReady)
+            prodigyTraceContainerStage("neuron-runtime-ready", container->plan.config.deploymentID(), container->plan.uuid);
           container->plan.runtimeReady = true;
 
           bool controllingBrainActive = (brain != nullptr && streamIsActive(brain));

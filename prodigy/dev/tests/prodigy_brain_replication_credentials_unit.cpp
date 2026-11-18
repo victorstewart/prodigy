@@ -45967,8 +45967,133 @@ static void testAuthorityElectionFrontierRefreshesDurablePeerRevision(TestSuite&
   owner.brains.erase(&peer); thisNeuron = savedNeuron;
 }
 
+static void testInitialControlPlaneBootstrapBarrier(TestSuite& suite)
+{
+  ScopedRing ring = {};
+  struct BootstrapBrain : TestBrain {
+    ClusterTopology roster;
+    bool loadAuthoritativeClusterTopology(ClusterTopology& topology) const override
+    {
+      topology = roster;
+      return true;
+    }
+  } brain;
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
+  brain.brainConfig.datacenterFragment = 7;
+  brain.masterAuthorityRuntimeStateDurable = true;
+  brain.durableMasterAuthorityRuntimeStateGeneration = brain.masterAuthorityRuntimeState.generation;
+
+  Machine first = {};
+  Machine second = {};
+  const auto prepare = [](Machine& machine, uint128_t uuid, uint64_t generation) {
+    machine.uuid = uuid;
+    machine.fragment = machine.reportedFragment = uint32_t(generation);
+    machine.reportedDatacenterFragment = 7;
+    machine.lastUpdatedOSMs = 1;
+    machine.kernel.assign("test-kernel"_ctv);
+    machine.hardware.inventoryComplete = true;
+    machine.hardware.cpu.logicalCores = 1;
+    machine.hardware.memory.totalMB = 1024;
+    machine.neuron.connected = true;
+    machine.neuron.isFixedFile = true;
+    machine.neuron.fslot = int(generation);
+    machine.neuron.ioGeneration = generation;
+  };
+  prepare(first, 0x7101, 17);
+  prepare(second, 0x7102, 19);
+  brain.machines.insert(&first);
+  brain.machines.insert(&second);
+
+  for (Machine *member : {&first, &second})
+  {
+    ClusterMachine configured = {};
+    configured.uuid = member->uuid;
+    brain.roster.machines.push_back(configured);
+    brain.machinesByUUID.insert_or_assign(member->uuid, member);
+    member->neuron.bootstrapRegistrationGeneration = member->neuron.ioGeneration;
+    member->neuron.bootstrapHardwareGeneration = member->neuron.ioGeneration;
+  }
+
+  suite.expect(!brain.initialControlPlaneBootstrapReleaseReady(), "initial_bootstrap_waits_for_election_reconciliation");
+  brain.initialBootstrapMasterEpoch = brain.masterAuthorityEpoch;
+  suite.expect(brain.initialControlPlaneBootstrapReleaseReady(),
+               "initial_bootstrap_release_requires_all_current_registrations_and_hardware");
+
+  brain.tryReleaseInitialControlPlaneBootstrap();
+  suite.expect(brain.initialBootstrapReleaseStarted && !brain.ignited,
+               "initial_bootstrap_requests_current_upload_before_ignition");
+  const auto acceptCurrentInventory = [&brain](Machine& machine) {
+    machine.stateUploadRequestPending = false;
+    machine.runtimeReady = true;
+    brain.containerRetirementInventoryByMachine[machine.uuid].authorityEpoch = brain.masterAuthorityEpoch;
+    brain.persistedMachineInventoryUploaded.insert(machine.uuid);
+    brain.containerRetirementInventoryByMachine[machine.uuid].ioGeneration = machine.neuron.ioGeneration;
+  };
+  acceptCurrentInventory(first);
+  acceptCurrentInventory(second);
+  suite.expect(brain.initialControlPlaneBootstrapRecoveryComplete(),
+               "initial_bootstrap_recovery_requires_all_current_accepted_inventories");
+
+  first.neuron.ioGeneration += 1;
+  suite.expect(!brain.initialControlPlaneBootstrapReleaseReady() &&
+                   !brain.initialControlPlaneBootstrapRecoveryComplete(),
+               "initial_bootstrap_rejects_stale_registration_and_inventory_after_reconnect");
+  first.neuron.ioGeneration -= 1;
+
+  brain.containerRetirementInventoryByMachine[first.uuid].ioGeneration += 1;
+  suite.expect(!brain.initialControlPlaneBootstrapRecoveryComplete(),
+               "initial_bootstrap_rejects_stale_accepted_inventory_generation");
+  brain.containerRetirementInventoryByMachine[first.uuid].ioGeneration = first.neuron.ioGeneration;
+
+  brain.machines.erase(&first);
+  suite.expect(!brain.initialControlPlaneBootstrapReleaseReady(), "initial_bootstrap_rejects_partial_live_catalog");
+  brain.machines.insert(&first);
+
+  Machine absent = {};
+  absent.uuid = 0x7103;
+  brain.machines.insert(&absent);
+  suite.expect(!brain.initialControlPlaneBootstrapReleaseReady(),
+               "initial_bootstrap_rejects_absent_authoritative_roster_member");
+  brain.machines.erase(&absent);
+
+  second.hardware.inventoryComplete = false;
+  suite.expect(!brain.initialControlPlaneBootstrapReleaseReady(),
+               "initial_bootstrap_rejects_incomplete_hardware_inventory");
+  second.hardware.inventoryComplete = true;
+
+  brain.masterAuthorityRuntimeStateDurable = false;
+  suite.expect(!brain.initialControlPlaneBootstrapReleaseReady(),
+               "initial_bootstrap_rejects_undurable_authority_state");
+  brain.masterAuthorityRuntimeStateDurable = true;
+
+  // Exercise the production completion hook, then deliver the retained
+  // fallback timer: the latter must be harmless after event-driven ignition.
+  first.state = MachineState::healthy;
+  second.state = MachineState::healthy;
+  brain.tryIgniteControlPlaneFromCompleteInitialBootstrapRecovery();
+  suite.expect(brain.ignited,
+               "initial_bootstrap_current_inventory_event_ignites_production_path");
+  TimeoutPacket fallback = {};
+  fallback.flags = uint64_t(BrainTimeoutFlags::ignition);
+  fallback.dispatcher = &brain;
+  RingDispatcher::installMultiplexee(&fallback, &brain);
+  brain.timeoutHandler(&fallback, 0);
+  RingDispatcher::eraseMultiplexee(&fallback);
+  suite.expect(brain.ignited,
+               "initial_bootstrap_fallback_timer_is_idempotent_after_event_ignition");
+}
+
 int main(void)
 {
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only &&
+      std::strcmp(only, "initial-bootstrap-barrier") == 0)
+  {
+    TestSuite suite;
+    testInitialControlPlaneBootstrapBarrier(suite);
+    std::printf("INITIAL_BOOTSTRAP_BARRIER_RESULT passed=%d failed=%d\n", suite.passed, suite.failed);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only && std::strcmp(only, "neuron-runtime-metrics") == 0)
   {
     TestSuite suite;
@@ -46180,6 +46305,7 @@ int main(void)
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   TestSuite suite;
+  if (!std::getenv("PRODIGY_TEST_ONLY")) testInitialControlPlaneBootstrapBarrier(suite);
   testMachineInventoryCopyDoesNotCopyTransport(suite);
   testClusterPairEpochOperationCodec(suite);
   testTransportCredentialDerivationSymmetry(suite);

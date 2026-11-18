@@ -558,7 +558,16 @@ public:
 
   void trimOlderThan(int64_t cutoffMs)
   {
-    headIndex = lowerBoundTimestamp(cutoffMs);
+    if (!empty())
+    {
+      // A one-second sweep on a five-second series usually expires zero or one sample.
+      if (timestampAt(headIndex) >= cutoffMs) return;
+      ++headIndex;
+      if (!empty() && timestampAt(headIndex) < cutoffMs)
+      {
+        headIndex = lowerBoundTimestamp(cutoffMs);
+      }
+    }
 
     if (headIndex == tailIndex)
     {

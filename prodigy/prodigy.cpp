@@ -5,6 +5,7 @@
 #include <prodigy/dns.providers.h>
 #include <prodigy/host.control.network.h>
 #include <prodigy/netdev.detect.h>
+#include <prodigy/runtime.trace.h>
 #include <prodigy/persistent.state.h>
 #include <prodigy/persistent.writer.h>
 #include <prodigy/iaas/runtime/runtime.h>
@@ -64,12 +65,6 @@ static const char *prodigyArtifactIOAdmissionName(ProdigyArtifactIO::Admission a
     case ProdigyArtifactIO::Admission::submissionRejected: return "submission-rejected";
   }
   return "unknown";
-}
-
-static bool prodigyRuntimeTraceEnabled(void)
-{
-  const char *value = std::getenv("PRODIGY_RUNTIME_TRACE");
-  return value != nullptr && value[0] == '1' && value[1] == '\0';
 }
 
 template <typename... Args>
@@ -2391,7 +2386,9 @@ int main(int argc, char *argv[])
   setenv("PRODIGY_MOTHERSHIP_SOCKET", effectiveBootstrapConfig.controlSocketPath.c_str(), 1);
 
   Prodigy<ProdigyNeuron, ProdigyBrain, ProdigyHostControlNetwork> prodigy;
+  prodigyTraceMachineStage("runtime-prepare-start", persistentLocalBrainState.uuid);
   prodigy.prepare(argc, argv);
+  prodigyTraceMachineStage("runtime-prepared", persistentLocalBrainState.uuid);
   prodigy.start();
   return EXIT_SUCCESS;
 }

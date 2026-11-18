@@ -40,6 +40,7 @@
 #include <prodigy/build.identity.h>
 #include <prodigy/bundle.artifact.h>
 #include <prodigy/container.contract.h>
+#include <prodigy/runtime.trace.h>
 #include <prodigy/gateway.recovery.record.h>
 #include <prodigy/container.mesh.identity.h>
 #include <prodigy/cousin.session.h>
@@ -12337,6 +12338,7 @@ public:
       container = nullptr;
       co_return false;
     }
+    prodigyTraceContainerStage("neuron-rootfs-prepared", plan.config.deploymentID(), plan.uuid);
 
     if (plan.config.storageMB > 0)
     {
@@ -14437,6 +14439,7 @@ public:
         }
       }
     } pendingLaunch {thisNeuron, plan.uuid, launchAdmissionGeneration};
+    prodigyTraceContainerStage("neuron-launch-admitted", plan.config.deploymentID(), plan.uuid);
 
     bool skipLaunch = false;
     String taskGateFailure = {};
@@ -14522,6 +14525,7 @@ public:
       }
       ContainerRegistry::retain(deploymentID);
     }
+    prodigyTraceContainerStage("neuron-artifact-verified", deploymentID, plan.uuid);
 
     // Verify the intended artifact before stopping any predecessor. A missing
     // or rejected successor must never retire the application's data owner.
@@ -14826,6 +14830,7 @@ public:
       co_return;
     }
 
+    prodigyTraceContainerStage("neuron-process-started", deploymentID, plan.uuid);
     if (thisNeuron != nullptr)
     {
       thisNeuron->noteTaskAttemptRunning(plan);

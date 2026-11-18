@@ -48,6 +48,9 @@ public:
   Machine *machine = nullptr;
   bool connected = false;
   bool hadSuccessfulConnection = false;
+  // Per-connection startup observations. Machine inventory copies start disconnected.
+  uint64_t bootstrapRegistrationGeneration = 0;
+  uint64_t bootstrapHardwareGeneration = 0;
   bool artifactCapabilityPending = false;
   // The peer supplied this only with the registration for ioGeneration. Brain
   // retains a valid digest as an authenticated active-control-stream

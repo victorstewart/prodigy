@@ -1576,6 +1576,14 @@ static __attribute__((noinline)) void testRecoveredStatefulSuccessorTarget(TestS
 
 struct ProdigyDeploymentTargetTestAccess {
   static void calculate(ApplicationDeployment& deployment) { deployment.calculateTargets(); }
+  static bool shardHandoffTimerInitialized(const ApplicationDeployment& deployment)
+  {
+    return deployment.shardTimer.dispatcher != nullptr;
+  }
+  static void cancelShardHandoffTimeout(ApplicationDeployment& deployment)
+  {
+    Ring::queueCancelTimeout(&deployment.shardTimer);
+  }
 };
 
 static void testFreshStatefulFloor(TestSuite& suite)
@@ -4043,6 +4051,60 @@ static void testGlobalSingleWriterPlacementShardInvariant(TestSuite& suite, uint
   thisBrain = savedBrain;
 }
 
+static void testStatefulShardHandoffGraceSafety(TestSuite& suite)
+{
+  ScopedFreshRing ring;
+  TestBrain brain;
+  BrainBase *savedBrain = thisBrain;
+  thisBrain = &brain;
+
+  ApplicationDeployment deployment = {};
+  seedCommonPlan(deployment, true);
+  deployment.plan.config.applicationID = 999;
+  deployment.plan.stateful.cousinPrefix = MeshServices::generateStatefulService(999, 3);
+  deployment.plan.stateful.shardingPrefix = MeshServices::generateStatefulService(999, 5);
+  deployment.nShardGroups = 2;
+  deployment.deployingNewShardGroup = true;
+  ContainerView replicas[3] = {};
+  for (auto& member : replicas)
+  {
+    member.isStateful = true;
+    member.shardGroup = 1;
+    member.state = ContainerState::healthy;
+    member.lifetime = ApplicationLifetime::base;
+    deployment.containersByShardGroup.insert(1, &member);
+  }
+
+  ContainerView older = {};
+  older.isStateful = true;
+  older.shardGroup = 0;
+  older.lifetime = ApplicationLifetime::base;
+  older.state = ContainerState::scheduled;
+  deployment.containerIsHealthy(&older);
+  suite.expect(!ProdigyDeploymentTargetTestAccess::shardHandoffTimerInitialized(deployment),
+               "stateful_shard_handoff_old_group_health_does_not_arm_timer");
+
+  replicas[2].state = ContainerState::crashedRestarting;
+  deployment.containerIsHealthy(&replicas[2]);
+  suite.expect(ProdigyDeploymentTargetTestAccess::shardHandoffTimerInitialized(deployment),
+               "stateful_shard_handoff_target_recovery_arms_timer");
+  ProdigyDeploymentTargetTestAccess::cancelShardHandoffTimeout(deployment);
+
+  TimeoutPacket expiry = {};
+  expiry.flags = uint64_t(DeploymentTimeoutFlags::shardGroupReady);
+  replicas[2].state = ContainerState::crashedRestarting;
+  deployment.dispatchTimeout(&expiry);
+  suite.expect(deployment.deployingNewShardGroup, "stateful_shard_handoff_preserves_data_after_target_crash");
+  deployment.containersByShardGroup.eraseEntry(1, &replicas[2]);
+  deployment.dispatchTimeout(&expiry);
+  suite.expect(deployment.deployingNewShardGroup, "stateful_shard_handoff_requires_complete_replica_count");
+  replicas[2].state = ContainerState::healthy;
+  deployment.containersByShardGroup.insert(1, &replicas[2]);
+  deployment.dispatchTimeout(&expiry);
+  suite.expect(!deployment.deployingNewShardGroup, "stateful_shard_handoff_completes_after_healthy_grace");
+  thisBrain = savedBrain;
+}
+
 int main(void)
 {
   TestSuite suite;
@@ -4185,6 +4247,7 @@ int main(void)
   {
     testStatefulHorizontalAutoscaleDispatch(suite);
     testStatefulHorizontalAutoscaleFloorDispatch(suite);
+    testStatefulShardHandoffGraceSafety(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (std::getenv("PRODIGY_TEST_INPLACE_PAIRING_ONLY") != nullptr)
@@ -9286,7 +9349,7 @@ int main(void)
 
   testStatefulHorizontalAutoscaleDispatch(suite);
   testStatefulHorizontalAutoscaleFloorDispatch(suite);
-
+  testStatefulShardHandoffGraceSafety(suite);
   {
     ScopedFreshRing ring;
     TestBrain brain;

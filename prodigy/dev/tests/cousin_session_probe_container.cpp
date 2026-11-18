@@ -14,6 +14,7 @@
 #include <prodigy/cousin.session.client.h>
 
 #include <arpa/inet.h>
+#include <array>
 #include <cerrno>
 #include <cstdlib>
 #include <cstdio>
@@ -29,6 +30,9 @@ constexpr auto probeConfigPath = "/cousin-probe-config"_ctv;
 constexpr auto probePayload = "COUSIN-native-session-probe-v1"_ctv;
 constexpr uint32_t tickMs = 20;
 constexpr uint32_t requestRetryMs = 5000;
+// A restarted graph client can send its first request before route discovery
+// has converged. Retry at 200 ms and 1 s, then resume the 5 s schedule.
+constexpr std::array<uint32_t, 3> graphInitialRequestDelaysMs = {200, 800, 4000};
 constexpr uint32_t maximumRequests = 64;
 constexpr int64_t maximumDurationMs = 180000;
 constexpr uint32_t echoIntervalMs = 2000;
@@ -86,6 +90,7 @@ class CousinSessionProbeContainer final : public NeuronHubDispatch, public Timeo
   bool payloadQueued = false;
   uint32_t echoRound = 0;
   uint32_t requestAttempts = 0;
+  size_t graphRetryStep = 0;
   int64_t startedAtMs = 0;
   int64_t nextRequestAtMs = 0;
   int64_t nextEchoAtMs = 0;
@@ -230,7 +235,10 @@ class CousinSessionProbeContainer final : public NeuronHubDispatch, public Timeo
     request.bindingNonce = sourceWhitehole->bindingNonce;
     request.slot = 0; // First probe profile has one configured stateful shard owner.
     ++requestAttempts;
-    nextRequestAtMs = now + requestRetryMs;
+    auto delayMs = requestRetryMs;
+    if (graphProfile && graphRetryStep < graphInitialRequestDelaysMs.size())
+      delayMs = graphInitialRequestDelaysMs[graphRetryStep++];
+    nextRequestAtMs = now + delayMs;
     char sourceAddress[INET6_ADDRSTRLEN] = {};
     if (!::inet_ntop(AF_INET6, sourceWhitehole->address.v6, sourceAddress, sizeof(sourceAddress))) return;
     std::printf("cousin_session_probe.request source=%s sourcePort=%u request=%016llx%016llx attempt=%u monotonicMs=%lld wallMs=%lld\n",
@@ -351,6 +359,7 @@ public:
       if (payloadQueued && outbound->rBuffer.size() == probePayload.size() &&
           std::memcmp(outbound->rBuffer.data(), probePayload.data(), probePayload.size()) == 0) {
         if (firstPayloadAtMs == 0) firstPayloadAtMs = now;
+        graphRetryStep = 0;
         outbound->rBuffer.clear(); payloadQueued = false; nextEchoAtMs = now + echoIntervalMs; ++echoRound;
         std::printf("cousin_session_probe.round request=%016llx%016llx peer=%016llx%016llx session=%016llx%016llx round=%u monotonicMs=%lld wallMs=%lld payload=exact\n",
                    (unsigned long long)(activeRequestUUID >> 64), (unsigned long long)activeRequestUUID,

@@ -8,8 +8,11 @@
 #include <cstring>
 #include <array>
 #include <mutex>
+#include <utility>
+#include <fcntl.h>
 #include <services/bitsery.h>
 #include <services/debug.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <ebpf/common/structs.h>
@@ -210,6 +213,115 @@ static inline uint32_t switchboardKernelMapID(int fd)
   return fd >= 0 && bpf_map_get_info_by_fd(fd, &info, &bytes) == 0 ? uint32_t(info.id) : 0u;
 }
 
+// The GC runs on the Ring every 100ms. Its maps are shared with attached
+// programs, so retain an FD only while the bpffs pin still names that map. A
+// pin replacement unlinks and recreates the bpffs dentry; its device/inode
+// pair is the generation checked before every sweep. An absent pin drops the
+// cached FD instead of allowing a superseded, unpinned map to be swept.
+class SwitchboardWormholeFlowGCPinnedMaps {
+  struct Map {
+    String path;
+    int fd = -1;
+    int pinFD = -1;
+    dev_t device = 0;
+    ino_t inode = 0;
+    bool validated = false;
+
+    void release()
+    {
+      if (fd >= 0) ::close(fd);
+      if (pinFD >= 0) ::close(pinFD);
+      fd = pinFD = -1;
+      validated = false;
+    }
+
+    int verifiedFD(bool (*validator)(int), bool& changed)
+    {
+      struct stat before = {};
+      if (::stat(path.c_str(), &before) != 0)
+      {
+        changed = fd >= 0;
+        release();
+        return -1;
+      }
+      if (fd < 0 || device != before.st_dev || inode != before.st_ino)
+      {
+        changed = true;
+        release();
+        pinFD = ::open(path.c_str(), O_PATH | O_CLOEXEC);
+        struct stat held = {};
+        if (pinFD < 0 || ::fstat(pinFD, &held) != 0 ||
+            held.st_dev != before.st_dev || held.st_ino != before.st_ino)
+        {
+          release();
+          return -1;
+        }
+        fd = bpf_obj_get(path.c_str());
+        struct stat after = {};
+        if (fd < 0 || ::stat(path.c_str(), &after) != 0 ||
+            held.st_dev != after.st_dev || held.st_ino != after.st_ino)
+        {
+          release();
+          return -1;
+        }
+        device = held.st_dev;
+        inode = held.st_ino;
+      }
+      if (!validated) validated = validator(fd);
+      return validated ? fd : -1;
+    }
+  };
+
+  Map established, pending, grants, routes;
+
+public:
+  explicit SwitchboardWormholeFlowGCPinnedMaps(uint32_t ifindex)
+  {
+    switchboardWormholeFlowPinPath(established.path, ifindex);
+    switchboardWormholePendingFlowPinPath(pending.path, ifindex);
+    switchboardPairAdmissionGrantPinPath(grants.path, ifindex);
+    switchboardPairAdmissionRoutePinPath(routes.path, ifindex);
+  }
+  SwitchboardWormholeFlowGCPinnedMaps(const SwitchboardWormholeFlowGCPinnedMaps&) = delete;
+  SwitchboardWormholeFlowGCPinnedMaps& operator=(const SwitchboardWormholeFlowGCPinnedMaps&) = delete;
+  ~SwitchboardWormholeFlowGCPinnedMaps() { reset(); }
+
+  void reset()
+  {
+    established.release();
+    pending.release();
+    grants.release();
+    routes.release();
+  }
+
+  template <typename Name, typename Callback>
+  void openVerifiedMap(const Name& name, bool (*validator)(int), Callback&& callback)
+  {
+    Map *map = nullptr;
+    if (name.equal("wh_flows"_ctv)) map = &established;
+    else if (name.equal("wh_pending"_ctv)) map = &pending;
+    else if (name.equal("wh_pair_grants"_ctv)) map = &grants;
+    else if (name.equal("wh_pair_routes"_ctv)) map = &routes;
+    bool changed = false;
+    const int fd = map ? map->verifiedFD(validator, changed) : -1;
+    callback(fd, changed);
+  }
+};
+
+template <typename Program, typename Name, typename Callback>
+static inline void switchboardOpenVerifiedWormholeGCMap(Program *program, Name&& name,
+                                                        bool (*validator)(int), Callback&& callback)
+{
+  program->openMap(std::forward<Name>(name), [&](int fd) { callback(validator(fd) ? fd : -1, false); });
+}
+
+template <typename Name, typename Callback>
+static inline void switchboardOpenVerifiedWormholeGCMap(SwitchboardWormholeFlowGCPinnedMaps *maps, Name&& name,
+                                                        bool (*validator)(int), Callback&& callback)
+{
+  maps->openVerifiedMap(std::forward<Name>(name), validator, std::forward<Callback>(callback));
+}
+
 static inline bool switchboardWormholeEstablishedFlowMapCompatibleFD(int fd)
 {
   struct bpf_map_info info = {};
@@ -329,8 +441,9 @@ static inline bool switchboardCleanupExpiredWormholeFlowMap(Program *program,
                                                              uint32_t& deleted)
 {
   bool cleaned = false;
-  program->openMap(String(mapName), [&](int mapFD) -> void {
-    if (compatible(mapFD) == false)
+  switchboardOpenVerifiedWormholeGCMap(program, String(mapName), compatible, [&](int mapFD, bool changed) -> void {
+    if (changed) cursor = {};
+    if (mapFD < 0)
     {
       return;
     }
@@ -462,10 +575,14 @@ static inline bool switchboardCleanupExpiredPairAdmissionMaps(Program *program,
   uint32_t deleted = 0;
   bool grantsCleaned = false;
   bool routesCleaned = false;
-  program->openMap("wh_pair_routes"_ctv, [&](int routeFD) -> void {
-    if (switchboardPairAdmissionRouteMapCompatibleFD(routeFD) == false) return;
-    program->openMap("wh_pair_grants"_ctv, [&](int mapFD) -> void {
-      if (switchboardPairAdmissionGrantMapCompatibleFD(mapFD) == false) return;
+  switchboardOpenVerifiedWormholeGCMap(program, "wh_pair_routes"_ctv,
+                                       switchboardPairAdmissionRouteMapCompatibleFD, [&](int routeFD, bool changed) -> void {
+    if (changed) cursor = {};
+    if (routeFD < 0) return;
+    switchboardOpenVerifiedWormholeGCMap(program, "wh_pair_grants"_ctv,
+                                         switchboardPairAdmissionGrantMapCompatibleFD, [&](int mapFD, bool changed) -> void {
+      if (changed) cursor.grantActive = false;
+      if (mapFD < 0) return;
       static thread_local std::array<switchboard_pair_admission_grant_key, WORMHOLE_FLOW_GC_BATCH_SIZE> keys = {};
       static thread_local std::array<switchboard_pair_admission_grant, WORMHOLE_FLOW_GC_BATCH_SIZE> values = {};
       switchboard_pair_admission_grant_key next = {};
@@ -483,12 +600,16 @@ static inline bool switchboardCleanupExpiredPairAdmissionMaps(Program *program,
         // grant only for its separately bounded established-session window.
         bool reclaim = state == SWITCHBOARD_PAIR_ADMISSION_CONSUMED ? grant.consumed_expires_at_ns <= nowNs
                                                                      : state != SWITCHBOARD_PAIR_ADMISSION_PENDING;
-        switchboard_pair_admission_route_key routeKey = {grant.pair_uuid_hi, grant.pair_uuid_lo, grant.route_uuid_hi, grant.route_uuid_lo};
-        switchboard_pair_admission_route_policy route = {};
-        bool routeCurrent = bpf_map_lookup_elem(routeFD, &routeKey, &route) == 0 &&
-                            route.expires_at_ns > nowNs && route.state != SWITCHBOARD_PAIR_ADMISSION_ROUTE_REVOKED &&
-                            route.route_generation == grant.route_generation && route.root_generation == grant.root_generation &&
-                            route.key_epoch == grant.key_epoch;
+        bool routeCurrent = false;
+        if (reclaim == false)
+        {
+          switchboard_pair_admission_route_key routeKey = {grant.pair_uuid_hi, grant.pair_uuid_lo, grant.route_uuid_hi, grant.route_uuid_lo};
+          switchboard_pair_admission_route_policy route = {};
+          routeCurrent = bpf_map_lookup_elem(routeFD, &routeKey, &route) == 0 &&
+                         route.expires_at_ns > nowNs && route.state != SWITCHBOARD_PAIR_ADMISSION_ROUTE_REVOKED &&
+                         route.route_generation == grant.route_generation && route.root_generation == grant.root_generation &&
+                         route.key_epoch == grant.key_epoch;
+        }
         if (reclaim || routeCurrent == false)
           deleted += bpf_map_delete_elem(mapFD, &keys[i]) == 0 ? 1u : 0u;
       }
@@ -496,18 +617,15 @@ static inline bool switchboardCleanupExpiredPairAdmissionMaps(Program *program,
       if (cursor.grantActive) cursor.grantBatch = next;
       grantsCleaned = true;
     });
-  });
-  program->openMap("wh_pair_routes"_ctv, [&](int mapFD) -> void {
-    if (switchboardPairAdmissionRouteMapCompatibleFD(mapFD) == false) return;
     static thread_local std::array<switchboard_pair_admission_route_key, 1024> keys = {};
     static thread_local std::array<switchboard_pair_admission_route_policy, 1024> values = {};
     switchboard_pair_admission_route_key next = {};
     __u32 count = 1024;
-    int result = bpf_map_lookup_batch(mapFD, cursor.routeActive ? &cursor.routeBatch : nullptr, &next,
+    int result = bpf_map_lookup_batch(routeFD, cursor.routeActive ? &cursor.routeBatch : nullptr, &next,
                                       keys.data(), values.data(), &count, nullptr);
     if (result != 0 && errno != ENOENT) return;
     for (__u32 i = 0; i < count; ++i)
-      if (values[i].expires_at_ns <= nowNs) deleted += bpf_map_delete_elem(mapFD, &keys[i]) == 0 ? 1u : 0u;
+      if (values[i].expires_at_ns <= nowNs) deleted += bpf_map_delete_elem(routeFD, &keys[i]) == 0 ? 1u : 0u;
     cursor.routeActive = result == 0 && count != 0;
     if (cursor.routeActive) cursor.routeBatch = next;
     routesCleaned = true;

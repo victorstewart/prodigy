@@ -2,6 +2,7 @@
 #include <arpa/inet.h>
 #include <services/debug.h>
 #include <prodigy/debug.h>
+#include <prodigy/runtime.trace.h>
 #include <prodigy/container.services.h>
 #include <prodigy/retained.container.recovery.h>
 #include <prodigy/brain/timing.knobs.h>
@@ -5864,6 +5865,7 @@ private:
             }
           }
           brain->replicateContainerRuntimeStateToFollowers(container);
+          prodigyTraceContainerStage("brain-launch-dispatch", deferred.deploymentID, deferred.containerUUID);
           if (deferred.retainedStorageRecoveryLaunch)
           {
             queueSend(deferred.machine, NeuronTopic::spinContainer, deferred.replaceContainerUUID,
@@ -9046,6 +9048,18 @@ public:
     dispatchDeferredStatefulScaleIntent();
   }
 
+  bool newestShardGroupIsHealthy()
+  {
+    if (!nShardGroups) return false;
+    const auto group = nShardGroups - 1;
+    const auto required = desiredReplicaCountForShardGroup(group);
+    const auto& members = containersByShardGroup[group];
+    if (!required || members.size() < required) return false;
+    return std::all_of(members.begin(), members.end(), [](const ContainerView *member) {
+      return member && member->state == ContainerState::healthy;
+    });
+  }
+
   void dispatchTimeout(TimeoutPacket *packet)
   {
     switch (DeploymentTimeoutFlags(packet->flags))
@@ -9057,6 +9071,13 @@ public:
         }
       case DeploymentTimeoutFlags::shardGroupReady:
         {
+          // Do not release old data if any member has lost health while the
+          // grace period was running.
+          if (deployingNewShardGroup == false || newestShardGroupIsHealthy() == false)
+          {
+            break;
+          }
+
           cullShardingServices();
           break;
         }
@@ -9532,6 +9553,7 @@ public:
     // Publish the acknowledged health before callbacks can resume a scheduler
     // and evaluate the complete healthy target.
     container->state = ContainerState::healthy;
+    prodigyTraceContainerStage("brain-healthy", container->deploymentID, container->uuid);
     switch (container->lifetime)
     {
       case ApplicationLifetime::canary:
@@ -9603,34 +9625,16 @@ public:
     {
       thisBrain->sendNeuronOpenSwitchboardWormholes(container, plan.wormholes);
     }
-    if (plan.isStateful)
+    if (plan.isStateful && deployingNewShardGroup && nShardGroups &&
+        container->shardGroup == nShardGroups - 1 && newestShardGroupIsHealthy())
     {
-      if (deployingNewShardGroup) // aka stateful
-      {
-        bool allHealthy = true;
-
-        for (ContainerView *container : containersByShardGroup[nShardGroups - 1]) // must be the most recent shard group
-        {
-          if (container->state != ContainerState::healthy)
-          {
-            allHealthy = false;
-            break;
-          }
-        }
-
-        if (allHealthy)
-        {
-          // now set a timer to wait some number of seconds for clients to connect to them
-          // then cull the sharding pairings (this is the signal to delete the sharded data!!!)
-          // cousin pairings lifetime is tied to the sharding as otherwise we’d end up with bad keys if we delete the data before clients stop sending it.
-
-          shardTimer.setTimeoutSeconds(15); // wait 15 seconds for clients to connect? seems long but not too long. surely should all connect byt then
-
-          shardTimer.dispatcher = this;
-          shardTimer.flags = uint64_t(DeploymentTimeoutFlags::shardGroupReady);
-          Ring::queueTimeout(&shardTimer);
-        }
-      }
+      // Removing these subscriptions authorizes data deletion. Give clients
+      // a full grace period after the new group's last healthy transition.
+      // Ring supersedes the old ticket if a recovering target restarts it.
+      shardTimer.setTimeoutSeconds(15);
+      shardTimer.dispatcher = this;
+      shardTimer.flags = uint64_t(DeploymentTimeoutFlags::shardGroupReady);
+      Ring::queueTimeout(&shardTimer);
     }
   }
 
@@ -9649,6 +9653,7 @@ public:
     if (container->runtimeReady == false)
     {
       container->runtimeReady = true;
+      prodigyTraceContainerStage("brain-runtime-ready", container->deploymentID, container->uuid);
       container->replayRuntimeReadyPairings();
     }
 

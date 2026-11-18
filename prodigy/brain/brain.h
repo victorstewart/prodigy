@@ -34,6 +34,7 @@ static inline cppsort::verge_adapter<cppsort::ska_sorter> sorter;
 #include <networking/reconnector.h>
 
 #include <prodigy/bootstrap.config.h>
+#include <prodigy/runtime.trace.h>
 #include <prodigy/bundle.upgrade.h>
 #include <prodigy/container.mesh.identity.h>
 #include <prodigy/container.retirement.h>
@@ -2148,6 +2149,12 @@ public:
 
   // master brain
   bool ignited = false;
+  // A cold healthy fleet can release its fragment/upload work as soon as every
+  // member has authenticated this control generation.  Keep these proofs
+  // generation-bound: registration, hardware, and inventory from a previous
+  // socket must never advance the startup barrier after a reconnect.
+  bool initialBootstrapReleaseStarted = false;
+  uint64_t initialBootstrapMasterEpoch = 0;
   // A promoted brain must first rebuild the complete live Neuron inventory.
   // Scheduling from a partial upload creates replacement UUIDs which become
   // duplicate runtimes when the remaining Neurons report their live copies.
@@ -9148,6 +9155,10 @@ public:
           captureDurableElasticAddressOperations();
           finalizePendingMachineFragmentAssignmentPersistence();
           if (replicate) queueMasterAuthorityRuntimeStateReplication();
+          // Registrations can complete while this authority revision is still
+          // in flight. Its durable receipt is the last proof needed to start
+          // the current-generation bootstrap release.
+          tryReleaseInitialControlPlaneBootstrap();
           // A connector's source-port reservation defers launch until this
           // exact authority state is durable. Wake its existing reconciler.
           reconcileCrossClusterMasqueGatewayRuntimeState();
@@ -9185,6 +9196,7 @@ public:
     captureDurableElasticAddressOperations();
     finalizePendingMachineFragmentAssignmentPersistence();
     queueMasterAuthorityRuntimeStateReplication();
+    tryReleaseInitialControlPlaneBootstrap();
     return true;
   }
 
@@ -9218,6 +9230,7 @@ public:
         captureDurableElasticAddressOperations();
         finalizePendingMachineFragmentAssignmentPersistence();
         queueMasterAuthorityRuntimeStateReplication();
+        tryReleaseInitialControlPlaneBootstrap();
       }
       if (completion) completion(durable && currentAuthority);
     });
@@ -24135,6 +24148,9 @@ public:
         // this exact control stream, never durable machine state.
         purgeCrossClusterNeuronObservations(machine->uuid);
         discardPersistedMachineStateUploadInventory(machine);
+        machine->neuron.bootstrapRegistrationGeneration = 0;
+        machine->neuron.bootstrapHardwareGeneration = 0;
+        initialBootstrapReleaseStarted = false;
         restoredContainerInventoryReplayByMachine.erase(machine->uuid);
         machine->stateUploadRequestPending = false;
         machine->stateUploadRequestIOGeneration = 0;
@@ -25665,6 +25681,148 @@ public:
     }
   }
 
+  // The normal ignition deadline is deliberately a reconnect budget. The fast
+  // path releases only a complete, current-generation set of registrations,
+  // hardware profiles, and accepted inventories; it never relies on cached
+  // state from a previous Neuron socket.
+  bool initialControlPlaneBootstrapReleaseReady() const
+  {
+    if (noMasterYet || !weAreMaster || !initialBootstrapMasterEpoch || initialBootstrapMasterEpoch != masterAuthorityEpoch ||
+        !brainConfig.datacenterFragment || machines.empty() ||
+        !recoveryAuthoritySnapshotDurable()) return false;
+
+    for (const Machine *machine : machines)
+    {
+      if (!machine || !machine->uuid || !neuronControlStreamActive(machine) ||
+          !machine->neuron.ioGeneration ||
+          machine->neuron.bootstrapRegistrationGeneration != machine->neuron.ioGeneration ||
+          machine->neuron.bootstrapHardwareGeneration != machine->neuron.ioGeneration ||
+          (machine->lastUpdatedOSMs <= 0 && machine->kernel.empty()) ||
+          !prodigyMachineHardwareInventoryReady(machine->hardware)) return false;
+    }
+
+    // A partial live index can have only healthy entries. Check its membership
+    // against the configured roster before releasing the reconnect deadline.
+    ClusterTopology topology;
+    if (!loadAuthoritativeClusterTopology(topology) || topology.machines.size() != machines.size())
+      return false;
+    for (const ClusterMachine& configured : topology.machines)
+    {
+      auto live = machinesByUUID.find(configured.uuid);
+      if (live == machinesByUUID.end() || !machines.contains(live->second)) return false;
+    }
+    return true;
+  }
+
+  bool initialControlPlaneBootstrapRecoveryComplete()
+  {
+    if (initialBootstrapReleaseStarted == false || initialControlPlaneBootstrapReleaseReady() == false)
+    {
+      return false;
+    }
+
+    for (const Machine *machine : machines)
+    {
+      auto inventory = containerRetirementInventoryByMachine.find(machine->uuid);
+      if (!machine->runtimeReady || machine->stateUploadRequestPending ||
+          persistedMachineInventoryUploaded.contains(machine->uuid) == false ||
+          inventory == containerRetirementInventoryByMachine.end() ||
+          inventory->second.authorityEpoch != masterAuthorityEpoch ||
+          inventory->second.ioGeneration != machine->neuron.ioGeneration)
+      {
+        return false;
+      }
+    }
+
+    // A recovered authority may still have retained inventory replay to do.
+    // Reuse its existing fail-closed gate before exposing ignition; it is
+    // side-effect-free until ignition permits replay materialization.
+    return finalizePersistedNeuronInventoryRecovery();
+  }
+
+  void igniteControlPlane()
+  {
+    if (ignited)
+    {
+      return;
+    }
+
+    ignited = true;
+
+    // At this point every live machine either supplied registration/inventory,
+    // or (on the deadline path) is considered missing and its recovery is
+    // already in progress.
+    for (Machine *machine : machines)
+    {
+      if ((machine->lastUpdatedOSMs > 0 || machine->kernel.size() > 0) &&
+          prodigyMachineHardwareInventoryReady(machine->hardware))
+      {
+        if (machine->fragment == 0)
+        {
+          assignMachineFragment(machine);
+        }
+
+        promoteMachineToHealthyIfReady(machine);
+      }
+    }
+
+    refreshMachineFragmentAssignmentsIfPossible();
+
+    // Recover only deployments whose authoritative DNS intent has completed
+    // for the exact current lease snapshot.
+    recoverDeploymentsAfterNeuronState();
+
+    armMachineUpdateTimerIfNeeded();
+
+    if (weAreMaster)
+    {
+      TimeoutPacket *recovery = new TimeoutPacket();
+      recovery->flags = uint64_t(BrainTimeoutFlags::postIgnitionRecovery);
+      recovery->dispatcher = this;
+      recovery->setTimeoutMs(prodigyBrainPostIgnitionRecoveryTimeoutMs);
+      RingDispatcher::installMultiplexee(recovery, this);
+      Ring::queueTimeout(recovery);
+    }
+  }
+
+  void tryReleaseInitialControlPlaneBootstrap()
+  {
+    if (ignited) return;
+    if (!initialBootstrapReleaseStarted)
+    {
+      if (!initialControlPlaneBootstrapReleaseReady()) return;
+      initialBootstrapReleaseStarted = true;
+      if (prodigyRuntimeTraceEnabled())
+      {
+        std::fprintf(stderr,
+                     "prodigy.brain.startup stage=bootstrap-release monotonicMs=%lld wallMs=%lld machines=%llu\n",
+                     (long long)Time::msSinceBoot(), (long long)Time::now<TimeResolution::ms>(),
+                     (unsigned long long)machines.size());
+      }
+      refreshMachineFragmentAssignmentsIfPossible();
+    }
+
+    // An inventory may have arrived before the matching authority became durable.
+    tryIgniteControlPlaneFromCompleteInitialBootstrapRecovery();
+  }
+
+  void tryIgniteControlPlaneFromCompleteInitialBootstrapRecovery()
+  {
+    if (ignited || initialControlPlaneBootstrapRecoveryComplete() == false)
+    {
+      return;
+    }
+
+    if (prodigyRuntimeTraceEnabled())
+    {
+      std::fprintf(stderr,
+                   "prodigy.brain.startup stage=ignited-current-inventory monotonicMs=%lld wallMs=%lld machines=%llu\n",
+                   (long long)Time::msSinceBoot(), (long long)Time::now<TimeResolution::ms>(),
+                   (unsigned long long)machines.size());
+    }
+    igniteControlPlane();
+  }
+
   void resumeMachineClaimsIfSchedulingReady(Machine *machine)
   {
     if (machine == nullptr || machine->state != MachineState::healthy || machine->runtimeReady == false || machine->claims.size() == 0)
@@ -25988,6 +26146,8 @@ public:
         // no extra metrics service subscriptions are required here.
       }
     }
+
+    tryReleaseInitialControlPlaneBootstrap();
   }
 
   virtual bool loadAuthoritativeClusterTopology(ClusterTopology& topology) const
@@ -31508,6 +31668,8 @@ public:
 
     // Promotion must flip master ownership before listener arm so any immediate
     // close CQE races on mothership control-listener re-arm through closeHandler.
+    initialBootstrapMasterEpoch = 0;
+    initialBootstrapReleaseStarted = false;
     weAreMaster = true;
     pendingHandoffAuthoritySource = {};
     masterAuthorityReplicationByPeer.clear();
@@ -31821,8 +31983,12 @@ public:
     {
       refreshMachineFragmentAssignmentsIfPossible();
     }
-    reconcileManagedMachineSchemasOnSelfElectionAsync([this](bool durable) {
-      if (durable) recoverDeploymentsAfterNeuronState();
+    prodigyTraceMachineStage("brain-master-elected", selfBrainUUID(), masterAuthorityEpoch);
+    reconcileManagedMachineSchemasOnSelfElectionAsync([this, epoch = masterAuthorityEpoch](bool durable) {
+      if (!durable || !weAreMaster || epoch != masterAuthorityEpoch) return;
+      initialBootstrapMasterEpoch = epoch;
+      recoverDeploymentsAfterNeuronState();
+      tryReleaseInitialControlPlaneBootstrap();
     });
 
     return true;
@@ -34812,43 +34978,7 @@ public:
         }
       case BrainTimeoutFlags::ignition:
         {
-          ignited = true;
-
-          // at this point we've either connected to every neuron and gotten an upload of its state,
-          // or we can assume the neuron is missing... and appropriate action would already be in progress
-
-          for (Machine *machine : machines)
-          {
-            // consider the machine registered if we've received neuron registration metadata
-            if ((machine->lastUpdatedOSMs > 0 || machine->kernel.size() > 0) && prodigyMachineHardwareInventoryReady(machine->hardware))
-            {
-              if (machine->fragment == 0)
-              {
-                assignMachineFragment(machine);
-              }
-
-              promoteMachineToHealthyIfReady(machine);
-            }
-            // else we'll be triaging it already
-          }
-
-          refreshMachineFragmentAssignmentsIfPossible();
-
-          // Recover only deployments whose authoritative DNS intent has
-          // completed for the exact current lease snapshot.
-          recoverDeploymentsAfterNeuronState();
-
-          armMachineUpdateTimerIfNeeded();
-
-          if (weAreMaster)
-          {
-            TimeoutPacket *recovery = new TimeoutPacket();
-            recovery->flags = uint64_t(BrainTimeoutFlags::postIgnitionRecovery);
-            recovery->dispatcher = this;
-            recovery->setTimeoutMs(prodigyBrainPostIgnitionRecoveryTimeoutMs);
-            RingDispatcher::installMultiplexee(recovery, this);
-            Ring::queueTimeout(recovery);
-          }
+          igniteControlPlane();
 
           break;
         }
@@ -57396,6 +57526,8 @@ public:
           {
             break;
           }
+          neuron->bootstrapRegistrationGeneration = neuron->ioGeneration;
+          prodigyTraceMachineStage("brain-registration-accepted", machine->uuid, neuron->ioGeneration);
           const bool localBrainRefresh = localBundleRefresh || localNeuronStateRefreshMayBypassIgnition(machine, haveData);
           needsStateRefresh = needsStateRefresh || workerBundleRefresh || localBundleRefresh || machineNeedsNeuronStateRefresh(machine);
 
@@ -57446,6 +57578,8 @@ public:
           {
             promoteMachineToHealthyIfReady(machine);
           }
+
+          tryReleaseInitialControlPlaneBootstrap();
 
           refreshNeuronControlHandshakeWatchdog(neuron, "registration");
           driveTransportCredentialEnrollmentOperations();
@@ -57502,6 +57636,8 @@ public:
           Machine *machine = neuron->machine;
           bool readyBeforeHardware = machineReadyForHealthyState(machine);
           applyMachineHardwareProfile(machine, hardware);
+          neuron->bootstrapHardwareGeneration = neuron->ioGeneration;
+          prodigyTraceMachineStage("brain-hardware-received", machine->uuid, neuron->ioGeneration);
 
 #if PRODIGY_DEBUG
           bool readyAfterHardware = machineReadyForHealthyState(machine);
@@ -57528,6 +57664,7 @@ public:
 #endif
 
           promoteMachineToHealthyIfReady(machine);
+          tryReleaseInitialControlPlaneBootstrap();
           refreshNeuronControlHandshakeWatchdog(neuron, "machine-hardware");
 
           break;
@@ -58108,6 +58245,8 @@ public:
             break;
           }
           noteRestoredContainerInventoryReplayInventoryResult(neuron->machine);
+          if (neuron->machine->runtimeReady)
+            prodigyTraceMachineStage("brain-neuron-runtime-ready", neuron->machine->uuid, neuron->ioGeneration);
           promoteMachineToHealthyIfReady(neuron->machine);
           refreshNeuronControlHandshakeWatchdog(neuron, "state-upload");
           // A resource observation can be older/larger than the sealed desired
@@ -58136,6 +58275,7 @@ public:
           {
             completeLocalBundleExecRecovery();
           }
+          tryReleaseInitialControlPlaneBootstrap();
 
           break;
         }
