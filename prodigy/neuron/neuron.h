@@ -660,6 +660,9 @@ protected:
   struct DeferredHardwareInventoryWake : public SocketBase {
   } deferredHardwareInventoryWake;
   bool deferredHardwareInventoryWakePollQueued = false;
+  class DeferredHardwareInventoryRetryWake;
+  DeferredHardwareInventoryRetryWake *deferredHardwareInventoryRetryWake = nullptr;
+  uint32_t deferredHardwareInventoryRetryAttempts = 0;
 
   struct DeferredHardwareInventoryResult {
 
@@ -1758,6 +1761,78 @@ protected:
     return result.serializedHardwareProfile.size() > 0 && result.hardware.inventoryComplete;
   }
 
+  static uint32_t deferredHardwareInventoryRetryDelayMs(uint32_t attempts)
+  {
+    return 250u << std::min(attempts, 4u);
+  }
+
+  // A canceled io_uring timeout can be dispatched after its original owner
+  // begins destruction. Keep the packet in this heap-owned dispatcher until
+  // that terminal completion, rather than leaving a member packet for Ring to
+  // dereference after Neuron's storage has gone away.
+  class DeferredHardwareInventoryRetryWake final : public TimeoutDispatcher {
+  private:
+    Neuron *owner = nullptr;
+    TimeoutPacket packet = {};
+
+  public:
+    DeferredHardwareInventoryRetryWake(Neuron& requestedOwner, uint32_t delayMs)
+        : owner(&requestedOwner)
+    {
+      packet.dispatcher = this;
+      packet.setTimeoutMs(delayMs);
+      Ring::queueTimeout(&packet);
+    }
+
+    void abandon(void)
+    {
+      owner = nullptr;
+      Ring::queueCancelTimeout(&packet);
+    }
+
+    void dispatchTimeout(TimeoutPacket *completedPacket) override
+    {
+      if (completedPacket != &packet)
+      {
+        return;
+      }
+      Neuron *completedOwner = owner;
+      owner = nullptr;
+      if (completedOwner != nullptr)
+      {
+        completedOwner->deferredHardwareInventoryRetryWake = nullptr;
+        completedOwner->beginDeferredHardwareInventoryCollection();
+      }
+      delete this;
+    }
+  };
+
+  void scheduleDeferredHardwareInventoryRetry(void)
+  {
+    if (deferredHardwareInventoryRetryWake != nullptr || hardwareProfile.inventoryComplete)
+    {
+      return;
+    }
+
+    const uint32_t delayMs = deferredHardwareInventoryRetryDelayMs(deferredHardwareInventoryRetryAttempts);
+    if (deferredHardwareInventoryRetryAttempts != UINT32_MAX)
+    {
+      ++deferredHardwareInventoryRetryAttempts;
+    }
+    deferredHardwareInventoryRetryWake = new DeferredHardwareInventoryRetryWake(*this, delayMs);
+  }
+
+  void resetDeferredHardwareInventoryRetry(void)
+  {
+    deferredHardwareInventoryRetryAttempts = 0;
+    if (deferredHardwareInventoryRetryWake != nullptr)
+    {
+      DeferredHardwareInventoryRetryWake *wake = deferredHardwareInventoryRetryWake;
+      deferredHardwareInventoryRetryWake = nullptr;
+      wake->abandon();
+    }
+  }
+
   void armDeferredHardwareInventoryWakePoll(void)
   {
     if (deferredHardwareInventoryWakePollQueued || deferredHardwareInventoryWake.fd < 0)
@@ -2073,6 +2148,7 @@ protected:
                (unsigned long long)result.hardware.network.nics.size());
     hardwareProfile = std::move(result.hardware);
     serializedHardwareProfile = std::move(result.serializedHardwareProfile);
+    resetDeferredHardwareInventoryRetry();
 
     if (hardwareProfile.inventoryComplete && thisBrain != nullptr)
     {
@@ -2198,7 +2274,7 @@ protected:
                  (unsigned long long)result.hardware.disks.size(),
                  (unsigned long long)result.hardware.network.nics.size(),
                  result.hardware.inventoryFailure.c_str());
-      beginDeferredHardwareInventoryCollection();
+      scheduleDeferredHardwareInventoryRetry();
       return false;
     }
 
@@ -5790,6 +5866,7 @@ public:
 
   ~Neuron()
   {
+    resetDeferredHardwareInventoryRetry();
     asyncOperationLifetime.reset();
     bgpConfigurationRefresh.reset();
     // Cancel HostTask awaiters before their retained containers or this Ring

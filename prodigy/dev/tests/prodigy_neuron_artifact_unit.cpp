@@ -859,6 +859,24 @@ public:
     brain->connected = true;
   }
 
+  using Neuron::completeDeferredHardwareInventoryIfReady;
+  using Neuron::deferredHardwareInventoryInFlight;
+  using Neuron::deferredHardwareInventoryRetryAttempts;
+  using Neuron::deferredHardwareInventoryRetryDelayMs;
+  using Neuron::deferredHardwareInventoryRetryWake;
+  using Neuron::latestHardwareProfileIfReady;
+  using Neuron::scheduleDeferredHardwareInventoryRetry;
+
+  void finishHardwareProbeForTest(bool complete)
+  {
+    DeferredHardwareInventoryResult result;
+    result.hardware.inventoryComplete = complete;
+    BitseryEngine::serialize(result.serializedHardwareProfile, result.hardware);
+    std::lock_guard lock(deferredHardwareInventoryMutex);
+    deferredHardwareInventoryReady = std::move(result);
+    deferredHardwareInventoryInFlight = true;
+  }
+
   ~TestNeuron()
   {
     // main() keeps this owner alive until quiesceForExec observes the terminal
@@ -1233,8 +1251,70 @@ static void testGatewayPrivateBGPWithdrawalIdempotence(TestSuite& suite)
   ring.shutdownRing();
 }
 
+static void testNeuronDeferredHardwareInventoryRetryPacing(TestSuite& suite)
+{
+  suite.expect(TestNeuron::deferredHardwareInventoryRetryDelayMs(0) == 250 &&
+                   TestNeuron::deferredHardwareInventoryRetryDelayMs(1) == 500 &&
+                   TestNeuron::deferredHardwareInventoryRetryDelayMs(2) == 1'000 &&
+                   TestNeuron::deferredHardwareInventoryRetryDelayMs(3) == 2'000 &&
+                   TestNeuron::deferredHardwareInventoryRetryDelayMs(4) == 4'000 &&
+                   TestNeuron::deferredHardwareInventoryRetryDelayMs(UINT32_MAX) == 4'000,
+               "neuron_deferred_hardware_inventory_retry_delay_is_bounded_exponential");
+
+  ArtifactRing ring = {};
+  auto neuron = std::make_unique<TestNeuron>();
+  neuron->finishHardwareProbeForTest(false);
+  suite.expect(!neuron->completeDeferredHardwareInventoryIfReady(), "incomplete_hardware_requires_retry");
+  const auto *wake = neuron->deferredHardwareInventoryRetryWake;
+  neuron->scheduleDeferredHardwareInventoryRetry();
+  suite.expect(wake && neuron->deferredHardwareInventoryRetryWake == wake && neuron->deferredHardwareInventoryRetryAttempts == 1,
+               "incomplete_hardware_schedules_one_retry");
+
+  // The timer must fire on the Ring. An active collector still owns the probe.
+  neuron->deferredHardwareInventoryInFlight = true;
+  const auto start = std::chrono::steady_clock::now();
+  runRingUntil(ring, [&] { return !neuron->deferredHardwareInventoryRetryWake; });
+  suite.expect(!ring.timedOut && neuron->deferredHardwareInventoryInFlight &&
+                   std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(240),
+               "hardware_retry_waits_for_deadline_and_preserves_active_collector");
+
+  neuron->finishHardwareProbeForTest(false);
+  (void)neuron->completeDeferredHardwareInventoryIfReady();
+  neuron->finishHardwareProbeForTest(true);
+  suite.expect(neuron->completeDeferredHardwareInventoryIfReady() && neuron->latestHardwareProfileIfReady() &&
+                   !neuron->deferredHardwareInventoryRetryWake && !neuron->deferredHardwareInventoryRetryAttempts,
+               "valid_hardware_is_adopted_immediately_and_resets_retry");
+
+  // The canceled wake owns its packet until Ring dispatches the cancellation.
+  // Destroy the Neuron before draining Ring to exercise the late-CQE lifetime
+  // path without leaving a member TimeoutPacket behind.
+  neuron.reset();
+  bool drained = false;
+  class CancellationDrain final : public TimeoutDispatcher {
+  public:
+    bool *drained = nullptr;
+    void dispatchTimeout(TimeoutPacket *) override { *drained = true; }
+  } cancellationDrain;
+  TimeoutPacket drainPacket = {};
+  drainPacket.dispatcher = &cancellationDrain;
+  cancellationDrain.drained = &drained;
+  drainPacket.setTimeoutMs(25);
+  Ring::queueTimeout(&drainPacket);
+  runRingUntil(ring, [&] { return drained; });
+  suite.expect(drained && ring.timedOut == false,
+               "neuron_deferred_hardware_inventory_cancelled_wake_drains_after_owner_destruction");
+  ring.shutdownRing();
+}
+
 int main()
 {
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "hardware-inventory-retry") == 0)
+  {
+    TestSuite suite = {};
+    testNeuronDeferredHardwareInventoryRetryPacing(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (const char *only = std::getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "gateway-private-bgp-withdrawal-idempotence") == 0)
   {
@@ -1260,6 +1340,7 @@ int main()
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   TestSuite suite = {};
+  testNeuronDeferredHardwareInventoryRetryPacing(suite);
   const bool gatewayStateUploadRecoveryOnly =
       std::getenv("PRODIGY_TEST_GATEWAY_STATE_UPLOAD_RECOVERY_ONLY") != nullptr;
   const bool gatewayRebindRecoveryOnly =

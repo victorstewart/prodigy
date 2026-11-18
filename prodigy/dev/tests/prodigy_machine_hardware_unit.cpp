@@ -41,6 +41,30 @@ static bool stringContains(const String& haystack, const String& needle)
   return stringContains(haystack, ownedNeedle.c_str());
 }
 
+class ScopedEnvironmentValue {
+  String name = {};
+  String value = {};
+  bool wasSet = false;
+
+public:
+  ScopedEnvironmentValue(const char *environmentName, const char *replacement)
+  {
+    name.assign(environmentName);
+    if (const char *existing = std::getenv(environmentName); existing != nullptr)
+    {
+      wasSet = true;
+      value.assign(existing);
+    }
+    ::setenv(environmentName, replacement, 1);
+  }
+
+  ~ScopedEnvironmentValue()
+  {
+    if (wasSet) ::setenv(name.c_str(), value.c_str(), 1);
+    else ::unsetenv(name.c_str());
+  }
+};
+
 int main(void)
 {
   TestSuite suite;
@@ -65,6 +89,55 @@ int main(void)
     suite.expect(output == "prodigy-spawn-fail"_ctv, "machine_hardware_command_spawn_failure_stdout");
     suite.expect(exitStatus == 7, "machine_hardware_command_spawn_failure_status");
     suite.expect(failure.size() > 0, "machine_hardware_command_spawn_failure_message");
+  }
+
+  {
+    constexpr const char *sentinelName = "PRODIGY_HARDWARE_INVENTORY_SHELL_SENTINEL";
+    ScopedEnvironmentValue restoreSentinel(sentinelName, "outer snapshot value with whitespace");
+    ProdigyHardwareInventoryShell outer = {};
+    const bool outerStarted = outer.start();
+    if (outerStarted)
+    {
+      ::setenv(sentinelName, "parent changed after outer snapshot", 1);
+      String prefix = {};
+      prodigyAppendCommandPrefix(prefix, 2);
+      suite.expect(stringContains(prefix, "timeout --preserve-status -k 1s 2s sh -c "),
+                   "machine_hardware_inventory_shell_active_uses_nonlogin_shell");
+
+      auto childSeesSnapshot = [] {
+        String output;
+        return prodigyRunBlockingLocalCommandCaptureStdout(
+                   "printf '%s' \"$PRODIGY_HARDWARE_INVENTORY_SHELL_SENTINEL\""_ctv, output) &&
+               output == "outer snapshot value with whitespace"_ctv;
+      };
+      suite.expect(childSeesSnapshot(), "machine_hardware_inventory_shell_child_sees_outer_snapshot");
+      suite.expect(std::strcmp(std::getenv(sentinelName), "parent changed after outer snapshot") == 0,
+                   "machine_hardware_inventory_shell_preserves_parent_mutation");
+      {
+        ProdigyHardwareInventoryShell inner;
+        suite.expect(inner.start() && childSeesSnapshot(), "machine_hardware_inventory_shell_nested_scope_shares_outer_snapshot");
+      }
+      suite.expect(childSeesSnapshot(), "machine_hardware_inventory_shell_nested_scope_restores_outer_snapshot");
+
+      String output, failure;
+      int exitStatus = -1;
+      suite.expect(!prodigyRunBlockingLocalCommandCaptureStdout("printf snapshot-stdout; exit 7"_ctv, output, &exitStatus, &failure) &&
+                       output == "snapshot-stdout"_ctv && exitStatus == 7 && failure.size() > 0,
+                   "machine_hardware_inventory_shell_failure_stdout_and_status");
+    }
+    else
+    {
+      String prefix;
+      prodigyAppendCommandPrefix(prefix, 2);
+      suite.expect(stringContains(prefix, "2s sh -lc "), "unsupported_inventory_environment_keeps_login_probes");
+    }
+  }
+
+  {
+    String prefix = {};
+    prodigyAppendCommandPrefix(prefix, 2);
+    suite.expect(stringContains(prefix, "timeout --preserve-status -k 1s 2s sh -lc "),
+                 "machine_hardware_inventory_shell_destruction_restores_login_shell");
   }
 
   {
