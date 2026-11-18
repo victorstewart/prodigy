@@ -4319,7 +4319,7 @@ public:
         validatedPlans.push_back(std::move(validated));
         continue;
       }
-      if (deploymentLaunchFenced(plan.config.deploymentID()))
+      if (pairedSourceRetirementLaunchFencedInValidatedJournal(uploadRetirements, plan.config.deploymentID()))
       {
         malformedStateUpload = true;
         return false;
@@ -12356,10 +12356,9 @@ public:
     return decodeContainerRetirementJournal(masterAuthorityRuntimeState, journal) ? journal.version : UINT32_MAX;
   }
 
-  bool pairedSourceRetirementLaunchFenced(uint64_t deploymentID) const
+  bool pairedSourceRetirementLaunchFencedInValidatedJournal(
+      const ProdigyContainerRetirementJournal& journal, uint64_t deploymentID) const
   {
-    ProdigyContainerRetirementJournal journal = {};
-    if (!decodeContainerRetirementJournal(masterAuthorityRuntimeState, journal)) return true;
     const auto *fence = prodigyFindPairedSourceRetirementFenceByDeploymentInValidatedJournal(journal, deploymentID);
     if (!fence) return false;
     if (fence->hasStatefulScope) return false; // scoped fence, never a sibling deployment cancellation
@@ -12376,6 +12375,13 @@ public:
         desired.sourceClusterUUID == fence->targetClusterUUID &&
         desired.targetClusterUUID == fence->sourceClusterUUID) return false;
     return true;
+  }
+
+  bool pairedSourceRetirementLaunchFenced(uint64_t deploymentID) const
+  {
+    ProdigyContainerRetirementJournal journal = {};
+    return !decodeContainerRetirementJournal(masterAuthorityRuntimeState, journal) ||
+           pairedSourceRetirementLaunchFencedInValidatedJournal(journal, deploymentID);
   }
 
   bool deploymentLaunchFenced(uint64_t deploymentID) const override
