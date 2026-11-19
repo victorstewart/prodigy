@@ -18,6 +18,7 @@ enum Commands {
     Build(BuildCommand),
     Bundle(BundleCommand),
     Remote(RemoteCommand),
+    InspectGatewayArtifact(InspectGatewayArtifactCommand),
     #[command(hide = true)]
     InternalRun(InternalRunCommand),
 }
@@ -113,6 +114,25 @@ pub struct InternalRunCommand {
 }
 
 #[derive(Args)]
+pub struct InspectGatewayArtifactCommand {
+    #[arg(long)]
+    pub artifact: PathBuf,
+
+    #[arg(long)]
+    pub expected_sha256: String,
+
+    #[arg(long)]
+    pub expected_bytes: u64,
+
+    /// Existing task-owned scratch directory beneath a .run owner.
+    #[arg(long)]
+    pub scratch_root: PathBuf,
+
+    #[arg(long)]
+    pub output: PathBuf,
+}
+
+#[derive(Args)]
 struct RemoteCommand {
     #[command(subcommand)]
     subcommand: RemoteSubcommand,
@@ -158,6 +178,7 @@ pub fn run() -> Result<()> {
         Commands::Build(command) => build::run(command),
         Commands::Bundle(command) => run_bundle(command),
         Commands::Remote(command) => run_remote(command),
+        Commands::InspectGatewayArtifact(command) => build::inspect_gateway_artifact(command),
         Commands::InternalRun(command) => build::run_internal(command),
     }
 }

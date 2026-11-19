@@ -1542,6 +1542,91 @@ public:
     return installCrossClusterPrivateBGPSecret(response);
   }
 
+  bool seedPrivateBGPStartupRetryForTest(
+      const CrossClusterMasqueGatewayAuthority& authority,
+      const ProdigyCrossClusterMasqueGatewayReadiness& readiness,
+      uint128_t containerUUID)
+  {
+    uuid = authority.localMachineUUID;
+    crossClusterMasqueGatewayRuntimes.clear();
+    crossClusterMasqueGatewayRuntimes.emplace_back();
+    auto& runtime = crossClusterMasqueGatewayRuntimes.back();
+    runtime.authority = authority;
+    runtime.readiness = readiness;
+    runtime.systemContainerUUID = containerUUID;
+    runtime.systemPlanAdmitted = true;
+    runtime.privateTunnelBGP = std::make_unique<NeuronPrivateTunnelBGPRuntime>();
+    ProdigyPairPrivateBGPSecretDeliveryResponse delivered = {};
+    delivered.accepted = true;
+    delivered.scope.pairUUID = authority.pairUUID;
+    delivered.scope.operationUUID = authority.pairOperationUUID;
+    delivered.scope.keyEpoch = authority.keyGeneration;
+    delivered.scope.tunnelSlot = authority.tunnelSlot;
+    delivered.scope.clusterUUID = authority.localClusterUUID;
+    delivered.scope.machineUUID = authority.localMachineUUID;
+    delivered.scope.authorityGeneration = authority.pairAuthorityGeneration;
+    delivered.scope.gatewayGeneration = authority.generation;
+    delivered.credential.assign("0123456789abcdef0123456789abcdef"_ctv);
+    return runtime.privateTunnelBGP->installDeliveredSecret(delivered);
+  }
+
+  bool schedulePrivateBGPStartupRetryForTest(uint128_t pairUUID)
+  {
+    auto *runtime = crossClusterMasqueGatewayRuntimeForPair(pairUUID);
+    if (runtime == nullptr) return false;
+    schedulePrivateBGPStartupRetry(*runtime);
+    return runtime->privateBGPStartupRetryPending;
+  }
+
+  bool privateBGPStartupRetryPendingForTest(uint128_t pairUUID) const
+  {
+    for (const auto& runtime : crossClusterMasqueGatewayRuntimes)
+      if (runtime.authority.pairUUID == pairUUID) return runtime.privateBGPStartupRetryPending;
+    return false;
+  }
+
+  bool privateBGPStartupRetryQueuedForTest() const
+  {
+    return privateBGPStartupRetryQueued;
+  }
+
+  bool revokePrivateBGPStartupRetryReadinessForTest(uint128_t pairUUID)
+  {
+    auto *runtime = crossClusterMasqueGatewayRuntimeForPair(pairUUID);
+    if (runtime == nullptr) return false;
+    (void)revokeCrossClusterMasqueGatewayReadiness(runtime->systemContainerUUID);
+    return !runtime->privateBGPStartupRetryPending;
+  }
+
+  bool withdrawPrivateBGPStartupRetrySecretForTest(uint128_t pairUUID)
+  {
+    auto *runtime = crossClusterMasqueGatewayRuntimeForPair(pairUUID);
+    if (runtime == nullptr) return false;
+    ProdigyPairPrivateBGPSecretScope scope = {};
+    scope.pairUUID = runtime->authority.pairUUID;
+    scope.operationUUID = runtime->authority.pairOperationUUID;
+    scope.keyEpoch = runtime->authority.keyGeneration;
+    scope.tunnelSlot = runtime->authority.tunnelSlot;
+    scope.clusterUUID = runtime->authority.localClusterUUID;
+    scope.machineUUID = runtime->authority.localMachineUUID;
+    scope.authorityGeneration = runtime->authority.pairAuthorityGeneration;
+    scope.gatewayGeneration = runtime->authority.generation;
+    return withdrawCrossClusterPrivateBGPSecret(scope);
+  }
+
+  bool advancePrivateBGPStartupRetryAuthorityForTest(CrossClusterMasqueGatewayAuthority authority)
+  {
+    return reconcileCrossClusterMasqueGatewayAuthority(authority);
+  }
+
+  bool faultPrivateBGPStartupRetryForTest(uint128_t pairUUID)
+  {
+    auto *runtime = crossClusterMasqueGatewayRuntimeForPair(pairUUID);
+    if (runtime == nullptr) return false;
+    runtime->faultLeaseActive = true;
+    return reconcileCrossClusterMasqueGatewayBGP(*runtime) == false;
+  }
+
   void queueCrossClusterMasqueGatewayPlanForTest(ContainerPlan plan)
   {
     Neuron::launchContainerFromBrain(std::move(plan), 0, {}, {});
@@ -2228,6 +2313,41 @@ public:
   bool retainedGatewayStateUploadRestorePendingForTest(uint128_t containerUUID) const
   {
     return pendingStateUploadRestores.contains(containerUUID) && !containers.contains(containerUUID);
+  }
+
+  bool stageGatewayStateUploadRecoveryForTest(ContainerPlan plan, bool coldRestart)
+  {
+    if (plan.uuid == 0 ||
+        plan.system.kind != SystemContainerKind::crossClusterMasqueGateway)
+    {
+      return false;
+    }
+    if (brain == nullptr) seedBrainStreamForTest(true);
+    if (brain == nullptr || !streamIsActive(brain)) return false;
+    stateUploadRestoreEpoch = 1;
+    auto operation = std::make_unique<StateUploadRestoreOperation>();
+    operation->container = std::make_unique<Container>();
+    operation->container->plan = std::move(plan);
+    operation->fragment = lcsubnet6;
+    operation->stream = brain;
+    operation->streamGeneration = brain->ioGeneration;
+    operation->requestedStream = brain;
+    operation->requestedGeneration = brain->ioGeneration;
+    operation->epoch = stateUploadRestoreEpoch;
+    operation->coldRestart = coldRestart;
+    operation->settled = true;
+    operation->launchAdmissionGeneration =
+        beginPendingContainerLaunch(operation->container->plan);
+    if (operation->launchAdmissionGeneration == 0) return false;
+    const uint128_t uuid = operation->container->plan.uuid;
+    pendingStateUploadRestores.insert_or_assign(uuid, std::move(operation));
+    stateUploadRestoreReplyPending = true;
+    return true;
+  }
+
+  void retrySettledStateUploadGatewayRecoveriesForTest()
+  {
+    retrySettledStateUploadGatewayRecoveries();
   }
 
   uint64_t stageRetainedStateUploadForControlReplacementTest(ContainerPlan plan)
@@ -9443,6 +9563,71 @@ static void testCrossClusterMasqueGatewayLifecycleOnSharedHost(TestSuite& suite)
                    plans[0].system.gatewayGeneration == first.generation && plans[1].system.gatewayGeneration == second.generation,
                "cross_cluster_masque_gateway_shared_host_launches_normal_system_plans_at_reserved_fragments");
 
+  // A complete, empty projection is authoritative withdrawal. A cold
+  // gateway cannot wait for an authority that the current stream has already
+  // omitted, because that wait also suppresses the state upload needed for
+  // Brain to retire overfull historical projection records.
+  auto coldGatewayPlan = plans[0];
+  coldGatewayPlan.uuid = 0xc1f10001;
+  TestNeuron projectionAfterCold = {};
+  projectionAfterCold.configureGatewayIdentityForTest(host.uuid, brain.brainConfig.clusterUUID);
+  suite.require(projectionAfterCold.stageGatewayStateUploadRecoveryForTest(
+                    coldGatewayPlan, true),
+                "cold_gateway_absence_stages_before_projection");
+  projectionAfterCold.retrySettledStateUploadGatewayRecoveriesForTest();
+  suite.expect(projectionAfterCold.retainedGatewayStateUploadRestorePendingForTest(
+                   coldGatewayPlan.uuid),
+               "cold_gateway_absence_waits_before_any_projection");
+  suite.require(projectionAfterCold.reconcileCrossClusterMasqueGatewayProjectionForTest(
+                    Vector<CrossClusterMasqueGatewayAuthority>{}),
+                "cold_gateway_absence_accepts_empty_current_projection");
+  suite.expect(!projectionAfterCold.retainedGatewayStateUploadRestorePendingForTest(
+                   coldGatewayPlan.uuid),
+               "cold_gateway_absence_retires_after_projection_following_state_upload");
+
+  TestNeuron projectionBeforeCold = {};
+  projectionBeforeCold.configureGatewayIdentityForTest(host.uuid, brain.brainConfig.clusterUUID);
+  projectionBeforeCold.seedBrainStreamForTest(true);
+  suite.require(projectionBeforeCold.reconcileCrossClusterMasqueGatewayProjectionForTest(
+                    Vector<CrossClusterMasqueGatewayAuthority>{}) &&
+                    projectionBeforeCold.stageGatewayStateUploadRecoveryForTest(coldGatewayPlan, true),
+                "cold_gateway_absence_accepts_projection_before_state_upload");
+  projectionBeforeCold.retrySettledStateUploadGatewayRecoveriesForTest();
+  suite.expect(!projectionBeforeCold.retainedGatewayStateUploadRestorePendingForTest(
+                   coldGatewayPlan.uuid),
+               "cold_gateway_absence_retires_after_state_upload_following_projection");
+
+  TestNeuron staleProjection = {};
+  staleProjection.configureGatewayIdentityForTest(host.uuid, brain.brainConfig.clusterUUID);
+  staleProjection.seedBrainStreamForTest(true);
+  suite.require(staleProjection.reconcileCrossClusterMasqueGatewayProjectionForTest(
+                    Vector<CrossClusterMasqueGatewayAuthority>{}),
+                "cold_gateway_absence_records_initial_projection_generation");
+  staleProjection.replaceBrainControlForPendingLaunchTest();
+  suite.require(staleProjection.stageGatewayStateUploadRecoveryForTest(coldGatewayPlan, true),
+                "cold_gateway_absence_stages_after_control_replacement");
+  staleProjection.retrySettledStateUploadGatewayRecoveriesForTest();
+  suite.expect(staleProjection.retainedGatewayStateUploadRestorePendingForTest(
+                   coldGatewayPlan.uuid),
+               "cold_gateway_absence_stale_projection_generation_keeps_candidate_fenced");
+  suite.require(staleProjection.reconcileCrossClusterMasqueGatewayProjectionForTest(
+                    Vector<CrossClusterMasqueGatewayAuthority>{}),
+                "cold_gateway_absence_accepts_replacement_projection");
+  suite.expect(!staleProjection.retainedGatewayStateUploadRestorePendingForTest(
+                   coldGatewayPlan.uuid),
+               "cold_gateway_absence_current_projection_generation_retires_candidate");
+
+  TestNeuron retainedGateway = {};
+  retainedGateway.configureGatewayIdentityForTest(host.uuid, brain.brainConfig.clusterUUID);
+  suite.require(retainedGateway.stageGatewayStateUploadRecoveryForTest(coldGatewayPlan, false) &&
+                    retainedGateway.reconcileCrossClusterMasqueGatewayProjectionForTest(
+                        Vector<CrossClusterMasqueGatewayAuthority>{}),
+                "retained_gateway_absence_accepts_empty_projection");
+  retainedGateway.retrySettledStateUploadGatewayRecoveriesForTest();
+  suite.expect(retainedGateway.retainedGatewayStateUploadRestorePendingForTest(
+                   coldGatewayPlan.uuid),
+               "retained_gateway_absence_keeps_live_candidate_fenced");
+
   host.neuron.wBuffer.clear(); brain.reconcileCrossClusterMasqueGatewayRuntimeState();
   suite.expect(host.neuron.wBuffer.empty() && brain.crossClusterMasqueGatewayBrainRuntimes.size() == 2,
                "cross_cluster_masque_gateway_shared_host_reconcile_is_idempotent");
@@ -9923,6 +10108,211 @@ static void testCrossClusterMasqueGatewayLifecycleOnSharedHost(TestSuite& suite)
                "cross_cluster_masque_gateway_pending_fragment_move_requeues_exact_old_kill_after_registration");
 }
 
+static void testGatewayInventoryBatchAdoptionWaitsForOneDurableReceipt(TestSuite& suite)
+{
+  ScopedRing ring = {};
+  struct GatewayInventoryBrain : TestBrain
+  {
+    ProdigyPersistentMasterAuthorityPackage lastPersistedMasterAuthorityPackage = {};
+
+    bool persistLocalRuntimeState(void) override
+    {
+      capturePersistentMasterAuthorityPackage(lastPersistedMasterAuthorityPackage);
+      return TestBrain::persistLocalRuntimeState();
+    }
+  };
+  GatewayInventoryBrain brain = {};
+  BrainBase *savedBrain = thisBrain;
+  thisBrain = &brain;
+  brain.weAreMaster = true;
+  brain.brainConfig.clusterUUID = 0xf100;
+  brain.brainConfig.datacenterFragment = 1;
+  brain.masterAuthorityEpoch = 1;
+  brain.masterAuthorityRuntimeState.generation = 10;
+  brain.masterAuthorityRuntimeStateDurable = true;
+  brain.durableMasterAuthorityRuntimeStateGeneration = 10;
+
+  Machine host = {};
+  host.uuid = 0xf101;
+  host.fragment = 0xf101;
+  host.state = MachineState::healthy;
+  host.runtimeReady = true;
+  host.neuron.machine = &host;
+  host.neuron.connected = true;
+  host.neuron.isFixedFile = true;
+  host.neuron.fslot = 95;
+  brain.machines.insert(&host);
+  brain.machinesByUUID.insert_or_assign(host.uuid, &host);
+  brain.neurons.insert(&host.neuron);
+  brain.persistedMachineInventoryUploaded.insert(host.uuid);
+
+  String artifact = prodigyDiscombobulatorCrossClusterMasqueGatewayBlobHeaderText();
+  artifact.append("gateway-batch-adoption"_ctv);
+  String sha = {}, failure = {};
+  if (!suite.require(prodigyComputeSHA256Hex(artifact, sha) &&
+                         brain.applySystemContainerArtifact(
+                             SystemContainerKind::crossClusterMasqueGateway,
+                             sha, artifact.size(), artifact, false, &failure),
+                     "gateway_batch_adoption_artifact_available"))
+  {
+    thisBrain = savedBrain;
+    return;
+  }
+
+  auto authority = [&](uint128_t pair, uint128_t operation, uint128_t peer,
+                       uint8_t slot, uint8_t fragment, const String& interface) {
+    CrossClusterMasqueGatewayAuthority value = {};
+    value.pairUUID = pair;
+    value.pairOperationUUID = operation;
+    value.localClusterUUID = brain.brainConfig.clusterUUID;
+    value.peerClusterUUID = pair + 0x1000;
+    value.localMachineUUID = host.uuid;
+    value.peerMachineUUID = peer;
+    value.localDatacenterFragment = 1;
+    value.peerDatacenterFragment = uint8_t(2 + slot);
+    value.localSitePrefix = prodigyContainerDatacenterSitePrefix(1);
+    value.peerSitePrefix = prodigyContainerDatacenterSitePrefix(value.peerDatacenterFragment);
+    value.artifactSHA256 = sha;
+    value.artifactBytes = artifact.size();
+    value.listenerPublicUDPEndpoint.is6 = true;
+    value.listenerPublicUDPEndpoint.v6[0] = 0x20;
+    value.listenerPublicUDPEndpoint.v6[1] = 1;
+    value.listenerPublicUDPEndpoint.v6[15] = uint8_t(20 + slot);
+    value.listenerPublicUDPPort = 4433;
+    value.tunnelSlot = slot;
+    value.gatewaySlot = 0;
+    value.privateTunnelInterface = interface;
+    value.privateTunnelLocalIPv6.is6 = value.privateTunnelPeerIPv6.is6 = true;
+    value.privateTunnelLocalIPv6.v6[0] = value.privateTunnelPeerIPv6.v6[0] = 0xfd;
+    value.privateTunnelLocalIPv6.v6[15] = uint8_t(1 + slot * 2);
+    value.privateTunnelPeerIPv6.v6[15] = uint8_t(2 + slot * 2);
+    value.privateLocalASN = uint16_t(42001 + slot);
+    value.privatePeerASN = uint16_t(42101 + slot);
+    value.privateLocalBGPID = 1 + slot;
+    value.privatePeerBGPID = 101 + slot;
+    value.privateSessionCredentialSHA256.assign("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"_ctv);
+    value.localIdentitySHA256.assign("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"_ctv);
+    value.peerIdentitySHA256.assign("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"_ctv);
+    value.peerTrustSHA256.assign("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"_ctv);
+    value.generation = 1;
+    value.pairAuthorityGeneration = 7;
+    value.keyGeneration = 3;
+    value.runtimeFragment = fragment;
+    value.localRole = CrossClusterMasqueGatewayRole::listener;
+    value.state = CrossClusterMasqueGatewayState::active;
+    return value;
+  };
+  const auto first = authority(0xf110, 0xf111, 0xf112, 0,
+      prodigyCrossClusterMasqueGatewayRuntimeFragmentFirst, "batch-gateway-a"_ctv);
+  const auto second = authority(0xf120, 0xf121, 0xf122, 1,
+      prodigyCrossClusterMasqueGatewayRuntimeFragmentSecond, "batch-gateway-b"_ctv);
+  for (const auto& value : {first, second})
+  {
+    ProdigyClusterPairEnrollment enrollment = {};
+    enrollment.pairUUID = value.pairUUID;
+    enrollment.localClusterUUID = value.localClusterUUID;
+    enrollment.peerClusterUUID = value.peerClusterUUID;
+    enrollment.operationUUID = value.pairOperationUUID;
+    enrollment.rootGeneration = 1;
+    enrollment.agreedKeyEpoch = value.keyGeneration;
+    enrollment.localAuthorityGeneration = value.pairAuthorityGeneration;
+    enrollment.state = ProdigyClusterPairEnrollmentState::active;
+    ProdigyClusterPairEnrollmentOperation operation = {};
+    operation.pairUUID = value.pairUUID;
+    operation.operationUUID = value.pairOperationUUID;
+    operation.localAuthorityGeneration = value.pairAuthorityGeneration;
+    operation.initialProjectionDelivered = true;
+    brain.masterAuthorityRuntimeState.clusterPairEnrollments.push_back(std::move(enrollment));
+    brain.masterAuthorityRuntimeState.clusterPairEnrollmentOperations.push_back(std::move(operation));
+  }
+  brain.masterAuthorityRuntimeState.crossClusterMasqueGatewayAuthorities = {first, second};
+
+  ContainerPlan firstPlan = {}, secondPlan = {};
+  if (!suite.require(
+          brain.buildCrossClusterMasqueGatewayPlan(first, first.runtimeFragment,
+                                                   uint128_t(0xf131), firstPlan) &&
+              brain.buildCrossClusterMasqueGatewayPlan(second, second.runtimeFragment,
+                                                       uint128_t(0xf132), secondPlan),
+          "gateway_batch_adoption_builds_two_current_unknown_gateway_plans"))
+  {
+    thisBrain = savedBrain;
+    return;
+  }
+
+  auto uploadBoth = [&] {
+    String upload = {};
+    const uint32_t header = Message::appendHeader(upload, NeuronTopic::stateUpload);
+    local_container_subnet6 fragment = {};
+    fragment.dpfx = brain.brainConfig.datacenterFragment;
+    fragment.mpfx[0] = uint8_t((host.fragment >> 16) & 0xff);
+    fragment.mpfx[1] = uint8_t((host.fragment >> 8) & 0xff);
+    fragment.mpfx[2] = uint8_t(host.fragment & 0xff);
+    Message::appendAlignedBuffer<Alignment::one>(upload,
+        reinterpret_cast<const uint8_t *>(&fragment), sizeof(fragment));
+    for (const ContainerPlan *plan : {&firstPlan, &secondPlan})
+    {
+      String serialized = {};
+      suite.require(BitseryEngine::serialize(serialized, *plan),
+                    "gateway_batch_adoption_serializes_current_gateway_plan");
+      Message::appendValue(upload, serialized);
+    }
+    Message::finish(upload, header);
+    brain.neuronHandler(&host.neuron, reinterpret_cast<Message *>(upload.data()));
+  };
+
+  brain.holdRuntimePersistence = true;
+  uploadBoth();
+  const auto containsRuntime = [&](uint128_t uuid) {
+    return std::any_of(brain.crossClusterMasqueGatewayBrainRuntimes.begin(),
+                       brain.crossClusterMasqueGatewayBrainRuntimes.end(),
+                       [&](const auto& runtime) { return runtime.plan.uuid == uuid; });
+  };
+  const auto persistedPackageContains = [&](uint128_t uuid) {
+    return std::any_of(
+        brain.lastPersistedMasterAuthorityPackage.containerRuntimeStates.begin(),
+        brain.lastPersistedMasterAuthorityPackage.containerRuntimeStates.end(),
+        [&](const auto& state) {
+          return state.plan.system.kind == SystemContainerKind::crossClusterMasqueGateway &&
+                 state.plan.uuid == uuid;
+        });
+  };
+  uint32_t spinBeforeReceipt = 0;
+  forEachMessageInBuffer(host.neuron.wBuffer, [&](Message *message) {
+    if (NeuronTopic(message->topic) == NeuronTopic::spinContainer) ++spinBeforeReceipt;
+  });
+  suite.expect(brain.persistCalls == 1 && brain.pendingRuntimePersistence.size() == 1 &&
+                   brain.crossClusterMasqueGatewayBrainRuntimes.size() == 2 &&
+                   containsRuntime(firstPlan.uuid) && containsRuntime(secondPlan.uuid) &&
+                   persistedPackageContains(firstPlan.uuid) &&
+                   persistedPackageContains(secondPlan.uuid) &&
+                   !host.runtimeReady &&
+                   !brain.persistedMachineInventoryUploaded.contains(host.uuid) &&
+                   spinBeforeReceipt == 0,
+               "gateway_batch_adoption_retains_all_reported_owners_before_one_durable_receipt");
+
+  brain.reconcileCrossClusterMasqueGatewayRuntimeState();
+  uint32_t spinDuringWithheldReceipt = 0;
+  forEachMessageInBuffer(host.neuron.wBuffer, [&](Message *message) {
+    if (NeuronTopic(message->topic) == NeuronTopic::spinContainer) ++spinDuringWithheldReceipt;
+  });
+  suite.expect(brain.crossClusterMasqueGatewayBrainRuntimes.size() == 2 &&
+                   !host.runtimeReady &&
+                   !brain.persistedMachineInventoryUploaded.contains(host.uuid) &&
+                   spinDuringWithheldReceipt == 0,
+               "gateway_batch_adoption_fences_machine_and_inventory_while_persistence_is_withheld");
+
+  brain.finishRuntimePersistence(true);
+  brain.holdRuntimePersistence = false;
+  host.neuron.wBuffer.clear();
+  uploadBoth();
+  suite.expect(brain.crossClusterMasqueGatewayBrainRuntimes.size() == 2 &&
+                   containsRuntime(firstPlan.uuid) && containsRuntime(secondPlan.uuid) &&
+                   host.runtimeReady && brain.persistedMachineInventoryUploaded.contains(host.uuid) &&
+                   brain.persistCalls == 1,
+               "gateway_batch_adoption_replay_after_durable_receipt_keeps_both_original_uuids_without_extra_owner");
+  thisBrain = savedBrain;
+}
+
 static void testCrossClusterMasqueGatewayConnectorLeaseLifecycle(TestSuite& suite)
 {
   ScopedRing ring = {};
@@ -9941,6 +10331,7 @@ static void testCrossClusterMasqueGatewayConnectorLeaseLifecycle(TestSuite& suit
   host.neuron.machine = &host; host.neuron.connected = true;
   host.neuron.isFixedFile = true; host.neuron.fslot = 93;
   brain.machines.insert(&host); brain.machinesByUUID.insert_or_assign(host.uuid, &host);
+  brain.masterAuthorityRuntimeState.machineFragmentAssignments.push_back({host.uuid, host.fragment});
   brain.neurons.insert(&host.neuron); brain.persistedMachineInventoryUploaded.insert(host.uuid);
   String artifact = prodigyDiscombobulatorCrossClusterMasqueGatewayBlobHeaderText();
   artifact.append("connector-lease-test"_ctv);
@@ -9991,6 +10382,11 @@ static void testCrossClusterMasqueGatewayConnectorLeaseLifecycle(TestSuite& suit
       brain.routableResourceLeaseRuntimeState.size() == 2 && !brain.pendingRuntimePersistence.empty(),
       "masque_connector_lease_waits_for_durable_reservation");
   brain.finishRuntimePersistence(true); brain.holdRuntimePersistence = false;
+  suite.expect(brain.crossClusterMasqueGatewayBrainRuntimes.size() == 1 &&
+      !brain.crossClusterMasqueGatewayBrainRuntimes[0].launchDispatched &&
+      !brain.pendingRuntimePersistence.empty(),
+      "masque_connector_retained_uuid_waits_for_durable_package");
+  brain.finishRuntimePersistence(true);
   suite.expect(brain.crossClusterMasqueGatewayBrainRuntimes.size() == 1 &&
       brain.crossClusterMasqueGatewayBrainRuntimes[0].launchDispatched,
       "masque_connector_durable_lease_wakes_gateway_launch");
@@ -10340,9 +10736,13 @@ static void testCrossClusterMasqueGatewayConnectorLeaseLifecycle(TestSuite& suit
   Vector<String> gatewayRecoveryBootstraps = {};
   NeuronContainerBootstrap capturedApplication = {}, capturedGateway = {};
   bool foundApplication = false, foundGateway = false;
+  String recoveryInventoryDiagnostic = {};
   const bool capturedRecoveryInventory =
-      promoted.collectAuthenticatedNeuronStateUploadBootstraps(&host, gatewayRecoveryBootstraps) &&
+      promoted.collectAuthenticatedNeuronStateUploadBootstraps(
+          &host, gatewayRecoveryBootstraps, &recoveryInventoryDiagnostic) &&
       gatewayRecoveryBootstraps.size() == 2;
+  if (!capturedRecoveryInventory)
+    std::fprintf(stderr, "gateway recovery inventory: %s\n", recoveryInventoryDiagnostic.c_str());
   if (capturedRecoveryInventory)
   {
     for (const String& serialized : gatewayRecoveryBootstraps)
@@ -10387,6 +10787,80 @@ static void testCrossClusterMasqueGatewayConnectorLeaseLifecycle(TestSuite& suit
   suite.expect(normalRecoveryProjection && normalGatewayFound &&
       normalGateway.plan.system.gatewayGeneration == a.generation,
       "masque_connector_normal_replay_projects_current_gateway_before_fresh_inventory");
+
+  // Promotion must replay a persisted system runtime before a fresh Neuron
+  // inventory; it is not authenticated merely because it came from disk.
+  ProdigyPersistentMasterAuthorityPackage gatewayRuntimePackage = {};
+  promoted.capturePersistentMasterAuthorityPackage(gatewayRuntimePackage);
+  String serializedGatewayRuntimePackage = {};
+  ProdigyPersistentMasterAuthorityPackage deserializedGatewayRuntimePackage = {};
+  const bool gatewayRuntimePackageRoundTrip =
+      BitseryEngine::serialize(serializedGatewayRuntimePackage, gatewayRuntimePackage) &&
+      BitseryEngine::deserializeSafe(
+          serializedGatewayRuntimePackage, deserializedGatewayRuntimePackage);
+  TestBrain restoredGateway = {};
+  restoredGateway.brainConfig = promoted.brainConfig;
+  Machine restoredGatewayMachine = {};
+  restoredGatewayMachine.uuid = host.uuid;
+  restoredGatewayMachine.private4 = host.private4;
+  restoredGatewayMachine.fragment = host.fragment;
+  restoredGatewayMachine.state = MachineState::healthy;
+  restoredGatewayMachine.runtimeReady = false;
+  restoredGateway.machines.insert(&restoredGatewayMachine);
+  restoredGateway.machinesByUUID.insert_or_assign(restoredGatewayMachine.uuid, &restoredGatewayMachine);
+  Vector<String> persistedGatewayReplay = {};
+  const bool gatewayRuntimePackageRestored =
+      gatewayRuntimePackageRoundTrip &&
+      restoredGateway.applyPersistentMasterAuthorityPackage(deserializedGatewayRuntimePackage) &&
+      restoredGateway.crossClusterMasqueGatewayBrainRuntimes.size() == 1 &&
+      restoredGateway.crossClusterMasqueGatewayBrainRuntimes[0].plan.uuid == plan.uuid &&
+      !restoredGateway.crossClusterMasqueGatewayBrainRuntimes[0].authenticatedInventory &&
+      restoredGateway.collectNeuronStateUploadBootstraps(&restoredGatewayMachine, persistedGatewayReplay);
+  bool persistedGatewayFound = false;
+  for (const String& serialized : persistedGatewayReplay)
+  {
+    NeuronContainerBootstrap bootstrap = {};
+    if (BitseryEngine::deserializeSafe(serialized, bootstrap) && bootstrap.plan.uuid == plan.uuid) persistedGatewayFound = true;
+  }
+  suite.expect(gatewayRuntimePackageRestored && persistedGatewayFound,
+               "masque_gateway_package_replays_retained_uuid_before_inventory");
+  ProdigyPersistentMasterAuthorityPackage staleGatewayRuntimePackage = gatewayRuntimePackage;
+  for (BrainReplicatedContainerRuntimeState& state : staleGatewayRuntimePackage.containerRuntimeStates)
+    if (state.plan.uuid == plan.uuid) ++state.plan.system.gatewayGeneration;
+  TestBrain staleGateway = {}; staleGateway.brainConfig = promoted.brainConfig;
+  suite.expect(!staleGateway.applyPersistentMasterAuthorityPackage(staleGatewayRuntimePackage) &&
+               staleGateway.crossClusterMasqueGatewayBrainRuntimes.empty(),
+               "masque_gateway_package_rejects_stale_authority_without_authenticating");
+  bool restoredGatewayReapplied = false;
+  if (gatewayRuntimePackageRestored)
+  {
+    thisBrain = &restoredGateway;
+    auto& runtime = restoredGateway.crossClusterMasqueGatewayBrainRuntimes[0];
+    runtime.authenticatedInventory = true;
+    runtime.authenticatedInventoryIOGeneration = 17;
+    runtime.neuronIOGeneration = 17;
+    restoredGatewayReapplied = restoredGateway.applyPersistentMasterAuthorityPackage(deserializedGatewayRuntimePackage) &&
+        !runtime.authenticatedInventory && runtime.authenticatedInventoryIOGeneration == 0 &&
+        runtime.neuronIOGeneration == 0;
+  }
+  suite.expect(restoredGatewayReapplied,
+               "masque_gateway_package_reapply_clears_ephemeral_authentication");
+  ProdigyPersistentMasterAuthorityPackage collisionGatewayRuntimePackage = gatewayRuntimePackage;
+  bool collisionPrepared = false;
+  for (const auto& state : gatewayRuntimePackage.containerRuntimeStates)
+    if (state.plan.uuid == plan.uuid)
+    {
+      auto ordinary = state;
+      ordinary.plan.system = {};
+      collisionGatewayRuntimePackage.containerRuntimeStates.push_back(std::move(ordinary));
+      collisionPrepared = true;
+      break;
+    }
+  TestBrain collisionGateway = {}; collisionGateway.brainConfig = promoted.brainConfig;
+  suite.expect(collisionPrepared && !collisionGateway.applyPersistentMasterAuthorityPackage(collisionGatewayRuntimePackage) &&
+               collisionGateway.crossClusterMasqueGatewayBrainRuntimes.empty(),
+               "masque_gateway_package_rejects_cross_kind_uuid_collision");
+  thisBrain = &promoted;
 
   ProdigyPersistentUpdateSelfMachineRecoveryWitness gatewayWitness = {};
   gatewayWitness.machineUUID = host.uuid;
@@ -10446,6 +10920,7 @@ static void testCrossClusterMasqueGatewayConnectorLeaseLifecycle(TestSuite& suit
                        &host, staleGatewayWitness, replayFailure) &&
                    replayFailure == "durable retained gateway bootstrap does not match canonical authority"_ctv,
                "masque_connector_durable_witness_rejects_non_authoritative_gateway_fields");
+
   promoted.crossClusterMasqueGatewayBrainRuntimes = std::move(savedGatewayRuntimes);
   promoted.deployments.insert_or_assign(applicationDeploymentID, &applicationDeployment);
   promoted.deploymentsByApp.insert_or_assign(
@@ -23741,6 +24216,96 @@ static CrossClusterMasqueGatewayAuthority makeGatewayReadinessReplayAuthority()
   return authority;
 }
 
+static ProdigyCrossClusterMasqueGatewayReadiness makePrivateBGPStartupRetryReadiness(
+    const CrossClusterMasqueGatewayAuthority& authority)
+{
+  ProdigyCrossClusterMasqueGatewayReadiness readiness = {};
+  readiness.pairUUID = authority.pairUUID;
+  readiness.localClusterUUID = authority.localClusterUUID;
+  readiness.localMachineUUID = authority.localMachineUUID;
+  readiness.keyEpoch = authority.keyGeneration;
+  readiness.authorityGeneration = authority.pairAuthorityGeneration;
+  readiness.gatewayGeneration = authority.generation;
+  readiness.authenticatedMasqueQUICReady = true;
+  return readiness;
+}
+
+static void testPrivateBGPStartupRetryFences(TestSuite& suite)
+{
+  auto authority = makeGatewayReadinessReplayAuthority();
+  String credential = {};
+  credential.assign("0123456789abcdef0123456789abcdef"_ctv);
+  if (!suite.require(prodigyComputeSHA256Hex(credential, authority.privateSessionCredentialSHA256),
+                     "private_bgp_startup_retry_fixture_hashes_exact_delivered_credential"))
+  {
+    Vault::secureClearString(credential);
+    return;
+  }
+  Vault::secureClearString(credential);
+  const auto readiness = makePrivateBGPStartupRetryReadiness(authority);
+  constexpr uint128_t containerUUID = 0x6a07;
+
+  auto schedule = [&](TestNeuron& neuron) {
+    return neuron.seedPrivateBGPStartupRetryForTest(authority, readiness, containerUUID) &&
+        neuron.schedulePrivateBGPStartupRetryForTest(authority.pairUUID) &&
+        neuron.privateBGPStartupRetryPendingForTest(authority.pairUUID) &&
+        neuron.privateBGPStartupRetryQueuedForTest();
+  };
+
+  {
+    ScopedRing ring = {};
+    TestNeuron neuron = {};
+    suite.expect(schedule(neuron),
+                 "private_bgp_startup_retry_schedules_only_for_exact_admitted_ready_tuple");
+  }
+  {
+    ScopedRing ring = {};
+    TestNeuron neuron = {};
+    auto notReady = readiness;
+    notReady.authenticatedMasqueQUICReady = false;
+    suite.expect(neuron.seedPrivateBGPStartupRetryForTest(authority, notReady, containerUUID) &&
+                     !neuron.schedulePrivateBGPStartupRetryForTest(authority.pairUUID) &&
+                     !neuron.privateBGPStartupRetryQueuedForTest(),
+                 "private_bgp_startup_retry_rejects_unattested_masque_tuple");
+  }
+  {
+    ScopedRing ring = {};
+    TestNeuron neuron = {};
+    const bool scheduled = schedule(neuron);
+    const bool revoked = neuron.revokePrivateBGPStartupRetryReadinessForTest(authority.pairUUID);
+    suite.expect(scheduled && revoked && !neuron.privateBGPStartupRetryPendingForTest(authority.pairUUID),
+                 "private_bgp_startup_retry_readiness_revoke_cancels_pending_retry");
+  }
+  {
+    ScopedRing ring = {};
+    TestNeuron neuron = {};
+    const bool scheduled = schedule(neuron);
+    const bool withdrawn = neuron.withdrawPrivateBGPStartupRetrySecretForTest(authority.pairUUID);
+    suite.expect(scheduled && withdrawn && !neuron.privateBGPStartupRetryPendingForTest(authority.pairUUID),
+                 "private_bgp_startup_retry_secret_withdrawal_cancels_pending_retry");
+  }
+  {
+    ScopedRing ring = {};
+    TestNeuron neuron = {};
+    const bool scheduled = schedule(neuron);
+    auto nextAuthority = authority;
+    nextAuthority.generation += 1;
+    nextAuthority.pairAuthorityGeneration += 1;
+    nextAuthority.keyGeneration += 1;
+    const bool advanced = neuron.advancePrivateBGPStartupRetryAuthorityForTest(nextAuthority);
+    suite.expect(scheduled && advanced && !neuron.privateBGPStartupRetryPendingForTest(authority.pairUUID),
+                 "private_bgp_startup_retry_authority_advance_cancels_pending_retry");
+  }
+  {
+    ScopedRing ring = {};
+    TestNeuron neuron = {};
+    const bool scheduled = schedule(neuron);
+    const bool faulted = neuron.faultPrivateBGPStartupRetryForTest(authority.pairUUID);
+    suite.expect(scheduled && faulted && !neuron.privateBGPStartupRetryPendingForTest(authority.pairUUID),
+                 "private_bgp_startup_retry_fault_fence_cancels_pending_retry");
+  }
+}
+
 static void testGatewayReadinessReplayAfterCompleteStateUpload(TestSuite& suite)
 {
   ScopedRing scopedRing = {};
@@ -29298,8 +29863,34 @@ static void testBrainReplicatedContainerRuntimeStateRestoresTakeoverView(TestSui
   BitseryEngine::serialize(serialized, runtimeState);
 
   BrainView source = {};
+  source.uuid = uint128_t(0x52f0);
+  source.boottimens = 123'462;
+  source.connected = true;
+  source.isFixedFile = true;
+  source.fslot = 54;
+  source.registrationFresh = true;
   String buffer = {};
   Message *message = buildBrainMessage(buffer, BrainTopic::replicateContainerRuntimeState, serialized);
+
+  // A follower must ignore a full runtime state from a peer that is not its
+  // selected master, before parsing or applying the state.
+  brain.brainHandler(&source, message);
+  suite.expect(brain.containers.empty() && brain.persistCalls == 0,
+               "brain_replicated_runtime_state_rejects_nonmaster_peer");
+
+  source.isMasterBrain = true;
+  brain.weAreMaster = true;
+  buffer.clear();
+  message = buildBrainMessage(buffer, BrainTopic::replicateContainerRuntimeState, serialized);
+  brain.brainHandler(&source, message);
+  suite.expect(brain.containers.empty() && brain.persistCalls == 0,
+               "brain_replicated_runtime_state_master_rejects_peer_state");
+
+  // The ordinary selected-master -> follower path remains the only accepted
+  // full-state direction.
+  brain.weAreMaster = false;
+  buffer.clear();
+  message = buildBrainMessage(buffer, BrainTopic::replicateContainerRuntimeState, serialized);
   brain.brainHandler(&source, message);
 
   auto restoredIt = brain.containers.find(seed.uuid);
@@ -29505,6 +30096,127 @@ static void testBrainReplicatedContainerRuntimeStateRestoresTakeoverView(TestSui
   brain.machinesByUUID.erase(offline.uuid);
   brain.machines.erase(&machine);
   brain.machines.erase(&offline);
+  thisBrain = previousBrain;
+}
+
+static void testBrainReplicatedStatefulRuntimeRestoresDeclaredCardinality(TestSuite& suite)
+{
+  ScopedRing scopedRing = {};
+  TestBrain brain = {};
+  NoopBrainIaaS iaas = {};
+  brain.iaas = &iaas;
+  brain.weAreMaster = false;
+  brain.ignited = true;
+  brain.brainConfig.datacenterFragment = 1;
+
+  BrainBase *previousBrain = thisBrain;
+  thisBrain = &brain;
+
+  Rack rack = {};
+  rack.uuid = 62'123;
+  Machine machine = {};
+  machine.uuid = uint128_t(0x5211);
+  machine.private4 = 0x0A000031;
+  machine.state = MachineState::healthy;
+  machine.runtimeReady = true;
+  machine.fragment = 0x1236;
+  machine.rack = &rack;
+  machine.neuron.machine = &machine;
+  machine.neuron.isFixedFile = true;
+  machine.neuron.fslot = 43;
+  machine.neuron.connected = true;
+  brain.machines.insert(&machine);
+  brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+  brain.neurons.insert(&machine.neuron);
+
+  ApplicationDeployment deployment = {};
+  deployment.plan = makeDeploymentPlan(62'123, 1);
+  deployment.plan.isStateful = true;
+  deployment.plan.config.type = ApplicationType::stateful;
+  deployment.state = DeploymentState::none;
+  brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+  brain.deploymentsByApp.insert_or_assign(deployment.plan.config.applicationID, &deployment);
+
+  ContainerView seed = {};
+  seed.uuid = uint128_t(0x5212);
+  seed.deploymentID = deployment.plan.config.deploymentID();
+  seed.applicationID = deployment.plan.config.applicationID;
+  seed.machine = &machine;
+  seed.lifetime = ApplicationLifetime::base;
+  seed.isStateful = true;
+  seed.shardGroup = 0;
+  seed.state = ContainerState::scheduled;
+  seed.runtimeReady = false;
+  seed.fragment = 1;
+  seed.createdAtMs = 123'462;
+
+  BrainReplicatedContainerRuntimeState runtimeState = {};
+  runtimeState.machineUUID = machine.uuid;
+  runtimeState.machinePrivate4 = machine.private4;
+  runtimeState.plan = seed.generatePlan(deployment.plan, 3);
+
+  ProdigyStatefulServingAuthority authority = {};
+  authority.deploymentID = deployment.plan.config.deploymentID();
+  authority.applicationID = deployment.plan.config.applicationID;
+  authority.targetConfig = deployment.plan.config;
+  authority.phase = StatefulWorkerTopologyUpgradePhase::applicationDataAuthority;
+  authority.dataAuthority.shardGroup = 0;
+  authority.dataAuthority.nShardGroups = 3;
+  authority.members.push_back({runtimeState.plan.uuid, machine.uuid, 0});
+  brain.masterAuthorityRuntimeState.statefulServingAuthorities.push_back(authority);
+  brain.statefulServingRuntimeStates.push_back(runtimeState);
+  brain.masterAuthorityRuntimeStateDurable = true;
+  brain.durableMasterAuthorityRuntimeStateGeneration = brain.masterAuthorityRuntimeState.generation;
+
+  suite.require(brain.applyReplicatedContainerRuntimeStateNow(runtimeState) ==
+                    Brain::ReplicatedContainerRuntimeStateApplyResult::applied,
+                "stateful replicated runtime accepts an authority projected member");
+  Vector<String> replay = {};
+  NeuronContainerBootstrap bootstrap = {};
+  const bool replayed = brain.collectNeuronStateUploadBootstraps(&machine, replay) && replay.size() == 1 &&
+      BitseryEngine::deserializeSafe(replay.front(), bootstrap);
+  suite.expect(deployment.nShardGroups == 3 && replayed && bootstrap.plan.nShardGroups == 3,
+               "stateful replicated runtime restores declared cardinality for replay");
+
+  // Positive local cardinality keeps the historical replay path unchanged;
+  // recovery does not turn this zero-only repair into a sharding admission rule.
+  deployment.nShardGroups = 2;
+  suite.expect(brain.applyReplicatedContainerRuntimeStateNow(runtimeState) ==
+                    Brain::ReplicatedContainerRuntimeStateApplyResult::applied &&
+                   deployment.nShardGroups == 2,
+               "stateful replicated runtime preserves positive local cardinality");
+
+  // Projection deliberately preserves plan cardinality. A declared authority
+  // that differs from that retained plan cannot initialize a zero owner.
+  deployment.nShardGroups = 0;
+  brain.masterAuthorityRuntimeState.statefulServingAuthorities[0].dataAuthority.nShardGroups = 2;
+  suite.expect(brain.applyReplicatedContainerRuntimeStateNow(runtimeState) ==
+                    Brain::ReplicatedContainerRuntimeStateApplyResult::applied &&
+                   deployment.nShardGroups == 0,
+               "stateful replicated runtime keeps zero for declared plan cardinality mismatch");
+
+  // A member-only result is merely a lower bound. It must not recover a zero
+  // deployment from the incoming plan, even when that plan claims three groups.
+  brain.masterAuthorityRuntimeState.statefulServingAuthorities[0].phase = StatefulWorkerTopologyUpgradePhase::none;
+  suite.expect(brain.applyReplicatedContainerRuntimeStateNow(runtimeState) ==
+                    Brain::ReplicatedContainerRuntimeStateApplyResult::applied &&
+                   deployment.nShardGroups == 0,
+               "stateful replicated runtime does not infer cardinality from a member lower bound");
+
+  auto restored = brain.containers.find(runtimeState.plan.uuid);
+  if (restored != brain.containers.end())
+  {
+    deployment.containers.erase(restored->second);
+    while (deployment.containersByShardGroup.eraseEntry(restored->second->shardGroup, restored->second)) {}
+    machine.removeContainerIndexEntry(restored->second->deploymentID, restored->second);
+    delete restored->second;
+    brain.containers.erase(restored);
+  }
+  brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
+  brain.deployments.erase(deployment.plan.config.deploymentID());
+  brain.neurons.erase(&machine.neuron);
+  brain.machinesByUUID.erase(machine.uuid);
+  brain.machines.erase(&machine);
   thisBrain = previousBrain;
 }
 
@@ -36146,6 +36858,286 @@ static void testDurableWitnessReplaysThreeRetainedMachinesAfterProjectionReload(
     reloaded.machinesByUUID.erase(machine.uuid);
     reloaded.machines.erase(&machine);
   }
+  thisNeuron = previousNeuron;
+  thisBrain = previousBrain;
+}
+
+template <uint32_t machineCount>
+static void testRegisteredRecoveryWitnessDurablyPrunesAbsentStaleGateway(TestSuite& suite)
+{
+  ScopedFreshRing ring = {};
+  StreamingTestBrain brain = {};
+  Mesh mesh = {};
+  brain.mesh = &mesh;
+  brain.weAreMaster = true;
+  brain.ignited = true;
+  brain.nBrains = 3;
+  brain.brainConfig.clusterUUID = uint128_t(0x5221cc01);
+  brain.brainConfig.datacenterFragment = 1;
+  brain.masterAuthorityEpoch = 17;
+  brain.masterAuthorityRuntimeState.generation = 11;
+  brain.masterAuthorityRuntimeStateDurable = true;
+  brain.durableMasterAuthorityRuntimeStateGeneration = 11;
+  brain.recoveringPersistedNeuronInventory = true;
+  brain.persistedMachineInventoryEnumerated = true;
+
+  static_assert(machineCount >= 3);
+  Machine machines[machineCount] = {};
+  ContainerView liveContainers[machineCount] = {};
+  BrainView peers[2] = {};
+  TestNeuron selfBrain = {};
+  constexpr uint128_t staleGatewayUUID = uint128_t(0x5221f0ff);
+  constexpr uint128_t staleGatewayPairUUID = uint128_t(0x5221ee01);
+  NeuronBase *previousNeuron = thisNeuron;
+  BrainBase *previousBrain = thisBrain;
+  thisBrain = &brain;
+  for (uint32_t index = 0; index < machineCount; ++index)
+  {
+    Machine& machine = machines[index];
+    machine.uuid = uint128_t(0x5221f001 + index);
+    machine.state = MachineState::healthy;
+    machine.fragment = 0x120001 + index;
+    machine.runtimeReady = true;
+    machine.neuron.machine = &machine;
+    machine.neuron.isFixedFile = true;
+    machine.neuron.fslot = int(90 + index);
+    machine.neuron.connected = true;
+    brain.machines.insert(&machine);
+    brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+    brain.neurons.insert(&machine.neuron);
+    brain.masterAuthorityRuntimeState.machineFragmentAssignments.push_back({machine.uuid, machine.fragment});
+    brain.persistedMachineInventoryUploaded.insert(machine.uuid);
+
+    ContainerView& live = liveContainers[index];
+    live.uuid = uint128_t(0x5221f100 + index);
+    DeploymentPlan liveDeploymentPlan = makeDeploymentPlan(uint16_t(0x5221 + index), 1);
+    live.deploymentID = liveDeploymentPlan.config.deploymentID();
+    brain.deploymentPlans.insert_or_assign(live.deploymentID, liveDeploymentPlan);
+    live.machine = &machine;
+    machine.upsertContainerIndexEntry(live.deploymentID, &live);
+
+    ContainerPlan livePlan = {};
+    livePlan.uuid = live.uuid;
+    livePlan.fragment = uint8_t(index + 1);
+    livePlan.config = liveDeploymentPlan.config;
+    IPPrefix liveAddress = {};
+    liveAddress.network.is6 = true;
+    liveAddress.cidr = 128;
+    std::memcpy(liveAddress.network.v6, container_network_subnet6.value,
+                sizeof(container_network_subnet6.value));
+    liveAddress.network.v6[11] = brain.brainConfig.datacenterFragment;
+    liveAddress.network.v6[12] = uint8_t((machine.fragment >> 16) & 0xffu);
+    liveAddress.network.v6[13] = uint8_t((machine.fragment >> 8) & 0xffu);
+    liveAddress.network.v6[14] = uint8_t(machine.fragment & 0xffu);
+    liveAddress.network.v6[15] = livePlan.fragment;
+    livePlan.addresses.push_back(liveAddress);
+    NeuronContainerBootstrap liveBootstrap = {};
+    liveBootstrap.plan = livePlan;
+    String serializedLive = {};
+    suite.require(BitseryEngine::serialize(serializedLive, liveBootstrap),
+                  "stale_gateway_witness_serializes_live_bootstrap");
+
+    ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
+    witness.machineUUID = machine.uuid;
+    witness.bundleRegistered = true;
+    witness.containerBootstraps.push_back(std::move(serializedLive));
+    if (index == 0)
+    {
+      ContainerPlan staleGateway = {};
+      staleGateway.uuid = staleGatewayUUID;
+      staleGateway.fragment = prodigyCrossClusterMasqueGatewayRuntimeFragmentFirst;
+      staleGateway.restartOnFailure = true;
+      staleGateway.system.kind = SystemContainerKind::crossClusterMasqueGateway;
+      staleGateway.system.gatewayPairUUID = staleGatewayPairUUID;
+      staleGateway.system.gatewayLocalClusterUUID = brain.brainConfig.clusterUUID;
+      staleGateway.system.gatewayLocalMachineUUID = machine.uuid;
+      IPPrefix staleAddress = liveAddress;
+      staleAddress.network.v6[15] = staleGateway.fragment;
+      staleGateway.addresses.push_back(staleAddress);
+      NeuronContainerBootstrap staleBootstrap = {};
+      staleBootstrap.plan = staleGateway;
+      String serializedStale = {};
+      suite.require(BitseryEngine::serialize(serializedStale, staleBootstrap),
+                    "stale_gateway_witness_serializes_stale_gateway_bootstrap");
+      witness.containerBootstraps.push_back(std::move(serializedStale));
+    }
+    brain.updateSelfMachineRecoveryWitnesses.push_back(std::move(witness));
+
+    auto& inventory = brain.containerRetirementInventoryByMachine[machine.uuid];
+    inventory.authorityEpoch = brain.masterAuthorityEpoch;
+    inventory.ioGeneration = machine.neuron.ioGeneration;
+    inventory.present.insert(live.uuid);
+
+    ClusterMachine topologyMachine = {};
+    topologyMachine.uuid = machine.uuid;
+    topologyMachine.isBrain = index < 3;
+    brain.authoritativeTopology.machines.push_back(topologyMachine);
+  }
+  brain.hasAuthoritativeTopology = true;
+  selfBrain.uuid = machines[0].uuid;
+  thisNeuron = &selfBrain;
+
+  bool authenticatedPeers = true;
+  for (uint32_t index = 1; index < 3; ++index)
+  {
+    BrainView& peer = peers[index - 1];
+    peer.uuid = machines[index].uuid;
+    peer.boottimens = 100 + index;
+    peer.ioGeneration = 1;
+    peer.transportEpoch = 1;
+    peer.version = ProdigyBinaryVersion;
+    peer.connected = true;
+    peer.isFixedFile = true;
+    peer.fslot = int(100 + index);
+    peer.registrationFresh = true;
+    peer.existingMasterUUID = machines[0].uuid;
+    ProdigyTransportTLSStream remote = {};
+    reserveTransportStream(peer);
+    reserveTransportStream(remote);
+    std::array<uint8_t, 32> psk = {};
+    psk.fill(uint8_t(17 + index));
+    authenticatedPeers = authenticatedPeers &&
+        peer.beginTransportAEGIS(false, psk.data(), "stale-gateway-witness"_ctv,
+                                 machines[0].uuid, peer.uuid) &&
+        remote.beginTransportAEGIS(true, psk.data(), "stale-gateway-witness"_ctv,
+                                   peer.uuid, machines[0].uuid) &&
+        completeTransportHandshake(peer, remote);
+    peer.containerRetirementCapabilityAcknowledged = true;
+    peer.containerRetirementCapabilityUUID = peer.uuid;
+    peer.containerRetirementCapabilityBootNs = peer.boottimens;
+    peer.containerRetirementCapabilityIOGeneration = peer.ioGeneration;
+    brain.brains.insert(&peer);
+  }
+  suite.require(authenticatedPeers, "stale_gateway_witness_authenticates_current_brain_cohort");
+  brain.masterAuthorityRuntimeState.updateSelf.machineRecoveryWitnesses =
+      brain.updateSelfMachineRecoveryWitnesses;
+  const auto originalWitnesses = brain.updateSelfMachineRecoveryWitnesses;
+
+  const auto containsStaleGateway = [&]() {
+    return std::any_of(brain.updateSelfMachineRecoveryWitnesses.begin(),
+                       brain.updateSelfMachineRecoveryWitnesses.end(),
+                       [&](const auto& witness) {
+      return std::any_of(witness.containerBootstraps.begin(),
+                         witness.containerBootstraps.end(),
+                         [&](const String& serialized) {
+        NeuronContainerBootstrap bootstrap = {};
+        return BitseryEngine::deserializeSafe(serialized, bootstrap) &&
+            bootstrap.plan.uuid == staleGatewayUUID;
+      });
+    });
+  };
+
+  // The stale gateway must cause a bounded inventory-only request: it may not
+  // replay an authority which is absent from the current master state.
+  brain.queueNeuronStateUploadForMachine(&machines[0]);
+  uint32_t observationOnlyUploads = 0;
+  bool observationOnlyWasEmpty = false;
+  forEachMessageInBuffer(machines[0].neuron.wBuffer, [&](Message *frame) {
+    if (NeuronTopic(frame->topic) != NeuronTopic::stateUpload) return;
+    ++observationOnlyUploads;
+    uint8_t *args = frame->args;
+    local_container_subnet6 ignored = {};
+    Message::extractBytes<Alignment::one>(args, reinterpret_cast<uint8_t*>(&ignored), sizeof(ignored));
+    observationOnlyWasEmpty = args == frame->terminal();
+  });
+  suite.expect(observationOnlyUploads == 1 && observationOnlyWasEmpty,
+               "stale_gateway_witness_requests_empty_current_inventory_observation");
+  machines[0].neuron.wBuffer.clear();
+  machines[0].stateUploadRequestPending = false;
+  machines[0].stateUploadRequestIOGeneration = 0;
+  machines[0].runtimeReady = true;
+  machines[0].reportedDatacenterFragment = brain.brainConfig.datacenterFragment;
+  machines[0].reportedFragment = machines[0].fragment;
+  brain.persistedMachineInventoryUploaded.insert(machines[0].uuid);
+  auto& observed = brain.containerRetirementInventoryByMachine[machines[0].uuid];
+  observed.authorityEpoch = brain.masterAuthorityEpoch;
+  observed.ioGeneration = machines[0].neuron.ioGeneration;
+  observed.present.insert(liveContainers[0].uuid);
+
+  const auto acknowledgeCurrentAuthority = [&]() {
+    String transitionBytes = {}, transitionDigest = {};
+    suite.require(brain.serializeCurrentMasterAuthorityTransition(transitionBytes, transitionDigest),
+                  "stale_gateway_witness_serializes_current_authority_for_peer_acknowledgement");
+    for (BrainView& peer : peers)
+    {
+      brain.noteMasterAuthorityTransitionSentToPeer(&peer, brain.masterAuthorityRuntimeState, transitionDigest);
+      ProdigyMasterAuthorityStateTransitionAck acknowledgement = {};
+      acknowledgement.generation = brain.masterAuthorityRuntimeState.generation;
+      acknowledgement.peerUUID = peer.uuid;
+      acknowledgement.peerBootNs = peer.boottimens;
+      acknowledgement.transitionDigest = transitionDigest;
+      brain.acknowledgeMasterAuthorityTransition(&peer, acknowledgement);
+    }
+  };
+  acknowledgeCurrentAuthority();
+  suite.require(brain.containerRetirementAuthorityAcknowledged(),
+                "stale_gateway_witness_current_three_brain_authority_is_acknowledged");
+  brain.holdRuntimePersistence = true;
+  String blocker = {};
+  auto& lastInventory = brain.containerRetirementInventoryByMachine[machines[machineCount - 1].uuid];
+  const auto originalInventory = lastInventory;
+  const auto expectBlockedWithoutPrune = [&](const char *name) {
+    suite.expect(!brain.finalizePersistedNeuronInventoryRecovery(&blocker) &&
+                     containsStaleGateway() &&
+                     brain.updateSelfMachineRecoveryWitnesses == originalWitnesses &&
+                     !brain.recoveryPersistencePending && brain.pendingRuntimePersistence.empty(), name);
+  };
+  brain.persistedMachineInventoryUploaded.erase(machines[machineCount - 1].uuid);
+  expectBlockedWithoutPrune("stale_gateway_witness_requires_every_machine_inventory");
+  brain.persistedMachineInventoryUploaded.insert(machines[machineCount - 1].uuid);
+  lastInventory.authorityEpoch = brain.masterAuthorityEpoch - 1;
+  expectBlockedWithoutPrune("stale_gateway_witness_rejects_old_authority_epoch");
+  lastInventory = originalInventory;
+  lastInventory.ioGeneration = machines[machineCount - 1].neuron.ioGeneration + 1;
+  expectBlockedWithoutPrune("stale_gateway_witness_rejects_wrong_control_generation");
+  lastInventory = originalInventory;
+  lastInventory.present.insert(staleGatewayUUID);
+  expectBlockedWithoutPrune("stale_gateway_witness_preserves_gateway_found_on_other_machine");
+  lastInventory = originalInventory;
+  suite.expect(brain.finalizePersistedNeuronInventoryRecovery(&blocker) == false &&
+                   brain.recoveryPersistencePending &&
+                   brain.pendingRuntimePersistence.size() == 1 &&
+                   !containsStaleGateway() && brain.recoveringPersistedNeuronInventory,
+               "stale_gateway_witness_prune_waits_for_durable_receipt_before_opening_recovery");
+  suite.expect(brain.updateSelfMachineRecoveryWitnesses.size() == machineCount &&
+                   brain.updateSelfMachineRecoveryWitnesses[0].containerBootstraps.size() == 1 &&
+                   brain.updateSelfMachineRecoveryWitnesses[1].containerBootstraps.size() == 1 &&
+                   brain.updateSelfMachineRecoveryWitnesses[2].containerBootstraps.size() == 1,
+               "stale_gateway_witness_prune_removes_only_absent_gateway_bootstrap");
+
+  brain.finishRuntimePersistence(false);
+  suite.expect(brain.updateSelfMachineRecoveryWitnesses == originalWitnesses &&
+                   brain.masterAuthorityRuntimeState.updateSelf.machineRecoveryWitnesses == originalWitnesses &&
+                   brain.recoveryPersistenceRetryPending && brain.recoveringPersistedNeuronInventory,
+               "stale_gateway_witness_nondurable_prune_restores_witness_and_keeps_gate_closed");
+
+  // Keep the retry receipt pending, then acknowledge the newly durable
+  // authority before the ordinary retirement barrier may open.
+  brain.retryDeferredRecoveryPersistence();
+  suite.expect(brain.pendingRuntimePersistence.size() == 1 && brain.recoveryPersistencePending,
+               "stale_gateway_witness_retry_reissues_durable_prune_before_recovery");
+  brain.finishRuntimePersistence(true);
+  suite.expect(!containsStaleGateway() && brain.recoveringPersistedNeuronInventory &&
+                   !brain.recoveryPersistencePending,
+               "stale_gateway_witness_durable_prune_still_waits_for_peer_authority_ack");
+  acknowledgeCurrentAuthority();
+  brain.recoverDeploymentsAfterNeuronState();
+  suite.expect(!containsStaleGateway() &&
+                   brain.masterAuthorityRuntimeState.updateSelf.machineRecoveryWitnesses ==
+                       brain.updateSelfMachineRecoveryWitnesses &&
+                   brain.recoveringPersistedNeuronInventory == false,
+               "stale_gateway_witness_durable_prune_releases_registered_recovery");
+
+  brain.finishRuntimePersistence(true);
+  for (uint32_t index = 0; index < machineCount; ++index)
+  {
+    machines[index].removeContainerIndexEntry(liveContainers[index].deploymentID,
+                                               &liveContainers[index]);
+    brain.neurons.erase(&machines[index].neuron);
+    brain.machinesByUUID.erase(machines[index].uuid);
+    brain.machines.erase(&machines[index]);
+  }
+  for (BrainView& peer : peers) brain.brains.erase(&peer);
   thisNeuron = previousNeuron;
   thisBrain = previousBrain;
 }
@@ -44390,6 +45382,63 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite, bool handof
           suite.expect(permissionBrain.cousinSessions.size() == 1 &&
               permissionBrain.cousinSessions.front().record.sourcePermission.purpose == ProdigyCousinServicePurpose::clientAuthority,
               "brain_owner_automatically_creates_exact_stateless_truth_session_without_app_request");
+          Brain::CousinAuthorityTurn cousinAuthorityTurn = {};
+          permissionBrain.lastCousinAutomaticSessionDriveMs = 0;
+          permissionBrain.driveCousinSessions(&cousinAuthorityTurn);
+          suite.expect(cousinAuthorityTurn.initialized &&
+              cousinAuthorityTurn.authorityGeneration == permissionBrain.masterAuthorityRuntimeState.generation &&
+              permissionBrain.cousinSessions.size() == 1,
+              "cousin_authority_turn_reuses_current_digest_without_changing_session_outcome");
+          auto staleCousinAuthorityTurn = cousinAuthorityTurn;
+          ++permissionBrain.masterAuthorityEpoch;
+          String recomputedCousinDigest = {};
+          const bool staleTurnRecomputed = permissionBrain.currentCousinAuthorityDigest(
+              &staleCousinAuthorityTurn, recomputedCousinDigest);
+          --permissionBrain.masterAuthorityEpoch;
+          suite.expect(staleTurnRecomputed &&
+              staleCousinAuthorityTurn.masterAuthorityEpoch == permissionBrain.masterAuthorityEpoch + 1 &&
+              staleCousinAuthorityTurn.digest == recomputedCousinDigest,
+              "cousin_authority_turn_epoch_change_recomputes_instead_of_reusing_stale_digest");
+          const bool savedPeerACapability = permissionPeerA.localCousinServicePermissionCapabilityAcknowledged;
+          const bool savedPeerBCapability = permissionPeerB.localCousinServicePermissionCapabilityAcknowledged;
+          permissionPeerA.localCousinServicePermissionCapabilityAcknowledged = false;
+          permissionPeerB.localCousinServicePermissionCapabilityAcknowledged = false;
+          suite.expect(!permissionBrain.localCousinServicePermissionAuthorityAcknowledged(&cousinAuthorityTurn) &&
+              !permissionBrain.cousinRouteAuthorityAcknowledged(&cousinAuthorityTurn),
+              "cousin_authority_turn_rechecks_peer_capability_within_turn");
+          permissionPeerA.localCousinServicePermissionCapabilityAcknowledged = savedPeerACapability;
+          permissionPeerB.localCousinServicePermissionCapabilityAcknowledged = savedPeerBCapability;
+          const auto savedAuthorityReceipts = permissionBrain.masterAuthorityReplicationByPeer;
+          permissionBrain.masterAuthorityReplicationByPeer.clear();
+          suite.expect(!permissionBrain.localCousinServicePermissionAuthorityAcknowledged(&cousinAuthorityTurn) &&
+              !permissionBrain.cousinRouteAuthorityAcknowledged(&cousinAuthorityTurn),
+              "cousin_authority_turn_rechecks_quorum_receipts_within_turn");
+          permissionBrain.masterAuthorityReplicationByPeer = savedAuthorityReceipts;
+          auto generationTurn = cousinAuthorityTurn;
+          ++permissionBrain.masterAuthorityRuntimeState.generation;
+          String generationDigest = {};
+          suite.expect(permissionBrain.currentCousinAuthorityDigest(&generationTurn, generationDigest) &&
+              generationTurn.authorityGeneration == permissionBrain.masterAuthorityRuntimeState.generation &&
+              generationTurn.digest != cousinAuthorityTurn.digest &&
+              !permissionBrain.localCousinServicePermissionAuthorityAcknowledged(&generationTurn),
+              "cousin_authority_turn_generation_change_recomputes_and_fails_closed");
+          --permissionBrain.masterAuthorityRuntimeState.generation;
+          auto durableTurn = cousinAuthorityTurn;
+          const bool savedAuthorityDurable = permissionBrain.masterAuthorityRuntimeStateDurable;
+          permissionBrain.masterAuthorityRuntimeStateDurable = false;
+          String durableDigest = {};
+          suite.expect(permissionBrain.currentCousinAuthorityDigest(&durableTurn, durableDigest) && !durableTurn.durable &&
+              !permissionBrain.localCousinServicePermissionAuthorityAcknowledged(&durableTurn),
+              "cousin_authority_turn_durability_loss_recomputes_and_fails_closed");
+          permissionBrain.masterAuthorityRuntimeStateDurable = savedAuthorityDurable;
+          auto pendingTurn = cousinAuthorityTurn;
+          ++permissionBrain.masterAuthorityPersistencePending;
+          String pendingDigest = {};
+          suite.expect(permissionBrain.currentCousinAuthorityDigest(&pendingTurn, pendingDigest) &&
+              pendingTurn.persistencePending == cousinAuthorityTurn.persistencePending + 1 &&
+              !permissionBrain.clusterPairAuthorityQualified(&pendingTurn),
+              "cousin_authority_turn_pending_persistence_recomputes_and_fails_closed");
+          --permissionBrain.masterAuthorityPersistencePending;
           auto withdrawn = exactRoute; withdrawn.state = CousinRouteState::withdrawn;
           withdrawn.withdrawalGeneration = withdrawn.generation; withdrawn.withdrawnAtMs = Time::now<TimeResolution::ms>();
           permissionBrain.masterAuthorityRuntimeState.cousinRoutes.front() = withdrawn;
@@ -46155,11 +47204,20 @@ int main(void)
     testGetMachinesPreservesTopologyIPv6ControlAddressOverSparseSnapshot(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only &&
+      strcmp(only, "focused-gateway-adoption-batch") == 0)
+  {
+    TestSuite suite;
+    testGatewayInventoryBatchAdoptionWaitsForOneDurableReceipt(suite);
+    std::printf("FOCUSED_GATEWAY_ADOPTION_BATCH passed=%d failed=%d\n", suite.passed, suite.failed);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
       only && strcmp(only, "gateway-whitehole-state-sync") == 0)
   {
     TestSuite suite;
     testCrossClusterMasqueGatewayConnectorLeaseLifecycle(suite);
+    std::printf("GATEWAY_RECOVERY_RESULT failed_assertions=%d\n", suite.failed);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
@@ -46168,6 +47226,8 @@ int main(void)
     TestSuite suite;
     testCrossClusterMasqueGatewayLifecycleOnSharedHost(suite);
     testCrossClusterMasqueGatewayConnectorLeaseLifecycle(suite);
+    testGatewayInventoryBatchAdoptionWaitsForOneDurableReceipt(suite);
+    std::printf("GATEWAY_RECOVERY_RESULT failed_assertions=%d\n", suite.failed);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
@@ -46182,6 +47242,13 @@ int main(void)
   {
     TestSuite suite;
     testCrossClusterMasqueGatewayBootstrapDefersLaunch(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only && strcmp(only, "private-bgp-startup-retry") == 0)
+  {
+    TestSuite suite;
+    testPrivateBGPStartupRetryFences(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "initial-seed-launch-ack") == 0)
@@ -46507,6 +47574,8 @@ int main(void)
     testAsyncRetainedStatefulRearmAcceptance(suite);
     testMaterializedRecoveryBlockers(suite);
     testDurableWitnessReplaysThreeRetainedMachinesAfterProjectionReload(suite);
+    testRegisteredRecoveryWitnessDurablyPrunesAbsentStaleGateway<3>(suite);
+    testRegisteredRecoveryWitnessDurablyPrunesAbsentStaleGateway<5>(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "async-retirement") == 0)
@@ -46708,6 +47777,12 @@ int main(void)
   {
     testPersistentRuntimeInventoryRestoresBeforeNeuronReplay(suite);
     testBrainReplicatedContainerRuntimeStateRestoresTakeoverView(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "stateful-replicated-cardinality") == 0)
+  {
+    testBrainReplicatedStatefulRuntimeRestoresDeclaredCardinality(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
@@ -47332,6 +48407,7 @@ int main(void)
   testBrainReplicatedContainerHealthyMarksContainerHealthyOnMaster(suite);
   testBrainContainerHealthyReplicatesRuntimeStateToFollowers(suite);
   testBrainReplicatedContainerRuntimeStateRestoresTakeoverView(suite);
+  testBrainReplicatedStatefulRuntimeRestoresDeclaredCardinality(suite);
   testBrainReplicatedContainerRuntimeStateWaitsForDeployment(suite);
   testPersistentRuntimeInventoryRestoresBeforeNeuronReplay(suite);
   testFailedDeploymentCleanerDefersPendingCanonicalRuntime(suite);

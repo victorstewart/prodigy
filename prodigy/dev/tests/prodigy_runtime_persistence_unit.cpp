@@ -1654,6 +1654,117 @@ static void testLocalBundleRecoveryDefersCheckpointUntilArtifactLeaseReleases(Te
   havePersistedBrainSnapshot = false;
 }
 
+static void testBundleExecPersistsResetRuntimeCoordinator(TestSuite& suite)
+{
+  PersistenceRing ring;
+  ScopedPersistentRoot root;
+  ProdigyPersistentStateStore store(root.path);
+  auto io = ProdigyArtifactIO::startOwned();
+  suite.expect(io != nullptr, "runtime_exec_snapshot_writer_starts");
+  if (!io) return;
+
+  persistentLocalBrainState = {};
+  persistentLocalBrainState.uuid = 0xA5514001ULL;
+  persistentBootState = {};
+  persistedBrainSnapshot = {};
+  havePersistedBrainSnapshot = false;
+  auto writer = std::make_shared<ProdigyPersistentStateWriter>(store, *io);
+  ProdigyHostControlNetwork network;
+  bool baselineCalled = false, baselineDurable = false;
+  bool completionCalled = false, completionDurable = false;
+  {
+    ProdigyBrain brain(network, writer);
+    brain.brainConfig.clusterUUID = 0xA5514002ULL;
+    brain.updateSelfState = Brain::UpdateSelfState::waitingForRelinquishEchos;
+    brain.updateSelfExpectedEchos = 2;
+    brain.updateSelfBundleEchos = 2;
+    brain.updateSelfRelinquishEchos = 2;
+    brain.updateSelfPlannedMasterPeerKey = 0xA5514005ULL;
+    brain.updateSelfUseStagedBundleOnly = true;
+    brain.updateSelfBundleBlob.assign("must-not-survive-final-exec-snapshot"_ctv);
+    for (uint128_t peerKey : {uint128_t(0xA5514004ULL), uint128_t(0xA5514005ULL)})
+    {
+      brain.updateSelfBundleEchoPeerKeys.insert(peerKey);
+      brain.updateSelfRelinquishEchoPeerKeys.insert(peerKey);
+      brain.updateSelfFollowerBootNsByPeerKey.insert_or_assign(peerKey, 1);
+      brain.updateSelfFollowerRebootedPeerKeys.insert(peerKey);
+    }
+    brain.updateSelfFollowerConcurrency = 1;
+    brain.updateSelfTransitionIssuedPeerKeys.insert(0xA5514004ULL);
+    brain.updateSelfFollowerReadyPeerKeys.insert(0xA5514004ULL);
+    brain.updateSelfWorkerExpectedBundleSHA256.assign(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
+    for (uint128_t machineUUID : {uint128_t(0xA5514001ULL), uint128_t(0xA5514004ULL),
+                                  uint128_t(0xA5514005ULL)})
+    {
+      ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
+      witness.machineUUID = machineUUID;
+      brain.updateSelfMachineRecoveryWitnesses.push_back(std::move(witness));
+    }
+    brain.persistLocalRuntimeStateAsync([&](bool durable) {
+      baselineCalled = true;
+      baselineDurable = durable;
+      if (!durable)
+      {
+        Ring::exit = true;
+        return;
+      }
+      brain.resetUpdateSelfState();
+      suite.expect(brain.updateSelfState == Brain::UpdateSelfState::idle &&
+                       brain.updateSelfExpectedEchos == 0 && brain.updateSelfBundleEchos == 0 &&
+                       brain.updateSelfRelinquishEchos == 0 && brain.updateSelfMachineRecoveryWitnesses.size() == 3 &&
+                       brain.updateSelfWorkerExpectedBundleSHA256.equals(
+                           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv) &&
+                       brain.updateSelfMachineRecoveryWitnesses[0].machineUUID == 0xA5514001ULL &&
+                       brain.updateSelfMachineRecoveryWitnesses[1].machineUUID == 0xA5514004ULL &&
+                       brain.updateSelfMachineRecoveryWitnesses[2].machineUUID == 0xA5514005ULL &&
+                       brain.updateSelfFollowerConcurrency == 0 &&
+                       brain.updateSelfTransitionIssuedPeerKeys.empty() && brain.updateSelfFollowerReadyPeerKeys.empty(),
+                   "runtime_exec_snapshot_fixture_models_reset_completed_relinquish_with_retained_witness");
+      brain.prepareForBundleExecAsync([&](bool finalDurable, String) {
+        completionCalled = true;
+        completionDurable = finalDurable;
+        Ring::exit = true;
+      });
+    });
+    ring.armDeadline(3000);
+    Ring::start();
+    suite.expect(!ring.timedOut && completionCalled && completionDurable && writer->drainForExec(),
+                 "runtime_exec_snapshot_and_local_projection_drain_before_exec");
+  }
+  writer.reset();
+  io->stop();
+  ring.drainStoppedIO();
+  io.reset();
+  (void)network.shutdown();
+  store.close();
+
+  ProdigyPersistentStateStore reopened(root.path);
+  ProdigyPersistentBrainSnapshot stored = {};
+  String failure = {};
+  suite.expect(reopened.loadBrainSnapshot(stored, &failure) &&
+                     stored.masterAuthority.runtimeState.updateSelf.state ==
+                         uint8_t(Brain::UpdateSelfState::idle) &&
+                     stored.masterAuthority.runtimeState.updateSelf.expectedEchos == 0 &&
+                     stored.masterAuthority.runtimeState.updateSelf.bundleEchos == 0 &&
+                     stored.masterAuthority.runtimeState.updateSelf.relinquishEchos == 0 &&
+                     stored.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses.size() == 3 &&
+                     stored.masterAuthority.runtimeState.updateSelf.workerExpectedBundleSHA256.equals(
+                         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv) &&
+                     stored.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[0].machineUUID == 0xA5514001ULL &&
+                     stored.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[1].machineUUID == 0xA5514004ULL &&
+                     stored.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[2].machineUUID == 0xA5514005ULL &&
+                     stored.masterAuthority.runtimeState.updateSelfFollowerConcurrency == 0 &&
+                     stored.masterAuthority.runtimeState.updateSelfFollowerTransitionIssuedPeerKeys.empty() &&
+                     stored.masterAuthority.runtimeState.updateSelfFollowerReadyPeerKeys.empty(),
+                 "runtime_exec_snapshot_persists_reset_coordinator_and_retained_witness");
+  reopened.close();
+  persistentLocalBrainState = {};
+  persistentBootState = {};
+  persistedBrainSnapshot = {};
+  havePersistedBrainSnapshot = false;
+}
+
 static void testAuthenticatedStateUploadInventoryDiagnostics(TestSuite& suite)
 {
   PersistenceRing ring;
@@ -3148,6 +3259,13 @@ int main(void)
 {
   TestSuite suite;
   if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only != nullptr &&
+      std::strcmp(only, "bundle-exec-runtime-snapshot") == 0)
+  {
+    testBundleExecPersistsResetRuntimeCoordinator(suite);
+    std::printf("BUNDLE_EXEC_RUNTIME_SNAPSHOT_RESULT failed_assertions=%d\n", suite.failed);
+    return suite.failed == 0 ? 0 : 1;
+  }
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only != nullptr &&
       std::strcmp(only, "reservation-profile-snapshot") == 0)
   {
     testSnapshotReservationProfileNormalizesTopologyCapacity(suite);
@@ -3243,5 +3361,6 @@ int main(void)
   testLocalPairProjectionMarkerBindsProjectionVersion(suite);
   testPersistentLocalCousinServicePermissions(suite);
   testNeuronForwardsFirstPairEpochProposalOnlyOnCurrentAuthorizedChannel(suite);
+  testBundleExecPersistsResetRuntimeCoordinator(suite);
   return suite.failed == 0 ? 0 : 1;
 }

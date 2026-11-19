@@ -189,13 +189,8 @@ static inline bool prodigyCousinCounterpartValid(const ProdigyCousinCounterpart&
       (value.routablePrefixUUID == 0 ?
        (!allowPrivateContainer || !value.wormholeRevision.empty() || value.publicTCPPort != value.servicePort) :
        !prodigyIsSHA256HexDigest(value.wormholeRevision))) return false;
-  for (uint16_t slot = 0; slot < nStatefulServiceGroupSlots; ++slot)
-  {
-    const bool expected = value.permission.slots.contains(slot) &&
-        statefulServiceGroupOwnerForSlot(slot, value.shardGroups) == value.shardGroup;
-    if (value.ownedSlots.contains(slot) != expected) return false;
-  }
-  return true;
+  return value.ownedSlots == cousinRouteSlotsOwnedByGroup(value.permission.slots,
+      value.shardGroup, value.shardGroups);
 }
 
 static inline bool prodigyCousinDiscoverySnapshotValid(const ProdigyCousinDiscoverySnapshot& snapshot)

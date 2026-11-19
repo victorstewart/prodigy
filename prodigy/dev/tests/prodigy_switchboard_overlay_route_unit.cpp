@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <linux/icmpv6.h>
+#include <linux/ipv6.h>
 #include <netinet/udp.h>
 
 class TestSuite {
@@ -201,6 +203,64 @@ int main(void)
                     !switchboardMasqueGatewayRemoteTransitPermitted(CONTAINER_NETWORK_DESTINATION_ALLOWLIST, &gatewaySubnet,
                     SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST, remoteTransitSource, localTransitDifferentMachine, false, &transitRoute),
                "switchboard_masque_gateway_transit_rejects_wrong_route_direction_endpoint_or_effective_policy");
+
+  struct {
+    ipv6hdr outer;
+    icmp6hdr icmp;
+    ipv6hdr quoted;
+    tcphdr quotedTCP;
+  } ptb = {};
+  ptb.outer.nexthdr = IPPROTO_ICMPV6;
+  ptb.icmp.icmp6_type = ICMPV6_PKT_TOOBIG;
+  ptb.quoted.nexthdr = IPPROTO_TCP;
+  auto setNetwork16 = [](void *target, uint16_t value) {
+    auto *bytes = static_cast<uint8_t *>(target);
+    bytes[0] = uint8_t(value >> 8); bytes[1] = uint8_t(value);
+  };
+  auto setNetwork32 = [](void *target, uint32_t value) {
+    auto *bytes = static_cast<uint8_t *>(target);
+    bytes[0] = uint8_t(value >> 24); bytes[1] = uint8_t(value >> 16);
+    bytes[2] = uint8_t(value >> 8); bytes[3] = uint8_t(value);
+  };
+  setNetwork32(&ptb.icmp.icmp6_mtu, 1280);
+  setNetwork16(&ptb.quoted.payload_len, 1408); // quoted original is 1448 bytes.
+  uint8_t localGatewaySource[16] = {};
+  std::memcpy(localGatewaySource, localTransitSameMachine, sizeof(localGatewaySource));
+  localGatewaySource[15] = SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST;
+  std::memcpy(ptb.outer.saddr.s6_addr, localGatewaySource, sizeof(ptb.outer.saddr.s6_addr));
+  std::memcpy(ptb.outer.daddr.s6_addr, localTransitDifferentMachine, sizeof(ptb.outer.daddr.s6_addr));
+  std::memcpy(ptb.quoted.saddr.s6_addr, localTransitDifferentMachine, sizeof(ptb.quoted.saddr.s6_addr));
+  std::memcpy(ptb.quoted.daddr.s6_addr, remoteTransitSource, sizeof(ptb.quoted.daddr.s6_addr));
+  switchboard_masque_gateway_ptb6 parsedPTB = {};
+  suite.expect(switchboardMasqueGatewayPTB6ShapeValid(&ptb.outer,
+                    reinterpret_cast<const uint8_t *>(&ptb) + sizeof(ptb), 1448, &parsedPTB) &&
+                    parsedPTB.mtu == 1280 && parsedPTB.quotedTCP == &ptb.quotedTCP,
+               "switchboard_masque_gateway_ptb_shape_accepts_bounded_reversed_quoted_tcp");
+  suite.expect(switchboardMasqueGatewayReservedLocalSourceValid(localGatewaySource, &gatewaySubnet) &&
+                    !switchboardMasqueGatewayReservedLocalSourceValid(remoteTransitSource, &gatewaySubnet),
+               "switchboard_masque_gateway_ptb_source_requires_local_reserved_gateway_fragment");
+  ptb.icmp.icmp6_type = ICMPV6_DEST_UNREACH;
+  suite.expect(!switchboardMasqueGatewayPTB6ShapeValid(&ptb.outer,
+                    reinterpret_cast<const uint8_t *>(&ptb) + sizeof(ptb), 1448, &parsedPTB),
+               "switchboard_masque_gateway_ptb_shape_rejects_non_ptb_icmpv6");
+  ptb.icmp.icmp6_type = ICMPV6_PKT_TOOBIG;
+  setNetwork32(&ptb.icmp.icmp6_mtu, 1279);
+  suite.expect(!switchboardMasqueGatewayPTB6ShapeValid(&ptb.outer,
+                    reinterpret_cast<const uint8_t *>(&ptb) + sizeof(ptb), 1448, &parsedPTB),
+               "switchboard_masque_gateway_ptb_shape_rejects_below_ipv6_minimum");
+  setNetwork32(&ptb.icmp.icmp6_mtu, 1449);
+  suite.expect(!switchboardMasqueGatewayPTB6ShapeValid(&ptb.outer,
+                    reinterpret_cast<const uint8_t *>(&ptb) + sizeof(ptb), 1448, &parsedPTB),
+               "switchboard_masque_gateway_ptb_shape_rejects_above_local_packet_budget");
+  setNetwork32(&ptb.icmp.icmp6_mtu, 1280);
+  ptb.outer.daddr.s6_addr[15] ^= 1;
+  suite.expect(!switchboardMasqueGatewayPTB6ShapeValid(&ptb.outer,
+                    reinterpret_cast<const uint8_t *>(&ptb) + sizeof(ptb), 1448, &parsedPTB),
+               "switchboard_masque_gateway_ptb_shape_rejects_nonreversed_outer_endpoints");
+  ptb.outer.daddr.s6_addr[15] ^= 1;
+  suite.expect(!switchboardMasqueGatewayPTB6ShapeValid(&ptb.outer,
+                    reinterpret_cast<const uint8_t *>(&ptb.quotedTCP), 1448, &parsedPTB),
+               "switchboard_masque_gateway_ptb_shape_rejects_truncated_quoted_tcp");
 
   SwitchboardOverlayMachineRoute mixed = route6;
   mixed.sourceAddress = IPAddress("198.51.100.10", false);

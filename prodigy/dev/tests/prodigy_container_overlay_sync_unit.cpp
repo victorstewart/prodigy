@@ -17,6 +17,7 @@
 #include <cstring>
 #include <functional>
 #include <linux/pkt_cls.h>
+#include <linux/icmpv6.h>
 #include <linux/ip.h>
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
@@ -440,6 +441,55 @@ static Vector<uint8_t> makeIPv6L4FrameWithPayload(const char *srcIPv6,
   }
 
   return frame;
+}
+
+static Vector<uint8_t> makeGatewayPTBFrame(const char *gateway, const char *hot, const char *remote,
+                                           uint16_t sourcePort, uint16_t destinationPort, uint32_t mtu)
+{
+  Vector<uint8_t> frame = {};
+  frame.resize(sizeof(ethhdr) + sizeof(ipv6hdr) + sizeof(icmp6hdr) + sizeof(ipv6hdr) + sizeof(tcphdr));
+  std::memset(frame.data(), 0, frame.size());
+  auto *eth = reinterpret_cast<ethhdr *>(frame.data()); eth->h_proto = bpf_htons(ETH_P_IPV6);
+  auto *outer = reinterpret_cast<ipv6hdr *>(eth + 1);
+  outer->version = 6; outer->nexthdr = IPPROTO_ICMPV6; outer->hop_limit = 64;
+  outer->payload_len = htons(sizeof(icmp6hdr) + sizeof(ipv6hdr) + sizeof(tcphdr));
+  parseIPv6Bytes(gateway, outer->saddr.s6_addr); parseIPv6Bytes(hot, outer->daddr.s6_addr);
+  auto *icmp = reinterpret_cast<icmp6hdr *>(outer + 1);
+  icmp->icmp6_type = ICMPV6_PKT_TOOBIG; icmp->icmp6_code = 0; icmp->icmp6_mtu = htonl(mtu);
+  auto *quoted = reinterpret_cast<ipv6hdr *>(icmp + 1);
+  // The captured original was a 1460-byte IPv6/TCP packet; the quote carries
+  // only its header, so it must not be constrained by the gateway's 1448 cap.
+  quoted->version = 6; quoted->nexthdr = IPPROTO_TCP; quoted->payload_len = htons(1420);
+  parseIPv6Bytes(hot, quoted->saddr.s6_addr); parseIPv6Bytes(remote, quoted->daddr.s6_addr);
+  auto *tcp = reinterpret_cast<tcphdr *>(quoted + 1);
+  tcp->source = htons(sourcePort); tcp->dest = htons(destinationPort); tcp->doff = 5;
+  return frame;
+}
+
+// This test-only fallback bypasses BPFProgram's debug logger when a private
+// guest rejects the PTB object before its packet assertions can run.
+static void emitGatewayPTBVerifierDiagnostic(const char *role, const char *path)
+{
+  Vector<char> kernelLog = {}; kernelLog.resize(4u * 1024u * 1024u);
+  std::memset(kernelLog.data(), 0, kernelLog.size());
+  struct bpf_object_open_opts options = {};
+  options.sz = sizeof(options);
+  options.kernel_log_buf = kernelLog.data();
+  options.kernel_log_size = kernelLog.size();
+  struct bpf_object *object = bpf_object__open_file(path, &options);
+  const long openError = libbpf_get_error(object);
+  if (openError != 0)
+  {
+    std::fprintf(stderr, "gateway-ptb-return verifier role=%s stage=open result=%ld errno=%d log=%s\n",
+                 role, openError, errno, kernelLog.data());
+    return;
+  }
+  struct bpf_program *program = nullptr;
+  bpf_object__for_each_program(program, object) bpf_program__set_log_level(program, 2);
+  const int loadResult = bpf_object__load(object);
+  std::fprintf(stderr, "gateway-ptb-return verifier role=%s stage=load result=%d errno=%d log=%s\n",
+               role, loadResult, errno, kernelLog.data());
+  bpf_object__close(object);
 }
 
 static Vector<uint8_t> makeIPv6UDPFrameWithPayload(const char *srcIPv6,
@@ -2816,6 +2866,104 @@ static void testAdoptedHostIngressOverlaySync(TestSuite& suite)
   }
 }
 
+static void testGatewayPTBReturn(TestSuite& suite)
+{
+  String egressPath(PRODIGY_TEST_BINARY_DIR), ingressPath(PRODIGY_TEST_BINARY_DIR);
+  egressPath.append("/container.egress.router.ebpf.o"_ctv);
+  ingressPath.append("/container.ingress.router.declared.ebpf.o"_ctv);
+  BPFProgram egress = {}, ingress = {};
+  const bool egressLoaded = egress.load(egressPath, "ct_egress"_ctv);
+  const bool ingressLoaded = ingress.load(ingressPath, "ct_ingress"_ctv);
+  if (!suite.require(egressLoaded && ingressLoaded,
+                     "gateway_ptb_return_loads_gateway_egress_and_declared_ingress"))
+  {
+    emitGatewayPTBVerifierDiagnostic("egress", egressPath.c_str());
+    emitGatewayPTBVerifierDiagnostic("declared-ingress", ingressPath.c_str());
+    return;
+  }
+  local_container_subnet6 subnet = {}; subnet.dpfx = 1; subnet.mpfx[1] = 1;
+  egress.setArrayElement("lc_subnet"_ctv, 0, subnet); ingress.setArrayElement("lc_subnet"_ctv, 0, subnet);
+  container_network_policy gateway = {}, hot = {};
+  gateway.mode = CONTAINER_NETWORK_DESTINATION_ALLOWLIST; gateway.interContainerMTU = 1448;
+  gateway.containerFragment = SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST;
+  hot.mode = CONTAINER_NETWORK_DECLARED_ONLY; hot.interContainerMTU = 1448; hot.containerFragment = 0xbd;
+  egress.setArrayElement("ct_net_policy"_ctv, 0, gateway); ingress.setArrayElement("ct_net_policy"_ctv, 0, hot);
+  constexpr const char *gatewayIP = "fdf8:d94c:7c33:e26e:ca4b:f501:1:fc";
+  constexpr const char *hotIP = "fdf8:d94c:7c33:e26e:ca4b:f501:1:bd";
+  constexpr const char *remoteIP = "fdf8:d94c:7c33:e26e:ca4b:f502:1:aa";
+  constexpr uint16_t sourcePort = 47001, destinationPort = 43105;
+  switchboard_overlay_site_route_set routes = {};
+  routes.version = SWITCHBOARD_OVERLAY_SITE_ROUTE_SET_VERSION; routes.count = 1;
+  routes.candidates[0].family = SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV6;
+  routes.candidates[0].use_gateway_mac = SWITCHBOARD_OVERLAY_ROUTE_ACTION_LOCAL_CONTAINER_REDIRECT;
+  routes.candidates[0].next_hop_mac[0] = SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST;
+  switchboard_overlay_machine_route_key siteKey = switchboardMakeOverlayMachineRouteKey(switchboardMakeOverlayDatacenterRouteKey(2));
+  suite.require(updateProgramMapElement(egress, "ovl_site_rts_v2"_ctv, siteKey, routes), "gateway_ptb_return_installs_selected_remote_site_route");
+  flow_key original = {};
+  parseIPv6Bytes(hotIP, reinterpret_cast<uint8_t *>(original.srcv6)); parseIPv6Bytes(remoteIP, reinterpret_cast<uint8_t *>(original.dstv6));
+  original.port16[0] = htons(sourcePort); original.port16[1] = htons(destinationPort); original.proto = IPPROTO_TCP;
+  container_tcp_authorization grant = {}; grant.authorizationExpiresAtNs = UINT64_MAX; grant.authorizationHi = 1;
+  container_tcp_flow current = {}; current.expiresAtNs = UINT64_MAX;
+  suite.require(updateProgramMapElement(ingress, "ct_tcp_grants"_ctv, original, grant) &&
+                    updateProgramMapElement(ingress, "ct_tcp_flows"_ctv, original, current),
+                "gateway_ptb_return_installs_recipient_current_bound_flow");
+  auto run = [&](BPFProgram& program, Vector<uint8_t>& frame, const char *name) {
+    Vector<uint8_t> output = {}; output.resize(frame.size() + 64u);
+    LIBBPF_OPTS(bpf_test_run_opts, opts, .data_in = frame.data(), .data_out = output.data(),
+                .data_size_in = static_cast<__u32>(frame.size()), .data_size_out = static_cast<__u32>(output.size()), .repeat = 1, );
+    const int result = bpf_prog_test_run_opts(program.prog_fd, &opts); suite.expect(result == 0, name);
+    return result == 0 ? int(opts.retval) : -1;
+  };
+  Vector<uint8_t> exact = makeGatewayPTBFrame(gatewayIP, hotIP, remoteIP, sourcePort, destinationPort, 1280);
+  suite.expect(run(egress, exact, "gateway_ptb_return_egress_exact_runs") == NETKIT_PASS,
+               "gateway_ptb_return_egress_accepts_selected_gateway_ptb");
+  suite.expect(run(ingress, exact, "gateway_ptb_return_ingress_exact_runs") == NETKIT_PASS,
+               "gateway_ptb_return_declared_recipient_accepts_current_bound_ptb");
+  auto *exactOuter = reinterpret_cast<ipv6hdr *>(exact.data() + sizeof(ethhdr));
+  auto *exactICMP = reinterpret_cast<icmp6hdr *>(exactOuter + 1);
+  auto *quotedIPv6 = reinterpret_cast<ipv6hdr *>(exactICMP + 1);
+  auto *quotedTCP = reinterpret_cast<tcphdr *>(quotedIPv6 + 1);
+  quotedTCP->source = htons(sourcePort + 1);
+  suite.expect(run(ingress, exact, "gateway_ptb_return_quoted_flow_mismatch_runs") == NETKIT_DROP,
+               "gateway_ptb_return_quoted_flow_mismatch_drops");
+  quotedTCP->source = htons(sourcePort);
+  auto *outer = exactOuter;
+  outer->saddr.s6_addr[15] = SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_SECOND;
+  suite.expect(run(egress, exact, "gateway_ptb_return_wrong_gateway_runs") == NETKIT_DROP,
+               "gateway_ptb_return_wrong_selected_gateway_drops");
+  outer->saddr.s6_addr[15] = SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST;
+  routes.candidates[0].next_hop_mac[0] = SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_SECOND;
+  suite.require(updateProgramMapElement(egress, "ovl_site_rts_v2"_ctv, siteKey, routes),
+                "gateway_ptb_return_changes_selected_gateway_route");
+  suite.expect(run(egress, exact, "gateway_ptb_return_route_mismatch_runs") == NETKIT_DROP,
+               "gateway_ptb_return_selected_route_mismatch_drops");
+  routes.candidates[0].next_hop_mac[0] = SWITCHBOARD_MASQUE_GATEWAY_FRAGMENT_FIRST;
+  suite.require(updateProgramMapElement(egress, "ovl_site_rts_v2"_ctv, siteKey, routes),
+                "gateway_ptb_return_restores_selected_gateway_route");
+  auto *icmp = reinterpret_cast<icmp6hdr *>(outer + 1); icmp->icmp6_type = ICMPV6_DEST_UNREACH;
+  suite.expect(run(egress, exact, "gateway_ptb_return_malformed_runs") == NETKIT_DROP,
+               "gateway_ptb_return_malformed_drops");
+  suite.expect(run(ingress, exact, "gateway_ptb_return_malformed_ingress_runs") == NETKIT_DROP,
+               "gateway_ptb_return_malformed_ingress_drops");
+  icmp->icmp6_type = ICMPV6_PKT_TOOBIG;
+  suite.require(deleteProgramMapElement(ingress, "ct_tcp_grants"_ctv, original),
+                "gateway_ptb_return_revokes_recipient_grant");
+  suite.expect(run(ingress, exact, "gateway_ptb_return_revoked_grant_runs") == NETKIT_DROP,
+               "gateway_ptb_return_revoked_grant_drops");
+  grant.authorizationExpiresAtNs = 1;
+  suite.require(updateProgramMapElement(ingress, "ct_tcp_grants"_ctv, original, grant),
+                "gateway_ptb_return_installs_expired_grant");
+  suite.expect(run(ingress, exact, "gateway_ptb_return_expired_grant_runs") == NETKIT_DROP,
+               "gateway_ptb_return_expired_grant_drops");
+  grant.authorizationExpiresAtNs = UINT64_MAX;
+  suite.require(updateProgramMapElement(ingress, "ct_tcp_grants"_ctv, original, grant) &&
+                    deleteProgramMapElement(ingress, "ct_tcp_flows"_ctv, original),
+                "gateway_ptb_return_removes_recipient_current_flow");
+  suite.expect(run(ingress, exact, "gateway_ptb_return_absent_flow_runs") == NETKIT_DROP,
+               "gateway_ptb_return_absent_flow_drops");
+  egress.close(); ingress.close();
+}
+
 int main(void)
 {
   if (const char *only = std::getenv("PRODIGY_TEST_ONLY");
@@ -2860,6 +3008,12 @@ int main(void)
   {
     testPrivateSessionExactFlowLease(suite);
     testDeclaredNetworkIdleTCPFlowReauthorization(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && std::strcmp(only, "gateway-ptb-return") == 0)
+  {
+    testGatewayPTBReturn(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = std::getenv("PRODIGY_TEST_ONLY");

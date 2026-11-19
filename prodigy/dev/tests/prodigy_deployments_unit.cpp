@@ -12133,6 +12133,8 @@ int main(void)
 
     deployment.plan.whiteholes[0].family = ExternalAddressFamily::ipv4;
     brain.brainConfig.runtimeEnvironment.test.enableFakeIpv4Boundary = true;
+    worker.hasInternetAccess = true;
+    worker.hardware.network.internet.sourceAddress = IPAddress("10.0.0.11", false);
     prodigyApplyInternalRuntimeEnvironmentDefaults(brain.brainConfig.runtimeEnvironment);
     fit = ApplicationDeployment::nFitOnMachine(&deployment, &worker, 1);
     suite.expect(fit == 1, "nFitOnMachine_whitehole_host_public_accepts_explicit_fake_ipv4_boundary");

@@ -267,7 +267,7 @@ static void replaceAll(std::string& value, const std::string& from, const std::s
   }
 }
 
-static bool runStorageCleanupScript(const String& rendered, const char *scenario, bool expectSuccess, bool expectUnmount, bool expectWipe, bool expectContainerKill = false)
+static bool runStorageCleanupScript(const String& rendered, const char *scenario, bool expectSuccess, bool expectUnmount, bool expectWipe, bool expectContainerKill = false, bool expectNativeCleanup = false)
 {
   char templatePath[] = "/tmp/prodigy-remove-unit-XXXXXX";
   char *rootPath = ::mkdtemp(templatePath);
@@ -279,7 +279,7 @@ static bool runStorageCleanupScript(const String& rendered, const char *scenario
   std::string cgroups = root + "/cgroups";
   std::string run = root + "/run";
   ::mkdir(fake.c_str(), 0700); ::mkdir(state.c_str(), 0700); ::mkdir(containers.c_str(), 0700); ::mkdir(cgroups.c_str(), 0700); ::mkdir(run.c_str(), 0700);
-  if (std::string(scenario) != "external") std::ofstream(state + "/containers.btrfs.loop").put('x');
+  if (std::string(scenario) != "external" && std::string(scenario) != "native" && std::string(scenario) != "nativebusy" && std::string(scenario) != "nativeabsentruntime") std::ofstream(state + "/containers.btrfs.loop").put('x');
   auto write = [&](const char *name, const char *body) { std::ofstream file(fake + "/" + name); file << "#!/bin/sh\n" << body; file.close(); ::chmod((fake + "/" + name).c_str(), 0700); };
   write("systemctl", R"SH(case "$*" in
   *LoadState*) echo loaded;;
@@ -292,8 +292,14 @@ exit 0
   write("mountpoint", "[ \"$2\" = \"$MOCK_CONTAINERS\" ] && [ -f \"$MOCK_ROOT/mounted\" ]\n");
   write("findmnt", R"SH(case "$*" in
   *FSTYPE*) echo btrfs;;
-  *--target*) [ "$MOCK_SCENARIO" = external ] && echo /dev/sda || echo /dev/loop7;;
+  *--target*) case "$MOCK_SCENARIO" in external) echo /dev/sda;; native|nativebusy|nativeabsentruntime) echo /dev/vda3;; *) echo /dev/loop7;; esac;;
   *) echo /dev/sda; [ "$MOCK_SCENARIO" = elsewhere ] && echo /dev/loop7;;
+esac
+exit 0
+)SH");
+  write("btrfs", R"SH(case "$*" in
+  *"subvolume list"*) [ "$MOCK_SCENARIO" = native ] && { echo "ID 9 gen 1 top level 5 path containers/child"; echo "ID 10 gen 1 top level 5 path containers/child/nested"; };;
+  *"subvolume delete"*) echo "btrfs-delete $*" >>"$MOCK_ROOT/log";;
 esac
 exit 0
 )SH");
@@ -313,7 +319,8 @@ exit 0
 [ "$MOCK_SCENARIO" = autoclear ] && /bin/rm -f "$MOCK_ROOT/associated";
 exit 0
 )SH");
-  write("rm", "echo rm >>\"$MOCK_ROOT/log\"\n");
+  write("rm", "case \"$3\" in \"$MOCK_RUN\"/.owned-native-subvolumes.*) exit 0;; esac\necho rm >>\"$MOCK_ROOT/log\"\n");
+  write("mkdir", "exec /bin/mkdir \"$@\"\n");
   write("sleep", "exit 0\n");
   write("cat", R"SH(case "$1" in
   "$MOCK_CGROUP"/*.slice/leaf/cgroup.procs)
@@ -349,8 +356,14 @@ esac
     std::ofstream(leaf + "/cgroup.kill");
     std::ofstream(leaf + "/cgroup.procs"); // Virtual cgroup files report zero stat size.
   }
-  std::ofstream(root + "/mounted").put('x');
-  if (std::string(scenario) != "external") std::ofstream(root + "/associated").put('x');
+  if (std::string(scenario) != "native" && std::string(scenario) != "nativebusy" && std::string(scenario) != "nativeabsentruntime") std::ofstream(root + "/mounted").put('x');
+  if (std::string(scenario) == "nativebusy") std::ofstream(root + "/mounted").put('x');
+  if (std::string(scenario) != "external" && std::string(scenario) != "native" && std::string(scenario) != "nativebusy" && std::string(scenario) != "nativeabsentruntime") std::ofstream(root + "/associated").put('x');
+  if (std::string(scenario) == "native" || std::string(scenario) == "nativebusy" || std::string(scenario) == "nativeabsentruntime")
+  {
+    ::mkdir((containers + "/child").c_str(), 0700); ::mkdir((containers + "/child/nested").c_str(), 0700);
+    ::mkdir((containers + "/store").c_str(), 0700); ::mkdir((containers + "/storage").c_str(), 0700); ::mkdir((containers + "/system-store").c_str(), 0700);
+  }
   String renderedCopy = rendered;
   std::string command(renderedCopy.c_str());
   replaceAll(command, "/var/lib/prodigy/containers.btrfs.loop", "@OWNED_LOOP_IMAGE@");
@@ -358,9 +371,11 @@ esac
   replaceAll(command, "/var/lib/prodigy", state);
   replaceAll(command, "/containers", containers);
   replaceAll(command, "/run/prodigy", run);
+  replaceAll(command, "/usr/bin/stat -c %d /)", "/usr/bin/stat -c %d " + root + ")");
   replaceAll(command, "@OWNED_LOOP_IMAGE@", state + "/containers.btrfs.loop");
+  if (std::string(scenario) == "nativeabsentruntime") ::rmdir(run.c_str());
   // A missing mock must fail closed rather than invoke a real host command.
-  std::string invoke = "PATH=" + shellQuote(fake) + " MOCK_ROOT=" + shellQuote(root) + " MOCK_CONTAINERS=" + shellQuote(containers) + " MOCK_CGROUP=" + shellQuote(cgroups) + " MOCK_SCENARIO=" + shellQuote(scenario) + " /bin/sh -c " + shellQuote(command);
+  std::string invoke = "PATH=" + shellQuote(fake) + " MOCK_ROOT=" + shellQuote(root) + " MOCK_RUN=" + shellQuote(run) + " MOCK_CONTAINERS=" + shellQuote(containers) + " MOCK_CGROUP=" + shellQuote(cgroups) + " MOCK_SCENARIO=" + shellQuote(scenario) + " /bin/sh -c " + shellQuote(command);
   bool success = ::system(invoke.c_str()) == 0;
   std::ifstream log(root + "/log"); std::string lines((std::istreambuf_iterator<char>(log)), {});
   const size_t stop = lines.find("stop");
@@ -368,7 +383,8 @@ esac
   const size_t unmount = lines.find("umount");
   const size_t wipe = lines.find("rm");
   bool killOrder = expectContainerKill == false || (kill != std::string::npos && unmount != std::string::npos && wipe != std::string::npos && stop != std::string::npos && stop < kill && kill < unmount && unmount < wipe);
-  bool okay = stop != std::string::npos && success == expectSuccess && (unmount != std::string::npos) == expectUnmount && (wipe != std::string::npos) == expectWipe && killOrder;
+  const bool nativeCleanup = lines.find("btrfs-delete") != std::string::npos;
+  bool okay = stop != std::string::npos && success == expectSuccess && (unmount != std::string::npos) == expectUnmount && (wipe != std::string::npos) == expectWipe && nativeCleanup == expectNativeCleanup && killOrder;
   (void)::system(("/bin/rm -rf " + shellQuote(root)).c_str());
   return okay;
 }
@@ -725,7 +741,10 @@ int main(void)
     mothershipBuildProdigyStateWipeCommand("/var/lib/prodigy/state"_ctv, command);
     suite.expect(runStorageCleanupScript(command, "autoclear", true, true, true), "remove_owned_loop_autoclear_before_wipe");
     suite.expect(runStorageCleanupScript(command, "detach", true, true, true), "remove_owned_loop_explicit_detach_before_wipe");
-    suite.expect(runStorageCleanupScript(command, "external", true, false, true), "remove_external_containers_preserved");
+    suite.expect(runStorageCleanupScript(command, "external", false, false, false), "remove_external_containers_refuse_wipe");
+    suite.expect(runStorageCleanupScript(command, "native", true, false, true, false, true), "remove_native_btrfs_children_and_owned_storage_after_drain");
+    suite.expect(runStorageCleanupScript(command, "nativeabsentruntime", true, false, true, false, true), "remove_native_btrfs_initializes_missing_runtime_root");
+    suite.expect(runStorageCleanupScript(command, "nativebusy", false, false, false), "remove_busy_native_btrfs_root_refuses_wipe");
     suite.expect(runStorageCleanupScript(command, "ambiguous", false, false, false), "remove_ambiguous_loop_refuses_wipe");
     suite.expect(runStorageCleanupScript(command, "umountfail", false, true, false), "remove_failed_unmount_refuses_wipe");
     suite.expect(runStorageCleanupScript(command, "stopfail", false, false, false), "remove_failed_stop_refuses_wipe");

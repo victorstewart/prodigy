@@ -30,6 +30,37 @@ __attribute__((__always_inline__)) static inline bool containerMasqueGatewayRemo
       policy->containerFragment, ip6h->saddr.s6_addr, ip6h->daddr.s6_addr, true, sourceSiteRoute);
 }
 
+// A gateway-generated PTB reverses an ordinary local-to-remote TCP packet.
+// Reuse the selected remote-site route test in its remote-to-local orientation
+// so an arbitrary ICMPv6 packet cannot become an allowlist bypass.
+__attribute__((noinline)) static bool containerMasqueGatewayPTBReturnIPv6(
+    struct ipv6hdr *ip6h, void *data_end)
+{
+  if (ip6h == NULL || (void *)(ip6h + 1) > data_end || ip6h->nexthdr != IPPROTO_ICMPV6)
+  {
+    return false;
+  }
+  struct switchboard_masque_gateway_ptb6 ptb = {};
+  if (switchboardMasqueGatewayPTB6ShapeValid(ip6h, data_end, containerInterContainerMTU(), &ptb) == false)
+  {
+    return false;
+  }
+  __u32 zeroidx = 0, remoteMachine = 0;
+  struct container_network_policy *policy = bpf_map_lookup_elem(&ct_net_policy, &zeroidx);
+  struct local_container_subnet6 *localSubnet = bpf_map_lookup_elem(&lc_subnet, &zeroidx);
+  if (policy == NULL || localSubnet == NULL ||
+      containerNetworkAddressMatches(ip6h->saddr.s6_addr) == false ||
+      switchboardExtractOverlayMachineIdentityFromIPv6(ptb.quotedIPv6->daddr.s6_addr, &remoteMachine) == false)
+  {
+    return false;
+  }
+
+  struct switchboard_overlay_machine_route *remoteSiteRoute = lookupOverlaySiteRoute(remoteMachine);
+  return switchboardMasqueGatewayRemoteTransitPermitted(CONTAINER_NETWORK_DESTINATION_ALLOWLIST,
+      localSubnet, policy->containerFragment, ptb.quotedIPv6->daddr.s6_addr,
+      ptb.quotedIPv6->saddr.s6_addr, true, remoteSiteRoute);
+}
+
 // This program is attached as BPF_NETKIT_PEER using the host-side primary
 // ifindex. Upstream netkit resolves that attach type to the peer endpoint, and
 // netkit_xmit() runs the program attached to the transmitting endpoint. That
@@ -177,6 +208,10 @@ int ct_egress(struct __sk_buff *skb)
       struct ipv6hdr *ip6h = (struct ipv6hdr *)l3_data;
       struct switchboard_l4_ports l4 = {};
       if (containerMasqueGatewayRemoteTransitIPv6(ip6h, data_end))
+      {
+        masqueGatewayTransit = true;
+      }
+      else if (containerMasqueGatewayPTBReturnIPv6(ip6h, data_end))
       {
         masqueGatewayTransit = true;
       }

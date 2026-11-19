@@ -9996,7 +9996,9 @@ public:
       }
     }
     if (requested.protocolVersion ==
-        MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeSupersedingUpgradeVersion) {
+            MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeSupersedingUpgradeVersion ||
+        requested.protocolVersion ==
+            MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimePlanBoundSupersedingUpgradeVersion) {
       MothershipLocalAuthorityRecoveryCohortRecord predecessor;
       String predecessorBytes,predecessorSHA;
       if (!loadLocalAuthorityRecoveryCohort(
@@ -10012,7 +10014,16 @@ public:
     for (const auto& bytes:values) {
       MothershipLocalAuthorityRecoveryCohortRecord cohort;
       if (!BitseryEngine::deserializeSafe(bytes,cohort) ||
-          !mothershipLocalAuthorityRecoveryCohortRecordValid(cohort)) {
+          cohort.protocolVersion != cohort.request.protocolVersion ||
+          !mothershipLocalAuthorityRecoveryCohortEnvelopeValid(cohort.request)) {
+        if (failure) failure->assign("local runtime recovery encountered an invalid prior cohort envelope"_ctv);
+        return false;
+      }
+      // Recovery history is cluster-owned. A retired cluster can retain an
+      // older gateway schema; its payload cannot authorize or block this
+      // cluster's cohort and must not be rewritten as current authority.
+      if (cohort.request.clusterUUID != requested.clusterUUID) continue;
+      if (!mothershipLocalAuthorityRecoveryCohortRecordValid(cohort)) {
         if (failure) failure->assign("local runtime recovery encountered an invalid prior cohort"_ctv);
         return false;
       }

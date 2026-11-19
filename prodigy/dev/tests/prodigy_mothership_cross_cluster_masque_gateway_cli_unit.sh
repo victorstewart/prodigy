@@ -75,6 +75,30 @@ expect_pair_rejected_before_lookup() {
   [[ ! -e $scratch/$label.tidesdb ]]
 }
 
+expect_readiness_lookup() {
+  local label=$1
+  if env PRODIGY_MOTHERSHIP_TIDESDB_PATH="$scratch/$label.tidesdb" "$mothership_bin" \
+      crossClusterMasqueGateway readiness "$pair_operation" "$local_machine" >"$scratch/$label.log" 2>&1; then
+    echo "$label unexpectedly found a readiness authority" >&2
+    exit 1
+  fi
+  "$rg_bin" -q 'crossClusterMasqueGateway success=0 .*failure=.*record not found' "$scratch/$label.log"
+  ! "$rg_bin" -q 'usage: crossClusterMasqueGateway' "$scratch/$label.log"
+}
+
+expect_readiness_rejected_before_lookup() {
+  local label=$1
+  shift
+  if env PRODIGY_MOTHERSHIP_TIDESDB_PATH="$scratch/$label.tidesdb" "$mothership_bin" \
+      crossClusterMasqueGateway readiness "$@" >"$scratch/$label.log" 2>&1; then
+    echo "$label unexpectedly accepted malformed readiness arguments" >&2
+    exit 1
+  fi
+  "$rg_bin" -q 'usage: crossClusterMasqueGateway' "$scratch/$label.log"
+  ! "$rg_bin" -q 'record not found' "$scratch/$label.log"
+  [[ ! -e $scratch/$label.tidesdb ]]
+}
+
 # Legacy no-suffix behavior stays valid with default slots. All three exact
 # slot values, a distinct gateway/tunnel pair, and artifact forms must reach
 # pair lookup.
@@ -95,6 +119,12 @@ expect_pair_lookup pair-distinct-slots --slots 0 2
 expect_pair_rejected_before_lookup pair-slot-too-large --slots 3 0
 expect_pair_rejected_before_lookup pair-slot-missing --slots 1
 expect_pair_rejected_before_lookup pair-wrong-flag --slot 1 0
+
+# Readiness accepts exactly one authority tuple and performs only the existing
+# read-only registry lookup.  It must not reinterpret malformed or stale IDs.
+expect_readiness_lookup readiness-absent
+expect_readiness_rejected_before_lookup readiness-missing-machine "$pair_operation"
+expect_readiness_rejected_before_lookup readiness-noncanonical 2 "$local_machine"
 
 expect_rejected_before_lookup slot-too-large --slots 3 0
 expect_rejected_before_lookup slot-negative --slots -1 0

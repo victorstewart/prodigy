@@ -41,6 +41,354 @@ static bool stringContains(const String& haystack, const char *needle)
                      needle + needleLength) != (haystack.data() + haystack.size());
 }
 
+static String recoveryDigest(char byte)
+{
+  String result = {};
+  for (uint32_t index = 0; index < 64; ++index) result.append(byte);
+  return result;
+}
+
+static MothershipLocalAuthorityRecoveryCohortRequest planBoundRecoveryFixture(uint32_t gatewaysPerMember)
+{
+  MothershipLocalAuthorityRecoveryCohortRequest request = {};
+  request.protocolVersion = MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimePlanBoundUpgradeVersion;
+  request.operationUUID = 0x601; request.clusterUUID = 0x602; request.topologyVersion = 17;
+  request.timeoutMilliseconds = mothershipLocalAuthorityRecoveryMinimumTimeoutMilliseconds;
+  const uint128_t machines[] = {0x11, 0x22, 0x33};
+  const char *linuxIDs[] = {"11111111111111111111111111111111", "22222222222222222222222222222222",
+                            "33333333333333333333333333333333"};
+  for (uint32_t index = 0; index < 3; ++index) {
+    MothershipLocalAuthorityRecoveryExecutor executor = {};
+    executor.machineUUID = machines[index]; executor.boundaryUUID = 0x100 + index;
+    executor.executorOperationUUID = 0x200 + index; executor.immutableBoundarySHA256 = recoveryDigest('a');
+    request.executors.push_back(std::move(executor));
+    MothershipLocalRecoveryRuntimeMember member = {};
+    member.machineUUID = machines[index]; member.linuxMachineID.assign(linuxIDs[index]);
+    member.beforeBootID = "00000000-0000-4000-8000-000000000001"_ctv;
+    member.runtimeRoot = "/root/prodigy"_ctv; member.gatewayInventory = "sealed-gateway-inventory"_ctv;
+    member.installRequired = true; request.runtime.members.push_back(std::move(member));
+  }
+  request.runtime.upgradeOperationUUID = 0x701; request.runtime.admissionSHA256 = recoveryDigest('b');
+  request.runtime.bundlePath = "/approved/runtime.bundle.tar.zst"_ctv;
+  request.runtime.targetContractSHA256 = recoveryDigest('c');
+  auto& identity = request.admittedRuntime;
+  identity.sourceBundleSHA256 = recoveryDigest('d'); identity.sourceContractSHA256 = recoveryDigest('e');
+  identity.sourceReleaseID = "source"_ctv; identity.sourceProdigySHA256 = recoveryDigest('f');
+  identity.sourceMothershipSHA256 = recoveryDigest('1'); identity.sourceBinaryVersion = "102"_ctv;
+  identity.targetBundleSHA256 = recoveryDigest('2'); identity.targetReleaseID = "target"_ctv;
+  identity.targetProdigySHA256 = recoveryDigest('3'); identity.targetMothershipSHA256 = recoveryDigest('4');
+  identity.targetBinaryVersion = "103"_ctv; identity.authorityGeneration = 9;
+  identity.masterUUID = machines[2]; identity.masterBootNs = 77; identity.semanticObservationSHA256 = recoveryDigest('5');
+  for (uint16_t application : {uint16_t(3), uint16_t(4), uint16_t(5)}) {
+    MothershipLocalRecoveryWorkloadIdentity workload = {};
+    workload.applicationID = application; workload.deploymentID = (uint64_t(application) << 48) | application;
+    workload.stateful = application != 5;
+    if (application == 4) { workload.shardGroups = 1; workload.target = workload.targetBase = 1; }
+    identity.workloads.push_back(workload);
+    MothershipLocalRecoveryPlanBinding binding = {};
+    binding.applicationID = application; binding.deploymentID = workload.deploymentID;
+    const char planDigest[] = {'6', '7', 'a'};
+    const char blobDigest[] = {'8', '9', 'b'};
+    binding.canonicalPlanSHA256 = recoveryDigest(planDigest[application - 3]);
+    binding.containerBlobSHA256 = recoveryDigest(blobDigest[application - 3]);
+    binding.containerBlobBytes = 4096 + application; binding.authorityGeneration = identity.authorityGeneration;
+    binding.masterUUID = identity.masterUUID; binding.masterBootNs = identity.masterBootNs;
+    request.planBindings.push_back(std::move(binding));
+  }
+  identity.activeDeploymentCount = identity.workloads.size();
+  for (uint32_t pair = 1; pair <= gatewaysPerMember; ++pair) for (uint32_t index = 0; index < 3; ++index) {
+    CrossClusterMasqueGatewayAuthority gateway = {};
+    gateway.pairUUID = pair; gateway.pairOperationUUID = 0x800 + pair;
+    gateway.localClusterUUID = request.clusterUUID; gateway.peerClusterUUID = 0x900 + pair;
+    gateway.localMachineUUID = machines[index]; gateway.peerMachineUUID = 0xa00 + pair * 10 + index;
+    gateway.localDatacenterFragment = 1; gateway.peerDatacenterFragment = uint8_t(pair + 1);
+    gateway.localSitePrefix = prodigyContainerDatacenterSitePrefix(1);
+    gateway.peerSitePrefix = prodigyContainerDatacenterSitePrefix(uint8_t(pair + 1));
+    gateway.artifactSHA256 = recoveryDigest('a'); gateway.artifactBytes = 4260945;
+    gateway.listenerPublicUDPEndpoint.is6 = true; gateway.listenerPublicUDPEndpoint.v6[0] = 0x20;
+    gateway.listenerPublicUDPPort = 4433; gateway.localIdentitySHA256 = recoveryDigest('b');
+    gateway.peerIdentitySHA256 = recoveryDigest('c'); gateway.peerTrustSHA256 = recoveryDigest('d');
+    gateway.generation = gateway.keyGeneration = gateway.pairAuthorityGeneration = 1;
+    gateway.gatewaySlot = index; gateway.tunnelSlot = index;
+    []<typename Authority>(Authority& value, uint32_t pairIndex) {
+      if constexpr (requires { value.runtimeFragment; })
+        value.runtimeFragment = pairIndex == 1 ? prodigyCrossClusterMasqueGatewayRuntimeFragmentFirst :
+                                                prodigyCrossClusterMasqueGatewayRuntimeFragmentSecond;
+    }(gateway, pair);
+    (void)prodigyDeriveCrossClusterMasquePrivateBGPTuple(gateway);
+    gateway.privateSessionCredentialSHA256 = recoveryDigest('e');
+    request.runtime.gateways.push_back(std::move(gateway));
+  }
+  return request;
+}
+
+static ClusterStatusReport planBoundRecoveryReport(const MothershipLocalAuthorityRecoveryCohortRequest& request,
+                                                    bool materializeUnknown)
+{
+  ClusterStatusReport report = {};
+  report.hasTopology = true; report.topology.version = request.topologyVersion; report.nMachines = 3;
+  report.nApplications = request.admittedRuntime.workloads.size();
+  for (const auto& member : request.runtime.members) {
+    ClusterMachine machine = {}; machine.uuid = member.machineUUID; machine.isBrain = true;
+    machine.kind = MachineConfig::MachineKind::vm; machine.backing = ClusterMachineBacking::owned;
+    machine.lifetime = MachineLifetime::owned; report.topology.machines.push_back(std::move(machine));
+    MachineStatusReport status = {}; status.machineUUID.assignItoh(member.machineUUID); status.isBrain = true;
+    status.controlPlaneReachable = status.runtimeReady = true; status.state = "healthy"_ctv;
+    status.updateStage = "idle"_ctv; status.currentMaster = member.machineUUID == request.admittedRuntime.masterUUID;
+    status.runningProdigyVersion = request.admittedRuntime.sourceBinaryVersion;
+    status.approvedBundleSHA256 = request.admittedRuntime.sourceBundleSHA256;
+    report.machineReports.push_back(std::move(status));
+  }
+  for (const auto& workload : request.admittedRuntime.workloads) {
+    ApplicationStatusReport application = {}; application.applicationID = workload.applicationID;
+    DeploymentStatusReport deployment = {}; deployment.versionID = workload.deploymentID & ((uint64_t(1) << 48) - 1);
+    deployment.isStateful = workload.stateful; deployment.nShardGroups = workload.shardGroups;
+    deployment.nTarget = workload.target; deployment.nTargetBase = workload.targetBase; deployment.nTargetSurge = workload.targetSurge;
+    if (materializeUnknown) {
+      deployment.state = DeploymentState::running;
+      deployment.nDeployed = deployment.nHealthy = deployment.nTarget;
+    }
+    if (workload.shardGroups == 0 && materializeUnknown) {
+      if (workload.stateful) deployment.nShardGroups = 3;
+      deployment.nTarget = deployment.nTargetBase = deployment.nDeployed = deployment.nHealthy = 1;
+    }
+    application.deploymentReports.push_back(std::move(deployment)); report.applicationReports.push_back(std::move(application));
+  }
+  return report;
+}
+
+static void testPlanBoundRecoveryRegressions(TestSuite& suite, const String& directory)
+{
+  String failure = {};
+  auto request = planBoundRecoveryFixture(1);
+  suite.expect(mothershipLocalAuthorityRecoveryCohortRequestValid(request, &failure),
+               "plan_bound_recovery_accepts_three_active_gateways");
+  auto sixGateways = planBoundRecoveryFixture(2);
+  suite.expect(mothershipLocalAuthorityRecoveryCohortRequestValid(sixGateways, &failure),
+               "plan_bound_recovery_accepts_six_active_gateways");
+  String bytes = {}; MothershipLocalAuthorityRecoveryCohortRequest decoded = {};
+  suite.expect(BitseryEngine::serialize(bytes, request) && BitseryEngine::deserializeSafe(bytes, decoded) &&
+                   mothershipLocalAuthorityRecoveryCohortRequestValid(decoded, &failure) &&
+                   decoded.planBindings.size() == request.planBindings.size(),
+               "plan_bound_recovery_v5_round_trip");
+
+  auto v3 = sixGateways; v3.protocolVersion = MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion;
+  auto v4 = sixGateways; v4.protocolVersion = MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeSupersedingUpgradeVersion;
+  v3.admittedRuntime.workloads[0].shardGroups = 1;
+  v3.admittedRuntime.workloads[0].target = v3.admittedRuntime.workloads[0].targetBase = 1;
+  v4.admittedRuntime.workloads[0].shardGroups = 1;
+  v4.admittedRuntime.workloads[0].target = v4.admittedRuntime.workloads[0].targetBase = 1;
+  v4.planBindings.clear();
+  v4.runtime.predecessorRecoveryUUID = 0x888; v4.runtime.predecessorRecoverySHA256 = recoveryDigest('f');
+  String v3Before = {}, v3After = {}; BitseryEngine::serialize(v3Before, v3); v3.planBindings.clear(); BitseryEngine::serialize(v3After, v3);
+  suite.expect(mothershipLocalAuthorityRecoveryCohortRequestValid(v3, &failure) &&
+                   mothershipLocalAuthorityRecoveryCohortRequestValid(v4, &failure) && v3Before == v3After,
+               "plan_bound_recovery_v3_v4_records_remain_valid_and_byte_stable");
+  auto v5Codec = request;
+  String v5Before = {}, v5After = {};
+  MothershipLocalRecoveryGatewayProvenance ignoredV5Proof = {};
+  ignoredV5Proof.artifactSHA256 = v5Codec.runtime.gateways[0].artifactSHA256;
+  ignoredV5Proof.artifactBytes = v5Codec.runtime.gateways[0].artifactBytes;
+  ignoredV5Proof.executableSHA256 = recoveryDigest('d'); ignoredV5Proof.executableBytes = 1;
+  ignoredV5Proof.provenanceSHA256 = recoveryDigest('e');
+  BitseryEngine::serialize(v5Before, v5Codec); v5Codec.gatewayProvenance.push_back(std::move(ignoredV5Proof));
+  BitseryEngine::serialize(v5After, v5Codec);
+  suite.expect(v5Before == v5After && !mothershipLocalAuthorityRecoveryCohortRequestValid(v5Codec, &failure),
+               "plan_bound_recovery_v5_codec_ignores_and_validator_rejects_v6_proof_tail");
+
+  auto source = planBoundRecoveryReport(request, false);
+  suite.expect(mothershipLocalAdmittedRuntimeUpgradeRecoverySourceReportValid(request, source),
+               "plan_bound_recovery_accepts_unknown_stateful_source");
+  suite.expect(!source.applicationReports[2].deploymentReports[0].isStateful &&
+                   source.applicationReports[2].deploymentReports[0].nShardGroups == 0 &&
+                   source.applicationReports[2].deploymentReports[0].nTarget == 0,
+               "plan_bound_recovery_preserves_unknown_stateless_probe_source");
+  suite.expect(!mothershipLocalRecoveryWorkloadsMaterialized(request, source),
+               "plan_bound_recovery_rejects_unknown_stateful_target");
+  auto target = planBoundRecoveryReport(request, true);
+  for (auto& status : target.machineReports) {
+    status.runningProdigyVersion = request.admittedRuntime.targetBinaryVersion;
+    status.approvedBundleSHA256 = request.admittedRuntime.targetBundleSHA256;
+  }
+  suite.expect(mothershipLocalAdmittedRuntimeUpgradeReportValid(request, target, true) &&
+                   mothershipLocalRecoveryWorkloadsMaterialized(request, target) &&
+                   mothershipLocalRecoveryPlanBindingsValid(request),
+               "plan_bound_recovery_accepts_materialized_healthy_target");
+  suite.expect(!target.applicationReports[2].deploymentReports[0].isStateful &&
+                   target.applicationReports[2].deploymentReports[0].nShardGroups == 0 &&
+                   target.applicationReports[2].deploymentReports[0].nTarget == 1,
+               "plan_bound_recovery_materializes_stateless_probe_without_shards");
+  auto incomplete = target;
+  incomplete.applicationReports[0].deploymentReports[0].nDeployed = 0;
+  suite.expect(!mothershipLocalRecoveryWorkloadsMaterialized(request, incomplete),
+               "plan_bound_recovery_rejects_incomplete_materialized_target");
+  auto drifted = target; ++drifted.applicationReports[1].deploymentReports[0].nTarget;
+  ++drifted.applicationReports[1].deploymentReports[0].nTargetBase;
+  suite.expect(!mothershipLocalRecoveryWorkloadsMaterialized(request, drifted),
+               "plan_bound_recovery_rejects_known_count_drift");
+
+  auto rejects = [&](const char *name, auto mutation) {
+    auto changed = request; mutation(changed);
+    suite.expect(!mothershipLocalAuthorityRecoveryCohortRequestValid(changed, &failure), name);
+  };
+  rejects("plan_bound_recovery_rejects_missing_member_gateway", [](auto& value) { value.runtime.gateways.pop_back(); });
+  rejects("plan_bound_recovery_rejects_foreign_gateway", [](auto& value) { ++value.runtime.gateways[0].localClusterUUID; });
+  rejects("plan_bound_recovery_rejects_withdrawn_gateway", [](auto& value) { value.runtime.gateways[0].state = CrossClusterMasqueGatewayState::withdrawn; });
+  rejects("plan_bound_recovery_rejects_duplicate_gateway", [](auto& value) { value.runtime.gateways.push_back(value.runtime.gateways[0]); });
+  rejects("plan_bound_recovery_rejects_mutated_binding_key", [](auto& value) { ++value.planBindings[0].deploymentID; });
+  rejects("plan_bound_recovery_rejects_missing_binding", [](auto& value) { value.planBindings.pop_back(); });
+  rejects("plan_bound_recovery_rejects_binding_authority_mismatch", [](auto& value) { ++value.planBindings[0].authorityGeneration; });
+
+  auto admitted = request;
+  MothershipUpgradeAdmissionRecord admission = {};
+  admission.clusterUUID = admitted.clusterUUID; admission.operationID = admitted.runtime.upgradeOperationUUID;
+  admission.sourceBundleSHA256 = admitted.admittedRuntime.sourceBundleSHA256;
+  admission.sourceContractSHA256 = admitted.admittedRuntime.sourceContractSHA256;
+  admission.sourceReleaseID = admitted.admittedRuntime.sourceReleaseID;
+  admission.sourceProdigySHA256 = admitted.admittedRuntime.sourceProdigySHA256;
+  admission.sourceMothershipSHA256 = admitted.admittedRuntime.sourceMothershipSHA256;
+  admission.targetBundleSHA256 = admitted.admittedRuntime.targetBundleSHA256;
+  admission.targetContractSHA256 = admitted.runtime.targetContractSHA256;
+  admission.authorityGeneration = admitted.admittedRuntime.authorityGeneration;
+  admission.masterUUID = admitted.admittedRuntime.masterUUID; admission.masterBootNs = admitted.admittedRuntime.masterBootNs;
+  admission.semanticObservationSHA256 = admitted.admittedRuntime.semanticObservationSHA256;
+  admission.eligible = false; admission.approvedPath = 0;
+  admission.firstStopGate = "generation-fenced peer upgrade observation is incomplete"_ctv;
+  admission.observationReceiptVersion = 1; admission.observationReportSHA256 = recoveryDigest('c');
+  admission.plannerInputSHA256 = recoveryDigest('d');
+  auto sealAdmission = [&](const String& path) {
+    MothershipClusterRegistry registry(path);
+    MothershipUpgradeAdmissionRecord recorded = {}; bool resumed = false; String encoded = {};
+    const bool valid = registry.recordUpgradeAdmission(admission, recorded, resumed, &failure) &&
+        BitseryEngine::serialize(encoded, recorded) && prodigyComputeSHA256Hex(encoded, admitted.runtime.admissionSHA256);
+    if (!valid) std::fprintf(stderr, "cohort admission fixture: %s\n", failure.c_str());
+    return valid;
+  };
+  auto historic = planBoundRecoveryFixture(2);
+  historic.protocolVersion = MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion;
+  historic.planBindings.clear(); historic.clusterUUID = 0x361055822e4c660aULL;
+  historic.operationUUID = 0x771; historic.runtime.upgradeOperationUUID = 0x772;
+  historic.admittedRuntime.workloads[0].shardGroups = historic.admittedRuntime.workloads[0].target =
+      historic.admittedRuntime.workloads[0].targetBase = 1;
+  for (auto& gateway : historic.runtime.gateways) {
+    gateway.localClusterUUID = historic.clusterUUID;
+    gateway.protocolVersion = 0; // A payload format unsupported by the current validator.
+  }
+  auto rawRecord = [&](const MothershipLocalAuthorityRecoveryCohortRequest& cohort) {
+    MothershipLocalAuthorityRecoveryCohortRecord record = {};
+    record.protocolVersion = cohort.protocolVersion; record.request = cohort;
+    record.phase = MothershipLocalAuthorityRecoveryPhase::released;
+    for (const auto& executor : cohort.executors) {
+      MothershipLocalAuthorityRecoveryBoundaryProgress boundary = {};
+      boundary.boundaryUUID = executor.boundaryUUID; boundary.phase = MothershipLocalAuthorityRecoveryPhase::released;
+      boundary.receiptSHA256 = recoveryDigest('e'); record.boundaries.push_back(std::move(boundary));
+      MothershipLocalRecoveryRuntimeProgress progress = {}; progress.boundaryUUID = executor.boundaryUUID;
+      record.runtimeProgress.push_back(std::move(progress));
+    }
+    return record;
+  };
+  auto predecessor = rawRecord(request);
+  const char *releasedBootIDs[] = {"00000000-0000-4000-8000-000000000002",
+                                   "00000000-0000-4000-8000-000000000003",
+                                   "00000000-0000-4000-8000-000000000004"};
+  for (uint32_t index = 0; index < predecessor.runtimeProgress.size(); ++index) {
+    auto& progress = predecessor.runtimeProgress[index];
+    progress.installDispatched = true; progress.stateSHA256 = recoveryDigest('e');
+    progress.secretsSHA256 = recoveryDigest('f'); progress.activationBootID = releasedBootIDs[index];
+  }
+  String predecessorBytes = {}, predecessorSHA = {};
+  suite.expect(mothershipLocalAuthorityRecoveryCohortRecordValid(predecessor, &failure) &&
+                   BitseryEngine::serialize(predecessorBytes, predecessor) &&
+                   prodigyComputeSHA256Hex(predecessorBytes, predecessorSHA, &failure),
+               "plan_bound_v6_predecessor_is_a_valid_released_record");
+  auto successor = request;
+  successor.protocolVersion = 6; // New wire version: plan-bound released-cohort successor.
+  MothershipLocalRecoveryGatewayProvenance gatewayProof = {};
+  gatewayProof.artifactSHA256 = successor.runtime.gateways[0].artifactSHA256;
+  gatewayProof.artifactBytes = successor.runtime.gateways[0].artifactBytes;
+  gatewayProof.executableSHA256 = recoveryDigest('d'); gatewayProof.executableBytes = 6459296;
+  gatewayProof.provenanceSHA256 = recoveryDigest('e'); successor.gatewayProvenance.push_back(std::move(gatewayProof));
+  successor.operationUUID = 0x991; successor.runtime.upgradeOperationUUID = 0x992;
+  successor.runtime.predecessorRecoveryUUID = request.operationUUID;
+  successor.runtime.predecessorRecoverySHA256 = predecessorSHA;
+  successor.admittedRuntime.sourceBundleSHA256 = request.admittedRuntime.targetBundleSHA256;
+  successor.admittedRuntime.sourceContractSHA256 = request.runtime.targetContractSHA256;
+  successor.admittedRuntime.sourceReleaseID = request.admittedRuntime.targetReleaseID;
+  successor.admittedRuntime.sourceProdigySHA256 = request.admittedRuntime.targetProdigySHA256;
+  successor.admittedRuntime.sourceMothershipSHA256 = request.admittedRuntime.targetMothershipSHA256;
+  successor.admittedRuntime.sourceBinaryVersion = request.admittedRuntime.targetBinaryVersion;
+  successor.admittedRuntime.targetBundleSHA256 = recoveryDigest('7');
+  successor.admittedRuntime.targetReleaseID = "target-104"_ctv;
+  successor.admittedRuntime.targetProdigySHA256 = recoveryDigest('8');
+  successor.admittedRuntime.targetMothershipSHA256 = recoveryDigest('9');
+  successor.admittedRuntime.targetBinaryVersion = "104"_ctv;
+  successor.admittedRuntime.authorityGeneration = 10; successor.admittedRuntime.masterBootNs = 78;
+  for (uint32_t index = 0; index < successor.runtime.members.size(); ++index)
+    successor.runtime.members[index].beforeBootID = releasedBootIDs[index];
+  for (auto& binding : successor.planBindings) { binding.authorityGeneration = 10; binding.masterBootNs = 78; }
+  suite.expect(mothershipLocalAuthorityRecoveryCohortRequestValid(successor, &failure) &&
+                   mothershipLocalReleasedRuntimeRecoveryCanBeSuperseded(predecessor, predecessorSHA, successor, &failure),
+               "plan_bound_v6_accepts_strict_released_supersession");
+  MothershipLocalAuthorityRecoveryCohortRecord successorRecord = {};
+  successorRecord.protocolVersion = 6; successorRecord.request = successor;
+  successorRecord.phase = MothershipLocalAuthorityRecoveryPhase::admitted;
+  for (const auto& executor : successor.executors) {
+    MothershipLocalAuthorityRecoveryBoundaryProgress boundary = {};
+    boundary.boundaryUUID = executor.boundaryUUID;
+    successorRecord.boundaries.push_back(std::move(boundary));
+    MothershipLocalRecoveryRuntimeProgress progress = {};
+    progress.boundaryUUID = executor.boundaryUUID;
+    successorRecord.runtimeProgress.push_back(std::move(progress));
+  }
+  String successorRecordBytes = {}; MothershipLocalAuthorityRecoveryCohortRecord decodedSuccessorRecord = {};
+  suite.expect(BitseryEngine::serialize(successorRecordBytes, successorRecord) &&
+                   BitseryEngine::deserializeSafe(successorRecordBytes, decodedSuccessorRecord) &&
+                   mothershipLocalAuthorityRecoveryCohortRecordValid(decodedSuccessorRecord, &failure),
+               "plan_bound_v6_request_and_record_round_trip");
+  auto unknownV7 = successor; unknownV7.protocolVersion = 7;
+  suite.expect(!mothershipLocalAuthorityRecoveryCohortRequestValid(unknownV7, &failure),
+               "plan_bound_v6_rejects_unknown_protocol_seven");
+  auto missingGatewayProof = successor; missingGatewayProof.gatewayProvenance.clear();
+  suite.expect(!mothershipLocalAuthorityRecoveryCohortRequestValid(missingGatewayProof, &failure),
+               "plan_bound_v6_rejects_missing_gateway_provenance");
+  auto duplicateGatewayProof = successor; duplicateGatewayProof.gatewayProvenance.push_back(duplicateGatewayProof.gatewayProvenance[0]);
+  suite.expect(!mothershipLocalAuthorityRecoveryCohortRequestValid(duplicateGatewayProof, &failure),
+               "plan_bound_v6_rejects_duplicate_gateway_provenance");
+  auto wrongGatewayProof = successor; wrongGatewayProof.gatewayProvenance[0].artifactSHA256 = recoveryDigest('f');
+  suite.expect(!mothershipLocalAuthorityRecoveryCohortRequestValid(wrongGatewayProof, &failure),
+               "plan_bound_v6_rejects_wrong_gateway_provenance_artifact");
+  auto rejectV6 = [&](const char *name, auto mutation) { auto changed = successor; mutation(changed); suite.expect(
+      !mothershipLocalReleasedRuntimeRecoveryCanBeSuperseded(predecessor, predecessorSHA, changed, &failure), name); };
+  rejectV6("plan_bound_v6_rejects_plan_drift", [](auto& value) { value.planBindings[0].canonicalPlanSHA256 = recoveryDigest('f'); });
+  rejectV6("plan_bound_v6_rejects_blob_drift", [](auto& value) { value.planBindings[0].containerBlobBytes++; });
+  rejectV6("plan_bound_v6_rejects_vm_boot_drift", [](auto& value) { value.runtime.members[0].beforeBootID = "00000000-0000-4000-8000-000000000009"_ctv; });
+  rejectV6("plan_bound_v6_rejects_predecessor_hash_drift", [](auto& value) { value.runtime.predecessorRecoverySHA256 = recoveryDigest('f'); });
+  auto writeRawCohort = [&](const String& path, const char *key,
+                            const MothershipLocalAuthorityRecoveryCohortRecord& record) {
+    String encoded = {}; const bool valid = BitseryEngine::serialize(encoded, record) &&
+        TidesDB(path).write("local_authority_recovery_cohorts"_ctv, String(key), encoded, &failure);
+    if (!valid) std::fprintf(stderr, "cohort history fixture: %s\n", failure.c_str());
+    return valid;
+  };
+  String foreignPath = {}; foreignPath.snprintf<"{}/foreign-invalid-cohort"_ctv>(directory);
+  suite.expect(sealAdmission(foreignPath) &&
+                   writeRawCohort(foreignPath, "foreign", rawRecord(historic)) &&
+                   MothershipClusterRegistry(foreignPath).localRecoveryRuntimeAuthorityMatches(admitted, &failure),
+               "plan_bound_recovery_ignores_foreign_runtime_invalid_historical_cohort");
+  auto rebound = historic; rebound.clusterUUID = admitted.clusterUUID;
+  String reboundPath = {}; reboundPath.snprintf<"{}/rebound-invalid-cohort"_ctv>(directory);
+  suite.expect(sealAdmission(reboundPath) &&
+                   writeRawCohort(reboundPath, "rebound", rawRecord(rebound)) &&
+                   !MothershipClusterRegistry(reboundPath).localRecoveryRuntimeAuthorityMatches(admitted, &failure),
+               "plan_bound_recovery_rejects_current_cluster_runtime_invalid_historical_cohort");
+  auto malformed = historic; malformed.executors[0].machineUUID = 0;
+  String malformedPath = {}; malformedPath.snprintf<"{}/malformed-foreign-cohort"_ctv>(directory);
+  suite.expect(sealAdmission(malformedPath) &&
+                   writeRawCohort(malformedPath, "malformed", rawRecord(malformed)) &&
+                   !MothershipClusterRegistry(malformedPath).localRecoveryRuntimeAuthorityMatches(admitted, &failure),
+               "plan_bound_recovery_rejects_malformed_foreign_cohort_envelope");
+}
+
 static bool equalControls(const Vector<MothershipProdigyClusterControl>& lhs, const Vector<MothershipProdigyClusterControl>& rhs)
 {
   if (lhs.size() != rhs.size())
@@ -554,6 +902,20 @@ static void testTruthRegistry(TestSuite& suite, const String& directory)
 
 static void testGlobalSingleWriterCompatibility(TestSuite& suite, const String& directory)
 {
+  ProdigyGlobalSingleWriterControl v1 = {};
+  v1.membershipUUID = 1; v1.operationUUID = 2; v1.localClusterUUID = 3; v1.containerUUID = 4;
+  v1.deploymentID = (uint64_t(42) << 48) | 1; v1.memberID = 1;
+  suite.expect(prodigyGlobalSingleWriterControlRequestValid(v1),
+      "global control keeps existing v1 inspection valid");
+  auto receipt = v1;
+  receipt.protocolVersion = 2; receipt.action = GlobalSingleWriterControlAction::inspectReservation;
+  receipt.reservationTopic = 1; receipt.reservationRequestUUID = 5; receipt.minimumAppliedIndex = 7;
+  suite.expect(prodigyGlobalSingleWriterControlRequestValid(receipt),
+      "global receipt inspection requires explicit v2 envelope");
+  receipt.protocolVersion = 1;
+  suite.expect(!prodigyGlobalSingleWriterControlRequestValid(receipt),
+      "global receipt inspection cannot reflect through a v1 envelope");
+
   ClusterStatusReport report; MachineStatusReport master;
   master.currentMaster=master.isBrain=master.controlPlaneReachable=master.runtimeReady=true;
   master.runningProdigyVersion="66"_ctv; report.machineReports.push_back(master);
@@ -727,6 +1089,7 @@ int main(int argc, char** argv)
 
   String dbPath;
   dbPath.assign(created);
+  testPlanBoundRecoveryRegressions(suite, dbPath);
   testTruthRegistry(suite, dbPath);
   testGlobalSingleWriterCompatibility(suite, dbPath);
   testTruthPrivateRoutes(suite, dbPath,10);

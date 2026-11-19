@@ -124,6 +124,11 @@ protected:
     // reconciler instead of inferring absence from cleared desired-state bits.
     bool privateBGPFallbackRemovalPending = false;
     std::unique_ptr<NeuronPrivateTunnelBGPRuntime> privateTunnelBGP;
+    // A failed first connector construction owns neither a BGPHub peer nor its
+    // reconnect timer. Keep only a tuple-bound retry intent here; the Vault
+    // credential remains in privateTunnelBGP and is never serialized.
+    bool privateBGPStartupRetryPending = false;
+    uint32_t privateBGPStartupRetryAttempts = 0;
     ProdigyCrossClusterPathFaultRequest faultLease = {};
     ProdigyCrossClusterPathFaultRequest completedFaultLease = {};
     bool faultLeaseActive = false, faultResumeAcknowledged = false;
@@ -425,6 +430,8 @@ protected:
   // receipt arrival, is the local proof that MASQUE still owns the route.
   Vector<std::unique_ptr<CrossClusterMasqueGatewayReadinessCarrier>> crossClusterMasqueGatewayReadinessCarriers;
   bytell_hash_map<uint128_t, CrossClusterMasqueGatewayReadinessCarrier *> activeCrossClusterMasqueGatewayReadinessCarriers;
+  TimeoutPacket privateBGPStartupRetryTick = {};
+  bool privateBGPStartupRetryQueued = false;
   std::unique_ptr<Switchboard> switchboard;
   std::unique_ptr<EthDevice> additionalIngressEth;
   std::unique_ptr<EthDevice> privateOverlayEth;
@@ -537,6 +544,11 @@ protected:
   bool bgpIPv6ReadinessRetryQueued = false;
   uint32_t bgpIPv6ReadinessRetryAttempts = 0;
   uint64_t bgpIPv6ReadinessRetryPendingGeneration = 0;
+  // A missing pair is terminal for a cold retained gateway only after the
+  // current authenticated Brain stream has supplied its complete authority
+  // snapshot.  Before then, state upload and authority delivery may arrive in
+  // either order.
+  uint64_t crossClusterMasqueGatewayAuthorityProjectionGeneration = 0;
   bytell_hash_map<uint128_t, std::unique_ptr<StateUploadRestoreOperation>> pendingStateUploadRestores;
   constexpr static uint32_t maximumPendingStateUploadRestores = 64;
   // An authenticated state upload may arrive while the prior control
@@ -3488,6 +3500,9 @@ protected:
       runtime->completedFaultLease = {};
     }
     runtime->faultLease = control.request; runtime->faultLeaseActive = true;
+    // A deliberate path fault is a terminal fence for startup retries.  The
+    // existing fault recovery owns any later, authenticated BGP restoration.
+    cancelPrivateBGPStartupRetry(*runtime);
     carrier->faultDeadlineNs = runtime->faultMonotonicDeadlineNs;
     carrier->faultControl = control; carrier->faultFrame = frame; carrier->faultFramePending = true;
     if (control.action == ProdigyCrossClusterPathFaultGatewayAction::pause)
@@ -3659,6 +3674,7 @@ protected:
         ensureSwitchboard()->closeWormholesToContainer(generateLocalContainerID(it->second->plan.fragment));
       removeCrossClusterMasqueGatewayListener(runtime->systemContainerUUID);
     }
+    cancelPrivateBGPStartupRetry(*runtime);
     runtime->gatewayBootstrap.reset();
     runtime->pendingLaunch.reset();
     runtime->faultLease = {}; runtime->completedFaultLease = {};
@@ -3718,6 +3734,10 @@ protected:
     if (newPairs > CrossClusterMasqueGatewayRuntime::maximumAuthoritiesPerMachine ||
         selected.size() > CrossClusterMasqueGatewayRuntime::maximumAuthoritiesPerMachine)
       return false;
+    // A later local reconciliation can still reject a live runtime (for
+    // example while rebuilding its Switchboard bindings).  From this first
+    // mutation onward the old snapshot is no longer a complete description.
+    crossClusterMasqueGatewayAuthorityProjectionGeneration = 0;
     // Retire absent pairs only after the complete replacement snapshot has
     // passed its advance/slot checks, leaving capacity for a two-pair swap.
     for (auto& runtime : crossClusterMasqueGatewayRuntimes)
@@ -3761,6 +3781,7 @@ protected:
       runtime.authority = {};
     }
     reconcileCrossClusterPrivateBGPSwitchboardFallback();
+    crossClusterMasqueGatewayAuthorityProjectionGeneration = containerLaunchControlGeneration;
     // stateUpload can arrive before the typed gateway authority. The retained
     // process remains fenced in that ordering; the completed authoritative
     // snapshot is the event that makes an exact local record retryable.
@@ -3894,6 +3915,65 @@ protected:
     return true;
   }
 
+  static uint32_t privateBGPStartupRetryDelayMs(uint32_t attempts)
+  {
+    constexpr uint32_t initialDelayMs = 1'000;
+    constexpr uint32_t maximumDelayMs = 60'000;
+    if (attempts >= 6) return maximumDelayMs;
+    return initialDelayMs << attempts;
+  }
+
+  bool privateBGPStartupRetryEligible(const CrossClusterMasqueGatewayRuntime& runtime) const
+  {
+    return runtime.privateTunnelBGP != nullptr &&
+        runtime.privateTunnelBGP->deliveredScopeMatchesAuthority(runtime.authority) &&
+        runtime.systemPlanAdmitted && runtime.systemContainerUUID != 0 &&
+        !runtime.faultLeaseActive &&
+        prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(runtime.authority) &&
+        runtime.authority.state == CrossClusterMasqueGatewayState::active &&
+        prodigyCrossClusterMasqueGatewayReady(runtime.authority, &runtime.readiness);
+  }
+
+  void cancelPrivateBGPStartupRetry(CrossClusterMasqueGatewayRuntime& runtime)
+  {
+    runtime.privateBGPStartupRetryPending = false;
+    runtime.privateBGPStartupRetryAttempts = 0;
+  }
+
+  void schedulePrivateBGPStartupRetry(CrossClusterMasqueGatewayRuntime& runtime)
+  {
+    if (!privateBGPStartupRetryEligible(runtime))
+    {
+      cancelPrivateBGPStartupRetry(runtime);
+      return;
+    }
+    runtime.privateBGPStartupRetryPending = true;
+    if (privateBGPStartupRetryQueued) return;
+    privateBGPStartupRetryTick.clear();
+    privateBGPStartupRetryTick.originator = this;
+    privateBGPStartupRetryTick.setTimeoutMs(
+        privateBGPStartupRetryDelayMs(runtime.privateBGPStartupRetryAttempts));
+    if (runtime.privateBGPStartupRetryAttempts != UINT32_MAX)
+      ++runtime.privateBGPStartupRetryAttempts;
+    privateBGPStartupRetryQueued = true;
+    Ring::queueTimeout(&privateBGPStartupRetryTick);
+  }
+
+  void servicePrivateBGPStartupRetry(void)
+  {
+    for (auto& runtime : crossClusterMasqueGatewayRuntimes)
+    {
+      if (!runtime.privateBGPStartupRetryPending) continue;
+      runtime.privateBGPStartupRetryPending = false;
+      if (!privateBGPStartupRetryEligible(runtime))
+      {
+        cancelPrivateBGPStartupRetry(runtime);
+        continue;
+      }
+      (void)reconcileCrossClusterMasqueGatewayBGP(runtime);
+    }
+  }
+
   bool restoreExpiredCrossClusterPathFault(CrossClusterMasqueGatewayRuntime& runtime)
   {
     if (!runtime.faultLeaseActive || !runtime.privateTunnelBGP ||
@@ -4015,6 +4095,7 @@ protected:
       return false;
     }
     runtime->revokeReadiness();
+    cancelPrivateBGPStartupRetry(*runtime);
     return reconcileCrossClusterMasqueGatewayBGP(*runtime);
   }
 
@@ -4092,9 +4173,11 @@ protected:
         !runtime->privateTunnelBGP->empty())
       return false;
 
+    cancelPrivateBGPStartupRetry(*runtime);
     runtime->gatewayBootstrap.reset();
     runtime->pendingLaunch.reset();
-    runtime->privateTunnelBGP.reset();
+    // Retain the empty hub: withdrawal can have queued close callbacks
+    // whose Ring dispatcher still references this inline owner.
     runtime->faultLease = {};
     runtime->completedFaultLease = {};
     runtime->faultLeaseActive = false;
@@ -4174,11 +4257,16 @@ protected:
     // A projected authority refresh must not republish BGP while an exact
     // fault lease is pending; restoration is driven by a fresh readiness
     // receipt after resume or expiry.
-    if (runtime.faultLeaseActive) { runtime.sitePrefixAdvertised = false; return false; }
+    if (runtime.faultLeaseActive) {
+      runtime.sitePrefixAdvertised = false;
+      cancelPrivateBGPStartupRetry(runtime);
+      return false;
+    }
     if (!prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(runtime.authority))
     {
       if (runtime.privateTunnelBGP) runtime.privateTunnelBGP->withdrawAll();
       runtime.sitePrefixAdvertised = false;
+      cancelPrivateBGPStartupRetry(runtime);
       return false;
     }
 
@@ -4251,6 +4339,17 @@ protected:
     runtime.sitePrefixAdvertised = reconciled &&
         runtime.privateTunnelBGP->desiredPaths().size() == 1 &&
         runtime.privateTunnelBGP->desiredPaths()[0].localPrefixAnnounced;
+    if (reconciled)
+    {
+      cancelPrivateBGPStartupRetry(runtime);
+    }
+    else if (runtime.privateTunnelBGP->desiredPaths().empty())
+    {
+      // A strict private connector can fail before BGPHub owns a peer and
+      // therefore before its reconnect timer exists. Retry only while this
+      // exact in-memory Vault scope and the authenticated gateway tuple hold.
+      schedulePrivateBGPStartupRetry(runtime);
+    }
     return reconciled;
   }
 
@@ -7774,18 +7873,24 @@ public:
     }
 
     // An authenticated Brain bootstrap creates this unpublished owner before
-    // asynchronous network recovery can publish it.  It is enough to retain
-    // the inventory fence only while every identity fence still names the
-    // exact live cgroup process; a directory name alone is never ownership.
+    // asynchronous network recovery can publish it.  The pending launch and
+    // live process identity own the cgroup across a Brain stream replacement:
+    // requiring the restore's old stream to be current here would withhold the
+    // state upload needed to admit the replacement stream.  Recovery itself
+    // still requires stateUploadRestoreCurrent before it can publish a process.
     for (const auto& [uuid, operation] : pendingStateUploadRestores)
     {
       if (operation == nullptr || operation->container == nullptr ||
+          operation->container->pendingDestroy ||
           operation->terminalRetirementPending || operation->coldRestart ||
           uuid != operation->container->plan.uuid ||
           operation->container->pid != pid ||
           operation->container->pidfd < 0 || operation->container->cgroup < 0 ||
           operation->container->name.equal(String(name.c_str())) == false ||
-          stateUploadRestoreCurrent(*operation, uuid) == false)
+          !pendingContainerLaunchIsCurrent(uuid, operation->launchAdmissionGeneration) ||
+          operation->epoch != stateUploadRestoreEpoch ||
+          memcmp(&operation->fragment, &lcsubnet6, sizeof(lcsubnet6)) != 0 ||
+          containers.contains(uuid))
       {
         continue;
       }
@@ -8526,7 +8631,15 @@ protected:
         const auto *runtime = crossClusterMasqueGatewayRuntimeForPair(
             found->second->container->plan.system.gatewayPairUUID);
         if (runtime == nullptr)
+        {
+          // An accepted replacement snapshot is complete for this Neuron. A
+          // missing pair therefore withdraws a cold candidate, but an absent
+          // or superseded snapshot must leave it fenced for an exact retry.
+          if (crossClusterMasqueGatewayAuthorityProjectionGeneration ==
+              containerLaunchControlGeneration)
+            (void)retirePendingStateUploadRestore(uuid);
           continue;
+        }
         if (runtime->authority.state != CrossClusterMasqueGatewayState::active)
           (void)retirePendingStateUploadRestore(uuid);
         else
@@ -10763,22 +10876,34 @@ public:
     readiness.authenticatedMasqueQUICReady = frame.rebindReceipt.authenticatedMasqueQUICReady && frame.rebindReceipt.ready &&
         prodigyIsSHA256HexDigest(frame.rebindReceipt.routeSetSHA256);
     CrossClusterMasqueGatewayReadinessListener::PeerIdentity candidateIdentity = {};
-    const bool admissionCurrent = carrier->localPhase == ProdigyGatewayLocalCarrierPhase::rebindReceipt &&
+    const bool rebindCurrent = carrier->localPhase == ProdigyGatewayLocalCarrierPhase::rebindReceipt &&
         tupleMatches(frame.rebindReceipt.tuple, carrier->recoveryTuple) &&
         memcmp(frame.rebindReceipt.nonce, carrier->recoveryNonce, sizeof(carrier->recoveryNonce)) == 0 && runtime != nullptr &&
         runtime->systemPlanAdmitted && runtime->systemContainerUUID == carrier->containerUUID &&
-        tupleMatches(gatewayRecoveryTuple(runtime->authority), carrier->recoveryTuple) && found != pendingStateUploadRestores.end() && found->second != nullptr &&
+        tupleMatches(gatewayRecoveryTuple(runtime->authority), carrier->recoveryTuple) &&
+        carrier->capturePeerIdentity && carrier->capturePeerIdentity(carrier->peerPID, candidateIdentity) && candidateIdentity == carrier->retainedIdentity &&
+        carrier->recoveryEpoch == stateUploadRestoreEpoch && prodigyCrossClusterMasqueGatewayReadinessMatches(runtime->authority, readiness);
+    const bool pendingCurrent = rebindCurrent && found != pendingStateUploadRestores.end() && found->second != nullptr &&
         found->second->container != nullptr && found->second->settled && !found->second->terminalRetirementPending &&
         found->second->container->pid == carrier->peerPID && found->second->container->pidfd >= 0 &&
-        carrier->capturePeerIdentity && carrier->capturePeerIdentity(found->second->container->pid, candidateIdentity) && candidateIdentity == carrier->retainedIdentity &&
-        found->second->epoch == carrier->recoveryEpoch && carrier->recoveryEpoch == stateUploadRestoreEpoch && found->second->gatewayRecoveryTokenBound &&
-        found->second->boundGatewayRecoveryToken == carrier->recoveryToken &&
-        found->second->stream == brain && found->second->requestedStream == brain && brain != nullptr &&
-        found->second->streamGeneration == brain->ioGeneration && found->second->requestedGeneration == brain->ioGeneration &&
-        streamIsActive(brain) && memcmp(&found->second->fragment, &lcsubnet6, sizeof(lcsubnet6)) == 0 &&
-        pendingContainerLaunchIsCurrent(carrier->containerUUID, found->second->launchAdmissionGeneration) &&
-        prodigyCrossClusterMasqueGatewayReadinessMatches(runtime->authority, readiness);
-    if (!admissionCurrent || !publishRestoredStateUploadContainer(*found->second, carrier->containerUUID, carrier->recoveryEpoch)) { reject(); return; }
+        found->second->epoch == carrier->recoveryEpoch && found->second->gatewayRecoveryTokenBound &&
+        found->second->boundGatewayRecoveryToken == carrier->recoveryToken && found->second->stream == brain &&
+        found->second->requestedStream == brain && brain != nullptr && found->second->streamGeneration == brain->ioGeneration &&
+        found->second->requestedGeneration == brain->ioGeneration && streamIsActive(brain) &&
+        memcmp(&found->second->fragment, &lcsubnet6, sizeof(lcsubnet6)) == 0 &&
+        pendingContainerLaunchIsCurrent(carrier->containerUUID, found->second->launchAdmissionGeneration);
+    const auto published = containers.find(carrier->containerUUID);
+    const auto *listener = crossClusterMasqueGatewayListenerForContainer(carrier->containerUUID);
+    const bool publishedCurrent = rebindCurrent && (found == pendingStateUploadRestores.end() ||
+        (found->second != nullptr && found->second->settled && found->second->container == nullptr)) && published != containers.end() &&
+        published->second != nullptr && published->second->plan.uuid == carrier->containerUUID && !published->second->pendingDestroy &&
+        !published->second->killedOnPurpose && !isContainerLaunchRetired(carrier->containerUUID) && published->second->pid == carrier->peerPID &&
+        published->second->pidfd >= 0 && published->second->plan.system.kind == SystemContainerKind::crossClusterMasqueGateway &&
+        listener != nullptr && listener->recovery && listener->fd >= 0 && listener->recoveryEpoch == carrier->recoveryEpoch &&
+        listener->recoveryToken == carrier->recoveryToken && tupleMatches(listener->recoveryTuple, carrier->recoveryTuple) &&
+        listener->retainedIdentity == carrier->retainedIdentity;
+    if ((!pendingCurrent && !publishedCurrent) ||
+        (pendingCurrent && !publishRestoredStateUploadContainer(*found->second, carrier->containerUUID, carrier->recoveryEpoch))) { reject(); return; }
     carrier->receiptAccepted = true; carrier->localPhase = ProdigyGatewayLocalCarrierPhase::established;
     carrier->rBuffer.consume(frameBytes, true);
     // The candidate is now owned by `containers`; a later readiness/BGP fence
@@ -11752,6 +11877,12 @@ public:
     if (packet == &crossClusterPathFaultTick) {
       crossClusterPathFaultTickQueued = false;
       if (result != -ECANCELED) serviceCrossClusterPathFaultTick();
+      return;
+    }
+
+    if (packet == &privateBGPStartupRetryTick) {
+      privateBGPStartupRetryQueued = false;
+      if (result != -ECANCELED) servicePrivateBGPStartupRetry();
       return;
     }
 

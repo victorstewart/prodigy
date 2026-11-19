@@ -132,17 +132,9 @@ static bool resolveMachineWhiteholeInternetSourceAddressForDeployment(const Mach
     return false;
   }
 
-  if (prodigyResolveMachineInternetSourceAddress(*machine, family, address, addressText))
-  {
-    return true;
-  }
-
-  if (thisBrain == nullptr || thisBrain->brainConfig.runtimeEnvironment.test.enabled == false)
-  {
-    return false;
-  }
-
-  if (family == ExternalAddressFamily::ipv4 && thisBrain->brainConfig.runtimeEnvironment.test.enableFakeIpv4Boundary)
+  if (thisBrain != nullptr && thisBrain->brainConfig.runtimeEnvironment.test.enabled &&
+      family == ExternalAddressFamily::ipv4 &&
+      thisBrain->brainConfig.runtimeEnvironment.test.enableFakeIpv4Boundary)
   {
     if (machine->private4 != 0)
     {
@@ -211,6 +203,11 @@ static bool resolveMachineWhiteholeInternetSourceAddressForDeployment(const Mach
       }
       return true;
     }
+  }
+
+  if (prodigyResolveMachineInternetSourceAddress(*machine, family, address, addressText))
+  {
+    return true;
   }
 
   return false;
@@ -3621,25 +3618,6 @@ private:
     }
   }
 
-  uint32_t recoveredStatefulShardGroupCount(void) const
-  {
-    uint32_t recovered = 0;
-    for (ContainerView *container : containers)
-    {
-      if (container == nullptr || container->machine == nullptr ||
-          container->deploymentID != plan.config.deploymentID() ||
-          container->isStateful == false ||
-          (container->state != ContainerState::scheduled && container->state != ContainerState::healthy &&
-           container->state != ContainerState::crashedRestarting) ||
-          container->shardGroup == UINT32_MAX)
-      {
-        continue;
-      }
-      recovered = std::max(recovered, container->shardGroup + 1);
-    }
-    return recovered;
-  }
-
   void horizontalScalerBounds(uint32_t& baseMin, uint32_t& baseMax,
                               uint32_t& surgeMin, uint32_t& surgeMax) const
   {
@@ -3766,6 +3744,25 @@ private:
   }
 
 public:
+
+  uint32_t recoveredStatefulShardGroupCount(void) const
+  {
+    uint32_t recovered = 0;
+    for (ContainerView *container : containers)
+    {
+      if (container == nullptr || container->machine == nullptr ||
+          container->deploymentID != plan.config.deploymentID() ||
+          container->isStateful == false ||
+          (container->state != ContainerState::scheduled && container->state != ContainerState::healthy &&
+           container->state != ContainerState::crashedRestarting) ||
+          container->shardGroup == UINT32_MAX)
+      {
+        continue;
+      }
+      recovered = std::max(recovered, container->shardGroup + 1);
+    }
+    return recovered;
+  }
 
   using StatefulWorkerTopologyUpgradePhase = ::StatefulWorkerTopologyUpgradePhase;
   constexpr static uint64_t statefulWorkerTopologyRollbackWindowMs = uint64_t(prodigyBrainStatefulTopologyRollbackWindowSeconds) * 1000ull;

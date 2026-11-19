@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <bit>
 #include <cstdint>
 
 #include <includes.h>
@@ -39,6 +40,27 @@ public:
   bool operator==(const CousinRouteSlotBitmap& other) const { return words == other.words; }
   bool operator!=(const CousinRouteSlotBitmap& other) const { return !(*this == other); }
 };
+
+// Routes select sparse logical slots. Preserve the exact group ownership rule
+// without hashing every unselected logical slot on each discovery publication.
+static inline CousinRouteSlotBitmap cousinRouteSlotsOwnedByGroup(const CousinRouteSlotBitmap& selected,
+                                                                  uint16_t shardGroup, uint16_t nShardGroups)
+{
+  CousinRouteSlotBitmap owned = {};
+  if (nShardGroups == 0 || shardGroup >= nShardGroups) return owned;
+  for (uint32_t wordIndex = 0; wordIndex < CousinRouteSlotBitmap::wordCount; ++wordIndex)
+  {
+    uint64_t remaining = selected.words[wordIndex];
+    while (remaining != 0)
+    {
+      const uint32_t bit = uint32_t(std::countr_zero(remaining));
+      const uint16_t slot = uint16_t(wordIndex * 64 + bit);
+      if (statefulServiceGroupOwnerForSlot(slot, nShardGroups) == shardGroup) owned.insert(slot);
+      remaining &= remaining - 1;
+    }
+  }
+  return owned;
+}
 
 template <typename S>
 static void serialize(S&& serializer, CousinRouteSlotBitmap& bitmap)
@@ -266,10 +288,17 @@ static inline bool prodigyCousinServicePermissionSingleSlot(
     const ProdigyLocalCousinServicePermission& permission, uint16_t& slot)
 {
   bool found = false;
-  for (uint16_t candidate = 0; candidate < CousinRouteSlotBitmap::slotCount; ++candidate) {
-    if (!permission.slots.contains(candidate)) continue;
-    if (found) return false;
-    found = true; slot = candidate;
+  for (uint16_t wordIndex = 0; wordIndex < CousinRouteSlotBitmap::wordCount; ++wordIndex) {
+    const uint64_t word = permission.slots.words[wordIndex];
+    if (word == 0) continue;
+    // Retain the old rejection-side result: the first (lowest) occupied slot
+    // is assigned before a second slot makes this permission invalid.
+    if (found || !std::has_single_bit(word)) {
+      if (!found) slot = uint16_t(wordIndex * 64u + std::countr_zero(word));
+      return false;
+    }
+    found = true;
+    slot = uint16_t(wordIndex * 64u + std::countr_zero(word));
   }
   return found;
 }

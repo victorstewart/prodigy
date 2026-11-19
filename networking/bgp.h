@@ -1599,8 +1599,11 @@ public:
       if (callerNamespace < 0 || transportNetworkNamespaceFD < 0 ||
           ::setns(transportNetworkNamespaceFD, CLONE_NEWNET) != 0)
       {
+        const int failure = errno;
         if (callerNamespace >= 0) ::close(callerNamespace);
         fd = -1;
+        std::fprintf(stderr, "private BGP socket namespace entry failed namespaceFD=%d errno=%d\n",
+                     transportNetworkNamespaceFD, failure);
         return;
       }
       TCPSocket::createSocket();
@@ -2394,8 +2397,17 @@ public:
         // The closed TCP session may have left a partial frame or unsent data.
         peer->clearSessionBuffers();
         peer->recreateSocket();
+        // A strict private peer can fail while recreating its socket (for
+        // example while its gateway namespace or TUN is transiently
+        // unavailable). No close CQE exists in that case, so re-arm the
+        // existing bounded reconnect owner instead of submitting fd=-1.
+        if (peer->fd < 0)
+        {
+          scheduleReconnect(peer);
+          continue;
+        }
         Ring::installFDIntoFixedFileSlot(peer);
-        Ring::queueConnect(peer);
+        if (!Ring::queueConnect(peer)) scheduleReconnect(peer);
       }
     }
   }

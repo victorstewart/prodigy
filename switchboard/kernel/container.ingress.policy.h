@@ -117,3 +117,34 @@ __attribute__((noinline)) static bool containerLearnOrAuthorizeInboundTCP(struct
   }
   return true;
 }
+
+// A PTB is admissible only for this container's still-authorized, current
+// outbound TCP flow. It does not create or revive a flow.
+__attribute__((__always_inline__)) static inline bool containerMasqueGatewayPTBReturnInboundIPv6(
+    struct ipv6hdr *ip6h, void *data_end, __u32 maximumMTU)
+{
+  struct switchboard_masque_gateway_ptb6 ptb = {};
+  if (switchboardMasqueGatewayPTB6ShapeValid(ip6h, data_end, maximumMTU, &ptb) == false)
+  {
+    return false;
+  }
+  __u32 zeroidx = 0;
+  struct local_container_subnet6 *localSubnet = bpf_map_lookup_elem(&lc_subnet, &zeroidx);
+  if (localSubnet == NULL ||
+      switchboardMasqueGatewayReservedLocalSourceValid(ip6h->saddr.s6_addr, localSubnet) == false ||
+      containerNetworkAddressMatches(ip6h->daddr.s6_addr) == false ||
+      containerNetworkAddressMatches(ptb.quotedIPv6->saddr.s6_addr) == false ||
+      switchboardContainerDestinationIPv6(ptb.quotedIPv6->daddr.s6_addr) == false)
+  {
+    return false;
+  }
+
+  struct flow_key original = {};
+  bpf_memcpy(original.srcv6, ptb.quotedIPv6->saddr.s6_addr32, sizeof(original.srcv6));
+  bpf_memcpy(original.dstv6, ptb.quotedIPv6->daddr.s6_addr32, sizeof(original.dstv6));
+  original.port16[0] = ptb.quotedTCP->source;
+  original.port16[1] = ptb.quotedTCP->dest;
+  original.proto = IPPROTO_TCP;
+  return containerTCPFlowHasBoundAuthorization(&original) &&
+      containerTCPFlowCurrent(&original, false, false);
+}

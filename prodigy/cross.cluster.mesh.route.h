@@ -260,7 +260,9 @@ static inline bool prodigyGatewayLocalControlFrameValid(const ProdigyGatewayLoca
     case ProdigyGatewayLocalKind::readiness: return prodigyGatewayLocalV2TokenValid(value.readiness.launchToken) && prodigyGatewayLocalTupleValid(value.readiness.tuple) && value.readiness.authenticatedMasqueQUICReady && value.readiness.ready && prodigyIsSHA256HexDigest(value.readiness.routeSetSHA256);
     case ProdigyGatewayLocalKind::rebindHello: return prodigyGatewayLocalV2TokenValid(value.rebindHello.recoveryToken) && prodigyGatewayLocalTupleValid(value.rebindHello.tuple);
     case ProdigyGatewayLocalKind::rebindChallenge: return prodigyGatewayLocalTupleValid(value.rebindChallenge.tuple) && prodigyGatewayLocalNonceValid(value.rebindChallenge.nonce);
-    case ProdigyGatewayLocalKind::rebindReceipt: return prodigyGatewayLocalTupleValid(value.rebindReceipt.tuple) && prodigyGatewayLocalNonceValid(value.rebindReceipt.nonce) && value.rebindReceipt.authenticatedMasqueQUICReady && value.rebindReceipt.ready && prodigyIsSHA256HexDigest(value.rebindReceipt.routeSetSHA256);
+    // A retained-process receipt proves the local identity rebind; route
+    // health remains separately fenced from Brain publication and BGP.
+    case ProdigyGatewayLocalKind::rebindReceipt: return prodigyGatewayLocalTupleValid(value.rebindReceipt.tuple) && prodigyGatewayLocalNonceValid(value.rebindReceipt.nonce) && prodigyIsSHA256HexDigest(value.rebindReceipt.routeSetSHA256);
     case ProdigyGatewayLocalKind::pathFault: return value.pathFault.protocolVersion == ProdigyCrossClusterPathFaultGatewayControlPayload::version || value.pathFault.protocolVersion == ProdigyCrossClusterPathFaultGatewayControlPayload::leaseVersion;
   }
   return false;

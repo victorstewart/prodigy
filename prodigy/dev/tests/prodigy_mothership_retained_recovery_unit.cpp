@@ -1618,6 +1618,14 @@ static void assertInitialSeedRuntimeRepair()
   const std::string exe="approved gateway fixture";
   InitialSeedRuntimeRepairManifest manifest;manifest.binding=binding;manifest.gatewayExecutableBytes=exe.size();
   String hash;assert(prodigyComputeSHA256Hex(text(exe),hash));manifest.gatewayExecutableSHA=str(hash);
+  const std::string artifactSHA(64,'a'), executableSHA(64,'b');
+  const std::string provenanceJSON="{\"schema\":\"prodigy.gateway-executable-provenance.v1\",\"builder\":\"Discombobulator\",\"artifactSHA256\":\""+
+      artifactSHA+"\",\"artifactBytes\":17,\"artifactKind\":\"cross-cluster-masque-gateway\",\"executePath\":\"/gateway/masque-tunnel\",\"executableSHA256\":\""+
+      executableSHA+"\",\"executableBytes\":19}";
+  String parsedExecutable,provenanceSHA,provenanceFailure;uint64_t parsedBytes=0;
+  assert(parseGatewayExecutableProvenance(text(provenanceJSON),text(artifactSHA),17,parsedExecutable,parsedBytes,provenanceSHA,&provenanceFailure) &&
+         parsedExecutable==text(executableSHA) && parsedBytes==19);
+  assert(!parseGatewayExecutableProvenance(text(provenanceJSON),text(std::string(64,'c')),17,parsedExecutable,parsedBytes,provenanceSHA,&provenanceFailure));
   auto replace=[](std::string& value,const std::string& from,const std::string& to) { size_t pos=0;while((pos=value.find(from,pos))!=std::string::npos){value.replace(pos,from.size(),to);pos+=to.size();} };
   const auto proc=root/"proc",cgroup=root/"cgroup";
   write(proc/"sys/kernel/random/boot_id","11111111-1111-1111-1111-111111111111\n");write(root/"machine-id",std::string(32,'a')+"\n");
@@ -1647,6 +1655,38 @@ static void assertInitialSeedRuntimeRepair()
   };
   auto coldManifest=manifest;coldManifest.binding.masterGeneration=coldManifest.binding.followerGeneration=40;
   assert(observe() && observeGatewaySubset());
+  // V6 binds the inner executable to its registered artifact, rather than
+  // assuming that every artifact contains the historical fallback executable.
+  // The mapping therefore succeeds even when that legacy fallback is wrong,
+  // and remains an exact live /proc executable check.
+  auto mappedManifest=manifest;
+  mappedManifest.gatewayExecutableSHA=std::string(64,'c');mappedManifest.gatewayExecutableBytes=1;
+  InitialSeedRuntimeRepairManifest::GatewayExecutable mappedExecutable;
+  mappedExecutable.artifactSHA256=binding.gateways[0].artifactSHA256;
+  mappedExecutable.artifactBytes=binding.gateways[0].artifactBytes;
+  mappedExecutable.executableSHA256=hash;mappedExecutable.executableBytes=exe.size();
+  mappedManifest.gatewayExecutables.push_back(mappedExecutable);
+  assert(observeCommand(initialSeedRepairInventoryProgram(mappedManifest,10,true,false,true,true)));
+  write(proc/"100/exe","wrong mapped gateway executable");
+  assert(!observeCommand(initialSeedRepairInventoryProgram(mappedManifest,10,true,false,true,true)));
+  write(proc/"100/exe",exe);
+  // A retained runtime can have one active registered gateway on a member.
+  // Preserve the complete cross-member ledger while selecting that exact
+  // machine-local authority, then reject both a missing and substituted peer.
+  auto oneGatewayManifest=manifest;oneGatewayManifest.binding.gateways.clear();bool retainedLocalGateway=false;
+  for(const auto& gateway:manifest.binding.gateways)
+    if(gateway.localMachineUUID!=10 || !retainedLocalGateway) {
+      oneGatewayManifest.binding.gateways.push_back(gateway);
+      retainedLocalGateway|=gateway.localMachineUUID==10;
+    }
+  auto observeOneGateway=[&] {
+    return observeCommand(initialSeedRepairInventoryProgram(oneGatewayManifest,10));
+  };
+  write(cgroup/"201.slice/leaf/cgroup.procs","");assert(observeOneGateway());
+  write(cgroup/"200.slice/leaf/cgroup.procs","");assert(!observeOneGateway());
+  write(cgroup/"200.slice/leaf/cgroup.procs","100\n");
+  write(proc/"100/environ",environments[1]);assert(!observeOneGateway());write(proc/"100/environ",environments[0]);
+  write(cgroup/"201.slice/leaf/cgroup.procs","101\n");
   // Active deployments share containers.slice with the optional gateway pair.
   // The gateway observer ignores ordinary application leaves, still rejects a
   // gateway-marked impostor and refuses a partially materialized pair.

@@ -1807,6 +1807,13 @@ if (PROJECT_ENABLE_TESTS)
    set_tests_properties(prodigy_mothership_json_argument_unit PROPERTIES TIMEOUT 60)
 
    add_test(
+      NAME prodigy_mothership_cross_cluster_masque_gateway_cli_unit
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_cross_cluster_masque_gateway_cli_unit.sh
+              $<TARGET_FILE:mothership> ${CMAKE_CURRENT_BINARY_DIR}
+   )
+   set_tests_properties(prodigy_mothership_cross_cluster_masque_gateway_cli_unit PROPERTIES TIMEOUT 60)
+
+   add_test(
       NAME prodigy_dev_kvm_boundary_unit
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_kvm_boundary_unit.py
    )
