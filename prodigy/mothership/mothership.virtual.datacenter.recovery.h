@@ -456,14 +456,28 @@ static inline bool mothershipVDCPrivateDirectory(const String& path)
 // Copies only directories and regular files into a new private tree.  This is
 // the shared private-state primitive used by both the test-VDC recovery and
 // the remote Brain diagnostic capture; neither caller opens the live DB.
-// Capture only an unambiguous built-in state location in the selected
-// process mount. Caller input never chooses a database pathname.
-static inline bool mothershipVDCBrainCaptureStatePaths(
-    const String& processRoot, String& primary, String& secrets, String *failure = nullptr)
+// Capture only a built-in state location in the selected process mount.  The
+// optional selector is an exact canonical location, never an arbitrary
+// database pathname; without it, retain the conservative unambiguous search.
+static inline bool mothershipVDCBrainCaptureStatePathSelectorValid(const String& selector)
 {
+  return selector.empty() || selector.equals("/containers/prodigy.state"_ctv) ||
+      selector.equals(defaultProdigyPersistentStateDBPath());
+}
+
+static inline bool mothershipVDCBrainCaptureStatePaths(
+    const String& processRoot, String& primary, String& secrets, String *failure = nullptr,
+    const String& selector = {})
+{
+  if (!mothershipVDCBrainCaptureStatePathSelectorValid(selector))
+  {
+    if (failure) failure->assign("Brain state path selector is not canonical"_ctv);
+    return false;
+  }
   uint32_t matches = 0;
   for (const char *canonical : {"/containers/prodigy.state", defaultProdigyPersistentStateDBPath()})
   {
+    if (!selector.empty() && !selector.equals(String(canonical))) continue;
     String candidate = processRoot;
     candidate.append(String(canonical));
     String candidateSecrets = candidate;

@@ -10901,6 +10901,32 @@ static void testCrossClusterMasqueGatewayConnectorLeaseLifecycle(TestSuite& suit
                    replayFailure.empty(),
                "masque_connector_durable_witness_projects_application_and_gateway_after_brain_reload");
 
+  // Election materializes ordinary plans and clears their deferred entries
+  // before Neuron inventory arrives. The materialized owner remains canonical
+  // even while its recovery state is none.
+  promoted.deploymentPlans.erase(applicationDeploymentID);
+  const auto savedDeploymentState = applicationDeployment.state;
+  applicationDeployment.state = DeploymentState::none;
+  promoted.deployments.insert_or_assign(applicationDeploymentID, &applicationDeployment);
+  suite.expect(promoted.deploymentPlans.empty() &&
+                   promoted.durableRecoveryWitnessBootstrapsProjectable(
+                       &host, restoredWitness.containerBootstraps, replayFailure) && replayFailure.empty(),
+               "durable_witness_uses_materialized_owner_after_election_clears_deferred_plans");
+  promoted.deploymentPlans.insert_or_assign(applicationDeploymentID, applicationPlan);
+  ++applicationDeployment.plan.config.containerBlobBytes;
+  suite.expect(!promoted.durableRecoveryWitnessBootstrapsProjectable(
+                   &host, restoredWitness.containerBootstraps, replayFailure) &&
+                   replayFailure == "durable retained bootstrap does not match canonical deployment authority"_ctv,
+               "durable_witness_rejects_changed_materialized_owner_despite_matching_deferred_plan");
+  --applicationDeployment.plan.config.containerBlobBytes;
+  promoted.deployments.erase(applicationDeploymentID);
+  promoted.deploymentPlans.erase(applicationDeploymentID);
+  suite.expect(!promoted.durableRecoveryWitnessBootstrapsProjectable(
+                   &host, restoredWitness.containerBootstraps, replayFailure),
+               "durable_witness_rejects_absent_materialized_and_deferred_authority");
+  applicationDeployment.state = savedDeploymentState;
+  promoted.deploymentPlans.insert_or_assign(applicationDeploymentID, applicationPlan);
+
   Vector<String> staleGatewayWitness = restoredWitness.containerBootstraps;
   bool mutatedGateway = false;
   for (String& serialized : staleGatewayWitness)
@@ -32768,13 +32794,14 @@ static void testBrainNeuronStateUploadRequiresMatchingAssignedFragmentForMachine
   thisBrain = previousBrain;
 }
 
-static void testBrainNeuronControlHandshakeWatchdogClosesStalledRebootRecovery(TestSuite& suite)
+static void testBrainNeuronControlHandshakeWatchdogClosesStalledRebootRecovery(
+    TestSuite& suite, bool preIgnitionInventory = false)
 {
   ScopedFreshRing scopedRing = {};
 
   TestBrain brain = {};
   brain.weAreMaster = true;
-  brain.ignited = true;
+  brain.ignited = !preIgnitionInventory;
   brain.brainConfig.datacenterFragment = 1;
 
   Machine machine = {};
@@ -32794,11 +32821,24 @@ static void testBrainNeuronControlHandshakeWatchdogClosesStalledRebootRecovery(T
   brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
   brain.neurons.insert(&machine.neuron);
 
+  if (preIgnitionInventory)
+  {
+    suite.expect(brain.neuronControlHandshakeComplete(&machine.neuron),
+                 "pre_ignition_without_inventory_request_preserves_handshake_shortcut");
+    machine.stateUploadRequestPending = true;
+    machine.stateUploadRequestIOGeneration = machine.neuron.ioGeneration + 1;
+    suite.expect(brain.neuronControlHandshakeComplete(&machine.neuron),
+                 "pre_ignition_stale_generation_does_not_block_handshake");
+    machine.stateUploadRequestIOGeneration = machine.neuron.ioGeneration;
+    suite.expect(!brain.neuronControlHandshakeComplete(&machine.neuron),
+                 "pre_ignition_current_inventory_request_requires_acknowledgement");
+  }
+
   brain.refreshNeuronControlHandshakeWatchdogForTest(&machine.neuron, "unit-stalled");
   TimeoutPacket *watchdog = brain.neuronControlHandshakeWatchdogForTest(&machine.neuron);
   suite.expect(watchdog != nullptr, "brain_neuron_handshake_watchdog_arms_for_reboot_recovery");
 
-  brain.dispatchTimeout(watchdog);
+  if (watchdog != nullptr) brain.dispatchTimeout(watchdog);
 
   suite.expect(brain.neuronControlHandshakeWatchdogForTest(&machine.neuron) == nullptr, "brain_neuron_handshake_watchdog_consumes_timeout");
   suite.expect(machine.neuronConnectFailStreak == 1, "brain_neuron_handshake_watchdog_counts_stalled_control_stream");
@@ -47126,6 +47166,401 @@ static void testInitialControlPlaneBootstrapBarrier(TestSuite& suite)
   RingDispatcher::eraseMultiplexee(&fallback);
   suite.expect(brain.ignited,
                "initial_bootstrap_fallback_timer_is_idempotent_after_event_ignition");
+static void testLegacyCoordinatorMigration(TestSuite& suite)
+{
+  ScopedFreshRing ring = {};
+  StreamingTestBrain brain = {};
+  NoopBrainIaaS iaas = {};
+  TestNeuron self = {};
+  BrainBase *savedBrain = thisBrain;
+  NeuronBase *savedNeuron = thisNeuron;
+  thisBrain = &brain;
+  thisNeuron = &self;
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+  brain.ignited = true;
+  brain.nBrains = 1;
+  brain.masterAuthorityEpoch = 31;
+  brain.boottimens = 910'000'001;
+  brain.masterAuthorityRuntimeState.generation = 81;
+  brain.masterAuthorityRuntimeState.hasCompletedInitialMasterElection = true;
+  brain.masterAuthorityRuntimeStateDurable = true;
+  brain.durableMasterAuthorityRuntimeStateGeneration = 81;
+  brain.hasAuthoritativeTopology = true;
+  brain.persistedMachineInventoryEnumerated = true;
+  brain.recoveringPersistedNeuronInventory = true;
+  brain.brainConfig.clusterUUID = uint128_t(0x991100);
+  brain.brainConfig.datacenterFragment = 1;
+  const String bundle = "retained legacy coordinator bundle fixture"_ctv;
+  String digest = {};
+  suite.require(prodigyComputeSHA256Hex(bundle, digest), "legacy_coordinator_migration_bundle_digest");
+  self.uuid = uint128_t(0x991101);
+  self.setInstalledBundleDigestForTest(digest);
+
+  ApplicationDeployment deployment = {};
+  deployment.plan = makeDeploymentPlan(0x9911, 1);
+  deployment.state = DeploymentState::running;
+  brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+  brain.deploymentsByApp.insert_or_assign(deployment.plan.config.applicationID, &deployment);
+  brain.deploymentPlans.insert_or_assign(deployment.plan.config.deploymentID(), deployment.plan);
+
+  Machine machines[4] = {};
+  ContainerView containers[4] = {};
+  ScopedSocketPair sockets[4] = {};
+  bool fixtureReady = true;
+  for (uint32_t index = 0; index < 4; ++index)
+  {
+    fixtureReady = sockets[index].create(suite, "legacy_coordinator_migration_neuron_socket") && fixtureReady;
+    Machine& machine = machines[index];
+    machine.uuid = self.uuid + index;
+    machine.state = MachineState::healthy;
+    machine.lifetime = MachineLifetime::owned;
+    machine.isBrain = index == 0;
+    machine.isThisMachine = index == 0;
+    machine.runtimeReady = true;
+    machine.fragment = 0x110001 + index;
+    brain.masterAuthorityRuntimeState.machineFragmentAssignments.push_back(
+        {.machineUUID = machine.uuid, .fragment = machine.fragment});
+    machine.neuron.machine = &machine;
+    machine.neuron.isFixedFile = true;
+    machine.neuron.fslot = sockets[index].adoptLeftIntoFixedFileSlot();
+    machine.neuron.connected = machine.neuron.fslot >= 0;
+    machine.neuron.ioGeneration = 1;
+    machine.neuron.verifiedInstalledBundleIOGeneration = machine.neuron.ioGeneration;
+    machine.neuron.verifiedInstalledBundleAuthorityEpoch = brain.masterAuthorityEpoch;
+    machine.neuron.verifiedInstalledBundleSHA256 = digest;
+    brain.machines.insert(&machine);
+    brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+    brain.persistedMachineInventoryUploaded.insert(machine.uuid);
+    ClusterMachine topology = {};
+    topology.uuid = machine.uuid;
+    topology.isBrain = machine.isBrain;
+    brain.authoritativeTopology.machines.push_back(topology);
+
+    ContainerView& container = containers[index];
+    container.uuid = uint128_t(0x991200 + index);
+    container.deploymentID = deployment.plan.config.deploymentID();
+    container.applicationID = deployment.plan.config.applicationID;
+    container.machine = &machine;
+    container.state = ContainerState::healthy;
+    container.fragment = index + 1;
+    IPPrefix address = {};
+    address.network.is6 = true;
+    address.cidr = 128;
+    std::memcpy(address.network.v6, container_network_subnet6.value, sizeof(container_network_subnet6.value));
+    address.network.v6[11] = brain.brainConfig.datacenterFragment;
+    address.network.v6[12] = uint8_t(machine.fragment >> 16);
+    address.network.v6[13] = uint8_t(machine.fragment >> 8);
+    address.network.v6[14] = uint8_t(machine.fragment);
+    address.network.v6[15] = uint8_t(container.fragment);
+    container.addresses.push_back(address);
+    deployment.containers.insert(&container);
+    machine.upsertContainerIndexEntry(container.deploymentID, &container);
+    brain.containers.insert_or_assign(container.uuid, &container);
+    ContainerPlan uploaded = container.generatePlan(deployment.plan);
+    uploaded.fragment = container.fragment;
+    String serialized = {};
+    BitseryEngine::serialize(serialized, uploaded);
+    brain.persistedMachineStateUploadPlansByMachine.insert_or_assign(machine.uuid, Vector<String>{std::move(serialized)});
+    auto& fresh = brain.containerRetirementInventoryByMachine[machine.uuid];
+    fresh.authorityEpoch = brain.masterAuthorityEpoch;
+    fresh.ioGeneration = machine.neuron.ioGeneration;
+    fresh.present.insert(container.uuid);
+  }
+  suite.require(fixtureReady, "legacy_coordinator_migration_has_four_current_control_streams");
+
+  ContainerView reservation = {};
+  reservation.uuid = uint128_t(0x991299);
+  reservation.deploymentID = deployment.plan.config.deploymentID();
+  reservation.applicationID = deployment.plan.config.applicationID;
+  reservation.machine = &machines[3];
+  reservation.state = ContainerState::planned;
+  deployment.containers.insert(&reservation);
+  machines[3].upsertContainerIndexEntry(reservation.deploymentID, &reservation);
+  brain.containers.insert_or_assign(reservation.uuid, &reservation);
+  Vector<String> reservationCapture = {};
+  String reservationDiagnostic = {};
+  suite.expect(!brain.collectAuthenticatedNeuronStateUploadBootstraps(
+                   &machines[3], reservationCapture, &reservationDiagnostic) &&
+                   std::strstr(reservationDiagnostic.c_str(), "canonical-planner-reservation-unlaunched") != nullptr,
+               "legacy_coordinator_migration_keeps_ordinary_exec_capture_strict");
+  deployment.waitingOnContainers.insert_or_assign(&reservation, ContainerState::healthy);
+  suite.expect(!brain.collectAuthenticatedNeuronStateUploadBootstraps(
+                   &machines[3], reservationCapture, &reservationDiagnostic, true) &&
+                   std::strstr(reservationDiagnostic.c_str(), "canonical-planner-reservation-not-fenced") != nullptr,
+               "legacy_coordinator_migration_refuses_pending_container_completion");
+  deployment.waitingOnContainers.erase(&reservation);
+  DeploymentWork queuedLaunch = {};
+  queuedLaunch.getBase()->lifecycle = LifecycleOp::construct;
+  queuedLaunch.getBase()->machine = &machines[3];
+  queuedLaunch.getBase()->container = &reservation;
+  deployment.toSchedule.push_back(&queuedLaunch);
+  suite.expect(!brain.collectAuthenticatedNeuronStateUploadBootstraps(
+                   &machines[3], reservationCapture, &reservationDiagnostic, true) &&
+                   std::strstr(reservationDiagnostic.c_str(), "canonical-planner-reservation-not-fenced") != nullptr,
+               "legacy_coordinator_migration_refuses_queued_launch_work");
+  deployment.toSchedule.clear();
+
+  brain.updateSelfBundleBlob = bundle;
+  brain.updateSelfWorkerExpectedBundleSHA256 = digest;
+  brain.updateSelfLocalMachineUUID = machines[0].uuid;
+  brain.updateSelfLocalBundleRegistered = true;
+  NeuronContainerBootstrap localBootstrap = {};
+  localBootstrap.plan = containers[0].generatePlan(deployment.plan);
+  localBootstrap.plan.fragment = containers[0].fragment;
+  BitseryEngine::serialize(brain.updateSelfLocalContainerBootstraps.emplace_back(), localBootstrap);
+  for (uint32_t index = 1; index < 4; ++index)
+  {
+    const uint128_t uuid = machines[index].uuid;
+    brain.updateSelfWorkerMachineUUIDs.insert(uuid);
+    brain.updateSelfWorkerStagedMachineUUIDs.insert(uuid);
+    brain.updateSelfWorkerTransitionIssuedMachineUUIDs.insert(uuid);
+    brain.updateSelfWorkerRebootedMachineUUIDs.insert(uuid);
+    brain.updateSelfWorkerStateUploadedMachineUUIDs.insert(uuid);
+  }
+  brain.masterAuthorityRuntimeState.updateSelf = brain.capturePersistentUpdateSelfState();
+
+  const auto unchangedLegacy = [&](const ProdigyPersistentUpdateSelfState& before) {
+    return prodigyPersistentUpdateSelfStatesEquivalent(before, brain.capturePersistentUpdateSelfState()) &&
+        !brain.masterAuthorityRuntimeState.taskExecutions.contains(
+            prodigyLocalBundleRecoveryWitnessRepairJournalExecutionID) &&
+        brain.recoveringPersistedNeuronInventory;
+  };
+  const auto inspectFailure = [&](uint128_t operation, const char *name) {
+    ProdigyLocalBundleRecoveryWitnessRepairScope scope = {};
+    Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness> witnesses = {};
+    String failure = {};
+    const auto before = brain.capturePersistentUpdateSelfState();
+    suite.expect(!brain.inspectLegacyLocalBundleRecoveryMigrationScope(
+                     operation, scope, witnesses, failure) && unchangedLegacy(before), name);
+  };
+  const auto originalWorkerUpload = brain.persistedMachineStateUploadPlansByMachine.at(machines[3].uuid);
+  const auto originalWorkerRetirement = brain.containerRetirementInventoryByMachine.at(machines[3].uuid);
+  brain.persistedMachineInventoryUploaded.erase(machines[3].uuid);
+  inspectFailure(uint128_t(0x9912f1), "legacy_coordinator_migration_missing_worker_upload_preserves_legacy_state");
+  brain.persistedMachineInventoryUploaded.insert(machines[3].uuid);
+  // The established refresh request revokes readiness until this fresh reply.
+  machines[3].runtimeReady = true;
+  machines[3].stateUploadRequestPending = false;
+  brain.persistedMachineStateUploadPlansByMachine.insert_or_assign(machines[3].uuid, originalWorkerUpload);
+  brain.containerRetirementInventoryByMachine.insert_or_assign(machines[3].uuid, originalWorkerRetirement);
+  const String verifiedDigest = machines[2].neuron.verifiedInstalledBundleSHA256;
+  machines[2].neuron.verifiedInstalledBundleSHA256.assign(
+      "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"_ctv);
+  inspectFailure(uint128_t(0x9912f2), "legacy_coordinator_migration_wrong_digest_preserves_legacy_state");
+  machines[2].neuron.verifiedInstalledBundleSHA256 = verifiedDigest;
+  const uint64_t verifiedIO = machines[1].neuron.verifiedInstalledBundleIOGeneration;
+  machines[1].neuron.verifiedInstalledBundleIOGeneration = verifiedIO + 1;
+  inspectFailure(uint128_t(0x9912f3), "legacy_coordinator_migration_stale_io_preserves_legacy_state");
+  machines[1].neuron.verifiedInstalledBundleIOGeneration = verifiedIO;
+  const auto legacyBeforeMismatch = brain.capturePersistentUpdateSelfState();
+  brain.updateSelfLocalContainerBootstraps.clear();
+  auto mismatchedBootstrap = localBootstrap;
+  mismatchedBootstrap.plan.uuid += 99;
+  BitseryEngine::serialize(brain.updateSelfLocalContainerBootstraps.emplace_back(), mismatchedBootstrap);
+  brain.masterAuthorityRuntimeState.updateSelf = brain.capturePersistentUpdateSelfState();
+  inspectFailure(uint128_t(0x9912f4), "legacy_coordinator_migration_mismatched_local_bootstrap_preserves_legacy_state");
+  brain.restorePersistentUpdateSelfState(legacyBeforeMismatch);
+  brain.masterAuthorityRuntimeState.updateSelf = brain.capturePersistentUpdateSelfState();
+
+  // A persisted, unlaunched stateless reservation is not a runtime to adopt.
+  // An ordinary retirement heartbeat must re-enter its existing replay owner
+  // after the exact authenticated fleet inventory proves it absent. A
+  // malformed lookalike remains pending; it must not be bypassed.
+  BrainReplicatedContainerRuntimeState absentReservation = {};
+  absentReservation.plan = reservation.generatePlan(deployment.plan);
+  absentReservation.plan.uuid = uint128_t(0x9912a0);
+  absentReservation.plan.state = ContainerState::planned;
+  absentReservation.plan.fragment = 0;
+  absentReservation.plan.runtimeReady = false;
+  absentReservation.machineUUID = machines[3].uuid;
+  // Materialized deployments are canonical once election drains the deferred
+  // map. Keep the volatile-row checks strict against that owner, including a
+  // mismatched active digest/size, rather than relying on deploymentPlans.
+  brain.deploymentPlans.erase(deployment.plan.config.deploymentID());
+  suite.require(brain.deploymentPlans.empty() &&
+                    prodigyWormholeDeploymentPlan(brain, deployment.plan.config.deploymentID()) == &deployment.plan,
+                "legacy_coordinator_migration_materialized_plan_is_canonical_after_deferred_drain");
+  const DeploymentPlan canonicalDeploymentPlan = deployment.plan;
+  ++deployment.plan.config.containerBlobBytes;
+  brain.pendingReplicatedContainerRuntimeStates[deployment.plan.config.deploymentID()].push_back(absentReservation);
+  brain.resumeStatefulTopologyRetirements();
+  suite.expect(!brain.pendingReplicatedContainerRuntimeStates.empty(),
+               "legacy_coordinator_migration_materialized_plan_mismatch_keeps_reservation_pending");
+  brain.pendingReplicatedContainerRuntimeStates.clear();
+  deployment.plan = canonicalDeploymentPlan;
+  auto malformedReservation = absentReservation;
+  malformedReservation.machineUUID = 0;
+  brain.pendingReplicatedContainerRuntimeStates[deployment.plan.config.deploymentID()].push_back(
+      malformedReservation);
+  brain.resumeStatefulTopologyRetirements();
+  suite.expect(!brain.pendingReplicatedContainerRuntimeStates.empty() &&
+                   brain.containers.size() == 5 && brain.containers.contains(reservation.uuid) &&
+                   brain.containers.contains(containers[0].uuid) &&
+                   brain.containers.contains(containers[1].uuid) && brain.containers.contains(containers[2].uuid) &&
+                   brain.containers.contains(containers[3].uuid),
+               "legacy_coordinator_migration_heartbeat_keeps_unproven_reservation_and_materialized_inventory");
+  brain.pendingReplicatedContainerRuntimeStates.clear();
+  const auto retainedInventory = brain.containerRetirementInventoryByMachine.at(machines[3].uuid);
+  brain.containerRetirementInventoryByMachine.erase(machines[3].uuid);
+  brain.pendingReplicatedContainerRuntimeStates[deployment.plan.config.deploymentID()].push_back(
+      absentReservation);
+  brain.resumeStatefulTopologyRetirements();
+  suite.expect(!brain.pendingReplicatedContainerRuntimeStates.empty() &&
+                   brain.containers.size() == 5 && brain.containers.contains(reservation.uuid) &&
+                   brain.containers.contains(containers[0].uuid) &&
+                   brain.containers.contains(containers[1].uuid) && brain.containers.contains(containers[2].uuid) &&
+                   brain.containers.contains(containers[3].uuid),
+               "legacy_coordinator_migration_heartbeat_requires_current_authenticated_inventory");
+  brain.containerRetirementInventoryByMachine.insert_or_assign(machines[3].uuid, retainedInventory);
+  brain.resumeStatefulTopologyRetirements();
+  suite.require(brain.pendingReplicatedContainerRuntimeStates.empty() &&
+                    brain.containers.size() == 5 && brain.containers.contains(reservation.uuid) &&
+                    brain.containers.contains(containers[0].uuid) &&
+                    brain.containers.contains(containers[1].uuid) && brain.containers.contains(containers[2].uuid) &&
+                    brain.containers.contains(containers[3].uuid),
+                "legacy_coordinator_migration_heartbeat_redrives_proven_absent_reservation_only");
+  brain.deploymentPlans.insert_or_assign(deployment.plan.config.deploymentID(), deployment.plan);
+
+  Mothership mothership = {};
+  mothership.isFixedFile = true;
+  mothership.fslot = 71;
+  brain.activeMotherships.insert(&mothership);
+  RepairLocalBundleRecoveryWitness query = {};
+  query.action = ProdigyLocalBundleRecoveryWitnessRepairAction::queryLegacy;
+  query.operationUUID = uint128_t(0x991301);
+  query.clusterUUID = brain.brainConfig.clusterUUID;
+  RepairLocalBundleRecoveryWitness queried = {};
+  suite.require(issueDeploymentLifecycleOperationForTest<MothershipTopic::repairLocalBundleRecoveryWitness>(
+                    brain, mothership, query, queried) && queried.success && queried.eligible &&
+                    queried.witnessPresent && queried.scope.machines.size() == 4,
+                "legacy_coordinator_migration_query_requires_and_returns_exact_four_machine_scope");
+  if (!queried.eligible) std::fprintf(stderr, "legacy migration query refused: %s\n", queried.failure.c_str());
+  String scopeSHA = {};
+  suite.require(prodigyLocalBundleRecoveryWitnessRepairScopeSHA256(queried.scope, scopeSHA) && scopeSHA.equals(queried.scopeSHA256),
+                "legacy_coordinator_migration_query_scope_is_canonical");
+  RepairLocalBundleRecoveryWitness migrate = query;
+  migrate.action = ProdigyLocalBundleRecoveryWitnessRepairAction::migrateLegacy;
+  migrate.scopeSHA256 = queried.scopeSHA256;
+  const auto beforePersistenceFailure = brain.capturePersistentUpdateSelfState();
+  brain.holdRuntimePersistence = true;
+  String migrationPayload = {}, migrationFrame = {};
+  BitseryEngine::serialize(migrationPayload, migrate);
+  mothership.wBuffer.clear();
+  brain.mothershipHandler(&mothership, buildMothershipMessage(
+      migrationFrame, MothershipTopic::repairLocalBundleRecoveryWitness, migrationPayload));
+  suite.require(mothership.wBuffer.empty() && brain.pendingRuntimePersistence.size() == 1,
+                "legacy_coordinator_migration_persistence_failure_is_held_before_reply");
+  String heldBlocker = {};
+  suite.expect(!brain.finalizePersistedNeuronInventoryRecovery(&heldBlocker) &&
+                   heldBlocker.equals("recovered inventory authority is not durable"_ctv) &&
+                   brain.recoveringPersistedNeuronInventory,
+               "legacy_coordinator_migration_pending_receipt_keeps_scheduling_barrier_closed");
+  brain.finishRuntimePersistence(false);
+  if (!unchangedLegacy(beforePersistenceFailure))
+    std::fprintf(stderr, "legacy migration rollback: coordinatorEqual=%d journalPresent=%d recovering=%d generation=%llu pending=%llu\n",
+                 equalSerializedObjects(beforePersistenceFailure, brain.capturePersistentUpdateSelfState()),
+                 brain.masterAuthorityRuntimeState.taskExecutions.contains(prodigyLocalBundleRecoveryWitnessRepairJournalExecutionID),
+                 brain.recoveringPersistedNeuronInventory,
+                 (unsigned long long)brain.masterAuthorityRuntimeState.generation,
+                 (unsigned long long)brain.masterAuthorityPersistencePending);
+  suite.expect(unchangedLegacy(beforePersistenceFailure),
+               "legacy_coordinator_migration_persistence_failure_rolls_back_legacy_state");
+  RepairLocalBundleRecoveryWitness persistenceRejected = {};
+  suite.require(extractAsyncRequestResponse(mothership.wBuffer,
+                    MothershipTopic::repairLocalBundleRecoveryWitness, persistenceRejected) &&
+                    !persistenceRejected.success,
+                "legacy_coordinator_migration_persistence_failure_returns_rejection");
+  brain.holdRuntimePersistence = false;
+  RepairLocalBundleRecoveryWitness migrated = {};
+  suite.require(issueDeploymentLifecycleOperationForTest<MothershipTopic::repairLocalBundleRecoveryWitness>(
+                    brain, mothership, migrate, migrated) && migrated.success && migrated.completed &&
+                    brain.updateSelfMachineRecoveryWitnesses.size() == 4 &&
+                    brain.updateSelfLocalMachineUUID == 0 && !brain.updateSelfLocalBundleRegistered &&
+                    brain.updateSelfLocalContainerBootstraps.empty() &&
+                    brain.persistedMachineInventoryUploaded.empty() &&
+                    brain.persistedMachineStateUploadPlansByMachine.empty(),
+                "legacy_coordinator_migration_atomically_replaces_singleton_with_four_witnesses");
+  suite.expect(reservation.state == ContainerState::planned && reservation.fragment == 0 &&
+                   !reservation.runtimeReady && brain.containers.at(reservation.uuid) == &reservation &&
+                   machines[3].containersByDeploymentID.hasEntryFor(reservation.deploymentID, &reservation) &&
+                   deployment.containers.contains(&reservation),
+               "legacy_coordinator_migration_preserves_unlaunched_reservation_and_accounting");
+  Mesh mesh = {};
+  brain.mesh = &mesh;
+  for (uint32_t index = 0; index < 4; ++index)
+  {
+    Machine& machine = machines[index];
+    machine.runtimeReady = true;
+    machine.stateUploadRequestPending = false;
+    machine.reportedDatacenterFragment = brain.brainConfig.datacenterFragment;
+    machine.reportedFragment = machine.fragment;
+    auto& currentInventory = brain.containerRetirementInventoryByMachine[machine.uuid];
+    currentInventory.authorityEpoch = brain.masterAuthorityEpoch;
+    currentInventory.ioGeneration = machine.neuron.ioGeneration;
+    currentInventory.present.insert(containers[index].uuid);
+    ContainerPlan uploaded = containers[index].generatePlan(deployment.plan);
+    uploaded.fragment = containers[index].fragment;
+    String serialized = {};
+    BitseryEngine::serialize(serialized, uploaded);
+    brain.persistedMachineInventoryUploaded.insert(machine.uuid);
+    brain.persistedMachineStateUploadPlansByMachine.insert_or_assign(
+        machine.uuid, Vector<String>{std::move(serialized)});
+  }
+  String finalizationBlocker = {};
+  suite.expect(!brain.finalizePersistedNeuronInventoryRecovery(&finalizationBlocker) &&
+                   finalizationBlocker.equals("recovered wormhole runtime acknowledgement is pending or failed"_ctv) &&
+                   brain.recoveringPersistedNeuronInventory,
+               "legacy_coordinator_migration_fresh_uploads_still_require_exact_switchboard_acks");
+  // Drive the established Switchboard acknowledgement path rather than
+  // clearing its pending sets in the fixture. Deferred sync may queue the next
+  // container after a prior operation's exact acknowledgement.
+  for (uint8_t round = 0; round < 8; ++round)
+  {
+    bool acknowledged = false;
+    for (ContainerView& container : containers)
+      for (Machine& machine : machines)
+      {
+        if (!container.wormholeRuntimePendingMachines.contains(machine.fragment)) continue;
+        String acknowledgement = {};
+        brain.neuronHandler(&machine.neuron, buildNeuronSwitchboardWormholeAcknowledgement(
+            acknowledgement, container.generateContainerID(), container.wormholeRuntimeRevision,
+            SwitchboardWormholeOperationStatus::applied,
+            pendingWormholeRequestGeneration(container, machine.fragment)));
+        acknowledged = true;
+      }
+    if (!acknowledged) break;
+  }
+  const bool finalized = brain.finalizePersistedNeuronInventoryRecovery(&finalizationBlocker);
+  const bool completed = brain.capturePersistentUpdateSelfState() == ProdigyPersistentUpdateSelfState{} ||
+      brain.completeLocalBundleExecRecoveryIfReady();
+  if (!finalized || !completed)
+    std::fprintf(stderr, "legacy migration finalization: finalized=%d completed=%d blocker=%s\n",
+                 finalized, completed, finalizationBlocker.c_str());
+  suite.expect(finalized && completed &&
+                   brain.capturePersistentUpdateSelfState() == ProdigyPersistentUpdateSelfState{},
+               "legacy_coordinator_migration_fresh_uploads_finalize_and_clear_coordinator");
+  RepairLocalBundleRecoveryWitness replay = {};
+  suite.expect(issueDeploymentLifecycleOperationForTest<MothershipTopic::repairLocalBundleRecoveryWitness>(
+                   brain, mothership, migrate, replay) && replay.success && replay.completed && replay.idempotent,
+               "legacy_coordinator_migration_replays_exact_durable_receipt");
+
+  brain.activeMotherships.erase(&mothership);
+  machines[3].removeContainerIndexEntry(reservation.deploymentID, &reservation);
+  brain.containers.erase(reservation.uuid);
+  for (uint32_t index = 0; index < 4; ++index)
+  {
+    machines[index].removeContainerIndexEntry(containers[index].deploymentID, &containers[index]);
+    brain.containers.erase(containers[index].uuid);
+    brain.machinesByUUID.erase(machines[index].uuid);
+    brain.machines.erase(&machines[index]);
+  }
+  deployment.containers.clear();
+  brain.deployments.clear();
+  brain.deploymentsByApp.clear();
+  brain.deploymentPlans.clear();
+  thisNeuron = savedNeuron;
+  thisBrain = savedBrain;
 }
 
 int main(void)
@@ -47144,6 +47579,14 @@ int main(void)
     testNeuronMetricSamplingHelpers(suite);
     testNeuronCollectsContainerMetricsAndForwardsToBrain(suite);
     std::printf("NEURON_RUNTIME_METRICS_RESULT passed=%d failed=%d\n", suite.passed, suite.failed);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "legacy-coordinator-migration") == 0)
+  {
+    TestSuite suite;
+    testLegacyCoordinatorMigration(suite);
+    std::printf("LEGACY_COORDINATOR_MIGRATION_RESULT passed=%d failed=%d\n", suite.passed, suite.failed);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char* only=getenv("PRODIGY_TEST_ONLY"); only && strcmp(only,"global-writer-reservations")==0) {
@@ -47731,6 +48174,12 @@ int main(void)
       only != nullptr && strcmp(only, "brain-bundle-exec-retry") == 0)
   {
     testBrainBundleExecRetryRoutesThroughDispatcher(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "pre-ignition-neuron-inventory") == 0)
+  {
+    testBrainNeuronControlHandshakeWatchdogClosesStalledRebootRecovery(suite, true);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
@@ -48429,6 +48878,7 @@ int main(void)
   testBrainNeuronStateUploadRequiresMatchingAssignedFragmentForMachineRuntimeReady(suite);
   testNeuronControlClosePreservesExactOwnersUntilFreshInventory(suite);
   testBrainNeuronControlHandshakeWatchdogClosesStalledRebootRecovery(suite);
+  testBrainNeuronControlHandshakeWatchdogClosesStalledRebootRecovery(suite, true);
   testBrainPeerHandshakeWatchdogClosesStalledRegistration(suite);
   testBrainPeerHandshakeWatchdogCancelsAfterFreshRegistration(suite);
   testBrainNeuronControlHandshakeWatchdogCancelsAfterRuntimeReadyUpload(suite);

@@ -1586,6 +1586,193 @@ struct ProdigyDeploymentTargetTestAccess {
   }
 };
 
+static void testRecoveredPlannedStatefulIntermediateTarget(TestSuite& suite)
+{
+  ScopedFreshRing ring;
+  TestBrain brain = {};
+  BrainBase *savedBrain = thisBrain;
+  thisBrain = &brain;
+  ApplicationDeployment predecessor = {}, intermediate = {}, queued = {};
+  seedCommonPlan(predecessor, true);
+  predecessor.plan.config.applicationID = 3;
+  predecessor.plan.config.versionID = 221649402827666;
+  predecessor.plan.config.type = ApplicationType::stateful;
+  predecessor.plan.config.architecture = nametagCurrentBuildMachineArchitecture();
+  predecessor.plan.config.storageMB = 512;
+  predecessor.plan.stateful.writerMode = StatefulWriterMode::localSingleWriter;
+  predecessor.plan.stateful.allowUpdateInPlace = true;
+  predecessor.plan.stateful.clientPrefix = prodigyRuntimeStatefulServicePrefix(3, 1);
+  predecessor.plan.stateful.siblingPrefix = prodigyRuntimeStatefulServicePrefix(3, 2);
+  predecessor.plan.stateful.cousinPrefix = prodigyRuntimeStatefulServicePrefix(3, 3);
+  predecessor.plan.stateful.seedingPrefix = prodigyRuntimeStatefulServicePrefix(3, 4);
+  predecessor.plan.stateful.shardingPrefix = prodigyRuntimeStatefulServicePrefix(3, 5);
+  intermediate.plan = predecessor.plan;
+  intermediate.plan.config.versionID = 221649402827667;
+  queued.plan = predecessor.plan;
+  queued.plan.config.versionID = 221649402827669;
+  predecessor.next = &intermediate;
+  intermediate.previous = &predecessor;
+  intermediate.next = &queued;
+  queued.previous = &intermediate;
+  queued.state = DeploymentState::waitingToDeploy;
+
+  brain.brainConfig.runtimeEnvironment.test.enabled = true;
+  brain.brainConfig.architecture = nametagCurrentBuildMachineArchitecture();
+  Rack racks[3] = {};
+  Machine machines[3] = {};
+  ScopedSocketPair sockets[3] = {};
+  bool ready = true;
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    racks[index].uuid = 0x667000 + index;
+    brain.racks.insert_or_assign(racks[index].uuid, &racks[index]);
+    String slug;
+    slug.snprintf<"retained-hot-{itoa}"_ctv>(uint64_t(index));
+    ready = sockets[index].create(suite, "retained_hot_chain_creates_control_socket") && ready;
+    if (ready) ready = seedSchedulableMachine(brain, racks[index], machines[index],
+        uint128_t(0x667100 + index), 0x0a000191 + index, slug, sockets[index]) && ready;
+  }
+  suite.expect(ready, "retained_hot_chain_has_active_control_streams");
+  const auto roles = StatefulMeshRoles::forShardGroup(predecessor.plan.stateful, 3, 0);
+  ContainerView survivors[2] = {}, reservations[2] = {};
+  for (uint32_t index = 0; index < 2; ++index)
+  {
+    survivors[index].uuid = uint128_t(0x666100 + index);
+    survivors[index].deploymentID = predecessor.plan.config.deploymentID();
+    survivors[index].applicationID = 3;
+    survivors[index].machine = &machines[index];
+    survivors[index].isStateful = true;
+    survivors[index].state = ContainerState::healthy;
+    survivors[index].runtimeReady = true;
+    survivors[index].fragment = uint8_t(135 + index);
+    survivors[index].explicitStatefulMeshRoles = roles;
+    if (index == 0) survivors[index].advertisements.emplace(
+        roles.client, Advertisement(roles.client, ContainerState::healthy, ContainerState::destroying, 31001));
+    else survivors[index].explicitStatefulMeshRoles.client = 0;
+    predecessor.containers.insert(&survivors[index]);
+    predecessor.containersByShardGroup.insert(0, &survivors[index]);
+    machines[index].upsertContainerIndexEntry(survivors[index].deploymentID, &survivors[index]);
+    brain.containers.insert_or_assign(survivors[index].uuid, &survivors[index]);
+    prodigyDebitMachineScalarResources(&machines[index], predecessor.plan.config, 1);
+    reservations[index].uuid = uint128_t(0x667200 + index);
+    reservations[index].deploymentID = intermediate.plan.config.deploymentID();
+    reservations[index].applicationID = 3;
+    reservations[index].machine = &machines[index];
+    reservations[index].isStateful = true;
+    reservations[index].state = ContainerState::planned;
+    intermediate.containers.insert(&reservations[index]);
+    intermediate.containersByShardGroup.insert(0, &reservations[index]);
+    machines[index].upsertContainerIndexEntry(reservations[index].deploymentID, &reservations[index]);
+    brain.containers.insert_or_assign(reservations[index].uuid, &reservations[index]);
+    prodigyDebitMachineScalarResources(&machines[index], intermediate.plan.config, 1);
+  }
+  brain.deployments.insert_or_assign(predecessor.plan.config.deploymentID(), &predecessor);
+  brain.deployments.insert_or_assign(intermediate.plan.config.deploymentID(), &intermediate);
+  brain.deployments.insert_or_assign(queued.plan.config.deploymentID(), &queued);
+
+  ProdigyDeploymentTargetTestAccess::calculate(intermediate);
+  ProdigyDeploymentTargetTestAccess::calculate(queued);
+  suite.expect(intermediate.nShardGroups == 1 && intermediate.nTarget() == 3 &&
+                   queued.nShardGroups == 1 && queued.nTarget() == 3,
+               "retained_hot_chain_recovers_topology_from_materialized_predecessor");
+  suite.expect(predecessor.containers.size() == 2 && intermediate.containers.size() == 2 &&
+                   queued.containers.empty() && intermediate.toSchedule.empty() &&
+                   survivors[0].state == ContainerState::healthy && survivors[1].state == ContainerState::healthy &&
+                   reservations[0].fragment == 0 && reservations[1].fragment == 0 &&
+                   brain.containers.at(reservations[0].uuid) == &reservations[0] &&
+                   brain.containers.at(reservations[1].uuid) == &reservations[1],
+               "retained_hot_chain_target_recovery_preserves_survivors_and_reservations");
+
+  Vector<std::pair<ContainerView *, ContainerView *>> bindings;
+  suite.expect(intermediate.collectRecoveredUnlaunchedStatefulReplacements(bindings) && bindings.size() == 2,
+               "retained_hot_chain_identifies_exact_canonical_replacement_cohort");
+  machines[0].neuron.connected = false;
+  suite.expect(!intermediate.collectRecoveredUnlaunchedStatefulReplacements(bindings) && bindings.empty(),
+               "retained_hot_chain_refuses_inactive_control_stream");
+  machines[0].neuron.connected = true;
+  intermediate.toSchedule.push_back(nullptr);
+  suite.expect(!intermediate.collectRecoveredUnlaunchedStatefulReplacements(bindings),
+               "retained_hot_chain_refuses_existing_execution_work");
+  intermediate.toSchedule.clear();
+  reservations[0].fragment = 1;
+  suite.expect(!intermediate.collectRecoveredUnlaunchedStatefulReplacements(bindings),
+               "retained_hot_chain_refuses_runtime_bearing_reservation");
+  reservations[0].fragment = 0;
+  predecessor.plan.config.storageMB = 513;
+  ProdigyDeploymentTargetTestAccess::calculate(intermediate);
+  suite.expect(intermediate.nTarget() == 0 &&
+                   !intermediate.collectRecoveredUnlaunchedStatefulReplacements(bindings),
+               "retained_hot_chain_refuses_incompatible_predecessor_topology");
+  predecessor.plan.config.storageMB = 512;
+  ProdigyDeploymentTargetTestAccess::calculate(intermediate);
+
+  intermediate.recoverAfterReboot();
+  suite.expect(intermediate.containers.size() == 2 && intermediate.toSchedule.empty() &&
+                   survivors[0].state == ContainerState::healthy && survivors[1].state == ContainerState::healthy,
+               "retained_hot_chain_waits_for_complete_predecessor_before_replacement");
+  if (ready) predecessor.recoverAfterReboot();
+  ContainerView *third = nullptr;
+  for (ContainerView *container : predecessor.containers)
+    if (container != &survivors[0] && container != &survivors[1]) third = container;
+  suite.expect(third && third->machine == &machines[2] && predecessor.nTarget() == 3 &&
+                   predecessor.nHealthy() == 2 && intermediate.containers.size() == 2 &&
+                   reservations[0].state == ContainerState::planned && reservations[1].state == ContainerState::planned,
+               "retained_hot_chain_fills_predecessor_deficit_before_touching_survivors");
+  if (third)
+  {
+    // Complete that owner's health wait without starting a second scheduler
+    // in this fixture; inspect the next owner's ordinary planning separately.
+    predecessor.next = nullptr;
+    predecessor.containerIsHealthy(third);
+    predecessor.next = &intermediate;
+    const int64_t firstMemory = machines[0].memoryMB_available;
+    const int64_t secondMemory = machines[1].memoryMB_available;
+    const int64_t firstStorage = machines[0].storageMB_available;
+    const int64_t secondStorage = machines[1].storageMB_available;
+    intermediate.state = DeploymentState::deploying;
+    intermediate.architect(nullptr, false);
+    uint32_t rebound = 0;
+    for (DeploymentWork *meta : intermediate.toSchedule)
+      if (auto *work = std::get_if<StatefulWork>(meta))
+        for (uint32_t index = 0; index < 2; ++index)
+          rebound += work->lifecycle == LifecycleOp::updateInPlace &&
+              work->container == &reservations[index] && work->oldContainer == &survivors[index];
+    suite.expect(rebound == 2 && intermediate.toSchedule.size() == 3 && intermediate.containers.size() == 3 &&
+                     brain.containers.at(reservations[0].uuid) == &reservations[0] &&
+                     brain.containers.at(reservations[1].uuid) == &reservations[1],
+                 "retained_hot_chain_rebinds_both_reserved_UUIDs_and_allocates_only_third_replacement");
+    suite.expect(machines[0].memoryMB_available == firstMemory && machines[1].memoryMB_available == secondMemory &&
+                     machines[0].storageMB_available == firstStorage && machines[1].storageMB_available == secondStorage &&
+                     survivors[0].state == ContainerState::healthy && survivors[1].state == ContainerState::healthy &&
+                     third->state == ContainerState::healthy,
+                 "retained_hot_chain_rebinding_does_not_redebit_or_retire_healthy_sources");
+  }
+
+  Vector<DeploymentWork *> abandoned;
+  for (DeploymentWork *work : intermediate.toSchedule) abandoned.push_back(work);
+  for (DeploymentWork *work : abandoned) intermediate.cancelDeploymentWork(work);
+  for (ContainerView *container : intermediate.containers)
+    if (container != &reservations[0] && container != &reservations[1]) delete container;
+  if (third)
+  {
+    brain.mesh->stopAllSubscriptions(third);
+    brain.mesh->stopAllAdvertisments(third);
+    delete third;
+  }
+  predecessor.containers.clear();
+  intermediate.containers.clear();
+  brain.deployments.clear();
+  brain.containers.clear();
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    machines[index].containersByDeploymentID.clear();
+    racks[index].machines.clear();
+  }
+  brain.machines.clear();
+  brain.racks.clear();
+  thisBrain = savedBrain;
+}
+
 static void testFreshStatefulFloor(TestSuite& suite)
 {
   TestBrain brain = {};
@@ -4109,6 +4296,21 @@ int main(void)
 {
   TestSuite suite;
   const char *selector = std::getenv("PRODIGY_TEST_ONLY");
+  if (selector == nullptr || std::strcmp(selector, "retained-hot-chain") == 0)
+  {
+    testRecoveredPlannedStatefulIntermediateTarget(suite);
+    if (selector != nullptr)
+    {
+      testFreshStatefulFloor(suite);
+      testRecoveredStatefulSuccessorTarget(suite, true);
+      testRecoveredStatefulSuccessorTarget(suite, false);
+      testRecoveredStatefulHeadShardTarget(suite);
+      testRecoveredStatefulQuorumDataStrategy(suite);
+      testInplacePairingOrder(suite);
+      dprintf(STDOUT_FILENO, "retained_hot_chain passed=%d failed=%d\n", suite.passed, suite.failed);
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+  }
   if (selector != nullptr && std::strcmp(selector, "truth-placement") == 0)
   {
     for (uint16_t app : {uint16_t(10), uint16_t(42)}) testGlobalSingleWriterPlacementShardInvariant(suite, app);
@@ -4588,6 +4790,23 @@ int main(void)
     suite.expect(crashBackoffReady(), "replacement_observed_crash_backoff_owner_admitted");
     suite.expect(ContainerManager::observedCrashBackoffPredecessorCgroupIsEmpty(&crashed, &crashBackoffFailure),
                  "replacement_observed_crash_backoff_cgroup_empty_required");
+    Container storageTarget;
+    storageTarget.cgroup = dup(crashed.cgroup);
+    suite.expect(ContainerManager::storageTargetIsQuiescent(&storageTarget, &crashBackoffFailure),
+                 "storage_ownership_fresh_target_has_an_empty_created_cgroup");
+    storageTarget.pid = 321;
+    suite.expect(!ContainerManager::storageTargetIsQuiescent(&storageTarget, &crashBackoffFailure),
+                 "storage_ownership_unobserved_process_rejected");
+    storageTarget.infop.si_pid = 321;
+    storageTarget.infop.si_code = CLD_EXITED;
+    suite.expect(ContainerManager::storageTargetIsQuiescent(&storageTarget, &crashBackoffFailure),
+                 "storage_ownership_observed_exit_and_empty_cgroup_admitted");
+    suite.expect(writeFileFixture(crashBackoffCgroup / "cgroup.events", "populated 1\n") &&
+                 !ContainerManager::storageTargetIsQuiescent(&storageTarget, &crashBackoffFailure) &&
+                 writeFileFixture(crashBackoffCgroup / "cgroup.events", "populated 0\n"),
+                 "storage_ownership_populated_cgroup_rejected");
+    close(storageTarget.cgroup); storageTarget.cgroup = -1; storageTarget.pid = -1;
+
     suite.expect(writeFileFixture(crashBackoffCgroup / "cgroup.events", "populated 1\n") &&
                      !ContainerManager::observedCrashBackoffPredecessorCgroupIsEmpty(&crashed, &crashBackoffFailure) &&
                      writeFileFixture(crashBackoffCgroup / "cgroup.events", "populated 0\n"),

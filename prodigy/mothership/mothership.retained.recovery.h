@@ -368,25 +368,27 @@ public:
   Vector<int64_t> observedCreatedAtMs;
 };
 
-static inline bool mothershipRetainedRecoveryPlansEqual(const DeploymentPlan& lhs, const DeploymentPlan& rhs)
+static inline void mothershipRetainedRecoveryNormalizePlanDeclaration(DeploymentPlan& plan)
 {
-  String left = {}, right = {};
-  DeploymentPlan leftCopy = lhs, rightCopy = rhs;
   // CID rotation is replicated runtime state, so stopped peers can retain
   // different key generations for the same declared deployment. Compare only
   // copies: recovery must preserve each peer's keys until normal replication
   // resumes. Rotation policy and every other declared field remain exact.
-  auto clearCidRuntime = [](DeploymentPlan& plan) {
-    for (Wormhole& wormhole : plan.wormholes)
-    {
-      const uint32_t rotationHours = wormhole.quicCidKeyState.rotationHours;
-      wormhole.hasQuicCidKeyState = false;
-      wormhole.quicCidKeyState = {};
-      wormhole.quicCidKeyState.rotationHours = rotationHours;
-    }
-  };
-  clearCidRuntime(leftCopy);
-  clearCidRuntime(rightCopy);
+  for (Wormhole& wormhole : plan.wormholes)
+  {
+    const uint32_t rotationHours = wormhole.quicCidKeyState.rotationHours;
+    wormhole.hasQuicCidKeyState = false;
+    wormhole.quicCidKeyState = {};
+    wormhole.quicCidKeyState.rotationHours = rotationHours;
+  }
+}
+
+static inline bool mothershipRetainedRecoveryPlansEqual(const DeploymentPlan& lhs, const DeploymentPlan& rhs)
+{
+  String left = {}, right = {};
+  DeploymentPlan leftCopy = lhs, rightCopy = rhs;
+  mothershipRetainedRecoveryNormalizePlanDeclaration(leftCopy);
+  mothershipRetainedRecoveryNormalizePlanDeclaration(rightCopy);
   BitseryEngine::serialize(left, leftCopy);
   BitseryEngine::serialize(right, rightCopy);
   return left == right;

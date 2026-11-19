@@ -51,6 +51,7 @@
 #include <prodigy/command.capture.h>
 
 #include <prodigy/neuron/container.storage.layout.h>
+#include <prodigy/neuron/container.storage.ownership.h>
 #include <switchboard/overlay.route.h>
 #include <switchboard/kernel/structs.h>
 #include <switchboard/whitehole.route.h>
@@ -9742,6 +9743,50 @@ public:
     return true;
   }
 
+  static bool storageTargetIsQuiescent(const Container *container, String *failureReport = nullptr)
+  {
+    const bool observedExit = container && !container->waitidPending &&
+        container->infop.si_pid == container->pid &&
+        (container->infop.si_code == CLD_EXITED || container->infop.si_code == CLD_KILLED ||
+         container->infop.si_code == CLD_DUMPED);
+    if (!container || (container->pid > 0 && !observedExit))
+    {
+      if (failureReport) failureReport->assign("storage ownership target has a live or unobserved process"_ctv);
+      return false;
+    }
+    return observedCrashBackoffPredecessorCgroupIsEmpty(container, failureReport);
+  }
+
+  static bool prepareLoopStorageOwnership(Container *container, String *failureReport = nullptr)
+  {
+    if (!container || !container->storageUsesLoopFilesystem || !container->plan.isStateful ||
+        container->plan.config.runAsID != 0) return true;
+    String expectedName, expectedRoot, expectedPayload;
+    expectedName.assignItoa(container->plan.uuid);
+    prodigyContainerStorageRootPathForName(expectedName, expectedRoot);
+    prodigyContainerStoragePayloadPathForName(expectedName, expectedPayload);
+    uint32_t userID = 0, executionID = 0;
+    if (container->name != expectedName || container->storageRootPath != expectedRoot ||
+        container->storagePayloadPath != expectedPayload || container->storageLoopDevices.empty() ||
+        !allContainerStorageBackingFilesExist(container->storageLoopDevices) ||
+        !prodigyDeriveContainerHostIDs(container->plan, userID, executionID) ||
+        executionID != container->executionHostID || !storageTargetIsQuiescent(container, failureReport))
+    {
+      if (failureReport && failureReport->empty()) failureReport->assign("storage ownership target backend is not canonical"_ctv);
+      return false;
+    }
+    int storage = open(container->storageRootPath.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    const bool imported = storage >= 0 && ProdigyStorageOwnership::transfer(
+        storage, container->storageRootPath, container->plan.uuid,
+        container->plan.config.deploymentID(), container->executionHostID,
+        container->plan.config.containerBlobSHA256, container->plan.config.containerBlobBytes,
+        [](const String& source, const String& target, String *error) {
+          return snapshotContainerArtifactSubvolume(source, target, error);
+        }, failureReport);
+    if (storage >= 0) close(storage);
+    return imported;
+  }
+
   static bool prepareContainerStorage(Container *container, String *failureReport = nullptr,
                                       bool requireExistingBackend = false)
   {
@@ -9861,6 +9906,9 @@ public:
 
     bool anyBackingExists = anyContainerStorageBackingFileExists(container->storageLoopDevices);
     bool allBackingExists = allContainerStorageBackingFilesExist(container->storageLoopDevices);
+    // Preparation may stop at any ownership/publication boundary. Retain an
+    // existing backend through failed-create cleanup until a process launches.
+    if (anyBackingExists) container->deleteStorageOnCleanUp = false;
     if (anyBackingExists != allBackingExists)
     {
       if (failureReport)
@@ -9885,16 +9933,8 @@ public:
       return false;
     }
 
-    String quotaFailure;
-    bool strictQuota = false;
-    if (applyLoopBackedStorageQuota(container, container->plan.config.storageMB, strictQuota, &quotaFailure) == false)
-    {
-      if (failureReport && quotaFailure.size() > 0)
-      {
-        failureReport->assign(quotaFailure);
-      }
-      return false;
-    }
+    // Import private descendants as well as the root after a UID rotation.
+    if (existingBackend && !prepareLoopStorageOwnership(container, failureReport)) return false;
 
     if (chown(container->storagePayloadPath.c_str(), uid_t(container->executionHostID), gid_t(container->executionHostID)) != 0)
     {
@@ -9904,6 +9944,19 @@ public:
                  unsigned(container->executionHostID),
                  errno,
                  strerror(errno));
+    }
+
+    // Ownership publication replaces /data with a new subvolume ID. Resolve
+    // the quota against that published owner before an application can start.
+    String quotaFailure;
+    bool strictQuota = false;
+    if (applyLoopBackedStorageQuota(container, container->plan.config.storageMB, strictQuota, &quotaFailure) == false)
+    {
+      if (failureReport && quotaFailure.size() > 0)
+      {
+        failureReport->assign(quotaFailure);
+      }
+      return false;
     }
 
     return true;
@@ -14951,6 +15004,8 @@ public:
     }
 
     prodigyTraceContainerStage("neuron-process-started", deploymentID, plan.uuid);
+    if (container->storageUsesLoopFilesystem)
+      container->deleteStorageOnCleanUp = true; // ordinary lifecycle owns the launched backend
     if (thisNeuron != nullptr)
     {
       thisNeuron->noteTaskAttemptRunning(plan);
@@ -15175,7 +15230,15 @@ public:
       thisNeuron->openWhiteholesForLocalContainer(container->plan.fragment, container->plan.whiteholes);
     }
 
-    if (startContainer(container, true, &failureReport) == false)
+    bool storageReady = true;
+    if (!coldRestart && container->storageUsesLoopFilesystem && container->plan.isStateful &&
+        container->plan.config.runAsID == 0)
+    {
+      bool strictQuota = false;
+      storageReady = prepareLoopStorageOwnership(container, &failureReport) &&
+          applyLoopBackedStorageQuota(container, container->plan.config.storageMB, strictQuota, &failureReport);
+    }
+    if (!storageReady || startContainer(container, true, &failureReport) == false)
     {
       if (failureReport.size() == 0)
       {

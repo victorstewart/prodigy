@@ -4087,7 +4087,7 @@ static bool mothershipVDCCaptureLocalCheckpoint(MothershipVDCBundleRecovery& ope
 // guard has verified that process resumed.
 static bool mothershipVDCCaptureBrainStateLocal(
     uint128_t expectedClusterUUID, uint128_t expectedMachineUUID,
-    uint64_t expectedPID, const String& directory, String *failure)
+    uint64_t expectedPID, const String& directory, const String& statePathSelector, String *failure)
 {
   auto reject = [&](const char *message) {
     if (failure && failure->empty()) failure->assign(message);
@@ -4095,6 +4095,7 @@ static bool mothershipVDCCaptureBrainStateLocal(
   };
   if (expectedClusterUUID == 0 || expectedMachineUUID == 0 || expectedPID < 2 ||
       !mothershipVDCPrivateDirectory(directory) ||
+      !mothershipVDCBrainCaptureStatePathSelectorValid(statePathSelector) ||
       std::getenv("PRODIGY_STATE_DB") != nullptr ||
       std::getenv("PRODIGY_STATE_SECRETS_DB") != nullptr)
     return reject("invalid isolated Brain state capture input");
@@ -4124,7 +4125,8 @@ static bool mothershipVDCCaptureBrainStateLocal(
 
   MothershipVDCProcessResumeGuard resume(receipt.process);
   if (!resume.freeze(failure)) return false;
-  if (!mothershipVDCBrainCaptureStatePaths(processRoot, source, sourceSecrets, failure)) return false;
+  if (!mothershipVDCBrainCaptureStatePaths(
+          processRoot, source, sourceSecrets, failure, statePathSelector)) return false;
   if (!mothershipVDCCopyPrivateStateTree(source, copy, failure) ||
       !mothershipVDCCopyPrivateStateTree(sourceSecrets, copySecrets, failure))
     return reject("private crash-consistent Brain state capture failed");
@@ -15225,15 +15227,17 @@ REMOTE_RUNTIME
     String machineText = argc > 1 ? String(argv[1]) : String();
     String pidText = argc > 2 ? String(argv[2]) : String();
     String directory = argc > 3 ? String(argv[3]) : String();
+    String statePathSelector = argc > 4 ? String(argv[4]) : String();
     uint128_t clusterUUID = 0, machineUUID = 0;
     uint64_t pid = 0;
     const char *pidBegin = reinterpret_cast<const char *>(pidText.data());
     String failure = {};
-    const bool valid = argc == 4 &&
+    const bool valid = (argc == 4 || argc == 5) &&
         prodigyParseCanonicalHex128(clusterText, clusterUUID) &&
         prodigyParseCanonicalHex128(machineText, machineUUID) &&
         mothershipVDCParseUnsigned(pidBegin, pidBegin + pidText.size(), pid) && pid > 1 &&
-        mothershipVDCCaptureBrainStateLocal(clusterUUID, machineUUID, pid, directory, &failure);
+        mothershipVDCCaptureBrainStateLocal(
+            clusterUUID, machineUUID, pid, directory, statePathSelector, &failure);
     basics_log("captureBrainStateLocal success=%u clusterUUID=%s machineUUID=%s pid=%llu failure=%s\n",
                unsigned(valid), clusterText.c_str(), machineText.c_str(),
                (unsigned long long)pid, failure.c_str());
@@ -27542,6 +27546,169 @@ LOCAL_RUNTIME
                                (unsigned long long)plan.config.deploymentID());
   }
 
+  void runCompareDeploymentPlan(int argc, char *argv[])
+  {
+    if (argc != 3)
+    {
+      basics_log("usage: compareDeploymentPlan [target: local|clusterName|clusterUUID] [json|-|@path] [accepted Bitsery plan path]\n");
+      exit(EXIT_FAILURE);
+    }
+
+    DeploymentPlan candidate = {};
+    String ignoredArtifactPath = {}, failure = {};
+    bool ignoredReturnAfterInitialSpinOkay = false;
+    if (prepareDeploymentPlan(argv[0], argv[1], "/dev/null", candidate, ignoredArtifactPath,
+                              ignoredReturnAfterInitialSpinOkay, failure) == false)
+    {
+      if (failure.size() > 0) basics_log("compareDeploymentPlan failed: %s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    const int fd = ::open(argv[2], O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+    {
+      basics_log("compareDeploymentPlan accepted plan unreadable\n");
+      exit(EXIT_FAILURE);
+    }
+    String acceptedBytes = {};
+    char buffer[4096];
+    for (;;)
+    {
+      const ssize_t bytes = ::read(fd, buffer, sizeof(buffer));
+      if (bytes < 0)
+      {
+        ::close(fd);
+        basics_log("compareDeploymentPlan accepted plan read failed\n");
+        exit(EXIT_FAILURE);
+      }
+      if (bytes == 0) break;
+      acceptedBytes.append(buffer, size_t(bytes));
+      if (acceptedBytes.size() > 1024 * 1024)
+      {
+        ::close(fd);
+        basics_log("compareDeploymentPlan accepted plan too large\n");
+        exit(EXIT_FAILURE);
+      }
+    }
+    if (::close(fd) != 0)
+    {
+      basics_log("compareDeploymentPlan accepted plan close failed\n");
+      exit(EXIT_FAILURE);
+    }
+
+    DeploymentPlan accepted = {};
+    if (acceptedBytes.empty() || !BitseryEngine::deserializeSafe(acceptedBytes, accepted))
+    {
+      basics_log("compareDeploymentPlan accepted plan decode failed\n");
+      exit(EXIT_FAILURE);
+    }
+    if (candidate.config.applicationID != accepted.config.applicationID)
+    {
+      basics_log("compareDeploymentPlan applicationID differs\n");
+      exit(EXIT_FAILURE);
+    }
+
+    String acceptedSHA256 = {}, candidateSHA256 = {}, comparisonSHA256 = {};
+    DeploymentPlan acceptedCopy = accepted, candidateCopy = candidate;
+    String acceptedEncoded = {}, candidateEncoded = {};
+    if (!BitseryEngine::serialize(acceptedEncoded, acceptedCopy) ||
+        !BitseryEngine::serialize(candidateEncoded, candidateCopy) ||
+        !prodigyComputeSHA256Hex(acceptedEncoded, acceptedSHA256, &failure) ||
+        !prodigyComputeSHA256Hex(candidateEncoded, candidateSHA256, &failure))
+    {
+      basics_log("compareDeploymentPlan serialization failed\n");
+      exit(EXIT_FAILURE);
+    }
+
+    candidate.config.versionID = accepted.config.versionID;
+    candidate.config.containerBlobSHA256 = accepted.config.containerBlobSHA256;
+    candidate.config.containerBlobBytes = accepted.config.containerBlobBytes;
+    const bool configEqual = prodigyStatefulServingApplicationConfigEqual(candidate.config, accepted.config);
+    // The existing config comparator handles unordered capability-set order.
+    // Compare all remaining plan fields with the same Bitsery schema.
+    candidate.config = accepted.config;
+    auto acceptedDeclaration = accepted;
+    mothershipRetainedRecoveryNormalizePlanDeclaration(candidate);
+    mothershipRetainedRecoveryNormalizePlanDeclaration(acceptedDeclaration);
+    String acceptedDeclarationEncoded = {};
+    if (!BitseryEngine::serialize(acceptedDeclarationEncoded, acceptedDeclaration)) exit(EXIT_FAILURE);
+    String comparisonEncoded = {};
+    if (!BitseryEngine::serialize(comparisonEncoded, candidate) ||
+        !prodigyComputeSHA256Hex(comparisonEncoded, comparisonSHA256, &failure))
+    {
+      basics_log("compareDeploymentPlan comparison serialization failed\n");
+      exit(EXIT_FAILURE);
+    }
+    if (comparisonEncoded != acceptedDeclarationEncoded)
+    {
+      const auto diagnose = [&]<typename T>(const char *name, const T& left, const T& right) {
+        T a = left, b = right;
+        String x = {}, y = {};
+        if (!BitseryEngine::serialize(x, a) || !BitseryEngine::serialize(y, b) || x != y)
+          basics_log("compareDeploymentPlan differingComponent=%s\n", name);
+      };
+#define PRODIGY_COMPARE_PLAN_COMPONENT(field) diagnose(#field, candidate.field, acceptedDeclaration.field)
+      PRODIGY_COMPARE_PLAN_COMPONENT(horizontalScalers);
+      PRODIGY_COMPARE_PLAN_COMPONENT(verticalScalers);
+      PRODIGY_COMPARE_PLAN_COMPONENT(stateful);
+      PRODIGY_COMPARE_PLAN_COMPONENT(stateless);
+      PRODIGY_COMPARE_PLAN_COMPONENT(wormholes);
+      PRODIGY_COMPARE_PLAN_COMPONENT(publicTLS);
+      PRODIGY_COMPARE_PLAN_COMPONENT(whiteholes);
+      PRODIGY_COMPARE_PLAN_COMPONENT(subscriptions);
+      PRODIGY_COMPARE_PLAN_COMPONENT(advertisements);
+      PRODIGY_COMPARE_PLAN_COMPONENT(tlsIssuancePolicy);
+      PRODIGY_COMPARE_PLAN_COMPONENT(apiCredentialPolicy);
+#undef PRODIGY_COMPARE_PLAN_COMPONENT
+      basics_log("compareDeploymentPlan wormholeCounts candidate=%zu accepted=%zu\n",
+                 candidate.wormholes.size(), acceptedDeclaration.wormholes.size());
+      for (size_t index = 0; index < std::min(candidate.wormholes.size(), acceptedDeclaration.wormholes.size()); ++index)
+      {
+        const auto diagnoseWormholeField = [&](const char *name, auto member) {
+          Wormhole a = {}, b = {};
+          a.*member = candidate.wormholes[index].*member;
+          b.*member = acceptedDeclaration.wormholes[index].*member;
+          String x = {}, y = {};
+          if (!BitseryEngine::serialize(x, a) || !BitseryEngine::serialize(y, b) || x != y)
+            basics_log("compareDeploymentPlan wormholeIndex=%zu differingField=%s\n", index, name);
+        };
+#define PRODIGY_COMPARE_WORMHOLE_FIELD(field) diagnoseWormholeField(#field, &Wormhole::field)
+        PRODIGY_COMPARE_WORMHOLE_FIELD(name);
+        PRODIGY_COMPARE_WORMHOLE_FIELD(externalAddress);
+        PRODIGY_COMPARE_WORMHOLE_FIELD(deliveryAddress);
+        PRODIGY_COMPARE_WORMHOLE_FIELD(externalPort);
+        PRODIGY_COMPARE_WORMHOLE_FIELD(containerPort);
+        PRODIGY_COMPARE_WORMHOLE_FIELD(layer4);
+        PRODIGY_COMPARE_WORMHOLE_FIELD(isQuic);
+        PRODIGY_COMPARE_WORMHOLE_FIELD(userCapacity);
+        PRODIGY_COMPARE_WORMHOLE_FIELD(hasQuicCidKeyState);
+        PRODIGY_COMPARE_WORMHOLE_FIELD(source);
+        PRODIGY_COMPARE_WORMHOLE_FIELD(routablePrefixUUID);
+        PRODIGY_COMPARE_WORMHOLE_FIELD(hasTlsResumptionConfig);
+        PRODIGY_COMPARE_WORMHOLE_FIELD(tlsResumption);
+        PRODIGY_COMPARE_WORMHOLE_FIELD(hasDNSConfig);
+        PRODIGY_COMPARE_WORMHOLE_FIELD(dns);
+        PRODIGY_COMPARE_WORMHOLE_FIELD(quicCidKeyState);
+#undef PRODIGY_COMPARE_WORMHOLE_FIELD
+      }
+      if (candidate.minimumSubscriberCapacity != accepted.minimumSubscriberCapacity ||
+          candidate.isStateful != accepted.isStateful || candidate.canaryCount != accepted.canaryCount ||
+          candidate.canariesMustLiveForMinutes != accepted.canariesMustLiveForMinutes ||
+          candidate.networkAccess != accepted.networkAccess || candidate.useHostNetworkNamespace != accepted.useHostNetworkNamespace ||
+          candidate.moveConstructively != accepted.moveConstructively ||
+          candidate.requiresDatacenterUniqueTag != accepted.requiresDatacenterUniqueTag ||
+          candidate.hasTlsIssuancePolicy != accepted.hasTlsIssuancePolicy ||
+          candidate.hasApiCredentialPolicy != accepted.hasApiCredentialPolicy)
+        basics_log("compareDeploymentPlan differingComponent=scalar-policy\n");
+    }
+    const bool equal = configEqual && comparisonEncoded == acceptedDeclarationEncoded;
+    basics_log("compareDeploymentPlan applicationID=%u equal=%u configEqual=%u remainingFieldsEqual=%u acceptedSHA256=%s candidateSHA256=%s comparisonSHA256=%s\n",
+               unsigned(accepted.config.applicationID), unsigned(equal), unsigned(configEqual),
+               unsigned(comparisonEncoded == acceptedDeclarationEncoded),
+               acceptedSHA256.c_str(), candidateSHA256.c_str(), comparisonSHA256.c_str());
+    if (!equal) exit(EXIT_FAILURE);
+  }
+
   void runApplicationReport(int argc, char *argv[])
   {
     if (argc < 2)
@@ -32618,6 +32785,13 @@ LOCAL_RUNTIME
       String& failure)
   {
     failure.clear();
+    // Local and test providers configure their in-process or VM runtime via
+    // the existing configure protocol; they have no adopted remote Brain to
+    // repair over SSH, so they must not require remote-only installation data.
+    if (cluster.deploymentMode != MothershipClusterDeploymentMode::remote)
+    {
+      return true;
+    }
     if (acme.configured() == false || cluster.remoteProdigyPath.size() == 0 ||
         cluster.remoteProdigyPath[0] != '/' ||
         prodigyMachineCpuArchitectureSupportedTarget(cluster.architecture) == false)
@@ -32625,14 +32799,6 @@ LOCAL_RUNTIME
       failure.assign("existing cluster ACME provisioning requires configured ACME, an absolute runtime root, and a supported architecture"_ctv);
       return false;
     }
-    if (cluster.deploymentMode != MothershipClusterDeploymentMode::remote)
-    {
-      // Local and test providers configure their in-process or VM runtime via
-      // the existing configure protocol; they have no adopted remote Brain to
-      // repair over SSH.
-      return true;
-    }
-
     String localExecutablePath = {};
     String approvedBundlePath = {};
     String approvedBundleSHA256 = {};
@@ -34185,14 +34351,17 @@ LOCAL_RUNTIME
 
   void runRepairLocalBundleRecoveryWitness(int argc, char *argv[])
   {
-    const bool query = argc == 3 && std::strcmp(argv[2], "--query") == 0;
+    const bool legacyQuery = argc == 3 && std::strcmp(argv[2], "--query-legacy") == 0;
+    const bool migrate = argc == 4 && std::strcmp(argv[2], "--migrate") == 0;
+    const bool query = legacyQuery || (argc == 3 && std::strcmp(argv[2], "--query") == 0);
     const bool retire = argc == 4 && std::strcmp(argv[2], "--retire") == 0;
+    const bool migration = legacyQuery || migrate;
     uint128_t operationUUID = 0;
     String failure = {}, operationText = {};
-    if ((!query && !retire) || !prodigyParseCanonicalHex128(String(argv[1]), operationUUID) ||
-        operationUUID == 0 || (retire && !prodigyIsSHA256HexDigest(String(argv[3]))))
+    if ((!query && !retire && !migrate) || !prodigyParseCanonicalHex128(String(argv[1]), operationUUID) ||
+        operationUUID == 0 || ((retire || migrate) && !prodigyIsSHA256HexDigest(String(argv[3]))))
     {
-      basics_log("repairLocalBundleRecoveryWitness success=0 failure=usage: repairLocalBundleRecoveryWitness TARGET OPERATION_UUID --query|--retire SCOPE_SHA256\n");
+      basics_log("repairLocalBundleRecoveryWitness success=0 failure=usage: repairLocalBundleRecoveryWitness TARGET OPERATION_UUID --query|--retire SCOPE_SHA256|--query-legacy|--migrate SCOPE_SHA256\n");
       exit(EXIT_FAILURE);
     }
     operationText.assignItoh(operationUUID);
@@ -34208,9 +34377,11 @@ LOCAL_RUNTIME
         exit(EXIT_FAILURE);
       }
     }
+    uint32_t registeredBrains = 0;
     for (const ClusterMachine& machine : cluster.topology.machines)
     {
-      if (!machine.isBrain || machine.uuid == 0)
+      registeredBrains += machine.isBrain;
+      if ((!migration && !machine.isBrain) || machine.uuid == 0)
       {
         basics_log("repairLocalBundleRecoveryWitness success=0 operationUUID=%s failure=registered topology is not an exact Brain set\n",
                    operationText.c_str());
@@ -34219,22 +34390,26 @@ LOCAL_RUNTIME
       registeredMachines.push_back(machine.uuid);
     }
     std::sort(registeredMachines.begin(), registeredMachines.end());
-    if (registeredMachines.size() != 3 ||
+    if ((migration ? (registeredBrains != 1 || registeredMachines.size() < 2 || registeredMachines.size() > 255)
+                   : registeredMachines.size() != 3) ||
         std::adjacent_find(registeredMachines.begin(), registeredMachines.end()) != registeredMachines.end() ||
         !configureControlTarget(argv[0], &failure))
     {
       basics_log("repairLocalBundleRecoveryWitness success=0 operationUUID=%s failure=%s\n",
                  operationText.c_str(),
-                 failure.empty() ? "registered topology is not the exact three-Brain cohort" : failure.c_str());
+                 failure.empty() ? "registered topology does not match the requested repair cohort" : failure.c_str());
       exit(EXIT_FAILURE);
     }
 
     RepairLocalBundleRecoveryWitness request = {};
-    request.action = query ? ProdigyLocalBundleRecoveryWitnessRepairAction::query
-                           : ProdigyLocalBundleRecoveryWitnessRepairAction::retire;
+    request.action = migration
+        ? (query ? ProdigyLocalBundleRecoveryWitnessRepairAction::queryLegacy
+                 : ProdigyLocalBundleRecoveryWitnessRepairAction::migrateLegacy)
+        : (query ? ProdigyLocalBundleRecoveryWitnessRepairAction::query
+                 : ProdigyLocalBundleRecoveryWitnessRepairAction::retire);
     request.operationUUID = operationUUID;
     request.clusterUUID = cluster.clusterUUID;
-    if (retire) request.scopeSHA256.assign(argv[3]);
+    if (retire || migrate) request.scopeSHA256.assign(argv[3]);
     String serializedRequest = {};
     BitseryEngine::serialize(serializedRequest, request);
     if (!socket.ensureConnected())
@@ -34254,7 +34429,7 @@ LOCAL_RUNTIME
                          serializedRequest);
       if (!socket.send()) exit(EXIT_FAILURE);
       Message *message = socket.recvExpectedTopic(
-          MothershipTopic::repairLocalBundleRecoveryWitness, 16 * 1024);
+          MothershipTopic::repairLocalBundleRecoveryWitness, 64 * 1024);
       if (message == nullptr)
       {
         failure = socket.ioFailureDetail();
@@ -34318,7 +34493,7 @@ LOCAL_RUNTIME
             ? "superseded-inventory-barrier" : "same-bundle");
     basics_log(
         "repairLocalBundleRecoveryWitness success=%u action=%s disposition=%s witnessPresent=%u eligible=%u idempotent=%u completed=%u operationUUID=%s clusterUUID=%s scopeSHA256=%s authorityGeneration=%llu masterUUID=%s masterBootNs=%lld installedBundleSHA256=%s witnessExpectedBundleSHA256=%s durableGeneration=%llu acceptedAtMs=%lld failure=%s\n",
-        unsigned(response.success), query ? "query" : "retire", disposition,
+        unsigned(response.success), migration ? (query ? "query-legacy" : "migrate") : (query ? "query" : "retire"), disposition,
         unsigned(response.witnessPresent),
         unsigned(response.eligible), unsigned(response.idempotent), unsigned(response.completed),
         operationText.c_str(), String::toHex(response.clusterUUID).c_str(), response.scopeSHA256.c_str(),
@@ -39414,6 +39589,7 @@ public:
         {"captureBrainStateLocal",          &Mothership::runCaptureBrainStateLocal         },
         {"checkClusterProviderPlan",        &Mothership::runCheckClusterProviderPlan       },
         {"clusterReport",                   &Mothership::runClusterReport                  },
+        {"compareDeploymentPlan",           &Mothership::runCompareDeploymentPlan          },
         {"configureGlobalSingleWriterGroup",             &Mothership::configureGlobalSingleWriterGroup                },
         {"configureLocalVMClusterLANIPv6",  &Mothership::runConfigureLocalVMClusterLANIPv6 },
         {"configureTestClusterPublicIngressSource", &Mothership::runConfigureTestClusterPublicIngressSource},
@@ -39748,6 +39924,8 @@ int main(int argc, char *argv[])
     message.append("deploy [target: local|clusterName|clusterUUID] [json|-|@path] [path to container blob] [--submit-only]\n");
     message.append("\t--submit-only returns after the initial accepted spin response; readiness remains unverified\n");
     message.append("\tdeploys an application on the cluster\n");
+    message.append("compareDeploymentPlan [target: local|clusterName|clusterUUID] [json|-|@path] [accepted Bitsery plan path]\n");
+    message.append("\tread-only: validates JSON with the deployment parser and compares its normalized Bitsery plan to an accepted plan after masking version and artifact identity\n");
     message.append("deploymentIdentity [clusterName|clusterUUID] [deploymentID] [--seed-details]\n");
     message.append("applicationReport [target: local|clusterName|clusterUUID] [application name]\n");
     message.append("\tfetches the state of each deployment of the application\n");
