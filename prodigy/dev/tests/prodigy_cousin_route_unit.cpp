@@ -100,6 +100,45 @@ static ProdigyLocalCousinServicePermission purposePermission(ProdigyCousinServic
   return p;
 }
 
+static void testCousinServicePermissionSingleSlot(TestSuite& suite)
+{
+  bool everySingleSlotPreserved = true;
+  for (uint16_t candidate = 0; candidate < CousinRouteSlotBitmap::slotCount; ++candidate) {
+    ProdigyLocalCousinServicePermission permission = {};
+    permission.slots.insert(candidate);
+    uint16_t slot = uint16_t(0xffff);
+    everySingleSlotPreserved = everySingleSlotPreserved &&
+        prodigyCousinServicePermissionSingleSlot(permission, slot) && slot == candidate;
+  }
+  suite.require(everySingleSlotPreserved, "single_slot_accepts_each_of_1024_slots_exactly");
+
+  ProdigyLocalCousinServicePermission empty = {};
+  uint16_t emptySlot = 0xabcd;
+  suite.require(!prodigyCousinServicePermissionSingleSlot(empty, emptySlot) && emptySlot == 0xabcd,
+      "single_slot_empty_rejection_preserves_caller_slot");
+
+  ProdigyLocalCousinServicePermission sameWord = {};
+  sameWord.slots.insert(67); sameWord.slots.insert(69);
+  uint16_t sameWordSlot = 0xffff;
+  suite.require(!prodigyCousinServicePermissionSingleSlot(sameWord, sameWordSlot) && sameWordSlot == 67,
+      "single_slot_same_word_rejection_preserves_first_slot");
+
+  ProdigyLocalCousinServicePermission separateWords = {};
+  separateWords.slots.insert(127); separateWords.slots.insert(128);
+  uint16_t separateWordsSlot = 0xffff;
+  suite.require(!prodigyCousinServicePermissionSingleSlot(separateWords, separateWordsSlot) && separateWordsSlot == 127,
+      "single_slot_second_word_rejection_preserves_first_slot");
+
+  auto permission = purposePermission(ProdigyCousinServicePurpose::clientAuthority, true, 3, 1, 3);
+  suite.require(prodigyLocalCousinServicePermissionValid(permission),
+      "single_slot_keeps_matching_destination_group_authorized");
+  const uint16_t wrongGroup = 2;
+  permission.destinationShardGroup = wrongGroup;
+  permission.authorizedService = MeshServices::constrainPrefixToGroup(permission.peerCousinServicePrefix, wrongGroup);
+  suite.require(!prodigyLocalCousinServicePermissionValid(permission),
+      "single_slot_keeps_destination_group_owner_validation");
+}
+
 static std::string purposePermissionJSON(ProdigyLocalCousinServicePermission p)
 {
   uint16_t slot = 0; prodigyCousinServicePermissionSingleSlot(p, slot);
@@ -314,6 +353,7 @@ static MothershipPairControlServiceTransit validPairControlServiceTransit(
 int main(void)
 {
   TestSuite suite;
+  testCousinServicePermissionSingleSlot(suite);
 #ifdef __linux__
   if (std::getenv("PRODIGY_TEST_PRIVATE_BGP_HOP_LIMIT_ONLY") != nullptr)
   {
@@ -1367,6 +1407,34 @@ int main(void)
                 "private_tunnel_bgp_withdraws_on_readiness_loss");
   gatewayReadiness.authenticatedMasqueQUICReady = true;
 
+  // A connector may briefly lack a usable gateway namespace during recovery.
+  // Keep the exact delivered scope in its existing volatile owner so Neuron
+  // can retry with a fresh descriptor; a changed authority remains ineligible.
+  NeuronPrivateTunnelBGPRuntime startupRetryRuntime = {};
+  ProdigyPairPrivateBGPSecretDeliveryResponse startupRetrySecret = {};
+  startupRetrySecret.accepted = true;
+  startupRetrySecret.scope.pairUUID = gateway.pairUUID;
+  startupRetrySecret.scope.operationUUID = gateway.pairOperationUUID;
+  startupRetrySecret.scope.keyEpoch = gateway.keyGeneration;
+  startupRetrySecret.scope.tunnelSlot = gateway.tunnelSlot;
+  startupRetrySecret.scope.clusterUUID = gateway.localClusterUUID;
+  startupRetrySecret.scope.machineUUID = gateway.localMachineUUID;
+  startupRetrySecret.scope.authorityGeneration = gateway.pairAuthorityGeneration;
+  startupRetrySecret.scope.gatewayGeneration = gateway.generation;
+  startupRetrySecret.credential = privateSessionKey;
+  suite.require(startupRetryRuntime.installDeliveredSecret(startupRetrySecret) &&
+                    !startupRetryRuntime.reconcile(gateway, &gatewayReadiness, &privateBGP, -1) &&
+                    startupRetryRuntime.desiredPaths().empty() &&
+                    !startupRetryRuntime.empty(),
+                "private_tunnel_bgp_transient_namespace_failure_retains_exact_volatile_scope_for_retry");
+  auto retryStaleAuthority = gateway;
+  ++retryStaleAuthority.generation;
+  suite.require(!startupRetryRuntime.reconcile(retryStaleAuthority, &gatewayReadiness,
+                                                   &privateBGP, -1) && startupRetryRuntime.empty(),
+                "private_tunnel_bgp_transient_retry_rejects_changed_authority_scope");
+  if (std::getenv("PRODIGY_TEST_PRIVATE_BGP_STARTUP_RETRY_ONLY") != nullptr)
+    return suite.failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+
   ProdigyCrossClusterAuthenticatedOverlayUnderlay underlay = {};
   underlay.pairUUID = mesh.pairUUID;
   underlay.localMachineUUID = mesh.localMachineUUID;
@@ -1500,6 +1568,34 @@ int main(void)
   suite.require(slotCoverageIsExact(allSlots, 2), "all_slots_assign_once_with_two_groups");
   suite.require(slotCoverageIsExact(allSlots, 3), "all_slots_assign_once_with_three_groups");
   suite.require(slotCoverageIsExact(allSlots, 7), "all_slots_assign_once_with_seven_groups");
+  CousinRouteSlotBitmap sparseSlots = {};
+  for (uint16_t slot : {uint16_t(0), uint16_t(63), uint16_t(64), uint16_t(511), uint16_t(1001)}) sparseSlots.insert(slot);
+  bool sparseOwnershipMatchesExhaustive = true;
+  bool denseOwnershipMatchesExhaustive = true;
+  for (uint16_t groups : {uint16_t(1), uint16_t(2), uint16_t(3), uint16_t(7)})
+    for (uint16_t group = 0; group < groups; ++group)
+    {
+      sparseOwnershipMatchesExhaustive = sparseOwnershipMatchesExhaustive &&
+          cousinRouteSlotsOwnedByGroup(sparseSlots, group, groups) == slotsOwnedBy(group, groups, sparseSlots);
+      denseOwnershipMatchesExhaustive = denseOwnershipMatchesExhaustive &&
+          cousinRouteSlotsOwnedByGroup(allSlots, group, groups) == slotsOwnedBy(group, groups, allSlots);
+    }
+  suite.require(sparseOwnershipMatchesExhaustive && denseOwnershipMatchesExhaustive &&
+                cousinRouteSlotsOwnedByGroup(allSlots, 0, 0).empty() &&
+                cousinRouteSlotsOwnedByGroup(allSlots, 7, 7).empty(),
+                "slot_intersection_matches_exhaustive_for_sparse_dense_and_invalid_groups");
+  auto exactOwnedCounterpart = discovery.records[0];
+  exactOwnedCounterpart.ownedSlots = cousinRouteSlotsOwnedByGroup(exactOwnedCounterpart.permission.slots,
+      exactOwnedCounterpart.shardGroup, exactOwnedCounterpart.shardGroups);
+  suite.require(prodigyCousinCounterpartValid(exactOwnedCounterpart), "sparse_counterpart_accepts_exact_owned_slots");
+  auto missingOwnedCounterpart = exactOwnedCounterpart;
+  for (uint16_t slot = 0; slot < nStatefulServiceGroupSlots; ++slot)
+    if (missingOwnedCounterpart.ownedSlots.contains(slot)) { missingOwnedCounterpart.ownedSlots.words[slot / 64] &= ~(uint64_t(1) << (slot % 64)); break; }
+  suite.require(!prodigyCousinCounterpartValid(missingOwnedCounterpart), "sparse_counterpart_rejects_missing_owned_slot");
+  auto extraOwnedCounterpart = exactOwnedCounterpart;
+  for (uint16_t slot = 0; slot < nStatefulServiceGroupSlots; ++slot)
+    if (!extraOwnedCounterpart.ownedSlots.contains(slot)) { extraOwnedCounterpart.ownedSlots.insert(slot); break; }
+  suite.require(!prodigyCousinCounterpartValid(extraOwnedCounterpart), "sparse_counterpart_rejects_extra_owned_slot");
 
   CousinRouteRecord prefixMismatch = route;
   CousinRouteRecord privateRoute = route;

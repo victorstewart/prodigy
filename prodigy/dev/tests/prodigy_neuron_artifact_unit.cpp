@@ -7,12 +7,15 @@
 #include <prodigy/neuron/neuron.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <vector>
 #include <sys/eventfd.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -126,6 +129,17 @@ public:
   }
 };
 
+class WithdrawalCloseCallbackHub final : public BGPHub {
+public:
+  uint32_t closeCallbacks = 0;
+  void hasShutdownBGP(void) override {}
+  void closeHandler(void *socket) override
+  {
+    closeCallbacks += 1;
+    BGPHub::closeHandler(socket);
+  }
+};
+
 class SwitchboardRingTestAccess {
 public:
   static const local_container_subnet6& subnet(const Switchboard& board)
@@ -193,7 +207,7 @@ public:
     none, helloToken, helloTuple, nonceFailure, nonceZero, receiptNonce,
     identity, authority, epoch, brainGeneration, fragment, launchGeneration,
     candidatePID, candidatePidfd, brainPointer, boundToken, unsettled,
-    malformed, oversized, coalesced, duplicate, eof
+    malformed, oversized, coalesced, duplicate, eof, routeDown
   };
   struct GatewayRecoveryTransitionResult {
     uint32_t sends = 0, recvs = 0, closes = 0;
@@ -208,6 +222,7 @@ public:
     bool opened = false, procIdentityCaptured = false, accepted = false;
     bool peerExact = false, changedIdentityRejected = false, cleaned = false;
   };
+  struct GatewayRecoveryPromotionResult { bool accepted = false, closed = false, republished = false, routeReady = false; };
   String root = {};
   int gatewayRecoveryRuntimeRootFD = -1;
   NeuronBrainControlStream *retained = nullptr;
@@ -313,6 +328,20 @@ public:
     replaceBrainWithoutClosing();
     controlTransportCredentials.self.clusterUUID = authority.localClusterUUID;
     return installGatewayAuthorityForStateUploadTest(authority);
+  }
+
+  bool prepareGatewayPrivateBGPOwnerForTest(uint128_t pairUUID)
+  {
+    auto *runtime = crossClusterMasqueGatewayRuntimeForPair(pairUUID);
+    if (runtime == nullptr) return false;
+    runtime->privateTunnelBGP = std::make_unique<NeuronPrivateTunnelBGPRuntime>();
+    return true;
+  }
+
+  bool gatewayPrivateBGPOwnerRetainedForTest(uint128_t pairUUID)
+  {
+    const auto *runtime = crossClusterMasqueGatewayRuntimeForPair(pairUUID);
+    return runtime != nullptr && runtime->privateTunnelBGP != nullptr;
   }
 
   void forgetGatewayPrivateBGPRuntimeForTest()
@@ -510,7 +539,10 @@ public:
       return pid == carrier.peerPID;
     };
     auto listener = std::make_unique<CrossClusterMasqueGatewayReadinessListener>();
-    listener->containerUUID = containerUUID; listener->recovery = true;
+    listener->containerUUID = containerUUID; listener->recovery = true; listener->recoveryEpoch = stateUploadRestoreEpoch;
+    listener->recoveryTuple = carrier.recoveryTuple; listener->recoveryToken.assign(token);
+    listener->retainedIdentity = carrier.retainedIdentity;
+    listener->fd = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     crossClusterMasqueGatewayReadinessListeners.push_back(std::move(listener));
     activeCrossClusterMasqueGatewayReadinessCarriers.insert_or_assign(containerUUID, &carrier);
     crossClusterMasqueGatewayReadinessCarriers.push_back(std::move(heldCarrier));
@@ -557,6 +589,7 @@ public:
     receipt.rebindReceipt.tuple = carrier.recoveryTuple;
     memcpy(receipt.rebindReceipt.nonce, carrier.recoveryNonce, sizeof(carrier.recoveryNonce));
     receipt.rebindReceipt.authenticatedMasqueQUICReady = true; receipt.rebindReceipt.ready = true;
+    if (fault == GatewayRecoveryFault::routeDown) receipt.rebindReceipt.authenticatedMasqueQUICReady = receipt.rebindReceipt.ready = false;
     receipt.rebindReceipt.routeSetSHA256.assign("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_ctv);
     if (fault == GatewayRecoveryFault::receiptNonce) receipt.rebindReceipt.nonce[0] ^= 1;
     if (fault == GatewayRecoveryFault::identity) *identityChanged = true;
@@ -611,6 +644,46 @@ public:
       return result;
     }
     finish();
+    return result;
+  }
+
+  GatewayRecoveryPromotionResult promotePublishedGatewayRecoveryForTest(
+      const CrossClusterMasqueGatewayAuthority& authority, const String& token, GatewayRecoveryFault fault = GatewayRecoveryFault::none)
+  {
+    GatewayRecoveryPromotionResult result = {};
+    const uint128_t uuid = uint128_t(0xa551f001);
+    auto *listener = crossClusterMasqueGatewayListenerForContainer(uuid);
+    if (!listener) return result;
+    CrossClusterMasqueGatewayReadinessCarrier carrier = {};
+    carrier.containerUUID = uuid; carrier.peerPID = 77; carrier.recovery = true;
+    carrier.recoveryEpoch = stateUploadRestoreEpoch; carrier.recoveryTuple = gatewayRecoveryTuple(authority);
+    carrier.recoveryToken.assign(token); carrier.localPhase = ProdigyGatewayLocalCarrierPhase::rebindHello;
+    carrier.retainedIdentity = listener->retainedIdentity;
+    carrier.capturePeerIdentity = [&carrier](pid_t pid, CrossClusterMasqueGatewayReadinessListener::PeerIdentity& identity) { identity = carrier.retainedIdentity; return pid == carrier.peerPID; };
+    const RecoveryFrameDispatch dispatch = {
+      [](CrossClusterMasqueGatewayReadinessCarrier *) {}, [](CrossClusterMasqueGatewayReadinessCarrier *) {},
+      [&result](CrossClusterMasqueGatewayReadinessCarrier *) { result.closed = true; },
+      [](uint8_t *bytes, uint32_t size) { if (size != 16) return false; memset(bytes, 0x4d, size); return true; }};
+    ProdigyGatewayLocalControlFrame hello = {};
+    hello.direction = ProdigyGatewayLocalDirection::gatewayToNeuron; hello.kind = ProdigyGatewayLocalKind::rebindHello;
+    hello.rebindHello.recoveryToken.assign(token); hello.rebindHello.tuple = carrier.recoveryTuple;
+    if (fault == GatewayRecoveryFault::helloTuple) ++hello.rebindHello.tuple.gatewayGeneration;
+    String encoded = {}; if (!prodigyEncodeGatewayLocalControlFrame(hello, encoded)) return result;
+    carrier.rBuffer.append(encoded); processRecoveryFrame(&carrier, dispatch);
+    ProdigyGatewayLocalControlFrame receipt = {};
+    receipt.direction = ProdigyGatewayLocalDirection::gatewayToNeuron; receipt.kind = ProdigyGatewayLocalKind::rebindReceipt;
+    receipt.rebindReceipt.tuple = carrier.recoveryTuple; memcpy(receipt.rebindReceipt.nonce, carrier.recoveryNonce, sizeof(carrier.recoveryNonce));
+    receipt.rebindReceipt.authenticatedMasqueQUICReady = true; receipt.rebindReceipt.ready = true;
+    receipt.rebindReceipt.routeSetSHA256.assign("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_ctv);
+    if (fault == GatewayRecoveryFault::receiptNonce) ++receipt.rebindReceipt.nonce[0];
+    if (fault == GatewayRecoveryFault::epoch) ++stateUploadRestoreEpoch;
+    if (fault == GatewayRecoveryFault::candidatePID) carrier.peerPID = 78;
+    encoded.clear(); if (!prodigyEncodeGatewayLocalControlFrame(receipt, encoded)) return result;
+    carrier.rBuffer.append(encoded); processRecoveryFrame(&carrier, dispatch);
+    result.accepted = carrier.receiptAccepted;
+    result.republished = publishedContainers != 1;
+    const auto *runtime = crossClusterMasqueGatewayRuntimeForContainer(uuid);
+    result.routeReady = runtime != nullptr && runtime->readiness.authenticatedMasqueQUICReady;
     return result;
   }
 
@@ -747,8 +820,9 @@ public:
 
   bool quiesceArtifactIOForTest()
   {
-    if (artifactIO == nullptr) return true;
+    if (artifactIO == nullptr && storageTelemetryIO == nullptr) return true;
     if (quiesceArtifactIOForBundleExec() == false) return false;
+    storageTelemetryIO.reset();
     artifactIO.reset();
     return true;
   }
@@ -805,6 +879,72 @@ public:
     containers.insert_or_assign(container->plan.uuid, container);
   }
 
+  void trackContainerForStorageTelemetryTest(Container *container)
+  {
+    containers.insert_or_assign(container->plan.uuid, container);
+  }
+
+  void untrackContainerForStorageTelemetryTest(uint128_t uuid)
+  {
+    containers.erase(uuid);
+    metricSampleStateByContainer.erase(uuid);
+    if (storageTelemetryCursorSet && storageTelemetryCursor == uuid) storageTelemetryCursorSet = false;
+  }
+
+  void sampleStorageTelemetryForTest(uint64_t nowNs)
+  {
+    collectContainerMetricsAndForward(nowNs);
+  }
+
+  bool sampleStorageTelemetrySynchronouslyForTest(const Container *container, uint64_t& utilPct)
+  {
+    String path = {};
+    uint64_t usageBytes = 0;
+    return containerStoragePayloadPath(container, path) && approximateDirectoryUsageBytes(path, usageBytes) &&
+        storageUtilPctForUsage(container, usageBytes, utilPct);
+  }
+
+  bool storageTelemetryInFlightForTest(void) const { return storageTelemetryInFlight != 0; }
+
+  bool queueStorageTelemetryBlockerForTest(std::atomic<bool>& entered, std::atomic<bool>& release)
+  {
+    return ensureStorageTelemetryIO() && storageTelemetryIO->submit(0,
+        [&entered, &release] { entered.store(true); while (!release.load()) usleep(1'000); },
+        [] {}, [](std::exception_ptr) {});
+  }
+
+  uint32_t storageMetricMessagesForTest(uint128_t first, uint128_t second) const
+  {
+    if (brain == nullptr) return 0;
+    uint32_t found = 0;
+    uint64_t offset = 0;
+    while (offset + Message::headerBytes <= brain->wBuffer.size())
+    {
+      Message *message = reinterpret_cast<Message *>(brain->wBuffer.data() + offset);
+      if (message->size < Message::headerBytes || offset + message->size > brain->wBuffer.size()) return 0;
+      if (NeuronTopic(message->topic) == NeuronTopic::containerStatistics)
+      {
+        uint8_t *args = message->args;
+        uint64_t deploymentID = 0, key = 0, value = 0;
+        uint128_t uuid = 0;
+        int64_t sampleTimeMs = 0;
+        Message::extractArg<ArgumentNature::fixed>(args, deploymentID);
+        Message::extractArg<ArgumentNature::fixed>(args, uuid);
+        Message::extractArg<ArgumentNature::fixed>(args, sampleTimeMs);
+        Message::extractArg<ArgumentNature::fixed>(args, key);
+        Message::extractArg<ArgumentNature::fixed>(args, value);
+        if ((uuid == first || uuid == second) && key == ProdigyMetrics::runtimeContainerStorageUtilPctKey()) ++found;
+      }
+      offset += message->size;
+    }
+    return found;
+  }
+
+  void clearBrainBufferForStorageTelemetryTest(void)
+  {
+    if (brain != nullptr) brain->wBuffer.clear();
+  }
+
   void untrackContainerForReplyTest(uint128_t uuid)
   {
     containers.erase(uuid);
@@ -859,11 +999,29 @@ public:
     brain->connected = true;
   }
 
+  using Neuron::completeDeferredHardwareInventoryIfReady;
+  using Neuron::deferredHardwareInventoryInFlight;
+  using Neuron::deferredHardwareInventoryRetryAttempts;
+  using Neuron::deferredHardwareInventoryRetryDelayMs;
+  using Neuron::deferredHardwareInventoryRetryWake;
+  using Neuron::latestHardwareProfileIfReady;
+  using Neuron::scheduleDeferredHardwareInventoryRetry;
+
+  void finishHardwareProbeForTest(bool complete)
+  {
+    DeferredHardwareInventoryResult result;
+    result.hardware.inventoryComplete = complete;
+    BitseryEngine::serialize(result.serializedHardwareProfile, result.hardware);
+    std::lock_guard lock(deferredHardwareInventoryMutex);
+    deferredHardwareInventoryReady = std::move(result);
+    deferredHardwareInventoryInFlight = true;
+  }
+
   ~TestNeuron()
   {
     // main() keeps this owner alive until quiesceForExec observes the terminal
     // raw-poll cancellation CQE. Do not destroy it beside Ring shutdown.
-    if (artifactIO != nullptr) std::abort();
+    if (artifactIO != nullptr || storageTelemetryIO != nullptr) std::abort();
     if (brain && brain->fd >= 0) ::close(brain->fd);
     if (retained && retained->fd >= 0) ::close(retained->fd);
     for (NeuronBrainControlStream *stream : retired)
@@ -1036,6 +1194,103 @@ static void testContainerMaterializationYieldsRingAndFencesRetirement(TestSuite&
   thisNeuron = savedNeuron;
 }
 
+static void testStorageTelemetryAsyncFairnessAndSessionFence(TestSuite& suite)
+{
+  ArtifactRing ring = {};
+  ScopedArtifactStore store = {};
+  TestNeuron neuron = {};
+  NeuronBase *savedNeuron = thisNeuron;
+  thisNeuron = &neuron;
+  const bool started = store.root.size() != 0 && neuron.startForArtifactTest(store.root);
+  suite.expect(started, "storage_telemetry_test_starts_bounded_worker");
+  if (!started) { thisNeuron = savedNeuron; return; }
+
+  const std::filesystem::path firstPath = std::filesystem::path(store.root.c_str()) / "storage-first";
+  const std::filesystem::path secondPath = std::filesystem::path(store.root.c_str()) / "storage-second";
+  std::filesystem::create_directories(firstPath);
+  std::filesystem::create_directories(secondPath);
+  for (uint32_t directory = 0; directory < 100; ++directory)
+  {
+    const std::filesystem::path directoryPath = firstPath / std::to_string(directory);
+    std::filesystem::create_directories(directoryPath);
+    for (uint32_t file = 0; file < 100; ++file)
+      std::ofstream(directoryPath / std::to_string(file), std::ios::binary) << "0123456789abcdef0123456789abcdef";
+  }
+  std::ofstream(secondPath / "payload") << "second";
+  Container first = {}, second = {};
+  first.plan.uuid = uint128_t(0x5101); second.plan.uuid = uint128_t(0x5102);
+  first.plan.config.storageMB = 1; second.plan.config.storageMB = 1;
+  first.neuronScalingDimensionsMask = ProdigyMetrics::maskForScalingDimension(ScalingDimension::storage);
+  second.neuronScalingDimensionsMask = first.neuronScalingDimensionsMask;
+  first.neuronMetricsCadenceMs = 250; second.neuronMetricsCadenceMs = 250;
+  first.storagePayloadPath.assign(firstPath.c_str()); second.storagePayloadPath.assign(secondPath.c_str());
+  neuron.trackContainerForStorageTelemetryTest(&first);
+  neuron.trackContainerForStorageTelemetryTest(&second);
+  struct timespec ts = {};
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  const uint64_t nowNs = uint64_t(ts.tv_sec) * 1'000'000'000ULL + uint64_t(ts.tv_nsec);
+  uint64_t syncUtilPct = 0;
+  const auto syncStarted = std::chrono::steady_clock::now();
+  const bool syncCollected = neuron.sampleStorageTelemetrySynchronouslyForTest(&first, syncUtilPct);
+  const auto syncElapsedUs = std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now() - syncStarted).count();
+  const auto dispatchStarted = std::chrono::steady_clock::now();
+  neuron.sampleStorageTelemetryForTest(nowNs);
+  const auto dispatchElapsedUs = std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now() - dispatchStarted).count();
+  std::printf("STORAGE_TELEMETRY_BENCHMARK fixture_files=10000 sync_ok=%d sync_util_pct=%llu sync_walk_us=%lld async_dispatch_us=%lld\n",
+              int(syncCollected), static_cast<unsigned long long>(syncUtilPct), static_cast<long long>(syncElapsedUs),
+              static_cast<long long>(dispatchElapsedUs));
+  runRingUntil(ring, [&] { return neuron.storageMetricMessagesForTest(first.plan.uuid, second.plan.uuid) == 2; });
+  suite.expect(!ring.timedOut && neuron.storageMetricMessagesForTest(first.plan.uuid, second.plan.uuid) == 2,
+               "storage_telemetry_rotates_due_containers_without_hash_head_starvation");
+
+  ring.timedOut = false;
+  neuron.clearBrainBufferForStorageTelemetryTest();
+  std::atomic<bool> entered {false}, release {false};
+  suite.expect(neuron.queueStorageTelemetryBlockerForTest(entered, release) && waitForArtifactWorker(entered),
+               "storage_telemetry_test_blocks_only_telemetry_worker");
+  neuron.sampleStorageTelemetryForTest(nowNs + 250'000'000ULL);
+  neuron.advanceBrainGenerationForReplyTest();
+  neuron.deactivateBrainForReplyTest();
+  release.store(true);
+  runRingUntil(ring, [&] { return !neuron.storageTelemetryInFlightForTest(); });
+  suite.expect(!ring.timedOut && neuron.storageMetricMessagesForTest(first.plan.uuid, second.plan.uuid) == 0,
+               "storage_telemetry_rejects_stale_control_session_completion");
+
+  ring.timedOut = false;
+  neuron.reactivateBrainForReplyTest();
+  neuron.untrackContainerForStorageTelemetryTest(second.plan.uuid);
+  neuron.clearBrainBufferForStorageTelemetryTest();
+  neuron.sampleStorageTelemetryForTest(nowNs + 500'000'000ULL);
+  runRingUntil(ring, [&] { return neuron.storageMetricMessagesForTest(first.plan.uuid, second.plan.uuid) == 1; });
+  neuron.sampleStorageTelemetryForTest(nowNs + 750'000'000ULL);
+  runRingUntil(ring, [&] { return neuron.storageMetricMessagesForTest(first.plan.uuid, second.plan.uuid) == 2; });
+  suite.expect(!ring.timedOut && neuron.storageMetricMessagesForTest(first.plan.uuid, second.plan.uuid) == 2,
+               "storage_telemetry_resamples_single_due_container_after_cursor_wrap");
+
+  ring.timedOut = false;
+  neuron.clearBrainBufferForStorageTelemetryTest();
+  std::atomic<bool> replacementEntered {false}, replacementRelease {false};
+  const std::filesystem::path replacementPath = std::filesystem::path(store.root.c_str()) / "storage-replacement";
+  std::filesystem::create_directories(replacementPath);
+  std::ofstream(replacementPath / "payload") << "replacement";
+  suite.expect(neuron.queueStorageTelemetryBlockerForTest(replacementEntered, replacementRelease) &&
+                   waitForArtifactWorker(replacementEntered),
+               "storage_telemetry_test_blocks_replaced_volume_completion");
+  neuron.sampleStorageTelemetryForTest(nowNs + 1'000'000'000ULL);
+  first.storagePayloadPath.assign(replacementPath.c_str());
+  replacementRelease.store(true);
+  runRingUntil(ring, [&] { return !neuron.storageTelemetryInFlightForTest(); });
+  suite.expect(!ring.timedOut && neuron.storageMetricMessagesForTest(first.plan.uuid, second.plan.uuid) == 0,
+               "storage_telemetry_rejects_replaced_volume_completion");
+
+  ring.timedOut = false;
+  runRingUntil(ring, [&] { return neuron.quiesceArtifactIOForTest(); });
+  suite.expect(!ring.timedOut, "storage_telemetry_test_quiesces_workers_before_ring_shutdown");
+  thisNeuron = savedNeuron;
+}
+
 static void testRetainedGatewayRecoveryAdmission(TestSuite& suite)
 {
   ArtifactRing ring = {};
@@ -1171,6 +1426,31 @@ static void testRetainedGatewayRecoveryAdmission(TestSuite& suite)
 static void testGatewayPrivateBGPWithdrawalIdempotence(TestSuite& suite)
 {
   ArtifactRing ring = {};
+  // This uses a Unix socket-pair only as a descriptor source: it does not
+  // connect or configure BGP.  The close CQE is dispatched through the real
+  // Ring/dispatcher path while the hub owner remains alive on this stack.
+  {
+    int descriptors[2] = {-1, -1};
+    WithdrawalCloseCallbackHub hub = {};
+    BGPPeer *peer = new BGPPeer();
+    const bool paired = peer != nullptr && ::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, descriptors) == 0;
+    if (paired)
+    {
+      if (peer->fd >= 0) ::close(peer->fd);
+      peer->fd = descriptors[0]; descriptors[0] = -1;
+      RingDispatcher::installMultiplexee(peer, &hub);
+      Ring::installFDIntoFixedFileSlot(peer);
+      Ring::queueClose(peer);
+      ring.arm(50);
+      Ring::start();
+      Ring::exit = false;
+    }
+    suite.expect(paired && hub.closeCallbacks == 1,
+                 "neuron_gateway_private_bgp_withdrawal_drains_queued_close_callback_while_hub_owner_lives");
+    if (descriptors[0] >= 0) ::close(descriptors[0]);
+    if (descriptors[1] >= 0) ::close(descriptors[1]);
+    if (!paired) delete peer;
+  }
   CrossClusterMasqueGatewayAuthority authority = {};
   authority.pairUUID = 0x9101; authority.pairOperationUUID = 0x9102;
   authority.localClusterUUID = 0x9103; authority.peerClusterUUID = 0x9104;
@@ -1202,12 +1482,19 @@ static void testGatewayPrivateBGPWithdrawalIdempotence(TestSuite& suite)
   TestNeuron neuron = {};
   bool firstAcknowledged = false, repeatedAcknowledged = false, newerRejected = false;
   const bool prepared = neuron.prepareGatewayPrivateBGPWithdrawalForTest(authority);
-  const bool firstParsed = prepared && neuron.withdrawGatewayPrivateBGPForTest(scope, firstAcknowledged);
+  const bool ownerPrepared = prepared && neuron.prepareGatewayPrivateBGPOwnerForTest(authority.pairUUID);
+  const bool firstParsed = ownerPrepared && neuron.withdrawGatewayPrivateBGPForTest(scope, firstAcknowledged);
   const bool repeatedParsed = firstParsed && neuron.withdrawGatewayPrivateBGPForTest(scope, repeatedAcknowledged);
   auto newer = scope; ++newer.authorityGeneration;
   const bool newerParsed = repeatedParsed && neuron.withdrawGatewayPrivateBGPForTest(newer, newerRejected);
   suite.expect(firstParsed && repeatedParsed && newerParsed && firstAcknowledged && repeatedAcknowledged && !newerRejected,
                "neuron_gateway_private_bgp_withdrawal_acknowledges_exact_empty_owner_idempotently_and_rejects_newer_authority");
+
+  suite.expect(neuron.gatewayPrivateBGPOwnerRetainedForTest(authority.pairUUID),
+               "neuron_gateway_private_bgp_withdrawal_keeps_empty_hub_owner_alive_after_terminal_withdrawal");
+  neuron.forgetGatewayPrivateBGPRuntimeForTest();
+  suite.expect(!neuron.gatewayPrivateBGPOwnerRetainedForTest(authority.pairUUID),
+               "neuron_gateway_private_bgp_withdrawal_releases_owner_only_with_runtime_teardown");
 
   TestNeuron absent = {};
   bool absentAcknowledged = false;
@@ -1233,8 +1520,70 @@ static void testGatewayPrivateBGPWithdrawalIdempotence(TestSuite& suite)
   ring.shutdownRing();
 }
 
+static void testNeuronDeferredHardwareInventoryRetryPacing(TestSuite& suite)
+{
+  suite.expect(TestNeuron::deferredHardwareInventoryRetryDelayMs(0) == 250 &&
+                   TestNeuron::deferredHardwareInventoryRetryDelayMs(1) == 500 &&
+                   TestNeuron::deferredHardwareInventoryRetryDelayMs(2) == 1'000 &&
+                   TestNeuron::deferredHardwareInventoryRetryDelayMs(3) == 2'000 &&
+                   TestNeuron::deferredHardwareInventoryRetryDelayMs(4) == 4'000 &&
+                   TestNeuron::deferredHardwareInventoryRetryDelayMs(UINT32_MAX) == 4'000,
+               "neuron_deferred_hardware_inventory_retry_delay_is_bounded_exponential");
+
+  ArtifactRing ring = {};
+  auto neuron = std::make_unique<TestNeuron>();
+  neuron->finishHardwareProbeForTest(false);
+  suite.expect(!neuron->completeDeferredHardwareInventoryIfReady(), "incomplete_hardware_requires_retry");
+  const auto *wake = neuron->deferredHardwareInventoryRetryWake;
+  neuron->scheduleDeferredHardwareInventoryRetry();
+  suite.expect(wake && neuron->deferredHardwareInventoryRetryWake == wake && neuron->deferredHardwareInventoryRetryAttempts == 1,
+               "incomplete_hardware_schedules_one_retry");
+
+  // The timer must fire on the Ring. An active collector still owns the probe.
+  neuron->deferredHardwareInventoryInFlight = true;
+  const auto start = std::chrono::steady_clock::now();
+  runRingUntil(ring, [&] { return !neuron->deferredHardwareInventoryRetryWake; });
+  suite.expect(!ring.timedOut && neuron->deferredHardwareInventoryInFlight &&
+                   std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(240),
+               "hardware_retry_waits_for_deadline_and_preserves_active_collector");
+
+  neuron->finishHardwareProbeForTest(false);
+  (void)neuron->completeDeferredHardwareInventoryIfReady();
+  neuron->finishHardwareProbeForTest(true);
+  suite.expect(neuron->completeDeferredHardwareInventoryIfReady() && neuron->latestHardwareProfileIfReady() &&
+                   !neuron->deferredHardwareInventoryRetryWake && !neuron->deferredHardwareInventoryRetryAttempts,
+               "valid_hardware_is_adopted_immediately_and_resets_retry");
+
+  // The canceled wake owns its packet until Ring dispatches the cancellation.
+  // Destroy the Neuron before draining Ring to exercise the late-CQE lifetime
+  // path without leaving a member TimeoutPacket behind.
+  neuron.reset();
+  bool drained = false;
+  class CancellationDrain final : public TimeoutDispatcher {
+  public:
+    bool *drained = nullptr;
+    void dispatchTimeout(TimeoutPacket *) override { *drained = true; }
+  } cancellationDrain;
+  TimeoutPacket drainPacket = {};
+  drainPacket.dispatcher = &cancellationDrain;
+  cancellationDrain.drained = &drained;
+  drainPacket.setTimeoutMs(25);
+  Ring::queueTimeout(&drainPacket);
+  runRingUntil(ring, [&] { return drained; });
+  suite.expect(drained && ring.timedOut == false,
+               "neuron_deferred_hardware_inventory_cancelled_wake_drains_after_owner_destruction");
+  ring.shutdownRing();
+}
+
 int main()
 {
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "hardware-inventory-retry") == 0)
+  {
+    TestSuite suite = {};
+    testNeuronDeferredHardwareInventoryRetryPacing(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (const char *only = std::getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "gateway-private-bgp-withdrawal-idempotence") == 0)
   {
@@ -1259,10 +1608,21 @@ int main()
     std::printf("CONTAINER_MATERIALIZATION_ASYNC_RESULT failed_assertions=%d\n", suite.failed);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "storage-telemetry") == 0)
+  {
+    TestSuite suite = {};
+    testStorageTelemetryAsyncFairnessAndSessionFence(suite);
+    std::printf("STORAGE_TELEMETRY_RESULT failed_assertions=%d\n", suite.failed);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   TestSuite suite = {};
+  testNeuronDeferredHardwareInventoryRetryPacing(suite);
   const bool gatewayStateUploadRecoveryOnly =
       std::getenv("PRODIGY_TEST_GATEWAY_STATE_UPLOAD_RECOVERY_ONLY") != nullptr;
-  const bool gatewayRebindRecoveryOnly =
+  const char *only = std::getenv("PRODIGY_TEST_ONLY");
+  const bool gatewayLocalRebindOnly = only != nullptr && strcmp(only, "gateway-local-rebind") == 0;
+  const bool gatewayRebindRecoveryOnly = gatewayLocalRebindOnly ||
       std::getenv("PRODIGY_TEST_GATEWAY_REBIND_RECOVERY_ONLY") != nullptr;
   String fixture = {};
   bool hasArtifactFixture = false;
@@ -1400,6 +1760,24 @@ gateway_state_upload_recovery:
                      acceptedTransition.recoveryLeasePreserved && acceptedTransition.waitidCalls == 1 &&
                      !acceptedTransition.retainedCandidate && !acceptedTransition.pendingLaunch,
                  "neuron_gateway_rebind_exact_receipt_base_publication_preserves_one_recovery_listener_carrier_and_waitid_owner");
+    TestNeuron falseFirstRecovery = {};
+    const auto falseFirst = falseFirstRecovery.processGatewayRecoveryTransitionForTest(
+        recoveryAuthority, token, TestNeuron::GatewayRecoveryFault::routeDown);
+    const auto promotedTransition = falseFirstRecovery.promotePublishedGatewayRecoveryForTest(
+        recoveryAuthority, token, TestNeuron::GatewayRecoveryFault::none);
+    suite.expect(promotedTransition.accepted && !promotedTransition.closed && !promotedTransition.republished &&
+                     promotedTransition.routeReady && falseFirst.readinessRevoked && falseFirst.receiptAccepted && falseFirstRecovery.publishedContainers == 1,
+                 "neuron_gateway_rebind_false_first_then_true_second_carrier_promotes_same_pid_without_second_publish");
+    for (const auto fault : {TestNeuron::GatewayRecoveryFault::epoch, TestNeuron::GatewayRecoveryFault::candidatePID,
+                             TestNeuron::GatewayRecoveryFault::helloTuple, TestNeuron::GatewayRecoveryFault::receiptNonce}) {
+      TestNeuron rejectedPromotion = {};
+      const auto initial = rejectedPromotion.processGatewayRecoveryTransitionForTest(recoveryAuthority, token);
+      const auto promotion = initial.receiptAccepted ? rejectedPromotion.promotePublishedGatewayRecoveryForTest(recoveryAuthority, token, fault)
+                                                       : TestNeuron::GatewayRecoveryPromotionResult{};
+      suite.expect(!promotion.accepted && promotion.closed && !promotion.republished && rejectedPromotion.publishedContainers == 1,
+                   "neuron_gateway_rebind_published_second_carrier_rejects_stale_epoch_pid_tuple_or_nonce");
+      (void)rejectedPromotion.cleanupGatewayRecoveryTransitionForTest();
+    }
     const std::vector<TestNeuron::GatewayRecoveryFault> recoveryPrepublicationFaults = {
       TestNeuron::GatewayRecoveryFault::helloToken, TestNeuron::GatewayRecoveryFault::helloTuple,
       TestNeuron::GatewayRecoveryFault::nonceFailure, TestNeuron::GatewayRecoveryFault::nonceZero,
@@ -1431,11 +1809,16 @@ gateway_state_upload_recovery:
     suite.expect(eofTransition.receiptAccepted && eofRecovery.publishedContainers == 1 && eofTransition.waitidCalls == 1 &&
                      eofTransition.carrierRemoved && eofTransition.readinessRevoked,
                  "neuron_gateway_rebind_eof_cleanup_revokes_carrier_readiness_without_republication");
-    suite.expect(acceptedRecovery.cleanupGatewayRecoveryTransitionForTest() &&
+    suite.expect(acceptedRecovery.cleanupGatewayRecoveryTransitionForTest() && falseFirstRecovery.cleanupGatewayRecoveryTransitionForTest() &&
                      duplicateRecovery.cleanupGatewayRecoveryTransitionForTest() && eofRecovery.cleanupGatewayRecoveryTransitionForTest(),
                  "neuron_gateway_rebind_base_published_test_owners_are_cleaned_before_ring_teardown");
     recoveryTransitionRing.shutdownRing();
     if (pair[0] >= 0) close(pair[0]); if (pair[1] >= 0) close(pair[1]);
+    if (gatewayLocalRebindOnly)
+    {
+      std::printf("GATEWAY_LOCAL_REBIND_RESULT failed_assertions=%d\n", suite.failed);
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
   }
   if (store.root.empty())
   {

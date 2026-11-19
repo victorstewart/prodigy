@@ -19,7 +19,7 @@
 #include <prodigy/types.h>
 #include <prodigy/container.retirement.h>
 #include <prodigy/stateful.serving.authority.h>
-#include <prodigy/brain/metrics.h>
+#include <prodigy/brain/metric.checkpoint.h>
 #include <services/base64.h>
 #include <services/random.h>
 
@@ -2644,11 +2644,36 @@ static void serialize(S&& serializer, ProdigyPersistentStoredBootState& record)
   serializer.object(record.state);
 }
 
+// The public snapshot is the commit record. Its trailer selects one complete
+// base and the contiguous suffix of deltas that were staged before publication.
+struct ProdigyMetricCheckpointRef {
+  static constexpr uint32_t formatV1 = 0x31434d50;
+  static constexpr uint8_t lastFrame = 63;
+  static constexpr size_t wireBytes = 6;
+  uint32_t format = formatV1;
+  uint8_t slot = 0;
+  uint8_t frame = 0;
+
+  bool valid() const {
+    return format == formatV1 && slot <= 2 && frame <= lastFrame && (slot || !frame);
+  }
+  bool operator==(const ProdigyMetricCheckpointRef&) const = default;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyMetricCheckpointRef& ref)
+{
+  serializer.value4b(ref.format);
+  serializer.value1b(ref.slot);
+  serializer.value1b(ref.frame);
+}
+
 class ProdigyPersistentStoredBrainSnapshot {
 public:
 
   uint64_t secretVersion = 0;
   ProdigyPersistentBrainSnapshot state;
+  ProdigyMetricCheckpointRef checkpoint;
 };
 
 template <typename S>
@@ -2656,6 +2681,7 @@ static void serialize(S&& serializer, ProdigyPersistentStoredBrainSnapshot& reco
 {
   serializer.value8b(record.secretVersion);
   serializer.object(record.state);
+  serializer.object(record.checkpoint);
 }
 
 class ProdigyPersistentStoredLocalBrainState {
@@ -5086,17 +5112,6 @@ static bool prodigyPersistentStoredRecordSecretVersion(const String& serialized,
   return true;
 }
 
-static bool prodigyPersistentStoredRecordPayloadEquals(const String& serialized, const String& payload)
-{
-  if (serialized.size() != sizeof(uint64_t) + payload.size())
-  {
-    return false;
-  }
-
-  const uint8_t *serializedBytes = reinterpret_cast<const uint8_t *>(serialized.data());
-  return payload.size() == 0 || std::memcmp(serializedBytes + sizeof(uint64_t), payload.data(), payload.size()) == 0;
-}
-
 template <typename StoredRecord>
 static bool prodigyLoadPersistentStoredRecord(const String& serialized, StoredRecord& record)
 {
@@ -5143,6 +5158,70 @@ private:
     return true;
   }
 
+  ProdigyMetricCheckpointRef cachedCheckpoint;
+  ProdigyMetricCheckpointCursors metricCursors;
+
+  static String metricFrameKey(uint8_t slot, uint8_t frame)
+  {
+    String key;
+    key.snprintf<"metrics.v1.{itoa}.{itoa}"_ctv>(unsigned(slot), unsigned(frame));
+    return key;
+  }
+
+  bool stageMetricCheckpoint(const MetricsStore::Snapshot& capture, const ProdigyMetricCheckpointRef& previous,
+                             ProdigyMetricCheckpointRef& ref, ProdigyMetricCheckpointCursors& next, String *failure)
+  {
+    ProdigyMetricCheckpointFrame frame;
+    bool extend = previous.slot && previous == cachedCheckpoint && !metricCursors.empty();
+    bool changed = false;
+    if (!prodigyBuildMetricCheckpoint(capture, extend ? &metricCursors : nullptr, frame, next, changed))
+    {
+      if (failure) failure->assign("Brain metric checkpoint exceeds format limits"_ctv);
+      return false;
+    }
+    if (!changed) { ref = previous; return true; }
+    if (extend && previous.frame < ProdigyMetricCheckpointRef::lastFrame)
+    {
+      ref = previous;
+      ++ref.frame;
+    }
+    else
+    {
+      // A failed save can leave an unreferenced frame. Replacing that key is
+      // safe because no key selected by the current commit is overwritten.
+      ref.slot = previous.slot == 1 ? 2 : 1;
+      ref.frame = 0;
+      if (extend && !prodigyBuildMetricCheckpoint(capture, nullptr, frame, next, changed))
+      {
+        if (failure) failure->assign("Brain metric checkpoint exceeds format limits"_ctv);
+        return false;
+      }
+    }
+    String encoded;
+    BitseryEngine::serialize(encoded, frame);
+    return db.write(brainColumnFamily, metricFrameKey(ref.slot, ref.frame), encoded, failure);
+  }
+
+  bool loadMetricCheckpoint(const ProdigyMetricCheckpointRef& ref,
+                            Vector<ProdigyMetricSample>& samples, String *failure)
+  {
+    if (!ref.slot) return true;
+    ProdigyMetricCheckpointReplay replay;
+    for (unsigned i = 0; i <= ref.frame; ++i)
+    {
+      String encoded;
+      ProdigyMetricCheckpointFrame frame;
+      if (!db.read(brainColumnFamily, metricFrameKey(ref.slot, i), encoded, failure)) return false;
+      if (!BitseryEngine::deserializeSafe(encoded, frame) || !replay.apply(frame, i == 0))
+      {
+        if (failure) failure->assign("invalid Brain metric checkpoint frame"_ctv);
+        return false;
+      }
+    }
+    replay.exportSamples(samples);
+    return true;
+  }
+
   bool loadStoredBrainSnapshotRecord(ProdigyPersistentStoredBrainSnapshot& record, String *failure = nullptr)
   {
     String serialized = {};
@@ -5151,7 +5230,8 @@ private:
       return false;
     }
 
-    if (prodigyLoadPersistentStoredRecord(serialized, record) == false)
+    if (!prodigyLoadPersistentStoredRecord(serialized, record) || !record.checkpoint.valid() ||
+        (record.checkpoint.slot && !record.state.metricSamples.empty()))
     {
       if (failure)
       {
@@ -5341,6 +5421,8 @@ public:
 
   void close(void)
   {
+    metricCursors.clear();
+    cachedCheckpoint = {};
     db.close();
     secretsDb.close();
   }
@@ -5445,7 +5527,7 @@ public:
       return false;
     }
 
-    snapshot = stored.state;
+    snapshot = std::move(stored.state);
     if (stored.secretVersion != 0)
     {
       ProdigyPersistentBrainSnapshotSecrets secrets = {};
@@ -5489,6 +5571,7 @@ public:
       return false;
     }
 
+    if (!loadMetricCheckpoint(stored.checkpoint, snapshot.metricSamples, failure)) return false;
     prodigyStripManagedCloudBootstrapCredentials(snapshot.brainConfig.runtimeEnvironment);
     prodigyStripMachineHardwareCapturesFromClusterTopology(snapshot.topology);
     return true;
@@ -5496,7 +5579,36 @@ public:
 
   bool saveBrainSnapshot(const ProdigyPersistentBrainSnapshot& snapshot, String *failure = nullptr)
   {
+    String existingStoredRecord, loadFailure;
+    ProdigyMetricCheckpointRef previous, ref;
+    uint64_t previousVersion = 0;
+    bool exists = db.read(brainColumnFamily, brainSnapshotKey, existingStoredRecord, &loadFailure);
+    if (exists)
+    {
+      const auto *begin = reinterpret_cast<const uint8_t *>(existingStoredRecord.data());
+      const auto *end = begin + existingStoredRecord.size();
+      if (existingStoredRecord.size() < sizeof(uint64_t) + previous.wireBytes ||
+          !BitseryEngine::deserializeSafe(end - previous.wireBytes, end, previous) ||
+          !previous.valid() || !prodigyPersistentStoredRecordSecretVersion(existingStoredRecord, previousVersion))
+      {
+        if (failure) failure->assign("invalid or unsupported persistent brain snapshot"_ctv);
+        return false;
+      }
+    }
+    else if (loadFailure.size() && loadFailure != "record not found"_ctv)
+    {
+      if (failure) *failure = loadFailure;
+      return false;
+    }
+
+    ProdigyMetricCheckpointCursors next;
     ProdigyPersistentBrainSnapshot canonicalSnapshot = snapshot;
+    auto capture = std::move(canonicalSnapshot.metricCapture);
+    if (capture)
+    {
+      canonicalSnapshot.metricSamples.clear();
+      if (capture->sampleCount() && !stageMetricCheckpoint(*capture, previous, ref, next, failure)) return false;
+    }
     prodigyStripManagedCloudBootstrapCredentials(canonicalSnapshot.brainConfig.runtimeEnvironment);
     prodigyStripMachineHardwareCapturesFromClusterTopology(canonicalSnapshot.topology);
 
@@ -5509,116 +5621,61 @@ public:
       return false;
     }
 
-    String serializedPublicSnapshot = {};
-    BitseryEngine::serialize(serializedPublicSnapshot, publicSnapshot);
-
-    String serializedSecrets = {};
-    if (secrets.empty() == false)
-    {
-      BitseryEngine::serialize(serializedSecrets, secrets);
-    }
-
-    uint64_t previousVersion = 0;
-    String existingStoredRecord = {};
-    String loadFailure = {};
-    if (db.read(brainColumnFamily, brainSnapshotKey, existingStoredRecord, &loadFailure))
-    {
-      uint64_t existingVersion = 0;
-      if (prodigyPersistentStoredRecordSecretVersion(existingStoredRecord, existingVersion))
-      {
-        if (existingVersion == 0)
-        {
-          previousVersion = 0;
-          if (serializedSecrets.size() == 0 && prodigyPersistentStoredRecordPayloadEquals(existingStoredRecord, serializedPublicSnapshot))
-          {
-            Vault::secureClearString(serializedPublicSnapshot);
-            secrets.clear();
-            if (failure)
-            {
-              failure->clear();
-            }
-            return true;
-          }
-        }
-        else
-        {
-          String existingSerializedSecrets = {};
-          String secretFailure = {};
-          String existingSecretKey = {};
-          prodigyBuildPersistentSecretRecordKey(brainSnapshotKey, existingVersion, existingSecretKey);
-          if (secretsDb.read(brainColumnFamily, existingSecretKey, existingSerializedSecrets, &secretFailure))
-          {
-            previousVersion = existingVersion;
-            bool samePublicSnapshot = prodigyPersistentStoredRecordPayloadEquals(
-                existingStoredRecord,
-                serializedPublicSnapshot);
-            bool sameSecrets = prodigyPersistentRawBytesEqual(existingSerializedSecrets, serializedSecrets);
-            Vault::secureClearString(existingSerializedSecrets);
-            if (samePublicSnapshot && sameSecrets)
-            {
-              Vault::secureClearString(serializedPublicSnapshot);
-              Vault::secureClearString(serializedSecrets);
-              secrets.clear();
-              if (failure)
-              {
-                failure->clear();
-              }
-              return true;
-            }
-          }
-          else if (secretFailure.size() > 0 && secretFailure != "record not found"_ctv)
-          {
-            Vault::secureClearString(serializedPublicSnapshot);
-            Vault::secureClearString(serializedSecrets);
-            secrets.clear();
-            if (failure)
-            {
-              failure->assign(secretFailure);
-            }
-            return false;
-          }
-        }
-      }
-    }
-    else if (loadFailure.size() > 0 && loadFailure != "record not found"_ctv)
-    {
-      Vault::secureClearString(serializedPublicSnapshot);
-      Vault::secureClearString(serializedSecrets);
-      secrets.clear();
-      if (failure)
-      {
-        failure->assign(loadFailure);
-      }
-      return false;
-    }
-
-    uint64_t newVersion = 0;
-    if (secrets.empty() == false)
-    {
-      newVersion = prodigyGeneratePersistentSecretVersion();
-      if (saveSecretRecord(brainColumnFamily, brainSnapshotKey, newVersion, secrets, failure) == false)
-      {
-        Vault::secureClearString(serializedPublicSnapshot);
-        Vault::secureClearString(serializedSecrets);
-        secrets.clear();
-        return false;
-      }
-    }
-
-    ProdigyPersistentStoredBrainSnapshot stored = {};
-    stored.secretVersion = newVersion;
+    ProdigyPersistentStoredBrainSnapshot stored;
     stored.state = std::move(publicSnapshot);
-
-    String serialized = {};
+    stored.checkpoint = ref;
+    String serialized;
     BitseryEngine::serialize(serialized, stored);
-    bool ok = db.write(brainColumnFamily, brainSnapshotKey, serialized, failure);
-    if (ok && previousVersion != newVersion)
-    {
-      removeSecretRecordBestEffort(brainColumnFamily, brainSnapshotKey, previousVersion);
-    }
+    String serializedSecrets;
+    if (!secrets.empty()) BitseryEngine::serialize(serializedSecrets, secrets);
 
+    // The fixed-width version prefix is patched after no-op detection. The
+    // public payload and trailer are already in their final encoded form.
+    const size_t prefix = sizeof(uint64_t);
+    bool same = exists && existingStoredRecord.size() == serialized.size() &&
+                std::memcmp(existingStoredRecord.data() + prefix, serialized.data() + prefix,
+                            serialized.size() - prefix) == 0;
+    bool ok = true;
+    if (same && previousVersion)
+    {
+      String key, priorSecrets, secretFailure;
+      prodigyBuildPersistentSecretRecordKey(brainSnapshotKey, previousVersion, key);
+      if (secretsDb.read(brainColumnFamily, key, priorSecrets, &secretFailure))
+        same = prodigyPersistentRawBytesEqual(priorSecrets, serializedSecrets);
+      else
+      {
+        same = false;
+        if (secretFailure.size() && secretFailure != "record not found"_ctv)
+        {
+          if (failure) *failure = secretFailure;
+          ok = false;
+        }
+      }
+      Vault::secureClearString(priorSecrets);
+    }
+    else if (same) same = secrets.empty();
+
+    if (ok && !same)
+    {
+      uint64_t newVersion = secrets.empty() ? 0 : prodigyGeneratePersistentSecretVersion();
+      if (newVersion)
+        ok = saveSecretRecord(brainColumnFamily, brainSnapshotKey, newVersion, secrets, failure);
+      if (ok)
+      {
+        for (size_t i = 0; i < prefix; ++i)
+          serialized.data()[i] = uint8_t(newVersion >> (8 * i));
+        ok = db.write(brainColumnFamily, brainSnapshotKey, serialized, failure);
+        if (ok && previousVersion && previousVersion != newVersion)
+          removeSecretRecordBestEffort(brainColumnFamily, brainSnapshotKey, previousVersion);
+      }
+    }
+    if (ok)
+    {
+      metricCursors = std::move(next);
+      cachedCheckpoint = ref;
+      if (failure) failure->clear();
+    }
     Vault::secureClearString(serialized);
-    Vault::secureClearString(serializedPublicSnapshot);
     Vault::secureClearString(serializedSecrets);
     secrets.clear();
     return ok;
@@ -5798,7 +5855,28 @@ public:
 
   bool removeBrainSnapshot(String *failure = nullptr)
   {
-    return db.remove(brainColumnFamily, brainSnapshotKey, failure);
+    String removeFailure;
+    const bool removed = db.remove(brainColumnFamily, brainSnapshotKey, &removeFailure);
+    if (!removed && removeFailure != "record not found"_ctv)
+    {
+      if (failure) *failure = removeFailure;
+      return false;
+    }
+    cachedCheckpoint = {};
+    metricCursors.clear();
+    for (uint8_t slot : {1, 2})
+      for (unsigned i = 0; i <= ProdigyMetricCheckpointRef::lastFrame; ++i)
+      {
+        String cleanupFailure;
+        if (!db.remove(brainColumnFamily, metricFrameKey(slot, i), &cleanupFailure) &&
+            cleanupFailure != "record not found"_ctv)
+        {
+          if (failure) *failure = cleanupFailure;
+          return false;
+        }
+      }
+    if (failure) *failure = removeFailure;
+    return removed;
   }
 };
 

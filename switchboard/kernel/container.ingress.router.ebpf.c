@@ -99,6 +99,7 @@ int ct_ingress(struct __sk_buff *skb)
   bool publicWormholeIngress = skb->mark == SWITCHBOARD_WORMHOLE_SKB_MARK;
   skb->mark = 0;
   skb->priority = 0;
+  bool masqueGatewayPTBReturn = false;
   if (protocol == BE_ETH_P_IPV6)
   {
     struct ipv6hdr *ip6h = (struct ipv6hdr *)l3_data;
@@ -106,6 +107,8 @@ int ct_ingress(struct __sk_buff *skb)
     {
       return NETKIT_DROP;
     }
+    masqueGatewayPTBReturn = containerMasqueGatewayPTBReturnInboundIPv6(
+        ip6h, data_end, containerInterContainerMTU());
     if (switchboardClassifyWormholeIngressIPv6(ip6h, data_end, publicWormholeIngress) == false)
     {
       return NETKIT_DROP;
@@ -129,7 +132,7 @@ int ct_ingress(struct __sk_buff *skb)
   {
     return NETKIT_DROP;
   }
-  if (networkMode == CONTAINER_NETWORK_DESTINATION_ALLOWLIST && !masqueGatewayInjection)
+  if (networkMode == CONTAINER_NETWORK_DESTINATION_ALLOWLIST && !masqueGatewayInjection && !masqueGatewayPTBReturn)
   {
     struct switchboard_l4_ports l4 = {};
     if (protocol == BE_ETH_P_IP)
@@ -163,7 +166,7 @@ int ct_ingress(struct __sk_buff *skb)
     }
     // The selected local gateway forwards this packet; the final container
     // enforces its endpoint authorization after tunnel delivery.
-    if (!masqueGatewayInjection &&
+    if (!masqueGatewayInjection && !masqueGatewayPTBReturn &&
         (networkMode == CONTAINER_NETWORK_DECLARED_ONLY ||
          switchboardCrossSiteContainerFlow(ip6h->saddr.s6_addr, ip6h->daddr.s6_addr)) &&
         switchboardContainerDestinationIPv6(ip6h->daddr.s6_addr))

@@ -1,5 +1,6 @@
 use crate::cli::{
-    parse_key_value, BuildCommand, BundleFlatCommand, InternalRunCommand, OutputKindArg,
+    parse_key_value, BuildCommand, BundleFlatCommand, InspectGatewayArtifactCommand,
+    InternalRunCommand, OutputKindArg,
 };
 use crate::plan::{
     normalize_absolute_path, parse_build_spec, resolve_build_spec, resolve_container_path,
@@ -291,6 +292,108 @@ pub fn bundle_flat(command: BundleFlatCommand) -> Result<()> {
     }
 
     emit_flat_bundle(stage_root, &command.output)?;
+    println!("{}", command.output.display());
+    Ok(())
+}
+
+pub fn inspect_gateway_artifact(command: InspectGatewayArtifactCommand) -> Result<()> {
+    ensure_root()?;
+    if command.artifact.is_file() == false {
+        bail!(
+            "gateway artifact path does not exist: {}",
+            command.artifact.display()
+        );
+    }
+    if command.expected_sha256.len() != 64
+        || command
+            .expected_sha256
+            .bytes()
+            .any(|byte| byte.is_ascii_hexdigit() == false)
+    {
+        bail!("gateway artifact expected SHA-256 must be 64 hexadecimal characters");
+    }
+    let artifact_metadata = fs::metadata(&command.artifact)?;
+    if artifact_metadata.len() != command.expected_bytes {
+        bail!("gateway artifact byte count differs from the expected identity");
+    }
+    if sha256_file(&command.artifact)? != command.expected_sha256 {
+        bail!("gateway artifact SHA-256 differs from the expected identity");
+    }
+
+    let scratch_root = fs::canonicalize(&command.scratch_root).with_context(|| {
+        format!(
+            "gateway inspector scratch root is unavailable: {}",
+            command.scratch_root.display()
+        )
+    })?;
+    if scratch_root.is_dir() == false
+        || scratch_root
+            .components()
+            .any(|component| component.as_os_str() == ".run")
+            == false
+        || scratch_root
+            .as_os_str()
+            .as_bytes()
+            .iter()
+            .any(|byte| *byte == b'\'' || *byte == b'\n' || *byte == b'\r')
+    {
+        bail!(
+            "gateway inspector scratch root must be an existing task-owned directory beneath .run"
+        );
+    }
+    let output_parent = command
+        .output
+        .parent()
+        .context("gateway inspector output requires a parent directory")?;
+    if output_parent.is_dir() == false {
+        bail!(
+            "gateway inspector output parent does not exist: {}",
+            output_parent.display()
+        );
+    }
+
+    let scratch = TempDir::new_in(&scratch_root)?;
+    let payload = scratch.path().join("gateway-artifact-payload.zst");
+    copy_gateway_payload_after_contract_header(&command.artifact, &payload)?;
+    let mount = LoopbackBtrfs::from_blob_in(scratch.path(), &payload)?;
+    let artifact_root = mount.receive_blob(&payload)?;
+    let launch_metadata: LaunchMetadata = serde_json::from_slice(
+        &fs::read(artifact_root.join(".prodigy-private/launch.metadata"))
+            .context("gateway artifact launch metadata is unavailable")?,
+    )
+    .context("gateway artifact launch metadata is invalid")?;
+    if launch_metadata.execute_path != "/gateway/masque-tunnel" {
+        bail!("gateway artifact launch path is not the canonical masque tunnel");
+    }
+    let executable = workspace_runtime_path(
+        &artifact_root.join("rootfs"),
+        Path::new(&launch_metadata.execute_path),
+        false,
+    )?;
+    let executable_metadata = fs::symlink_metadata(&executable)?;
+    if executable_metadata.file_type().is_symlink() || executable_metadata.is_file() == false {
+        bail!("gateway artifact masque tunnel is not a contained regular file");
+    }
+    let executable_sha256 = sha256_file(&executable)?;
+
+    // Recheck the original object after extraction: the receipt binds the
+    // inspected executable to the same immutable caller-supplied blob.
+    if fs::metadata(&command.artifact)?.len() != command.expected_bytes
+        || sha256_file(&command.artifact)? != command.expected_sha256
+    {
+        bail!("gateway artifact changed while it was being inspected");
+    }
+    let receipt = GatewayExecutableProvenance {
+        schema: "prodigy.gateway-executable-provenance.v1",
+        builder: "Discombobulator",
+        artifact_sha256: command.expected_sha256,
+        artifact_bytes: command.expected_bytes,
+        artifact_kind: "cross-cluster-masque-gateway",
+        execute_path: launch_metadata.execute_path,
+        executable_sha256,
+        executable_bytes: executable_metadata.len(),
+    };
+    write_private_atomic_json(&command.output, &receipt)?;
     println!("{}", command.output.display());
     Ok(())
 }
@@ -2689,6 +2792,46 @@ fn cross_cluster_masque_gateway_blob_header() -> &'static [u8] {
     b"PRODIGY-DISCOMBOBULATOR-CROSS-CLUSTER-MASQUE-GATEWAY\ncontract=prodigy-cross-cluster-masque-gateway\ncontract_version=1\ncontainer_kind=crossClusterMasqueGateway\nrequires_standard_neuron_socket=false\nrequires_switchboard_gateway_injection=true\nnetwork_policy=ipv6UdpEgressOnly\n\n"
 }
 
+fn copy_gateway_payload_after_contract_header(artifact: &Path, payload: &Path) -> Result<()> {
+    let header = cross_cluster_masque_gateway_blob_header();
+    let mut input = fs::File::open(artifact)?;
+    let mut observed = vec![0u8; header.len()];
+    input
+        .read_exact(&mut observed)
+        .context("gateway artifact is shorter than its contract header")?;
+    if observed != header {
+        bail!("gateway artifact does not carry the cross-cluster MASQUE contract header");
+    }
+    let mut output = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(payload)?;
+    std::io::copy(&mut input, &mut output)?;
+    output.sync_all()?;
+    Ok(())
+}
+
+fn write_private_atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("private receipt requires a parent directory")?;
+    let staging = TempDir::new_in(parent)?;
+    let staged = staging.path().join("receipt.json");
+    let bytes = serde_json::to_vec_pretty(value)?;
+    {
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&staged)?;
+        output.write_all(&bytes)?;
+        output.write_all(b"\n")?;
+        output.sync_all()?;
+    }
+    fs::set_permissions(&staged, fs::Permissions::from_mode(0o600))?;
+    fs::rename(&staged, path)?;
+    Ok(())
+}
+
 fn output_blob_header(output_kind: OutputKind) -> Option<&'static [u8]> {
     match output_kind {
         OutputKind::App => Some(discombobulator_blob_header()),
@@ -3634,6 +3777,78 @@ mod runtime_closure_tests {
         .unwrap_err();
         assert!(format!("{error:#}").contains("existing symlink"));
     }
+
+    #[test]
+    fn gateway_inspector_provenance_receipt_uses_the_exact_shared_schema_keys() {
+        let receipt = GatewayExecutableProvenance {
+            schema: "prodigy.gateway-executable-provenance.v1",
+            builder: "Discombobulator",
+            artifact_sha256: "a".repeat(64),
+            artifact_bytes: 17,
+            artifact_kind: "cross-cluster-masque-gateway",
+            execute_path: "/gateway/masque-tunnel".to_string(),
+            executable_sha256: "b".repeat(64),
+            executable_bytes: 23,
+        };
+        let value: serde_json::Value = serde_json::to_value(receipt).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(
+            object.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                "artifactBytes",
+                "artifactKind",
+                "artifactSHA256",
+                "builder",
+                "executableBytes",
+                "executableSHA256",
+                "executePath",
+                "schema",
+            ]
+        );
+        assert_eq!(object["artifactSHA256"].as_str().unwrap(), "a".repeat(64));
+        assert_eq!(object["executableSHA256"].as_str().unwrap(), "b".repeat(64));
+    }
+
+    #[test]
+    fn gateway_inspector_payload_copy_requires_the_exact_typed_header() {
+        let root = tempfile::tempdir().unwrap();
+        let artifact = root.path().join("gateway.blob");
+        let payload = root.path().join("payload.zst");
+        fs::write(
+            &artifact,
+            [
+                cross_cluster_masque_gateway_blob_header(),
+                b"compressed-payload",
+            ]
+            .concat(),
+        )
+        .unwrap();
+        copy_gateway_payload_after_contract_header(&artifact, &payload).unwrap();
+        assert_eq!(fs::read(&payload).unwrap(), b"compressed-payload");
+
+        let wrong = root.path().join("wrong.blob");
+        let mut wrong_header = cross_cluster_masque_gateway_blob_header().to_vec();
+        wrong_header[0] = b'X';
+        wrong_header.extend_from_slice(b"compressed-payload");
+        fs::write(&wrong, wrong_header).unwrap();
+        let error =
+            copy_gateway_payload_after_contract_header(&wrong, &root.path().join("wrong.zst"))
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("cross-cluster MASQUE contract header"));
+
+        let truncated = root.path().join("truncated.blob");
+        fs::write(
+            &truncated,
+            &cross_cluster_masque_gateway_blob_header()[..16],
+        )
+        .unwrap();
+        let error = copy_gateway_payload_after_contract_header(
+            &truncated,
+            &root.path().join("truncated.zst"),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("shorter than its contract header"));
+    }
 }
 
 fn copy_context_entry(context_root: &Path, source: &Path, destination: &Path) -> Result<()> {
@@ -3794,13 +4009,28 @@ fn component_matches(pattern: &str, candidate: &str) -> bool {
     pattern.ends_with('*') || offset == candidate.len()
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct LaunchMetadata {
     execute_path: String,
     execute_args: Vec<String>,
     execute_env: Vec<String>,
     execute_cwd: String,
     execute_arch: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GatewayExecutableProvenance {
+    schema: &'static str,
+    builder: &'static str,
+    #[serde(rename = "artifactSHA256")]
+    artifact_sha256: String,
+    artifact_bytes: u64,
+    artifact_kind: &'static str,
+    execute_path: String,
+    #[serde(rename = "executableSHA256")]
+    executable_sha256: String,
+    executable_bytes: u64,
 }
 
 struct LoopbackBtrfs {

@@ -124,6 +124,11 @@ protected:
     // reconciler instead of inferring absence from cleared desired-state bits.
     bool privateBGPFallbackRemovalPending = false;
     std::unique_ptr<NeuronPrivateTunnelBGPRuntime> privateTunnelBGP;
+    // A failed first connector construction owns neither a BGPHub peer nor its
+    // reconnect timer. Keep only a tuple-bound retry intent here; the Vault
+    // credential remains in privateTunnelBGP and is never serialized.
+    bool privateBGPStartupRetryPending = false;
+    uint32_t privateBGPStartupRetryAttempts = 0;
     ProdigyCrossClusterPathFaultRequest faultLease = {};
     ProdigyCrossClusterPathFaultRequest completedFaultLease = {};
     bool faultLeaseActive = false, faultResumeAcknowledged = false;
@@ -425,6 +430,8 @@ protected:
   // receipt arrival, is the local proof that MASQUE still owns the route.
   Vector<std::unique_ptr<CrossClusterMasqueGatewayReadinessCarrier>> crossClusterMasqueGatewayReadinessCarriers;
   bytell_hash_map<uint128_t, CrossClusterMasqueGatewayReadinessCarrier *> activeCrossClusterMasqueGatewayReadinessCarriers;
+  TimeoutPacket privateBGPStartupRetryTick = {};
+  bool privateBGPStartupRetryQueued = false;
   std::unique_ptr<Switchboard> switchboard;
   std::unique_ptr<EthDevice> additionalIngressEth;
   std::unique_ptr<EthDevice> privateOverlayEth;
@@ -465,6 +472,10 @@ protected:
   bytell_hash_subvector<uint32_t, LocalWhiteholeBindingEntry> whiteholeBindingsByContainer;
   bytell_hash_subvector<uint64_t, CoroutineStack *> pendingContainerDownloads;
   std::unique_ptr<ProdigyArtifactIO> artifactIO;
+  // Storage accounting walks a container filesystem and can take arbitrarily
+  // longer than a metric cadence.  Keep it off both the Ring and the artifact
+  // worker: deploy/download progress must not sit behind telemetry.
+  std::unique_ptr<ProdigyArtifactIO> storageTelemetryIO;
   // Receipt-driven operations may complete after their control stream was
   // replaced.  The callback must not touch a destroyed Neuron.
   std::shared_ptr<uint8_t> asyncOperationLifetime = std::make_shared<uint8_t>(0);
@@ -533,6 +544,11 @@ protected:
   bool bgpIPv6ReadinessRetryQueued = false;
   uint32_t bgpIPv6ReadinessRetryAttempts = 0;
   uint64_t bgpIPv6ReadinessRetryPendingGeneration = 0;
+  // A missing pair is terminal for a cold retained gateway only after the
+  // current authenticated Brain stream has supplied its complete authority
+  // snapshot.  Before then, state upload and authority delivery may arrive in
+  // either order.
+  uint64_t crossClusterMasqueGatewayAuthorityProjectionGeneration = 0;
   bytell_hash_map<uint128_t, std::unique_ptr<StateUploadRestoreOperation>> pendingStateUploadRestores;
   constexpr static uint32_t maximumPendingStateUploadRestores = 64;
   // An authenticated state upload may arrive while the prior control
@@ -660,6 +676,9 @@ protected:
   struct DeferredHardwareInventoryWake : public SocketBase {
   } deferredHardwareInventoryWake;
   bool deferredHardwareInventoryWakePollQueued = false;
+  class DeferredHardwareInventoryRetryWake;
+  DeferredHardwareInventoryRetryWake *deferredHardwareInventoryRetryWake = nullptr;
+  uint32_t deferredHardwareInventoryRetryAttempts = 0;
 
   struct DeferredHardwareInventoryResult {
 
@@ -675,10 +694,17 @@ protected:
 
     uint64_t lastSampleNs = 0;
     uint64_t lastCpuUsageUs = 0;
+    uint64_t lastStorageRequestNs = 0;
+    uint64_t storageRequestGeneration = 0;
     bool hasLastCpuUsage = false;
   };
 
   bytell_hash_map<uint128_t, ContainerMetricSampleState> metricSampleStateByContainer;
+  uint128_t storageTelemetryCursor = 0;
+  bool storageTelemetryCursorSet = false;
+  uint64_t nextStorageTelemetryRequestGeneration = 0;
+  bool storageTelemetryInFlight = false;
+  std::atomic<bool> stopStorageTelemetry = false;
 
   const MachineHardwareProfile *latestHardwareProfileIfReady(void) const override
   {
@@ -1758,6 +1784,78 @@ protected:
     return result.serializedHardwareProfile.size() > 0 && result.hardware.inventoryComplete;
   }
 
+  static uint32_t deferredHardwareInventoryRetryDelayMs(uint32_t attempts)
+  {
+    return 250u << std::min(attempts, 4u);
+  }
+
+  // A canceled io_uring timeout can be dispatched after its original owner
+  // begins destruction. Keep the packet in this heap-owned dispatcher until
+  // that terminal completion, rather than leaving a member packet for Ring to
+  // dereference after Neuron's storage has gone away.
+  class DeferredHardwareInventoryRetryWake final : public TimeoutDispatcher {
+  private:
+    Neuron *owner = nullptr;
+    TimeoutPacket packet = {};
+
+  public:
+    DeferredHardwareInventoryRetryWake(Neuron& requestedOwner, uint32_t delayMs)
+        : owner(&requestedOwner)
+    {
+      packet.dispatcher = this;
+      packet.setTimeoutMs(delayMs);
+      Ring::queueTimeout(&packet);
+    }
+
+    void abandon(void)
+    {
+      owner = nullptr;
+      Ring::queueCancelTimeout(&packet);
+    }
+
+    void dispatchTimeout(TimeoutPacket *completedPacket) override
+    {
+      if (completedPacket != &packet)
+      {
+        return;
+      }
+      Neuron *completedOwner = owner;
+      owner = nullptr;
+      if (completedOwner != nullptr)
+      {
+        completedOwner->deferredHardwareInventoryRetryWake = nullptr;
+        completedOwner->beginDeferredHardwareInventoryCollection();
+      }
+      delete this;
+    }
+  };
+
+  void scheduleDeferredHardwareInventoryRetry(void)
+  {
+    if (deferredHardwareInventoryRetryWake != nullptr || hardwareProfile.inventoryComplete)
+    {
+      return;
+    }
+
+    const uint32_t delayMs = deferredHardwareInventoryRetryDelayMs(deferredHardwareInventoryRetryAttempts);
+    if (deferredHardwareInventoryRetryAttempts != UINT32_MAX)
+    {
+      ++deferredHardwareInventoryRetryAttempts;
+    }
+    deferredHardwareInventoryRetryWake = new DeferredHardwareInventoryRetryWake(*this, delayMs);
+  }
+
+  void resetDeferredHardwareInventoryRetry(void)
+  {
+    deferredHardwareInventoryRetryAttempts = 0;
+    if (deferredHardwareInventoryRetryWake != nullptr)
+    {
+      DeferredHardwareInventoryRetryWake *wake = deferredHardwareInventoryRetryWake;
+      deferredHardwareInventoryRetryWake = nullptr;
+      wake->abandon();
+    }
+  }
+
   void armDeferredHardwareInventoryWakePoll(void)
   {
     if (deferredHardwareInventoryWakePollQueued || deferredHardwareInventoryWake.fd < 0)
@@ -2073,6 +2171,7 @@ protected:
                (unsigned long long)result.hardware.network.nics.size());
     hardwareProfile = std::move(result.hardware);
     serializedHardwareProfile = std::move(result.serializedHardwareProfile);
+    resetDeferredHardwareInventoryRetry();
 
     if (hardwareProfile.inventoryComplete && thisBrain != nullptr)
     {
@@ -2198,7 +2297,7 @@ protected:
                  (unsigned long long)result.hardware.disks.size(),
                  (unsigned long long)result.hardware.network.nics.size(),
                  result.hardware.inventoryFailure.c_str());
-      beginDeferredHardwareInventoryCollection();
+      scheduleDeferredHardwareInventoryRetry();
       return false;
     }
 
@@ -2344,7 +2443,8 @@ protected:
     return parseUnsignedDecimal(memoryCurrent, memoryCurrentBytes);
   }
 
-  static bool approximateDirectoryUsageBytes(const String& path, uint64_t& usageBytes)
+  static bool approximateDirectoryUsageBytes(const String& path, uint64_t& usageBytes,
+                                             const std::atomic<bool> *stop = nullptr)
   {
     namespace fs = std::filesystem;
     std::error_code ec;
@@ -2378,6 +2478,7 @@ protected:
 
     while (iterator != end)
     {
+      if (stop && stop->load(std::memory_order_relaxed)) return false;
       const fs::directory_entry& entry = *iterator;
       std::error_code entryError;
       fs::file_status status = entry.symlink_status(entryError);
@@ -2483,14 +2584,13 @@ protected:
     return true;
   }
 
-  static bool sampleContainerStorageUtilPct(const Container *container, uint64_t& utilPct)
+  static bool containerStoragePayloadPath(const Container *container, String& storagePath)
   {
     if (container == nullptr || container->plan.config.storageMB == 0)
     {
       return false;
     }
 
-    String storagePath;
     if (container->storagePayloadPath.size() > 0)
     {
       storagePath.assign(container->storagePayloadPath);
@@ -2500,13 +2600,13 @@ protected:
       storagePath.snprintf<"/containers/storage/{itoa}"_ctv>(container->plan.uuid);
     }
 
-    uint64_t usageBytes = 0;
-    if (approximateDirectoryUsageBytes(storagePath, usageBytes) == false)
-    {
-      return false;
-    }
+    return true;
+  }
 
-    uint64_t storageLimitBytes = uint64_t(container->plan.config.storageMB) * 1024ULL * 1024ULL;
+  static bool storageUtilPctForUsage(const Container *container, uint64_t usageBytes, uint64_t& utilPct)
+  {
+    if (container == nullptr) return false;
+    const uint64_t storageLimitBytes = uint64_t(container->plan.config.storageMB) * 1024ULL * 1024ULL;
     if (storageLimitBytes == 0)
     {
       return false;
@@ -2526,9 +2626,134 @@ protected:
     return true;
   }
 
+  struct StorageMetricScan final {
+    String path = {};
+    uint64_t usageBytes = 0;
+    bool collected = false;
+  };
+
+  void completeStorageMetricScan(uint128_t containerUUID, uint64_t requestGeneration,
+                                 NeuronBrainControlStream *requestStream, uint64_t streamGeneration,
+                                 uint64_t deploymentID, uint64_t storageLimitBytes,
+                                 std::shared_ptr<StorageMetricScan> scan)
+  {
+    storageTelemetryInFlight = false;
+    if (stopStorageTelemetry.load(std::memory_order_relaxed)) return;
+    const auto scheduleNext = [this] {
+      const uint64_t nowNs = monotonicNowNs();
+      if (nowNs > 0) queueDueStorageMetricScan(nowNs);
+    };
+    const auto found = containers.find(containerUUID);
+    if (found == containers.end()) { scheduleNext(); return; }
+    ContainerMetricSampleState *state = nullptr;
+    if (auto sample = metricSampleStateByContainer.find(containerUUID); sample != metricSampleStateByContainer.end())
+      state = &sample->second;
+    String currentStoragePath = {};
+    uint64_t utilPct = 0;
+    if (state == nullptr || state->storageRequestGeneration != requestGeneration ||
+        brain != requestStream || requestStream == nullptr || requestStream->ioGeneration != streamGeneration ||
+        !streamIsActive(requestStream) || (activeMetricsMask(found->second) &
+        ProdigyMetrics::maskForScalingDimension(ScalingDimension::storage)) == 0 || !scan->collected ||
+        found->second->plan.config.deploymentID() != deploymentID || storageLimitBytes == 0 ||
+        containerStoragePayloadPath(found->second, currentStoragePath) == false || currentStoragePath != scan->path ||
+        uint64_t(found->second->plan.config.storageMB) * 1024ULL * 1024ULL != storageLimitBytes ||
+        storageUtilPctForUsage(found->second, scan->usageBytes, utilPct) == false)
+    {
+      scheduleNext();
+      return;
+    }
+
+    const int64_t sampleTimeMs = Time::now<TimeResolution::ms>();
+    uint32_t headerOffset = Message::appendHeader(requestStream->wBuffer, NeuronTopic::containerStatistics);
+    Message::append(requestStream->wBuffer, found->second->plan.config.deploymentID());
+    Message::append(requestStream->wBuffer, containerUUID);
+    Message::append(requestStream->wBuffer, sampleTimeMs);
+    Message::append(requestStream->wBuffer, ProdigyMetrics::runtimeContainerStorageUtilPctKey());
+    Message::append(requestStream->wBuffer, utilPct);
+    Message::finish(requestStream->wBuffer, headerOffset);
+    Ring::queueSend(requestStream);
+    scheduleNext();
+  }
+
+  bool ensureStorageTelemetryIO(void)
+  {
+    if (storageTelemetryIO != nullptr) return true;
+    storageTelemetryIO = ProdigyArtifactIO::startOwned();
+    return storageTelemetryIO != nullptr;
+  }
+
+  void queueDueStorageMetricScan(uint64_t sampleTimeNs)
+  {
+    if (storageTelemetryInFlight || stopStorageTelemetry.load(std::memory_order_relaxed) || brain == nullptr || !streamIsActive(brain)) return;
+
+    Container *selected = nullptr;
+    uint128_t selectedUUID = 0;
+    auto eligible = [this, sampleTimeNs](uint128_t uuid, Container *container) {
+      if (container == nullptr || (activeMetricsMask(container) &
+          ProdigyMetrics::maskForScalingDimension(ScalingDimension::storage)) == 0 ||
+          container->plan.config.storageMB == 0) return false;
+      ContainerMetricSampleState& state = metricSampleStateByContainer[uuid];
+      const uint64_t cadenceNs = uint64_t(normalizedMetricsCadenceMs(container)) * 1'000'000ULL;
+      return state.storageRequestGeneration == 0 ||
+          (sampleTimeNs > state.lastStorageRequestNs && sampleTimeNs - state.lastStorageRequestNs >= cadenceNs);
+    };
+    auto iterator = containers.begin();
+    if (storageTelemetryCursorSet)
+    {
+      auto cursor = containers.find(storageTelemetryCursor);
+      if (cursor != containers.end())
+      {
+        iterator = cursor;
+        ++iterator;
+        if (iterator == containers.end()) iterator = containers.begin();
+      }
+    }
+    for (size_t examined = 0; iterator != containers.end() && examined < containers.size(); ++examined)
+    {
+      const uint128_t uuid = iterator->first;
+      Container *container = iterator->second;
+      ++iterator;
+      if (iterator == containers.end()) iterator = containers.begin();
+      if (eligible(uuid, container)) { selected = container; selectedUUID = uuid; break; }
+    }
+    if (selected == nullptr) return;
+
+    String storagePath = {};
+    if (containerStoragePayloadPath(selected, storagePath) == false) return;
+    const uint64_t storageLimitBytes = uint64_t(selected->plan.config.storageMB) * 1024ULL * 1024ULL;
+    if (storageLimitBytes == 0) return;
+    if (ensureStorageTelemetryIO() == false) return;
+    ContainerMetricSampleState& state = metricSampleStateByContainer[selectedUUID];
+    const uint64_t requestGeneration = ++nextStorageTelemetryRequestGeneration;
+    const uint64_t deploymentID = selected->plan.config.deploymentID();
+    const std::weak_ptr<uint8_t> lifetime = asyncOperationLifetime;
+    NeuronBrainControlStream *requestStream = brain;
+    const uint64_t streamGeneration = requestStream->ioGeneration;
+    auto scan = std::make_shared<StorageMetricScan>();
+    scan->path = std::move(storagePath);
+    if (!storageTelemetryIO->submit(0,
+          [scan, stop = &stopStorageTelemetry] { scan->collected = approximateDirectoryUsageBytes(scan->path, scan->usageBytes, stop); },
+          [this, lifetime, selectedUUID, requestGeneration, requestStream, streamGeneration, deploymentID, storageLimitBytes, scan] {
+            if (lifetime.expired()) return;
+            completeStorageMetricScan(selectedUUID, requestGeneration, requestStream, streamGeneration, deploymentID, storageLimitBytes, scan);
+          },
+          [this, lifetime, selectedUUID, requestGeneration, requestStream, streamGeneration, deploymentID, storageLimitBytes, scan](std::exception_ptr) {
+            scan->collected = false;
+            if (lifetime.expired()) return;
+            completeStorageMetricScan(selectedUUID, requestGeneration, requestStream, streamGeneration, deploymentID, storageLimitBytes, scan);
+          })) return;
+
+    state.lastStorageRequestNs = sampleTimeNs;
+    state.storageRequestGeneration = requestGeneration;
+    storageTelemetryCursor = selectedUUID;
+    storageTelemetryCursorSet = true;
+    storageTelemetryInFlight = true;
+  }
+
   void collectContainerMetricsAndForward(uint64_t sampleTimeNs)
   {
     bool queuedToBrain = false;
+    bool hasStorageMetric = false;
     int64_t sampleTimeMs = Time::now<TimeResolution::ms>();
 
     for (const auto& [containerUUID, container] : containers)
@@ -2541,6 +2766,7 @@ protected:
         continue;
       }
 
+      hasStorageMetric |= (mask & ProdigyMetrics::maskForScalingDimension(ScalingDimension::storage)) != 0;
       auto& sampleState = metricSampleStateByContainer[container->plan.uuid];
       uint32_t cadenceMs = normalizedMetricsCadenceMs(container);
       if (sampleState.lastSampleNs > 0)
@@ -2578,17 +2804,6 @@ protected:
         }
       }
 
-      if ((mask & ProdigyMetrics::maskForScalingDimension(ScalingDimension::storage)) > 0)
-      {
-        uint64_t value = 0;
-        if (sampleContainerStorageUtilPct(container, value))
-        {
-          metricKeys[metricCount] = ProdigyMetrics::runtimeContainerStorageUtilPctKey();
-          metricValues[metricCount] = value;
-          metricCount += 1;
-        }
-      }
-
       sampleState.lastSampleNs = sampleTimeNs;
 
       if (metricCount == 0 || brain == nullptr)
@@ -2615,6 +2830,7 @@ protected:
     {
       Ring::queueSend(brain);
     }
+    if (hasStorageMetric) queueDueStorageMetricScan(sampleTimeNs);
   }
 
   template <typename T>
@@ -3318,6 +3534,9 @@ protected:
       runtime->completedFaultLease = {};
     }
     runtime->faultLease = control.request; runtime->faultLeaseActive = true;
+    // A deliberate path fault is a terminal fence for startup retries.  The
+    // existing fault recovery owns any later, authenticated BGP restoration.
+    cancelPrivateBGPStartupRetry(*runtime);
     carrier->faultDeadlineNs = runtime->faultMonotonicDeadlineNs;
     carrier->faultControl = control; carrier->faultFrame = frame; carrier->faultFramePending = true;
     if (control.action == ProdigyCrossClusterPathFaultGatewayAction::pause)
@@ -3489,6 +3708,7 @@ protected:
         ensureSwitchboard()->closeWormholesToContainer(generateLocalContainerID(it->second->plan.fragment));
       removeCrossClusterMasqueGatewayListener(runtime->systemContainerUUID);
     }
+    cancelPrivateBGPStartupRetry(*runtime);
     runtime->gatewayBootstrap.reset();
     runtime->pendingLaunch.reset();
     runtime->faultLease = {}; runtime->completedFaultLease = {};
@@ -3548,6 +3768,10 @@ protected:
     if (newPairs > CrossClusterMasqueGatewayRuntime::maximumAuthoritiesPerMachine ||
         selected.size() > CrossClusterMasqueGatewayRuntime::maximumAuthoritiesPerMachine)
       return false;
+    // A later local reconciliation can still reject a live runtime (for
+    // example while rebuilding its Switchboard bindings).  From this first
+    // mutation onward the old snapshot is no longer a complete description.
+    crossClusterMasqueGatewayAuthorityProjectionGeneration = 0;
     // Retire absent pairs only after the complete replacement snapshot has
     // passed its advance/slot checks, leaving capacity for a two-pair swap.
     for (auto& runtime : crossClusterMasqueGatewayRuntimes)
@@ -3591,6 +3815,7 @@ protected:
       runtime.authority = {};
     }
     reconcileCrossClusterPrivateBGPSwitchboardFallback();
+    crossClusterMasqueGatewayAuthorityProjectionGeneration = containerLaunchControlGeneration;
     // stateUpload can arrive before the typed gateway authority. The retained
     // process remains fenced in that ordering; the completed authoritative
     // snapshot is the event that makes an exact local record retryable.
@@ -3724,6 +3949,65 @@ protected:
     return true;
   }
 
+  static uint32_t privateBGPStartupRetryDelayMs(uint32_t attempts)
+  {
+    constexpr uint32_t initialDelayMs = 1'000;
+    constexpr uint32_t maximumDelayMs = 60'000;
+    if (attempts >= 6) return maximumDelayMs;
+    return initialDelayMs << attempts;
+  }
+
+  bool privateBGPStartupRetryEligible(const CrossClusterMasqueGatewayRuntime& runtime) const
+  {
+    return runtime.privateTunnelBGP != nullptr &&
+        runtime.privateTunnelBGP->deliveredScopeMatchesAuthority(runtime.authority) &&
+        runtime.systemPlanAdmitted && runtime.systemContainerUUID != 0 &&
+        !runtime.faultLeaseActive &&
+        prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(runtime.authority) &&
+        runtime.authority.state == CrossClusterMasqueGatewayState::active &&
+        prodigyCrossClusterMasqueGatewayReady(runtime.authority, &runtime.readiness);
+  }
+
+  void cancelPrivateBGPStartupRetry(CrossClusterMasqueGatewayRuntime& runtime)
+  {
+    runtime.privateBGPStartupRetryPending = false;
+    runtime.privateBGPStartupRetryAttempts = 0;
+  }
+
+  void schedulePrivateBGPStartupRetry(CrossClusterMasqueGatewayRuntime& runtime)
+  {
+    if (!privateBGPStartupRetryEligible(runtime))
+    {
+      cancelPrivateBGPStartupRetry(runtime);
+      return;
+    }
+    runtime.privateBGPStartupRetryPending = true;
+    if (privateBGPStartupRetryQueued) return;
+    privateBGPStartupRetryTick.clear();
+    privateBGPStartupRetryTick.originator = this;
+    privateBGPStartupRetryTick.setTimeoutMs(
+        privateBGPStartupRetryDelayMs(runtime.privateBGPStartupRetryAttempts));
+    if (runtime.privateBGPStartupRetryAttempts != UINT32_MAX)
+      ++runtime.privateBGPStartupRetryAttempts;
+    privateBGPStartupRetryQueued = true;
+    Ring::queueTimeout(&privateBGPStartupRetryTick);
+  }
+
+  void servicePrivateBGPStartupRetry(void)
+  {
+    for (auto& runtime : crossClusterMasqueGatewayRuntimes)
+    {
+      if (!runtime.privateBGPStartupRetryPending) continue;
+      runtime.privateBGPStartupRetryPending = false;
+      if (!privateBGPStartupRetryEligible(runtime))
+      {
+        cancelPrivateBGPStartupRetry(runtime);
+        continue;
+      }
+      (void)reconcileCrossClusterMasqueGatewayBGP(runtime);
+    }
+  }
+
   bool restoreExpiredCrossClusterPathFault(CrossClusterMasqueGatewayRuntime& runtime)
   {
     if (!runtime.faultLeaseActive || !runtime.privateTunnelBGP ||
@@ -3845,6 +4129,7 @@ protected:
       return false;
     }
     runtime->revokeReadiness();
+    cancelPrivateBGPStartupRetry(*runtime);
     return reconcileCrossClusterMasqueGatewayBGP(*runtime);
   }
 
@@ -3922,9 +4207,11 @@ protected:
         !runtime->privateTunnelBGP->empty())
       return false;
 
+    cancelPrivateBGPStartupRetry(*runtime);
     runtime->gatewayBootstrap.reset();
     runtime->pendingLaunch.reset();
-    runtime->privateTunnelBGP.reset();
+    // Retain the empty hub: withdrawal can have queued close callbacks
+    // whose Ring dispatcher still references this inline owner.
     runtime->faultLease = {};
     runtime->completedFaultLease = {};
     runtime->faultLeaseActive = false;
@@ -4004,11 +4291,16 @@ protected:
     // A projected authority refresh must not republish BGP while an exact
     // fault lease is pending; restoration is driven by a fresh readiness
     // receipt after resume or expiry.
-    if (runtime.faultLeaseActive) { runtime.sitePrefixAdvertised = false; return false; }
+    if (runtime.faultLeaseActive) {
+      runtime.sitePrefixAdvertised = false;
+      cancelPrivateBGPStartupRetry(runtime);
+      return false;
+    }
     if (!prodigyCrossClusterMasqueGatewayAuthorityStructurallyValid(runtime.authority))
     {
       if (runtime.privateTunnelBGP) runtime.privateTunnelBGP->withdrawAll();
       runtime.sitePrefixAdvertised = false;
+      cancelPrivateBGPStartupRetry(runtime);
       return false;
     }
 
@@ -4081,6 +4373,17 @@ protected:
     runtime.sitePrefixAdvertised = reconciled &&
         runtime.privateTunnelBGP->desiredPaths().size() == 1 &&
         runtime.privateTunnelBGP->desiredPaths()[0].localPrefixAnnounced;
+    if (reconciled)
+    {
+      cancelPrivateBGPStartupRetry(runtime);
+    }
+    else if (runtime.privateTunnelBGP->desiredPaths().empty())
+    {
+      // A strict private connector can fail before BGPHub owns a peer and
+      // therefore before its reconnect timer exists. Retry only while this
+      // exact in-memory Vault scope and the authenticated gateway tuple hold.
+      schedulePrivateBGPStartupRetry(runtime);
+    }
     return reconciled;
   }
 
@@ -5790,12 +6093,15 @@ public:
 
   ~Neuron()
   {
+    stopStorageTelemetry.store(true, std::memory_order_relaxed);
+    resetDeferredHardwareInventoryRetry();
     asyncOperationLifetime.reset();
     bgpConfigurationRefresh.reset();
     // Cancel HostTask awaiters before their retained containers or this Ring
     // owner can be destroyed. Late Netlink/command callbacks then observe a
     // detached operation instead of this Neuron.
     pendingStateUploadRestores.clear();
+    storageTelemetryIO.reset();
     artifactIO.reset();
     if (wormholeFlowGC)
     {
@@ -7322,10 +7628,12 @@ public:
 
   bool quiesceArtifactIOForBundleExec(void) override
   {
+    stopStorageTelemetry.store(true, std::memory_order_relaxed);
     const bool artifactsReady = !artifactIO || artifactIO->quiesceForExec();
+    const bool storageTelemetryReady = !storageTelemetryIO || storageTelemetryIO->quiesceForExec();
     const bool ringsReady = !switchboard || switchboard->quiesceRingPreparationForExec();
     const bool pairControlReady = !pairControlRuntime || pairControlRuntime->quiesce();
-    return artifactsReady && ringsReady && pairControlReady;
+    return artifactsReady && storageTelemetryReady && ringsReady && pairControlReady;
   }
 
   bool quiesceContainerControlSocketsForBundleExec(void) override
@@ -7595,18 +7903,24 @@ public:
     }
 
     // An authenticated Brain bootstrap creates this unpublished owner before
-    // asynchronous network recovery can publish it.  It is enough to retain
-    // the inventory fence only while every identity fence still names the
-    // exact live cgroup process; a directory name alone is never ownership.
+    // asynchronous network recovery can publish it.  The pending launch and
+    // live process identity own the cgroup across a Brain stream replacement:
+    // requiring the restore's old stream to be current here would withhold the
+    // state upload needed to admit the replacement stream.  Recovery itself
+    // still requires stateUploadRestoreCurrent before it can publish a process.
     for (const auto& [uuid, operation] : pendingStateUploadRestores)
     {
       if (operation == nullptr || operation->container == nullptr ||
+          operation->container->pendingDestroy ||
           operation->terminalRetirementPending || operation->coldRestart ||
           uuid != operation->container->plan.uuid ||
           operation->container->pid != pid ||
           operation->container->pidfd < 0 || operation->container->cgroup < 0 ||
           operation->container->name.equal(String(name.c_str())) == false ||
-          stateUploadRestoreCurrent(*operation, uuid) == false)
+          !pendingContainerLaunchIsCurrent(uuid, operation->launchAdmissionGeneration) ||
+          operation->epoch != stateUploadRestoreEpoch ||
+          memcmp(&operation->fragment, &lcsubnet6, sizeof(lcsubnet6)) != 0 ||
+          containers.contains(uuid))
       {
         continue;
       }
@@ -8347,7 +8661,15 @@ protected:
         const auto *runtime = crossClusterMasqueGatewayRuntimeForPair(
             found->second->container->plan.system.gatewayPairUUID);
         if (runtime == nullptr)
+        {
+          // An accepted replacement snapshot is complete for this Neuron. A
+          // missing pair therefore withdraws a cold candidate, but an absent
+          // or superseded snapshot must leave it fenced for an exact retry.
+          if (crossClusterMasqueGatewayAuthorityProjectionGeneration ==
+              containerLaunchControlGeneration)
+            (void)retirePendingStateUploadRestore(uuid);
           continue;
+        }
         if (runtime->authority.state != CrossClusterMasqueGatewayState::active)
           (void)retirePendingStateUploadRestore(uuid);
         else
@@ -10584,22 +10906,34 @@ public:
     readiness.authenticatedMasqueQUICReady = frame.rebindReceipt.authenticatedMasqueQUICReady && frame.rebindReceipt.ready &&
         prodigyIsSHA256HexDigest(frame.rebindReceipt.routeSetSHA256);
     CrossClusterMasqueGatewayReadinessListener::PeerIdentity candidateIdentity = {};
-    const bool admissionCurrent = carrier->localPhase == ProdigyGatewayLocalCarrierPhase::rebindReceipt &&
+    const bool rebindCurrent = carrier->localPhase == ProdigyGatewayLocalCarrierPhase::rebindReceipt &&
         tupleMatches(frame.rebindReceipt.tuple, carrier->recoveryTuple) &&
         memcmp(frame.rebindReceipt.nonce, carrier->recoveryNonce, sizeof(carrier->recoveryNonce)) == 0 && runtime != nullptr &&
         runtime->systemPlanAdmitted && runtime->systemContainerUUID == carrier->containerUUID &&
-        tupleMatches(gatewayRecoveryTuple(runtime->authority), carrier->recoveryTuple) && found != pendingStateUploadRestores.end() && found->second != nullptr &&
+        tupleMatches(gatewayRecoveryTuple(runtime->authority), carrier->recoveryTuple) &&
+        carrier->capturePeerIdentity && carrier->capturePeerIdentity(carrier->peerPID, candidateIdentity) && candidateIdentity == carrier->retainedIdentity &&
+        carrier->recoveryEpoch == stateUploadRestoreEpoch && prodigyCrossClusterMasqueGatewayReadinessMatches(runtime->authority, readiness);
+    const bool pendingCurrent = rebindCurrent && found != pendingStateUploadRestores.end() && found->second != nullptr &&
         found->second->container != nullptr && found->second->settled && !found->second->terminalRetirementPending &&
         found->second->container->pid == carrier->peerPID && found->second->container->pidfd >= 0 &&
-        carrier->capturePeerIdentity && carrier->capturePeerIdentity(found->second->container->pid, candidateIdentity) && candidateIdentity == carrier->retainedIdentity &&
-        found->second->epoch == carrier->recoveryEpoch && carrier->recoveryEpoch == stateUploadRestoreEpoch && found->second->gatewayRecoveryTokenBound &&
-        found->second->boundGatewayRecoveryToken == carrier->recoveryToken &&
-        found->second->stream == brain && found->second->requestedStream == brain && brain != nullptr &&
-        found->second->streamGeneration == brain->ioGeneration && found->second->requestedGeneration == brain->ioGeneration &&
-        streamIsActive(brain) && memcmp(&found->second->fragment, &lcsubnet6, sizeof(lcsubnet6)) == 0 &&
-        pendingContainerLaunchIsCurrent(carrier->containerUUID, found->second->launchAdmissionGeneration) &&
-        prodigyCrossClusterMasqueGatewayReadinessMatches(runtime->authority, readiness);
-    if (!admissionCurrent || !publishRestoredStateUploadContainer(*found->second, carrier->containerUUID, carrier->recoveryEpoch)) { reject(); return; }
+        found->second->epoch == carrier->recoveryEpoch && found->second->gatewayRecoveryTokenBound &&
+        found->second->boundGatewayRecoveryToken == carrier->recoveryToken && found->second->stream == brain &&
+        found->second->requestedStream == brain && brain != nullptr && found->second->streamGeneration == brain->ioGeneration &&
+        found->second->requestedGeneration == brain->ioGeneration && streamIsActive(brain) &&
+        memcmp(&found->second->fragment, &lcsubnet6, sizeof(lcsubnet6)) == 0 &&
+        pendingContainerLaunchIsCurrent(carrier->containerUUID, found->second->launchAdmissionGeneration);
+    const auto published = containers.find(carrier->containerUUID);
+    const auto *listener = crossClusterMasqueGatewayListenerForContainer(carrier->containerUUID);
+    const bool publishedCurrent = rebindCurrent && (found == pendingStateUploadRestores.end() ||
+        (found->second != nullptr && found->second->settled && found->second->container == nullptr)) && published != containers.end() &&
+        published->second != nullptr && published->second->plan.uuid == carrier->containerUUID && !published->second->pendingDestroy &&
+        !published->second->killedOnPurpose && !isContainerLaunchRetired(carrier->containerUUID) && published->second->pid == carrier->peerPID &&
+        published->second->pidfd >= 0 && published->second->plan.system.kind == SystemContainerKind::crossClusterMasqueGateway &&
+        listener != nullptr && listener->recovery && listener->fd >= 0 && listener->recoveryEpoch == carrier->recoveryEpoch &&
+        listener->recoveryToken == carrier->recoveryToken && tupleMatches(listener->recoveryTuple, carrier->recoveryTuple) &&
+        listener->retainedIdentity == carrier->retainedIdentity;
+    if ((!pendingCurrent && !publishedCurrent) ||
+        (pendingCurrent && !publishRestoredStateUploadContainer(*found->second, carrier->containerUUID, carrier->recoveryEpoch))) { reject(); return; }
     carrier->receiptAccepted = true; carrier->localPhase = ProdigyGatewayLocalCarrierPhase::established;
     carrier->rBuffer.consume(frameBytes, true);
     // The candidate is now owned by `containers`; a later readiness/BGP fence
@@ -11576,6 +11910,12 @@ public:
       return;
     }
 
+    if (packet == &privateBGPStartupRetryTick) {
+      privateBGPStartupRetryQueued = false;
+      if (result != -ECANCELED) servicePrivateBGPStartupRetry();
+      return;
+    }
+
     if (packet == &bundleExecRetryTick)
     {
       bundleExecRetryTickQueued = false;
@@ -11826,6 +12166,10 @@ public:
     pendingSubscriptionPairings.erase(container->plan.uuid);
     pendingCredentialRefreshes.erase(container->plan.uuid);
     metricSampleStateByContainer.erase(container->plan.uuid);
+    if (storageTelemetryCursorSet && storageTelemetryCursor == container->plan.uuid)
+    {
+      storageTelemetryCursorSet = false;
+    }
 
     RingDispatcher::eraseMultiplexee(container);
   }

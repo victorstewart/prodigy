@@ -1664,18 +1664,30 @@ public:
         return;
       }
       auto state = execPersistence;
-      const bool admitted = persistentWriter->submitLocalBrainMutation(persistentLocalBrainState,
-          [](auto&, String&) { return true; },
-          [state, finish](auto&& result) mutable {
-            state->durable = result.durable;
-            state->failure = result.failure;
-            finish(state->durable, state->failure);
-          });
-      if (!admitted)
-      {
-        state->failure.assign("final local state persistence admission rejected"_ctv);
-        finish(false, state->failure);
-      }
+      // The update-self continuation may have reset its phase immediately
+      // before asking us to exec. Snapshot that live coordinator first: the
+      // local-state mutation below only drains its own projection and cannot
+      // substitute for a fresh Brain runtime receipt.
+      persistLocalRuntimeStateAsync([this, state, finish](bool snapshotDurable) mutable {
+        if (!snapshotDurable)
+        {
+          state->failure.assign("final runtime snapshot persistence failed"_ctv);
+          finish(false, state->failure);
+          return;
+        }
+        const bool admitted = persistentWriter->submitLocalBrainMutation(persistentLocalBrainState,
+            [](auto&, String&) { return true; },
+            [state, finish](auto&& result) mutable {
+              state->durable = result.durable;
+              state->failure = result.failure;
+              finish(state->durable, state->failure);
+            });
+        if (!admitted)
+        {
+          state->failure.assign("final local state persistence admission rejected"_ctv);
+          finish(false, state->failure);
+        }
+      });
     };
 
     if (bundleExecExpectedSHA256.empty())

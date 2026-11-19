@@ -135,6 +135,8 @@ public:
   uint32_t storageDeviceMB = 1'024;
   MothershipClusterTestBootstrapFamily brainBootstrapFamily = MothershipClusterTestBootstrapFamily::ipv4;
   bool enableFakeIpv4Boundary = false;
+  // Kept out of this nested codec: V9 owns its versioned tail.
+  String fakePublicIngressSourcePreservingIPv4;
   uint32_t interContainerMTU = 0;
 
   uint32_t initialMachineCount() const

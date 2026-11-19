@@ -4,6 +4,29 @@
 
 #include <prodigy/types.h>
 
+// Multiple services can project the same address and port into one policy map.
+static inline bool declaredNetworkReferencesEndpoint(const ContainerPlan& plan, uint128_t address,
+                                                     uint16_t port, bool advertisement)
+{
+  if (advertisement)
+  {
+    for (const auto& [service, pairings] : plan.advertisementPairings.map)
+    {
+      auto config = plan.advertisements.find(service);
+      if (config == plan.advertisements.end() || config->second.port != port) continue;
+      for (const AdvertisementPairing& pairing : pairings)
+        if (pairing.address == address) return true;
+    }
+  }
+  else
+  {
+    for (const auto& [service, pairings] : plan.subscriptionPairings.map)
+      for (const SubscriptionPairing& pairing : pairings)
+        if (pairing.address == address && pairing.port == port) return true;
+  }
+  return false;
+}
+
 static inline bool declaredNetworkPairingsValid(const ContainerPlan& plan)
 {
   uint64_t subscriptionCount = 0;

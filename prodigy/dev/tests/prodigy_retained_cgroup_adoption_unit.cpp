@@ -202,8 +202,43 @@ static void testRejectsUnprovenCgroupVariants()
   std::filesystem::remove_all(fragmentRoot.c_str());
 }
 
+static void testRetainedIsolatedChildDescriptors()
+{
+  String root = makeRoot("children");
+  const std::filesystem::path slice = std::filesystem::path(root.c_str()) / "55.slice";
+  const auto leaf = slice / "leaf";
+  std::filesystem::create_directories(leaf);
+  std::filesystem::create_directory(slice / "isolated.0");
+  Container owner;
+  owner.cgroup = open(leaf.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
+  assert(owner.cgroup >= 0);
+  owner.plan.config.maxPids = 3;
+  owner.plan.config.isolatedChildMemoryMB = 192;
+  String failure;
+  assert(!ContainerManager::ensureIsolatedChildCgroupDescriptors(&owner, &failure));
+  assert(owner.isolatedChildCgroups.empty());
+  std::filesystem::create_directory_symlink(leaf, slice / "isolated.1");
+  assert(!ContainerManager::ensureIsolatedChildCgroupDescriptors(&owner, &failure));
+  assert(owner.isolatedChildCgroups.empty());
+  std::filesystem::remove(slice / "isolated.1");
+  std::filesystem::create_directory(slice / "isolated.1");
+  assert(ContainerManager::ensureIsolatedChildCgroupDescriptors(&owner, &failure));
+  assert(ContainerManager::ensureIsolatedChildCgroupDescriptors(&owner, &failure));
+  assert(owner.isolatedChildCgroups.size() == 2);
+  for (size_t i = 0; i < owner.isolatedChildCgroups.size(); ++i)
+  {
+    const int fd = owner.isolatedChildCgroups[i];
+    assert(std::filesystem::equivalent("/proc/self/fd/" + std::to_string(fd),
+                                       slice / ("isolated." + std::to_string(i))));
+    close(fd);
+  }
+  close(owner.cgroup);
+  std::filesystem::remove_all(root.c_str());
+}
+
 int main()
 {
+  testRetainedIsolatedChildDescriptors();
   testThreeNeuronAuthenticatedPendingOwners();
   testRejectsUnprovenCgroupVariants();
   return 0;

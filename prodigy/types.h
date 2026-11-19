@@ -11958,11 +11958,14 @@ template <typename S> static void serialize(S&& s, CommitGlobalSingleWriterMembe
 
 // The application owns the Raft state. Brain and Neuron attest the transport
 // endpoints; a desired placement cannot supply a committed report.
-#define PRODIGY_GLOBAL_SINGLE_WRITER_CONTROL_VERSION 1
-enum class GlobalSingleWriterControlAction : uint8_t { inspect = 1, provisionOnce, addLearner, removeVoter, promoteLearner };
+#define PRODIGY_GLOBAL_SINGLE_WRITER_CONTROL_VERSION 2
+enum class GlobalSingleWriterControlAction : uint8_t { inspect = 1, provisionOnce, addLearner, removeVoter, promoteLearner, inspectReservation };
 
 class ProdigyGlobalSingleWriterControl : public MothershipResponse {
 public:
+  // Version two preserves the complete version-one prefix.  It adds only the
+  // member-addressed, read-only receipt proof after the old payload, so a v1
+  // inspect/provision exchange remains byte-for-byte unchanged.
   uint32_t protocolVersion = 1;
   GlobalSingleWriterControlAction action = GlobalSingleWriterControlAction::inspect;
   bool response = false, provisioned = false;
@@ -11973,6 +11976,11 @@ public:
   Vector<GlobalSingleWriterMember> members;
   Vector<int32_t> reachableMemberIDs, caughtUpMemberIDs;
   GlobalSingleWriterMembershipProjection bindings = {.protocolVersion = 0};
+  uint16_t reservationTopic = 0;
+  uint128_t reservationRequestUUID = 0;
+  uint64_t minimumAppliedIndex = 0;
+  bool reservationFound = false;
+  String reservationDigest;
 };
 template<typename S> static void serialize(S&& s, ProdigyGlobalSingleWriterControl& v) {
   s.value4b(v.protocolVersion); s.value1b(v.action); s.value1b(v.response); s.value1b(v.success);
@@ -11982,6 +11990,10 @@ template<typename S> static void serialize(S&& s, ProdigyGlobalSingleWriterContr
   s.value8b(v.committedConfigIndex); s.value8b(v.term); s.value8b(v.appliedIndex); s.value4b(v.memberID);
   s.value4b(v.targetMemberID); s.value4b(v.leaderMemberID); s.text1b(v.expectedCommittedConfigSHA256,64);
   s.text1b(v.committedConfigSHA256,64); s.container(v.members,4); s.container4b(v.reachableMemberIDs,4); s.container4b(v.caughtUpMemberIDs,4); s.object(v.bindings);
+  if (v.protocolVersion >= 2) {
+    s.value2b(v.reservationTopic); s.value16b(v.reservationRequestUUID); s.value8b(v.minimumAppliedIndex);
+    s.value1b(v.reservationFound); s.text1b(v.reservationDigest,64);
+  }
 }
 
 static inline bool prodigyGlobalSingleWriterCommittedConfigDigest(uint128_t group, uint64_t deployment, uint64_t index,
@@ -12012,17 +12024,24 @@ static inline bool prodigyGlobalSingleWriterCommittedConfigDigest(uint128_t grou
   return voters >= 2 && voters <= 3 && members.size()-voters <= 1 && prodigyComputeSHA256Hex(bytes,digest);
 }
 static inline bool prodigyGlobalSingleWriterControlAddressValid(const ProdigyGlobalSingleWriterControl& v) {
-  return v.protocolVersion == 1 && v.membershipUUID && v.operationUUID && v.localClusterUUID && v.containerUUID &&
+  return (v.protocolVersion == 1 || v.protocolVersion == 2) && v.membershipUUID && v.operationUUID && v.localClusterUUID && v.containerUUID &&
       prodigyGlobalSingleWriterDeploymentIDValid(v.deploymentID) && v.memberID > 0 &&
-      v.action >= GlobalSingleWriterControlAction::inspect && v.action <= GlobalSingleWriterControlAction::promoteLearner;
+      v.action >= GlobalSingleWriterControlAction::inspect && v.action <= GlobalSingleWriterControlAction::inspectReservation &&
+      (v.protocolVersion != 1 || v.action != GlobalSingleWriterControlAction::inspectReservation);
 }
 
 static inline bool prodigyGlobalSingleWriterControlRequestValid(const ProdigyGlobalSingleWriterControl& v) {
   if (!prodigyGlobalSingleWriterControlAddressValid(v) || v.response || v.success || !v.failure.empty() ||
       v.provisioned || v.committedConfigIndex || v.term || v.appliedIndex || v.leaderMemberID ||
-      !v.committedConfigSHA256.empty() || !v.members.empty() || !v.reachableMemberIDs.empty() || !v.caughtUpMemberIDs.empty())
+      !v.committedConfigSHA256.empty() || !v.members.empty() || !v.reachableMemberIDs.empty() || !v.caughtUpMemberIDs.empty() ||
+      v.reservationFound || !v.reservationDigest.empty())
     return false;
-  if (v.action == GlobalSingleWriterControlAction::inspect) return v.targetMemberID == 0;
+  if (v.action == GlobalSingleWriterControlAction::inspect)
+    return v.targetMemberID == 0 && !v.reservationTopic && !v.reservationRequestUUID && !v.minimumAppliedIndex;
+  if (v.action == GlobalSingleWriterControlAction::inspectReservation)
+    return v.protocolVersion == 2 && v.targetMemberID == 0 && v.reservationTopic != 0 && v.reservationRequestUUID != 0 &&
+        v.minimumAppliedIndex != 0 && !v.expectedCommittedConfigIndex && v.expectedCommittedConfigSHA256.empty() && !v.bootNonce;
+  if (v.reservationTopic || v.reservationRequestUUID || v.minimumAppliedIndex) return false;
   if (!v.bootNonce || !v.generation) return false;
   if (v.action == GlobalSingleWriterControlAction::provisionOnce) return v.targetMemberID == 0;
   return v.targetMemberID > 0 && v.expectedCommittedConfigIndex && prodigyIsSHA256HexDigest(v.expectedCommittedConfigSHA256);
@@ -12032,6 +12051,14 @@ static inline bool prodigyGlobalSingleWriterControlReportValid(const ProdigyGlob
   if (!prodigyGlobalSingleWriterControlAddressValid(v) || !v.response || !v.exchangeUUID || v.bindings.protocolVersion) return false;
   if (!v.success) return !v.failure.empty();
   if (!v.failure.empty() || !v.generation || !v.bootNonce) return false;
+  const bool reservationInspection = v.action == GlobalSingleWriterControlAction::inspectReservation;
+  if (reservationInspection) {
+    if (v.protocolVersion != 2 || !v.reservationTopic || !v.reservationRequestUUID || !v.minimumAppliedIndex ||
+        v.appliedIndex < v.minimumAppliedIndex ||
+        (v.reservationFound ? !prodigyIsSHA256HexDigest(v.reservationDigest) : !v.reservationDigest.empty())) return false;
+  } else if (v.reservationTopic || v.reservationRequestUUID || v.minimumAppliedIndex || v.reservationFound || !v.reservationDigest.empty()) {
+    return false;
+  }
   // A bound journal can be inspected before genesis or the first election.
   if (!v.committedConfigIndex)
     return v.leaderMemberID == 0 && v.members.empty() && v.committedConfigSHA256.empty() &&

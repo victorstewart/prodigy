@@ -1,5 +1,7 @@
 #pragma once
 
+#include <arpa/inet.h>
+
 #include <prodigy/mothership/mothership.cluster.types.h>
 
 constexpr static uint32_t mothershipTestClusterMachineLogicalCoresMax = 65'535;
@@ -37,6 +39,16 @@ static inline bool mothershipTestClusterWorkspaceRootValid(const String& workspa
     componentStart = index + 1;
   }
   return nested;
+}
+
+static inline bool mothershipTestClusterPublicIngressSourcePreservingIPv4Valid(const String& value)
+{
+  if (value.empty()) return true;
+  String terminated = value;
+  in_addr address = {};
+  if (::inet_pton(AF_INET, terminated.c_str(), &address) != 1) return false;
+  const uint32_t host = ntohl(address.s_addr);
+  return (host & 0xffff0000u) == 0xc6120000u && (host & 0xffu) != 0 && (host & 0xffu) != 0xff;
 }
 
 static inline void mothershipResolveTestClusterControlSocketPath(const MothershipProdigyCluster& cluster, String& path)

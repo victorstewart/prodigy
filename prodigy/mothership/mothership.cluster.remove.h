@@ -267,6 +267,62 @@ if [ -n "$loop" ]; then
   losetup -d "$loop" || { echo 'failed to detach owned /containers loop' >&2; exit 1; };
   query_owned_loop;
   [ -z "$loop" ] || { echo 'owned /containers loop remained attached' >&2; exit 1; };
+fi;
+# A native install has no loop image: its managed container roots are direct
+# Btrfs children below /containers.  Never erase /containers itself (it may be
+# part of /); after the drain, accept only the same Btrfs root as / and remove
+# verified child subvolumes deepest first.
+if [ -z "$loop" ] && [ ! -e "$img" ] && [ -e /containers ]; then
+  test -d /containers && test ! -L /containers && test -O /containers || { echo 'unsafe native /containers root' >&2; exit 1; };
+  mountpoint -q /containers && { echo 'refusing mounted native /containers root' >&2; exit 1; };
+  root_source=$(findmnt -rn -o SOURCE --target /) || { echo 'failed to identify root source' >&2; exit 1; };
+  root_fstype=$(findmnt -rn -o FSTYPE --target /) || { echo 'failed to identify root filesystem' >&2; exit 1; };
+  native_source=$(findmnt -rn -o SOURCE --target /containers) || { echo 'failed to identify native /containers source' >&2; exit 1; };
+  native_fstype=$(findmnt -rn -o FSTYPE --target /containers) || { echo 'failed to identify native /containers filesystem' >&2; exit 1; };
+  [ "$root_fstype" = btrfs ] && [ "$native_fstype" = btrfs ] && [ "$root_source" = "$native_source" ] || { echo 'refusing foreign native /containers filesystem' >&2; exit 1; };
+  [ "$(/usr/bin/stat -c %d /)" = "$(/usr/bin/stat -c %d /containers)" ] || { echo 'refusing native /containers device mismatch' >&2; exit 1; };
+  native_has_mount() { /usr/bin/awk -v native_root="$1" '$5 == native_root || index($5, native_root "/") == 1 { found=1; exit } END { exit found ? 0 : 1 }' /proc/self/mountinfo; };
+  native_runtime_root=/run/prodigy;
+  test ! -L "$native_runtime_root" || { echo 'unsafe native cleanup runtime root' >&2; exit 1; };
+  mkdir -p "$native_runtime_root" || { echo 'failed to initialize native cleanup runtime root' >&2; exit 1; };
+  test -d "$native_runtime_root" && test ! -L "$native_runtime_root" && test -O "$native_runtime_root" || { echo 'unsafe native cleanup runtime root' >&2; exit 1; };
+  native_list=$native_runtime_root/.owned-native-subvolumes.$$;
+  native_validated=${native_list}.validated;
+  native_weighted=${native_list}.weighted;
+  native_sorted=${native_list}.sorted;
+  native_paths=${native_list}.paths;
+  trap 'rm -f -- "$native_list" "$native_validated" "$native_weighted" "$native_sorted" "$native_paths"' EXIT HUP INT TERM;
+  for native_temporary in "$native_list" "$native_validated" "$native_weighted" "$native_sorted" "$native_paths"; do
+    (set -C; : >"$native_temporary") 2>/dev/null || { echo 'failed to create native cleanup temporary' >&2; exit 1; };
+  done;
+  btrfs subvolume list -o /containers >"$native_list" || { echo 'failed to list native Prodigy subvolumes' >&2; exit 1; };
+  while IFS= read -r native_row; do
+    native_relative=$(printf '%s\n' "$native_row" | /usr/bin/sed -n 's/^.* path //p');
+    [ -n "$native_relative" ] || { echo 'invalid native Prodigy subvolume row' >&2; exit 1; };
+    case "$native_relative" in containers/*) native_suffix=${native_relative#containers/};; *) continue;; esac;
+    case "/$native_suffix/" in *'//'*|*'/./'*|*'/../'*) echo 'refusing unsafe native subvolume component' >&2; exit 1;; esac;
+    native_subvolume=/containers/$native_suffix;
+    test -d "$native_subvolume" && test ! -L "$native_subvolume" && test -O "$native_subvolume" || { echo 'unsafe native Prodigy subvolume' >&2; exit 1; };
+    native_has_mount "$native_subvolume" && { echo 'refusing mounted native Prodigy subvolume' >&2; exit 1; };
+    printf '%s\n' "$native_subvolume" >>"$native_validated" || { echo 'failed to stage native Prodigy subvolume' >&2; exit 1; };
+  done <"$native_list";
+  /usr/bin/awk '{ print length, $0 }' "$native_validated" >"$native_weighted" || { echo 'failed to weight native Prodigy subvolumes' >&2; exit 1; };
+  /usr/bin/sort -rn "$native_weighted" >"$native_sorted" || { echo 'failed to sort native Prodigy subvolumes' >&2; exit 1; };
+  /usr/bin/cut -d' ' -f2- "$native_sorted" >"$native_paths" || { echo 'failed to finalize native Prodigy subvolumes' >&2; exit 1; };
+  for native_garbage in /containers/store /containers/storage /containers/system-store; do
+    test -e "$native_garbage" || test ! -L "$native_garbage" || { echo 'refusing native Prodigy garbage symlink' >&2; exit 1; };
+    test -e "$native_garbage" || continue;
+    test -d "$native_garbage" && test ! -L "$native_garbage" && test -O "$native_garbage" || { echo 'unsafe native Prodigy garbage root' >&2; exit 1; };
+    native_has_mount "$native_garbage" && { echo 'refusing mounted native Prodigy garbage root' >&2; exit 1; };
+  done;
+  while IFS= read -r native_subvolume; do
+    test -n "$native_subvolume" || { echo 'empty native Prodigy subvolume' >&2; exit 1; };
+    btrfs subvolume delete -- "$native_subvolume" || { echo 'failed to remove native Prodigy subvolume' >&2; exit 1; };
+  done <"$native_paths";
+  for native_garbage in /containers/store /containers/storage /containers/system-store; do
+    test -e "$native_garbage" || continue;
+    rm -rf -- "$native_garbage" || { echo 'failed to remove native Prodigy garbage' >&2; exit 1; };
+  done;
 fi)SH"_ctv);
 }
 

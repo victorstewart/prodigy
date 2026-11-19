@@ -470,9 +470,10 @@ static void testAsyncLocalBundleRecoveryWitnessRepair(TestSuite& suite)
 
   // Reproduce the post-upgrade deadlock: every current Neuron attests one
   // newer bundle, while the durable update-self coordinator still owns an
-  // all-machine terminal witness for the released predecessor. One captured
-  // bootstrap retains its UUID and canonical owner but no longer matches the
-  // deployment artifact authority, so it must never be projected.
+  // all-machine terminal witness for the released predecessor. The captured
+  // identities have canonical owners or fresh authenticated absence proofs.
+  // A fully projectable historical inventory must not prevent the dormant
+  // witness from retiring after the installed bundle has advanced.
   constexpr uint16_t retainedApplicationID = 63114;
   ApplicationDeployment retainedDeployment = {};
   retainedDeployment.plan = makeDeploymentPlan(retainedApplicationID, 1);
@@ -681,19 +682,17 @@ static void testAsyncLocalBundleRecoveryWitnessRepair(TestSuite& suite)
   brain.containers.insert_or_assign(
       retainedContainer.uuid, &retainedContainer);
 
-  NeuronContainerBootstrap staleBootstrap = {};
-  staleBootstrap.plan.uuid = retainedContainer.uuid;
-  staleBootstrap.plan.config = retainedDeployment.plan.config;
-  staleBootstrap.plan.fragment = retainedContainer.fragment;
-  staleBootstrap.plan.addresses = retainedContainer.addresses;
-  staleBootstrap.plan.config.containerBlobSHA256.assign(
-      "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"_ctv);
-  String serializedStaleBootstrap = {};
+  NeuronContainerBootstrap canonicalBootstrap = {};
+  canonicalBootstrap.plan.uuid = retainedContainer.uuid;
+  canonicalBootstrap.plan.config = retainedDeployment.plan.config;
+  canonicalBootstrap.plan.fragment = retainedContainer.fragment;
+  canonicalBootstrap.plan.addresses = retainedContainer.addresses;
+  String serializedCanonicalBootstrap = {};
   suite.require(
-      BitseryEngine::serialize(serializedStaleBootstrap, staleBootstrap),
-      "local_bundle_witness_repair_serializes_superseded_bootstrap");
+      BitseryEngine::serialize(serializedCanonicalBootstrap, canonicalBootstrap),
+      "local_bundle_witness_repair_serializes_canonical_superseded_bootstrap");
 
-  NeuronContainerBootstrap absentBootstrap = staleBootstrap;
+  NeuronContainerBootstrap absentBootstrap = canonicalBootstrap;
   absentBootstrap.plan.uuid = uint128_t(0x7308);
   absentBootstrap.plan.config = retainedDeployment.plan.config;
   String serializedAbsentBootstrap = {};
@@ -723,7 +722,7 @@ static void testAsyncLocalBundleRecoveryWitnessRepair(TestSuite& suite)
     witness.bundleRegistered = false;
     if (index == 0)
     {
-      witness.containerBootstraps.push_back(serializedStaleBootstrap);
+      witness.containerBootstraps.push_back(serializedCanonicalBootstrap);
       witness.containerBootstraps.push_back(serializedAbsentBootstrap);
       witness.containerBootstraps.push_back(
           serializedAbsentGatewayBootstrap);
@@ -752,6 +751,28 @@ static void testAsyncLocalBundleRecoveryWitnessRepair(TestSuite& suite)
   brain.masterAuthorityRuntimeStateDurable = true;
   brain.durableMasterAuthorityRuntimeStateGeneration =
       brain.masterAuthorityRuntimeState.generation;
+
+  String canonicalWitnessProjectionFailure = {};
+  suite.require(
+      brain.durableRecoveryWitnessBootstrapsProjectable(
+          &machines[0],
+          brain.updateSelfMachineRecoveryWitnesses.front().containerBootstraps,
+          canonicalWitnessProjectionFailure) &&
+          canonicalWitnessProjectionFailure.empty(),
+      "local_bundle_witness_repair_projects_fully_canonical_superseded_inventory");
+
+  // A durable update-self witness is historical recovery identity, not live
+  // gateway admission. Its connector source-port lease can be rebuilt only
+  // after this exact bootstrap gets the restarted Neuron far enough to send
+  // its inventory, so requiring the volatile live lease here deadlocks that
+  // recovery path.
+  String retainedGatewayWitnessFailure = {};
+  const Vector<String> retainedGatewayWitness = {serializedAbsentGatewayBootstrap};
+  suite.expect(
+      brain.durableRecoveryWitnessBootstrapsProjectable(
+          &machines[0], retainedGatewayWitness, retainedGatewayWitnessFailure) &&
+          retainedGatewayWitnessFailure.empty(),
+      "local_bundle_witness_projects_connector_gateway_without_current_runtime_lease");
 
   serializedAuthority.clear();
   authorityDigest.clear();
@@ -1069,7 +1090,7 @@ static void testAsyncLocalBundleRecoveryWitnessRepair(TestSuite& suite)
               completedJournal.receipts.back().scope),
       "local_bundle_witness_repair_commits_superseded_receipt_and_requeues_fresh_inventory");
 
-  // A completed superseded receipt must also retire the stale witness if an
+  // A completed superseded receipt must also retire the old witness if an
   // old local snapshot projects it again. Its cached bundle payload alone is
   // not an active coordinator: it belongs to the installed release, not the
   // superseded expected bundle recorded by the witness.

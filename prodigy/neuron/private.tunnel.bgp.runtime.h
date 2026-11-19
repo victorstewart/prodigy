@@ -363,8 +363,14 @@ public:
                  const ProdigyCrossClusterPrivateTunnelBGPDesiredState* state,
                  int gatewayNetworkNamespaceFD)
   {
-    if (state == nullptr || gatewayNetworkNamespaceFD < 0 || !sameDeliveredScope(authority))
+    if (state == nullptr || !sameDeliveredScope(authority))
     { if (pathFaultPaused) clearPaths(); else withdrawAll(); return false; }
+    // Neuron obtains this descriptor from the live gateway immediately before
+    // reconciliation. A transient acquisition failure removes any stale path
+    // and fallback while retaining only the authenticated in-memory scope for
+    // Neuron's tuple-bound retry; authority or scope loss above remains
+    // terminal and clears that scope too.
+    if (gatewayNetworkNamespaceFD < 0) { clearPaths(); return false; }
     ProdigyCrossClusterPrivateTunnelBGPDesiredState resolved = *state;
     Vault::secureClearString(resolved.sessionKey); resolved.sessionKey = deliveredSecret;
     if (!prodigyCrossClusterPrivateTunnelBGPMatchesAuthority(authority, readiness, resolved))
@@ -372,7 +378,8 @@ public:
     // Only an exact current tuple counts as retained.  A new generation may
     // keep the same pair identity while rotating the peer, key, or local /96;
     // treating that old UPDATE as current would suppress the required replace.
-    const bool currentlyAdvertised = paths.size() == 1 && paths[0].localPrefixAnnounced &&
+    const bool currentlyAdvertised = paths.size() == 1 &&
+        prodigyCrossClusterPrivateTunnelBGPPathUsable(paths[0]) &&
         paths[0].state.sessionKey == deliveredSecret &&
         prodigyCrossClusterPrivateTunnelBGPMatchesAuthority(authority, readiness, paths[0].state);
     ProdigyCrossClusterSiteBGPRoutePlan routePlan = {};
@@ -419,6 +426,11 @@ public:
     return true;
   }
   const Vector<ProdigyCrossClusterPrivateTunnelBGPPath>& desiredPaths(void) const { return paths; }
+  // The credential itself stays exclusively in this runtime owner.  A caller
+  // may only ask whether its currently-authoritative tuple still authorizes a
+  // transient transport-start retry.
+  bool deliveredScopeMatchesAuthority(const CrossClusterMasqueGatewayAuthority& authority) const
+  { return sameDeliveredScope(authority); }
   bool hasCrossClusterPathFault(const ProdigyCrossClusterPathFaultRequest& request) const
   { return pathFaultPaused && prodigyCrossClusterPathFaultRequestEqual(pathFaultRequest, request); }
 private:

@@ -13,7 +13,9 @@ bool globalSingleWriterControl(const ProdigyGlobalSingleWriterControl& q, Prodig
       r.operationUUID == q.operationUUID && r.localClusterUUID == q.localClusterUUID && r.containerUUID == q.containerUUID &&
       r.memberID == q.memberID && r.action == q.action && r.targetMemberID == q.targetMemberID &&
       (!q.generation || q.generation == r.generation) && (!q.bootNonce || q.bootNonce == r.bootNonce) &&
-      q.expectedCommittedConfigIndex == r.expectedCommittedConfigIndex && q.expectedCommittedConfigSHA256 == r.expectedCommittedConfigSHA256;
+      q.expectedCommittedConfigIndex == r.expectedCommittedConfigIndex && q.expectedCommittedConfigSHA256 == r.expectedCommittedConfigSHA256 &&
+      r.protocolVersion == q.protocolVersion && r.reservationTopic == q.reservationTopic &&
+      r.reservationRequestUUID == q.reservationRequestUUID && r.minimumAppliedIndex == q.minimumAppliedIndex;
 }
 
 static ProdigyGlobalSingleWriterControl memberCommand(const MothershipGlobalSingleWriterGroup& state, const GlobalSingleWriterMember& m) {
@@ -125,21 +127,38 @@ void configureGlobalSingleWriterGroup(int argc,char** argv) {
 void runGlobalSingleWriterControl(int argc,char** argv) {
   uint128_t groupID=0;
   uint64_t member=0;
-  if (argc!=3 || !globalSingleWriterHex(argv[0],groupID) || !mothershipParseUnsignedArgument(argv[2],INT32_MAX,member) || !member) {
-    basics_log("usage: globalSingleWriterControl GROUP inspect|provisionOnce MEMBER\n"); exit(EXIT_FAILURE);
+  const bool receiptInspection = argc == 6 && !std::strcmp(argv[1],"inspectReservation");
+  uint64_t topic = 0, minimumAppliedIndex = 0;
+  uint128_t requestUUID = 0;
+  if ((!receiptInspection && argc != 3) || !globalSingleWriterHex(argv[0],groupID) ||
+      !mothershipParseUnsignedArgument(argv[2],INT32_MAX,member) || !member ||
+      (receiptInspection && (!mothershipParseUnsignedArgument(argv[3],UINT16_MAX,topic) || !topic ||
+          !globalSingleWriterHex(argv[4],requestUUID) || !requestUUID ||
+          !mothershipParseUnsignedArgument(argv[5],UINT64_MAX,minimumAppliedIndex) || !minimumAppliedIndex))) {
+    basics_log("usage: globalSingleWriterControl GROUP inspect|provisionOnce MEMBER\n"
+               "       globalSingleWriterControl GROUP inspectReservation MEMBER TOPIC REQUEST_UUID MIN_APPLIED_INDEX\n"); exit(EXIT_FAILURE);
   }
   MothershipGlobalSingleWriterGroup state; String failure;
   { auto registry=openClusterRegistry(); if (!registry.loadGlobalSingleWriterGroup(groupID,state,&failure)) exit(EXIT_FAILURE); }
   auto m=std::find_if(state.group.members.begin(),state.group.members.end(),[&](const auto& m){return m.memberID==int32_t(member);});
   if (m==state.group.members.end()) exit(EXIT_FAILURE);
   ProdigyGlobalSingleWriterControl report{};
-  if (!globalSingleWriterControl(memberCommand(state,*m),report,failure)) { basics_log("global single-writer inspect failed: %s\n",failure.c_str()); exit(EXIT_FAILURE); }
-  if (!std::strcmp(argv[1],"provisionOnce")) {
+  if (receiptInspection) {
+    auto q=memberCommand(state,*m);
+    q.protocolVersion=2; q.action=GlobalSingleWriterControlAction::inspectReservation;
+    q.reservationTopic=uint16_t(topic); q.reservationRequestUUID=requestUUID; q.minimumAppliedIndex=minimumAppliedIndex;
+    if (!globalSingleWriterControl(q,report,failure)) { basics_log("global single-writer reservation inspect failed: %s\n",failure.c_str()); exit(EXIT_FAILURE); }
+  } else if (!globalSingleWriterControl(memberCommand(state,*m),report,failure)) {
+    basics_log("global single-writer inspect failed: %s\n",failure.c_str()); exit(EXIT_FAILURE);
+  }
+  if (!receiptInspection && !std::strcmp(argv[1],"provisionOnce")) {
     if (!provisionGlobalSingleWriter(state,*m,report,failure) || !globalSingleWriterControl(memberCommand(state,*m),report,failure)) exit(EXIT_FAILURE);
-  } else if (std::strcmp(argv[1],"inspect")) exit(EXIT_FAILURE);
-  basics_log("globalSingleWriterControl success=1 member=%d provisioned=%d leader=%d term=%llu config=%llu applied=%llu digest=%s\n",
+  } else if (!receiptInspection && std::strcmp(argv[1],"inspect")) exit(EXIT_FAILURE);
+  basics_log("globalSingleWriterControl success=1 member=%d provisioned=%d leader=%d term=%llu config=%llu applied=%llu digest=%s receiptTopic=%u receiptRequest=%016llx%016llx receiptMinimumApplied=%llu receiptFound=%u receiptDigest=%s\n",
       m->memberID,int(report.provisioned),report.leaderMemberID,(unsigned long long)report.term,
-      (unsigned long long)report.committedConfigIndex,(unsigned long long)report.appliedIndex,report.committedConfigSHA256.c_str());
+      (unsigned long long)report.committedConfigIndex,(unsigned long long)report.appliedIndex,report.committedConfigSHA256.c_str(),
+      unsigned(report.reservationTopic),(unsigned long long)(report.reservationRequestUUID>>64),(unsigned long long)report.reservationRequestUUID,
+      (unsigned long long)report.minimumAppliedIndex,unsigned(report.reservationFound),report.reservationDigest.c_str());
   for (const auto& member : report.members) {
     basics_log("globalSingleWriterCommittedMember member=%d role=%s cluster=%016llx%016llx container=%016llx%016llx reachable=%u caughtUp=%u\n",
         member.memberID, member.role == GlobalSingleWriterMemberRole::voter ? "voter" : "learner",

@@ -5,6 +5,86 @@
 #include <prodigy/persistent.state.h>
 #include <prodigy/container.contract.h>
 #include <prodigy/retained.container.recovery.h>
+#include <prodigy/neuron/neuron.h>
+
+#include <filesystem>
+#include <fstream>
+#include <sys/eventfd.h>
+#include <unistd.h>
+
+// This fixture deliberately stops before gateway recovery admission.  It
+// models the handoff after a Brain-control replacement: an exact retained
+// process still owns its cgroup, but it must not become restore-current until
+// the replacement stream supplies an authenticated stateUpload replay.
+class RetainedGatewayInventoryNeuron final : public Neuron {
+public:
+  String inventoryRoot = {};
+  NeuronBrainControlStream *retiredBrain = nullptr;
+
+  ~RetainedGatewayInventoryNeuron()
+  {
+    delete brain;
+    delete retiredBrain;
+  }
+
+  String containerCgroupInventoryRoot(void) const override { return inventoryRoot; }
+
+  bool installPendingRetainedGateway(const std::filesystem::path& root, uint128_t containerUUID,
+                                     pid_t pid)
+  {
+    inventoryRoot.assign(root.c_str());
+    brain = new NeuronBrainControlStream();
+    brain->connected = true;
+    brain->fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (brain->fd < 0) return false;
+
+    auto container = std::make_unique<Container>();
+    container->plan.uuid = containerUUID;
+    container->plan.system.kind = SystemContainerKind::crossClusterMasqueGateway;
+    container->name.assignItoa(containerUUID);
+    container->pid = pid;
+    const std::filesystem::path leaf = root / (std::to_string(uint64_t(containerUUID)) + ".slice") / "leaf";
+    container->cgroup = Filesystem::openDirectoryAt(-1, String(leaf.c_str()));
+    container->pidfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (container->cgroup < 0 || container->pidfd < 0) return false;
+
+    const uint64_t admission = beginPendingContainerLaunch(container->plan);
+    if (admission == 0) return false;
+    stateUploadRestoreEpoch = 1;
+    auto operation = std::make_unique<StateUploadRestoreOperation>();
+    operation->container = std::move(container);
+    operation->fragment = lcsubnet6;
+    operation->epoch = stateUploadRestoreEpoch;
+    operation->stream = brain;
+    operation->streamGeneration = brain->ioGeneration;
+    operation->requestedStream = brain;
+    operation->requestedGeneration = brain->ioGeneration;
+    operation->launchAdmissionGeneration = admission;
+    pendingStateUploadRestores.insert_or_assign(containerUUID, std::move(operation));
+    return true;
+  }
+
+  void replaceControlWithoutReplay(void)
+  {
+    fenceStateUploadRestoresForControl(brain);
+    resetContainerLaunchControlForBrainReplacement();
+    retiredBrain = brain;
+    brain = new NeuronBrainControlStream();
+    brain->connected = true;
+    brain->fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+  }
+
+  bool inventoryCompleteForTest(String& failure) const { return liveContainerInventoryComplete(failure); }
+
+  bool restoreStillFencedForTest(uint128_t containerUUID)
+  {
+    const auto found = pendingStateUploadRestores.find(containerUUID);
+    return found != pendingStateUploadRestores.end() && found->second != nullptr &&
+        found->second->container != nullptr &&
+        !stateUploadRestoreCurrent(*found->second, containerUUID) &&
+        crossClusterMasqueGatewayListenerForContainer(containerUUID) == nullptr;
+  }
+};
 
 static DeploymentPlan deployment(bool stateful)
 {
@@ -279,12 +359,41 @@ static void expectColdInventoryRejectsRetainedUnownedProcesses()
   std::filesystem::remove_all(root);
 }
 
+static void expectRetainedGatewayRemainsInventoryOwnedAcrossControlReplacement()
+{
+  const auto scratch = std::filesystem::current_path() / ".run";
+  std::filesystem::create_directories(scratch);
+  std::string temporary = (scratch / "prodigy-retained-gateway-inventory-XXXXXX").string();
+  char *created = mkdtemp(temporary.data());
+  assert(created != nullptr);
+  const std::filesystem::path root = created;
+  constexpr uint128_t containerUUID = uint128_t(0x7711);
+  constexpr pid_t retainedPID = 4242;
+  const auto leaf = root / "30481.slice" / "leaf";
+  std::filesystem::create_directories(leaf);
+  std::ofstream(root / "30481.slice" / "cgroup.events") << "populated 1\nfrozen 0\n";
+  std::ofstream(leaf / "cgroup.procs") << retainedPID << "\n";
+
+  RetainedGatewayInventoryNeuron neuron = {};
+  assert(neuron.installPendingRetainedGateway(root, containerUUID, retainedPID));
+  neuron.replaceControlWithoutReplay();
+
+  String failure = {};
+  // The exact pending launch/PID/cgroup still owns the observed process, so
+  // the first stateUpload must be eligible to report it to the replacement
+  // stream.  It remains restore-fenced until that authenticated replay.
+  assert(neuron.inventoryCompleteForTest(failure));
+  assert(neuron.restoreStillFencedForTest(containerUUID));
+  std::filesystem::remove_all(root);
+}
+
 int main()
 {
   expectGraphReplicaRecovery();
   expectGraphAllMastersRecovery();
   expectLegacyGraphWriterEgressRecovery();
   expectColdInventoryRejectsRetainedUnownedProcesses();
+  expectRetainedGatewayRemainsInventoryOwnedAcrossControlReplacement();
   expectCompactStartupCPURecovery();
   expectReplicaAndShardableRecovery();
   expectValidStateless();

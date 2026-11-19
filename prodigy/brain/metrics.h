@@ -3,6 +3,7 @@
 #include <networking/includes.h>
 #include <prodigy/types.h>
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cstring>
 #include <limits>
@@ -311,6 +312,23 @@ private:
   uint64_t headIndex = 0;
   uint64_t tailIndex = 0;
   int64_t newestMs = std::numeric_limits<int64_t>::min();
+  uint64_t ringIncarnation = nextIncarnation();
+
+  static uint64_t nextIncarnation(void)
+  {
+    // Cursors never cross a process boundary: persistent checkpoints carry
+    // their own generation. A process-local sequence avoids entropy/syscall
+    // cost while still invalidating destroyed or independently copied rings.
+    // Zero is reserved as an invalid lineage.
+    static std::atomic<uint64_t> next {1};
+    uint64_t result = next.fetch_add(1, std::memory_order_relaxed);
+    return result == 0 ? next.fetch_add(1, std::memory_order_relaxed) : result;
+  }
+
+  void invalidateLineage(void)
+  {
+    ringIncarnation = nextIncarnation();
+  }
 
   static uint32_t nextPowerOfTwo(uint32_t value)
   {
@@ -359,6 +377,9 @@ private:
 
     // Removing a whole table period preserves every physical block and offset.
     // No sample needs to move, including samples retained by a frozen view.
+    // Absolute indexes are the base+delta cursor. Renormalizing them changes
+    // their meaning, so later frozen captures must advertise a new lineage.
+    invalidateLineage();
     const uint64_t shift = headIndex & ~uint64_t(slotsMask);
     headIndex -= shift;
     tailIndex -= shift;
@@ -391,12 +412,33 @@ private:
 
 public:
 
+  MetricRing(const MetricRing& other)
+      : blocks(other.blocks), slotsMask(other.slotsMask), headIndex(other.headIndex),
+        tailIndex(other.tailIndex), newestMs(other.newestMs), ringIncarnation(nextIncarnation())
+  {}
+
+  MetricRing& operator=(const MetricRing& other)
+  {
+    if (this == &other) return *this;
+    blocks = other.blocks;
+    slotsMask = other.slotsMask;
+    headIndex = other.headIndex;
+    tailIndex = other.tailIndex;
+    newestMs = other.newestMs;
+    invalidateLineage();
+    return *this;
+  }
+
+  MetricRing(MetricRing&&) noexcept = default;
+  MetricRing& operator=(MetricRing&&) noexcept = default;
+
   class Frozen {
   private:
     std::vector<std::shared_ptr<const Block>> blocks;
     uint32_t slotsMask = 0;
     uint64_t headIndex = 0;
     uint64_t tailIndex = 0;
+    uint64_t ringIncarnation = 0;
     size_t retained = 0;
 
     size_t blockSlot(uint64_t index) const
@@ -406,9 +448,9 @@ public:
 
   public:
     Frozen(std::vector<std::shared_ptr<const Block>> requestedBlocks, uint32_t requestedMask,
-           uint64_t requestedHead, uint64_t requestedTail)
+           uint64_t requestedHead, uint64_t requestedTail, uint64_t requestedIncarnation)
         : blocks(std::move(requestedBlocks)), slotsMask(requestedMask), headIndex(requestedHead),
-          tailIndex(requestedTail)
+          tailIndex(requestedTail), ringIncarnation(requestedIncarnation)
     {
       retained = sizeof(Frozen) + 128 + blocks.capacity() * sizeof(std::shared_ptr<const Block>);
       for (const auto& block : blocks) if (block) retained += sizeof(Block) + 64;
@@ -416,15 +458,30 @@ public:
 
     size_t sampleCount(void) const { return size_t(tailIndex - headIndex); }
     size_t retainedBytes(void) const { return retained; }
+    uint64_t head(void) const { return headIndex; }
+    uint64_t tail(void) const { return tailIndex; }
+    uint64_t incarnation(void) const { return ringIncarnation; }
 
     template <typename Handler>
     void forEachSample(Handler&& handler) const
     {
-      for (uint64_t index = headIndex; index < tailIndex; ++index)
+      (void)forEachSampleFrom(headIndex, handler);
+    }
+
+    // A caller that has proved incarnation equality can serialize only the
+    // suffix appended after its last durable tail. Out-of-range cursors are
+    // rejected rather than silently replaying a partial generation.
+    template <typename Handler>
+    bool forEachSampleFrom(uint64_t index, Handler&& handler) const
+    {
+      if (index < headIndex || index > tailIndex) return false;
+      for (uint64_t current = index; current < tailIndex; ++current)
       {
-        const auto& block = blocks[blockSlot(index)];
-        handler(block->timestamps[index & (samplesPerBlock - 1)], block->values[index & (samplesPerBlock - 1)]);
+        const auto& block = blocks[blockSlot(current)];
+        handler(block->timestamps[current & (samplesPerBlock - 1)],
+                block->values[current & (samplesPerBlock - 1)]);
       }
+      return true;
     }
   };
 
@@ -508,6 +565,7 @@ public:
       headIndex = 0;
       tailIndex = 0;
       newestMs = std::numeric_limits<int64_t>::min();
+      invalidateLineage();
     }
     else
     {
@@ -556,7 +614,7 @@ public:
     std::vector<std::shared_ptr<const Block>> frozenBlocks;
     frozenBlocks.reserve(blocks.size());
     for (const auto& block : blocks) frozenBlocks.push_back(block);
-    return std::make_shared<const Frozen>(std::move(frozenBlocks), slotsMask, headIndex, tailIndex);
+    return std::make_shared<const Frozen>(std::move(frozenBlocks), slotsMask, headIndex, tailIndex, ringIncarnation);
   }
 };
 
@@ -583,6 +641,7 @@ public:
   public:
     size_t sampleCount(void) const { return samples; }
     size_t retainedBytes(void) const { return retained; }
+    const std::vector<SeriesView>& seriesViews(void) const { return views; }
 
     void exportSamples(Vector<ProdigyMetricSample>& out) const
     {

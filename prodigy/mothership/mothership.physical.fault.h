@@ -976,6 +976,25 @@ template<typename S> static void serialize(S&& s, MothershipLocalRecoveryWorkloa
   s.value4b(w.shardGroups); s.value4b(w.target); s.value4b(w.targetBase); s.value4b(w.targetSurge);
 }
 
+// Protocol five binds the immutable deployment material which survives a
+// degraded source report.  Keep it separate from the workload shape: a cold
+// stateful row may have no materialized shard counts, but it must still name
+// one exact plan/blob under one authority tuple.
+struct MothershipLocalRecoveryPlanBinding {
+  uint16_t applicationID = 0;
+  uint64_t deploymentID = 0;
+  String canonicalPlanSHA256, containerBlobSHA256;
+  uint64_t containerBlobBytes = 0, authorityGeneration = 0;
+  uint128_t masterUUID = 0;
+  int64_t masterBootNs = 0;
+};
+template<typename S> static void serialize(S&& s, MothershipLocalRecoveryPlanBinding& v) {
+  s.value2b(v.applicationID); s.value8b(v.deploymentID);
+  s.text1b(v.canonicalPlanSHA256,64); s.text1b(v.containerBlobSHA256,64);
+  s.value8b(v.containerBlobBytes); s.value8b(v.authorityGeneration);
+  s.value16b(v.masterUUID); s.value8b(v.masterBootNs);
+}
+
 // Version three retains the existing sealed recovery owner while replacing
 // the historical one-cohort literals with the already-durable upgrade
 // admission and exact observed workload identity.
@@ -1014,6 +1033,14 @@ template<typename S> static void serialize(S&& s, MothershipLocalRecoveryRuntime
   s.text1b(r.bundlePath,4096); s.text1b(r.targetContractSHA256,64);
   s.object(r.members); s.object(r.gateways);
 }
+struct MothershipLocalRecoveryGatewayProvenance {
+  String artifactSHA256, executableSHA256, provenanceSHA256;
+  uint64_t artifactBytes = 0, executableBytes = 0;
+};
+template<typename S> static void serialize(S&& s, MothershipLocalRecoveryGatewayProvenance& v) {
+  s.text1b(v.artifactSHA256,64); s.value8b(v.artifactBytes); s.text1b(v.executableSHA256,64);
+  s.value8b(v.executableBytes); s.text1b(v.provenanceSHA256,64);
+}
 
 class MothershipLocalAuthorityRecoveryCohortRequest {
 public:
@@ -1026,6 +1053,10 @@ public:
   // from producing its final authority receipt without discarding either
   // cohort's durable audit record.
   static constexpr uint32_t admittedRuntimeSupersedingUpgradeVersion = 4;
+  static constexpr uint32_t admittedRuntimePlanBoundUpgradeVersion = 5;
+  // Version six appends the existing v5 bindings to the v4 released-cohort
+  // successor contract; versions three through five retain their bytes.
+  static constexpr uint32_t admittedRuntimePlanBoundSupersedingUpgradeVersion = 6;
   uint32_t protocolVersion = version;
   uint128_t operationUUID = 0;
   uint128_t clusterUUID = 0;
@@ -1034,6 +1065,8 @@ public:
   Vector<MothershipLocalAuthorityRecoveryExecutor> executors;
   MothershipLocalRecoveryRuntimeIntent runtime;
   MothershipLocalAdmittedRuntimeUpgradeIdentity admittedRuntime;
+  Vector<MothershipLocalRecoveryPlanBinding> planBindings;
+  Vector<MothershipLocalRecoveryGatewayProvenance> gatewayProvenance;
 };
 template <typename S>
 static void serialize(S&& serializer, MothershipLocalAuthorityRecoveryCohortRequest& value)
@@ -1046,6 +1079,45 @@ static void serialize(S&& serializer, MothershipLocalAuthorityRecoveryCohortRequ
     serializer.object(value.runtime);
   if (value.protocolVersion >= MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion)
     serializer.object(value.admittedRuntime);
+  if (value.protocolVersion >= MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimePlanBoundUpgradeVersion)
+    serializer.object(value.planBindings);
+  // V6 appends the package-owner proof that maps every registered gateway
+  // artifact to the executable that must be observed in cgroups.
+  if (value.protocolVersion == MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimePlanBoundSupersedingUpgradeVersion)
+    serializer.object(value.gatewayProvenance);
+}
+
+static inline bool mothershipLocalRecoveryPlanBoundProtocolVersion(uint32_t protocolVersion)
+{
+  return protocolVersion == MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimePlanBoundUpgradeVersion ||
+      protocolVersion == MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimePlanBoundSupersedingUpgradeVersion;
+}
+
+static inline bool mothershipLocalRecoveryGatewayProvenanceValid(
+    const MothershipLocalAuthorityRecoveryCohortRequest& request)
+{
+  if (request.protocolVersion != MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimePlanBoundSupersedingUpgradeVersion)
+    return request.gatewayProvenance.empty();
+  if (request.gatewayProvenance.empty()) return false;
+  for (uint32_t index=0; index<request.gatewayProvenance.size(); ++index) {
+    const auto& proof=request.gatewayProvenance[index]; uint32_t authorities=0;
+    if (!prodigyIsSHA256HexDigest(proof.artifactSHA256) || !proof.artifactBytes ||
+        !prodigyIsSHA256HexDigest(proof.executableSHA256) || !proof.executableBytes ||
+        !prodigyIsSHA256HexDigest(proof.provenanceSHA256) ||
+        (index && (std::memcmp(proof.artifactSHA256.data(), request.gatewayProvenance[index-1].artifactSHA256.data(), 64) < 0 ||
+                   (request.gatewayProvenance[index-1].artifactSHA256 == proof.artifactSHA256 &&
+                    request.gatewayProvenance[index-1].artifactBytes >= proof.artifactBytes)))) return false;
+    for (const auto& authority:request.runtime.gateways)
+      authorities += authority.artifactSHA256 == proof.artifactSHA256 && authority.artifactBytes == proof.artifactBytes;
+    if (!authorities) return false;
+  }
+  for (const auto& authority:request.runtime.gateways) {
+    uint32_t matches=0;
+    for (const auto& proof:request.gatewayProvenance)
+      matches += authority.artifactSHA256 == proof.artifactSHA256 && authority.artifactBytes == proof.artifactBytes;
+    if (matches != 1) return false;
+  }
+  return true;
 }
 
 // Protocol-two records outlive the one release-specific recovery that created
@@ -1118,10 +1190,19 @@ static inline bool mothershipLocalRecoveryWorkloadIdentityValid(
       (value.stateful ? value.shardGroups != 0 : value.shardGroups == 0);
 }
 
+static inline bool mothershipLocalRecoveryWorkloadIdentityUnknown(
+    const MothershipLocalRecoveryWorkloadIdentity& value)
+{
+  return value.applicationID != 0 && value.deploymentID != 0 &&
+      uint16_t(value.deploymentID >> 48) == value.applicationID &&
+      value.shardGroups == 0 && value.target == 0 && value.targetBase == 0 &&
+      value.targetSurge == 0;
+}
+
 static inline bool mothershipLocalRecoveryWorkloadIdentityFromReport(
     uint16_t applicationID, const DeploymentStatusReport& deployment,
     MothershipLocalRecoveryWorkloadIdentity& identity,
-    bool allowUnmaterializedStateful = false)
+    bool allowUnmaterializedStateful = false, bool allowUnknownCounts = false)
 {
   if (deployment.versionID == 0 || deployment.versionID >= (uint64_t(1) << 48)) return false;
   identity.applicationID = applicationID;
@@ -1132,6 +1213,7 @@ static inline bool mothershipLocalRecoveryWorkloadIdentityFromReport(
   identity.targetBase = deployment.nTargetBase;
   identity.targetSurge = deployment.nTargetSurge;
   if (mothershipLocalRecoveryWorkloadIdentityValid(identity)) return true;
+  if (allowUnknownCounts && mothershipLocalRecoveryWorkloadIdentityUnknown(identity)) return true;
   // A released predecessor already owns the immutable shard intent. Its cold
   // source may not have reconstructed any runtime counts yet; this report-only
   // shape cannot become a durable identity or satisfy terminal verification.
@@ -1145,14 +1227,42 @@ static inline bool mothershipLocalRecoveryWorkloadIdentityFromReport(
       deployment.containerRuntimes.empty();
 }
 
+static inline bool mothershipLocalRecoveryPlanBindingsValid(
+    const MothershipLocalAuthorityRecoveryCohortRequest& request)
+{
+  if (!mothershipLocalRecoveryPlanBoundProtocolVersion(request.protocolVersion) ||
+      request.planBindings.size() != request.admittedRuntime.workloads.size() ||
+      request.planBindings.empty()) return false;
+  uint64_t generation = 0; uint128_t master = 0; int64_t boot = 0;
+  for (uint32_t index = 0; index < request.planBindings.size(); ++index) {
+    const auto& binding = request.planBindings[index];
+    const auto& workload = request.admittedRuntime.workloads[index];
+    if (binding.applicationID != workload.applicationID || binding.deploymentID != workload.deploymentID ||
+        !prodigyIsSHA256HexDigest(binding.canonicalPlanSHA256) ||
+        !prodigyIsSHA256HexDigest(binding.containerBlobSHA256) || binding.containerBlobBytes == 0 ||
+        binding.authorityGeneration == 0 || binding.masterUUID == 0 || binding.masterBootNs <= 0 ||
+        (index && (request.planBindings[index - 1].applicationID > binding.applicationID ||
+                   (request.planBindings[index - 1].applicationID == binding.applicationID &&
+                    request.planBindings[index - 1].deploymentID >= binding.deploymentID)))) return false;
+    if (!generation) { generation = binding.authorityGeneration; master = binding.masterUUID; boot = binding.masterBootNs; }
+    else if (generation != binding.authorityGeneration || master != binding.masterUUID || boot != binding.masterBootNs)
+      return false;
+  }
+  return generation == request.admittedRuntime.authorityGeneration && master == request.admittedRuntime.masterUUID &&
+      boot == request.admittedRuntime.masterBootNs;
+}
+
 static inline bool mothershipLocalAdmittedRuntimeUpgradeIdentityValid(
     const MothershipLocalAuthorityRecoveryCohortRequest& request)
 {
   const auto& runtime = request.runtime;
   const auto& identity = request.admittedRuntime;
   const bool superseding = request.protocolVersion ==
-      MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeSupersedingUpgradeVersion;
+      MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeSupersedingUpgradeVersion ||
+      request.protocolVersion == MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimePlanBoundSupersedingUpgradeVersion;
+  const bool planBound = mothershipLocalRecoveryPlanBoundProtocolVersion(request.protocolVersion);
   if ((request.protocolVersion != MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion &&
+       !planBound &&
        !superseding) ||
       request.clusterUUID == 0 || runtime.upgradeOperationUUID == 0 ||
       request.operationUUID == runtime.upgradeOperationUUID ||
@@ -1163,7 +1273,7 @@ static inline bool mothershipLocalAdmittedRuntimeUpgradeIdentityValid(
       !mothershipPhysicalFaultDigestValid(runtime.admissionSHA256) ||
       !mothershipPhysicalFaultSafeAbsolutePath(runtime.bundlePath) ||
       !mothershipPhysicalFaultDigestValid(runtime.targetContractSHA256) ||
-      runtime.members.size() != 3 || runtime.gateways.size() != 6 || request.executors.size() != 3 ||
+      runtime.members.size() != 3 || request.executors.size() != 3 ||
       !prodigyCrossClusterMasqueGatewayAuthoritiesValid(runtime.gateways, request.clusterUUID) ||
       !mothershipPhysicalFaultDigestValid(identity.sourceBundleSHA256) ||
       !mothershipPhysicalFaultDigestValid(identity.sourceContractSHA256) ||
@@ -1179,13 +1289,24 @@ static inline bool mothershipLocalAdmittedRuntimeUpgradeIdentityValid(
       identity.sourceBundleSHA256 == identity.targetBundleSHA256 || identity.authorityGeneration == 0 ||
       identity.masterUUID == 0 || identity.masterBootNs <= 0 ||
       !mothershipPhysicalFaultDigestValid(identity.semanticObservationSHA256) ||
-      identity.activeDeploymentCount == 0 || identity.activeDeploymentCount != identity.workloads.size()) return false;
+      identity.activeDeploymentCount == 0 || identity.activeDeploymentCount != identity.workloads.size() ||
+      (!planBound && !request.planBindings.empty())) return false;
   for (uint32_t index = 0; index < identity.workloads.size(); ++index) {
     const auto& workload = identity.workloads[index];
-    if (!mothershipLocalRecoveryWorkloadIdentityValid(workload) ||
+    if (!(mothershipLocalRecoveryWorkloadIdentityValid(workload) ||
+          (planBound && mothershipLocalRecoveryWorkloadIdentityUnknown(workload))) ||
         (index != 0 && (identity.workloads[index - 1].applicationID > workload.applicationID ||
           (identity.workloads[index - 1].applicationID == workload.applicationID &&
            identity.workloads[index - 1].deploymentID >= workload.deploymentID)))) return false;
+  }
+  if (planBound) for (uint32_t index = 0; index < runtime.gateways.size(); ++index) {
+    const auto& authority = runtime.gateways[index]; bool represented = false;
+    for (const auto& executor : request.executors) represented |= executor.machineUUID == authority.localMachineUUID;
+    if (!represented || authority.localClusterUUID != request.clusterUUID ||
+        authority.state != CrossClusterMasqueGatewayState::active ||
+        (index && (runtime.gateways[index - 1].pairUUID > authority.pairUUID ||
+                   (runtime.gateways[index - 1].pairUUID == authority.pairUUID &&
+                    runtime.gateways[index - 1].localMachineUUID >= authority.localMachineUUID)))) return false;
   }
   for (uint32_t index = 0; index < runtime.members.size(); ++index) {
     const auto& member = runtime.members[index];
@@ -1202,9 +1323,10 @@ static inline bool mothershipLocalAdmittedRuntimeUpgradeIdentityValid(
             authority.state != CrossClusterMasqueGatewayState::active) return false;
         ++gateways;
       }
-    if (gateways != 2) return false;
+    if (planBound ? (gateways < 1 || gateways > 2) : gateways != 2) return false;
   }
-  return true;
+  return (!planBound || mothershipLocalRecoveryPlanBindingsValid(request)) &&
+      mothershipLocalRecoveryGatewayProvenanceValid(request);
 }
 
 static inline bool mothershipLocalRecoveryRuntimeIntentValid(
@@ -1256,7 +1378,8 @@ static inline bool mothershipLocalRecoveryWorkloadsMatch(
     for (const auto& deployment : application.deploymentReports) {
       MothershipLocalRecoveryWorkloadIdentity identity;
       if (!mothershipLocalRecoveryWorkloadIdentityFromReport(
-              application.applicationID, deployment, identity)) return false;
+              application.applicationID, deployment, identity, false,
+              mothershipLocalRecoveryPlanBoundProtocolVersion(request.protocolVersion))) return false;
       observed.push_back(std::move(identity));
     }
   std::sort(observed.begin(), observed.end(), [](const auto& left, const auto& right) {
@@ -1271,6 +1394,41 @@ static inline bool mothershipLocalRecoveryWorkloadsMatch(
         left.stateful != right.stateful || left.shardGroups != right.shardGroups ||
         left.target != right.target || left.targetBase != right.targetBase ||
         left.targetSurge != right.targetSurge) return false;
+  }
+  return true;
+}
+
+static inline bool mothershipLocalRecoveryWorkloadsMaterialized(
+    const MothershipLocalAuthorityRecoveryCohortRequest& request,
+    const ClusterStatusReport& report)
+{
+  Vector<MothershipLocalRecoveryWorkloadIdentity> observed;
+  if (!mothershipLocalRecoveryPlanBoundProtocolVersion(request.protocolVersion) ||
+      report.nApplications != report.applicationReports.size()) return false;
+  for (const auto& application : report.applicationReports)
+    for (const auto& deployment : application.deploymentReports) {
+      MothershipLocalRecoveryWorkloadIdentity identity;
+      if (deployment.state != DeploymentState::running || deployment.nHealthy != deployment.nTarget ||
+          deployment.nDeployed != deployment.nTarget ||
+          !mothershipLocalRecoveryWorkloadIdentityFromReport(
+              application.applicationID, deployment, identity)) return false;
+      observed.push_back(std::move(identity));
+    }
+  std::sort(observed.begin(), observed.end(), [](const auto& left, const auto& right) {
+    return left.applicationID == right.applicationID ? left.deploymentID < right.deploymentID :
+        left.applicationID < right.applicationID;
+  });
+  if (observed.size() != request.admittedRuntime.workloads.size()) return false;
+  for (uint32_t index = 0; index < observed.size(); ++index) {
+    const auto& source = request.admittedRuntime.workloads[index];
+    const auto& target = observed[index];
+    if (source.applicationID != target.applicationID || source.deploymentID != target.deploymentID ||
+        source.stateful != target.stateful) return false;
+    if (mothershipLocalRecoveryWorkloadIdentityUnknown(source)) {
+      if (target.target == 0 || target.target != target.targetBase + target.targetSurge ||
+          (target.stateful ? target.shardGroups == 0 : target.shardGroups != 0)) return false;
+    } else if (source.shardGroups != target.shardGroups || source.target != target.target ||
+               source.targetBase != target.targetBase || source.targetSurge != target.targetSurge) return false;
   }
   return true;
 }
@@ -1312,7 +1470,8 @@ static inline bool mothershipLocalRecoveryWorkloadsCanRecoverTo(
       if (!mothershipLocalRecoveryWorkloadIdentityFromReport(
               application.applicationID, deployment, identity,
               request.protocolVersion == MothershipLocalAuthorityRecoveryCohortRequest::
-                  admittedRuntimeSupersedingUpgradeVersion)) return false;
+                  admittedRuntimeSupersedingUpgradeVersion,
+              mothershipLocalRecoveryPlanBoundProtocolVersion(request.protocolVersion))) return false;
       observed.push_back(std::move(identity));
     }
   std::sort(observed.begin(), observed.end(), [](const auto& left, const auto& right) {
@@ -1334,7 +1493,9 @@ static inline bool mothershipLocalAdmittedRuntimeUpgradeReportValid(
   if (!mothershipLocalAdmittedRuntimeUpgradeIdentityValid(request) || !report.hasTopology ||
       report.topology.version < request.topologyVersion || report.topology.machines.size() != 3 ||
       report.machineReports.size() != 3 || report.nMachines != 3 ||
-      !mothershipLocalRecoveryWorkloadsMatch(request, report)) return false;
+      !(completed && mothershipLocalRecoveryPlanBoundProtocolVersion(request.protocolVersion) ?
+          mothershipLocalRecoveryWorkloadsMaterialized(request, report) :
+          mothershipLocalRecoveryWorkloadsMatch(request, report))) return false;
   unsigned masters = 0;
   for (const auto& member : request.runtime.members) {
     unsigned topologyMatches = 0, reportMatches = 0;
@@ -1374,8 +1535,10 @@ static inline bool mothershipLocalAdmittedRuntimeUpgradeRecoverySourceReportVali
   if (!mothershipLocalAdmittedRuntimeUpgradeIdentityValid(request) || !report.hasTopology ||
       report.topology.version < request.topologyVersion || report.topology.machines.size() != 3 ||
       report.machineReports.size() != 3 || report.nMachines != 3 ||
-      !(request.protocolVersion ==
-            MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeSupersedingUpgradeVersion ?
+      !((request.protocolVersion ==
+            MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeSupersedingUpgradeVersion ||
+          request.protocolVersion ==
+            MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimePlanBoundSupersedingUpgradeVersion) ?
           mothershipLocalRecoveryWorkloadsCanRecoverTo(request, report) :
           mothershipLocalRecoveryWorkloadsMatch(request, report))) return false;
   unsigned masters = 0;
@@ -1433,7 +1596,9 @@ static inline bool mothershipLocalAuthorityRecoveryCohortEnvelopeValid(
   if ((value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRequest::version &&
        value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRequest::interruptedUpgradeVersion &&
        value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion &&
-       value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeSupersedingUpgradeVersion) ||
+       value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeSupersedingUpgradeVersion &&
+       value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimePlanBoundUpgradeVersion &&
+       value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimePlanBoundSupersedingUpgradeVersion) ||
       value.operationUUID == 0 || value.clusterUUID == 0 || value.topologyVersion == 0 ||
       value.timeoutMilliseconds < mothershipLocalAuthorityRecoveryMinimumTimeoutMilliseconds ||
       value.timeoutMilliseconds > mothershipLocalVMFaultMaximumRecoveryMilliseconds || value.executors.size() != 3)
@@ -1524,6 +1689,8 @@ public:
   static constexpr uint32_t interruptedUpgradeVersion = 2;
   static constexpr uint32_t admittedRuntimeUpgradeVersion = 3;
   static constexpr uint32_t admittedRuntimeSupersedingUpgradeVersion = 4;
+  static constexpr uint32_t admittedRuntimePlanBoundUpgradeVersion = 5;
+  static constexpr uint32_t admittedRuntimePlanBoundSupersedingUpgradeVersion = 6;
   uint32_t protocolVersion = version;
   MothershipLocalAuthorityRecoveryCohortRequest request;
   MothershipLocalAuthorityRecoveryPhase phase = MothershipLocalAuthorityRecoveryPhase::admitted;
@@ -1546,7 +1713,9 @@ static inline bool mothershipLocalAuthorityRecoveryCohortRecordValid(
   if ((value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRecord::version &&
        value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRecord::interruptedUpgradeVersion &&
        value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRecord::admittedRuntimeUpgradeVersion &&
-       value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRecord::admittedRuntimeSupersedingUpgradeVersion) ||
+       value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRecord::admittedRuntimeSupersedingUpgradeVersion &&
+       value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRecord::admittedRuntimePlanBoundUpgradeVersion &&
+       value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRecord::admittedRuntimePlanBoundSupersedingUpgradeVersion) ||
       value.protocolVersion != value.request.protocolVersion ||
       !mothershipLocalAuthorityRecoveryCohortEnvelopeValid(value.request, failure) ||
       !mothershipLocalAuthorityRecoveryPhaseValid(value.phase) || value.boundaries.size() != 3)
@@ -1615,8 +1784,9 @@ static inline bool mothershipLocalReleasedRuntimeRecoveryCanBeSuperseded(
     if (failure) failure->assign(reason);
     return false;
   };
-  if (successor.protocolVersion !=
-          MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeSupersedingUpgradeVersion ||
+  if ((successor.protocolVersion !=
+          MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeSupersedingUpgradeVersion &&
+       successor.protocolVersion != MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimePlanBoundSupersedingUpgradeVersion) ||
       predecessor.protocolVersion <
           MothershipLocalAuthorityRecoveryCohortRecord::admittedRuntimeUpgradeVersion ||
       predecessor.phase != MothershipLocalAuthorityRecoveryPhase::released ||
@@ -1646,6 +1816,19 @@ static inline bool mothershipLocalReleasedRuntimeRecoveryCanBeSuperseded(
         left.target != right.target || left.targetBase != right.targetBase ||
         left.targetSurge != right.targetSurge)
       return reject("superseding local runtime recovery changed the predecessor workload intent");
+  }
+  if (successor.protocolVersion == MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimePlanBoundSupersedingUpgradeVersion) {
+    if ((predecessor.request.protocolVersion != MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimePlanBoundUpgradeVersion &&
+         predecessor.request.protocolVersion != MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimePlanBoundSupersedingUpgradeVersion) ||
+        predecessor.request.planBindings.size() != successor.planBindings.size())
+      return reject("plan-bound superseding recovery is not bound to a plan-bound predecessor");
+    for (uint32_t index = 0; index < successor.planBindings.size(); ++index) {
+      const auto& left = predecessor.request.planBindings[index]; const auto& right = successor.planBindings[index];
+      if (left.applicationID != right.applicationID || left.deploymentID != right.deploymentID ||
+          left.canonicalPlanSHA256 != right.canonicalPlanSHA256 ||
+          left.containerBlobSHA256 != right.containerBlobSHA256 || left.containerBlobBytes != right.containerBlobBytes)
+        return reject("plan-bound superseding recovery changed predecessor plan or blob binding");
+    }
   }
   auto predecessorGateways = predecessor.request.runtime.gateways;
   auto successorGateways = successor.runtime.gateways;

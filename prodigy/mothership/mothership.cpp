@@ -5202,14 +5202,18 @@ static bool mothershipStartVirtualDatacenterProvider(const MothershipProdigyClus
   arguments.push_back(std::move(storageDeviceCount));
   arguments.push_back(std::move(storageDeviceMB));
   arguments.push_back(std::move(controlSocketPath));
-  if (cluster.test.spareMachineCount != 0 || requirePublicIngressMTU)
+  if (cluster.test.spareMachineCount != 0 || requirePublicIngressMTU || !cluster.test.fakePublicIngressSourcePreservingIPv4.empty())
   {
     arguments.emplace_back();
     arguments.back().assignItoa(cluster.test.spareMachineCount);
   }
-  if (requirePublicIngressMTU)
+  if (requirePublicIngressMTU || !cluster.test.fakePublicIngressSourcePreservingIPv4.empty())
   {
     arguments.push_back(std::move(bgpUnderlay));
+  }
+  if (!cluster.test.fakePublicIngressSourcePreservingIPv4.empty())
+  {
+    arguments.push_back(cluster.test.fakePublicIngressSourcePreservingIPv4);
   }
   // Launch first clears the previous disposable workspace. Publish new OS
   // material only afterward; the provider waits for the final ready receipt.
@@ -5251,6 +5255,17 @@ static bool mothershipFaultVirtualDatacenterProvider(
   arguments.emplace_back();
   arguments.back().assignItoa(upMs);
   return mothershipRunVirtualDatacenterProvider(std::move(arguments), failure);
+}
+
+static bool mothershipConfigureVirtualDatacenterPublicIngressSource(
+    const MothershipProdigyCluster& cluster, const String& previous, const String& source, String& receipt, String *failure = nullptr)
+{
+  Vector<String> arguments = {};
+  arguments.emplace_back("--configure-public-ingress-source"_ctv);
+  arguments.push_back(cluster.test.workspaceRoot);
+  arguments.push_back(previous);
+  arguments.push_back(source);
+  return mothershipRunVirtualDatacenterProvider(std::move(arguments), &receipt, failure, 1024, 30'000, true);
 }
 
 static bool mothershipRepairVirtualDatacenterTransport(const MothershipProdigyCluster& cluster,
@@ -10858,34 +10873,48 @@ private:
     return scope;
   }
 
+  bool queryCrossClusterMasqueGatewayReadiness(
+      const MothershipProdigyCluster& cluster, const CrossClusterMasqueGatewayAuthority& authority,
+      ProdigyCrossClusterMasqueGatewayReadinessResponse& response, bool& masqueReady,
+      bool& privateBGPReady, String& failure)
+  {
+    masqueReady = false; privateBGPReady = false;
+    const ProdigyPairPrivateBGPSecretScope scope = crossClusterPrivateBGPScope(authority);
+    if (!prodigyPairPrivateBGPSecretScopeValid(scope)) {
+      failure.assign("cross-cluster MASQUE readiness scope is invalid"_ctv); return false;
+    }
+    ProdigyCrossClusterMasqueGatewayReadinessQuery query = {}; query.scope = scope;
+    String clusterName = cluster.name;
+    if (!configureControlTarget(clusterName.c_str(), &failure) ||
+        !requestTopicRoundTrip(MothershipTopic::pullCrossClusterMasqueGatewayReadiness, query, response, failure)) return false;
+    if (response.protocolVersion != ProdigyCrossClusterMasqueGatewayReadinessResponse::version || !response.success) {
+      if (failure.empty()) failure.assign("cross-cluster MASQUE readiness query was rejected"_ctv); return false;
+    }
+    masqueReady = response.found && response.receipt.pairUUID == scope.pairUUID &&
+        response.receipt.localClusterUUID == scope.clusterUUID &&
+        response.receipt.localMachineUUID == scope.machineUUID && response.receipt.keyEpoch == scope.keyEpoch &&
+        response.receipt.authorityGeneration == scope.authorityGeneration &&
+        response.receipt.gatewayGeneration == scope.gatewayGeneration && response.receipt.authenticatedMasqueQUICReady;
+    privateBGPReady = response.privateBGPFound &&
+        prodigyPairPrivateBGPSecretScopeEqual(response.privateBGPReceipt.scope, scope) &&
+        prodigyCrossClusterPrivateBGPReadinessMatchesAuthority(response.privateBGPReceipt, authority) &&
+        prodigyCrossClusterPrivateBGPReady(response.privateBGPReceipt);
+    return true;
+  }
+
   bool waitForCrossClusterMasqueGatewayReadiness(const MothershipProdigyCluster& cluster,
                                                   const CrossClusterMasqueGatewayAuthority& authority, String& failure,
                                                   ProdigyCrossClusterMasqueGatewayReadiness *observed = nullptr,
                                                   ProdigyCrossClusterPrivateBGPReadiness *privateBGPObserved = nullptr,
                                                   bool requirePrivateBGP = true)
   {
-    const ProdigyPairPrivateBGPSecretScope scope = crossClusterPrivateBGPScope(authority);
-    if (!prodigyPairPrivateBGPSecretScopeValid(scope)) { failure.assign("cross-cluster MASQUE readiness scope is invalid"_ctv); return false; }
-    ProdigyCrossClusterMasqueGatewayReadinessQuery query = {}; query.scope = scope;
     String latestDiagnostic;
     bool lastFound = false, lastMasqueReady = false, lastPrivateBGPFound = false, lastPrivateBGPReady = false;
     for (unsigned attempt = 0; attempt < 30; ++attempt) {
-      String clusterName = cluster.name;
       ProdigyCrossClusterMasqueGatewayReadinessResponse response = {};
-      if (!configureControlTarget(clusterName.c_str(), &failure) || !requestTopicRoundTrip(MothershipTopic::pullCrossClusterMasqueGatewayReadiness, query, response, failure)) return false;
-      if (response.protocolVersion != ProdigyCrossClusterMasqueGatewayReadinessResponse::version || !response.success) {
-        if (failure.empty()) failure.assign("cross-cluster MASQUE readiness query was rejected"_ctv); return false;
-      }
+      bool masqueReady = false, privateBGPReady = false;
+      if (!queryCrossClusterMasqueGatewayReadiness(cluster, authority, response, masqueReady, privateBGPReady, failure)) return false;
       latestDiagnostic.assign(response.failure);
-      const bool masqueReady = response.found && response.receipt.pairUUID == scope.pairUUID &&
-          response.receipt.localClusterUUID == scope.clusterUUID &&
-          response.receipt.localMachineUUID == scope.machineUUID && response.receipt.keyEpoch == scope.keyEpoch &&
-          response.receipt.authorityGeneration == scope.authorityGeneration && response.receipt.gatewayGeneration == scope.gatewayGeneration &&
-          response.receipt.authenticatedMasqueQUICReady;
-      const bool privateBGPReady = response.privateBGPFound &&
-          prodigyPairPrivateBGPSecretScopeEqual(response.privateBGPReceipt.scope, scope) &&
-          prodigyCrossClusterPrivateBGPReadinessMatchesAuthority(response.privateBGPReceipt, authority) &&
-          prodigyCrossClusterPrivateBGPReady(response.privateBGPReceipt);
       lastFound = response.found; lastMasqueReady = masqueReady;
       lastPrivateBGPFound = response.privateBGPFound; lastPrivateBGPReady = privateBGPReady;
       if (masqueReady && (!requirePrivateBGP || privateBGPReady)) {
@@ -13669,6 +13698,33 @@ private:
                (unsigned long long)desiredCluster.topology.version,
                unsigned(desiredCluster.topology.machines.size()));
     printManagedCluster(desiredCluster);
+  }
+
+  void runConfigureTestClusterPublicIngressSource(int argc, char *argv[])
+  {
+    String identity = argc > 0 ? String(argv[0]) : String();
+    String requested = argc > 1 ? String(argv[1]) : String();
+    String failure = {}, receipt = {};
+    MothershipProdigyCluster cluster = {};
+    const bool valid = argc == 2 && (requested == "--disable"_ctv || (!requested.empty() && mothershipTestClusterPublicIngressSourcePreservingIPv4Valid(requested))) &&
+        loadClusterForScopedMutation("configureTestClusterPublicIngressSource", identity, cluster, failure) &&
+        cluster.deploymentMode == MothershipClusterDeploymentMode::test && cluster.test.enableFakeIpv4Boundary;
+    if (!valid) {
+      if (failure.empty()) failure.assign("usage: configureTestClusterPublicIngressSource [name|clusterUUID] [198.18.x.y|--disable]; requires test fake IPv4 boundary"_ctv);
+      basics_log("configureTestClusterPublicIngressSource success=0 identity=%s failure=%s\n", identity.c_str(), failure.c_str()); exit(EXIT_FAILURE);
+    }
+    if (requested == "--disable"_ctv) requested.clear();
+    if (!mothershipConfigureVirtualDatacenterPublicIngressSource(cluster, cluster.test.fakePublicIngressSourcePreservingIPv4, requested, receipt, &failure)) {
+      basics_log("configureTestClusterPublicIngressSource success=0 identity=%s failure=%s\n", identity.c_str(), failure.c_str()); exit(EXIT_FAILURE);
+    }
+    MothershipProdigyCluster desired = cluster; desired.test.fakePublicIngressSourcePreservingIPv4 = requested; desired.controls.clear();
+    MothershipClusterRegistry registry = openClusterRegistry(); MothershipProdigyCluster persisted = {};
+    if (!registry.upsertCluster(desired, &persisted, &failure)) {
+      String rollback = {}; (void)mothershipConfigureVirtualDatacenterPublicIngressSource(cluster, requested, cluster.test.fakePublicIngressSourcePreservingIPv4, rollback, nullptr);
+      basics_log("configureTestClusterPublicIngressSource success=0 identity=%s failure=persistence failed; provider rollback attempted: %s\n", identity.c_str(), failure.c_str()); exit(EXIT_FAILURE);
+    }
+    basics_log("%s", receipt.c_str());
+    basics_log("configureTestClusterPublicIngressSource success=1 identity=%s ipv4=%s\n", identity.c_str(), requested.c_str());
   }
 
   void runAdoptTestClusterSpare(int argc, char *argv[])
@@ -18148,7 +18204,31 @@ REMOTE_RUNTIME
     output.clear();
     if(target.localSeed) {
       bool detected=false;uint128_t local=0;
-      if(!resolveVerifiedDisposableLocalVMIdentity(detected,local,&failure) || !detected || local!=target.executor.machineUUID) {
+      if (!resolveVerifiedDisposableLocalVMIdentity(detected,local,&failure)) return false;
+      if (!detected) {
+        // A guest reboot clears /run. Re-establish the marker only through
+        // the sealed VM owner, which verifies KVM, DMI, and the saved SSH pin.
+        String immutable, starttime, machineID, bootID;
+        uint64_t pid = 0;
+        LocalVMGuestLinuxIdentity guest;
+        if (!queryLocalVMBoundaryExecutor(target.boundary, immutable, failure, &pid, &starttime) ||
+            immutable != target.boundary.immutableStateSHA256 ||
+            immutable != target.executor.immutableBoundarySHA256 ||
+            !queryLocalVMBoundaryGuestLinuxIdentity(target.boundary, guest, failure) ||
+            guest.qemuPID != pid || guest.qemuStarttime != starttime) {
+          if (failure.empty()) failure.assign("local runtime recovery seed boundary changed during verification"_ctv);
+          return false;
+        }
+        Filesystem::openReadAtClose(-1, String("/etc/machine-id"_ctv), machineID, 128);
+        Filesystem::openReadAtClose(-1, String("/proc/sys/kernel/random/boot_id"_ctv), bootID, 128);
+        if (!localRecoveryLine(machineID, 32) || !localRecoveryLine(bootID, 36) ||
+            machineID != guest.machineID || bootID != guest.bootID ||
+            !resolveVerifiedDisposableLocalVMIdentity(detected,local,&failure)) {
+          if (failure.empty()) failure.assign("local runtime recovery is outside the verified seed boot"_ctv);
+          return false;
+        }
+      }
+      if(!detected || local!=target.executor.machineUUID) {
         failure.assign("local runtime recovery is not executing in its exact registered seed guest"_ctv);return false;
       }
       if(uploadSource && (!uploadDestination || !prodigyRunLocalShellCommand(
@@ -18182,8 +18262,19 @@ REMOTE_RUNTIME
                                                    uint128_t machine,bool emptyOnly=false) {
     using namespace MothershipRetainedRecovery;
     InitialSeedRuntimeRepairManifest manifest;
-    manifest.gatewayExecutableSHA="fdc9fe507e486c1c74967558ac9733767612d0a725e45448329c6dc96c758cf5";
-    manifest.gatewayExecutableBytes=6441168;manifest.binding.gateways=request.runtime.gateways;
+    manifest.binding.gateways=request.runtime.gateways;
+    if (request.protocolVersion ==
+        MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimePlanBoundSupersedingUpgradeVersion) {
+      for (const auto& proof:request.gatewayProvenance) {
+        InitialSeedRuntimeRepairManifest::GatewayExecutable binding;
+        binding.artifactSHA256=proof.artifactSHA256;binding.artifactBytes=proof.artifactBytes;
+        binding.executableSHA256=proof.executableSHA256;binding.executableBytes=proof.executableBytes;
+        manifest.gatewayExecutables.push_back(std::move(binding));
+      }
+    } else {
+      manifest.gatewayExecutableSHA="fdc9fe507e486c1c74967558ac9733767612d0a725e45448329c6dc96c758cf5";
+      manifest.gatewayExecutableBytes=6441168;
+    }
     const auto empty=initialSeedRepairInventoryProgram(manifest,machine,false);
     if(emptyOnly)return empty;
     // Admitted active-runtime recovery owns ordinary application containers
@@ -18240,6 +18331,108 @@ LOCAL_RUNTIME
     } catch(const std::exception& e) {failure.assign(e.what());return false;}
   }
 
+  // The canonical plan is retained authority even when a degraded projection
+  // has not reconstructed shard counts. Observe the complete set in one stable
+  // authority epoch; the existing cohort still owns state preservation and launch.
+  bool readLocalRecoveryPlanBindings(const MothershipProdigyCluster& cluster,
+      const MothershipLocalAuthorityRecoveryCohortRequest& request,
+      const ClusterStatusReport& before, bool completed,
+      Vector<MothershipLocalRecoveryPlanBinding>& bindings, String& failure)
+  {
+    bindings.clear();
+    for (const auto& workload : request.admittedRuntime.workloads) {
+      DeploymentIdentityReport observed;
+      DeploymentPlan plan;
+      String canonical, digest;
+      if (!readDeploymentIdentity(cluster, workload.deploymentID, observed, failure, completed)) return false;
+      if (!prodigyDeploymentIdentityReportVersionSupported(observed.version, 2) ||
+          observed.applicationID != workload.applicationID ||
+          observed.versionID != (workload.deploymentID & 0x0000FFFFFFFFFFFFULL) ||
+          observed.isStateful != workload.stateful || observed.authorityGeneration == 0 ||
+          observed.masterUUID == 0 || observed.masterBootNs <= 0 ||
+          !BitseryEngine::deserializeSafe(observed.normalizedDeploymentPlan, plan) ||
+          !BitseryEngine::serialize(canonical, plan) || canonical != observed.normalizedDeploymentPlan ||
+          !prodigyComputeSHA256Hex(canonical, digest, &failure) || digest != observed.canonicalPlanSHA256 ||
+          plan.config.applicationID != workload.applicationID ||
+          plan.config.deploymentID() != workload.deploymentID || plan.isStateful != workload.stateful ||
+          plan.config.type != (workload.stateful ? ApplicationType::stateful : ApplicationType::stateless) ||
+          plan.config.containerBlobSHA256 != observed.containerBlobSHA256 ||
+          plan.config.containerBlobBytes != observed.containerBlobBytes || observed.containerBlobBytes == 0 ||
+          !mothershipPhysicalFaultDigestValid(observed.containerBlobSHA256)) {
+        failure.assign("local runtime recovery canonical deployment plan identity is invalid"_ctv); return false;
+      }
+      MothershipLocalRecoveryPlanBinding binding;
+      binding.applicationID = workload.applicationID; binding.deploymentID = workload.deploymentID;
+      binding.canonicalPlanSHA256 = digest; binding.containerBlobSHA256 = observed.containerBlobSHA256;
+      binding.containerBlobBytes = observed.containerBlobBytes;
+      binding.authorityGeneration = observed.authorityGeneration;
+      binding.masterUUID = observed.masterUUID; binding.masterBootNs = observed.masterBootNs;
+      if ((!bindings.empty() &&
+           (binding.authorityGeneration != bindings[0].authorityGeneration ||
+            binding.masterUUID != bindings[0].masterUUID || binding.masterBootNs != bindings[0].masterBootNs)) ||
+          (!completed && (binding.authorityGeneration != request.admittedRuntime.authorityGeneration ||
+            binding.masterUUID != request.admittedRuntime.masterUUID ||
+            binding.masterBootNs != request.admittedRuntime.masterBootNs)) ||
+          (completed && binding.authorityGeneration == request.admittedRuntime.authorityGeneration &&
+            binding.masterUUID == request.admittedRuntime.masterUUID &&
+            binding.masterBootNs == request.admittedRuntime.masterBootNs)) {
+        failure.assign("local runtime recovery plan observation changed authority; admit a fresh source snapshot"_ctv);
+        return false;
+      }
+      if (!request.planBindings.empty()) {
+        if (bindings.size() >= request.planBindings.size()) return false;
+        const auto& expected = request.planBindings[bindings.size()];
+        if (binding.applicationID != expected.applicationID || binding.deploymentID != expected.deploymentID ||
+            binding.canonicalPlanSHA256 != expected.canonicalPlanSHA256 ||
+            binding.containerBlobSHA256 != expected.containerBlobSHA256 ||
+            binding.containerBlobBytes != expected.containerBlobBytes) {
+          failure.assign("local runtime recovery changed a retained canonical deployment plan"_ctv); return false;
+        }
+      }
+      bindings.push_back(std::move(binding));
+    }
+    ClusterStatusReport after;
+    Vector<MothershipLocalRecoveryWorkloadIdentity> beforeWorkloads, afterWorkloads;
+    if (bindings.empty() || (!request.planBindings.empty() && bindings.size() != request.planBindings.size()) ||
+        !readManagedClusterStatus(cluster, after, failure) || !before.hasTopology || !after.hasTopology ||
+        !mothershipPhysicalFaultExactSerializedEqual(before.topology, after.topology) ||
+        !captureLocalRecoveryWorkloads(before, beforeWorkloads, failure, false, true) ||
+        !captureLocalRecoveryWorkloads(after, afterWorkloads, failure, false, true) ||
+        !mothershipPhysicalFaultExactSerializedEqual(beforeWorkloads, afterWorkloads) ||
+        before.machineReports.size() != after.machineReports.size()) {
+      if (failure.empty()) failure.assign("local runtime recovery workload inventory changed during plan observation"_ctv);
+      return false;
+    }
+    unsigned masters = 0;
+    String master; master.assignItoh(bindings[0].masterUUID);
+    for (const auto& prior : before.machineReports) {
+      unsigned matches = 0;
+      for (const auto& current : after.machineReports) if (prior.machineUUID == current.machineUUID) {
+        ++matches;
+        if (prior.currentMaster != current.currentMaster ||
+            prior.runningProdigyVersion != current.runningProdigyVersion ||
+            prior.approvedBundleSHA256 != current.approvedBundleSHA256 ||
+            (current.currentMaster && current.machineUUID != master)) {
+          failure.assign("local runtime recovery machine authority changed during plan observation"_ctv); return false;
+        }
+        masters += current.currentMaster;
+      }
+      if (matches != 1) return false;
+    }
+    if (masters != 1) return false;
+    // Re-pull the first plan after the closing census to fence an authority
+    // transition at the end of a multi-plan observation.
+    DeploymentIdentityReport fence;
+    if (!readDeploymentIdentity(cluster, bindings[0].deploymentID, fence, failure, completed) ||
+        fence.authorityGeneration != bindings[0].authorityGeneration ||
+        fence.masterUUID != bindings[0].masterUUID || fence.masterBootNs != bindings[0].masterBootNs ||
+        fence.canonicalPlanSHA256 != bindings[0].canonicalPlanSHA256) {
+      if (failure.empty()) failure.assign("local runtime recovery plan authority changed before snapshot closed"_ctv);
+      return false;
+    }
+    return true;
+  }
+
   bool localRecoveryRuntimeFreshAuthority(const MothershipProdigyCluster& cluster,
       const MothershipLocalAuthorityRecoveryCohortRequest& request,const ProdigyApprovedUpgradeBundle& bundle,
       bool completed,String& failure)
@@ -18255,6 +18448,18 @@ LOCAL_RUNTIME
     if(!statusRead || !mothershipLocalAuthorityRecoveryTopologyMatches(request,status.topology) || !statusValid) {
       if(failure.empty())failure.assign("local runtime recovery lacks its exact empty healthy runtime cohort"_ctv);
       return false;
+    }
+    if (mothershipLocalRecoveryPlanBoundProtocolVersion(request.protocolVersion)) {
+      Vector<MothershipLocalRecoveryPlanBinding> bindings;
+      if (!readLocalRecoveryPlanBindings(cluster, request, status, completed, bindings, failure)) return false;
+      Vector<CrossClusterMasqueGatewayAuthority> gateways;
+      {
+        auto registry = openClusterRegistry();
+        if (!registry.loadLocalRecoveryGateways(cluster.clusterUUID, gateways, &failure)) return false;
+      }
+      if (!mothershipPhysicalFaultExactSerializedEqual(gateways, request.runtime.gateways)) {
+        failure.assign("local runtime recovery active gateway inventory changed"_ctv); return false;
+      }
     }
     // Admission plus the direct per-VM observations owns the degraded source
     // boundary. A complete healthy authority report is mandatory again after
@@ -18317,7 +18522,7 @@ LOCAL_RUNTIME
 
   static bool captureLocalRecoveryWorkloads(const ClusterStatusReport& report,
       Vector<MothershipLocalRecoveryWorkloadIdentity>& workloads,String& failure,
-      bool allowUnmaterializedStateful = false)
+      bool allowUnmaterializedStateful = false, bool allowUnknownStateful = false)
   {
     workloads.clear();
     if(report.nApplications!=report.applicationReports.size()) {
@@ -18327,7 +18532,7 @@ LOCAL_RUNTIME
       for(const auto& deployment:application.deploymentReports) {
         MothershipLocalRecoveryWorkloadIdentity identity;
         if(!mothershipLocalRecoveryWorkloadIdentityFromReport(
-            application.applicationID,deployment,identity,allowUnmaterializedStateful)) {
+            application.applicationID,deployment,identity,allowUnmaterializedStateful,allowUnknownStateful)) {
           failure.assign("local runtime recovery observed a malformed deployment identity"_ctv);return false;
         }
         workloads.push_back(std::move(identity));
@@ -18349,19 +18554,30 @@ LOCAL_RUNTIME
 
   bool prepareLocalRecoveryRuntimeIntent(const MothershipProdigyCluster& cluster,
       const Vector<LocalAuthorityRecoveryTarget>& targets,const char *upgradeText,const char *bundleText,
-      const char *predecessorText,bool existing,MothershipLocalAuthorityRecoveryCohortRequest& request,
+      const char *predecessorText,const Vector<String>& provenancePaths,bool existing,MothershipLocalAuthorityRecoveryCohortRequest& request,
       ProdigyApprovedUpgradeBundle& bundle,String& failure)
   {
     using namespace MothershipTidesMigration;
     const std::string predecessorArgument=predecessorText;
     const std::string supersedingPrefix="--supersede-released-runtime=";
-    const bool supersedingRuntime=predecessorArgument.starts_with(supersedingPrefix);
+    const std::string planBoundSupersedingPrefix="--plan-bound-supersede-released-runtime=";
+    const bool planBoundSupersedingRuntime=predecessorArgument.starts_with(planBoundSupersedingPrefix);
+    const bool supersedingRuntime=predecessorArgument.starts_with(supersedingPrefix) || planBoundSupersedingRuntime;
+    const bool planBoundRuntime=std::strcmp(predecessorText,"--plan-bound-active-runtime")==0 || planBoundSupersedingRuntime;
     const bool admittedRuntime=std::strcmp(predecessorText,"--admitted-active-runtime")==0 ||
-        supersedingRuntime;
+        planBoundRuntime || supersedingRuntime;
+    auto readGatewayProvenance=[&](const String& path,String& bytes) {
+      try {
+        if(!mothershipPhysicalFaultSafeAbsolutePath(path)) return false;
+        MothershipRetainedRecovery::privateFile(str(path),1024*1024);
+        Filesystem::openReadAtClose(-1,path,bytes,1024*1024);
+        return !bytes.empty();
+      } catch(const std::exception& error) { failure.assign(error.what()); return false; }
+    };
     uint128_t upgrade=0,predecessor=0;
     if(!prodigyParseCanonicalHex128(String(upgradeText),upgrade) ||
         (supersedingRuntime && !prodigyParseCanonicalHex128(
-            String(predecessorArgument.substr(supersedingPrefix.size()).c_str()),predecessor)) ||
+            String(predecessorArgument.substr(planBoundSupersedingRuntime ? planBoundSupersedingPrefix.size() : supersedingPrefix.size()).c_str()),predecessor)) ||
         (!admittedRuntime && !prodigyParseCanonicalHex128(String(predecessorText),predecessor)))return false;
     if(!admittedRuntime && (upgrade!=mothershipLocalInterruptedUpgradeOperationUUID() ||
         predecessor!=mothershipLocalInterruptedUpgradePredecessorUUID() ||
@@ -18374,21 +18590,43 @@ LOCAL_RUNTIME
         bundle.contract.prodigySHA256!=mothershipLocalInterruptedUpgradeTargetRuntime))return false;
     auto& intent=request.runtime;
     if(existing) {
-      const uint32_t protocol=supersedingRuntime ?
+      const uint32_t protocol=planBoundSupersedingRuntime ?
+          MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimePlanBoundSupersedingUpgradeVersion : (supersedingRuntime ?
           MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeSupersedingUpgradeVersion :
           (admittedRuntime ? MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion :
-                             MothershipLocalAuthorityRecoveryCohortRequest::interruptedUpgradeVersion);
-      if(request.protocolVersion!=protocol ||
+                             MothershipLocalAuthorityRecoveryCohortRequest::interruptedUpgradeVersion));
+      const uint32_t expectedProtocol = planBoundSupersedingRuntime ?
+          MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimePlanBoundSupersedingUpgradeVersion :
+          (planBoundRuntime ? MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimePlanBoundUpgradeVersion : protocol);
+      if(request.protocolVersion!=expectedProtocol ||
           intent.upgradeOperationUUID!=upgrade || intent.predecessorRecoveryUUID!=predecessor ||
           intent.bundlePath!=path || intent.targetContractSHA256!=bundle.contract.contractSHA256 ||
           (admittedRuntime && (request.admittedRuntime.targetBundleSHA256!=bundle.bundleSHA256 ||
             request.admittedRuntime.targetProdigySHA256!=bundle.contract.prodigySHA256 ||
             request.admittedRuntime.targetMothershipSHA256!=bundle.contract.mothershipSHA256)))return false;
+      if (planBoundSupersedingRuntime) {
+        if (provenancePaths.size()!=request.gatewayProvenance.size()) return false;
+        Vector<uint8_t> seen(request.gatewayProvenance.size(),0);
+        for (const auto& path:provenancePaths) {
+          String bytes,sha;
+          if (!readGatewayProvenance(path,bytes) || !prodigyComputeSHA256Hex(bytes,sha,&failure)) return false;
+          int32_t matched=-1;
+          for(uint32_t index=0;index<request.gatewayProvenance.size();++index)
+            if(request.gatewayProvenance[index].provenanceSHA256==sha) {
+              if(matched>=0) return false; matched=index;
+            }
+          if(matched<0 || seen[matched]) return false;
+          seen[matched]=1;
+        }
+        for(uint8_t matched:seen) if(!matched) return false;
+      }
     } else {
-      request.protocolVersion=supersedingRuntime ?
-          MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeSupersedingUpgradeVersion :
-          (admittedRuntime ? MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion :
-                             MothershipLocalAuthorityRecoveryCohortRequest::interruptedUpgradeVersion);
+      request.protocolVersion=planBoundSupersedingRuntime ?
+          MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimePlanBoundSupersedingUpgradeVersion :
+          (planBoundRuntime ? MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimePlanBoundUpgradeVersion :
+          (supersedingRuntime ? MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeSupersedingUpgradeVersion :
+            (admittedRuntime ? MothershipLocalAuthorityRecoveryCohortRequest::admittedRuntimeUpgradeVersion :
+                               MothershipLocalAuthorityRecoveryCohortRequest::interruptedUpgradeVersion)));
       intent.upgradeOperationUUID=upgrade;intent.predecessorRecoveryUUID=predecessor;
       intent.bundlePath=path;intent.targetContractSHA256=bundle.contract.contractSHA256;
       MothershipUpgradeAdmissionRecord admission;MothershipLocalAuthorityRecoveryCohortRecord prior;
@@ -18401,6 +18639,40 @@ LOCAL_RUNTIME
       if(!localRecoveryObjectDigest(admission,intent.admissionSHA256,failure) ||
           ((!admittedRuntime || supersedingRuntime) &&
            !localRecoveryObjectDigest(prior,intent.predecessorRecoverySHA256,failure)))return false;
+      if (planBoundSupersedingRuntime) {
+        Vector<String> proofBytes;
+        if (provenancePaths.empty()) return false;
+        for (const auto& path : provenancePaths) {
+          String bytes;
+          if (!readGatewayProvenance(path,bytes)) return false;
+          proofBytes.push_back(std::move(bytes));
+        }
+        request.gatewayProvenance.clear();
+        for (const auto& authority : intent.gateways) {
+          bool already=false;
+          for (const auto& priorProof:request.gatewayProvenance)
+            already |= priorProof.artifactSHA256==authority.artifactSHA256 && priorProof.artifactBytes==authority.artifactBytes;
+          if (already) continue;
+          uint32_t matches=0; MothershipLocalRecoveryGatewayProvenance selected;
+          for (const auto& bytes:proofBytes) {
+            String executable,provenanceSHA,why; uint64_t executableBytes=0;
+            if (MothershipRetainedRecovery::parseGatewayExecutableProvenance(
+                    bytes,authority.artifactSHA256,authority.artifactBytes,executable,executableBytes,provenanceSHA,&why)) {
+              ++matches; selected.artifactSHA256=authority.artifactSHA256;selected.artifactBytes=authority.artifactBytes;
+              selected.executableSHA256=std::move(executable);selected.executableBytes=executableBytes;
+              selected.provenanceSHA256=std::move(provenanceSHA);
+            }
+          }
+          if (matches!=1) { failure.assign("local runtime recovery gateway provenance does not bind one registered artifact"_ctv); return false; }
+          request.gatewayProvenance.push_back(std::move(selected));
+        }
+        if (request.gatewayProvenance.size()!=proofBytes.size()) {
+          failure.assign("local runtime recovery gateway provenance has an extra or duplicate artifact proof"_ctv); return false;
+        }
+        std::sort(request.gatewayProvenance.begin(),request.gatewayProvenance.end(),[](const auto& a,const auto& b) {
+          return a.artifactSHA256==b.artifactSHA256 ? a.artifactBytes<b.artifactBytes : std::memcmp(a.artifactSHA256.data(),b.artifactSHA256.data(),64)<0;
+        });
+      }
       const bool normalAdmission=admission.eligible &&
           admission.approvedPath==uint8_t(MothershipUpgradePath::sameLogicalRollout);
       const bool recoveryAdmission=!admission.eligible &&
@@ -18433,7 +18705,7 @@ LOCAL_RUNTIME
         ClusterStatusReport status;
         Vector<MothershipLocalRecoveryWorkloadIdentity> observedWorkloads;
         if(!readManagedClusterStatus(cluster,status,failure) ||
-            !captureLocalRecoveryWorkloads(status,observedWorkloads,failure,supersedingRuntime))return false;
+            !captureLocalRecoveryWorkloads(status,observedWorkloads,failure,supersedingRuntime,planBoundRuntime))return false;
         if(supersedingRuntime) {
           if(observedWorkloads.size()!=prior.request.admittedRuntime.workloads.size()) {
             failure.assign("superseding local runtime recovery changed the predecessor deployment inventory"_ctv);
@@ -18471,6 +18743,11 @@ LOCAL_RUNTIME
         }
         if(observedMachines.size()!=targets.size()) {
           failure.assign("local runtime recovery cluster report lacks an exact machine inventory"_ctv);return false;
+        }
+        if (planBoundRuntime) {
+          Vector<MothershipLocalRecoveryPlanBinding> bindings;
+          if (!readLocalRecoveryPlanBindings(cluster, request, status, false, bindings, failure)) return false;
+          request.planBindings = std::move(bindings);
         }
       }
       for(uint32_t i=0;i<targets.size();++i) {
@@ -18636,12 +18913,21 @@ LOCAL_RUNTIME
     String failure = {};
     uint128_t operationUUID = 0;
     uint64_t timeout = 0;
-    const bool interruptedUpgrade=argc==7 && std::strcmp(argv[3],"--complete-interrupted-upgrade")==0;
-    bool valid = (argc == 3 || interruptedUpgrade) && prodigyParseCanonicalHex128(String(argv[0]), operationUUID) && operationUUID != 0 &&
+    const bool interruptedUpgrade=argc>=7 && std::strcmp(argv[3],"--complete-interrupted-upgrade")==0;
+    Vector<String> provenancePaths;
+    bool provenanceArguments=true;
+    if (interruptedUpgrade) for(int index=7;index<argc;++index) {
+      const std::string argument=argv[index],prefix="--gateway-provenance=";
+      if(!argument.starts_with(prefix) || argument.size()==prefix.size()) { provenanceArguments=false; break; }
+      provenancePaths.push_back(String(argument.substr(prefix.size()).c_str()));
+    }
+    const bool v6Argument=interruptedUpgrade && std::string(argv[6]).starts_with("--plan-bound-supersede-released-runtime=");
+    bool valid = (argc == 3 || (interruptedUpgrade && provenanceArguments &&
+        (v6Argument ? !provenancePaths.empty() : provenancePaths.empty()))) && prodigyParseCanonicalHex128(String(argv[0]), operationUUID) && operationUUID != 0 &&
         mothershipParseUnsignedArgument(argv[2], mothershipLocalVMFaultMaximumRecoveryMilliseconds, timeout) &&
         timeout >= mothershipLocalAuthorityRecoveryMinimumTimeoutMilliseconds;
     if (!valid)
-      failure.assign("usage: recoverLocalClusterAuthority OPERATION_UUID CLUSTER TIMEOUT_MS [--complete-interrupted-upgrade UPGRADE_OPERATION APPROVED_BUNDLE PREDECESSOR_RECOVERY|--admitted-active-runtime|--supersede-released-runtime=RECOVERY_OPERATION] (timeout must be 120000..300000)"_ctv);
+      failure.assign("usage: recoverLocalClusterAuthority OPERATION_UUID CLUSTER TIMEOUT_MS [--complete-interrupted-upgrade UPGRADE_OPERATION APPROVED_BUNDLE PREDECESSOR_RECOVERY [--gateway-provenance=PATH]...] (timeout must be 120000..300000)"_ctv);
 
     MothershipProdigyCluster cluster = {};
     if (valid)
@@ -18723,8 +19009,10 @@ LOCAL_RUNTIME
           request.protocolVersion=existingCohortRecord.request.protocolVersion;
           request.runtime=existingCohortRecord.request.runtime;
           request.admittedRuntime=existingCohortRecord.request.admittedRuntime;
+          request.planBindings=existingCohortRecord.request.planBindings;
+          request.gatewayProvenance=existingCohortRecord.request.gatewayProvenance;
         }
-        valid=prepareLocalRecoveryRuntimeIntent(cluster,targets,argv[4],argv[5],argv[6],existingCohort,
+        valid=prepareLocalRecoveryRuntimeIntent(cluster,targets,argv[4],argv[5],argv[6],provenancePaths,existingCohort,
                                                 request,repairBundle,failure);
         if(!valid && failure.empty())failure.assign("local runtime recovery admission or artifact binding failed"_ctv);
       }
@@ -30183,10 +30471,12 @@ LOCAL_RUNTIME
       for (const auto& member : report.statefulRuntimeCohort) {
         const auto* selected = nametagSourceCutMember(report, member.shardGroup);
         auto receipt = member.nativeSourceCutReceipt;
-        basics_log("deploymentIdentitySeedMember shardGroup=%u shardGroups=%u storeKind=%u containerUUID=%016llx%016llx machineUUID=%016llx%016llx writable=%u clientServing=%u allMasters=%u sourceCutSelected=%u receiptValid=%u receiptProtocol=%u receiptState=%u receiptSeedGeneration=%llu receiptSiblingHealthy=%u receiptCutMaterialized=%u receiptHeadsDominateCut=%u receiptContentSHA256=%s receiptHeadsSHA256=%s\n",
+        basics_log("deploymentIdentitySeedMember shardGroup=%u shardGroups=%u storeKind=%u containerUUID=%016llx%016llx machineUUID=%016llx%016llx seededFromClusterUUID=%016llx%016llx seededFromContainerUUID=%016llx%016llx writable=%u clientServing=%u allMasters=%u sourceCutSelected=%u receiptValid=%u receiptProtocol=%u receiptState=%u receiptSeedGeneration=%llu receiptSiblingHealthy=%u receiptCutMaterialized=%u receiptHeadsDominateCut=%u receiptContentSHA256=%s receiptHeadsSHA256=%s\n",
             unsigned(member.shardGroup), unsigned(report.nShardGroups), unsigned(member.storeKind),
             (unsigned long long)(member.containerUUID >> 64), (unsigned long long)member.containerUUID,
             (unsigned long long)(member.machineUUID >> 64), (unsigned long long)member.machineUUID,
+            (unsigned long long)(member.seededFromClusterUUID >> 64), (unsigned long long)member.seededFromClusterUUID,
+            (unsigned long long)(member.seededFromContainerUUID >> 64), (unsigned long long)member.seededFromContainerUUID,
             unsigned(member.writable), unsigned(member.clientServing), unsigned(member.allMasters),
             unsigned(member.allMasters || selected == &member),
             unsigned(prodigyStatefulStoreReceiptValid(receipt)), unsigned(receipt.protocolVersion), unsigned(receipt.state),
@@ -30551,6 +30841,8 @@ LOCAL_RUNTIME
   {
     String action = {}, failure = {};
     CrossClusterMasqueGatewayAuthority authority = {}, recorded = {};
+    ProdigyCrossClusterMasqueGatewayReadinessResponse readiness = {};
+    bool masqueReady = false, privateBGPReady = false, readinessQueried = false;
     bool resumed = false;
     bool valid = argc >= 1;
     if (valid) action.assign(argv[0]);
@@ -30738,26 +31030,34 @@ LOCAL_RUNTIME
         }
       }
     }
-    else if (valid && (action == "query"_ctv || action == "withdraw"_ctv))
+    else if (valid && (action == "query"_ctv || action == "readiness"_ctv || action == "withdraw"_ctv))
     {
       uint128_t pairUUID = 0, localMachineUUID = 0;
-      valid = argc == (action == "query"_ctv ? 3 : 4) && parseUUID(argv[1], pairUUID) && parseUUID(argv[2], localMachineUUID);
+      valid = argc == (action == "withdraw"_ctv ? 4 : 3) && parseUUID(argv[1], pairUUID) && parseUUID(argv[2], localMachineUUID);
       uint64_t generation = 0;
       MothershipProdigyCluster localCluster = {};
-      {
+      if (valid) {
         MothershipClusterRegistry registry = openClusterRegistry();
-        if (valid && action == "query"_ctv)
+        if (valid && (action == "query"_ctv || action == "readiness"_ctv))
           valid = registry.loadCrossClusterMasqueGateway(pairUUID, localMachineUUID, recorded, &failure);
         else if (valid) {
           valid = parseUnsigned(argv[3], UINT64_MAX, generation) &&
               registry.loadCrossClusterMasqueGateway(pairUUID, localMachineUUID, recorded, &failure) &&
               (recorded.state == CrossClusterMasqueGatewayState::active ||
                (recorded.state == CrossClusterMasqueGatewayState::withdrawn && recorded.generation == generation));
-          if (valid) {
-            String clusterIdentity = {}; clusterIdentity.assignItoh(recorded.localClusterUUID);
-            valid = registry.getClusterByIdentity(clusterIdentity, localCluster, &failure);
-          }
         }
+        if (valid && (action == "readiness"_ctv || action == "withdraw"_ctv)) {
+          String clusterIdentity = {}; clusterIdentity.assignItoh(recorded.localClusterUUID);
+          valid = registry.getClusterByIdentity(clusterIdentity, localCluster, &failure);
+        }
+      }
+      if (valid && action == "readiness"_ctv) {
+        valid = recorded.state == CrossClusterMasqueGatewayState::active &&
+            queryCrossClusterMasqueGatewayReadiness(localCluster, recorded, readiness, masqueReady, privateBGPReady, failure);
+        readinessQueried = valid;
+        valid = valid && masqueReady && privateBGPReady;
+        if (!valid && failure.empty())
+          failure.assign("cross-cluster MASQUE readiness receipt is absent, stale, or lacks private-BGP /96 readiness"_ctv);
       }
       if (valid && action == "withdraw"_ctv && recorded.state == CrossClusterMasqueGatewayState::active) {
         // The Neuron's receipt means its private BGPHub peer, fallback and
@@ -30782,7 +31082,7 @@ LOCAL_RUNTIME
     else valid = false;
 
     if (!valid && failure.empty()) failure.assign(
-        "usage: crossClusterMasqueGateway configure|configurePair PAIR_OPERATION_UUID LOCAL_MACHINE_UUID PEER_MACHINE_UUID listener|connector LISTENER_UDP_IP LISTENER_UDP_PORT ARTIFACT_SHA256 ARTIFACT_BYTES LOCAL_ID_SHA256 PEER_ID_SHA256 PEER_TRUST_SHA256 GENERATION [ARTIFACT_BLOB] [--slots GATEWAY_SLOT TUNNEL_SLOT] | query PAIR_UUID LOCAL_MACHINE_UUID | withdraw PAIR_UUID LOCAL_MACHINE_UUID GENERATION"_ctv);
+        "usage: crossClusterMasqueGateway configure|configurePair PAIR_OPERATION_UUID LOCAL_MACHINE_UUID PEER_MACHINE_UUID listener|connector LISTENER_UDP_IP LISTENER_UDP_PORT ARTIFACT_SHA256 ARTIFACT_BYTES LOCAL_ID_SHA256 PEER_ID_SHA256 PEER_TRUST_SHA256 GENERATION [ARTIFACT_BLOB] [--slots GATEWAY_SLOT TUNNEL_SLOT] | query|readiness PAIR_UUID LOCAL_MACHINE_UUID | withdraw PAIR_UUID LOCAL_MACHINE_UUID GENERATION"_ctv);
     basics_log("crossClusterMasqueGateway success=%u action=%s pairUUID=%016llx%016llx localMachineUUID=%016llx%016llx generation=%llu state=%u resumed=%u failure=%s\n",
         unsigned(valid), action.c_str(), (unsigned long long)(recorded.pairUUID >> 64), (unsigned long long)recorded.pairUUID,
         (unsigned long long)(recorded.localMachineUUID >> 64), (unsigned long long)recorded.localMachineUUID,
@@ -30799,6 +31099,24 @@ LOCAL_RUNTIME
           (unsigned long long)(recorded.peerMachineUUID >> 64), (unsigned long long)recorded.peerMachineUUID,
           unsigned(recorded.gatewaySlot), unsigned(recorded.tunnelSlot), recorded.privateTunnelInterface.c_str(),
           localPrefix.c_str(), unsigned(recorded.localSitePrefix.cidr), peerPrefix.c_str(), unsigned(recorded.peerSitePrefix.cidr));
+    }
+    if (action == "readiness"_ctv && readinessQueried)
+    {
+      String localPrefix, peerPrefix;
+      (void)ClusterMachine::renderIPAddressLiteral(recorded.localSitePrefix.network, localPrefix);
+      (void)ClusterMachine::renderIPAddressLiteral(recorded.peerSitePrefix.network, peerPrefix);
+      basics_log("crossClusterMasqueGatewayReadiness found=%u masqueReady=%u privateBGPFound=%u privateBGPReady=%u pairUUID=%016llx%016llx localClusterUUID=%016llx%016llx localMachineUUID=%016llx%016llx peerMachineUUID=%016llx%016llx keyEpoch=%llu authorityGeneration=%llu gatewayGeneration=%llu gatewaySlot=%u tunnelSlot=%u localSitePrefix=%s/%u peerSitePrefix=%s/%u announced=%u established=%u imported=%u fallback=%u diagnostic=%s\n",
+          unsigned(readiness.found), unsigned(masqueReady), unsigned(readiness.privateBGPFound), unsigned(privateBGPReady),
+          (unsigned long long)(readiness.receipt.pairUUID >> 64), (unsigned long long)readiness.receipt.pairUUID,
+          (unsigned long long)(readiness.receipt.localClusterUUID >> 64), (unsigned long long)readiness.receipt.localClusterUUID,
+          (unsigned long long)(readiness.receipt.localMachineUUID >> 64), (unsigned long long)readiness.receipt.localMachineUUID,
+          (unsigned long long)(recorded.peerMachineUUID >> 64), (unsigned long long)recorded.peerMachineUUID,
+          (unsigned long long)readiness.receipt.keyEpoch, (unsigned long long)readiness.receipt.authorityGeneration,
+          (unsigned long long)readiness.receipt.gatewayGeneration,
+          unsigned(recorded.gatewaySlot), unsigned(recorded.tunnelSlot), localPrefix.c_str(), unsigned(recorded.localSitePrefix.cidr),
+          peerPrefix.c_str(), unsigned(recorded.peerSitePrefix.cidr),
+          unsigned(readiness.privateBGPReceipt.localSitePrefixAnnounced), unsigned(readiness.privateBGPReceipt.sessionEstablished),
+          unsigned(readiness.privateBGPReceipt.peerSitePrefixImported), unsigned(readiness.privateBGPReceipt.switchboardFallbackInstalled), readiness.failure.c_str());
     }
     if (!valid) exit(EXIT_FAILURE);
   }
@@ -39097,6 +39415,7 @@ public:
         {"clusterReport",                   &Mothership::runClusterReport                  },
         {"configureGlobalSingleWriterGroup",             &Mothership::configureGlobalSingleWriterGroup                },
         {"configureLocalVMClusterLANIPv6",  &Mothership::runConfigureLocalVMClusterLANIPv6 },
+        {"configureTestClusterPublicIngressSource", &Mothership::runConfigureTestClusterPublicIngressSource},
         {"containerLogs",                   &Mothership::runContainerLogs                  },
         {"cousinPermission",                &Mothership::runCousinPermission               },
         {"cousinRoute",                     &Mothership::runCousinRoute                    },
@@ -39317,7 +39636,6 @@ int main(int argc, char *argv[])
     message.append("adoptTestClusterSpare [name|clusterUUID]\n\tsubmits the configured SSH spare to ordinary Brain AddMachines and exits; observe native durable acceptance and cluster readiness separately\n");
     message.append("migrateTidesDB9To10 [private versioned plan JSON path] [optional rollback before activation]\n");
     message.append("recoverTestClusterBundle [name|clusterUUID] [approved bundle] [machineIndex] [expected installed bundle SHA256] [optional expected incomplete worker bundle SHA256 for sole Brain]\n");
-    message.append("\tadopts an exact retained test-provider owner and replaces one worker while preserving descendant cgroups; application health must be observed separately\n");
     message.append("repairTestClusterStorageMounts CLUSTER MACHINE_INDEX --check|--apply CSV_CONTAINER_UUIDS\n");
     message.append("\tverifies the selected Btrfs storage mounts on a replacement test machine and, with --apply, reattaches missing mounts to their original volumes\n");
     message.append("recoverTestClusterFollowerBrain [name|clusterUUID] [approved target bundle] [machineIndex] [expected installed source bundle SHA256] [optional test fault phase]\n");
@@ -39327,7 +39645,7 @@ int main(int argc, char *argv[])
     message.append("faultLocalClusterMachine [operationUUID] [localVMBoundaryUUID] cold-reboot [timeoutMs]\n");
     message.append("faultLocalClusterMachine [operationUUID] [localVMBoundaryUUID] recover-unready-upgrade [timeoutMs] [upgradeOperationUUID] [approvedTargetBundle]\n");
     message.append("\tcold-reboots one exact registered VM in a three-Brain deploymentMode=local cluster and proves its new healthy boot identity; the recovery form additionally requires an exact admitted peer-inventory phase and a newer complete post-reboot inventory\n");
-    message.append("recoverLocalClusterAuthority [operationUUID] [cluster] [timeoutMs] [--complete-interrupted-upgrade upgradeOperation approvedBundle predecessorRecovery|--admitted-active-runtime|--supersede-released-runtime=recoveryOperation]\n");
+    message.append("recoverLocalClusterAuthority [operationUUID] [cluster] [timeoutMs] [--complete-interrupted-upgrade upgradeOperation approvedBundle predecessorRecovery|--admitted-active-runtime|--plan-bound-active-runtime|--supersede-released-runtime=recoveryOperation|--plan-bound-supersede-released-runtime=recoveryOperation]\n");
     message.append("rearmRetainedStatefulDeployment [cluster] [proof JSON|-|@path]\n");
     message.append("\tdurably re-arms only the exact target-zero, two-member all-masters deployment named by an immutable three-machine authority proof\n");
     message.append("repairLocalBundleRecoveryWitness [cluster] [operation UUID] --query|--retire [scope SHA256]\n");
@@ -39413,7 +39731,7 @@ int main(int argc, char *argv[])
     message.append("cousinPermission [target: local|clusterName|clusterUUID] [install JSON|query UUID|revoke UUID|discover UUID SLOT]\n");
     message.append("cousinRoute [put PAIR_OPERATION_UUID JSON|query ROUTE_UUID|recover ROUTE_UUID]\n");
     message.append("\tpersists one permission-bound TCP route generation and applies or resumes both enrolled cluster halves\n");
-    message.append("crossClusterMasqueGateway [configure|configurePair PAIR_OPERATION_UUID LOCAL_MACHINE_UUID PEER_MACHINE_UUID listener|connector LISTENER_UDP_IP LISTENER_UDP_PORT ARTIFACT_SHA256 ARTIFACT_BYTES LOCAL_ID_SHA256 PEER_ID_SHA256 PEER_TRUST_SHA256 GENERATION [ARTIFACT_BLOB] [--slots GATEWAY_SLOT TUNNEL_SLOT]|query PAIR_UUID LOCAL_MACHINE_UUID|withdraw PAIR_UUID LOCAL_MACHINE_UUID GENERATION]\n");
+    message.append("crossClusterMasqueGateway [configure|configurePair PAIR_OPERATION_UUID LOCAL_MACHINE_UUID PEER_MACHINE_UUID listener|connector LISTENER_UDP_IP LISTENER_UDP_PORT ARTIFACT_SHA256 ARTIFACT_BYTES LOCAL_ID_SHA256 PEER_ID_SHA256 PEER_TRUST_SHA256 GENERATION [ARTIFACT_BLOB] [--slots GATEWAY_SLOT TUNNEL_SLOT]|query|readiness PAIR_UUID LOCAL_MACHINE_UUID|withdraw PAIR_UUID LOCAL_MACHINE_UUID GENERATION]\n");
     message.append("\tconfigurePair derives and stages both reciprocal enrolled-pair authorities before either readiness wait; an optional artifact blob is verified and stored as the dedicated gateway kind\n");
     message.append("transportCredentialLifecycle [clusterName|clusterUUID] [operationUUID canonical hex] [query|request brain|neuron rotate|revoke nodeUUID canonical hex]\n");
     message.append("\trequests a new epoch from the originating cluster, or observes both sides; clusters negotiate and finish autonomously\n");

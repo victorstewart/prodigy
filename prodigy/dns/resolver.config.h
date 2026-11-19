@@ -106,7 +106,9 @@ inline bool configure(const ContainerParameters& parameters,
 
    for (const Whitehole& whitehole : parameters.whiteholes)
    {
-      if (whitehole.source != ExternalAddressSource::hostPublicAddress ||
+      if ((whitehole.source != ExternalAddressSource::hostPublicAddress &&
+           !(whitehole.family == ExternalAddressFamily::ipv4 &&
+             whitehole.source == ExternalAddressSource::registeredRoutablePrefix)) ||
           nonces.emplace(whitehole.bindingNonce).second == false)
       {
          return fail("DNS resolver whitehole source or nonce is invalid"_ctv);

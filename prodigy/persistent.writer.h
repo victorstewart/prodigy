@@ -270,7 +270,7 @@ public:
   {
     if (!value.metricCapture) return retainedBytesFor<ProdigyPersistentBrainSnapshot>(value);
     // Measure the ordinary schema with its empty flat vector, then charge the
-    // immutable graph, worker-only flat vector and encoded sample bytes. No
+    // immutable graph, checkpoint frame and encoded sample bytes. No
     // live sample is visited, copied or serialized for admission accounting.
     struct RestoreCapture {
       ProdigyPersistentBrainSnapshot& snapshot;
@@ -281,17 +281,14 @@ public:
     const uint64_t base = retainedBytesFor<ProdigyPersistentBrainSnapshot>(value);
     const uint64_t count = restore.capture->sampleCount();
     if (!base || count > UINT32_MAX) return 0;
-    using Context = std::tuple<PointerLinkingContext>;
-    Context context;
-    bitsery::Serializer<bitsery::BasicMeasureSize<FastConfig>, Context> measure {context};
-    ProdigyMetricSample sample = {};
-    measure.object(sample);
-    measure.adapter().flush();
-    // Five bytes conservatively cover the schema's variable count prefix.
-    const uint64_t perSample = sizeof(ProdigyMetricSample) + 3 * measure.adapter().writtenBytesCount();
+    // Admit the worst case (a base rollover), even if this generation becomes
+    // a tiny delta. Each point holds a timestamp and value. Allow alignment,
+    // frame encoding, output growth, and transient per-series cursor entries.
     const uint64_t captured = restore.capture->retainedBytes();
-    if (captured > maximumRetainedBytes / 2 || count > maximumRetainedBytes / perSample) return 0;
-    const uint64_t extra = captured * 2 + count * perSample + 15;
+    const uint64_t series = restore.capture->seriesViews().size();
+    constexpr uint64_t perSample = sizeof(ProdigyMetricCheckpointPoint) + 3 * (sizeof(int64_t) + sizeof(float));
+    if (captured > maximumRetainedBytes / 2 || series > UINT32_MAX) return 0;
+    const uint64_t extra = 2 * captured + count * perSample + 512 * series + 32;
     if (extra > maximumRetainedBytes || base > maximumRetainedBytes - extra) return 0;
     return base + extra;
   }

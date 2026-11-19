@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <future>
 #include <limits.h>
 #include <pwd.h>
 #include <random>
@@ -209,6 +210,28 @@ static inline void prodigyEnsureMachineHardwareCommandSigchldWaitable(void)
   (void)prodigyEnsureSigchldDefaultWaitable();
 }
 
+// Keep probe settings local to a report. Its bounded network worker borrows
+// the same immutable environment and finishes before the owning scope exits.
+class ProdigyHardwareInventoryShell final {
+  String exported;
+  std::vector<char *> entries;
+  static inline thread_local char **active = nullptr;
+  char **previous = active;
+
+public:
+  ProdigyHardwareInventoryShell() = default;
+  explicit ProdigyHardwareInventoryShell(char **environment) { active = environment; }
+  ProdigyHardwareInventoryShell(const ProdigyHardwareInventoryShell&) = delete;
+  ProdigyHardwareInventoryShell& operator=(const ProdigyHardwareInventoryShell&) = delete;
+  static char **environment() { return active; }
+  bool start();
+  ~ProdigyHardwareInventoryShell()
+  {
+    active = previous;
+    if (exported.size()) explicit_bzero(exported.data(), exported.size());
+  }
+};
+
 static inline bool prodigyDecodeMachineHardwareCommandStatus(int rawStatus, int savedErrno, int *exitStatus = nullptr, String *failure = nullptr)
 {
   if (exitStatus)
@@ -365,7 +388,9 @@ static inline bool prodigyRunBlockingLocalCommandCaptureStdout(const String& com
       const_cast<char *>(ownedCommand.c_str()),
       nullptr};
   extern char **environ;
-  int spawnRC = (spawnSetupRC == 0) ? posix_spawn(&pid, shellPath, &actions, &attrs, argv, environ) : spawnSetupRC;
+  char **probeEnvironment = ProdigyHardwareInventoryShell::environment();
+  int spawnRC = (spawnSetupRC == 0) ? posix_spawn(&pid, shellPath, &actions, &attrs, argv,
+                                                  probeEnvironment ? probeEnvironment : environ) : spawnSetupRC;
   if (actionsInitialized)
   {
     posix_spawn_file_actions_destroy(&actions);
@@ -623,6 +648,11 @@ static inline bool prodigyRunRecordedLocalCommand(
 
 static inline void prodigyAppendCommandPrefix(String& command, uint32_t timeoutSeconds)
 {
+  if (ProdigyHardwareInventoryShell::environment())
+  {
+    command.snprintf<"timeout --preserve-status -k 1s {itoa}s sh -c "_ctv>(timeoutSeconds);
+    return;
+  }
   command.assign("env"_ctv);
 
   String homeDirectory = {};
@@ -657,6 +687,40 @@ static inline void prodigyAppendMachineHardwareShellSingleQuoted(String& command
     }
   }
   command.append("'"_ctv);
+}
+
+inline bool ProdigyHardwareInventoryShell::start()
+{
+  if (active) return true;
+  entries.clear();
+  String command;
+  prodigyAppendCommandPrefix(command, 4);
+  // A snapshot can reproduce exported variables. If a profile also changes
+  // process limits, umask, cwd, or command resolution, keep running it.
+  prodigyAppendMachineHardwareShellSingleQuoted(command,
+      "[ . -ef /proc/$PPID/cwd ] && [ \"$(umask)\" = \"$1\" ] && "
+      "[ \"$(command -v sh)\" -ef \"$2\" ] && [ \"$(command -v timeout)\" -ef \"$3\" ] && "
+      "/usr/bin/cmp -s /proc/$$/limits /proc/$PPID/limits || exit 1; "
+      "for t in lscpu dmidecode strings lsblk lspci ip ethtool nvidia-smi timeout sh; do "
+      "command -v \"$t\" || :; done | while IFS= read -r path; do "
+      "case $path in /*) ;; *) exit 1;; esac; done || exit 1; "
+      "printf 'prodigy-env\\000'; exec /usr/bin/env -0"_ctv);
+  command.append(" inventory \"$(umask)\" \"$(command -v sh)\" \"$(command -v timeout)\""_ctv);
+  if (!prodigyRunBlockingLocalCommandCaptureStdout(command, exported, nullptr, nullptr)) return false;
+  constexpr char marker[] = "prodigy-env";
+  if (exported.size() <= sizeof(marker) || memcmp(exported.data(), marker, sizeof(marker)) != 0) return false;
+  char *cursor = reinterpret_cast<char *>(exported.data()) + sizeof(marker);
+  char *end = reinterpret_cast<char *>(exported.data()) + exported.size();
+  while (cursor < end)
+  {
+    char *nul = static_cast<char *>(memchr(cursor, 0, end - cursor));
+    if (!nul || *cursor == '=' || !memchr(cursor, '=', nul - cursor)) return false;
+    entries.push_back(cursor);
+    cursor = nul + 1;
+  }
+  entries.push_back(nullptr);
+  active = entries.data();
+  return true;
 }
 
 static inline bool prodigyReadCPUModelName(String& model)
@@ -3754,12 +3818,25 @@ static inline void prodigyCollectMachineHardwareProfile(MachineHardwareProfile& 
   hardware = {};
   hardware.collectedAtMs = Time::now<TimeResolution::ms>();
 
+  ProdigyHardwareInventoryShell shell;
+  std::future<void> networkProbe;
+  if (options.allowLocalCommands && !options.collectOptionalBenchmarks && shell.start())
+  {
+    // The network and device probes write disjoint sections. Allow deferred
+    // execution if a second worker cannot be started on a constrained node.
+    networkProbe = std::async(std::launch::async | std::launch::deferred,
+        [env = shell.environment(), &hardware, &options] {
+          ProdigyHardwareInventoryShell workerShell(env);
+          prodigyCollectNicInventory(hardware.network, options);
+        });
+  }
   prodigyCollectCpuHardwareProfile(hardware.cpu, options);
   prodigyCollectMemoryHardwareProfile(hardware.memory, hardware.cpu, options);
   bool haveDisks = prodigyCollectDiskInventory(hardware.disks, hardware.captures, options);
   prodigyAppendDevContainerStorageMountPaths(hardware.disks);
-  prodigyCollectNicInventory(hardware.network, options);
+  if (!networkProbe.valid()) prodigyCollectNicInventory(hardware.network, options);
   prodigyCollectGpuInventory(hardware.gpus, options);
+  if (networkProbe.valid()) networkProbe.get();
 
   bool haveNetworkAddressing = false;
   for (const MachineNicHardwareProfile& nic : hardware.network.nics)

@@ -1215,6 +1215,19 @@ int main(void)
     suite.expect(prodigyGlobalSingleWriterCommittedConfigDigest(report.membershipUUID,report.deploymentID,report.committedConfigIndex,
         report.members,report.committedConfigSHA256) && prodigyGlobalSingleWriterControlReportValid(report),
         "non_truth_committed_quorum_report_valid");
+    auto receiptReport = report;
+    receiptReport.protocolVersion = 2;
+    receiptReport.action = GlobalSingleWriterControlAction::inspectReservation;
+    receiptReport.reservationTopic = 1;
+    receiptReport.reservationRequestUUID = 71;
+    receiptReport.minimumAppliedIndex = receiptReport.appliedIndex;
+    receiptReport.reservationFound = true;
+    receiptReport.reservationDigest.assign("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
+    suite.expect(prodigyGlobalSingleWriterControlReportValid(receiptReport),
+        "global_receipt_report_v2_preserves_member_bound_applied_proof");
+    receiptReport.reservationDigest.clear();
+    suite.expect(!prodigyGlobalSingleWriterControlReportValid(receiptReport),
+        "global_receipt_report_requires_digest_when_receipt_exists");
     ++report.deploymentID;
     suite.expect(!prodigyGlobalSingleWriterControlReportValid(report), "global report digest binds exact deployment");
     auto successor = group;
@@ -1823,6 +1836,28 @@ int main(void)
     globalControl.deploymentID = (uint64_t(42) << 48) | 1;
     globalControl.memberID = 1;
     suite.expect(prodigyGlobalSingleWriterControlRequestValid(globalControl), "global_single_writer_control_fixture_is_valid_request");
+    auto receiptControl = globalControl;
+    receiptControl.protocolVersion = 2;
+    receiptControl.action = GlobalSingleWriterControlAction::inspectReservation;
+    receiptControl.reservationTopic = 1;
+    receiptControl.reservationRequestUUID = 77;
+    receiptControl.minimumAppliedIndex = 9;
+    suite.expect(prodigyGlobalSingleWriterControlRequestValid(receiptControl),
+        "global_receipt_inspection_v2_request_is_member_bound");
+    String receiptControlPayload = {};
+    ProdigyGlobalSingleWriterControl restoredReceiptControl = {};
+    suite.expect(BitseryEngine::serialize(receiptControlPayload, receiptControl) &&
+        BitseryEngine::deserializeSafe(receiptControlPayload, restoredReceiptControl) &&
+        restoredReceiptControl.protocolVersion == 2 &&
+        restoredReceiptControl.action == GlobalSingleWriterControlAction::inspectReservation &&
+        restoredReceiptControl.reservationTopic == receiptControl.reservationTopic &&
+        restoredReceiptControl.reservationRequestUUID == receiptControl.reservationRequestUUID &&
+        restoredReceiptControl.minimumAppliedIndex == receiptControl.minimumAppliedIndex &&
+        prodigyGlobalSingleWriterControlRequestValid(restoredReceiptControl),
+        "global_receipt_inspection_v2_roundtrips_without_reframing_v1");
+    receiptControl.protocolVersion = 1;
+    suite.expect(!prodigyGlobalSingleWriterControlRequestValid(receiptControl),
+        "global_receipt_inspection_rejects_v1_reflection");
     String globalControlPayload = {};
     suite.expect(BitseryEngine::serialize(globalControlPayload, globalControl), "global_single_writer_control_fixture_encodes");
     frame.clear(); Message::construct(frame, MothershipTopic::globalSingleWriterControl, globalControlPayload);

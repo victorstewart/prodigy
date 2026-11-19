@@ -132,11 +132,24 @@ static void testRuntimeConfig(TestSuite& suite)
    suite.expect(ProdigyDns::configure(duplicate, config) == false,
                 "dns_config_rejects_duplicate_whitehole");
 
+   ContainerParameters registeredIPv4 = validParameters();
+   for (Whitehole& whitehole : registeredIPv4.whiteholes)
+   {
+      if (whitehole.family == ExternalAddressFamily::ipv4)
+      {
+         whitehole.source = ExternalAddressSource::registeredRoutablePrefix;
+      }
+   }
+   suite.expect(ProdigyDns::configure(registeredIPv4, config) &&
+                    endpointsAreExact(config.backend.udpBinds) &&
+                    endpointsAreExact(config.backend.tcpBinds),
+                "dns_config_accepts_registered_ipv4_source");
+
    ContainerParameters wrongSource = validParameters();
-   wrongSource.whiteholes[0].source =
+   wrongSource.whiteholes[2].source =
        ExternalAddressSource::registeredRoutablePrefix;
    suite.expect(ProdigyDns::configure(wrongSource, config) == false,
-                "dns_config_rejects_non_host_public_source");
+                "dns_config_rejects_registered_ipv6_source");
 
    ContainerParameters wrongFamily = validParameters();
    wrongFamily.whiteholes[0].address = IPAddress("2001:db8::99", true);

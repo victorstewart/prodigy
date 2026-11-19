@@ -1868,7 +1868,35 @@ struct InitialSeedRuntimeRepairManifest {
   MothershipPopulatedSeedRuntimeRepairProof populatedProof;
   std::string successorBundleSHA,successorRuntimeSHA,gatewayArtifactSHA,gatewayExecutableSHA;
   uint64_t gatewayArtifactBytes=0,gatewayExecutableBytes=0;
+  struct GatewayExecutable { String artifactSHA256, executableSHA256; uint64_t artifactBytes=0, executableBytes=0; };
+  Vector<GatewayExecutable> gatewayExecutables;
 };
+
+inline bool parseGatewayExecutableProvenance(const String& bytes,const String& expectedArtifact,uint64_t expectedBytes,
+                                             String& executable,uint64_t& executableBytes,String& provenanceSHA,String *failure=nullptr) {
+  if (failure) failure->clear(); executable.clear(); executableBytes=0; provenanceSHA.clear();
+  try {
+  simdjson::dom::parser parser; simdjson::dom::element doc;
+  if (parser.parse(bytes.data(),bytes.size()).get(doc)!=simdjson::SUCCESS ||
+      text(field(doc,"schema"))!="prodigy.gateway-executable-provenance.v1"_ctv ||
+      text(field(doc,"builder"))!="Discombobulator"_ctv ||
+      text(field(doc,"artifactKind"))!="cross-cluster-masque-gateway"_ctv ||
+      text(field(doc,"executePath"))!="/gateway/masque-tunnel"_ctv ||
+      text(field(doc,"artifactSHA256"))!=expectedArtifact) {
+    if(failure)failure->assign("gateway executable provenance shape differs from the approved package owner"_ctv);return false;
+  }
+  uint64_t artifactBytes=0,bytesValue=0;
+  if (doc["artifactBytes"].get_uint64().get(artifactBytes)!=simdjson::SUCCESS || artifactBytes!=expectedBytes ||
+      doc["executableBytes"].get_uint64().get(bytesValue)!=simdjson::SUCCESS || !bytesValue ||
+      !prodigyIsSHA256HexDigest(text(field(doc,"executableSHA256"))) ||
+      !prodigyComputeSHA256Hex(bytes,provenanceSHA,failure)) {
+    if(failure && failure->empty())failure->assign("gateway executable provenance identity is invalid"_ctv);return false;
+  }
+  executable=text(field(doc,"executableSHA256")); executableBytes=bytesValue; return true;
+  } catch (const std::exception&) {
+    if(failure)failure->assign("gateway executable provenance is malformed"_ctv);return false;
+  }
+}
 inline InitialSeedRuntimeRepairManifest parseInitialSeedRepairManifest(const std::string& file,Execution& e) {
   privateFile(file); simdjson::dom::parser parser; simdjson::dom::element doc;
   auto bytes=read(file); require(parser.parse(bytes).get(doc)==simdjson::SUCCESS,"invalid initial seed repair manifest");
@@ -1976,16 +2004,22 @@ inline InitialSeedRuntimeRepairManifest parseInitialSeedRepairManifest(const std
 inline std::string initialSeedRepairInventoryProgram(const InitialSeedRuntimeRepairManifest& m,uint128_t machine,
                                                     bool gatewaysPresent=true,bool populatedPresent=false,
                                                     bool ignoreUnrelatedProcesses=false,bool allowAbsentGateways=false) {
-  std::string config="{\"sha256\":"+repairJSON(m.gatewayExecutableSHA)+",\"bytes\":"+std::to_string(m.gatewayExecutableBytes)+",\"authorities\":[";
+  std::string config="{\"authorities\":[";
   bool comma=false;
   for (const auto& authority:m.binding.gateways) if (gatewaysPresent && authority.localMachineUUID==machine) {
     SystemContainerRuntimePlan plan; plan.kind=SystemContainerKind::crossClusterMasqueGateway;
     Vector<String> environment;
     require(prodigyBindCrossClusterMasqueGatewayRuntimePlanAuthority(plan,authority) &&
             prodigyAppendCrossClusterMasqueGatewayAuthorityEnvironment(plan,environment),"gateway environment authority invalid");
-    if (comma) config+=","; comma=true; config+="[";
+    String executable=text(m.gatewayExecutableSHA);uint64_t executableBytes=m.gatewayExecutableBytes;
+    for(const auto& binding:m.gatewayExecutables)
+      if(binding.artifactSHA256==authority.artifactSHA256 && binding.artifactBytes==authority.artifactBytes) {
+        executable=binding.executableSHA256;executableBytes=binding.executableBytes;break;
+      }
+    require(prodigyIsSHA256HexDigest(executable) && executableBytes,"gateway executable binding missing");
+    if (comma) config+=","; comma=true; config+="{\"env\":[";
     for (uint32_t i=0;i<environment.size();++i) { if(i)config+=","; config+=repairJSON(str(environment[i])); }
-    config+="]";
+    config+="],\"sha256\":"+repairJSON(str(executable))+",\"bytes\":"+std::to_string(executableBytes)+"}";
   }
   config+="],\"pulse\":";
   if(populatedPresent && m.populatedSeed && machine==m.populatedProof.pulseMachineUUID) {
@@ -2007,8 +2041,8 @@ inline std::string initialSeedRepairInventoryProgram(const InitialSeedRuntimeRep
   config+="}";
   return "python3 - "+quote(config)+R"PY( <<'ISRR_PY'
 import hashlib,json,os,pathlib,re,sys
-cfg=json.loads(sys.argv[1]); expected=[dict(v.split('=',1) for v in a) for a in cfg['authorities']]
-assert len(expected) in (0,2)
+cfg=json.loads(sys.argv[1]); expected=[(dict(v.split('=',1) for v in a['env']),a['sha256'],a['bytes']) for a in cfg['authorities']]
+assert len(expected) in (0,1,2)
 pulse=cfg['pulse']; pulse_seen=False
 ignore_unrelated=cfg['ignoreUnrelatedProcesses']; allow_absent=cfg['allowAbsentGateways']
 assert not allow_absent or (ignore_unrelated and expected and not pulse)
@@ -2064,14 +2098,14 @@ for directory,dirs,files in os.walk(root,followlinks=False):
             rows.append({'cgroup':relative,'pid':int(pid),'startTicks':start,'exeSHA256':executable,
                          'parametersSHA256':pulse['paramsSHA256'],'storage':pulse['storage'],'kind':'initialPulse'})
             continue
-        matches=[i for i,e in enumerate(expected) if all(env.get(k.encode())==v.encode() for k,v in e.items())]
+        matches=[i for i,e in enumerate(expected) if all(env.get(k.encode())==v.encode() for k,v in e[0].items())]
         if ignore_unrelated and not matches:
             assert not any(key.startswith(b'PRODIGY_MASQUE_') for key in env)
             continue
         assert len(matches)==1 and matches[0] not in matched; matched.add(matches[0])
         with proc.joinpath('exe').open('rb') as f:
             digest=hashlib.file_digest(f,'sha256').hexdigest(); size=f.tell()
-        assert digest==cfg['sha256'] and size==cfg['bytes']
+        assert digest==expected[matches[0]][1] and size==expected[matches[0]][2]
         assert proc.joinpath('stat').read_text().rsplit(') ',1)[1].split()[19]==start
         rows.append({'cgroup':relative,'pid':int(pid),'startTicks':start,'exeSHA256':digest,'authority':matches[0]})
 if allow_absent:

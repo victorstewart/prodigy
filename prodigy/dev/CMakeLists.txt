@@ -1807,6 +1807,13 @@ if (PROJECT_ENABLE_TESTS)
    set_tests_properties(prodigy_mothership_json_argument_unit PROPERTIES TIMEOUT 60)
 
    add_test(
+      NAME prodigy_mothership_cross_cluster_masque_gateway_cli_unit
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_cross_cluster_masque_gateway_cli_unit.sh
+              $<TARGET_FILE:mothership> ${CMAKE_CURRENT_BINARY_DIR}
+   )
+   set_tests_properties(prodigy_mothership_cross_cluster_masque_gateway_cli_unit PROPERTIES TIMEOUT 60)
+
+   add_test(
       NAME prodigy_dev_kvm_boundary_unit
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_kvm_boundary_unit.py
    )
@@ -2278,6 +2285,8 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_neuron_hub_unit
    )
    add_test(NAME prodigy_neuron_artifact_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_neuron_artifact_unit)
+   add_test(NAME prodigy_storage_telemetry
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=storage-telemetry $<TARGET_FILE:prodigy_neuron_artifact_unit>)
    set_tests_properties(
       prodigy_artifact_io_unit
       prodigy_mothership_artifact_responsiveness_unit
@@ -2340,6 +2349,8 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_container_overlay_sync_unit
    )
    set_tests_properties(prodigy_container_overlay_sync_unit PROPERTIES SKIP_RETURN_CODE 77)
+   add_test(NAME prodigy_declared_shared_pairing_plan
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=declared-network-shared-pairing-plan $<TARGET_FILE:prodigy_container_overlay_sync_unit>)
    add_test(
       NAME prodigy_container_device_map_transaction_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_container_device_map_transaction_unit
